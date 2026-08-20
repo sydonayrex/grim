@@ -40,18 +40,19 @@ cc = "1.0"
 
 [features]
 default = ["jit-hw-adaptive"]
-jit-hw-adaptive = []
-multi-gpu-kernel = []
-rocm-profile = []
+rocm = []
+jit-hw-adaptive = ["rocm"]
+multi-gpu-kernel = ["rocm"]
+rocm-profile = ["rocm"]
 
-rocm-aiter = []
+rocm-aiter = ["rocm"]
 # grim-sonnet F8 — Composable Kernel (ck_tile) GEMM used to expose a
 # `ck` cargo feature that built src/device/ck_gemm.cpp + a C FFI surface
 # against the vendored CK headers. grim is Rust-centric now: the
 # decode-GEMM kernel is an embedded HIP source literal in
-# `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime. The
-cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys"]
-rccl = []
+# `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime.
+cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys", "rocm"]
+rccl = ["rocm"]
 
 [dev-dependencies]
 grim-quant = { workspace = true }

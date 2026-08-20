@@ -1,12 +1,23 @@
-//! Compatibility loader for `moonshotai/Kimi-K3` (HuggingFace `model_type = "kimi_k3"`).
+//! Compatibility loader and native implementation for `moonshotai/Kimi-K3`.
+//!
+//! # Architecture Details
+//! - **Multi-Head Latent Attention (MLA)**: Dual Q-LoRA (`q_a_proj -> q_b_proj`) and KV-LoRA (`kv_a_proj_with_mqa -> kv_b_proj`) latent projections.
+//! - **Kimi MoE**: 64-expert Mixture of Experts with top-6 routing and scaling factor.
+//! - **SwiGLU Experts**: $w_1$ (gate), $w_3$ (up), and $w_2$ (down) feed-forward branches.
 
+use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
-use grim_tensor::{ArithType, Device, Tensor};
+use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-/// Native mirror of `KimiK3Config` (HuggingFace `kimi_k3`).
-#[derive(Debug, Clone)]
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// Configuration for Kimi-K3 architecture.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KimiK3Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -21,8 +32,34 @@ pub struct KimiK3Config {
     pub v_head_dim: usize,
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
+    pub intermediate_size: usize,
     pub routed_scaling_factor: f32,
     pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+}
+
+impl Default for KimiK3Config {
+    fn default() -> Self {
+        Self {
+            vocab_size: 163840,
+            hidden_size: 2048,
+            num_attention_heads: 16,
+            num_key_value_heads: 16,
+            head_dim: 128,
+            num_hidden_layers: 28,
+            q_lora_rank: 256,
+            kv_lora_rank: 512,
+            qk_nope_head_dim: 128,
+            qk_rope_head_dim: 64,
+            v_head_dim: 128,
+            num_experts: 64,
+            num_experts_per_tok: 6,
+            intermediate_size: 1408,
+            routed_scaling_factor: 2.0,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+        }
+    }
 }
 
 impl ModelConfig for KimiK3Config {
@@ -55,46 +92,405 @@ impl KimiK3Config {
             v_head_dim: u("v_head_dim"),
             num_experts: u("num_experts"),
             num_experts_per_tok: u("num_experts_per_tok"),
-            routed_scaling_factor: f("routed_scaling_factor"),
-            rms_norm_eps: f("rms_norm_eps"),
+            intermediate_size: if u("intermediate_size") > 0 { u("intermediate_size") } else { 1408 },
+            routed_scaling_factor: if f("routed_scaling_factor") > 0.0 { f("routed_scaling_factor") } else { 2.0 },
+            rms_norm_eps: if f("rms_norm_eps") > 0.0 { f("rms_norm_eps") } else { 1e-6 },
+            rope_theta: if f("rope_theta") > 0.0 { f("rope_theta") } else { 10000.0 },
         }
     }
 }
 
-#[allow(dead_code)]
-pub const KIMI_K3_TENSOR_KEYS: &[&str] = &[
-    "model.embed_tokens.weight",
-    "model.norm.weight",
-    "lm_head.weight",
-    "model.layers.{i}.input_layernorm.weight",
-    "model.layers.{i}.post_attention_layernorm.weight",
-    "model.layers.{i}.self_attn.q_a_proj.weight",
-    "model.layers.{i}.self_attn.q_b_proj.weight",
-    "model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight",
-    "model.layers.{i}.self_attn.kv_b_proj.weight",
-    "model.layers.{i}.self_attn.o_proj.weight",
-    "model.layers.{i}.moe.gate.weight",
-    "model.layers.{i}.moe.experts.{e}.w1.weight",
-    "model.layers.{i}.moe.experts.{e}.w2.weight",
-    "model.layers.{i}.moe.experts.{e}.w3.weight",
-];
+// ---------------------------------------------------------------------------
+// MLA Attention Block
+// ---------------------------------------------------------------------------
+
+pub struct KimiK3Mla {
+    pub q_a_proj: Linear,
+    pub q_b_proj: Linear,
+    pub kv_a_proj: Linear,
+    pub kv_b_proj: Linear,
+    pub o_proj: Linear,
+    pub rope: Rope,
+    pub num_heads: usize,
+    pub qk_nope_head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub q_lora_rank: usize,
+    pub kv_lora_rank: usize,
+}
+
+impl KimiK3Mla {
+    pub fn load(ws: &WeightSource<'_>, cfg: &KimiK3Config) -> Result<Self> {
+        let q_dim = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim);
+        let q_a_proj = Linear::load_shape(&ws.scoped("q_a_proj"), [cfg.hidden_size, cfg.q_lora_rank])?;
+        let q_b_proj = Linear::load_shape(&ws.scoped("q_b_proj"), [cfg.q_lora_rank, q_dim])?;
+
+        let kv_a_proj = Linear::load_shape(
+            &ws.scoped("kv_a_proj_with_mqa"),
+            [cfg.hidden_size, cfg.kv_lora_rank + cfg.qk_rope_head_dim],
+        )?;
+        let kv_b_proj = Linear::load_shape(
+            &ws.scoped("kv_b_proj"),
+            [cfg.kv_lora_rank, cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim)],
+        )?;
+        let o_proj = Linear::load_shape(&ws.scoped("o_proj"), [cfg.num_attention_heads * cfg.v_head_dim, cfg.hidden_size])?;
+
+        let rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
+
+        Ok(Self {
+            q_a_proj,
+            q_b_proj,
+            kv_a_proj,
+            kv_b_proj,
+            o_proj,
+            rope,
+            num_heads: cfg.num_attention_heads,
+            qk_nope_head_dim: cfg.qk_nope_head_dim,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+            v_head_dim: cfg.v_head_dim,
+            q_lora_rank: cfg.q_lora_rank,
+            kv_lora_rank: cfg.kv_lora_rank,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let seq_len = x.shape().dims()[0];
+
+        // 1. Q projection
+        let q_lat = self.q_a_proj.forward(x)?;
+        let q_full = self.q_b_proj.forward(&q_lat)?;
+        let q_full_v = q_full.to_vec_f32()?;
+        let total_q_head = self.qk_nope_head_dim + self.qk_rope_head_dim;
+
+        let mut q_nope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_nope_head_dim];
+        let mut q_rope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_rope_head_dim];
+
+        for s in 0..seq_len {
+            for h in 0..self.num_heads {
+                let in_off = s * self.num_heads * total_q_head + h * total_q_head;
+                let nope_off = s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
+                let rope_off = s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim;
+
+                q_nope_v[nope_off..nope_off + self.qk_nope_head_dim]
+                    .copy_from_slice(&q_full_v[in_off..in_off + self.qk_nope_head_dim]);
+                q_rope_v[rope_off..rope_off + self.qk_rope_head_dim]
+                    .copy_from_slice(&q_full_v[in_off + self.qk_nope_head_dim..in_off + total_q_head]);
+            }
+        }
+
+        crate::qwen35::apply_rope_neox(&mut q_rope_v, positions, self.num_heads, self.qk_rope_head_dim, 10000.0);
+
+        // 2. KV latent projection
+        let kv_latent = self.kv_a_proj.forward(x)?;
+        let kv_latent_v = kv_latent.to_vec_f32()?;
+
+        let mut kv_a_v = vec![0.0f32; seq_len * self.kv_lora_rank];
+        let mut k_rope_v = vec![0.0f32; seq_len * self.qk_rope_head_dim];
+
+        for s in 0..seq_len {
+            let in_off = s * (self.kv_lora_rank + self.qk_rope_head_dim);
+            kv_a_v[s * self.kv_lora_rank..(s + 1) * self.kv_lora_rank]
+                .copy_from_slice(&kv_latent_v[in_off..in_off + self.kv_lora_rank]);
+            k_rope_v[s * self.qk_rope_head_dim..(s + 1) * self.qk_rope_head_dim]
+                .copy_from_slice(&kv_latent_v[in_off + self.kv_lora_rank..in_off + self.kv_lora_rank + self.qk_rope_head_dim]);
+        }
+
+        let kv_a_t = cpu_tensor(kv_a_v, Shape::new(vec![seq_len, self.kv_lora_rank]));
+        crate::qwen35::apply_rope_neox(&mut k_rope_v, positions, 1, self.qk_rope_head_dim, 10000.0);
+
+        let kv_b = self.kv_b_proj.forward(&kv_a_t)?;
+        let kv_b_v = kv_b.to_vec_f32()?;
+        let kv_b_head = self.qk_nope_head_dim + self.v_head_dim;
+
+        let mut k_nope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_nope_head_dim];
+        let mut v_v = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
+
+        for s in 0..seq_len {
+            for h in 0..self.num_heads {
+                let in_off = s * self.num_heads * kv_b_head + h * kv_b_head;
+                let k_off = s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
+                let v_off = s * self.num_heads * self.v_head_dim + h * self.v_head_dim;
+
+                k_nope_v[k_off..k_off + self.qk_nope_head_dim]
+                    .copy_from_slice(&kv_b_v[in_off..in_off + self.qk_nope_head_dim]);
+                v_v[v_off..v_off + self.v_head_dim]
+                    .copy_from_slice(&kv_b_v[in_off + self.qk_nope_head_dim..in_off + kv_b_head]);
+            }
+        }
+
+        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
+            let mut new_k = prev_k.to_vec_f32()?;
+            let mut new_v = prev_v.to_vec_f32()?;
+            new_k.extend(k_nope_v);
+            new_v.extend(v_v);
+            let total_k_dim = self.num_heads * self.qk_nope_head_dim;
+            let total_v_dim = self.num_heads * self.v_head_dim;
+            let total_seq = new_k.len() / total_k_dim;
+            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, total_k_dim]));
+            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, total_v_dim]));
+            *kv_cache = Some((full_k.clone(), full_v.clone()));
+            (full_k, full_v)
+        } else {
+            let total_k_dim = self.num_heads * self.qk_nope_head_dim;
+            let total_v_dim = self.num_heads * self.v_head_dim;
+            let full_k = cpu_tensor(k_nope_v, Shape::new(vec![seq_len, total_k_dim]));
+            let full_v = cpu_tensor(v_v, Shape::new(vec![seq_len, total_v_dim]));
+            *kv_cache = Some((full_k.clone(), full_v.clone()));
+            (full_k, full_v)
+        };
+
+        let total_kv_len = k_all.shape().dims()[0];
+        let k_all_v = k_all.to_vec_f32()?;
+        let v_all_v = v_all.to_vec_f32()?;
+
+        let scale = 1.0 / ((self.qk_nope_head_dim + self.qk_rope_head_dim) as f32).sqrt();
+        let mut attn_out = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
+
+        for s in 0..seq_len {
+            for h in 0..self.num_heads {
+                let q_nope_slice = &q_nope_v[s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim
+                    ..s * self.num_heads * self.qk_nope_head_dim + (h + 1) * self.qk_nope_head_dim];
+                let q_rope_slice = &q_rope_v[s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim
+                    ..s * self.num_heads * self.qk_rope_head_dim + (h + 1) * self.qk_rope_head_dim];
+
+                let mut scores = vec![0.0f32; total_kv_len];
+                for t in 0..total_kv_len {
+                    let k_nope_slice = &k_all_v[t * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim
+                        ..t * self.num_heads * self.qk_nope_head_dim + (h + 1) * self.qk_nope_head_dim];
+                    let k_rope_slice = if t < seq_len {
+                        &k_rope_v[t * self.qk_rope_head_dim..(t + 1) * self.qk_rope_head_dim]
+                    } else {
+                        &k_rope_v[0..self.qk_rope_head_dim]
+                    };
+
+                    let dot_nope: f32 = q_nope_slice.iter().zip(k_nope_slice.iter()).map(|(a, b)| a * b).sum();
+                    let dot_rope: f32 = q_rope_slice.iter().zip(k_rope_slice.iter()).map(|(a, b)| a * b).sum();
+                    scores[t] = (dot_nope + dot_rope) * scale;
+                }
+
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_scores: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
+                let sum_exp: f32 = exp_scores.iter().sum();
+                let weights: Vec<f32> = exp_scores.iter().map(|e| e / (sum_exp + 1e-12)).collect();
+
+                for d in 0..self.v_head_dim {
+                    let mut acc = 0.0f32;
+                    for t in 0..total_kv_len {
+                        let v_val = v_all_v[t * self.num_heads * self.v_head_dim + h * self.v_head_dim + d];
+                        acc += weights[t] * v_val;
+                    }
+                    attn_out[s * self.num_heads * self.v_head_dim + h * self.v_head_dim + d] = acc;
+                }
+            }
+        }
+
+        let attn_tensor = cpu_tensor(attn_out, Shape::new(vec![seq_len, self.num_heads * self.v_head_dim]));
+        Ok(self.o_proj.forward(&attn_tensor)?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MoE Feed-Forward Layer
+// ---------------------------------------------------------------------------
+
+pub struct KimiK3Expert {
+    pub gate_proj: Linear,
+    pub up_proj: Linear,
+    pub down_proj: Linear,
+}
+
+impl KimiK3Expert {
+    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, intermediate_size: usize) -> Result<Self> {
+        let gate_proj = Linear::load_shape(&ws.scoped("gate_proj"), [hidden_size, intermediate_size])?;
+        let up_proj = Linear::load_shape(&ws.scoped("up_proj"), [hidden_size, intermediate_size])?;
+        let down_proj = Linear::load_shape(&ws.scoped("down_proj"), [intermediate_size, hidden_size])?;
+        Ok(Self { gate_proj, up_proj, down_proj })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        let gv = gate.to_vec_f32()?;
+        let uv = up.to_vec_f32()?;
+        let swiglu: Vec<f32> = gv
+            .iter()
+            .zip(uv.iter())
+            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
+        Ok(self.down_proj.forward(&swiglu_t)?)
+    }
+}
+
+pub struct KimiK3Moe {
+    pub gate: Linear,
+    pub experts: Vec<KimiK3Expert>,
+    pub num_experts_per_tok: usize,
+    pub routed_scaling_factor: f32,
+}
+
+impl KimiK3Moe {
+    pub fn load(ws: &WeightSource<'_>, cfg: &KimiK3Config) -> Result<Self> {
+        let gate = Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts])?;
+
+        let intermediate_size = (cfg.hidden_size * 8 / 3) / 8 * 8;
+        let mut experts = Vec::with_capacity(cfg.num_experts);
+        let exp_ws = ws.scoped("experts");
+        for e in 0..cfg.num_experts {
+            let exp = KimiK3Expert::load(&exp_ws.scoped(&e.to_string()), cfg.hidden_size, intermediate_size)?;
+            experts.push(exp);
+        }
+
+        Ok(Self {
+            gate,
+            experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let seq_len = x.shape().dims()[0];
+        let hidden_dim = x.shape().dims()[1];
+        let logits = self.gate.forward(x)?;
+        let logits_v = logits.to_vec_f32()?;
+        let num_exp = self.experts.len();
+
+        let xv = x.to_vec_f32()?;
+        let mut out = vec![0.0f32; seq_len * hidden_dim];
+
+        for s in 0..seq_len {
+            let row = &logits_v[s * num_exp..(s + 1) * num_exp];
+            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
+
+            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
+            let sum_e: f32 = exps.iter().sum();
+            let weights: Vec<f32> = exps.iter().map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor).collect();
+
+            let token_x = cpu_tensor(xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(), Shape::new(vec![1, hidden_dim]));
+
+            for (i, (exp_idx, _)) in topk.iter().enumerate() {
+                let w = weights[i];
+                let exp_out = self.experts[*exp_idx].forward(&token_x)?.to_vec_f32()?;
+                for d in 0..hidden_dim {
+                    out[s * hidden_dim + d] += w * exp_out[d];
+                }
+            }
+        }
+
+        Ok(cpu_tensor(out, x.shape().clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block
+// ---------------------------------------------------------------------------
+
+pub struct KimiK3Block {
+    pub attn_norm: RmsNorm,
+    pub self_attn: KimiK3Mla,
+    pub ffn_norm: RmsNorm,
+    pub moe: KimiK3Moe,
+}
+
+impl KimiK3Block {
+    pub fn load(ws: &WeightSource<'_>, cfg: &KimiK3Config) -> Result<Self> {
+        let attn_norm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let self_attn = KimiK3Mla::load(&ws.scoped("self_attn"), cfg)?;
+        let ffn_norm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let moe = KimiK3Moe::load(&ws.scoped("block_sparse_moe"), cfg)?;
+
+        Ok(Self {
+            attn_norm,
+            self_attn,
+            ffn_norm,
+            moe,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let normed_attn = self.attn_norm.forward(x)?;
+        let attn_out = self.self_attn.forward(&normed_attn, positions, kv_cache)?;
+
+        let xv = x.to_vec_f32()?;
+        let av = attn_out.to_vec_f32()?;
+        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
+        let res1_t = cpu_tensor(res1, x.shape().clone());
+
+        let normed_ffn = self.ffn_norm.forward(&res1_t)?;
+        let mlp_out = self.moe.forward(&normed_ffn)?;
+
+        let r1v = res1_t.to_vec_f32()?;
+        let mv = mlp_out.to_vec_f32()?;
+        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
+
+        Ok(cpu_tensor(out_vec, x.shape().clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model & Session
+// ---------------------------------------------------------------------------
 
 pub struct KimiK3 {
     pub cfg: KimiK3Config,
     pub device: Device,
+    pub tok_embeddings: Linear,
+    pub layers: Vec<KimiK3Block>,
+    pub norm: RmsNorm,
+    pub output: Linear,
 }
 
 impl KimiK3 {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: KimiK3Config) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: KimiK3Config,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg)
     }
 
     pub fn load_tp(
-        _device: Device,
-        _ws: &grim_nn::WeightSource<'_>,
-        _cfg: KimiK3Config,
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: KimiK3Config,
     ) -> Result<Self> {
-        Err(Error::Unimplemented("KimiK3 load_tp is not yet implemented".into()))
+        let root = ws.scoped("model");
+
+        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            let layer_ws = root.scoped("layers").scoped(&i.to_string());
+            let block = KimiK3Block::load(&layer_ws, &cfg)?;
+            layers.push(block);
+        }
+
+        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let output = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
+            .unwrap_or_else(|_| tok_embeddings.clone());
+
+        Ok(Self {
+            cfg,
+            device,
+            tok_embeddings,
+            layers,
+            norm,
+            output,
+        })
     }
 }
 
@@ -117,14 +513,43 @@ impl CausalLm for KimiK3 {
     fn new_session(&self) -> Box<dyn SessionT> {
         Box::new(grim_core::session::Session::new(self.device.clone()))
     }
+
     fn forward(
         &self,
-        _session: &mut dyn SessionT,
-        _input_ids: &Tensor,
-        _positions: &Tensor,
+        session: &mut dyn SessionT,
+        input_ids: &Tensor,
+        positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        Err(Error::Unimplemented("KimiK3 forward pass".into()))
+        let ids = input_ids.to_vec_f32()?;
+        let seq_len = ids.len();
+        let pos_v: Vec<u32> = positions
+            .to_vec_f32()
+            .map(|v| v.into_iter().map(|p| p as u32).collect())
+            .unwrap_or_else(|_| (0..seq_len as u32).collect());
+
+        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
+
+        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
+        for (i, &tok_f) in ids.iter().enumerate() {
+            let tok = tok_f as usize;
+            if tok < self.cfg.vocab_size {
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
+                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+            }
+        }
+
+        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        let mut kv_caches = vec![None; self.layers.len()];
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(&x, &pos_v, &mut kv_caches[layer_idx])?;
+        }
+
+        let normed = self.norm.forward(&x)?;
+        let logits = self.output.forward(&normed)?;
+        session.advance_pos(seq_len);
+        Ok(logits)
     }
 }
 
@@ -170,3 +595,4 @@ mod tests {
         );
     }
 }
+

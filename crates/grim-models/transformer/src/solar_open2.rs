@@ -171,10 +171,14 @@ impl SolarOpen2Block {
                         vocab_size: cfg.vocab_size,
                         hidden_size: cfg.hidden_size,
                         num_heads: cfg.num_heads,
+                        head_dim: cfg.head_dim,
                         num_layers: cfg.num_layers,
                         intermediate_size: cfg.intermediate_size,
+                        chunk_size: 64,
+                        rms_norm_eps: 1e-5,
                         max_seq_len: cfg.max_seq_len,
                     },
+
                 )?;
                 (None, Some(dnet))
             }

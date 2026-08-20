@@ -264,3 +264,38 @@ impl Default for WmmaGemmConfig {
         }
     }
 }
+
+/// WI-F1 — Load-time concatenation of the per-layer Q/K/V projection weights
+/// into a single row-major `[hidden, q_dim + k_dim + v_dim]` matrix, so all
+/// three projections run as one GEMM launch (`RocmDevice::fused_qkv_proj`).
+/// One-time host cost at model load; must never run per forward pass.
+pub fn concat_qkv_weights(
+    q_w: &[f32],
+    k_w: &[f32],
+    v_w: &[f32],
+    hidden: usize,
+) -> crate::Result<Vec<f32>> {
+    if hidden == 0
+        || q_w.len() % hidden != 0
+        || k_w.len() % hidden != 0
+        || v_w.len() % hidden != 0
+    {
+        return Err(crate::Error::Shape(format!(
+            "concat_qkv_weights: weights must be row-major [hidden, _] with hidden={hidden} (got lens {}/{}/{})",
+            q_w.len(),
+            k_w.len(),
+            v_w.len()
+        )));
+    }
+    let q_dim = q_w.len() / hidden;
+    let k_dim = k_w.len() / hidden;
+    let v_dim = v_w.len() / hidden;
+    let qkv_dim = q_dim + k_dim + v_dim;
+    let mut out = Vec::with_capacity(hidden * qkv_dim);
+    for r in 0..hidden {
+        out.extend_from_slice(&q_w[r * q_dim..(r + 1) * q_dim]);
+        out.extend_from_slice(&k_w[r * k_dim..(r + 1) * k_dim]);
+        out.extend_from_slice(&v_w[r * v_dim..(r + 1) * v_dim]);
+    }
+    Ok(out)
+}

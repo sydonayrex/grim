@@ -398,6 +398,12 @@ impl Linear {
         })
     }
 
+    /// Load an unbiased Linear layer from a shape pair `[in_dim, out_dim]`.
+    pub fn load_shape(ws: &WeightSource<'_>, shape: [usize; 2]) -> Result<Self> {
+        Self::load(ws, shape[0], shape[1], false)
+    }
+
+
     /// Load a column-parallel shard (dim==0): each rank gets `out_dim / world_size`
     /// rows of the weight matrix. Bias is loaded unsharded (same on all ranks).
     pub fn load_column_parallel(
@@ -752,6 +758,54 @@ impl RmsNorm {
         ))
     }
 }
+
+// ---------- LayerNorm ----------
+
+#[derive(Clone)]
+pub struct LayerNorm {
+    pub weight: Tensor,
+    pub bias: Option<Tensor>,
+    pub eps: f32,
+}
+
+impl LayerNorm {
+    pub fn new(weight: Tensor, bias: Option<Tensor>, eps: f32) -> Self {
+        Self { weight, bias, eps }
+    }
+
+    pub fn load(ws: &WeightSource<'_>, dim: usize, eps: f32) -> Result<Self> {
+        let weight = ws.get([dim], "weight")?;
+        let bias = ws.get([dim], "bias").ok();
+        Ok(Self { weight, bias, eps })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let xv = x.to_vec_f32()?;
+        let wv = self.weight.to_vec_f32()?;
+        let bv = self.bias.as_ref().map(|b| b.to_vec_f32()).transpose()?;
+
+        let dim = x.shape().dims().last().copied().unwrap_or(1);
+        let batch = xv.len() / dim;
+        let mut out = vec![0.0f32; xv.len()];
+
+        for b in 0..batch {
+            let slice = &xv[b * dim..(b + 1) * dim];
+            let mean = slice.iter().sum::<f32>() / (dim as f32);
+            let var = slice.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / (dim as f32);
+            let inv_std = 1.0 / (var + self.eps).sqrt();
+
+            for d in 0..dim {
+                let norm = (slice[d] - mean) * inv_std;
+                let w = wv[d];
+                let bias_val = bv.as_ref().map(|b_vec| b_vec[d]).unwrap_or(0.0);
+                out[b * dim + d] = norm * w + bias_val;
+            }
+        }
+
+        Ok(grim_backend_cpu::cpu_tensor(out, x.shape().clone()))
+    }
+}
+
 
 // ---------- Embedding ----------
 

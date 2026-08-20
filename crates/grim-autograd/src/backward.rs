@@ -142,6 +142,244 @@ pub fn backward(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], d_gate)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], d_up)?;
             }
+            TapeMetadata::RmsNorm { eps, weight_param } => {
+                let x = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing rmsnorm input x".into()))?;
+                let weight = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing rmsnorm input weight".into()))?;
+
+                let (dx, dw) = crate::ops::rmsnorm_backward(x, weight, &out_grad, *eps)?;
+
+                if let Some(pid) = weight_param {
+                    if let Some(param) = trainable_params.get_mut(*pid) {
+                        param.accumulate_grad(&dw)?;
+                    }
+                }
+
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], dw)?;
+            }
+            TapeMetadata::Rope => {
+                let cos = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing rope cos".into()))?;
+                let sin = tape
+                    .get(entry.inputs[2])
+                    .ok_or_else(|| Error::Backend("missing rope sin".into()))?;
+
+                let dx = crate::ops::rope_backward(&out_grad, cos, sin)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+            }
+            TapeMetadata::Softmax => {
+                let s = tape
+                    .get(entry.output)
+                    .ok_or_else(|| Error::Backend("missing softmax output".into()))?;
+                let dx = crate::ops::softmax_backward(&out_grad, s)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+            }
+            TapeMetadata::Embedding {
+                token_ids,
+                vocab_size,
+                hidden_dim,
+                weight_param,
+            } => {
+                let dw = crate::ops::embedding_backward(
+                    &out_grad,
+                    token_ids,
+                    *vocab_size,
+                    *hidden_dim,
+                )?;
+
+                if let Some(pid) = weight_param {
+                    if let Some(param) = trainable_params.get_mut(*pid) {
+                        param.accumulate_grad(&dw)?;
+                    }
+                }
+
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dw)?;
+            }
+        }
+    }
+
+    Ok(ctx.grads)
+}
+
+/// Execute reverse-mode autograd pass over `tape`, directly fusing backward gradient calculation
+/// with optimizer parameter update stepping (LOMO style).
+///
+/// This eliminates the need to retain parameter gradient tensors in memory across the entire backward pass.
+pub fn backward_step(
+    tape: &Tape,
+    loss_grad: Tensor,
+    loss_tensor_id: TensorId,
+    trainable_params: &mut TrainableParams,
+    optimizer: &mut crate::adamw::Optimizer,
+) -> Result<HashMap<TensorId, Tensor>> {
+    let mut ctx = BackwardContext::new(tape, loss_grad, loss_tensor_id);
+
+    for entry in tape.iter_rev() {
+        if !ctx.grads.contains_key(&entry.output) {
+            continue;
+        }
+
+        let out_grad = ctx.get_grad(entry.output)?.clone();
+
+        match &entry.metadata {
+            TapeMetadata::LoRAApply { alpha, rank, a, b } => {
+                let _base = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing base tensor".into()))?;
+                let x = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing x tensor".into()))?;
+                let a_t = tape
+                    .get(entry.inputs[2])
+                    .ok_or_else(|| Error::Backend("missing a tensor".into()))?;
+                let b_t = tape
+                    .get(entry.inputs[3])
+                    .ok_or_else(|| Error::Backend("missing b tensor".into()))?;
+
+                let scale = alpha / (*rank as f32);
+                let (g_base, g_x, g_a, g_b) = lora_backward(&out_grad, x, a_t, b_t, scale)?;
+
+                // Fused LOMO step: immediately step parameter and release gradient buffer
+                if let Some(param_a) = trainable_params.get_mut(*a) {
+                    param_a.accumulate_grad(&g_a)?;
+                    optimizer.step_param(*a, param_a)?;
+                    param_a.zero_grad()?;
+                }
+                if let Some(param_b) = trainable_params.get_mut(*b) {
+                    param_b.accumulate_grad(&g_b)?;
+                    optimizer.step_param(*b, param_b)?;
+                    param_b.zero_grad()?;
+                }
+
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g_base)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], g_x)?;
+            }
+            TapeMetadata::MatMul {
+                transpose_a,
+                transpose_b,
+                ..
+            } => {
+                let a = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing matmul input a".into()))?;
+                let b = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing matmul input b".into()))?;
+
+                let args = MatMulArgs {
+                    a: a.clone(),
+                    b: b.clone(),
+                    out_grad: out_grad.clone(),
+                    transpose_a: *transpose_a,
+                    transpose_b: *transpose_b,
+                };
+                let (g_a, g_b) = matmul_backward(&args)?;
+
+                if let Some(pid) = entry.param_id {
+                    if let Some(param) = trainable_params.get_mut(pid) {
+                        param.accumulate_grad(&g_a)?;
+                        optimizer.step_param(pid, param)?;
+                        param.zero_grad()?;
+                    }
+                }
+
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g_a)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], g_b)?;
+            }
+            TapeMetadata::Add => {
+                let args = AddArgs {
+                    out_grad: out_grad.clone(),
+                };
+                let (gl, gr) = add_backward(&args)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], gl)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], gr)?;
+            }
+            TapeMetadata::Scale { factor } => {
+                let args = ScaleArgs {
+                    input_grad: out_grad.clone(),
+                    factor: *factor,
+                };
+                let g = scale_backward(&args)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g)?;
+            }
+            TapeMetadata::SiluMul => {
+                let gate = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing silu_mul gate".into()))?;
+                let up = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing silu_mul up".into()))?;
+                let (d_gate, d_up) = silu_mul_backward(gate, up, &out_grad)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], d_gate)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], d_up)?;
+            }
+            TapeMetadata::RmsNorm { eps, weight_param } => {
+                let x = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing rmsnorm input x".into()))?;
+                let weight = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing rmsnorm input weight".into()))?;
+
+                let (dx, dw) = crate::ops::rmsnorm_backward(x, weight, &out_grad, *eps)?;
+
+                if let Some(pid) = weight_param {
+                    if let Some(param) = trainable_params.get_mut(*pid) {
+                        param.accumulate_grad(&dw)?;
+                        optimizer.step_param(*pid, param)?;
+                        param.zero_grad()?;
+                    }
+                }
+
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], dw)?;
+            }
+            TapeMetadata::Rope => {
+                let cos = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing rope cos".into()))?;
+                let sin = tape
+                    .get(entry.inputs[2])
+                    .ok_or_else(|| Error::Backend("missing rope sin".into()))?;
+
+                let dx = crate::ops::rope_backward(&out_grad, cos, sin)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+            }
+            TapeMetadata::Softmax => {
+                let s = tape
+                    .get(entry.output)
+                    .ok_or_else(|| Error::Backend("missing softmax output".into()))?;
+                let dx = crate::ops::softmax_backward(&out_grad, s)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
+            }
+            TapeMetadata::Embedding {
+                token_ids,
+                vocab_size,
+                hidden_dim,
+                weight_param,
+            } => {
+                let dw = crate::ops::embedding_backward(
+                    &out_grad,
+                    token_ids,
+                    *vocab_size,
+                    *hidden_dim,
+                )?;
+
+                if let Some(pid) = weight_param {
+                    if let Some(param) = trainable_params.get_mut(*pid) {
+                        param.accumulate_grad(&dw)?;
+                        optimizer.step_param(*pid, param)?;
+                        param.zero_grad()?;
+                    }
+                }
+
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dw)?;
+            }
         }
     }
 
@@ -234,5 +472,48 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn backward_step_accumulates_and_steps_optimizer() {
+        let mut tape = Tape::new();
+        let mut params = TrainableParams::new();
+
+        let base = tape.register(cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2])));
+        let x = tape.register(cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])));
+
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+
+        let a_data = cpu_tensor(vec![0.5, 0.5], Shape::new(vec![1, 2]));
+        let b_data = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2, 1]));
+
+        let a_id = tape.register_param(pid_a, a_data.clone());
+        let b_id = tape.register_param(pid_b, b_data.clone());
+
+        params.insert(crate::param::TrainableParam::new(pid_a, a_data).unwrap());
+        params.insert(crate::param::TrainableParam::new(pid_b, b_data).unwrap());
+
+        let out = tape.record_lora_apply(
+            base,
+            x,
+            a_id,
+            b_id,
+            cpu_tensor(vec![2.0, 3.0], Shape::new(vec![1, 2])),
+            1.0,
+            1,
+            pid_a,
+            pid_b,
+        );
+
+        let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
+        let mut optimizer = crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
+        let initial_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+
+        let grads = backward_step(&tape, loss_grad, out, &mut params, &mut optimizer).unwrap();
+
+        assert!(grads.contains_key(&base));
+        let stepped_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+        assert_ne!(initial_a, stepped_a);
     }
 }

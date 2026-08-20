@@ -767,23 +767,31 @@ pub fn lora_backward(
     } else {
         x_dims[1]
     };
-    let rank = a_dims[0];
-    let out_features = b_dims[0];
+    let rank = if a_dims.len() == 1 {
+        a_vec.len() / in_features
+    } else {
+        a_dims[0]
+    };
+    let out_features = if b_dims.len() == 1 {
+        b_vec.len() / rank
+    } else {
+        b_dims[0]
+    };
 
     // Fallback: transpose via CPU for all backends.
     // [P1-16 fix attempt: on-device transpose was attempted but transpose_f32_2d
     // is not available on Box<dyn BackendDevice>. CPU round-trip is the safe fallback.]
 
-    let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) {
+    let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) && b_dims.len() == 2 {
         b.storage().clone()
     } else {
-        Arc::from(dev.from_cpu(&b_vec, b.shape(), DType::F32)?)
+        Arc::from(dev.from_cpu(&b_vec, &Shape::new(vec![out_features, rank]), DType::F32)?)
     };
 
-    let a_storage = if matches!(a.device(), grim_tensor::Device::Rocm(_)) {
+    let a_storage = if matches!(a.device(), grim_tensor::Device::Rocm(_)) && a_dims.len() == 2 {
         a.storage().clone()
     } else {
-        Arc::from(dev.from_cpu(&a_vec, a.shape(), DType::F32)?)
+        Arc::from(dev.from_cpu(&a_vec, &Shape::new(vec![rank, in_features]), DType::F32)?)
     };
 
     // a_t = transpose(a): [rank, in_features] -> [in_features, rank]
@@ -1383,6 +1391,333 @@ pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
     ))
 }
 
+/// Reverse-mode autodiff for RMSNorm layer: `y = (x / rms) * weight`.
+///
+/// Mathematical contract:
+/// - `x`: Input tensor of shape `[..., hidden_dim]`
+/// - `weight`: Learnable scale parameter of shape `[hidden_dim]`
+/// - `out_grad`: Incoming loss gradient w.r.t. output `y`, shape `[..., hidden_dim]`
+/// - `eps`: Numerical epsilon for variance stabilization
+///
+/// Returns `(dx, dweight)` where:
+/// - `dweight[j] = sum_{batch} out_grad[..., j] * (x[..., j] / rms)`
+/// - `dx[i] = (weight[i] / rms) * out_grad[i] - (x[i] / (hidden_dim * rms^3)) * sum_j(out_grad[j] * weight[j] * x[j])`
+pub fn rmsnorm_backward(
+    x: &Tensor,
+    weight: &Tensor,
+    out_grad: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let dev = crate::pick_device_for_tensor(x);
+    if let grim_tensor::Device::Rocm(_) = x.device() {
+        if let Ok((dx_st, dw_st, _handle)) = dev.rmsnorm_backward(
+            x.storage().as_ref(),
+            weight.storage().as_ref(),
+            out_grad.storage().as_ref(),
+            eps,
+            x.shape(),
+            weight.shape(),
+        ) {
+            let dx = Tensor::new(
+                Arc::from(dx_st),
+                x.shape().clone(),
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            );
+            let dw = Tensor::new(
+                Arc::from(dw_st),
+                weight.shape().clone(),
+                DType::F32,
+                weight.provenance().clone(),
+                weight.device().clone(),
+            );
+            return Ok((dx, dw));
+        }
+    }
+
+    let x_vec = x.to_vec_f32()?;
+    let w_vec = weight.to_vec_f32()?;
+    let g_vec = out_grad.to_vec_f32()?;
+
+    let hidden_dim = w_vec.len();
+    if hidden_dim == 0 || x_vec.len() % hidden_dim != 0 {
+        return Err(Error::Backend(format!(
+            "rmsnorm_backward: invalid hidden_dim {hidden_dim} for input size {}",
+            x_vec.len()
+        )));
+    }
+
+    let num_rows = x_vec.len() / hidden_dim;
+    let mut dx_vec = vec![0.0f32; x_vec.len()];
+    let mut dw_vec = vec![0.0f32; hidden_dim];
+
+    for r in 0..num_rows {
+        let offset = r * hidden_dim;
+        let x_row = &x_vec[offset..offset + hidden_dim];
+        let g_row = &g_vec[offset..offset + hidden_dim];
+
+        let sum_sq: f32 = x_row.iter().map(|&v| v * v).sum();
+        let rms = (sum_sq / (hidden_dim as f32) + eps).sqrt();
+        let rms_inv = 1.0f32 / rms;
+        let rms_cube_inv = rms_inv * rms_inv * rms_inv;
+
+        let mut sum_g_w_x = 0.0f32;
+        for i in 0..hidden_dim {
+            sum_g_w_x += g_row[i] * w_vec[i] * x_row[i];
+            dw_vec[i] += g_row[i] * (x_row[i] * rms_inv);
+        }
+
+        let scale_sub = sum_g_w_x / (hidden_dim as f32) * rms_cube_inv;
+        for i in 0..hidden_dim {
+            dx_vec[offset + i] = (w_vec[i] * rms_inv) * g_row[i] - x_row[i] * scale_sub;
+        }
+    }
+
+    let dev = crate::pick_device_for_tensor(x);
+    let dx = Tensor::new(
+        Arc::from(dev.from_cpu(&dx_vec, x.shape(), DType::F32)?),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    );
+    let dw = Tensor::new(
+        Arc::from(dev.from_cpu(&dw_vec, weight.shape(), DType::F32)?),
+        weight.shape().clone(),
+        DType::F32,
+        weight.provenance().clone(),
+        weight.device().clone(),
+    );
+
+    Ok((dx, dw))
+}
+
+/// Reverse-mode autodiff for Rotary Position Embedding (RoPE).
+///
+/// Mathematical contract:
+/// - RoPE is an orthogonal rotation matrix $R(\theta)$.
+/// - Backward w.r.t. input $x$ is matrix-vector multiply by $R(\theta)^T = R(-\theta)$.
+/// - For pairs $(g_0, g_1)$ rotated by $(\cos \theta, \sin \theta)$, the backward gradient is:
+///   $dx_0 = g_0 \cos \theta + g_1 \sin \theta$
+///   $dx_1 = -g_0 \sin \theta + g_1 \cos \theta$
+pub fn rope_backward(
+    out_grad: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<Tensor> {
+    let dev = crate::pick_device_for_tensor(out_grad);
+    if let grim_tensor::Device::Rocm(_) = out_grad.device() {
+        if let Ok((dx_st, _handle)) = dev.rope_backward(
+            out_grad.storage().as_ref(),
+            cos.storage().as_ref(),
+            sin.storage().as_ref(),
+            out_grad.shape(),
+        ) {
+            return Ok(Tensor::new(
+                Arc::from(dx_st),
+                out_grad.shape().clone(),
+                DType::F32,
+                out_grad.provenance().clone(),
+                out_grad.device().clone(),
+            ));
+        }
+    }
+
+    let g_vec = out_grad.to_vec_f32()?;
+    let cos_vec = cos.to_vec_f32()?;
+    let sin_vec = sin.to_vec_f32()?;
+
+    let dim = cos_vec.len();
+    if dim == 0 || g_vec.len() % (dim * 2) != 0 {
+        let mut dx_vec = vec![0.0f32; g_vec.len()];
+        let pairs = g_vec.len() / 2;
+        let c_len = cos_vec.len().min(sin_vec.len()).max(1);
+        for p in 0..pairs {
+            let idx0 = p * 2;
+            let idx1 = p * 2 + 1;
+            let c = cos_vec.get(p % c_len).copied().unwrap_or(1.0);
+            let s = sin_vec.get(p % c_len).copied().unwrap_or(0.0);
+            let g0 = g_vec[idx0];
+            let g1 = g_vec[idx1];
+            dx_vec[idx0] = g0 * c + g1 * s;
+            dx_vec[idx1] = -g0 * s + g1 * c;
+        }
+        let dev = crate::pick_device_for_tensor(out_grad);
+        return Ok(Tensor::new(
+            Arc::from(dev.from_cpu(&dx_vec, out_grad.shape(), DType::F32)?),
+            out_grad.shape().clone(),
+            DType::F32,
+            out_grad.provenance().clone(),
+            out_grad.device().clone(),
+        ));
+    }
+
+    let half_dim = dim;
+    let head_dim = half_dim * 2;
+    let num_heads_tokens = g_vec.len() / head_dim;
+    let mut dx_vec = vec![0.0f32; g_vec.len()];
+
+    for t in 0..num_heads_tokens {
+        let offset = t * head_dim;
+        for i in 0..half_dim {
+            let g0 = g_vec[offset + i];
+            let g1 = g_vec[offset + half_dim + i];
+            let c = cos_vec[i];
+            let s = sin_vec[i];
+            dx_vec[offset + i] = g0 * c + g1 * s;
+            dx_vec[offset + half_dim + i] = -g0 * s + g1 * c;
+        }
+    }
+
+    let dev = crate::pick_device_for_tensor(out_grad);
+    Ok(Tensor::new(
+        Arc::from(dev.from_cpu(&dx_vec, out_grad.shape(), DType::F32)?),
+        out_grad.shape().clone(),
+        DType::F32,
+        out_grad.provenance().clone(),
+        out_grad.device().clone(),
+    ))
+}
+
+/// Reverse-mode autodiff for Softmax activation along the last dimension.
+///
+/// Mathematical contract:
+/// - `softmax_out`: Forward softmax probabilities $s$, $\sum_j s_j = 1$.
+/// - `out_grad`: Incoming loss gradient $g$.
+/// - Returns $dx_i = s_i \cdot (g_i - \sum_j g_j \cdot s_j)$.
+pub fn softmax_backward(
+    out_grad: &Tensor,
+    softmax_out: &Tensor,
+) -> Result<Tensor> {
+    let dev = crate::pick_device_for_tensor(out_grad);
+    if let grim_tensor::Device::Rocm(_) = out_grad.device() {
+        if let Ok((dx_st, _handle)) = dev.softmax_backward(
+            out_grad.storage().as_ref(),
+            softmax_out.storage().as_ref(),
+            out_grad.shape(),
+        ) {
+            return Ok(Tensor::new(
+                Arc::from(dx_st),
+                out_grad.shape().clone(),
+                DType::F32,
+                out_grad.provenance().clone(),
+                out_grad.device().clone(),
+            ));
+        }
+    }
+
+    let g_vec = out_grad.to_vec_f32()?;
+    let s_vec = softmax_out.to_vec_f32()?;
+
+    if g_vec.len() != s_vec.len() {
+        return Err(Error::Backend(format!(
+            "softmax_backward shape mismatch: {} vs {}",
+            g_vec.len(),
+            s_vec.len()
+        )));
+    }
+
+    let last_dim = softmax_out.shape().dims().last().copied().unwrap_or(1);
+    if last_dim == 0 {
+        return Err(Error::Backend("softmax_backward: last_dim is 0".into()));
+    }
+    let num_rows = g_vec.len() / last_dim;
+    let mut dx_vec = vec![0.0f32; g_vec.len()];
+
+    for r in 0..num_rows {
+        let offset = r * last_dim;
+        let g_row = &g_vec[offset..offset + last_dim];
+        let s_row = &s_vec[offset..offset + last_dim];
+
+        let mut sum_g_s = 0.0f32;
+        for i in 0..last_dim {
+            sum_g_s += g_row[i] * s_row[i];
+        }
+
+        for i in 0..last_dim {
+            dx_vec[offset + i] = s_row[i] * (g_row[i] - sum_g_s);
+        }
+    }
+
+    let dev = crate::pick_device_for_tensor(out_grad);
+    Ok(Tensor::new(
+        Arc::from(dev.from_cpu(&dx_vec, out_grad.shape(), DType::F32)?),
+        out_grad.shape().clone(),
+        DType::F32,
+        out_grad.provenance().clone(),
+        out_grad.device().clone(),
+    ))
+}
+
+/// Reverse-mode autodiff for token embedding lookup table.
+///
+/// Mathematical contract:
+/// - `out_grad`: Incoming gradients for token activations, shape `[seq_len, hidden_dim]`
+/// - `token_ids`: Token indices corresponding to rows in `out_grad`
+/// - `vocab_size`: Total vocabulary dimension of embedding weight matrix `[vocab_size, hidden_dim]`
+/// - `hidden_dim`: Embedding vector dimension
+///
+/// Accumulates row gradients via scatter-add: `dweight[token_ids[i]] += out_grad[i]`.
+pub fn embedding_backward(
+    out_grad: &Tensor,
+    token_ids: &[u32],
+    vocab_size: usize,
+    hidden_dim: usize,
+) -> Result<Tensor> {
+    // P3: fused HIP kernel path when the gradient already lives on a GPU
+    // backend that implements the scatter-add (ROCm today).
+    if matches!(out_grad.device(), grim_tensor::Device::Rocm(_)) {
+        let dev = crate::pick_device_for_tensor(out_grad);
+        let shape = grim_tensor::Shape::new(vec![vocab_size, hidden_dim]);
+        if let Ok((storage, handle)) =
+            dev.embedding_backward(out_grad.storage().as_ref(), token_ids, vocab_size, hidden_dim)
+        {
+            handle.synchronize()?;
+            return Ok(Tensor::new(
+                Arc::from(storage),
+                shape,
+                DType::F32,
+                out_grad.provenance().clone(),
+                out_grad.device().clone(),
+            ));
+        }
+        // fall through to the CPU path on Unimplemented
+    }
+
+    let g_vec = out_grad.to_vec_f32()?;
+    if g_vec.len() != token_ids.len() * hidden_dim {
+        return Err(Error::Backend(format!(
+            "embedding_backward size mismatch: grad len {} != tokens {} * hidden_dim {}",
+            g_vec.len(),
+            token_ids.len(),
+            hidden_dim
+        )));
+    }
+
+    let mut dw_vec = vec![0.0f32; vocab_size * hidden_dim];
+    for (t_idx, &tok) in token_ids.iter().enumerate() {
+        let tok_usize = tok as usize;
+        if tok_usize < vocab_size {
+            let w_offset = tok_usize * hidden_dim;
+            let g_offset = t_idx * hidden_dim;
+            for d in 0..hidden_dim {
+                dw_vec[w_offset + d] += g_vec[g_offset + d];
+            }
+        }
+    }
+
+    let dev = crate::pick_device_for_tensor(out_grad);
+    let shape = grim_tensor::Shape::new(vec![vocab_size, hidden_dim]);
+    Ok(Tensor::new(
+        Arc::from(dev.from_cpu(&dw_vec, &shape, DType::F32)?),
+        shape,
+        DType::F32,
+        out_grad.provenance().clone(),
+        out_grad.device().clone(),
+    ))
+}
+
 /// Backward: STE — gradient passes through as identity (gradient of
 /// quantize+dequant w.r.t. input is 1.0 everywhere in the STE
 /// approximation, ignoring the non-differentiable clamp/round).
@@ -1970,5 +2305,51 @@ mod tests {
         check("grad_a", &a_v, &grad_a.to_vec_f32().unwrap(), 1);
         check("grad_b", &b_v, &grad_b.to_vec_f32().unwrap(), 2);
         check("grad_m", &m_v, &grad_m.to_vec_f32().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_rmsnorm_backward_numeric() {
+        let x = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]);
+        let w = tensor(vec![1.0, 1.0, 1.0, 1.0], vec![4]);
+        let g = tensor(vec![0.5, 0.5, 0.5, 0.5], vec![1, 4]);
+        let (dx, dw) = rmsnorm_backward(&x, &w, &g, 1e-5).unwrap();
+        assert_eq!(dx.shape().dims(), &[1, 4]);
+        assert_eq!(dw.shape().dims(), &[4]);
+        let dw_v = dw.to_vec_f32().unwrap();
+        assert!(dw_v.iter().all(|&v| v > 0.0));
+    }
+
+    #[test]
+    fn test_rope_backward_inverts_rotation() {
+        let g = tensor(vec![1.0, 0.0], vec![1, 2]);
+        let cos = tensor(vec![0.0], vec![1]);
+        let sin = tensor(vec![1.0], vec![1]);
+        let dx = rope_backward(&g, &cos, &sin).unwrap();
+        let dx_v = dx.to_vec_f32().unwrap();
+        // Forward would rotate [1,0] by 90deg to [0, 1].
+        // Backward rotates [1, 0] by -90deg to [0, -1].
+        assert!((dx_v[0] - 0.0).abs() < 1e-5);
+        assert!((dx_v[1] - (-1.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_softmax_backward_zero_sum_property() {
+        // Softmax Jacobian times any constant vector produces 0 gradient.
+        let s = tensor(vec![0.2, 0.3, 0.5], vec![1, 3]);
+        let g = tensor(vec![2.0, 2.0, 2.0], vec![1, 3]);
+        let dx = softmax_backward(&g, &s).unwrap();
+        let dx_v = dx.to_vec_f32().unwrap();
+        for &v in &dx_v {
+            assert!(v.abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_embedding_backward_scatter_add() {
+        let g = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let token_ids = vec![1u32, 1u32]; // both tokens map to row 1
+        let dw = embedding_backward(&g, &token_ids, 3, 2).unwrap();
+        let dw_v = dw.to_vec_f32().unwrap();
+        assert_eq!(dw_v, vec![0.0, 0.0, 4.0, 6.0, 0.0, 0.0]);
     }
 }

@@ -15,7 +15,6 @@ pub use grim_tensor::dtype::QuantFormat;
 pub const BLOCK_SIZE_Q8: usize = 32;
 pub const BLOCK_SIZE_Q4_K: usize = 32;
 const BLOCK_SIZE_QK: usize = 32;
-const GPTQ_PROXY_COLUMN_GROUP: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct TensorRewritePlan {
@@ -2158,6 +2157,7 @@ pub fn quant_fp8_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn quant_packed_symmetric(
     data: &[f32],
     bits: u8,
@@ -2462,6 +2462,10 @@ pub fn dequant_packed_symmetric(data: &[u8], num_weights: usize, bits: u8) -> Re
     Ok(out)
 }
 
+#[allow(dead_code)]
+const GPTQ_PROXY_COLUMN_GROUP: usize = 4;
+
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct BlockQuantization {
     scale: f32,

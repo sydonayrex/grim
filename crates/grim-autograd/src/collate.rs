@@ -5,7 +5,7 @@
 //! training path for long context fine-tuning.
 
 use grim_tensor::{
-    DType, Shape, Tensor,
+    BackendDevice, DType, Shape, Tensor,
     error::{Error, Result},
 };
 use std::sync::Arc;
@@ -177,8 +177,117 @@ impl VarLenCollator {
             positions: positions_tensor,
             attention_mask: attention_tensor,
             labels: labels_tensor,
+            cu_seqlens: selected.iter().map(|(_, s)| s.len()).collect(),
         })
     }
+
+    /// Pack variable-length sequences into a single 1D concatenated sequence buffer
+    /// with block-diagonal attention mask (P2.1 & P2.2 varlen packing, zero cross-example leakage).
+    pub fn collate_1d_packed(&self, sequences: &[TokenSequence]) -> Result<Packed1DBatch> {
+        if sequences.is_empty() {
+            return Err(Error::Backend("No sequences to collate".into()));
+        }
+
+        let mut packed_tokens = Vec::new();
+        let mut packed_labels = Vec::new();
+        let mut packed_positions = Vec::new();
+        let mut cu_seqlens = vec![0usize];
+        let mut seq_lens = Vec::new();
+
+        let mut current_offset = 0usize;
+
+        for seq in sequences {
+            if packed_tokens.len() + seq.len() > self.max_seq_len {
+                break;
+            }
+            if seq_lens.len() >= self.max_seqs {
+                break;
+            }
+
+            let len = seq.len();
+            for i in 0..len {
+                packed_tokens.push(seq.tokens[i]);
+                packed_labels.push(seq.labels[i]);
+                packed_positions.push(i as f32);
+            }
+            current_offset += len;
+            cu_seqlens.push(current_offset);
+            seq_lens.push(len);
+        }
+
+        if packed_tokens.is_empty() {
+            return Err(Error::Backend("No sequences fit in 1D packed batch".into()));
+        }
+
+        let total_tokens = packed_tokens.len();
+        // Block diagonal causal mask: [total_tokens, total_tokens]
+        // mask[i, j] = 1.0 if token i and token j belong to same sequence AND j <= i, else 0.0
+        let mut block_diag_mask = vec![0.0f32; total_tokens * total_tokens];
+
+        let mut seq_start = 0;
+        for &len in &seq_lens {
+            let seq_end = seq_start + len;
+            for i in seq_start..seq_end {
+                for j in seq_start..=i {
+                    block_diag_mask[i * total_tokens + j] = 1.0;
+                }
+            }
+            seq_start = seq_end;
+        }
+
+        let shape_1d = Shape::new(vec![1, total_tokens]);
+        let mask_shape = Shape::new(vec![total_tokens, total_tokens]);
+
+        let dev = grim_backend_cpu::CpuDevice::new();
+        let input_tensor = Tensor::new(
+            Arc::from(dev.from_cpu(&packed_tokens, &shape_1d, DType::F32)?),
+            shape_1d.clone(),
+            DType::F32,
+            Default::default(),
+            grim_tensor::Device::Cpu,
+        );
+        let labels_tensor = Tensor::new(
+            Arc::from(dev.from_cpu(&packed_labels, &shape_1d, DType::F32)?),
+            shape_1d.clone(),
+            DType::F32,
+            Default::default(),
+            grim_tensor::Device::Cpu,
+        );
+        let positions_tensor = Tensor::new(
+            Arc::from(dev.from_cpu(&packed_positions, &shape_1d, DType::F32)?),
+            shape_1d,
+            DType::F32,
+            Default::default(),
+            grim_tensor::Device::Cpu,
+        );
+        let mask_tensor = Tensor::new(
+            Arc::from(dev.from_cpu(&block_diag_mask, &mask_shape, DType::F32)?),
+            mask_shape,
+            DType::F32,
+            Default::default(),
+            grim_tensor::Device::Cpu,
+        );
+
+        Ok(Packed1DBatch {
+            input_ids: input_tensor,
+            positions: positions_tensor,
+            attention_mask: mask_tensor,
+            labels: labels_tensor,
+            cu_seqlens,
+            total_tokens,
+        })
+    }
+}
+
+/// Packed 1D batch with block-diagonal attention mask for zero-padding SFT.
+#[derive(Debug, Clone)]
+pub struct Packed1DBatch {
+    pub input_ids: Tensor,
+    pub positions: Tensor,
+    pub attention_mask: Tensor,
+    pub labels: Tensor,
+    pub cu_seqlens: Vec<usize>,
+    pub total_tokens: usize,
 }
 
 /// Packed batch tensor bundle for varlen training.
@@ -188,6 +297,7 @@ pub struct PackedBatch {
     pub positions: Tensor,
     pub attention_mask: Tensor,
     pub labels: Tensor,
+    pub cu_seqlens: Vec<usize>,
 }
 
 impl PackedBatch {
@@ -217,5 +327,30 @@ mod tests {
         let batch = collator.collate(&sequences).unwrap();
         assert!(batch.num_sequences() <= 8);
         assert!(batch.max_seq_len() <= 64);
+    }
+
+    #[test]
+    fn test_varlen_collator_1d_block_diagonal() {
+        let collator = VarLenCollator::with_token_id(64, 8, 0);
+        let sequences = vec![
+            TokenSequence::new(vec![10, 20, 30]),
+            TokenSequence::new(vec![40, 50]),
+        ];
+        let packed = collator.collate_1d_packed(&sequences).unwrap();
+        assert_eq!(packed.total_tokens, 5);
+        assert_eq!(packed.cu_seqlens, vec![0, 3, 5]);
+
+        let mask = packed.attention_mask.to_vec_f32().unwrap();
+        // Token 0 can attend to 0 (seq 0)
+        assert_eq!(mask[0 * 5 + 0], 1.0);
+        // Token 3 (start of seq 1) CANNOT attend to token 0, 1, 2 (seq 0)
+        assert_eq!(mask[3 * 5 + 0], 0.0);
+        assert_eq!(mask[3 * 5 + 1], 0.0);
+        assert_eq!(mask[3 * 5 + 2], 0.0);
+        // Token 3 can attend to token 3
+        assert_eq!(mask[3 * 5 + 3], 1.0);
+        // Token 4 can attend to token 3 and 4
+        assert_eq!(mask[4 * 5 + 3], 1.0);
+        assert_eq!(mask[4 * 5 + 4], 1.0);
     }
 }

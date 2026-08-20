@@ -19,8 +19,17 @@ void grim_qkv_attention(
     int kv_seq_len,
     int cache_offset,   // absolute position of q[head, 0, *]
     float inv_sqrt_d,
-    int window_lo       // sliding-window lower bound: max(0, abs_i - window + 1).
+    int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
                         // Pass 0 for full causal attention (no window).
+    // WI-F2 — fused O-projection epilogue. When fuse_o != 0, `out` is
+    // [seq_len, o_dim] (host pre-zeroed) and the per-head normalized
+    // attention vector is multiplied by this head's slice of `o_proj_w`
+    // (row-major [num_heads*head_dim, o_dim]) and accumulated across heads
+    // with atomicAdd instead of being written per-head. Pass o_proj_w=null,
+    // o_dim=0, fuse_o=0 for the unfused per-head output path.
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o
 ) {
     // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
     // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts)
@@ -202,7 +211,13 @@ void grim_qkv_attention(
         m_final = m_new;
     }
 
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Reconstruct this lane's slice of the normalized attention vector.
+    float attn_reg[4];
+    #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
+        attn_reg[chunk] = 0.0f;
         int d = lane_id + chunk * wave_size;
         if (d < head_dim) {
             float acc_final = 0.0f;
@@ -211,8 +226,38 @@ void grim_qkv_attention(
                 if (w >= num_waves) break;
                 acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
             }
-            const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-            out[q_offset + d] = acc_final * inv_sum;
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its
+        // strided slice of the head_dim axis; per output column oc the lane
+        // partial is butterfly-reduced across the wavefront and lane 0
+        // atomically accumulates into the (host-zeroed) fused output row.
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
         }
     }
 

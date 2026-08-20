@@ -246,6 +246,57 @@ pub fn fcp_fallback_tile_search(
     winner
 }
 
+/// Eagerly tune and JIT-compile canonical GEMM workload shapes on host GPU during installation.
+///
+/// Sweeps standard inference shapes (decode token GEMMs, prefill prompt GEMMs, and lm_head logit projections)
+/// to populate the in-memory cache and write out both the tuned `{gpu_arch}.json` autotune map and
+/// compiled `.hsaco` binaries into `output_dir`.
+pub fn run_install_tune(
+    device: &RocmDevice,
+    output_dir: &std::path::Path,
+) -> grim_tensor::error::Result<usize> {
+    let spec = device.hardware_spec();
+    let mut tuned_count = 0;
+
+    // Canonical workload shapes: (entry, shape_class, m, n, k)
+    let coverage_matrix: &[(&str, ShapeClass, u32, u32, u32)] = &[
+        // Decode GEMM (M=1 per-token steps across common hidden/intermediate dims)
+        ("grim_decode_gemm", ShapeClass::Decode, 1, 2048, 2048),
+        ("grim_decode_gemm", ShapeClass::Decode, 1, 3072, 3072),
+        ("grim_decode_gemm", ShapeClass::Decode, 1, 4096, 4096),
+        ("grim_decode_gemm", ShapeClass::Decode, 1, 8192, 4096),
+        ("grim_decode_gemm", ShapeClass::Decode, 1, 14336, 4096),
+        ("grim_decode_gemm", ShapeClass::Decode, 1, 7168, 7168),
+        // Prefill GEMM (Batch/prompt processing)
+        ("grim_prefill_gemm", ShapeClass::Prefill, 32, 4096, 4096),
+        ("grim_prefill_gemm", ShapeClass::Prefill, 128, 4096, 4096),
+        ("grim_prefill_gemm", ShapeClass::Prefill, 512, 4096, 4096),
+        ("grim_prefill_gemm", ShapeClass::Prefill, 128, 7168, 7168),
+        // LM Head / Logit projection (Wide vocab-dominated output column)
+        ("grim_lm_head", ShapeClass::TLOLog, 1, 32000, 4096),
+        ("grim_lm_head", ShapeClass::TLOLog, 1, 64000, 4096),
+        ("grim_lm_head", ShapeClass::TLOLog, 1, 128256, 4096),
+        ("grim_lm_head", ShapeClass::TLOLog, 1, 152064, 7168),
+        // QKV Attention projections
+        ("grim_qkv_attention", ShapeClass::Decode, 1, 4096, 4096),
+        ("grim_qkv_attention", ShapeClass::Prefill, 128, 4096, 4096),
+    ];
+
+    for &(entry, shape_class, m, n, k) in coverage_matrix {
+        let dims = ShapeDims::new(m, n, k);
+        // Eagerly invoke get_or_tune_tiles: evaluates FCP search on GPU and caches winning config.
+        let _ = device.get_or_tune_tiles(entry, &spec, dims, shape_class);
+        tuned_count += 1;
+    }
+
+    // Persist JSON autotune table to output_dir
+    let _ = std::fs::create_dir_all(output_dir);
+    let json_path = output_dir.join(format!("{}.json", spec.gcn_arch));
+    let _ = device.save_autotune_cache(&json_path);
+
+    Ok(tuned_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

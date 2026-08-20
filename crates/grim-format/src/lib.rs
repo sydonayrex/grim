@@ -10,6 +10,7 @@ pub mod safetensors;
 pub mod spec;
 pub mod tokenizer;
 pub mod tprov;
+pub mod weight_format;
 /// WI-R6: training-state `.grim.train` sidecar (adapters, optimizer, error matrix).
 pub mod train;
 
@@ -18,12 +19,13 @@ pub use convert::{
 };
 pub use format::normals_packed_size;
 pub use format::{
-    FUCKING_SORCERY, GrimHeader, GrimTensorEntry, WaveSize, normals_packed_size_for_wave,
+    FUCKING_SORCERY, GrimFile, GrimHeader, GrimTensorEntry, WaveSize, normals_packed_size_for_wave,
     pack_row_bpw, pack_row_bpw_for_wave,
 };
 pub use gguf::{
     GGUF_MAGIC, GGUF_VERSION, GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp,
     GrimLayoutHint, GrimMetadata, GrimQuantOverride, GrimRocmlProfile, GrimTrainQuantMode,
+    ModelFootprint, estimate_vram_bytes, read_gguf,
 };
 pub use onnx::OnnxProvider;
 pub use spec::{BackupLayer, GrimTensorExt, LayoutHintTag, PayloadCompression};
@@ -35,3 +37,4 @@ pub use tokenizer::{
 pub use tprov::GgufProvider;
 pub use tprov::GrimProvider;
 pub use train::{TrainFpFormat, TrainState};
+pub use weight_format::{QuantModeHint, WeightFormat};

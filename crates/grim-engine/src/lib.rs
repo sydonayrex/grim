@@ -6,6 +6,8 @@ pub mod rope_scaling;
 /// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
 pub mod scythe2;
 pub mod streaming_forward;
+/// P2: packed-step training driver (varlen grouping + one optimizer step per group).
+pub mod train_packed;
 
 use std::collections::HashMap;
 use std::sync::Arc;

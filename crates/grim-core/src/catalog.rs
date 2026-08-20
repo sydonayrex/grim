@@ -48,6 +48,10 @@ pub struct ModelEntry {
     /// Registry that provided the file (`"ollama"`, `"huggingface"`, `"url"`).
     #[serde(default)]
     pub source: String,
+    /// Preferred arithmetic dtype tagged into the `.grim` metadata at train
+    /// time (`"f32"` / `"bf16"` / `"fp16"`); empty when unknown.
+    #[serde(default)]
+    pub preferred_dtype: String,
 }
 
 impl ModelEntry {
@@ -172,6 +176,23 @@ pub fn self_heal_sidecar(model_path: &Path) {
         if entry.arch.is_empty() || entry.context_length == 0 {
             apply_gguf_enrichment(&mut entry, model_path);
             let _ = entry.save(model_path);
+        }
+    }
+}
+
+/// Fill a `ModelEntry`'s `preferred_dtype` from a native `.grim` file's JSON
+/// metadata layer (P1 §8 tag written at train time). Header + metadata read
+/// only — payload bytes are never touched — so it is cheap on the catalog
+/// scan path. Non-`.grim` files or missing tags leave the entry untouched.
+pub fn apply_grim_tags(entry: &mut ModelEntry, model_path: &Path) {
+    if !entry.preferred_dtype.is_empty() || model_path.extension().map(|e| e != "grim").unwrap_or(true) {
+        return;
+    }
+    if let Ok(mut file) = std::fs::File::open(model_path) {
+        if let Ok(grim) = grim_format::format::GrimFile::read(&mut file) {
+            if let Some(dt) = grim.metadata.preferred_dtype {
+                entry.preferred_dtype = dt;
+            }
         }
     }
 }
@@ -491,10 +512,14 @@ pub fn list_local_models() -> Vec<ModelEntry> {
                     sha256: String::new(),
                     pulled_at: String::new(),
                     source: String::new(),
+                    preferred_dtype: String::new(),
                 };
                 // WI-3: best-effort header-derived arch/params/context_length
                 // for manually-placed files that have no pull sidecar.
                 apply_gguf_enrichment(&mut entry, &path);
+                // P1 §8: surface the train-time `preferred_dtype` tag for
+                // native `.grim` artifacts.
+                apply_grim_tags(&mut entry, &path);
                 out.push(entry);
             }
         }
@@ -699,6 +724,7 @@ mod tests {
             sha256: String::new(),
             pulled_at: String::new(),
             source: String::new(),
+            preferred_dtype: String::new(),
         };
         apply_gguf_enrichment(&mut entry, &tmp);
         assert_eq!(
@@ -741,6 +767,7 @@ mod tests {
             sha256: String::new(),
             pulled_at: String::new(),
             source: String::new(),
+            preferred_dtype: String::new(),
         };
         entry.save(&tmp).unwrap();
 
@@ -780,6 +807,7 @@ mod tests {
             sha256: String::new(),
             pulled_at: String::new(),
             source: String::new(),
+            preferred_dtype: String::new(),
         };
         entry.save(&tmp).unwrap();
 

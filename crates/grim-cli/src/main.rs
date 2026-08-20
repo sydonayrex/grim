@@ -24,6 +24,7 @@ pub mod start;
 pub mod stop;
 pub mod train;
 pub mod tui;
+pub mod tune;
 pub mod verify;
 
 pub use service::ServiceManager;
@@ -264,6 +265,15 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
     },
+    /// Run hardware-adaptive JIT kernel tuning and persist optimized tile configurations.
+    Tune {
+        /// GPU device ordinal to tune (default 0).
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+        /// Output directory for persisted .json and .hsaco caches.
+        #[arg(short, long)]
+        output_dir: Option<String>,
+    },
     /// Quantize a model.
     Quantize,
     /// Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
@@ -313,13 +323,20 @@ enum Commands {
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
-        /// Training mode (e.g. "qlora", "soul-eater").
+        /// Training mode (e.g. "qlora", "lora", "full-bf16", "full-fp16", "soul-eater").
         #[arg(long, default_value = "qlora")]
         mode: String,
         /// Enable SCALE-ECHO echo training mode. Bypasses the autograd tape
         /// and uses subspace echo state + FP4 updates instead.
         #[arg(long)]
         echo_mode: bool,
+        /// RNG seed for deterministic adapter init (0 = random).
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Master-parameter compute precision: f32, bf16, or fp16.
+        /// bf16/fp16 halve VRAM vs f32 on consumer RDNA (salamander.md P1).
+        #[arg(long, default_value = "f32")]
+        train_dtype: train::TrainDtype,
         /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
         /// lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit,
         /// lomo, adalomo, came, sophia).
@@ -408,6 +425,11 @@ enum Commands {
     /// Re-verify every claim Grim makes about itself (§13.5).
     /// Checks: unit on disk, OS service visibility, HTTP health, GPU backend,
     /// WASM grant enforcement, and ExecStart consistency.
+    ///
+    /// WI-2: `--model <path>` additionally runs a pre-flight model/hardware
+    /// compatibility check *before* the user attempts a load — predicts
+    /// fit (fits / tight / doesn't fit) and native/fallback/unsupported
+    /// verdicts from the existing `resolve_quant_mode` arch gate.
     Doctor {
         /// Address the server is expected to be reachable on.
         #[arg(long, default_value = "127.0.0.1:11434")]
@@ -421,6 +443,10 @@ enum Commands {
         /// Absolute path to grim.toml (used for ExecStart check).
         #[arg(long, default_value = "/etc/grim/grim.toml")]
         config_path: String,
+        /// WI-2: model file to pre-flight-check (.gguf or .grim). Header-only
+        /// parse — no tensor data is loaded.
+        #[arg(long)]
+        model: Option<std::path::PathBuf>,
     },
     /// ROCm-optimized GGUF conversion tool — calibrate, search, and convert.
     Oxidizer {
@@ -979,6 +1005,17 @@ async fn main() -> Result<()> {
             rocml_profile,
         } => {
             client::download_model(&model, output).await?;
+            // Auto-install architecture plugin if model reference is Hugging Face
+            if model.starts_with("hf:") || (model.contains('/') && !model.starts_with("http://") && !model.starts_with("https://")) {
+                let clean_ref = model.trim_start_matches("hf:");
+                let parts: Vec<&str> = clean_ref.split('/').collect();
+                if parts.len() >= 2 {
+                    let org_repo = format!("{}/{}", parts[0], parts[1]);
+                    if let Err(e) = arch_plugin::cmd_arch_plugin_generate(&org_repo, None).await {
+                        eprintln!("[grim] note: could not auto-generate arch plugin for {org_repo}: {e}");
+                    }
+                }
+            }
             // WI-S6: offer ROCm-tuned conversion after pull. Detection respects --rocml-profile or auto-detect.
             offer_rocml_conversion(&model, rocml_profile.as_deref());
         }
@@ -1037,6 +1074,12 @@ async fn main() -> Result<()> {
         } => {
             bench::cmd_bench(tokens, concurrency, model.as_deref()).await?;
         }
+        Commands::Tune { device, output_dir } => {
+            if let Err(e) = tune::cmd_tune(device, output_dir) {
+                eprintln!("[grim tune] Error during hardware kernel tuning: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Quantize => {
             // WI-5: the redirect previously named `grim oxidize`, which is not
             // a real subcommand — following it produced a clap "unrecognized
@@ -1073,6 +1116,8 @@ async fn main() -> Result<()> {
             use_olora,
             olora_lambda,
             echo_mode,
+            seed,
+            train_dtype,
         } => {
             let opts = train::TrainOptions {
                 model_path: model,
@@ -1097,6 +1142,8 @@ async fn main() -> Result<()> {
                 use_olora,
                 olora_lambda,
                 echo_mode,
+                seed,
+                train_dtype,
                 use_spectral_qlora: false,
             };
             if let Err(e) = train::cmd_train(opts) {
@@ -1257,13 +1304,20 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Doctor {
+Commands::Doctor {
             addr,
             service_name,
             exec_path,
             config_path,
+            model,
         } => {
-            let healthy = doctor::run_doctor(&addr, &service_name, &exec_path, &config_path);
+            let healthy = doctor::run_doctor(
+                &addr,
+                &service_name,
+                &exec_path,
+                &config_path,
+                model.as_deref(),
+            );
             match healthy {
                 Ok(ok) => {
                     if !ok {

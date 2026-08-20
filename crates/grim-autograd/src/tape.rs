@@ -9,6 +9,7 @@
 
 use crate::param::ParamId;
 use grim_tensor::Tensor;
+use grim_tensor::error::Result;
 use std::collections::HashMap;
 
 /// Identifier for a tensor in the tape's registry. Id-only (no reference)
@@ -30,6 +31,14 @@ pub enum TapeKind {
     LoRAApply,
     /// SwiGLU activation: `output = silu(gate) * up`. Arity is 2.
     SiluMul,
+    /// RMSNorm: `output = (x / rms) * weight`. Arity is 2.
+    RmsNorm,
+    /// RoPE: `output = rope(x, cos, sin)`. Arity is 3.
+    Rope,
+    /// Softmax: `output = softmax(x)`. Arity is 1.
+    Softmax,
+    /// Token embedding lookup: `output = embedding(ids, weight)`. Arity is 1.
+    Embedding,
 }
 
 /// A single recorded operation on the tape.
@@ -44,7 +53,7 @@ pub struct TapeEntry {
     pub inputs: Vec<TensorId>,
     /// Output tensor id.
     pub output: TensorId,
-    /// If this op touches a trainable LoRA parameter, its id (for
+    /// If this op touches a trainable parameter, its id (for
     /// `trainable_params.accumulate_grad`).
     pub param_id: Option<ParamId>,
     /// Operation-specific context.
@@ -76,6 +85,22 @@ pub enum TapeMetadata {
     },
     /// SwiGLU activation: `output = silu(gate) * up`.
     SiluMul,
+    /// RMSNorm with epsilon and optional parameter id.
+    RmsNorm {
+        eps: f32,
+        weight_param: Option<ParamId>,
+    },
+    /// RoPE rotation.
+    Rope,
+    /// Softmax.
+    Softmax,
+    /// Embedding with token ids and parameter id.
+    Embedding {
+        token_ids: Vec<u32>,
+        vocab_size: usize,
+        hidden_dim: usize,
+        weight_param: Option<ParamId>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -252,9 +277,103 @@ impl Tape {
         out_id
     }
 
+    /// Record an RMSNorm operation `output = (x / rms) * weight`.
+    pub fn record_rmsnorm(
+        &mut self,
+        x: TensorId,
+        weight: TensorId,
+        output: Tensor,
+        eps: f32,
+        weight_param: Option<ParamId>,
+    ) -> TensorId {
+        let out_id = self.register(output);
+        self.entries.push(TapeEntry {
+            kind: TapeKind::RmsNorm,
+            inputs: vec![x, weight],
+            output: out_id,
+            param_id: weight_param,
+            metadata: TapeMetadata::RmsNorm { eps, weight_param },
+        });
+        out_id
+    }
+
+    /// Record a RoPE rotation operation.
+    pub fn record_rope(
+        &mut self,
+        x: TensorId,
+        cos: TensorId,
+        sin: TensorId,
+        output: Tensor,
+    ) -> TensorId {
+        let out_id = self.register(output);
+        self.entries.push(TapeEntry {
+            kind: TapeKind::Rope,
+            inputs: vec![x, cos, sin],
+            output: out_id,
+            param_id: None,
+            metadata: TapeMetadata::Rope,
+        });
+        out_id
+    }
+
+    /// Record a Softmax operation along the last dimension.
+    pub fn record_softmax(&mut self, input: TensorId, output: Tensor) -> TensorId {
+        let out_id = self.register(output);
+        self.entries.push(TapeEntry {
+            kind: TapeKind::Softmax,
+            inputs: vec![input],
+            output: out_id,
+            param_id: None,
+            metadata: TapeMetadata::Softmax,
+        });
+        out_id
+    }
+
+    /// Record an Embedding lookup table forward pass.
+    pub fn record_embedding(
+        &mut self,
+        weight: TensorId,
+        output: Tensor,
+        token_ids: Vec<u32>,
+        vocab_size: usize,
+        hidden_dim: usize,
+        weight_param: Option<ParamId>,
+    ) -> TensorId {
+        let out_id = self.register(output);
+        self.entries.push(TapeEntry {
+            kind: TapeKind::Embedding,
+            inputs: vec![weight],
+            output: out_id,
+            param_id: weight_param,
+            metadata: TapeMetadata::Embedding {
+                token_ids,
+                vocab_size,
+                hidden_dim,
+                weight_param,
+            },
+        });
+        out_id
+    }
+
     /// Reverse-order iteration for backward pass.
     pub fn iter_rev(&self) -> impl Iterator<Item = &TapeEntry> {
         self.entries.iter().rev()
+    }
+
+    /// Drains the tape and executes the backward pass, directly dispatching
+    /// on-device fused optimizer step updates into `trainable_params` using `optimizer`.
+    ///
+    /// This eliminates host synchronization barriers and CPU-GPU roundtrips during training epochs.
+    pub fn drain_and_step(
+        &mut self,
+        loss_grad: Tensor,
+        loss_tensor_id: TensorId,
+        trainable_params: &mut crate::param::TrainableParams,
+        optimizer: &mut crate::adamw::Optimizer,
+    ) -> Result<HashMap<TensorId, Tensor>> {
+        let grads = crate::backward::backward_step(self, loss_grad, loss_tensor_id, trainable_params, optimizer)?;
+        self.clear();
+        Ok(grads)
     }
 }
 
@@ -326,6 +445,53 @@ mod tests {
         assert_eq!(e.param_id, Some(a_param));
         assert_eq!(tape.param_tensor(a_param), Some(a));
         assert_eq!(tape.param_tensor(b_param), Some(b));
+    }
+
+    #[test]
+    fn test_tape_drain_and_step_dispatches_optimizer() {
+        let mut tape = Tape::new();
+        let mut params = crate::param::TrainableParams::new();
+
+        let base = tape.register(cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2])));
+        let x = tape.register(cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])));
+
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+
+        let a_data = cpu_tensor(vec![0.5, 0.5], Shape::new(vec![1, 2]));
+        let b_data = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2, 1]));
+
+        let a_id = tape.register_param(pid_a, a_data.clone());
+        let b_id = tape.register_param(pid_b, b_data.clone());
+
+        params.insert(crate::param::TrainableParam::new(pid_a, a_data).unwrap());
+        params.insert(crate::param::TrainableParam::new(pid_b, b_data).unwrap());
+
+        let out = tape.record_lora_apply(
+            base,
+            x,
+            a_id,
+            b_id,
+            cpu_tensor(vec![2.0, 3.0], Shape::new(vec![1, 2])),
+            1.0,
+            1,
+            pid_a,
+            pid_b,
+        );
+
+        let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
+        let mut optimizer = crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
+
+        assert_eq!(tape.len(), 1);
+        let initial_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+
+        let grads = tape.drain_and_step(loss_grad, out, &mut params, &mut optimizer).unwrap();
+
+        // Check grads returned, tape cleared, and params updated by optimizer step
+        assert!(grads.contains_key(&base));
+        assert!(tape.is_empty());
+        let stepped_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+        assert_ne!(initial_a, stepped_a);
     }
 
     // Helper for the test above

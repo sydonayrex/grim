@@ -58,7 +58,7 @@ pub mod trace;
 
 /// SCYTHE-2 WI-2: capability profiler re-export.
 pub use device::capability_profiler::{
-    CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, current_epoch, vram_info,
+    CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch, vram_info,
 };
 
 // ----- Crate-root re-exports ------------------------------------
@@ -151,12 +151,26 @@ pub use crate::rccl::RcclAllReduce;
 
 pub use fusion::{
     KvQuantFormat, DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, KvDequantAttentionConfig,
-    QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, SplitKGemmConfig, WmmaGemmConfig, hipDim3,
+    QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, SplitKGemmConfig, WmmaGemmConfig, concat_qkv_weights, hipDim3,
 };
 
 pub use kernels::qkv_attention::{BlockTableEntry, launch_paged_attention, launch_tree_attention};
+pub use kernels::tile_picker::run_install_tune;
 
 pub use quantization::QuantMode;
+
+/// WI-2: arch-gate helpers re-exported so callers outside
+/// `grim-backend-rocm` (e.g. `grim-cli::doctor`) can classify a
+/// `WeightFormat` against detected hardware without reimplementing the
+/// capability table. Prerequisite change per the WI-2 plan: these were
+/// `pub` in their module but invisible at the crate boundary.
+pub use quantization::{arch_capability, gcn_arch, resolve_quant_mode};
+
+/// WI-2: coarse-grained arch bin, re-exported so callers outside
+/// `grim-backend-rocm` (e.g. `grim-cli::doctor`) can classify a model
+/// against detected hardware without reaching into the `quantization`
+/// module.
+pub use quantization::GcnArch;
 
 #[cfg(test)]
 mod lib_internal_tests;

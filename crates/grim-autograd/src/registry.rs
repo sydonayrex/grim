@@ -6,7 +6,7 @@ use crate::AutogradScope;
 use crate::injection::{InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry};
 use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{Shape, error::Result};
+use grim_tensor::{BackendDevice, Shape, error::Result};
 
 /// Base weights keyed by `(layer_idx, injection_point)`, in
 /// `[out_features * in_features]` row-major order. Supplied by the
@@ -20,6 +20,9 @@ pub struct AutogradRegistry {
     pub injection_registry: LoRAInjectionRegistry,
     pub params: TrainableParams,
     pub scope: AutogradScope,
+    /// RNG seed used for non-PiSSA/non-Spectral Kaiming LoRA init
+    /// (salamander.md P0.2). 0 = legacy flat-index init (pre-seed behavior).
+    pub seed: u64,
 }
 
 impl AutogradRegistry {
@@ -43,6 +46,32 @@ impl AutogradRegistry {
         Self::with_scope_and_base_weights(model_config, injection_registry, scope, None)
     }
 
+    /// Seeded constructor (salamander.md P0.2). `seed != 0` makes non-PiSSA /
+    /// non-Spectral Kaiming LoRA init reproducible across runs.
+    pub fn with_seed(
+        model_config: InjectionConfig,
+        injection_registry: LoRAInjectionRegistry,
+        scope: AutogradScope,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::with_scope_base_weights_seed_dtype(
+            model_config, injection_registry, scope, None, seed, grim_tensor::DType::F32,
+        )
+    }
+
+    /// Seeded and precision-aware constructor (salamander.md P0.2 & P1.1).
+    pub fn with_seed_and_dtype(
+        model_config: InjectionConfig,
+        injection_registry: LoRAInjectionRegistry,
+        scope: AutogradScope,
+        seed: u64,
+        dtype: grim_tensor::DType,
+    ) -> Result<Self> {
+        Self::with_scope_base_weights_seed_dtype(
+            model_config, injection_registry, scope, None, seed, dtype,
+        )
+    }
+
     /// Create a new `AutogradRegistry` with an explicit scope and optional
     /// base weights.
     ///
@@ -57,6 +86,19 @@ impl AutogradRegistry {
         scope: AutogradScope,
         base_weights: Option<&BaseWeightMap>,
     ) -> Result<Self> {
+        Self::with_scope_base_weights_seed_dtype(
+            model_config, injection_registry, scope, base_weights, 0, grim_tensor::DType::F32,
+        )
+    }
+
+    fn with_scope_base_weights_seed_dtype(
+        model_config: InjectionConfig,
+        injection_registry: LoRAInjectionRegistry,
+        scope: AutogradScope,
+        base_weights: Option<&BaseWeightMap>,
+        seed: u64,
+        dtype: grim_tensor::DType,
+    ) -> Result<Self> {
         let mut params = TrainableParams::new();
 
         for config in injection_registry.enabled() {
@@ -68,8 +110,26 @@ impl AutogradRegistry {
                 .lora_b_shape(&model_config, config.rank);
 
             let stddev = (1.0 / a_cols as f32).sqrt();
+            // When a user seed is set (salamander.md P0.2), mix it into the
+            // Kaiming pseudo-random value per flat index so init is
+            // reproducible and differs across seeds. Seed 0 preserves the
+            // legacy flat-index behavior (`i % 17`) bit-for-bit.
+            let mut seed_state = seed
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add((config.layer_idx as u64).wrapping_mul(0x100000001B3))
+                .wrapping_add((config.injection_point as u64).wrapping_mul(0xC2B2AE3D27D4EB4F));
             let default_a: Vec<f32> = (0..(a_rows * a_cols))
-                .map(|i| (((i % 17) as f32 / 17.0) - 0.5) * stddev)
+                .map(|i| {
+                    if seed == 0 {
+                        (((i % 17) as f32 / 17.0) - 0.5) * stddev
+                    } else {
+                        // xorshift64 step per element for a reproducible stream.
+                        seed_state ^= seed_state << 13;
+                        seed_state ^= seed_state >> 7;
+                        seed_state ^= seed_state << 17;
+                        ((seed_state >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * stddev
+                    }
+                })
                 .collect();
             let zero_b: Vec<f32> = vec![0.0f32; b_rows * b_cols];
 
@@ -182,8 +242,26 @@ impl AutogradRegistry {
                 (a_data, b_data)
             };
 
-            let a_tensor = cpu_tensor(a_data, Shape::new(vec![a_rows, a_cols]));
-            let b_tensor = cpu_tensor(b_data, Shape::new(vec![b_rows, b_cols]));
+            let dev = grim_backend_cpu::CpuDevice::new();
+            let a_storage =
+                dev.from_cpu(&a_data, &Shape::new(vec![a_rows, a_cols]), dtype.clone())?;
+            let b_storage =
+                dev.from_cpu(&b_data, &Shape::new(vec![b_rows, b_cols]), dtype.clone())?;
+
+            let a_tensor = grim_tensor::Tensor::new(
+                std::sync::Arc::from(a_storage),
+                Shape::new(vec![a_rows, a_cols]),
+                dtype.clone(),
+                Default::default(),
+                grim_tensor::Device::Cpu,
+            );
+            let b_tensor = grim_tensor::Tensor::new(
+                std::sync::Arc::from(b_storage),
+                Shape::new(vec![b_rows, b_cols]),
+                dtype.clone(),
+                Default::default(),
+                grim_tensor::Device::Cpu,
+            );
 
             let param_a = TrainableParam::new(config.param_id_a(), a_tensor)?;
             let param_b = TrainableParam::new(config.param_id_b(), b_tensor)?;
@@ -215,6 +293,7 @@ impl AutogradRegistry {
             injection_registry,
             params,
             scope,
+            seed,
         })
     }
 
@@ -381,5 +460,59 @@ mod tests {
             !ic.use_spectral_qlora,
             "spectral_qlora should default to false"
         );
+    }
+
+    #[test]
+    fn seeded_init_is_reproducible_across_runs() {
+        // Same seed -> identical A/B init; different seed -> different init
+        // (salamander.md P0.2). This is the property that makes `--seed`
+        // a reproducibility lever.
+        let cfg = cfg();
+        let make = |seed: u64| {
+            let mut inj = LoRAInjectionRegistry::new();
+            inj.add(LoRAInjectionConfig::new(LoRAInjectionPoint::QProj, 0, 1, 4, 16.0));
+            let reg = AutogradRegistry::with_seed(cfg.clone(), inj, AutogradScope::default(), seed).unwrap();
+            reg.params
+                .get(ParamId::a(0, 1, LoRAInjectionPoint::QProj))
+                .unwrap()
+                .data
+                .to_vec_f32()
+                .unwrap()
+        };
+
+        let s1 = make(1);
+        let s1_again = make(1);
+        let s2 = make(2);
+
+        assert_eq!(s1, s1_again, "same seed must reproduce identical init");
+        assert_ne!(s1, s2, "different seeds must produce different init");
+    }
+
+    #[test]
+    fn zero_seed_preserves_legacy_init() {
+        // seed=0 stays on the legacy `(i % 17)` formula so existing runs
+        // don't change when no --seed is passed.
+        let cfg = cfg();
+        let mut inj = LoRAInjectionRegistry::new();
+        inj.add(LoRAInjectionConfig::new(LoRAInjectionPoint::QProj, 0, 1, 4, 16.0));
+
+        let legacy = AutogradRegistry::new(cfg.clone(), inj.clone()).unwrap();
+        let seeded0 = AutogradRegistry::with_seed(cfg, inj, AutogradScope::default(), 0).unwrap();
+
+        let a_legacy = legacy
+            .params
+            .get(ParamId::a(0, 1, LoRAInjectionPoint::QProj))
+            .unwrap()
+            .data
+            .to_vec_f32()
+            .unwrap();
+        let a_seeded0 = seeded0
+            .params
+            .get(ParamId::a(0, 1, LoRAInjectionPoint::QProj))
+            .unwrap()
+            .data
+            .to_vec_f32()
+            .unwrap();
+        assert_eq!(a_legacy, a_seeded0, "seed=0 must match legacy init bit-for-bit");
     }
 }

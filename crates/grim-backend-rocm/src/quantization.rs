@@ -69,6 +69,21 @@ pub fn gcn_arch(name: &str) -> GcnArch {
     GcnArch::Other
 }
 
+impl std::fmt::Display for GcnArch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            GcnArch::RDNA1 => "RDNA1",
+            GcnArch::RDNA2 => "RDNA2",
+            GcnArch::RDNA3 => "RDNA3",
+            GcnArch::RDNA4 => "RDNA4",
+            GcnArch::CDNA2 => "CDNA2",
+            GcnArch::CDNA3 => "CDNA3",
+            GcnArch::Other => "Other",
+        };
+        f.write_str(s)
+    }
+}
+
 fn strip_prefix_digits<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     if s.len() >= prefix.len() && &s[..prefix.len()] == prefix {
         Some(&s[prefix.len()..])

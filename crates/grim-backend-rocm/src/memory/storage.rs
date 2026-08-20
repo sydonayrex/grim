@@ -67,6 +67,7 @@ impl RocmStorage {
         ordinal: usize,
     ) -> Result<Self> {
         if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
+            crate::memory::budget::note_managed_fallback(ordinal, bytes);
             let mut ptr = std::ptr::null_mut();
             check_hip("hipMallocManaged", unsafe {
                 hipMallocManaged(&mut ptr, bytes, 1)
@@ -87,6 +88,7 @@ impl RocmStorage {
             Err(vram_error) => {
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
+                    crate::memory::budget::note_managed_fallback(ordinal, bytes);
                     return Ok(RocmStorage {
                         device_ptr: Some(ptr as u64),
                         bytes,

@@ -78,11 +78,12 @@ pub use soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
 pub use turbo_finetune::{TrainingMode, TurboFinetuneConfig, TurboFinetuneScheduler};
 
 pub use adamw::{
-    Adafactor, AdafactorConfig, AdamW, AdamWConfig, LRScheduler, Lion8Bit, Lion8BitConfig, Muon,
-    MuonConfig, Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig,
+    Adafactor, AdafactorConfig, AdamW, AdamWConfig, LRScheduler, Lion8Bit, Lion8BitConfig,
+    LionVote, LionVoteConfig, MAdam, MAdamConfig, Muon, MuonConfig, Optimizer, OptimizerKind,
+    PagedAdamW, PagedAdamWConfig,
 };
-pub use backward::{BackwardContext, backward};
-pub use collate::{PackedBatch, TokenSequence, VarLenCollator};
+pub use backward::{BackwardContext, backward, backward_step};
+pub use collate::{Packed1DBatch, PackedBatch, TokenSequence, VarLenCollator};
 pub use injection::{
     InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
     loftq_initialize, pissa_initialize,
@@ -144,6 +145,9 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
         _ => Box::new(grim_backend_cpu::CpuDevice::new()),
     }
 }
+
+#[cfg(test)]
+mod toy_overfit;
 
 #[cfg(test)]
 mod tests {

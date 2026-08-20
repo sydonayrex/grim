@@ -30,6 +30,7 @@ members = [
     "crates/grim-disagg",
     "crates/grim-autograd",
     "crates/grim-garage",
+    "crates/grim-constrain",
 ]
 
 [workspace.package]
@@ -81,8 +82,10 @@ grim-speculative   = { path = "crates/grim-speculative" }
 grim-kvquant       = { path = "crates/grim-kvquant" }
 grim-plugin        = { path = "crates/grim-plugin" }
 grim-kvtransport   = { path = "crates/grim-kvtransport" }
-grim-disagg        = { path = "crates/grim-disagg" }
-grim-autograd      = { path = "crates/grim-autograd" }
+    grim-disagg        = { path = "crates/grim-disagg" }
+    grim-autograd      = { path = "crates/grim-autograd" }
+    grim-garage        = { path = "crates/grim-garage" }
+    grim-constrain     = { path = "crates/grim-constrain" }
 
 # External (only commonly-needed / safe defaults; backends add their own)
 thiserror = "1"

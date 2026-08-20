@@ -3258,7 +3258,6 @@ impl BackendDevice for CudaDevice {
                     // Simplified: k * n bytes (used in tests/legacy path)
                     let b_bytes = b_storage.bytes();
                     let real_packed_size = n * blocks_per_col * 34;
-                    let b_ptr_at_zero = b_ptr as *const u8; // for adjusted pointer in kernel
 
                     let (scales_device_ptr, b_data_offset) = if b_bytes == real_packed_size {
                         // Real packed: extract f16 scales from headers.
@@ -5480,4 +5479,13 @@ pub fn vram_info(ordinal: usize) -> Option<(u64, u64)> {
         }
     }
     Some((free as u64, total as u64))
+}
+
+/// WI-1: live compute utilization for `ordinal`.
+///
+/// Scope note (per WI-1): `grim-backend-cuda` does not link NVML, and adding
+/// NVML is out of scope for this WI. Returns `None` rather than fabricating a
+/// value from indirect signals — `null` on the wire is the honest answer.
+pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
+    None
 }

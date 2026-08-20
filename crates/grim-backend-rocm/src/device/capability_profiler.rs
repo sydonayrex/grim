@@ -9,6 +9,8 @@ use grim_tensor::backend::{GpuCapability, ScytheLink};
 use crate::device::probe::probe_host_gpu;
 use crate::peer_access::{P2PStatus, enumerate_devices, peer_status};
 
+use libloading::Symbol;
+
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────
 
 /// HIP device attribute: active clock throttle reasons. [see: `hipDeviceAttributeCurrentThermalThrottlePercent`]
@@ -250,6 +252,65 @@ pub fn vram_info(ordinal: usize) -> (u64, u64) {
     (free as u64, total as u64)
 }
 
+// ── ROCm SMI (rsmi) dynamic load — compute utilization ──────────────────────
+
+/// WI-1: live GPU compute/busy utilization [0, 100] for `ordinal`.
+///
+/// ROCm exposes no utilization query through the HIP runtime API, so this
+/// goes through `librocm_smi64.so` (`rsmi_dev_busy_percent_get`), the same
+/// source `rocm-smi --showuse` reads. The library is dynamically loaded — no
+/// link-time dependency, and `None` is returned cleanly when rsmi is absent
+/// rather than fabricating a value from indirect signals.
+///
+/// The handle is cached process-wide behind a `OnceLock` so the stats
+/// endpoint never re-dlopens or re-initializes rsmi per request (WI-1 gate 4:
+/// the query must not block the endpoint for more than ~5ms).
+pub fn compute_utilization(ordinal: usize) -> Option<u32> {
+    let lib = RsmiLib::load()?;
+    let mut busy: u32 = 0;
+    // SAFETY: `busy` is a local with stable address; `rsmi_dev_busy_percent_get`
+    // writes one u32. rsmi is initialized once at load time (see `RsmiLib`).
+    let status = unsafe {
+        let f: Symbol<'_, RsmiBusyFn> = lib.handle().get(b"rsmi_dev_busy_percent_get").ok()?;
+        f(ordinal as u32, &mut busy)
+    };
+    if status == RSMI_STATUS_SUCCESS && busy <= 100 {
+        Some(busy)
+    } else {
+        None
+    }
+}
+
+type RsmiBusyFn = unsafe extern "C" fn(u32, *mut u32) -> u32;
+const RSMI_STATUS_SUCCESS: u32 = 0;
+
+/// Process-wide dlopen handle for `librocm_smi64.so`, initialized lazily.
+struct RsmiLib {
+    lib: libloading::Library,
+}
+
+impl RsmiLib {
+    fn load() -> Option<&'static Self> {
+        use std::sync::OnceLock;
+        static HANDLE: OnceLock<Option<RsmiLib>> = OnceLock::new();
+        let opt = HANDLE.get_or_init(|| {
+            let lib = unsafe { libloading::Library::new("librocm_smi64.so") }
+                .or_else(|_| unsafe { libloading::Library::new("librocm_smi64.so.1") })
+                .ok()?;
+            // rsmi must be initialized before any dev_* call.
+            let init: Symbol<'_, RsmiInitFn> = unsafe { lib.get(b"rsmi_init").ok()? };
+            let _ = unsafe { init(0) };
+            Some(RsmiLib { lib })
+        });
+        opt.as_ref()
+    }
+fn handle(&self) -> &libloading::Library {
+        &self.lib
+    }
+}
+
+type RsmiInitFn = unsafe extern "C" fn(u64) -> u32;
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -311,5 +372,28 @@ mod tests {
     fn test_tick_gpu_less() {
         let profiler = CapabilityProfiler::new();
         profiler.tick(); // Must not panic.
+    }
+
+    /// WI-1: `compute_utilization` must never fabricate a value. On a box
+    /// without rsmi (or with no devices) it returns `None`; on a real ROCm
+    /// device it returns `Some(0..=100)`. Never returns a value outside the
+    /// valid range — that would be the lying-zero problem this WI exists to
+    /// fix, just in the opposite direction.
+    #[test]
+    fn test_compute_utilization_range_or_none() {
+        let n = enumerate_devices().unwrap_or(0);
+        if n == 0 {
+            assert!(compute_utilization(0).is_none());
+            return;
+        }
+        for ord in 0..n {
+            match compute_utilization(ord) {
+                Some(pct) => assert!(
+                    pct <= 100,
+                    "compute_utilization({ord}) returned {pct}, expected 0..=100"
+                ),
+                None => {} // rsmi absent on this device — honest absence.
+            }
+        }
     }
 }
