@@ -528,9 +528,14 @@ unsafe impl Sync for VulkanContext {}
 
 impl VulkanContext {
     fn init() -> Result<Self> {
-        // Do NOT enable the Primus/Bumblebee layer; it requires an X display and
-        // breaks headless/GPU-direct hosts. The loader resolves the native
-        // ICD without it.
+        // Do NOT enable third-party layers (e.g. Steam overlay, MangoHud, Bumblebee);
+        // they hang headless environments. Disable implicit layers unless user specified otherwise.
+        if std::env::var("VK_LOADER_LAYERS_DISABLE").is_err() {
+            unsafe {
+                std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~all~");
+            }
+        }
+
         let instance_ci = VkInstanceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -565,36 +570,58 @@ impl VulkanContext {
         let mut gpus = vec![std::ptr::null_mut(); gpu_count as usize];
         let res =
             unsafe { vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr()) };
-        if res != VK_SUCCESS || gpus.is_empty() || gpus[0].is_null() {
+        if res != VK_SUCCESS || gpus.is_empty() || gpus.iter().all(|&p| p.is_null()) {
             unsafe {
                 vkDestroyInstance(instance, std::ptr::null());
             }
             return Err(Error::Backend(format!(
-                "vkEnumeratePhysicalDevices failed or returned null device with status {}",
+                "vkEnumeratePhysicalDevices failed with status {}",
                 res
             )));
         }
-        let physical_device = gpus[0];
 
-        // Reject software rasterizers (lavapipe/swiftshader/llvmpipe) — never
-        // report a CPU tier as a live GPU (§3).
-        let mut props = VkPhysicalDeviceProperties {
-            api_version: 0,
-            driver_version: 0,
-            vendor_id: 0,
-            device_id: 0,
-            device_type: 0,
-            device_name: [0u8; 256],
-        };
-        unsafe { vkGetPhysicalDeviceProperties(physical_device, &mut props) };
-        if props.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
-            unsafe {
-                vkDestroyInstance(instance, std::ptr::null());
+        // Iterate devices and choose best GPU (prefer discrete GPU over integrated GPU; reject CPU).
+        let mut chosen_dev = None;
+        let mut chosen_props = None;
+
+        for &dev in &gpus {
+            if dev.is_null() {
+                continue;
             }
-            return Err(Error::Backend(
-                "Vulkan physical device is a software rasterizer (CPU); refusing to use it as a GPU tier".into(),
-            ));
+            let mut props = VkPhysicalDeviceProperties {
+                api_version: 0,
+                driver_version: 0,
+                vendor_id: 0,
+                device_id: 0,
+                device_type: 0,
+                device_name: [0u8; 256],
+            };
+            unsafe { vkGetPhysicalDeviceProperties(dev, &mut props) };
+            if props.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
+                continue;
+            }
+            if props.device_type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
+                chosen_dev = Some(dev);
+                chosen_props = Some(props);
+                break;
+            }
+            if chosen_dev.is_none() {
+                chosen_dev = Some(dev);
+                chosen_props = Some(props);
+            }
         }
+
+        let (physical_device, props) = match (chosen_dev, chosen_props) {
+            (Some(d), Some(p)) => (d, p),
+            _ => {
+                unsafe {
+                    vkDestroyInstance(instance, std::ptr::null());
+                }
+                return Err(Error::Backend(
+                    "No valid non-CPU Vulkan GPU device found".into(),
+                ));
+            }
+        };
 
         // Find compute queue family index
         let mut qfam_count: u32 = 0;
@@ -1035,14 +1062,11 @@ impl VulkanStorage {
             };
             Ok(bytes)
         } else {
-            // A staging copy needs a command pool + compute queue, which this
-            // storage does not own (only `device`/`memory`/`buffer`). Callers
-            // that need readback must allocate with `alloc_gpu` (host-visible).
-            Err(Error::Backend(
-                "read_raw_bytes: buffer is DEVICE_LOCAL and not host-mappable; \
-                 allocate with alloc_gpu for readable buffers"
-                    .into(),
-            ))
+            // Device-local buffers are not host-mappable: route through a
+            // staging buffer copy on the compute queue. `read_back_via_staging`
+            // acquires the global context itself, so callers must not hold the
+            // context lock (BackendStorage trait methods never do).
+            read_back_via_staging(self)
         }
     }
 }
@@ -1430,8 +1454,8 @@ impl VulkanDevice {
 
     /// Probes the system for available Vulkan GPUs.
     pub fn probe() -> Result<Vec<VulkanDevice>> {
-        let ctx = global_context();
-        if ctx.is_some() {
+        let has_ctx = global_context().is_some();
+        if has_ctx {
             Ok(vec![VulkanDevice::new()])
         } else {
             Ok(vec![])
