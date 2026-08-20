@@ -18,7 +18,7 @@
 /// `depth_*` are the open-brace / open-bracket stacks; a value is valid
 /// only when both return to 0, the FSM is not mid-string, and at least one
 /// value token has been emitted (an empty stream is not valid JSON).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JsonModeState {
     /// Inside a `"..."` string literal.
     pub in_string: bool,

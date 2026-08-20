@@ -5,13 +5,14 @@ use std::io::BufReader;
 
 #[test]
 fn scan_q4k_model_dtypes() {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .find(|p| p.join("models").is_dir())
-        .expect("repo root with models/")
-        .to_path_buf();
     let path = "/drive/bigfast/grim/models/Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf";
-    let file = File::open(path).expect("failed to open GGUF");
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("skip: model file {path} not present");
+            return;
+        }
+    };
     let mut reader = BufReader::new(file);
     let file = read_gguf(&mut reader).expect("failed to parse GGUF");
     println!("Metadata:");

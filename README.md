@@ -57,6 +57,7 @@ cargo test --workspace
 | [`grim-disagg`](crates/grim-disagg/README.md) | Disaggregated serving split for separate prefill and decode execution clusters. |
 | [`grim-autograd`](crates/grim-autograd/README.md) | Reverse-mode automatic differentiation engine for parameter-efficient fine-tuning. |
 | [`grim-garage`](crates/grim-garage/README.md) | Embedded web dashboard backend for monitoring training and engine status. |
+| [`grim-constrain`](crates/grim-constrain/README.md) | Grammar-based and schema-constrained token masking and sampling for JSON and structured generation. |
 
 ## Top-Level Directories
 

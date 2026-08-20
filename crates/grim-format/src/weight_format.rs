@@ -135,3 +135,149 @@ impl std::fmt::Display for ParseWeightFormatError {
 }
 
 impl std::error::Error for ParseWeightFormatError {}
+
+/// Summary descriptor of a model's memory footprint and architecture.
+#[derive(Debug, Clone)]
+pub struct ModelFootprint {
+    pub architecture: String,
+    pub param_count: Option<u64>,
+    pub quant_format: Option<WeightFormat>,
+    pub estimated_weight_bytes: u64,
+    pub context_length_default: Option<u32>,
+    pub is_moe: bool,
+}
+
+impl ModelFootprint {
+    pub fn from_gguf_file(gguf: &crate::gguf::GgufFile) -> Self {
+        let arch = gguf
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let context_length_default = gguf
+            .metadata
+            .get(&format!("{arch}.context_length"))
+            .or_else(|| gguf.metadata.get("context_length"))
+            .and_then(|v| v.as_u32());
+
+        let mut param_count: u64 = 0;
+        let mut estimated_weight_bytes: u64 = 0;
+        let mut is_moe = arch.to_lowercase().contains("moe");
+
+        for t in &gguf.tensors {
+            param_count += t.elem_count() as u64;
+            estimated_weight_bytes += t.size_bytes;
+            if t.name.contains("expert") || t.name.contains("block_sparse") {
+                is_moe = true;
+            }
+        }
+
+        let quant_format = gguf
+            .metadata
+            .get("general.target_weight_format")
+            .or_else(|| gguf.metadata.get("target_weight_format"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<WeightFormat>().ok())
+            .or_else(|| {
+                gguf.tensors.first().and_then(|t| match t.dtype {
+                    crate::gguf::GgufDType::BF16 => Some(WeightFormat::Bf16),
+                    crate::gguf::GgufDType::Q4K | crate::gguf::GgufDType::Q4_0 => {
+                        Some(WeightFormat::Crow)
+                    }
+                    crate::gguf::GgufDType::MXFP4 => Some(WeightFormat::Rook),
+                    _ => None,
+                })
+            });
+
+        Self {
+            architecture: arch,
+            param_count: if param_count > 0 {
+                Some(param_count)
+            } else {
+                None
+            },
+            quant_format,
+            estimated_weight_bytes,
+            context_length_default,
+            is_moe,
+        }
+    }
+
+    pub fn from_grim_file(grim: &crate::format::GrimFile) -> Self {
+        let mut arch = grim
+            .metadata
+            .target_gcn
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut ctx = None;
+
+        if let Some(ref gguf_meta) = grim.metadata.gguf_metadata {
+            if let Some(a) = gguf_meta.get("general.architecture").and_then(|v| v.as_str()) {
+                arch = a.to_string();
+            }
+            ctx = gguf_meta
+                .get(&format!("{arch}.context_length"))
+                .or_else(|| gguf_meta.get("context_length"))
+                .and_then(|v| v.as_u32());
+        }
+
+        let mut param_count: u64 = 0;
+        let mut estimated_weight_bytes: u64 = 0;
+        let mut is_moe = arch.to_lowercase().contains("moe");
+
+        for t in &grim.tensors {
+            let elems: u64 = t.shape.iter().map(|&d| d as u64).product();
+            param_count += elems;
+            estimated_weight_bytes +=
+                t.payload_size + (t.outlier_count as u64 * 6) + t.kv_compressed_size;
+            if t.name.contains("expert") || t.name.contains("block_sparse") {
+                is_moe = true;
+            }
+        }
+
+        let quant_format = grim
+            .metadata
+            .target_weight_format
+            .as_deref()
+            .and_then(|s| s.parse::<WeightFormat>().ok());
+
+        Self {
+            architecture: arch,
+            param_count: if param_count > 0 {
+                Some(param_count)
+            } else {
+                None
+            },
+            quant_format,
+            estimated_weight_bytes,
+            context_length_default: ctx,
+            is_moe,
+        }
+    }
+}
+
+/// Conservative estimation of VRAM bytes needed for loading and running a model.
+///
+/// Formula: weight bytes + KV cache estimate + 10% overhead heuristic.
+pub fn estimate_vram_bytes(
+    footprint: &ModelFootprint,
+    context_length: u32,
+    batch_size: u32,
+    kv_layers: u32,
+    kv_heads: u32,
+    head_dim: u32,
+) -> u64 {
+    // 2 bytes per element (BF16/FP16) * 2 (key + value)
+    let kv_bytes = 2u64
+        * 2
+        * (kv_layers as u64)
+        * (kv_heads as u64)
+        * (head_dim as u64)
+        * (context_length as u64)
+        * (batch_size as u64);
+    let base = footprint.estimated_weight_bytes.saturating_add(kv_bytes);
+    let overhead = (base as f64 * 0.10) as u64;
+    base.saturating_add(overhead)
+}

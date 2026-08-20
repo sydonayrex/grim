@@ -25,7 +25,7 @@ pub use format::{
 pub use gguf::{
     GGUF_MAGIC, GGUF_VERSION, GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp,
     GrimLayoutHint, GrimMetadata, GrimQuantOverride, GrimRocmlProfile, GrimTrainQuantMode,
-    ModelFootprint, estimate_vram_bytes, read_gguf,
+    read_gguf,
 };
 pub use onnx::OnnxProvider;
 pub use spec::{BackupLayer, GrimTensorExt, LayoutHintTag, PayloadCompression};
@@ -37,4 +37,6 @@ pub use tokenizer::{
 pub use tprov::GgufProvider;
 pub use tprov::GrimProvider;
 pub use train::{TrainFpFormat, TrainState};
-pub use weight_format::{QuantModeHint, WeightFormat};
+pub use weight_format::{
+    ModelFootprint, ParseWeightFormatError, QuantModeHint, WeightFormat, estimate_vram_bytes,
+};

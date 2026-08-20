@@ -233,14 +233,14 @@ mod tests {
             ",".to_string(),
             "}".to_string(),
         ]);
-        let cs = constrained_json_object(inner).with_vocab(vocab);
+        let cs = constrained_json_object(inner).with_vocab(vocab.clone());
 
         // Validate that the FSM starts at Root by checking the first mask
         // allows `{` but not `}`.
         let fsm = cs.fsm.lock().unwrap();
         let mask = fsm.valid_tokens(&vocab);
-        assert!(mask[0], "token `{` should be valid at root");
-        assert!(!mask[5], "token `}` should be invalid at root");
+        assert!(mask[0], "token `{{` should be valid at root");
+        assert!(!mask[5], "token `}}` should be invalid at root");
         drop(fsm);
 
         // Simulate sampling token 0 (`{`), feed it.
@@ -248,7 +248,7 @@ mod tests {
         // Now `}` (token 5) should be valid.
         let fsm = cs.fsm.lock().unwrap();
         let mask = fsm.valid_tokens(&vocab);
-        assert!(mask[5], "token `}` should be valid after `{`");
+        assert!(mask[5], "token `}}` should be valid after `{{`");
         drop(fsm);
     }
 }

@@ -1,43 +1,79 @@
-# Integrations
+# External Integrations
 
-## Hardware Backends
+This document describes all external protocols, client APIs, hardware driver libraries, and plugin environments integrated with Grim.
 
-The engine routes tensor operations to available hardware backends:
+---
 
-*   **ROCm/HIP**: Supported via `grim-backend-hip` crate for AMD accelerators.
-*   **CUDA**: Supported via `grim-backend-cuda` crate for NVIDIA accelerators.
-*   **Vulkan**: Hardware-agnostic GPU acceleration using `grim-backend-vulkan`.
-*   **Metal**: Apple Silicon GPU support via `grim-backend-metal`.
+## 1. HTTP API Serving (`grim-server`)
 
-## Network and API
+`grim-server` runs an asynchronous Axum HTTP service implementing both OpenAI-compatible and Ollama-compatible API standards.
 
-### Axum REST & Ollama Protocol
-The HTTP serving layer is implemented using `axum`. The server implements the Ollama API specification to expose inference endpoints.
+### Supported Endpoints
+
+- **OpenAI Compatible**:
+  - `POST /v1/chat/completions` (Streaming SSE & JSON responses, supports `response_format` via `grim-constrain`)
+  - `POST /v1/completions`
+  - `GET /v1/models`
+- **Ollama Compatible**:
+  - `POST /api/generate`
+  - `POST /api/chat`
+  - `GET /api/tags`
+  - `POST /api/show`
+  - `POST /api/pull`
+- **Observability**:
+  - `GET /health`
+  - `GET /metrics` (Prometheus exporter)
+
+### Request Lifecycle Diagram
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#2b2d42', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#edf2f4'}}}%%
 sequenceDiagram
-    participant Client
-    participant AxumServer
-    participant GrimEngine
-    
-    Client->>AxumServer: POST /api/generate
-    
-    %% Spacer to ensure 480px minimum height
-    Note over Client, GrimEngine: Processing request...
-    Note over Client, GrimEngine: Processing request...
-    Note over Client, GrimEngine: Processing request...
-    Note over Client, GrimEngine: Processing request...
-    Note over Client, GrimEngine: Processing request...
-    Note over Client, GrimEngine: Processing request...
-    
-    AxumServer->>GrimEngine: Queue inference request
-    GrimEngine-->>AxumServer: Token stream
-    AxumServer-->>Client: Streaming HTTP Response
+    autonumber
+    actor Client as HTTP Client
+    participant Server as grim-server (Axum)
+    participant Scheduler as grim-scheduler
+    participant Engine as grim-engine
+    participant Backends as Backend Device (ROCm/CUDA/CPU)
+    participant Constrain as grim-constrain
+
+    Client->>Server: POST /v1/chat/completions (JSON / Stream)
+    Server->>Constrain: Wrap Sampler with JSON/Schema FSM (if response_format)
+    Server->>Scheduler: Submit Request Session
+    Scheduler->>Engine: Batch Active Sessions
+    loop Continuous Batching Iterations
+        Engine->>Backends: Dispatch Model Forward GEMM
+        Backends-->>Engine: Logits Tensor
+        Engine->>Constrain: Mask Logits & Sample Token
+        Constrain-->>Engine: Sampled Token
+        Engine-->>Server: Token Channel Chunk
+        Server-->>Client: Stream SSE Token Event
+    end
+    Server-->>Client: [DONE] / Final JSON Response
 ```
 
-### WASM Runtime
-The framework supports a WebAssembly target for browser-based client execution. Memory structures are mapped to `WebAssembly.Memory`.
+---
 
-## Failure Modes
-*   **OOM (Out of Memory)**: If hardware backends exceed VRAM bounds, the process will panic unless intermediate offloading is configured.
-*   **Backend Mismatch**: If `grim-backend-cuda` is queried on a host without NVIDIA drivers, execution falls back to CPU or aborts based on configuration.
+## 2. Remote Model Registries (`grim-cli`)
+
+`grim pull` communicates with remote model repositories:
+
+- **Hugging Face Hub**: Downloads `.gguf` and `.safetensors` weight splits over HTTPS using `reqwest`.
+- **Ollama Registry**: Pulls manifest descriptors and layer blobs over HTTPS.
+
+---
+
+## 3. Plugin Runtime (`grim-plugin`)
+
+`grim-plugin` enables extending the engine using:
+1. **Dynamic Libraries (`.so` / `.dylib` / `.dll`)**: Loaded via `libloading` for native C-ABI plugins.
+2. **WebAssembly (`.wasm`)**: Executed inside a sandboxed WASM runtime (`wasmtime`) with isolated memory boundaries.
+
+---
+
+## 4. Hardware Driver Integrations
+
+- **ROCm**: Dynamic loading of `libamdhip64.so` and `librocblas.so`.
+- **CUDA**: FFI bindings to `libcudart.so` and `libcublas.so`, plus `nvcc` child process invocation for PTX JIT compilation.
+- **Vulkan**: Dynamic linking to Vulkan loader (`libvulkan.so.1`) for SPIR-V compute dispatch.
+- **Metal**: macOS Metal framework and Metal Performance Shaders (MPS) bindings.

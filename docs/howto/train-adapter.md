@@ -42,7 +42,8 @@ Train or fine-tune LoRA adapters (SFT QLoRA) on a base model using a custom data
      --lr 2e-4 \
      --rank 32 \
      --alpha 64.0 \
-     --device cpu
+     --seed 42 \
+     --device rocm
    ```
 
 4. **Bake the Adapter (Optional)**

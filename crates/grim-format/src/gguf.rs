@@ -581,6 +581,14 @@ pub struct GrimMetadata {
     pub kv_method: Option<String>,
     /// Target bits-per-weight for KV cache quantization.
     pub kv_bpw: Option<f32>,
+    /// Preferred tensor precision format (e.g. `"bf16"`, `"f16"`, `"f32"`).
+    pub preferred_dtype: Option<String>,
+    /// Preferred GEMM backend (e.g. `"rocblas"`).
+    pub gemm_backend: Option<String>,
+    /// Whether FP8 execution is enabled.
+    pub fp8: Option<bool>,
+    /// Multi-GPU dispatch strategy (e.g. `"replica-dp"`).
+    pub multi_gpu_strategy: Option<String>,
 }
 
 impl Default for GrimMetadata {
@@ -612,6 +620,10 @@ impl Default for GrimMetadata {
             recon_rank: None,
             kv_method: None,
             kv_bpw: None,
+            preferred_dtype: None,
+            gemm_backend: None,
+            fp8: None,
+            multi_gpu_strategy: None,
         }
     }
 }
@@ -809,6 +821,19 @@ impl GrimMetadata {
             .get("grim.rocm.kv_layout_optimized")
             .and_then(read_bool);
         let has_kv_registry = metadata.get("grim.has_kv_registry").and_then(read_bool);
+        let preferred_dtype = metadata
+            .get("grim.preferred_dtype")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let gemm_backend = metadata
+            .get("grim.gemm_backend")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let fp8 = metadata.get("grim.fp8").and_then(read_bool);
+        let multi_gpu_strategy = metadata
+            .get("grim.multi_gpu_strategy")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         GrimMetadata {
             magic,
@@ -837,6 +862,10 @@ impl GrimMetadata {
             recon_rank: None,
             kv_method: None,
             kv_bpw: None,
+            preferred_dtype,
+            gemm_backend,
+            fp8,
+            multi_gpu_strategy,
         }
     }
 
@@ -1161,6 +1190,27 @@ impl GrimMetadata {
                 ),
             );
         }
+        if let Some(dtype) = &self.preferred_dtype {
+            obj.insert(
+                "preferred_dtype".into(),
+                serde_json::Value::String(dtype.clone()),
+            );
+        }
+        if let Some(gemm) = &self.gemm_backend {
+            obj.insert(
+                "gemm_backend".into(),
+                serde_json::Value::String(gemm.clone()),
+            );
+        }
+        if let Some(fp8) = self.fp8 {
+            obj.insert("fp8".into(), serde_json::Value::Bool(fp8));
+        }
+        if let Some(strategy) = &self.multi_gpu_strategy {
+            obj.insert(
+                "multi_gpu_strategy".into(),
+                serde_json::Value::String(strategy.clone()),
+            );
+        }
         serde_json::Value::Object(obj)
     }
 
@@ -1268,6 +1318,19 @@ impl GrimMetadata {
             .and_then(|v| v.as_str())
             .map(String::from);
         let kv_bpw = obj.get("kv_bpw").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let preferred_dtype = obj
+            .get("preferred_dtype")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let gemm_backend = obj
+            .get("gemm_backend")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let fp8 = obj.get("fp8").and_then(|v| v.as_bool());
+        let multi_gpu_strategy = obj
+            .get("multi_gpu_strategy")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let ext_entries = obj
             .get("grim.ext.entries")
             .and_then(|v| v.as_array())
@@ -1313,6 +1376,10 @@ impl GrimMetadata {
             recon_rank,
             kv_method,
             kv_bpw,
+            preferred_dtype,
+            gemm_backend,
+            fp8,
+            multi_gpu_strategy,
             ext_entries,
             gguf_metadata,
         }
@@ -1988,6 +2055,10 @@ mod tests {
             kv_bpw: Some(3.25),
             ext_entries: Vec::new(),
             gguf_metadata: None,
+            preferred_dtype: Some("bf16".into()),
+            gemm_backend: Some("rocblas".into()),
+            fp8: Some(false),
+            multi_gpu_strategy: Some("replica-dp".into()),
         }
     }
 
@@ -2037,6 +2108,10 @@ mod tests {
         assert_eq!(original.rocm_fusion_ops, restored.rocm_fusion_ops);
         assert_eq!(original.xnack_enabled, restored.xnack_enabled);
         assert_eq!(original.kv_layout_optimized, restored.kv_layout_optimized);
+        assert_eq!(original.preferred_dtype, restored.preferred_dtype);
+        assert_eq!(original.gemm_backend, restored.gemm_backend);
+        assert_eq!(original.fp8, restored.fp8);
+        assert_eq!(original.multi_gpu_strategy, restored.multi_gpu_strategy);
     }
 
     #[test]
