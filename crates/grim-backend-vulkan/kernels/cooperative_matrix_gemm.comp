@@ -1,0 +1,57 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Params {
+    uint m;
+    uint n;
+    uint k;
+    float alpha;
+    float beta;
+} params;
+
+layout(std430, binding = 0) readonly buffer A { float a_in[]; };
+layout(std430, binding = 1) readonly buffer B { float b_in[]; };
+layout(std430, binding = 2) writeonly buffer C { float c_out[]; };
+
+void main() {
+    uint row = gl_GlobalInvocationID.y * 16u;
+    uint col = gl_GlobalInvocationID.x * 16u;
+
+    if (row >= params.m || col >= params.n) return;
+
+    #ifdef GL_KHR_cooperative_matrix
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_mat;
+    c_mat = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint ki = 0; ki < params.k; ki += 16u) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a_mat;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b_mat;
+
+        coopMatLoad(a_mat, a_in, row * params.k + ki, params.k, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b_mat, b_in, ki * params.n + col, params.n, gl_CooperativeMatrixLayoutRowMajor);
+
+        c_mat = coopMatMulAdd(a_mat, b_mat, c_mat);
+    }
+
+    coopMatStore(c_mat, c_out, row * params.n + col, params.n, gl_CooperativeMatrixLayoutRowMajor);
+    #else
+    // Fallback scalar 16x16 tile block
+    for (uint i = 0; i < 16u; ++i) {
+        for (uint j = 0; j < 16u; ++j) {
+            uint r = row + i;
+            uint c = col + j;
+            if (r < params.m && c < params.n) {
+                float acc = 0.0;
+                for (uint ki = 0; ki < params.k; ++ki) {
+                    acc += a_in[r * params.k + ki] * b_in[ki * params.n + c];
+                }
+                c_out[r * params.n + c] = acc;
+            }
+        }
+    }
+    #endif
+}

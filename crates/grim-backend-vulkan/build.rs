@@ -137,6 +137,10 @@ fn kernels() -> Vec<(&'static str, String)> {
             load_kernel("qkv_attention_paged_dequant"),
         ),
         ("speculative_acceptor", load_kernel("speculative_acceptor")),
+        (
+            "cooperative_matrix_gemm",
+            load_kernel("cooperative_matrix_gemm"),
+        ),
     ]
 }
 
@@ -202,6 +206,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/softmax_merge.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention_paged_dequant.comp");
     println!("cargo:rerun-if-changed=kernels/speculative_acceptor.comp");
+    println!("cargo:rerun-if-changed=kernels/cooperative_matrix_gemm.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 
