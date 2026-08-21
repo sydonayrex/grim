@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint total;
+    float lr;
+    float beta1;
+    float beta2;
+    float weight_decay;
+} params;
+
+layout(std430, binding = 0) buffer P { float p[]; };
+layout(std430, binding = 1) readonly buffer G { float g[]; };
+layout(std430, binding = 2) buffer M { float exp_avg[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.total) return;
+
+    float grad = g[idx];
+    float param = p[idx];
+    float m = exp_avg[idx];
+
+    // Decoupled weight decay
+    if (params.weight_decay != 0.0) {
+        param -= params.lr * params.weight_decay * param;
+    }
+
+    // Lion update direction: sign(beta1 * m + (1 - beta1) * grad)
+    float c = params.beta1 * m + (1.0 - params.beta1) * grad;
+    float update = sign(c);
+
+    param -= params.lr * update;
+    p[idx] = param;
+
+    // Update tracking momentum
+    exp_avg[idx] = params.beta2 * m + (1.0 - params.beta2) * grad;
+}

@@ -2767,6 +2767,192 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = q.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan sage_attention: q is not VulkanStorage".into())
+        })?;
+        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan sage_attention: k is not VulkanStorage".into())
+        })?;
+        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan sage_attention: v is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let q_dims = q.shape().dims();
+        let num_heads = q_dims[q_dims.len() - 2];
+        let head_dim = q_dims[q_dims.len() - 1];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
+        let push = push_params(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            kv_seq_len as u32,
+            64,
+            scale,
+        );
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::SageAttention,
+            &buffers,
+            num_heads as u32,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan sage_attention dispatch failed: {e}")))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    fn fused_adamw_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = p
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: p is not VulkanStorage".into()))?;
+        let g_s = g
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: g is not VulkanStorage".into()))?;
+        let m_s = m
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: m is not VulkanStorage".into()))?;
+        let v_s = v
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: v is not VulkanStorage".into()))?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let buffers = [p_s.buffer, g_s.buffer, m_s.buffer, v_s.buffer];
+        let grid_x = ((total + 255) / 256) as u32;
+
+        let push = [
+            total as u32,
+            lr.to_bits(),
+            beta1.to_bits(),
+            beta2.to_bits(),
+            eps.to_bits(),
+            weight_decay.to_bits(),
+            bc1.to_bits(),
+            bc2.to_bits(),
+        ];
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::FusedAdamw,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan fused_adamw_step dispatch failed: {e}")))?;
+
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = p
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_lion: p is not VulkanStorage".into()))?;
+        let g_s = g
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_lion: g is not VulkanStorage".into()))?;
+        let m_s = exp_avg
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan fused_lion: exp_avg is not VulkanStorage".into())
+            })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let buffers = [p_s.buffer, g_s.buffer, m_s.buffer];
+        let grid_x = ((total + 255) / 256) as u32;
+
+        let push = [
+            total as u32,
+            lr.to_bits(),
+            beta1.to_bits(),
+            beta2.to_bits(),
+            weight_decay.to_bits(),
+            0,
+            0,
+            0,
+        ];
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::FusedLion,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan fused_lion_step dispatch failed: {e}")))?;
+
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+
     fn embedding(
         &self,
         weight: &dyn BackendStorage,
@@ -4530,6 +4716,14 @@ pub enum VulkanKernel {
     /// Fused grouped MoE dispatch (WI-M5): gate+up SiLU + down, atomicAdd per
     /// routed (token, expert) pair. FP32 base case.
     MoeFusedDispatch,
+    /// DeepSeek Multi-Head Latent Attention (MLA) Matrix-Absorbed Decode.
+    MlaDecode,
+    /// Block-quantized SageAttention for long context.
+    SageAttention,
+    /// On-device fused AdamW parameter update.
+    FusedAdamw,
+    /// On-device fused Lion parameter update.
+    FusedLion,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -4585,6 +4779,10 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::FusedQuantGemmQ80 => SPIRV_FUSED_QUANT_GEMM_Q8_0,
         VulkanKernel::FusedQuantGemmFp8 => SPIRV_FUSED_QUANT_GEMM_FP8,
         VulkanKernel::MoeFusedDispatch => SPIRV_MOE_FUSED_DISPATCH,
+        VulkanKernel::MlaDecode => SPIRV_MLA_DECODE,
+        VulkanKernel::SageAttention => SPIRV_SAGE_ATTENTION,
+        VulkanKernel::FusedAdamw => SPIRV_FUSED_ADAMW,
+        VulkanKernel::FusedLion => SPIRV_FUSED_LION,
     }
 }
 
@@ -4622,10 +4820,14 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedDequantGemmMxFp4
         | VulkanKernel::FusedQuantGemmQ80
         | VulkanKernel::FusedQuantGemmFp8
+        | VulkanKernel::FusedLion
         | VulkanKernel::SiluMulBackward => 3,
         VulkanKernel::QkvAttention
         | VulkanKernel::QkvAttentionSwa
         | VulkanKernel::FlashAttention
+        | VulkanKernel::MlaDecode
+        | VulkanKernel::SageAttention
+        | VulkanKernel::FusedAdamw
         | VulkanKernel::RwkvTimeMix => 4,
         VulkanKernel::QkvAttentionPaged
         | VulkanKernel::QkvAttentionPagedSwa
