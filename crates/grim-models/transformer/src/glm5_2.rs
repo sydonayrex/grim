@@ -6,11 +6,11 @@
 //! - **Post/Pre Attention LayerNorms**: RMSNorm or LayerNorm on transformer blocks with rotary position encodings.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::error::{Error, Result};
+use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 /// Native mirror of `Glm52Config` (HuggingFace `glm5_2`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

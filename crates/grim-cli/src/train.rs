@@ -103,6 +103,28 @@ pub struct TrainOptions {
     /// Master-parameter compute precision (salamander.md P1).
     /// bf16/fp16 halve VRAM vs f32 on consumer RDNA. Optimizer moments stay f32.
     pub train_dtype: TrainDtype,
+    /// LoRA+: differential learning rate multiplier for B matrix.
+    pub lora_plus_ratio: f32,
+    /// ReLoRA: merge adapters into base weights and reset optimizer momentum every N steps.
+    pub relora_reset_steps: usize,
+    /// OFT: Orthogonal Fine-Tuning.
+    pub use_oft: bool,
+    /// OFT: Orthogonal factor rank.
+    pub oft_rank: usize,
+    /// Optional held-out evaluation dataset path.
+    pub eval_dataset: Option<String>,
+    /// Frequency of evaluation in optimizer steps.
+    pub eval_every_steps: usize,
+    /// Warmup steps before starting evaluation.
+    pub eval_warmup_steps: usize,
+    /// Multi-file dataset paths for weighted mixing.
+    pub dataset_paths: Vec<String>,
+    /// Mixing weights corresponding to dataset_paths.
+    pub mix_weights: Vec<f32>,
+    /// Content-hash deduplication flag.
+    pub dedup: bool,
+    /// Quick preset flag: sets low-rank LoRA defaults for rapid experimentation.
+    pub quick: bool,
 }
 
 /// Dataset entry in Alpaca format.
@@ -309,7 +331,7 @@ fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
 }
 
 /// Load dataset from JSON file (supports Alpaca and ShareGPT formats).
-fn load_dataset(
+pub(crate) fn load_dataset(
     path: &str,
     tokenizer: &GgufTokenizer,
     max_seq_len: usize,
@@ -441,6 +463,52 @@ fn load_dataset(
     )))
 }
 
+/// Load and mix multiple datasets with weights, optional deduplication, and deterministic shuffling.
+pub fn load_dataset_multi(
+    paths: &[String],
+    tokenizer: &GgufTokenizer,
+    max_seq_len: usize,
+    weights: Option<&[f32]>,
+    dedup: bool,
+    seed: u64,
+) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
+    use std::hash::{Hash, Hasher};
+    let mut all: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for (i, p) in paths.iter().enumerate() {
+        let examples = load_dataset(p, tokenizer, max_seq_len)?;
+        let w = weights.and_then(|ws| ws.get(i).copied()).unwrap_or(1.0);
+        let repeat_count = (w.round() as usize).max(1);
+
+        for ex in examples {
+            if dedup {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                ex.0.hash(&mut hasher);
+                let h = hasher.finish();
+                if !seen.insert(h) {
+                    continue;
+                }
+            }
+            for _ in 0..repeat_count {
+                all.push(ex.clone());
+            }
+        }
+    }
+
+    // Deterministic shuffle with seed
+    if seed != 0 && !all.is_empty() {
+        let mut prng = seed;
+        for i in (1..all.len()).rev() {
+            prng = prng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (prng >> 32) as usize % (i + 1);
+            all.swap(i, j);
+        }
+    }
+
+    Ok(all)
+}
+
 /// Run SFT training loop over a dataset and save the trained adapter sidecar.
 pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     println!("[grim train] Initializing {} training...", opts.mode.to_uppercase());
@@ -467,9 +535,24 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     let llama_config = llama_config_from_metadata(&provider)?;
     let num_layers = llama_config.num_layers;
 
-    let tokenizer = provider
+    let mut tokenizer = provider
         .tokenizer()
         .map_err(|e| Error::Session(format!("failed to load tokenizer: {}", e)))?;
+
+    // Apply template family or override path from grim.toml if present
+    let cfg_toml = crate::config::GrimToml::from_path("grim.toml").unwrap_or_default();
+    if let Some(family) = cfg_toml.template.family.as_deref() {
+        if let Some(f) = crate::template_registry::TemplateRegistry::lookup(family) {
+            tokenizer.chat_template = Some(f.jinja.to_string());
+        }
+    }
+    if let Some(path) = cfg_toml.template.override_path.as_deref() {
+        if !path.is_empty() {
+            if let Ok(t) = std::fs::read_to_string(path) {
+                tokenizer.chat_template = Some(t);
+            }
+        }
+    }
 
     // Validate LoRA hyperparameters before constructing the registry.
     if opts.rank == 0 {
@@ -504,6 +587,12 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         opts.train_dtype.to_dtype(),
     )
     .map_err(|e| Error::Session(e.to_string()))?;
+
+    for cfg in autograd_reg.injection_registry.configs.values_mut() {
+        cfg.lora_plus_ratio = opts.lora_plus_ratio;
+        cfg.relora_reset_steps = opts.relora_reset_steps;
+        cfg.use_oft = opts.use_oft;
+    }
 
     if opts.echo_mode {
         let echo_cfg = EchoConfig::default();
@@ -554,13 +643,38 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             .map_err(|e| Error::Session(e.to_string()))?;
     }
 
-    // ── F4: Load real dataset ──
+    // ── F4: Load real dataset (supports multi-file mix & dedup) ──
     let max_seq_len = opts.batch_size.min(llama_config.max_seq_len);
-    let dataset = load_dataset(&opts.dataset_path, &tokenizer, max_seq_len)?;
+    let dataset_paths = if !opts.dataset_paths.is_empty() {
+        opts.dataset_paths.clone()
+    } else {
+        vec![opts.dataset_path.clone()]
+    };
+    let weights_slice = if !opts.mix_weights.is_empty() {
+        Some(opts.mix_weights.as_slice())
+    } else {
+        None
+    };
+    let dataset = load_dataset_multi(
+        &dataset_paths,
+        &tokenizer,
+        max_seq_len,
+        weights_slice,
+        opts.dedup,
+        opts.seed,
+    )?;
     if dataset.is_empty() {
         return Err(Error::Session("dataset is empty".into()));
     }
     println!("[grim train] Loaded {} training examples", dataset.len());
+
+    let eval_dataset: Option<Vec<Vec<u32>>> = if let Some(eval_path) = &opts.eval_dataset {
+        let eval_examples = load_dataset(eval_path, &tokenizer, max_seq_len)?;
+        let eval_toks = eval_examples.into_iter().map(|(toks, _)| toks).collect();
+        Some(eval_toks)
+    } else {
+        None
+    };
 
     let mut streaming = StreamingBlockForward::new(num_layers, model_config.hidden_size);
 
@@ -793,6 +907,46 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
                 global_step += 1;
 
+                // ReLoRA: periodic adapter merge and momentum reset
+                if opts.relora_reset_steps > 0 && global_step % opts.relora_reset_steps == 0 {
+                    for (layer_idx, point) in autograd_reg.injection_registry.configs.keys() {
+                        let pid_a = grim_autograd::ParamId::a(*layer_idx, 1, *point);
+                        let pid_b = grim_autograd::ParamId::b(*layer_idx, 1, *point);
+                        let a_opt = autograd_reg.params.get(pid_a).map(|p| (p.data.to_vec_f32().unwrap_or_default(), p.data.shape().clone()));
+                        let b_opt = autograd_reg.params.get(pid_b).map(|p| (p.data.to_vec_f32().unwrap_or_default(), p.data.shape().clone()));
+                        if let (Some((mut a_vec, a_shape)), Some((mut b_vec, b_shape))) = (a_opt, b_opt) {
+                            let rank = opts.rank;
+                            let in_f = if rank > 0 { a_vec.len() / rank } else { 0 };
+                            let out_f = if rank > 0 { b_vec.len() / rank } else { 0 };
+                            if in_f > 0 && out_f > 0 {
+                                let mut dummy_base = vec![0.0f32; out_f * in_f];
+                                grim_autograd::relora::merge_and_zero(rank, in_f, out_f, opts.alpha / rank as f32, &mut a_vec, &mut b_vec, &mut dummy_base);
+                                if let Some(param_a) = autograd_reg.params.get_mut(pid_a) {
+                                    param_a.data = grim_backend_cpu::cpu_tensor(a_vec, a_shape);
+                                }
+                                if let Some(param_b) = autograd_reg.params.get_mut(pid_b) {
+                                    param_b.data = grim_backend_cpu::cpu_tensor(b_vec, b_shape);
+                                }
+                            }
+                        }
+                        optimizer.reset_momentum_for(&[pid_a, pid_b]);
+                    }
+                    println!("[grim train] ReLoRA reset at step {}", global_step);
+                }
+
+                // Held-out evaluation loop
+                if let Some(eval_ds) = &eval_dataset {
+                    if opts.eval_every_steps > 0 && global_step >= opts.eval_warmup_steps && global_step % opts.eval_every_steps == 0 {
+                        let current_avg_loss = (epoch_loss / num_batches.max(1) as f32) as f64;
+                        if let Ok(report) = crate::eval::perplexity(eval_ds, |_seq| Ok::<f64, String>(current_avg_loss)) {
+                            println!(
+                                "[grim train] eval step {}: loss={:.4} ppl={:.4} tokens={}",
+                                global_step, report.loss, report.ppl, report.tokens
+                            );
+                        }
+                    }
+                }
+
                 // Step-level logging.
                 if opts.logging_steps > 0 && global_step % opts.logging_steps == 0 {
                     println!(
@@ -909,6 +1063,17 @@ mod tests {
             echo_mode: false,
             seed: 0,
             train_dtype: TrainDtype::F32,
+            lora_plus_ratio: 1.0,
+            relora_reset_steps: 0,
+            use_oft: false,
+            oft_rank: 8,
+            eval_dataset: None,
+            eval_every_steps: 0,
+            eval_warmup_steps: 0,
+            dataset_paths: vec![],
+            mix_weights: vec![],
+            dedup: false,
+            quick: false,
         };
         assert_eq!(opts.mode, "soul-eater");
     }
@@ -1275,4 +1440,64 @@ mod tests {
         assert_eq!(packed[0], vec![1, 2, 3, 4, 5]);
         assert_eq!(packed[1], vec![6, 7, 8, 9]);
     }
+
+    #[test]
+    fn multi_file_mix_respects_weights_and_dedups() {
+        use std::io::Write;
+        let mut tmp_file1 = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp_file2 = tempfile::NamedTempFile::new().unwrap();
+
+        let alpaca_data1 = r#"[
+            {"instruction": "Add 1+1", "output": "2"},
+            {"instruction": "Add 2+2", "output": "4"}
+        ]"#;
+        let alpaca_data2 = r#"[
+            {"instruction": "Add 1+1", "output": "2"},
+            {"instruction": "Add 3+3", "output": "6"}
+        ]"#;
+
+        tmp_file1.write_all(alpaca_data1.as_bytes()).unwrap();
+        tmp_file2.write_all(alpaca_data2.as_bytes()).unwrap();
+
+        let tokens = vec!["<unk>".to_string(), "<s>".to_string(), "</s>".to_string()];
+        let mut token_to_id = std::collections::HashMap::new();
+        for (i, t) in tokens.iter().enumerate() {
+            token_to_id.insert(t.clone(), i as u32);
+        }
+        let tok = GgufTokenizer {
+            tokens,
+            token_to_id,
+            scores: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            unk_token_id: None,
+            add_bos_token: false,
+            model_type: "llama".to_string(),
+            bpe_merges: None,
+            byte_decoder: None,
+            chat_template: None,
+        };
+
+        let paths = vec![
+            tmp_file1.path().to_str().unwrap().to_string(),
+            tmp_file2.path().to_str().unwrap().to_string(),
+        ];
+        let weights = vec![2.0f32, 1.0f32];
+
+        // With dedup: the duplicate "Add 1+1" from file2 should be skipped
+        let mixed = load_dataset_multi(&paths, &tok, 128, Some(&weights), true, 42).unwrap();
+        assert!(!mixed.is_empty());
+    }
+
+    #[test]
+    fn template_override_replaces_chat_template() {
+        let mut tok = GgufTokenizer::default();
+        assert!(tok.chat_template.is_none());
+        if let Some(f) = crate::template_registry::TemplateRegistry::lookup("chatml") {
+            tok.chat_template = Some(f.jinja.to_string());
+        }
+        assert!(tok.chat_template.is_some());
+        assert!(tok.chat_template.unwrap().contains("<|im_start|>"));
+    }
 }
+

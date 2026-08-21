@@ -1951,7 +1951,7 @@ mod tests {
 
                 let partials: Vec<ExpertPartial> = expert_groups
                     .into_iter()
-                    .map(|(expert, mut group)| {
+                    .map(|(expert, group)| {
                         // Merge group into single partial per expert.
                         // Sum combine weights for repeated expert selections (standard
                         // MoE top-k combine semantics), not average. Also set col_offset

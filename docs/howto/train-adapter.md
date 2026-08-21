@@ -23,12 +23,13 @@ Train or fine-tune LoRA adapters (SFT QLoRA) on a base model using a custom data
    {"text": "Chat conversation or text to learn from"}
    ```
 
-2. **Run the Training Process**
-   Execute the `train` command to train the adapter. You must specify the base model, dataset, and output path.
+2. **Run Quick LoRA Training (`--quick`)**
+   For fast experimentation without tweaking dozens of hyperparameter flags, use `--quick`:
 
    ```bash
-   grim train --model granite-3.1-8b --dataset ./data/alpaca.jsonl --output adapter.grim.train
+   grim train --quick --model granite-3.1-8b --dataset ./data/alpaca.jsonl
    ```
+   This automatically configures a lightweight LoRA preset (`rank=8`, `alpha=16.0`, `epochs=1`, `device=cpu`, output=`adapter.grim.train`).
 
 3. **Train with Custom Hyperparameters**
    You can adjust the learning rate, epochs, LoRA rank, and alpha for better convergence.
@@ -46,7 +47,15 @@ Train or fine-tune LoRA adapters (SFT QLoRA) on a base model using a custom data
      --device rocm
    ```
 
-4. **Bake the Adapter (Optional)**
+4. **Choosing a Training Mode**
+   Grim supports several fine-tuning modes via `--mode`:
+   - `qlora` (default): Quantized LoRA with frozen 4-bit base weights and trainable adapter matrices.
+   - `lora`: Standard LoRA on full-precision / half-precision base weights.
+   - `full-bf16` / `full-fp16`: Full parameter fine-tuning in BF16 or FP16.
+   - `soul-eater`: High-throughput adapter training with FP4/FP8 subspace caching.
+   - `oft`: Orthogonal Fine-Tuning preserving Frobenius norms.
+
+5. **Bake the Adapter (Optional)**
    You can permanently merge the trained adapter sidecar into a base model using the `merge` command.
 
    ```bash

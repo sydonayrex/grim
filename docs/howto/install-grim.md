@@ -60,6 +60,11 @@ rustup update stable
    grim doctor
    ```
 
+   You can also run a pre-flight model check to predict memory fit before attempting to serve:
+   ```bash
+   grim doctor --model /path/to/model.gguf
+   ```
+
 4. **(Optional) Install as a background service**
    Register Grim to run continuously as a system service.
 

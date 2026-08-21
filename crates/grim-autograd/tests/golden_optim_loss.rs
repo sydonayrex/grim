@@ -64,6 +64,7 @@ fn adamw_one_step_matches_hand_computed_reference() {
         beta2: 0.999,
         eps: 1e-8,
         weight_decay: 0.01,
+        lora_plus_ratio: 1.0,
     };
     let mut opt = AdamW::new(cfg.clone());
 

@@ -455,6 +455,10 @@ fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
         }
     };
 
+    let meta = std::fs::metadata(path).ok();
+    let size_bytes = meta.map(|m| m.len()).unwrap_or(0);
+    println!("  [INFO] File size: {:.2} MB ({} bytes)", size_bytes as f64 / (1024.0 * 1024.0), size_bytes);
+
     println!(
         "  [INFO] Architecture: {}, params: {:?}, quant: {:?}, weight bytes: {}",
         footprint.architecture,

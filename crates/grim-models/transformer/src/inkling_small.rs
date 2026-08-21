@@ -5,11 +5,11 @@
 //! - **SwiGLU FFN**: RMSNorm pre-layer normalization and SwiGLU feed-forward network.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::error::{Error, Result};
+use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
-use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
+use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 // ---------------------------------------------------------------------------
 // Config

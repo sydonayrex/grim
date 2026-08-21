@@ -384,7 +384,7 @@ mod tests {
         let correct_hash = DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash");
 
         // Create a manifest with the correct hash - should fail because file isn't a valid .so
-        let manifest = PluginManifest {
+        let _manifest = PluginManifest {
             name: "test-plugin".into(),
             abi_version: 1,
             kind: PluginKind::Dylib,
@@ -407,7 +407,7 @@ mod tests {
         }
 
         // Create a manifest with wrong hash - should fail at hash check
-        let wrong_manifest = PluginManifest {
+        let _wrong_manifest = PluginManifest {
             name: "test-plugin".into(),
             abi_version: 1,
             kind: PluginKind::Dylib,

@@ -451,7 +451,7 @@ mod tests {
                     partials.push(row);
                 }
                 // Expected output: sum over k in f32, then cast to fp16 (kernel does f16→f32 sum→f16).
-                let expected: Vec<u16> = (0..total)
+                let _expected: Vec<u16> = (0..total)
                     .map(|idx| {
                         let i = idx / n;
                         let j = idx % n;

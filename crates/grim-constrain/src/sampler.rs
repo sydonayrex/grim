@@ -19,7 +19,7 @@ use grim_core::sampler::Sampler;
 use grim_tensor::Tensor;
 use grim_tensor::error::Result;
 
-use crate::json_mode::{apply_mask, JsonModeFsm};
+use crate::json_fsm::{apply_mask, JsonState, TokenMaskCache};
 use crate::schema::{compile_json_schema, JsonSchemaConstraint, JsonSchemaCompilerError};
 
 /// WI-3: the constraint mode a `ConstrainedSampler` is enforcing.
@@ -60,7 +60,11 @@ pub struct ConstrainedSampler {
     inner: std::sync::Arc<dyn Sampler>,
     constraint: Constraint,
     /// JSON-mode FSM state (used for `JsonObject`; ignored for `JsonSchema`).
-    fsm: Arc<Mutex<JsonModeFsm>>,
+    /// The full pushdown automaton from `json_fsm`; was the shallow
+    /// bracket-counter before implodsion.md WP0.
+    fsm: Arc<Mutex<JsonState>>,
+    /// Per-FSM-state token-validity cache (WI-3c). Keys on `JsonState`.
+    cache: Arc<Mutex<TokenMaskCache>>,
     /// Accumulated output text, used by the JSON-schema validator.
     output: Arc<Mutex<String>>,
     /// Optional vocabulary. When present, `compute_mask` simulates each
@@ -75,7 +79,8 @@ impl ConstrainedSampler {
         Self {
             inner,
             constraint,
-            fsm: Arc::new(Mutex::new(JsonModeFsm::new())),
+            fsm: Arc::new(Mutex::new(JsonState::default())),
+            cache: Arc::new(Mutex::new(TokenMaskCache::new())),
             output: Arc::new(Mutex::new(String::new())),
             vocab: None,
         }
@@ -111,7 +116,9 @@ impl Sampler for ConstrainedSampler {
         // inner sampler's sampling policy (temperature/top-p) still applies
         // within the masked set.
         let masked = grim_backend_cpu::cpu_tensor(v, logits.shape().clone());
-        self.inner.sample(&masked, history)
+        let token_id = self.inner.sample(&masked, history)?;
+        self.feed_sampled_token_id(token_id);
+        Ok(token_id)
     }
 
     fn name(&self) -> &str {
@@ -166,7 +173,8 @@ impl ConstrainedSampler {
             Constraint::JsonObject => {
                 if let Some(vocab) = &self.vocab {
                     let fsm = self.fsm.lock().unwrap();
-                    let mut mask = fsm.valid_tokens(vocab);
+                    let mut cache = self.cache.lock().unwrap();
+                    let mut mask = cache.mask_for(fsm.clone(), vocab).to_vec();
                     if mask.len() != vocab_size {
                         mask.resize(vocab_size, true);
                     }

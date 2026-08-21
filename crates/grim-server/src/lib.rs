@@ -34,6 +34,8 @@ use grim_engine::{Engine, model_loader};
 use grim_format::GgufProvider;
 use tokio_util::sync::CancellationToken;
 
+/// Tool parsing and structured JSON call extraction.
+/// See `docs/howto/tool-calling.md` for a complete client-side loop walkthrough.
 mod tool_parse;
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -2352,25 +2354,29 @@ async fn unload_adapter(
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct GrimServerConfigSection {
+    default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct GrimServerTomlConfig {
+    #[serde(default)]
+    server: Option<GrimServerConfigSection>,
+    default_model: Option<String>,
+}
+
 /// Retrieve default model configured in the config file.
 fn get_default_model_from_config() -> Option<String> {
-    let paths = vec![
-        "grim.toml",
-        "/etc/grim/grim.toml",
-        "C:\\Program Files\\Grim\\grim.toml",
-    ];
+    let paths = ["grim.toml", "/etc/grim/grim.toml", "C:\\Program Files\\Grim\\grim.toml"];
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with("default_model") {
-                    if let Some(pos) = line.find('=') {
-                        let mut v = line[pos + 1..].trim();
-                        if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
-                            v = &v[1..v.len() - 1];
-                        }
-                        return Some(v.to_string());
-                    }
+            if let Ok(cfg) = toml::from_str::<GrimServerTomlConfig>(&content) {
+                if let Some(s) = cfg.server.and_then(|srv| srv.default_model) {
+                    return Some(s);
+                }
+                if let Some(dm) = cfg.default_model {
+                    return Some(dm);
                 }
             }
         }

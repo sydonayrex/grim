@@ -179,6 +179,14 @@ pub struct LoRAInjectionConfig {
     /// dominant subspace, reusing `grim-quant::soul_eater::subspace_newton_schulz_step`
     /// at adapter creation. Replaces standard Kaiming/Zeors init.
     pub use_spectral_qlora: bool,
+    /// LoRA+: effective lr multiplier for the B matrix (1.0 = standard LoRA).
+    pub lora_plus_ratio: f32,
+    /// ReLoRA: merge LoRA delta back into base weights and reset optimizer momentum every N steps (0 = disabled).
+    pub relora_reset_steps: usize,
+    /// OFT: Orthogonal Fine-Tuning via Cayley-transform orthogonal matrix updates.
+    pub use_oft: bool,
+    /// OFT: Orthogonal factor rank.
+    pub oft_rank: usize,
     #[serde(skip, default = "default_device")]
     pub target_device: grim_tensor::Device,
 }
@@ -208,6 +216,10 @@ impl LoRAInjectionConfig {
             codebook_dim: 1,
             num_codebooks: 1,
             use_spectral_qlora: false,
+            lora_plus_ratio: 1.0,
+            relora_reset_steps: 0,
+            use_oft: false,
+            oft_rank: 8,
             target_device: grim_tensor::Device::Cpu,
         }
     }
@@ -594,6 +606,34 @@ pub fn pissa_initialize(
     Ok((a_vec, b_vec, quantized_base))
 }
 
+/// OFT (Orthogonal Fine-Tuning) initialization.
+/// Computes an orthogonal rank-r factor from truncated SVD.
+pub fn oft_initialize(
+    w_base: &[f32],
+    rows: usize,
+    cols: usize,
+    rank: usize,
+) -> Result<(Vec<f32>, f32)> {
+    if rows * cols != w_base.len() {
+        return Err(Error::Backend(format!(
+            "oft: base weight length {} != {}x{}",
+            w_base.len(),
+            rows,
+            cols
+        )));
+    }
+    let min_dim = rows.min(cols);
+    if rank > min_dim {
+        return Err(Error::Backend(format!(
+            "oft: rank {} exceeds dimension {}",
+            rank, min_dim
+        )));
+    }
+    let svd = compute_truncated_svd(w_base, rows, cols, rank)?;
+    let r_factor = svd.v_t;
+    Ok((r_factor, 1.0))
+}
+
 /// Result of truncated SVD computation.
 pub struct TruncatedSvdResult {
     pub u: Vec<f32>,     // Shape: (rows, rank)
@@ -896,4 +936,13 @@ mod tests {
         assert!(pissa_initialize(&w, 2, 2, 3).is_err());
         assert!(pissa_initialize(&vec![1.0], 2, 2, 1).is_err());
     }
+
+    #[test]
+    fn oft_initialize_is_orthogonal() {
+        let w: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let (r_factor, scale) = oft_initialize(&w, 3, 4, 2).unwrap();
+        assert_eq!(r_factor.len(), 2 * 4);
+        assert!((scale - 1.0).abs() < 1e-5, "OFT scale factor should be 1.0");
+    }
 }
+

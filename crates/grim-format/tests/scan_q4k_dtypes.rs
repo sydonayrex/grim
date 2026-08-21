@@ -1,5 +1,4 @@
-use grim_format::gguf::{GgufDType, read_gguf};
-use std::fmt::Write;
+use grim_format::gguf::read_gguf;
 use std::fs::File;
 use std::io::BufReader;
 

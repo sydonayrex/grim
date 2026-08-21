@@ -77,3 +77,35 @@ sequenceDiagram
 - **CUDA**: FFI bindings to `libcudart.so` and `libcublas.so`, plus `nvcc` child process invocation for PTX JIT compilation.
 - **Vulkan**: Dynamic linking to Vulkan loader (`libvulkan.so.1`) for SPIR-V compute dispatch.
 - **Metal**: macOS Metal framework and Metal Performance Shaders (MPS) bindings.
+
+---
+
+## 5. Multimodal Capabilities
+
+Grim includes models and routing surfaces for multimodal workloads:
+
+- **Vision**: `grim multimodal vision encode --image <path> --model <name>` (routes to `grim-models-vision`).
+- **Audio (ASR / TTS)**: `POST /v1/audio/transcriptions` and `grim multimodal audio transcribe` (routes to `grim-models-audio` / `wav_tokenizer_dec`).
+- **Diffusion (Image Generation)**: `POST /v1/images/generations` and `grim multimodal diffusion generate` (routes to `grim-models-diffusion` / `diffusion_gemma`).
+
+---
+
+## 6. Tool Calling & Function Execution
+
+Grim server parses structured tool definitions in `POST /v1/chat/completions` requests and extracts function arguments. See [`docs/howto/tool-calling.md`](howto/tool-calling.md) for a copy-paste runnable curl example.
+
+---
+
+## 7. Model Trust & Provenance
+
+To verify model artifacts against tampering and review hardware configuration:
+- Use `grim provenance <path>` to print SHA256 checksums, tensor formats, quantization info, and catalog registration status.
+- Use `grim doctor --model <path>` to execute header-only pre-flight checks and verify memory fit before loading.
+
+---
+
+## 8. Health & Metrics
+
+- **Health Probe**: `GET /health` (returns `{"status": "ok"}`).
+- **Prometheus Metrics**: `GET /metrics` (active sessions, KV cache memory tiers, scheduler queues, tokens/sec). Public access enabled via `GRIM_ALLOW_PUBLIC_METRICS=1`. See [`docs/howto/deploy.md`](howto/deploy.md).
+

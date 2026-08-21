@@ -11,10 +11,10 @@
 //! - The `Sampler` trait itself is **unmodified** — this is wrapping, not
 //!   altering, so no existing sampler needs changes.
 
-pub mod json_mode;
+pub mod json_fsm;
 pub mod schema;
 pub mod sampler;
 
-pub use json_mode::{JsonModeFsm, JsonModeState};
+pub use json_fsm::{apply_mask, FsmCheck, JsonState, TokenMaskCache};
 pub use schema::{compile_json_schema, JsonSchemaCompilerError};
 pub use sampler::{constrained_json_object, ConstrainedSampler, Constraint};

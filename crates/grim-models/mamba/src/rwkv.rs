@@ -324,7 +324,7 @@ impl RwkvBlock {
         // [P1-32 fix: use tm_data in residual.]
         let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
 
-        let ffn_k = self.channel_mix_key.forward(&x_res1)?;
+        let _ffn_k = self.channel_mix_key.forward(&x_res1)?;
         let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
         // ffn_v must use its own weight, not ffn_k's.
         // [P1-32 fix: ffn_v uses channel_mix_value weight.]

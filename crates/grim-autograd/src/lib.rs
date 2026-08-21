@@ -67,6 +67,7 @@ pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
 pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
 pub mod omnilo_prune;
 pub mod registry;
+pub mod relora;
 pub mod scythe1;
 pub mod soul_eater;
 pub mod tape;
@@ -86,7 +87,7 @@ pub use backward::{BackwardContext, backward, backward_step};
 pub use collate::{Packed1DBatch, PackedBatch, TokenSequence, VarLenCollator};
 pub use injection::{
     InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
-    loftq_initialize, pissa_initialize,
+    loftq_initialize, oft_initialize, pissa_initialize,
 };
 pub use loss::cross_entropy_loss;
 pub use lr_schedule::CosineWarmupSchedule;
@@ -94,7 +95,7 @@ pub use omnigrad::{OmniGradConfig, OmniGradRouter};
 pub use ops::{
     AddArgs, FakeQuantInt4Args, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora,
     fake_quant_int4_backward, fake_quant_int4_forward, lora_backward, matmul_backward,
-    scale_backward, vera_backward, vera_forward,
+    oft_backward, oft_forward, scale_backward, vera_backward, vera_forward,
 };
 pub use param::{ParamId, TrainableParam, TrainableParams};
 pub use preference_loss::{

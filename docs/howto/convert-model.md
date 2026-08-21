@@ -71,6 +71,15 @@ When converting, you will see a progress bar and metadata about the conversion:
 [grim] conversion complete
 ```
 
+## Quantization
+
+Grim provides two primary entry points for quantizing and converting models:
+
+- **One-Shot Conversion (`grim convert`)**: Converts a GGUF checkpoint directly to `.grim` format with target bits-per-weight quantization in a single command (`grim convert -i model.gguf -o model.grim --target-bpw 4.0`).
+- **Full Evolutionary Pipeline (`grim oxidizer convert`)**: Offers multi-phase importance calibration (`calibrate`), optimal tensor bit-allocation search (`search`), and fused artifact authoring (`convert`).
+
+---
+
 ## What Can Go Wrong
 
 - **Invalid model format**: Grim may reject unsupported or corrupted files. **Recovery**: Ensure you are using a valid, intact `.gguf` or supported format file.
