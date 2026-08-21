@@ -2344,6 +2344,7 @@ dependencies = [
  "grim-models-vision",
  "grim-nn",
  "grim-plugin",
+ "grim-quant",
  "grim-scheduler",
  "grim-speculative",
  "grim-tensor",
@@ -2556,6 +2557,8 @@ dependencies = [
  "grim-nn",
  "grim-tensor",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

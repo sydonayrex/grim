@@ -13,6 +13,8 @@ rocm = ["rocm-mem"]
 [dependencies]
 grim-tensor = { workspace = true }
 rayon = "1.12"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [lib]
 name = "grim_quant"
