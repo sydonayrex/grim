@@ -536,6 +536,22 @@ impl Engine {
         self.adapters.values().find(|a| a.name == name)
     }
 
+    /// Fresh adapter id: max existing + 1. (`adapter_count() + 1` would reuse
+    /// ids freed by `drop_adapter`, silently aliasing stale references.)
+    pub fn next_adapter_id(&self) -> u32 {
+        self.adapters.keys().copied().max().unwrap_or(0) + 1
+    }
+
+    /// The model a new adapter should attach to by default: the engine's
+    /// default model if set, else the first registered one.
+    pub fn default_model_name(&self) -> Option<&str> {
+        if let Some(default) = self.models.get("default") {
+            let _ = default;
+            return Some("default");
+        }
+        self.models.keys().next().map(String::as_str)
+    }
+
     /// Returns a list of loaded model names.
     pub fn loaded_models(&self) -> Vec<String> {
         self.models.keys().cloned().collect()

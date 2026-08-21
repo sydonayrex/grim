@@ -4,7 +4,7 @@ Grim is a pure-Rust neural network inference and fine-tuning engine supporting a
 
 ## Workspace Structure
 
-The workspace contains 28 crates organized into five functional layers:
+The workspace is organized into five functional layers:
 
 - **Foundation Layer** (`grim-tensor`, `grim-tensor-graph`, `grim-quant`, `grim-format`): Tensors, quantization codecs (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, FP8, MXFP4), and container file I/O (GGUF, SafeTensors, `.grim`).
 - **Backend Layer** (`grim-backend-cpu`, `grim-backend-rocm`, `grim-backend-cuda`, `grim-backend-vulkan`, `grim-backend-metal`): Hardware execution engines and vendor runtime bindings.

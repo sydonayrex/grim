@@ -782,9 +782,7 @@ impl BackendDevice for CpuDevice {
                     let qslice: Vec<f32> = (0..head_dim)
                         .map(|d| qd[t * num_head_dims + h * head_dim + d])
                         .collect();
-                    let k0: Vec<f32> = (0..head_dim)
-                        .map(|d| kd[kvh * head_dim + d])
-                        .collect();
+                    let k0: Vec<f32> = (0..head_dim).map(|d| kd[kvh * head_dim + d]).collect();
                     let k1: Vec<f32> = (0..head_dim)
                         .map(|d| kd[1 * kv_stride + kvh * head_dim + d])
                         .collect();
@@ -1173,9 +1171,7 @@ impl BackendDevice for CpuDevice {
                     let qslice: Vec<f32> = (0..head_dim)
                         .map(|d| qd[t * num_head_dims + h * head_dim + d])
                         .collect();
-                    let k0: Vec<f32> = (0..head_dim)
-                        .map(|d| kd[kvh * head_dim + d])
-                        .collect();
+                    let k0: Vec<f32> = (0..head_dim).map(|d| kd[kvh * head_dim + d]).collect();
                     let k1: Vec<f32> = (0..head_dim)
                         .map(|d| kd[1 * kv_stride + kvh * head_dim + d])
                         .collect();

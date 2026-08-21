@@ -627,6 +627,7 @@ fn roc_mdevice_info_serializes_name_fields() {
         xnack_enabled: false,
         compute_units: 84,
         max_threads_per_block: 1024,
+        gpu_busy_percent: 25,
     };
     assert_eq!(info.ordinal, 0);
     assert_eq!(info.wavefront_size, 32);

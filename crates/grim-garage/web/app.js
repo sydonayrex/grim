@@ -159,7 +159,7 @@ document.addEventListener('DOMContentLoaded', () => {
               <div class="vram-bar-container" style="height: 6px;">
                 <div class="vram-bar" style="width: ${pct.toFixed(1)}%;"></div>
               </div>
-              <div class="vram-text" style="font-size: 10px; margin-top: 2px; color: var(--text-muted);">${usedGb} GB / ${totalGb} GB VRAM</div>
+              <div class="vram-text" style="font-size: 10px; margin-top: 2px; color: var(--text-muted);">${usedGb} GB / ${totalGb} GB VRAM · ${Number(d.gpu_busy_percent || 0)}% util</div>
             `;
             telemetryList.appendChild(item);
           });

@@ -25,14 +25,8 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::q2k_gemm::KERNEL_SOURCE);
     #[cfg(feature = "q3k")]
     s.push_str(crate::kernels::q3k_gemm::KERNEL_SOURCE);
-    s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);
     s.push_str(crate::kernels::fp8_gemm_rdna4::KERNEL_SOURCE);
-    s.push_str(crate::kernels::mxfp_standalone::KERNEL_SOURCE);
-    s.push_str(crate::kernels::mxfp4_gemm::KERNEL_SOURCE);
-    s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
-    #[cfg(feature = "q4k")]
-    s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
-    s.push_str(crate::kernels::iq_dequant::KERNEL_SOURCE);
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
     s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);

@@ -31,6 +31,9 @@ pub struct RocmDeviceInfo {
     /// Currently allocated / used VRAM size in bytes.
     #[serde(default)]
     pub vram_used_bytes: u64,
+    /// Live GPU utilization percent (sysfs `gpu_busy_percent`; 0 when absent).
+    #[serde(default)]
+    pub gpu_busy_percent: u32,
     /// Wavefront / Warp execution width (32 for RDNA / NVIDIA Warp, 64 for CDNA).
     pub wavefront_size: u32,
     /// Whether WMMA (Wave Matrix Multiply Accumulate) tensor hardware is present.
@@ -255,6 +258,44 @@ pub fn query_amd_vram_used(ordinal: u32) -> u64 {
     0
 }
 
+/// Query live AMD GPU busy percent from the sysfs gpu_busy_percent interface.
+/// Returns 0 when unavailable (non-Linux, iGPU without the node) — the panel
+/// then simply shows 0% rather than pretending telemetry is absent.
+pub fn query_amd_gpu_busy(ordinal: u32) -> u32 {
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        let mut busy: Vec<u32> = Vec::new();
+        let mut card_paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| {
+                        n.to_string_lossy().starts_with("card")
+                            && !n.to_string_lossy().contains('-')
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        card_paths.sort();
+
+        for path in card_paths {
+            let vendor_path = path.join("device/vendor");
+            if let Ok(v_str) = std::fs::read_to_string(&vendor_path) {
+                if v_str.trim().eq_ignore_ascii_case("0x1002") {
+                    let busy_path = path.join("device/gpu_busy_percent");
+                    if let Ok(b_str) = std::fs::read_to_string(&busy_path) {
+                        if let Ok(pct) = b_str.trim().parse::<u32>() {
+                            busy.push(pct);
+                        }
+                    }
+                }
+            }
+        }
+        return busy.get(ordinal as usize).copied().unwrap_or(0);
+    }
+    0
+}
+
 /// Helper to map AMD GCN / RDNA / CDNA target architecture strings to family names.
 pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
     let arch_lower = gcn_arch.to_lowercase();
@@ -433,6 +474,7 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
             gcn_arch: String::new(),
             vram_bytes: 8_589_934_592,
             vram_used_bytes: 0,
+            gpu_busy_percent: 0,
             wavefront_size: 32,
             wmma_supported: true,
             mfma_supported: false,
@@ -468,6 +510,7 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
                 dev.name = friendly;
                 dev.gcn_arch = full_arch;
                 dev.vram_used_bytes = query_amd_vram_used(ordinal);
+                dev.gpu_busy_percent = query_amd_gpu_busy(ordinal);
                 dev.wmma_supported = is_w32 || is_cdna;
                 dev.mfma_supported = is_w64 || is_cdna;
                 dev.xnack_enabled = is_cdna;
@@ -556,6 +599,7 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
         dev.name = friendly;
         dev.gcn_arch = full_arch;
         dev.vram_used_bytes = query_amd_vram_used(ordinal);
+        dev.gpu_busy_percent = query_amd_gpu_busy(ordinal);
         dev.wmma_supported = is_w32 || is_cdna;
         dev.mfma_supported = is_w64 || is_cdna;
         dev.xnack_enabled = is_cdna;
@@ -594,6 +638,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
             gcn_arch: arch,
             vram_bytes: vram_total_bytes,
             vram_used_bytes,
+            gpu_busy_percent: 0,
             wavefront_size: 32,
             wmma_supported: false,
             mfma_supported: false,
@@ -655,6 +700,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                             gcn_arch: arch,
                             vram_bytes: 8_589_934_592u64,
                             vram_used_bytes: 0,
+                            gpu_busy_percent: 0,
                             wavefront_size: 32,
                             wmma_supported: false,
                             mfma_supported: false,
@@ -686,6 +732,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                             gcn_arch: arch,
                             vram_bytes: 0,
                             vram_used_bytes: 0,
+                            gpu_busy_percent: 0,
                             wavefront_size: 0,
                             wmma_supported: false,
                             mfma_supported: false,
@@ -723,6 +770,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                     gcn_arch: full_arch,
                     vram_bytes: 8_589_934_592,
                     vram_used_bytes: query_amd_vram_used(ordinal),
+                    gpu_busy_percent: query_amd_gpu_busy(ordinal),
                     wavefront_size,
                     wmma_supported: wavefront_size == 32,
                     mfma_supported: wavefront_size == 64,
@@ -760,6 +808,7 @@ mod tests {
             gcn_arch: detect_nvidia_arch("NVIDIA GeForce RTX 4070 Laptop GPU"),
             vram_bytes: 8 * 1024 * 1024 * 1024,
             vram_used_bytes: 0,
+            gpu_busy_percent: 0,
             wavefront_size: 32,
             wmma_supported: false,
             mfma_supported: false,

@@ -15,7 +15,7 @@ oversights — they are per-request or config concerns:
   explicitly via `POST /v1/models/load`.
 - **Backend**: `GRIM_BACKEND` env var or `grim.toml`.
 - **Sampling** (`temperature`, `top-p`, `top_k`): per-request JSON body fields,
-  or `grim run`'s `--temperature` / `--top-p` / `--top_k` for one-shot CLI use.
+  or `grim run`'s `--temperature` / `--top-p` / `--top-k` for one-shot CLI use.
 - **Threads / batch size / KV cache**: `grim.toml` `[server]` and `[scheduler]`
   keys plus `GRIM_CONTEXT` / `GRIM_MEM_BUDGET_MIB` (see `configuration.md`).
 
@@ -49,7 +49,7 @@ One-shot inference or HTTP serving for a model.
 | `--rocml-profile` | - | None | No |
 | `--temperature` | - | `0.7` | No |
 | `--top-p` | - | `0.9` | No |
-| `--top_k` | - | `40` | No |
+| `--top-k` | - | `40` | No |
 | `--max-tokens` | - | `256` | No |
 | `--seed` | - | `0` (random) | No |
 | `--device` | - | None | No |
@@ -130,25 +130,19 @@ Log in to a registry or cloud provider.
 | `provider` | - | (required) | Yes |
 | `--token` | `-t` | (prompt if absent) | No |
 
-## `grim quantize`
-
-Stub command. It performs no quantization; it prints pointers to the commands
-that do: `grim convert -i <in.gguf> -o <out.grim> --target-bpw 4.0` for the
-one-shot path, or `grim oxidizer convert` for the full calibrate → search →
-write pipeline. There is no `--dtype` flag and no `grim oxidize` subcommand.
-
-No arguments.
-
 ## `grim convert`
 
-Convert a model file to ROCm-optimized .grim format using Oxidizer.
+Convert a model file to ROCm-optimized .grim format using Oxidizer. Quantization
+is part of conversion and is controlled with `--target-bpw`; for the full
+calibrate → search → write pipeline use `grim oxidizer convert`. There is no
+separate `grim quantize` command.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
 | `--input` | `-i` | (required) | Yes |
 | `--output` | `-o` | (required) | Yes |
 | `--target` | `-t` | `auto` | No |
-| `--target_bpw` | - | `4.0` | No |
+| `--target-bpw` | - | `4.0` | No |
 | `--generations` | - | `50` | No |
 | `--dataset` | - | None | No |
 
@@ -165,22 +159,22 @@ Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
 | `--lr` | - | `2e-4` | No |
 | `--rank` | - | `16` | No |
 | `--alpha` | - | `32.0` | No |
-| `--batch_size` | - | `2048` | No |
-| `--gradient_accumulation_steps` | - | `1` | No |
-| `--warmup_steps` | - | `0` | No |
-| `--logging_steps` | - | `0` | No |
-| `--max_grad_norm` | - | `1.0` | No |
-| `--early_stopping_patience` | - | `0` | No |
-| `--num_gpus` | - | `1` | No |
+| `--batch-size` | - | `2048` | No |
+| `--gradient-accumulation-steps` | - | `1` | No |
+| `--warmup-steps` | - | `0` | No |
+| `--logging-steps` | - | `0` | No |
+| `--max-grad-norm` | - | `1.0` | No |
+| `--early-stopping-patience` | - | `0` | No |
+| `--num-gpus` | - | `1` | No |
 | `--device` | - | `cpu` | No |
 | `--mode` | - | `qlora` | No |
-| `--echo_mode` | - | false | No |
+| `--echo-mode` | - | false | No |
 | `--optimizer` | - | `adamw` | No |
 | `--scheduler` | - | `cosine-warmup` | No |
 | `--seed` | - | `0` (random) | No |
-| `--use_pissa` | - | false | No |
-| `--use_olora` | - | false | No |
-| `--olora_lambda` | - | `1.0` | No |
+| `--use-pissa` | - | false | No |
+| `--use-olora` | - | false | No |
+| `--olora-lambda` | - | `1.0` | No |
 
 ## `grim cp`
 
@@ -277,7 +271,7 @@ Run EvoPress evolutionary search on pre-computed importance scores.
 |---|---|---|---|
 | `scores_path` | - | (required) | Yes |
 | `tensor_sizes` | - | (required) | Yes |
-| `--target_bpw` | - | `4.0` | No |
+| `--target-bpw` | - | `4.0` | No |
 | `--generations` | - | `50` | No |
 
 ### `grim oxidizer convert`
@@ -288,7 +282,7 @@ Full convert pipeline: calibrate → search → write .grim.
 |---|---|---|---|
 | `model` | - | (required) | Yes |
 | `--output` | `-o` | (required) | Yes |
-| `--target_bpw` | - | `4.0` | No |
+| `--target-bpw` | - | `4.0` | No |
 | `--generations` | - | `50` | No |
 | `--profile` | - | None | No |
 | `--dataset` | - | None | No |
@@ -301,7 +295,7 @@ Raven FP8/MXFP4 repack pipeline: rewrite model tensors into FP8 format.
 |---|---|---|---|
 | `model` | - | (required) | Yes |
 | `--output` | `-o` | (required) | Yes |
-| `--target_bpw` | - | `8.0` | No (optional) |
+| `--target-bpw` | - | `8.0` | No (optional) |
 | `--dataset` | - | None | No |
 
 ### `grim oxidizer prepare`
@@ -336,26 +330,23 @@ Re-verify every claim Grim makes about itself (§13.5). Checks: unit on disk, OS
 |---|---|---|---|
 | `--model` | `-m` | None | No (runs VRAM pre-flight estimation and codec check on target model file) |
 | `--addr` | - | `127.0.0.1:11434` | No |
-| `--service_name` | - | `grim` | No |
-| `--exec_path` | - | `/usr/local/bin/grim` | No |
-| `--config_path` | - | `/etc/grim/grim.toml` | No |
+| `--service-name` | - | `grim` | No |
+| `--exec-path` | - | `/usr/local/bin/grim` | No |
+| `--config-path` | - | `/etc/grim/grim.toml` | No |
 
-## `grim accept`
+## `grim arch-plugin`
 
-Validate and install a model architecture plugin into system plugin directory.
+Generate and install an architecture compatibility plugin (`.grimplugin`) from
+a HuggingFace model repo. Fetches `config.json` via the HF Hub API, validates
+the required fields, and installs the plugin into the grim plugins directory,
+where the model loader discovers it at load time.
 
-| Argument | Required |
-|---|---|
-| `plugin_path` | Yes |
+Subcommand: `generate` (there are no `grim accept` or `grim compat` commands).
 
-## `grim compat`
-
-Generate a model architecture compatibility plugin from a HuggingFace config.json.
-
-| Flag | Short | Default | Required |
+| Argument / Flag | Short | Default | Required |
 |---|---|---|---|
-| `--config_path` | `-c` | (required) | Yes |
-| `--output` | `-o` | stdout | No |
+| `model_id` (positional, `generate`) | - | (required) | Yes — `hf:org/repo` reference |
+| `--output` (`generate`) | `-o` | `{model_type}.grimplugin` in the plugins dir | No |
 
 ## `grim verify`
 

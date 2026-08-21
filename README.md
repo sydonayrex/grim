@@ -22,7 +22,9 @@ git clone https://github.com/Nelsk/Grim.git
 cd Grim
 cargo build --release
 cargo test --workspace
-./target/release/grim serve
+# Build artifact is `grim-cli`; installing it as `grim` is shown in
+# docs/howto/install-grim.md (cp target/release/grim-cli /usr/local/bin/grim).
+./target/release/grim-cli serve
 ```
 
 ## Workspace Map

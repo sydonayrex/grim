@@ -100,6 +100,15 @@ impl Default for PluginKind {
         PluginKind::Wasm
     }
 }
+/// Capability grants for a plugin (§6.4, deny-by-default: all fields off).
+///
+/// Two manifest forms feed this struct:
+/// - legacy inline: `[plugin.grants] network = true, filesystem = ["models/"]`
+/// - scoped: `[grants] filesystem = true` + `[scopes] allowed_dirs = ["models/"]`
+///
+/// `filesystem` holds the effective scope — the exact directories that would
+/// be WASI-preopened for the plugin. It is only non-empty when a grant
+/// explicitly names its scopes.
 #[derive(Debug, Clone, Default)]
 pub struct PluginGrants {
     pub network: bool,
@@ -291,6 +300,50 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
             }
+        }
+    }
+
+    // Top-level [grants] / [scopes] form (§6.4). Grants are additive with the
+    // legacy [plugin.grants] table above. A `filesystem = true` grant must
+    // name its scopes: an unrestricted filesystem grant is rejected here, at
+    // plugin-load time, rather than silently degrading to a trap later.
+    if let Some(grants_tbl) = tbl.get("grants").and_then(|v| v.as_table()) {
+        if grants_tbl
+            .get("network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            grants.network = true;
+        }
+        if grants_tbl
+            .get("filesystem")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let allowed_dirs = tbl
+                .get("scopes")
+                .and_then(|v| v.as_table())
+                .and_then(|s| s.get("allowed_dirs"))
+                .and_then(|v| v.as_array())
+                .map(|arr| -> Result<Vec<String>> {
+                    arr.iter()
+                        .map(|v| {
+                            v.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                                grim_tensor::Error::Backend(
+                                    "scopes.allowed_dirs entries must be strings".into(),
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if allowed_dirs.is_empty() {
+                return Err(grim_tensor::Error::Backend(format!(
+                    "plugin '{name}': filesystem grant requires [scopes].allowed_dirs in plugin.grim.toml"
+                )));
+            }
+            grants.filesystem.extend(allowed_dirs);
         }
     }
 

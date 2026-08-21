@@ -36,7 +36,7 @@ cd Grim
 
 ## Step 2: Build the project
 
-Build all 29 crates in release mode:
+Build every workspace crate in release mode:
 
 ```bash
 cargo build --release
@@ -68,10 +68,12 @@ cargo test -p grim-engine
 
 ### Running GPU tests (ROCm)
 
-GPU tests require the `GRIM_RUN_GPU_TESTS` environment variable:
+GPU tests are gated behind the `GRIM_RUN_GPU_TESTS` environment variable. The
+canonical incantation (matching the shipping build, which compiles the ROCm
+backend with `cubecl`):
 
 ```bash
-GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter
+GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features cubecl
 ```
 
 ### Running a single test by name
@@ -94,7 +96,7 @@ cargo test -p <crate-name>
 
 ```
 grim/
-├── Cargo.toml              # Workspace definition (29 crates)
+├── Cargo.toml              # Workspace manifest (all workspace members)
 ├── crates/                 # Individual crates
 │   ├── grim-tensor/        # Core tensor abstractions (DType, Device, Shape)
 │   ├── grim-tensor-graph/  # Fusion patterns for tensor operations
@@ -165,7 +167,6 @@ codegen-units = 1
 
 Key feature flags:
 
-- `rocm` - Enables the ROCm backend
 - `rocm` - Enables the ROCm backend (workspace-level)
 - `rocm-aiter` - ROCm AI tensor operations (grim-backend-rocm)
 - `rocm-profile` - ROCm profiling support (grim-backend-rocm)
@@ -219,4 +220,4 @@ Maintainer Status: Actively maintained. Please see the GitHub repository for the
 | Format check | `cargo fmt --check` |
 | Run specific crate tests | `cargo test -p <crate-name>` |
 | Enable ROCm features | `cargo build --features rocm` |
-| Run GPU tests | `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter,rccl` |
+| Run GPU tests | `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features cubecl` |

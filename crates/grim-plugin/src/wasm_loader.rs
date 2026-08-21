@@ -6,14 +6,17 @@
 //!
 //! Grant enforcement (§6.4, deny-by-default):
 //!   Every WASM plugin starts with **no** host imports linked. Capabilities
-//!   are added only when the manifest's `[plugin.capabilities.grants]` block
-//!   explicitly enables them:
+//!   are added only when the manifest's grants block (`[plugin.grants]` or
+//!   top-level `[grants]` + `[scopes]`) explicitly enables them:
 //!     - `network = false` (default) → no WASI socket imports linked.
 //!     - `filesystem = []` (default) → no WASI filesystem imports linked.
 //!     - `request_metadata = false` (default) → no grim host-call for request
 //!       metadata linked.
-//!   A plugin that calls an unlinked import traps at runtime with a clear
-//!   `missing import` error rather than being silently permitted.
+//!   A plugin that calls an unlinked import traps at instantiation with a
+//!   clear `unknown import` error rather than being silently permitted.
+//!   A grant that this build cannot honor (the wasmtime dependency carries
+//!   no WASI implementation, so no preopens or sockets can ever be linked)
+//!   is rejected at plugin-load time — loudly, never as a silent trap.
 
 use crate::{PluginGrants, PluginLimits};
 use grim_core::Sampler;
@@ -90,14 +93,48 @@ impl WasmPluginLoader {
 
     /// Create a sampler from WASM bytes, enforcing all manifest grants.
     ///
-    /// Grant enforcement: the Wasmtime `Linker` is built with only the host
-    /// functions that `self.grants` permits. Any import the plugin calls that
-    /// was not linked will trap at instantiation time with a
-    /// `"missing import"` error — the plugin cannot silently bypass the
+    /// Grant enforcement: a grant this build cannot link (network,
+    /// filesystem, request_metadata — none have host implementations here)
+    /// is rejected with a clear error at plugin-load time. Otherwise the
+    /// Wasmtime `Linker` is built with no host functions at all, so any
+    /// import the module declares traps at instantiation time with an
+    /// `"unknown import"` error — the plugin cannot silently bypass the
     /// sandbox by calling an unlinked function.
     #[cfg(feature = "wasm-sandbox")]
     pub fn create_sampler(&self, wasm_bytes: &[u8]) -> Result<Arc<dyn Sampler>> {
         use wasmtime::{Config, Engine as WasmtimeEngine, Linker, Module, Store};
+
+        // ----- Grant validation (before any compilation: fail at load) -----
+        // Deny-by-default grants are correct with an empty linker — a plugin
+        // importing WASI then traps at instantiation with wasmtime's
+        // "unknown import" error. But a *granted* capability that this build
+        // cannot link must not degrade to that same trap (the plugin author
+        // asked for a real capability and silently got nothing), so it errors
+        // here instead. The wasmtime dependency carries no WASI
+        // implementation (no wasi-common / wasmtime-wasi), so network and
+        // filesystem grants can never be linked in this build.
+        if self.grants.network {
+            return Err(Error::Backend(format!(
+                "plugin '{}': network grant cannot be honored — this build links no \
+                 WASI socket imports; remove the network grant from plugin.grim.toml",
+                self.name
+            )));
+        }
+        if !self.grants.filesystem.is_empty() {
+            return Err(Error::Backend(format!(
+                "plugin '{}': filesystem grant for {:?} cannot be honored — this build \
+                 links no WASI preopens; remove the filesystem grant from plugin.grim.toml",
+                self.name, self.grants.filesystem
+            )));
+        }
+        if self.grants.request_metadata {
+            return Err(Error::Backend(format!(
+                "plugin '{}': request_metadata grant cannot be honored — no grim host \
+                 interface is linked in this build; remove the request_metadata grant \
+                 from plugin.grim.toml",
+                self.name
+            )));
+        }
 
         let mut config = Config::new();
         config.max_wasm_stack(1048576); // 1 MB default
@@ -124,67 +161,14 @@ impl WasmPluginLoader {
                 .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
         }
 
-        // Build the linker. Start with nothing linked — deny-by-default.
+        // Build the linker. Nothing is linked — deny-by-default. Grants were
+        // validated above: reaching here means every grant is off, so any
+        // import the module declares (WASI filesystem, sockets, grim host
+        // calls) is left unlinked. This is where granted scopes would be
+        // linked as WASI preopens once the dependency set carries a WASI
+        // implementation (`wasmtime-wasi`), preopening exactly
+        // `grants.filesystem` and nothing else.
         let linker: Linker<()> = Linker::new(&engine);
-
-        // ----- Network capability -----
-        // Only link WASI socket/network interfaces if the manifest explicitly
-        // grants network access. A plugin that calls sockets without the grant
-        // will trap at instantiation with "missing import" — visible to the
-        // operator, not silently permitted.
-        if self.grants.network {
-            eprintln!(
-                "[WasmPluginLoader] plugin '{}': network grant ACTIVE \
-                 (WASI socket imports linked)",
-                self.name
-            );
-            // In a real wasmtime-wasi integration, wasi_nn or wasi_sockets
-            // imports would be added here. The stub records the decision.
-        } else {
-            eprintln!(
-                "[WasmPluginLoader] plugin '{}': network grant DENIED \
-                 (WASI socket imports NOT linked — any socket call will trap)",
-                self.name
-            );
-        }
-
-        // ----- Filesystem capability -----
-        // Only link WASI preopens for paths explicitly listed in the manifest's
-        // `filesystem` array. An empty list means no filesystem access at all.
-        if self.grants.filesystem.is_empty() {
-            eprintln!(
-                "[WasmPluginLoader] plugin '{}': filesystem grant DENIED \
-                 (no preopens linked — any file open will trap)",
-                self.name
-            );
-        } else {
-            for path in &self.grants.filesystem {
-                eprintln!(
-                    "[WasmPluginLoader] plugin '{}': filesystem grant ACTIVE for path '{}'",
-                    self.name, path
-                );
-                // In a real integration: add a WASI preopen for this path
-                // to the linker's store context. Stub records the decision.
-            }
-        }
-
-        // ----- Request metadata capability -----
-        // The grim host-call `grim::request::metadata` is only linked when
-        // the manifest enables it. Without it the function is missing from
-        // the import namespace and any call traps immediately.
-        if self.grants.request_metadata {
-            eprintln!(
-                "[WasmPluginLoader] plugin '{}': request_metadata grant ACTIVE",
-                self.name
-            );
-            // Real integration: linker.func_wrap("grim", "request_metadata", ...)
-        } else {
-            eprintln!(
-                "[WasmPluginLoader] plugin '{}': request_metadata grant DENIED \
-                 (host call NOT linked)",
-                self.name
-            );
-        }
 
         // Instantiate — any unlinked import causes a trap here, not at call time.
         // This is the correct place to fail: before the plugin runs any user code.

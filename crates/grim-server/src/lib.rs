@@ -1164,10 +1164,52 @@ async fn chat_completions(
     // before the streaming / non-streaming split.  If the tokenizer
     // carries a Jinja chat template, use it; otherwise fall back to the
     // last message's content (best-effort, pre-existing behaviour).
+    //
+    // OpenAI multimodal shape: `content` may be a plain string OR an array
+    // of typed parts. Text parts are concatenated into the prompt content;
+    // image parts are counted and rejected with 422 unless the loaded model
+    // actually has a vision encoder — never silently dropped.
     let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
+    let mut image_parts: usize = 0;
     if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
         for (idx, v) in arr.iter().enumerate() {
-            match serde_json::from_value(v.clone()) {
+            let normalized = match v.get("content").and_then(|c| c.as_array()) {
+                Some(parts) => {
+                    let mut text = String::new();
+                    let mut images = 0usize;
+                    for p in parts {
+                        match p.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(t);
+                                }
+                            }
+                            Some("image_url") => images += 1,
+                            other => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(request_error(
+                                        ErrorCode::UnknownField,
+                                        &format!(
+                                            "malformed message at index {idx}: unsupported content part type {other:?} (expected text or image_url)"
+                                        ),
+                                    )),
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                    image_parts += images;
+                    let mut norm = v.clone();
+                    norm["content"] = serde_json::Value::String(text);
+                    norm
+                }
+                None => v.clone(),
+            };
+            match serde_json::from_value(normalized) {
                 Ok(msg) => messages.push(msg),
                 Err(e) => {
                     return (
@@ -1193,6 +1235,22 @@ async fn chat_completions(
                 body["error"]["messages"] = serde_json::json!([]);
                 body
             }),
+        )
+            .into_response();
+    }
+    // Image parts are only servable by a model whose modality hint includes
+    // vision. No such model is loadable in the serving path today, so this
+    // fires for every image request until a vision encoder is wired — an
+    // honest 422 beats silently generating text-only output.
+    if image_parts > 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(request_error(
+                ErrorCode::InvalidRequest,
+                &format!(
+                    "request contains {image_parts} image part(s) but the loaded model has no vision encoder; pass text-only content or load a vision model"
+                ),
+            )),
         )
             .into_response();
     }
@@ -1254,6 +1312,14 @@ async fn chat_completions(
             .unwrap_or_default();
         if tokens.is_empty() { vec![1] } else { tokens }
     };
+    if std::env::var("GRIM_DEBUG_PROMPT").as_deref() == Ok("1") {
+        eprintln!(
+            "[grim-server] prompt tokens ({}): {:?}\n[grim-server] prompt text: {:?}",
+            prompt_tokens.len(),
+            prompt_tokens,
+            prompt_text
+        );
+    }
 
     // P0-3.2: Vocab size for clamping sampled tokens into the model's actual
     // range. The engine's internal logits table is fixed at 65536 entries; a
@@ -2103,7 +2169,7 @@ async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
             "error": {
                 "type": "not_implemented",
                 "capability": "embeddings",
-                "message": "Embeddings endpoint is not yet implemented."
+                "message": "no embedding model is loaded; embeddings require a text-embedding or vision-encoder model — load one via POST /v1/models/load (the embeddings pipeline is not wired in this build)"
             }
         })),
     )
@@ -2122,7 +2188,7 @@ async fn audio_transcriptions() -> (StatusCode, Json<serde_json::Value>) {
             "error": {
                 "type": "not_implemented",
                 "capability": "audio_transcription",
-                "message": "Audio transcription endpoint is not yet implemented."
+                "message": "no ASR model is loaded; transcription requires a Whisper-family GGUF — load one via POST /v1/models/load (the ASR pipeline is not wired in this build)"
             }
         })),
     )
@@ -2142,7 +2208,7 @@ async fn images_generations() -> (StatusCode, Json<serde_json::Value>) {
             "error": {
                 "type": "not_implemented",
                 "capability": "image_generation",
-                "message": "Image generation endpoint is not yet implemented."
+                "message": "no diffusion model is loaded; generation requires a UNet/DDIM checkpoint — load one via POST /v1/models/load (the diffusion pipeline is not wired in this build)"
             }
         })),
     )
@@ -2307,7 +2373,6 @@ async fn load_model(
     let resolved_path = grim_core::catalog::resolve_model_preferring_grim(&req.model);
 
     let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-    let device = grim_tensor::Device::Cpu;
 
     let model_path = match resolved_path {
         Some(p) => p,
@@ -2336,19 +2401,11 @@ async fn load_model(
     } else {
         "gguf"
     };
-    match model_loader::load_from_path(&model_path_str).or_else(|_| {
-        // Defensive: load_from_path already handles .grim/.gguf routing on
-        // modern engines. fall back to the explicit GGUF loader for older
-        // binaries that did not implement the dispatch.
-        if model_path_str.ends_with(".gguf") {
-            model_loader::load_model_from_gguf(&model_path_str, device)
-        } else {
-            Err(grim_core::error::Error::Config(format!(
-                "unsupported model extension for '{}'",
-                model_path_str
-            )))
-        }
-    }) {
+    // No CPU-retry fallback here: load_from_path owns device selection and
+    // hard-errors when an explicitly requested backend (GRIM_BACKEND /
+    // GRIM_FORCE_DEVICE) is unavailable — retrying on a hardcoded CPU device
+    // would silently defeat that guard (WS-E1).
+    match model_loader::load_from_path(&model_path_str) {
         Ok(m) => {
             // Tokenizer lives in GGUF metadata; if a .grim is the primary model,
             // try a sibling .gguf for the tokenizer.
@@ -2466,46 +2523,154 @@ async fn unload_adapter(
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct LoadAdapterRequest {
+    /// Human-readable name used in per-request `"adapters": [..]` routing.
     name: String,
+    /// Sidecar written by `grim train` (`*.grim.train`). Required — this
+    /// endpoint never fabricates weights.
+    path: String,
+    /// Base model the adapter targets; defaults to the default/first loaded.
     #[serde(default)]
     base_model: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    rank: Option<usize>,
 }
 
+/// Load a trained LoRA sidecar (`grim train` output) and register it for
+/// per-request routing WITHOUT an engine restart.
+///
+/// Runtime LoRA application (`lora.rs::apply_adapters_to_logits`) applies
+/// adapter pairs to the logits projection. Sidecars whose pairs target
+/// per-layer projections (Q/K/V/O/Gate/Up/Down — the standard QLoRA sites)
+/// cannot be applied at runtime by that path; for those this endpoint
+/// returns 409 with a per-tensor breakdown and the `grim merge` bake path,
+/// rather than registering inert weights and pretending success.
 async fn load_adapter_endpoint(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LoadAdapterRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut engine = state.lock_engine();
-    let base_model = payload.base_model.unwrap_or_else(|| "default".into());
-    let next_id = (engine.adapter_count() as u32) + 1;
-    let rank = payload.rank.unwrap_or(16);
-    let a = grim_backend_cpu::cpu_tensor(
-        vec![0.01f32; 4096 * rank],
-        grim_tensor::Shape::new(vec![rank, 4096]),
-    );
-    let b = grim_backend_cpu::cpu_tensor(
-        vec![0.01f32; 4096 * rank],
-        grim_tensor::Shape::new(vec![4096, rank]),
-    );
-    let handle = grim_core::model::AdapterHandle {
-        id: next_id,
-        a,
-        b,
-        alpha: 1.0,
+    let sidecar = std::path::Path::new(&payload.path);
+    if !sidecar.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "sidecar_not_found",
+                    "message": format!("adapter sidecar '{}' not found", payload.path)
+                }
+            })),
+        );
+    }
+    let train_state = match grim_format::train::TrainState::read(sidecar) {
+        Ok(Some(ts)) => ts,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "sidecar_not_found",
+                        "message": format!("adapter sidecar '{}' is empty or truncated", payload.path)
+                    }
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "invalid_sidecar",
+                        "message": format!("failed to read sidecar '{}': {e}", payload.path)
+                    }
+                })),
+            );
+        }
     };
-    engine.register_adapter(&base_model, &payload.name, handle);
+
+    let mut engine = state.lock_engine();
+    let base_model = payload
+        .base_model
+        .clone()
+        .or_else(|| engine.default_model_name().map(str::to_string));
+    let Some(base_model) = base_model else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "no_base_model",
+                    "message": "load a base model first (POST /v1/models/load) or pass base_model"
+                }
+            })),
+        );
+    };
+
+    let mut applied: Vec<String> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    for tensor_name in train_state.lora_tensor_names() {
+        let Some((a_data, a_shape, b_data, b_shape)) = train_state.lora_weights_for(&tensor_name)
+        else {
+            skipped.push(serde_json::json!({
+                "tensor": tensor_name, "reason": "incomplete A/B pair in sidecar"
+            }));
+            continue;
+        };
+        // Runtime contract (lora.rs): A=[rank, in], B=[out, rank], applied at
+        // the logits projection. Per-layer projections (q_proj/k_proj/…)
+        // never fit that site regardless of shapes.
+        let is_layer_proj = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+        .iter()
+        .any(|p| tensor_name.contains(p));
+        let rank_match = a_shape.first() == b_shape.last();
+        if is_layer_proj || !rank_match {
+            skipped.push(serde_json::json!({
+                "tensor": tensor_name,
+                "reason": if is_layer_proj {
+                    "per-layer projection: bake with `grim merge <sidecar> <base>` (runtime LoRA applies to the logits projection only)"
+                } else {
+                    "A/B shapes do not form a [rank,in]x[out,rank] pair"
+                }
+            }));
+            continue;
+        }
+        let a = grim_backend_cpu::cpu_tensor(a_data, grim_tensor::Shape::from_slice(a_shape));
+        let b = grim_backend_cpu::cpu_tensor(b_data, grim_tensor::Shape::from_slice(b_shape));
+        // alpha=32 matches `grim merge`'s scale convention (32/rank).
+        let handle = grim_core::model::AdapterHandle {
+            id: engine.next_adapter_id(),
+            a,
+            b,
+            alpha: 32.0,
+        };
+        engine.register_adapter(&base_model, &payload.name, handle);
+        applied.push(tensor_name);
+    }
+
+    if applied.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "sidecar_not_runtime_loadable",
+                    "message": "sidecar contains no runtime-applicable pairs; bake it instead",
+                    "skipped": skipped,
+                    "bake_command": format!("grim merge {} <base-model>", payload.path)
+                }
+            })),
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "loaded",
             "name": payload.name,
-            "id": next_id,
             "base_model": base_model,
-            "path": payload.path
+            "applied_tensors": applied,
+            "skipped_tensors": skipped,
         })),
     )
 }
@@ -3741,19 +3906,52 @@ mod tests {
 
     #[tokio::test]
     async fn test_adapter_load_endpoint() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            grim_tensor::Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let mut train_state = grim_format::train::TrainState {
+            step: 1,
+            fp_format: grim_format::train::TrainFpFormat::Fp32,
+            dtypes: std::collections::HashMap::new(),
+            blobs: std::collections::HashMap::new(),
+        };
+        let a_bytes: Vec<u8> = vec![0u8; 8 * 512 * 4];
+        let b_bytes: Vec<u8> = vec![0u8; 32000 * 8 * 4];
+        train_state.add_blob("lm_head.lora_A.weight", vec![8, 512], a_bytes);
+        train_state.add_blob("lm_head.lora_B.weight", vec![32000, 8], b_bytes);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sidecar_path = temp_dir.path().join("adapter.grim.train");
+        train_state.write(&sidecar_path).unwrap();
+
         let state = Arc::new(AppState {
-            engine: Mutex::new(grim_engine::Engine::new(
-                grim_engine::EngineConfig::default(),
-            )),
+            engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
             plugin_registry: None,
         });
+
         let req = LoadAdapterRequest {
             name: "test-lora".into(),
-            base_model: Some("base".into()),
-            path: None,
-            rank: Some(8),
+            base_model: Some("default".into()),
+            path: sidecar_path.to_str().unwrap().to_string(),
         };
         let (status, resp) = load_adapter_endpoint(State(state.clone()), Json(req)).await;
         assert_eq!(status, StatusCode::OK);

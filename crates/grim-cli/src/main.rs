@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
 
+pub mod adapter;
 pub mod arch_plugin;
 pub mod bench;
 pub mod catalog;
@@ -426,6 +427,12 @@ enum Commands {
         /// Server address to query (defaults to 127.0.0.1:11434).
         #[arg(short, long, default_value = "127.0.0.1:11434")]
         addr: String,
+    },
+    /// Runtime LoRA adapter management against a live server (load/list/unload
+    /// without engine restart).
+    Adapter {
+        #[command(subcommand)]
+        cmd: adapter::AdapterCmd,
     },
     /// Verify model integrity, checksums, and catalog provenance.
     Provenance {
@@ -1236,6 +1243,9 @@ async fn main() -> Result<()> {
         }
         Commands::Scheduler { addr } => {
             scheduler::cmd_scheduler(&addr).await?;
+        }
+        Commands::Adapter { cmd } => {
+            adapter::cmd_adapter(cmd).await?;
         }
         Commands::Provenance { path } => {
             provenance::cmd_provenance(&path)?;

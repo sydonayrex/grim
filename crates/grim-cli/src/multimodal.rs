@@ -66,6 +66,9 @@ pub enum DiffusionCmd {
 }
 
 pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
+    // Every arm validates inputs against the real catalog and fails with a
+    // precise, actionable error. No arm prints a success banner for an
+    // unwired pipeline (registry item 1 in fit-it-damn-you.md §9).
     match cmd {
         MultimodalCmd::Vision { cmd } => match cmd {
             VisionCmd::Encode { image, model } => {
@@ -78,13 +81,23 @@ pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
                         image.display()
                     )));
                 }
-                println!(
-                    "\n[grim vision] Vision models (Qwen2-VL, CogVLM, Gemma-3N, Hunyuan-VL) are integrated in `grim-models-vision`."
-                );
-                println!(
-                    "[grim vision] HTTP Endpoint: POST /v1/chat/completions with image_url payload."
-                );
-                Ok(())
+                let resolved = grim_core::catalog::resolve_model_preferring_grim(&model)
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "vision model '{model}' not found in the catalog. The ViT/glimmer \
+                             encoders load from GGUF checkpoints via WeightSource::root; no \
+                             vision checkpoint with that name is installed. Pull one (e.g. a \
+                             CLIP/ViT GGUF) and retry."
+                        ))
+                    })?;
+                Err(Error::Config(format!(
+                    "vision encoder pipeline is not wired in this build: model '{model}' \
+                     resolved to '{}' but no ViT/glimmer forward is reachable from the CLI. \
+                     The encoder structs (grim-models-vision Vit::load + encode_image) are \
+                     real; wiring them to catalog checkpoints lands with the first vision \
+                     model release.",
+                    resolved.display()
+                )))
             }
         },
         MultimodalCmd::Audio { cmd } => match cmd {
@@ -98,11 +111,19 @@ pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
                         audio.display()
                     )));
                 }
-                println!(
-                    "\n[grim audio] Audio decoder integrated in `grim-models-audio` (WavTokenizer / Whisper layout)."
-                );
-                println!("[grim audio] HTTP Endpoint: POST /v1/audio/transcriptions.");
-                Ok(())
+                let resolved = grim_core::catalog::resolve_model_preferring_grim(&model)
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "ASR model '{model}' not found in the catalog. Transcription \
+                             requires a Whisper-family GGUF; pull one and retry."
+                        ))
+                    })?;
+                Err(Error::Config(format!(
+                    "ASR pipeline is not wired in this build: '{}' resolved but the Whisper \
+                     mel-encoder → decoder → detokenize path has no runtime caller. The \
+                     whisper structs are real; wiring lands with the first ASR model release.",
+                    resolved.display()
+                )))
             }
         },
         MultimodalCmd::Diffusion { cmd } => match cmd {
@@ -115,11 +136,19 @@ pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
                 println!("Prompt      : \"{prompt}\"");
                 println!("Output File : {}", output.display());
                 println!("Model       : {model}");
-                println!(
-                    "\n[grim diffusion] Diffusion pipeline integrated in `grim-models-diffusion` (Diffusion Gemma)."
-                );
-                println!("[grim diffusion] HTTP Endpoint: POST /v1/images/generations.");
-                Ok(())
+                let resolved = grim_core::catalog::resolve_model_preferring_grim(&model)
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "diffusion model '{model}' not found in the catalog. Generation \
+                             requires a UNet + DDIM checkpoint; pull one and retry."
+                        ))
+                    })?;
+                Err(Error::Config(format!(
+                    "diffusion pipeline is not wired in this build: '{}' resolved but the \
+                     Unet2D + DdimScheduler sampling loop has no runtime caller. The structs \
+                     are real; wiring lands with the first diffusion model release.",
+                    resolved.display()
+                )))
             }
         },
     }

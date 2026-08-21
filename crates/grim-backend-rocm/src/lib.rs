@@ -1,5 +1,9 @@
 //! ROCm backend for Grim — primary GPU target per architecture §4.
-#![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::not_unsafe_ptr_arg_deref
+)]
 //!
 //! Replicates core architectural design concepts from the `rocm-rs` library ecosystem:
 //! - Safe RAII allocation handles (Drop-on-scope, zero leaks) mimicking `DeviceMemoryExt`.
