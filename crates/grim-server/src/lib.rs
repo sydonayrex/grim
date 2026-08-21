@@ -196,6 +196,9 @@ pub struct AppState {
     /// Path to the primary model file being served — used for
     /// `GET /v1/models` metadata and first-run doctor checks.
     pub model_path: Option<std::path::PathBuf>,
+    /// Architecture string (e.g. "lfm2", "llama") of the loaded model —
+    /// drives the per-arch tool-call detector registry (WI-E8).
+    pub model_arch: std::sync::Mutex<Option<String>>,
     /// Plugin samplers loaded from `--plugins <dir>` at startup. Read-only at
     /// request time via `get_sampler(name)`; `None` when no plugins were loaded.
     /// `Arc<PluginRegistry>` is `Send + Sync` (the `Sampler` trait is
@@ -212,6 +215,24 @@ impl AppState {
     pub fn lock_tokenizer(&self) -> std::sync::MutexGuard<'_, Option<grim_format::GgufTokenizer>> {
         self.tokenizer.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// WI-E8: read `general.architecture` from a GGUF file's metadata. Returns
+/// None when the path is missing, unreadable, or lacks the key — the caller
+/// then falls back to template heuristics.
+fn state_arch_hint(path: Option<&std::path::Path>) -> Option<String> {
+    let p = path?;
+    // Primary artifact carries the arch; a `.grim` primary keeps it in the
+    // sibling `.gguf` (same lookup order the tokenizer uses).
+    GgufProvider::open(p.display().to_string().as_str())
+        .ok()
+        .and_then(|prov| prov.architecture().map(str::to_string))
+        .or_else(|| {
+            let sibling = p.with_extension("gguf");
+            GgufProvider::open(sibling.display().to_string().as_str())
+                .ok()
+                .and_then(|prov| prov.architecture().map(str::to_string))
+        })
 }
 
 /// Health-check endpoint.
@@ -640,10 +661,14 @@ fn build_choice_payload(
     reasoning_content: Option<&str>,
     tools_active: bool,
     template_family: Option<&str>,
+    model_arch: Option<&str>,
     prior_messages: &[grim_format::ChatMessage],
 ) -> serde_json::Value {
     let (message, finish_reason) = if tools_active {
-        let family = tool_parse::resolve_tool_family(template_family.unwrap_or(""));
+        let family = tool_parse::resolve_effective_tool_family(
+            template_family.unwrap_or(""),
+            model_arch,
+        );
         match tool_parse::parse_tool_calls(content, family) {
             tool_parse::ParseOutcome {
                 calls: Some(calls), ..
@@ -747,17 +772,18 @@ fn diagnostic_arguments(original: &str, repeat_count: usize) -> String {
 /// the hard guard is fully enforced on the non-streaming path where the entire
 /// completion is available before any response is returned.
 fn terminal_tool_delta(
-    parse_ctx: &(bool, Option<String>),
+    parse_ctx: &(bool, Option<String>, Option<String>),
     emitted: &str,
     prior_messages: &[grim_format::ChatMessage],
     reasoning_content: Option<&str>,
 ) -> Option<std::result::Result<axum::response::sse::Event, axum::Error>> {
-    let (tools_active, template_family) = parse_ctx;
+    let (tools_active, template_family, model_arch) = parse_ctx;
     let choice = build_choice_payload(
         emitted,
         reasoning_content,
         *tools_active,
         template_family.as_deref(),
+        model_arch.as_deref(),
         prior_messages,
     );
     // A clean parse surfaces a non-empty `tool_calls` array on the message.
@@ -1565,7 +1591,11 @@ async fn chat_completions(
                 let adapter_ids = adapter_ids_clone.clone();
                 let stop_seqs = stop_sequences_clone.clone();
                 let sampler = sampler_clone.clone();
-                let parse_ctx = (tools_active_clone, template_family_clone.clone());
+                let parse_ctx = (
+                    tools_active_clone,
+                    template_family_clone.clone(),
+                    state.model_arch.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                );
                 let prior_messages = messages.clone();
                 let req_model = requested_model.clone();
                 let stream_model = requested_model.clone();
@@ -1924,7 +1954,14 @@ async fn chat_completions(
         // The soft guard (>= 2 prior) is applied inside build_choice_payload
         // via diagnostic-argument substitution.
         if tools_active {
-            let family = tool_parse::resolve_tool_family(template_family.as_deref().unwrap_or(""));
+            let family = tool_parse::resolve_effective_tool_family(
+                template_family.as_deref().unwrap_or(""),
+                state
+                    .model_arch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_deref(),
+            );
             if let tool_parse::ParseOutcome {
                 calls: Some(calls), ..
             } = tool_parse::parse_tool_calls(&content, family)
@@ -1985,11 +2022,17 @@ async fn chat_completions(
                 }
             }
         }
+        let model_arch = state
+            .model_arch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let choice = build_choice_payload(
             &content,
             reasoning_content.as_deref(),
             tools_active,
             template_family.as_deref(),
+            model_arch.as_deref(),
             &messages,
         );
         // WI-CANCEL-0: tear down engine-side request state on every exit
@@ -2777,6 +2820,20 @@ async fn load_model(
                         .and_then(|gg| GgufProvider::open(gg).ok().and_then(|p| p.tokenizer().ok()))
                 });
             *state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()) = tokenizer;
+            // WI-E8: refresh the arch hint so tool-call parsing follows the
+            // newly loaded model (same primary/sibling lookup as the tokenizer).
+            let arch = GgufProvider::open(&model_path_str)
+                .ok()
+                .and_then(|p| p.architecture().map(str::to_string))
+                .or_else(|| {
+                    let sibling = model_path.with_extension("gguf");
+                    sibling.to_str().and_then(|gg| {
+                        GgufProvider::open(gg)
+                            .ok()
+                            .and_then(|p| p.architecture().map(str::to_string))
+                    })
+                });
+            *state.model_arch.lock().unwrap_or_else(|e| e.into_inner()) = arch;
             engine.register_model(&req.model, m);
             (
                 StatusCode::OK,
@@ -4561,10 +4618,14 @@ pub async fn serve(
         );
     }
 
+    // WI-E8: detect the model architecture from the GGUF metadata so the
+    // tool-call parser can use the per-arch detector registry.
+    let detected_arch = state_arch_hint(resolved_path.as_deref());
     let state = Arc::new(AppState {
         engine: Mutex::new(engine),
         tokenizer: Mutex::new(tokenizer),
         model_path: resolved_path,
+        model_arch: std::sync::Mutex::new(detected_arch),
         plugin_registry,
     });
 
@@ -4748,6 +4809,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let response = get_status(State(state)).await.0;
@@ -4800,6 +4862,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -4833,6 +4896,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(Some(tok)),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -4882,6 +4946,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -4914,6 +4979,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let (status, resp) = reset_prefix_cache_endpoint(State(state)).await;
@@ -4941,6 +5007,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(Some(tok)),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -5004,6 +5071,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -5087,6 +5155,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -5113,6 +5182,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let headers = axum::http::HeaderMap::new();
@@ -5140,6 +5210,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let (status, Json(body)) = readyz(State(state)).await;
@@ -5177,6 +5248,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let axum::Json(val) = stats_endpoint(State(state)).await;
@@ -5193,6 +5265,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let mut headers = axum::http::HeaderMap::new();
@@ -5245,6 +5318,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -5311,6 +5385,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         })
     }
@@ -5690,6 +5765,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: Some(Arc::new(registry)),
         });
 
@@ -5789,6 +5865,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: Some(Arc::new(registry)),
         });
         let app = Router::new()
@@ -5864,6 +5941,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: Some(Arc::new(grim_plugin::PluginRegistry::new())),
         });
         let app = Router::new()
@@ -5926,6 +6004,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -5985,6 +6064,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -6057,6 +6137,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -6115,6 +6196,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -6178,6 +6260,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -6236,6 +6319,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
 
@@ -6344,6 +6428,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -6584,6 +6669,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         })
     }
@@ -6618,6 +6704,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -6693,6 +6780,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -6774,6 +6862,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -6851,6 +6940,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -6984,6 +7074,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -7057,6 +7148,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -7124,6 +7216,7 @@ mod tests {
                     engine: Mutex::new(engine),
                     tokenizer: Mutex::new(None),
                     model_path: None,
+            model_arch: std::sync::Mutex::new(None),
                     plugin_registry: None,
                 }),
                 42,
@@ -7151,6 +7244,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -7198,6 +7292,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -7257,6 +7352,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         });
         let app = Router::new()
@@ -7317,6 +7413,7 @@ mod tests {
             )),
             tokenizer: Mutex::new(None),
             model_path: None,
+            model_arch: std::sync::Mutex::new(None),
             plugin_registry: None,
         };
         // Verify we can lock it (Mutex works)
