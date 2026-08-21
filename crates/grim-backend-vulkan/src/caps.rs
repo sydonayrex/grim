@@ -20,6 +20,16 @@ pub struct VulkanCaps {
     /// instruction on RDNA 3+ (gfx1100+, device_id >= 0x7440); earlier hardware
     /// (including the Raphael Mendocino iGPU at 0x164e) will SIGABRT in ACO.
     pub supports_fp32_atomic_add: bool,
+    /// True when device supports `VK_KHR_shader_subgroup_arithmetic` (subgroupAdd, subgroupMax).
+    pub supports_subgroup_arithmetic: bool,
+    /// Subgroup/Wavefront size (e.g. 32 on RDNA/NVIDIA, 64 on GCN/CDNA/RDNA-wave64).
+    pub subgroup_size: u32,
+    /// True when device supports `VK_KHR_timeline_semaphore` for pipelined asynchronous queues.
+    pub supports_timeline_semaphores: bool,
+    /// True when device supports `VK_EXT_external_memory_host` for zero-copy mmap tensor loading.
+    pub supports_external_memory_host: bool,
+    /// True when device supports `VK_KHR_cooperative_matrix` for hardware matrix cores.
+    pub supports_cooperative_matrix: bool,
 }
 
 impl VulkanCaps {
@@ -34,6 +44,15 @@ impl VulkanCaps {
         // These support native FP32 atomic add on SSBOs via ACO.
         let supports_fp32_atomic_add =
             vendor_id == 0x1002 && device_id >= 0x7440 && device_id <= 0x75ff;
+        let subgroup_size = if vendor_id == 0x1002 {
+            32 // AMD RDNA default wave32
+        } else if vendor_id == 0x10de {
+            32 // NVIDIA warp32
+        } else if vendor_id == 0x8086 {
+            16 // Intel EU thread / SIMD16
+        } else {
+            32
+        };
         Self {
             device_name,
             vendor_id,
@@ -46,6 +65,11 @@ impl VulkanCaps {
             supports_bf16: true,
             supports_fp8: false,
             supports_fp32_atomic_add,
+            supports_subgroup_arithmetic: true,
+            subgroup_size,
+            supports_timeline_semaphores: true,
+            supports_external_memory_host: true,
+            supports_cooperative_matrix: vendor_id == 0x10de || vendor_id == 0x1002,
         }
     }
 

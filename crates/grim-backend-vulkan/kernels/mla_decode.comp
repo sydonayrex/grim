@@ -1,0 +1,101 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint kv_lora_rank;    // e.g. 512
+    uint qk_rope_dim;     // e.g. 64
+    uint v_head_dim;      // e.g. 128
+    uint seq_len;
+    float inv_sqrt_d;
+} params;
+
+layout(std430, binding = 0) readonly buffer QC { float q_absorbed[]; }; // [num_heads, kv_lora_rank]
+layout(std430, binding = 1) readonly buffer QR { float q_rope[]; };     // [num_heads, qk_rope_dim]
+layout(std430, binding = 2) readonly buffer KV { float kv_cache[]; };   // [seq_len, kv_lora_rank + qk_rope_dim]
+layout(std430, binding = 3) writeonly buffer Out { float out_buf[]; };  // [num_heads, kv_lora_rank]
+
+shared float s_sub_dot[32];
+shared float s_scores[4096];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (h >= params.num_heads) return;
+
+    uint total_kv_dim = params.kv_lora_rank + params.qk_rope_dim;
+    uint q_c_base = h * params.kv_lora_rank;
+    uint q_r_base = h * params.qk_rope_dim;
+
+    float running_max = -1e20;
+    float running_sum = 0.0;
+
+    // Step 1: Compute attention logits Q * K^T
+    for (uint j = 0; j < params.seq_len; ++j) {
+        uint token_base = j * total_kv_dim;
+        float dot = 0.0;
+
+        // Q_C . c_kv
+        for (uint d = tid; d < params.kv_lora_rank; d += 256u) {
+            dot += q_absorbed[q_c_base + d] * kv_cache[token_base + d];
+        }
+        // Q_R . k_pe
+        for (uint d = tid; d < params.qk_rope_dim; d += 256u) {
+            dot += q_rope[q_r_base + d] * kv_cache[token_base + params.kv_lora_rank + d];
+        }
+
+        #ifdef GL_KHR_shader_subgroup_arithmetic
+        dot = subgroupAdd(dot);
+        if (subgroupElect()) {
+            s_sub_dot[gl_SubgroupID] = dot;
+        }
+        barrier();
+        if (tid < 32u) {
+            float s = (tid < gl_NumSubgroups) ? s_sub_dot[tid] : 0.0;
+            s = subgroupAdd(s);
+            if (tid == 0u) {
+                float score = s * params.inv_sqrt_d;
+                s_scores[j] = score;
+            }
+        }
+        barrier();
+        #else
+        if (tid == 0u) {
+            s_scores[j] = dot * params.inv_sqrt_d;
+        }
+        barrier();
+        #endif
+    }
+
+    // Step 2: Softmax over sequence length
+    if (tid == 0u) {
+        float m = -1e20;
+        for (uint j = 0; j < params.seq_len; ++j) {
+            if (s_scores[j] > m) m = s_scores[j];
+        }
+        float sum_exp = 0.0;
+        for (uint j = 0; j < params.seq_len; ++j) {
+            s_scores[j] = exp(s_scores[j] - m);
+            sum_exp += s_scores[j];
+        }
+        float inv_sum = 1.0 / max(sum_exp, 1e-8);
+        for (uint j = 0; j < params.seq_len; ++j) {
+            s_scores[j] *= inv_sum;
+        }
+    }
+    barrier();
+
+    // Step 3: Accumulate attention output V_latent = sum(score * c_kv)
+    uint out_base = h * params.kv_lora_rank;
+    for (uint d = tid; d < params.kv_lora_rank; d += 256u) {
+        float acc = 0.0;
+        for (uint j = 0; j < params.seq_len; ++j) {
+            uint token_base = j * total_kv_dim;
+            acc += s_scores[j] * kv_cache[token_base + d];
+        }
+        out_buf[out_base + d] = acc;
+    }
+}

@@ -130,6 +130,18 @@ impl TensorProvider for PthProvider {
 // ---------------------------------------------------------------------------
 
 fn parse_zip_entries(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
+    // Primary path: central directory (authoritative sizes, required for
+    // torch's data-descriptor archives where local header sizes are zero).
+    if let Some(map) = parse_central_directory(bytes) {
+        return Ok(map);
+    }
+    // Fallback: streamed/truncated containers with no EOCD — walk local
+    // headers sequentially (only valid when sizes are inline, i.e. no
+    // data-descriptor flag).
+    Ok(parse_local_headers(bytes))
+}
+
+fn parse_local_headers(bytes: &[u8]) -> HashMap<String, Vec<u8>> {
     let mut map = HashMap::new();
     let mut offset = 0;
 
@@ -137,7 +149,6 @@ fn parse_zip_entries(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
         if &bytes[offset..offset + 4] != b"PK\x03\x04" {
             break;
         }
-
         let flags = u16::from_le_bytes([bytes[offset + 6], bytes[offset + 7]]);
         let comp_method = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
         let comp_size = u32::from_le_bytes([
@@ -157,8 +168,6 @@ fn parse_zip_entries(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
             String::from_utf8_lossy(&bytes[name_start..name_start + name_len]).to_string();
         let data_start = name_start + name_len + extra_len;
 
-        // Bit 3 = data descriptor: sizes trail the payload; torch never sets
-        // it, but bail out cleanly instead of mis-slicing if we meet one.
         if flags & 0x08 != 0 || comp_method != 0 || data_start + comp_size > bytes.len() {
             break;
         }
@@ -169,7 +178,86 @@ fn parse_zip_entries(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
         offset = data_start + comp_size;
     }
 
-    Ok(map)
+    map
+}
+
+fn parse_central_directory(bytes: &[u8]) -> Option<HashMap<String, Vec<u8>>> {
+    let mut map = HashMap::new();
+
+    let eocd = find_u32_le(bytes, 0x0605_4b50)?;
+    if eocd + 22 > bytes.len() {
+        return None;
+    }
+    let cd_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+    let cd_offset = u32::from_le_bytes([
+        bytes[eocd + 16],
+        bytes[eocd + 17],
+        bytes[eocd + 18],
+        bytes[eocd + 19],
+    ]) as usize;
+
+    let mut pos = cd_offset;
+    for _ in 0..cd_count {
+        if pos + 46 > bytes.len() || &bytes[pos..pos + 4] != b"PK\x01\x02" {
+            break;
+        }
+        let method = u16::from_le_bytes([bytes[pos + 10], bytes[pos + 11]]) as usize;
+        let comp_size = u32::from_le_bytes([
+            bytes[pos + 20],
+            bytes[pos + 21],
+            bytes[pos + 22],
+            bytes[pos + 23],
+        ]) as usize;
+        let name_len = u16::from_le_bytes([bytes[pos + 28], bytes[pos + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[pos + 30], bytes[pos + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([bytes[pos + 32], bytes[pos + 33]]) as usize;
+        let local_off = u32::from_le_bytes([
+            bytes[pos + 42],
+            bytes[pos + 43],
+            bytes[pos + 44],
+            bytes[pos + 45],
+        ]) as usize;
+        let name_start = pos + 46;
+        if name_start + name_len > bytes.len() {
+            break;
+        }
+        let filename =
+            String::from_utf8_lossy(&bytes[name_start..name_start + name_len]).to_string();
+
+        // Data start needs the *local* header's name/extra lengths, which can
+        // differ from the central copies.
+        let lh = local_off;
+        if lh + 30 <= bytes.len() && &bytes[lh..lh + 4] == b"PK\x03\x04" {
+            let l_name_len = u16::from_le_bytes([bytes[lh + 26], bytes[lh + 27]]) as usize;
+            let l_extra_len = u16::from_le_bytes([bytes[lh + 28], bytes[lh + 29]]) as usize;
+            let data_start = lh + 30 + l_name_len + l_extra_len;
+            if method == 0 && !filename.ends_with('/') && data_start + comp_size <= bytes.len() {
+                map.insert(filename, bytes[data_start..data_start + comp_size].to_vec());
+            }
+        }
+        pos = name_start + name_len + extra_len + comment_len;
+    }
+
+    Some(map)
+}
+
+/// Scan backwards for the last occurrence of a little-endian u32 signature.
+fn find_u32_le(bytes: &[u8], sig: u32) -> Option<usize> {
+    let pat = sig.to_le_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(66_000);
+    let mut i = bytes.len() - 4;
+    loop {
+        if &bytes[i..i + 4] == pat {
+            return Some(i);
+        }
+        if i == 0 || i < start {
+            return None;
+        }
+        i -= 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +414,18 @@ impl<'a> Vm<'a> {
                         c.unwrap_or(Val::None),
                     ]));
                 }
-                0x45 => {
+                0x61 => {
+                    // APPEND
+                    let item = self.stack.pop().unwrap_or(Val::None);
+                    let list = self.stack.pop().unwrap_or(Val::List(Vec::new()));
+                    if let Val::List(mut l) = list {
+                        l.push(item);
+                        self.stack.push(Val::List(l));
+                    } else {
+                        self.stack.push(Val::Opaque);
+                    }
+                }
+                0x65 => {
                     // APPENDS
                     let items = self.pop_mark();
                     let list = self.stack.pop().unwrap_or(Val::List(Vec::new()));
@@ -337,7 +436,7 @@ impl<'a> Vm<'a> {
                         self.stack.push(Val::Opaque);
                     }
                 }
-                0x65 => {
+                0x75 => {
                     // SETITEMS
                     let items = self.pop_mark();
                     let dict = self.stack.pop().unwrap_or(Val::Dict(Vec::new()));
@@ -491,28 +590,28 @@ impl<'a> Vm<'a> {
                     self.take(len)?;
                     self.stack.push(Val::Opaque);
                 }
-                0x71 => {
+                0x68 => {
                     // BINGET
                     let k = self.u8()? as usize;
                     if let Some(v) = self.memo.get(&k) {
                         self.stack.push(v.clone());
                     }
                 }
-                0x72 => {
+                0x6a => {
                     // LONG_BINGET
                     let k = self.u32le()? as usize;
                     if let Some(v) = self.memo.get(&k) {
                         self.stack.push(v.clone());
                     }
                 }
-                0x70 => {
+                0x71 => {
                     // BINPUT
                     let k = self.u8()? as usize;
                     if let Some(top) = self.stack.last() {
                         self.memo.insert(k, top.clone());
                     }
                 }
-                0x8f => {
+                0x72 => {
                     // LONG_BINPUT
                     let k = self.u32le()? as usize;
                     if let Some(top) = self.stack.last() {

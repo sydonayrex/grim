@@ -11,7 +11,7 @@ fn torch_pickle_entry(name: &str, storage_key: &str, dims: &[u8]) -> Vec<u8> {
 
     s(&[0x80, 0x04]); // PROTO 4
     s(b"}"); // EMPTY_DICT (state dict root)
-    s(&[0x70, 0x00]); // BINPUT 0
+    s(&[0x71, 0x00]); // BINPUT 0
     s(&[0x28]); // MARK
     s(&[0x8c, name.len() as u8]);
     s(name.as_bytes());
@@ -54,7 +54,7 @@ fn torch_pickle_entry(name: &str, storage_key: &str, dims: &[u8]) -> Vec<u8> {
     s(b"}"); // backward_hooks = {}
     s(&[0x74]); // TUPLE — bundle args for REDUCE
     s(&[0x52]); // REDUCE
-    s(&[0x65]); // SETITEMS (consumes through MARK)
+    s(&[0x75]); // SETITEMS (consumes through MARK)
     s(&[0x2e]); // STOP
     p
 }
