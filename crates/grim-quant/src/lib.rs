@@ -2,9 +2,14 @@
 
 use grim_tensor::error::{Error, Result};
 
+pub mod accuracy_gate;
 pub mod soul_eater;
 pub mod spqr;
 
+pub use accuracy_gate::{
+    AccuracyGate, AccuracyTolerance, AccuracyVerdict, compute_cosine_similarity,
+    compute_cross_entropy_ppl, compute_relative_l2_error,
+};
 pub use spqr::{SpqrSalientResidual, spqr_identify_salient};
 
 /// Re-exported from `grim_tensor` so the `BackendDevice::quantize` trait method

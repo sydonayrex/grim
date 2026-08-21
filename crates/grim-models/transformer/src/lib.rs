@@ -4,6 +4,11 @@ pub mod afmoe;
 pub mod apertus;
 pub mod arcee;
 pub mod arctic;
+pub mod attention_dispatcher;
+
+pub use attention_dispatcher::{
+    AttentionDispatcher, AttentionRequest, AttentionTier, AttentionTopology,
+};
 pub mod baichuan;
 pub mod bailingmoe;
 pub mod bailingmoe2;
