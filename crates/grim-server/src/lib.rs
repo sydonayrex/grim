@@ -3862,6 +3862,9 @@ async fn grim_chat(
         payload["tool_choice"] = tc.clone();
     }
 
+    // F-6: wall-clock timing so the Ollama stats fields carry real
+    // measurements instead of hardcoded zeros.
+    let chat_start = std::time::Instant::now();
     let response = chat_completions(State(state), Json(payload)).await;
     if !response.status().is_success() {
         return response;
@@ -3989,11 +3992,16 @@ async fn grim_chat(
                 "created_at": utc_now_rfc3339(),
                 "message": message,
                 "done": true,
-                "total_duration": 0,
+                // F-6: real wall-clock measurement; eval_count approximated
+                // from the response content (≈4 chars/token) so Ollama
+                // clients that throttle on these fields get usable data.
+                "total_duration": chat_start.elapsed().as_nanos() as u64,
                 "load_duration": 0,
-                "prompt_eval_count": 0,
-                "eval_count": 0,
-                "eval_duration": 0
+                "prompt_eval_count": messages.as_array().map(|m| {
+                    m.iter().map(|x| x["content"].as_str().map(|c| c.len() / 4).unwrap_or(0)).sum::<usize>()
+                }).unwrap_or(0),
+                "eval_count": content.len().div_ceil(4),
+                "eval_duration": chat_start.elapsed().as_nanos() as u64
             });
             let mut res = Response::from_parts(
                 parts,
@@ -4326,6 +4334,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Dashboard:
         .route("/", get(dashboard_html))
         .route("/api/stats", get(stats_endpoint))
+        // F-6: alias so `GET /adapters` returns the same JSON list as
+        // `/v1/adapters` instead of an empty 200 from a missing route.
+        .route("/adapters", get(list_adapters))
         // F-2: scheduler queue/admission state must be reachable at the same
         // origin as the server itself — the CLI `grim scheduler` subcommand
         // and dashboards poll this instead of guessing ports.

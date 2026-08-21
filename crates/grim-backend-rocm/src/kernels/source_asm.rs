@@ -45,6 +45,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::preshuffled_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::mrope::KERNEL_SOURCE);
     s.push_str(crate::kernels::speculative_sampler::KERNEL_SOURCE);
+    s.push_str(crate::kernels::mxfp4_gemm::KERNEL_SOURCE);
     s
 }
 

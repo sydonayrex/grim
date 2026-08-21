@@ -105,12 +105,20 @@ impl FeatureSet {
     pub fn supported_on(&self, arch: &str) -> bool {
         let is_gfx11 = arch.starts_with("gfx11");
         let is_gfx12 = arch.starts_with("gfx12");
+        let is_gfx13 = arch.starts_with("gfx13");
+        let is_cdna_mfma = arch.starts_with("gfx94")
+            || arch.starts_with("gfx95")
+            || arch.starts_with("gfx908")
+            || arch.starts_with("gfx90a");
 
         if self.requires_fp8_mfma {
-            return is_gfx12;
+            return is_gfx12
+                || is_gfx13
+                || arch.starts_with("gfx94")
+                || arch.starts_with("gfx95");
         }
         if self.requires_wmma {
-            return is_gfx11 || is_gfx12;
+            return is_gfx11 || is_gfx12 || is_gfx13 || is_cdna_mfma;
         }
         true
     }

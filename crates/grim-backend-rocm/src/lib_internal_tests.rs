@@ -556,9 +556,10 @@ mod tests {
         use crate::device::accel_features::{wmma_dispatch, wmma_supported};
         use crate::quantization::{GcnArch, QuantMode};
 
-        // RDNA3 and RDNA4 support WMMA for native modes
+        // RDNA3, RDNA4, and UDNA support WMMA for native modes
         assert!(wmma_supported(GcnArch::RDNA3, QuantMode::F16));
         assert!(wmma_supported(GcnArch::RDNA4, QuantMode::Fp8Native));
+        assert!(wmma_supported(GcnArch::UDNA, QuantMode::Fp8Native));
 
         // CDNA and RDNA1/2 do not support WMMA
         assert!(!wmma_supported(GcnArch::CDNA2, QuantMode::F16));

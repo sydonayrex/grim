@@ -74,10 +74,9 @@ pub fn parse_tool_calls(completion: &str, family: ToolFamily) -> ParseOutcome {
             diagnostic: second.diagnostic,
         };
     }
-    ParseOutcome {
-        calls: None,
-        diagnostic: first.diagnostic.or(second.diagnostic),
-    }
+    // F-4: LFM2.5 convention — `<|tool_call_start|>[name(arg=val, ...)]<|tool_call_end|>`.
+    // Tried last so the Hermes/bare-JSON conventions keep priority.
+    parse_bracket_call(completion)
 }
 
 /// WI-TOOLS-4b/4c — stable reason strings shared by both runaway-call guards so
@@ -252,6 +251,150 @@ fn extract_call(value: &str) -> Option<ToolCallMsg> {
     extract_call_value(&v)
 }
 
+/// F-4: LFM2.5 bracket-call convention —
+/// `<|tool_call_start|>[name(arg=val, ...)]<|tool_call_end|>`.
+/// Parses Python-literal-style arguments (unquoted strings, True/False/None)
+/// into a JSON arguments string. Returns `calls: None` when no marker pair is
+/// present so the caller falls back cleanly to plain content.
+fn parse_bracket_call(completion: &str) -> ParseOutcome {
+    const START: &str = "<|tool_call_start|>";
+    const END: &str = "<|tool_call_end|>";
+    if !completion.contains(START) {
+        return ParseOutcome {
+            calls: None,
+            diagnostic: None,
+        };
+    }
+    let mut calls = Vec::new();
+    let mut diagnostic = None;
+    let mut rest = completion;
+    while let Some(open) = rest.find(START) {
+        let after = &rest[open + START.len()..];
+        let Some(close) = after.find(END) else {
+            diagnostic = Some("tool_call_start without tool_call_end".to_string());
+            break;
+        };
+        let inner = after[..close].trim();
+        // Strip the surrounding [ ] list wrapper.
+        let inner = inner.trim_start_matches('[').trim_end_matches(']').trim();
+        match parse_fn_literal(inner) {
+            Some(call) => calls.push(call),
+            None => {
+                diagnostic = Some(format!("bracket call unparseable: {inner}"));
+            }
+        }
+        rest = &after[close + END.len()..];
+    }
+    ParseOutcome {
+        calls: if calls.is_empty() { None } else { Some(calls) },
+        diagnostic,
+    }
+}
+
+/// Parse `name(arg=val, ...)` into a `ToolCallMsg`. Arguments use the
+/// Python-literal forms LFM2.5 emits: bare identifiers for strings,
+/// `True`/`False`/`None`, numbers, and nested lists/objects.
+fn parse_fn_literal(s: &str) -> Option<ToolCallMsg> {
+    let open = s.find('(')?;
+    if !s.ends_with(')') {
+        return None;
+    }
+    let name = s[..open].trim().to_string();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let args_str = &s[open + 1..s.len() - 1];
+    let mut args = serde_json::Map::new();
+    for (i, part) in split_top_level(args_str).iter().enumerate() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = match part.split_once('=') {
+            Some((k, v)) => (
+                k.trim().trim_matches('"').trim_matches('\'').to_string(),
+                v.trim(),
+            ),
+            None => (format!("arg{i}"), part),
+        };
+        args.insert(key, py_literal_to_json(value));
+    }
+    let arguments =
+        serde_json::to_string(&serde_json::Value::Object(args)).unwrap_or_else(|_| "{}".into());
+    Some(ToolCallMsg {
+        id: "call_0".to_string(),
+        name,
+        arguments,
+    })
+}
+
+/// Split on top-level commas only (respecting nesting and quotes).
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str: Option<char> = None;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match in_str {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    in_str = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    in_str = Some(c);
+                    cur.push(c);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    cur.push(c);
+                }
+                ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            },
+        }
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// Convert one Python-literal value token to a JSON value.
+fn py_literal_to_json(v: &str) -> serde_json::Value {
+    let v = v.trim();
+    match v {
+        "True" | "true" => serde_json::Value::Bool(true),
+        "False" | "false" => serde_json::Value::Bool(false),
+        "None" | "null" | "" => serde_json::Value::Null,
+        _ => {
+            if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+            {
+                serde_json::Value::String(v[1..v.len() - 1].to_string())
+            } else if let Ok(i) = v.parse::<i64>() {
+                serde_json::json!(i)
+            } else if let Ok(f) = v.parse::<f64>() {
+                serde_json::json!(f)
+            } else if v.starts_with('[') || v.starts_with('{') {
+                serde_json::from_str(v).unwrap_or(serde_json::Value::String(v.to_string()))
+            } else {
+                serde_json::Value::String(v.to_string())
+            }
+        }
+    }
+}
+
 fn extract_call_value(v: &serde_json::Value) -> Option<ToolCallMsg> {
     let obj = v.as_object()?;
     // Hermes-style interior: {"name": ..., "arguments": {...}} or
@@ -301,6 +444,25 @@ mod tests {
             name: name.to_string(),
             arguments: args.to_string(),
         }
+    }
+
+    #[test]
+    fn bracket_call_parses_lfm25_convention() {
+        let out = parse_tool_calls(
+            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>",
+            ToolFamily::Auto,
+        );
+        let calls = out.calls.expect("bracket call must parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert!(calls[0].arguments.contains("\"city\""));
+        assert!(calls[0].arguments.contains("Paris"));
+        // Plain prose still yields no calls.
+        assert!(
+            parse_tool_calls("It is sunny today", ToolFamily::Auto)
+                .calls
+                .is_none()
+        );
     }
 
     #[test]

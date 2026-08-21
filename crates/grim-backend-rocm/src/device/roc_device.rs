@@ -520,13 +520,15 @@ impl RocmDevice {
             }
         } else {
             match crate::quantization::gcn_arch(&gpu_target) {
-                crate::quantization::GcnArch::CDNA2 | crate::quantization::GcnArch::CDNA3 => {
-                    WavefrontSize::W64
-                }
+                crate::quantization::GcnArch::CDNA1
+                | crate::quantization::GcnArch::CDNA2
+                | crate::quantization::GcnArch::CDNA3
+                | crate::quantization::GcnArch::CDNA4 => WavefrontSize::W64,
                 crate::quantization::GcnArch::RDNA1
                 | crate::quantization::GcnArch::RDNA2
                 | crate::quantization::GcnArch::RDNA3
-                | crate::quantization::GcnArch::RDNA4 => WavefrontSize::W32,
+                | crate::quantization::GcnArch::RDNA4
+                | crate::quantization::GcnArch::UDNA => WavefrontSize::W32,
                 _ => {
                     if warp_size == 64 && gpu_target.starts_with("gfx9") {
                         WavefrontSize::W64
@@ -613,7 +615,9 @@ impl RocmDevice {
             wmma_gemm_config: Mutex::new(WmmaGemmConfig {
                 enabled: matches!(
                     crate::quantization::gcn_arch(&gpu_target),
-                    crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
                 ),
                 wavefront_size: wf_u32,
             }),
@@ -628,25 +632,22 @@ impl RocmDevice {
                         !matches!(v.as_str(), "0" | "false" | "off" | "no")
                     }
                     Err(_) => {
-                        // GPU-confirmation guard: RDNA4 (gfx12x) is the first
-                        // arch with native 2:4 FP4 / E8M0 matrix hardware that
-                        // the Jay-Tier fused dequant-GEMM kernel is validated
-                        // against. On that silicon the fused kernel replaces the
-                        // stopgap dequant+requant path with an in-register fused
-                        // dequant, so default it ON there. Other families keep
-                        // the proven tiled path until per-GPU parity with the
-                        // F32 oracle is confirmed (mirrors the wmma RDNA3/4 gate
-                        // and the `GRIM_MXFP4_FUSED_GEMM` escape hatch above).
+                        // GPU-confirmation guard: RDNA4 (gfx12x), UDNA (gfx13x), and CDNA4 (gfx95x)
+                        // are the architectures with native FP4/MXFP4 matrix hardware.
                         matches!(
                             crate::quantization::gcn_arch(&gpu_target),
                             crate::quantization::GcnArch::RDNA4
+                                | crate::quantization::GcnArch::UDNA
+                                | crate::quantization::GcnArch::CDNA4
                         )
                     }
                 },
             ),
             wmma_gemm_enabled: AtomicBool::new(matches!(
                 crate::quantization::gcn_arch(&gpu_target),
-                crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
+                crate::quantization::GcnArch::RDNA3
+                    | crate::quantization::GcnArch::RDNA4
+                    | crate::quantization::GcnArch::UDNA
             )),
             rccl: Mutex::new(None),
             upload_event: Mutex::new(None),
@@ -5242,7 +5243,9 @@ impl RocmDevice {
 
         let is_native_wmma = matches!(
             crate::quantization::gcn_arch(&self.gpu_target),
-            crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
+            crate::quantization::GcnArch::RDNA3
+                | crate::quantization::GcnArch::RDNA4
+                | crate::quantization::GcnArch::UDNA
         );
 
         let (grid_dim, block_dim) = if is_native_wmma {
