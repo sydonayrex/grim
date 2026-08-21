@@ -2337,6 +2337,7 @@ dependencies = [
  "grim-kvquant",
  "grim-kvtransport",
  "grim-memory",
+ "grim-models-audio",
  "grim-models-mamba",
  "grim-models-transformer",
  "grim-models-vision",

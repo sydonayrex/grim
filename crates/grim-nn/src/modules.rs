@@ -2374,3 +2374,293 @@ impl LinearAttentionBlock {
         self.o_proj.forward(&out_t)
     }
 }
+
+/// 1D Convolution layer with support for stride, padding, dilation, and grouped/depthwise convolutions.
+#[derive(Debug, Clone)]
+pub struct Conv1d {
+    pub weight: Tensor,
+    pub bias: Option<Tensor>,
+    pub stride: usize,
+    pub padding: usize,
+    pub dilation: usize,
+    pub groups: usize,
+}
+
+impl Conv1d {
+    /// Construct a new `Conv1d` module directly from weight and optional bias tensors.
+    pub fn new(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Self {
+        Self {
+            weight,
+            bias,
+            stride: stride.max(1),
+            padding,
+            dilation: dilation.max(1),
+            groups: groups.max(1),
+        }
+    }
+
+    /// Load a `Conv1d` module from a `WeightSource`.
+    pub fn load(
+        ws: &WeightSource<'_>,
+        out_c: usize,
+        in_c_per_group: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let weight = ws.get_f32([out_c, in_c_per_group, kernel_size], "weight")?;
+        let bias = ws.get_f32([out_c], "bias").ok();
+        Ok(Self::new(weight, bias, stride, padding, dilation, groups))
+    }
+
+    /// Forward pass for 1D convolution. Accepts `[seq_len, in_channels]` or `[batch, in_channels, seq_len]`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_dims = x.shape().dims();
+        let w_dims = self.weight.shape().dims();
+        if w_dims.len() != 3 {
+            return Err(Error::ShapeMismatch {
+                expected: vec![0, 0, 0],
+                got: w_dims.to_vec(),
+            });
+        }
+        let out_c = w_dims[0];
+        let in_c_per_group = w_dims[1];
+        let kernel_size = w_dims[2];
+        let in_c = in_c_per_group * self.groups;
+
+        let (batch, in_seq, x_flat) = if x_dims.len() == 2 {
+            if x_dims[1] == in_c {
+                (1, x_dims[0], x.to_vec_f32()?)
+            } else if x_dims[0] == in_c {
+                (1, x_dims[1], x.to_vec_f32()?)
+            } else {
+                (1, x_dims[0], x.to_vec_f32()?)
+            }
+        } else if x_dims.len() == 3 {
+            (x_dims[0], x_dims[2], x.to_vec_f32()?)
+        } else {
+            return Err(Error::Shape(format!(
+                "Conv1d: unsupported input rank {}",
+                x_dims.len()
+            )));
+        };
+
+        let effective_k = self.dilation * (kernel_size - 1) + 1;
+        if in_seq + 2 * self.padding < effective_k {
+            return Err(Error::Shape(format!(
+                "Conv1d: input length {} with padding {} is smaller than effective kernel {}",
+                in_seq, self.padding, effective_k
+            )));
+        }
+        let out_seq = (in_seq + 2 * self.padding - effective_k) / self.stride + 1;
+
+        let w_vec = self.weight.to_vec_f32()?;
+        let b_vec = self.bias.as_ref().map(|b| b.to_vec_f32()).transpose()?;
+
+        let mut out = vec![0.0f32; batch * out_c * out_seq];
+        let out_c_per_group = out_c / self.groups;
+
+        for b in 0..batch {
+            let b_in_off = b * in_c * in_seq;
+            let b_out_off = b * out_c * out_seq;
+
+            for g in 0..self.groups {
+                let g_in_start = g * in_c_per_group;
+                let g_out_start = g * out_c_per_group;
+
+                for oc_i in 0..out_c_per_group {
+                    let oc = g_out_start + oc_i;
+                    let bias_val = b_vec.as_ref().map(|b| b[oc]).unwrap_or(0.0);
+
+                    for os in 0..out_seq {
+                        let in_center = os * self.stride;
+                        let mut sum = bias_val;
+
+                        for ic_i in 0..in_c_per_group {
+                            let ic = g_in_start + ic_i;
+                            let w_base = (oc * in_c_per_group + ic_i) * kernel_size;
+
+                            for k in 0..kernel_size {
+                                let in_pos = in_center as isize + (k * self.dilation) as isize
+                                    - self.padding as isize;
+                                if in_pos >= 0 && (in_pos as usize) < in_seq {
+                                    let x_val = x_flat[b_in_off + ic * in_seq + in_pos as usize];
+                                    let w_val = w_vec[w_base + k];
+                                    sum += x_val * w_val;
+                                }
+                            }
+                        }
+                        out[b_out_off + oc * out_seq + os] = sum;
+                    }
+                }
+            }
+        }
+
+        let dev = pick_device_for_tensor(x);
+        let out_shape = if x_dims.len() == 2 && x_dims[1] == in_c {
+            Shape::new(vec![out_seq, out_c])
+        } else if x_dims.len() == 2 {
+            Shape::new(vec![out_c, out_seq])
+        } else {
+            Shape::new(vec![batch, out_c, out_seq])
+        };
+
+        let storage = dev.from_cpu(&out, &out_shape, DType::F32)?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        ))
+    }
+}
+
+/// 1D Transposed Convolution layer for audio upsampling and waveform generation.
+#[derive(Debug, Clone)]
+pub struct ConvTranspose1d {
+    pub weight: Tensor,
+    pub bias: Option<Tensor>,
+    pub stride: usize,
+    pub padding: usize,
+    pub output_padding: usize,
+    pub dilation: usize,
+    pub groups: usize,
+}
+
+impl ConvTranspose1d {
+    /// Construct a new `ConvTranspose1d` module directly from weight and optional bias tensors.
+    pub fn new(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Self {
+        Self {
+            weight,
+            bias,
+            stride: stride.max(1),
+            padding,
+            output_padding,
+            dilation: dilation.max(1),
+            groups: groups.max(1),
+        }
+    }
+
+    /// Forward pass for 1D transposed convolution. Accepts `[seq_len, in_channels]` or `[batch, in_channels, seq_len]`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_dims = x.shape().dims();
+        let w_dims = self.weight.shape().dims();
+        if w_dims.len() != 3 {
+            return Err(Error::ShapeMismatch {
+                expected: vec![0, 0, 0],
+                got: w_dims.to_vec(),
+            });
+        }
+        let in_c = w_dims[0];
+        let out_c_per_group = w_dims[1];
+        let kernel_size = w_dims[2];
+        let out_c = out_c_per_group * self.groups;
+
+        let (batch, in_seq, x_flat) = if x_dims.len() == 2 {
+            if x_dims[1] == in_c {
+                (1, x_dims[0], x.to_vec_f32()?)
+            } else {
+                (1, x_dims[1], x.to_vec_f32()?)
+            }
+        } else if x_dims.len() == 3 {
+            (x_dims[0], x_dims[2], x.to_vec_f32()?)
+        } else {
+            return Err(Error::Shape(format!(
+                "ConvTranspose1d: unsupported input rank {}",
+                x_dims.len()
+            )));
+        };
+
+        let out_seq = (in_seq - 1) * self.stride
+            + self.dilation * (kernel_size - 1)
+            + self.output_padding
+            + 1
+            - 2 * self.padding;
+        let w_vec = self.weight.to_vec_f32()?;
+        let b_vec = self.bias.as_ref().map(|b| b.to_vec_f32()).transpose()?;
+
+        let mut out = vec![0.0f32; batch * out_c * out_seq];
+        if let Some(ref b) = b_vec {
+            for batch_i in 0..batch {
+                for oc in 0..out_c {
+                    let b_val = b[oc];
+                    for os in 0..out_seq {
+                        out[batch_i * out_c * out_seq + oc * out_seq + os] = b_val;
+                    }
+                }
+            }
+        }
+
+        let in_c_per_group = in_c / self.groups;
+
+        for b in 0..batch {
+            let b_in_off = b * in_c * in_seq;
+            let b_out_off = b * out_c * out_seq;
+
+            for g in 0..self.groups {
+                let g_in_start = g * in_c_per_group;
+                let g_out_start = g * out_c_per_group;
+
+                for ic_i in 0..in_c_per_group {
+                    let ic = g_in_start + ic_i;
+
+                    for oc_i in 0..out_c_per_group {
+                        let oc = g_out_start + oc_i;
+                        let w_base = (ic * out_c_per_group + oc_i) * kernel_size;
+
+                        for is_pos in 0..in_seq {
+                            let in_val = x_flat[b_in_off + ic * in_seq + is_pos];
+                            let out_base = is_pos * self.stride;
+
+                            for k in 0..kernel_size {
+                                let out_pos = out_base as isize + (k * self.dilation) as isize
+                                    - self.padding as isize;
+                                if out_pos >= 0 && (out_pos as usize) < out_seq {
+                                    let w_val = w_vec[w_base + k];
+                                    out[b_out_off + oc * out_seq + out_pos as usize] +=
+                                        in_val * w_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let dev = pick_device_for_tensor(x);
+        let out_shape = if x_dims.len() == 2 && x_dims[1] == in_c {
+            Shape::new(vec![out_seq, out_c])
+        } else if x_dims.len() == 2 {
+            Shape::new(vec![out_c, out_seq])
+        } else {
+            Shape::new(vec![batch, out_c, out_seq])
+        };
+
+        let storage = dev.from_cpu(&out, &out_shape, DType::F32)?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        ))
+    }
+}

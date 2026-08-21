@@ -9,7 +9,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{ModalityHint, Model, ModelConfig, VoiceConversionModel};
 use grim_core::rng::SimpleRng;
-use grim_nn::{Linear, RmsNorm};
+use grim_nn::{Conv1d, Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 /// Configuration parameters for MeanVC2 DiT Voice Conversion model.
@@ -195,13 +195,14 @@ impl DiTBlock {
     }
 }
 
-/// MeanVC2 Voice Conversion Model.
+/// MeanVC2 Voice Conversion Diffusion Transformer Model.
 pub struct MeanVC2 {
     pub config: MeanVC2Config,
     pub device: Device,
     in_proj: Linear,
     style_proj: Linear,
     blocks: Vec<DiTBlock>,
+    conv_layers: Vec<Conv1d>,
     out_proj: Linear,
 }
 
@@ -242,6 +243,24 @@ impl MeanVC2 {
             ));
         }
 
+        let mut conv_layers = Vec::with_capacity(config.conv_layers);
+        for _ in 0..config.conv_layers {
+            let cw = (0..config.dim * 1 * 5)
+                .map(|_| (rng.next_f32() - 0.5) * 0.02)
+                .collect();
+            conv_layers.push(Conv1d::new(
+                cpu_tensor(cw, Shape::new(vec![config.dim, 1, 5])),
+                Some(cpu_tensor(
+                    vec![0.0; config.dim],
+                    Shape::new(vec![config.dim]),
+                )),
+                1,
+                2,
+                1,
+                config.dim,
+            ));
+        }
+
         let out_w = (0..config.n_mels * config.dim)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
@@ -259,6 +278,7 @@ impl MeanVC2 {
             in_proj,
             style_proj,
             blocks,
+            conv_layers,
             out_proj,
         }
     }
@@ -297,6 +317,10 @@ impl VoiceConversionModel for MeanVC2 {
 
         for block in &self.blocks {
             x = block.forward(&x, &cond)?;
+        }
+
+        for conv in &self.conv_layers {
+            x = conv.forward(&x)?;
         }
 
         let out = self.out_proj.forward(&x)?;
