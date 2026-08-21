@@ -82,6 +82,12 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(
         let _ = hiprtcAddNameExpression(prog, name_cstr.as_ptr());
 
         let options_c = crate::device::util::hiprtc_options_for_arch(arch);
+        let cache_key = crate::device::jit_cache::compute_cache_key(arch, source, &options_c);
+
+        if let Some(cached_bytes) = crate::device::jit_cache::load_cached_code_object(&cache_key) {
+            return Ok((cached_bytes, entry_name.to_string()));
+        }
+
         let options_ptrs: Vec<*const i8> = options_c.iter().map(|c| c.as_ptr()).collect();
 
         let status = hiprtcCompileProgram(prog, options_ptrs.len() as i32, options_ptrs.as_ptr());
@@ -115,6 +121,9 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(
             let _ = hiprtcDestroyProgram(&mut prog);
             return Err(Error::Backend(format!("hiprtcGetCode failed: {}", status)));
         }
+
+        // Store freshly compiled HSA code object in persistent disk cache.
+        let _ = crate::device::jit_cache::store_cached_code_object(&cache_key, &code_bytes);
 
         // Resolve the lowered (possibly mangled) name. If hipRTC didn't mangle
         // the entry (most kernels), this returns the plain name unchanged.

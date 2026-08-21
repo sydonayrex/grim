@@ -76,7 +76,17 @@ pub fn parse_tool_calls(completion: &str, family: ToolFamily) -> ParseOutcome {
     }
     // F-4: LFM2.5 convention — `<|tool_call_start|>[name(arg=val, ...)]<|tool_call_end|>`.
     // Tried last so the Hermes/bare-JSON conventions keep priority.
-    parse_bracket_call(completion)
+    let bracket = parse_bracket_call(completion);
+    if let Some(calls) = bracket.calls {
+        return ParseOutcome {
+            calls: Some(calls),
+            diagnostic: bracket.diagnostic,
+        };
+    }
+    ParseOutcome {
+        calls: None,
+        diagnostic: first.diagnostic.or(second.diagnostic).or(bracket.diagnostic),
+    }
 }
 
 /// WI-TOOLS-4b/4c — stable reason strings shared by both runaway-call guards so
