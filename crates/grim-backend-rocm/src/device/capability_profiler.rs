@@ -185,12 +185,18 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
         }
         return (40.0, 0.0, 432.0); // generic RDNA3
     }
-    // RDNA 4 / GFX12xx — has FP8 units
+    // UDNA / GFX13xx & RDNA 4 / GFX12xx — has FP8 & unified matrix units
+    if gcn.starts_with("gfx13") {
+        return (160.0, 320.0, 1500.0);
+    }
     if gcn.starts_with("gfx12") {
         return (80.0, 160.0, 960.0);
     }
     // CDNA (Instinct MI-series)
     if gcn.starts_with("gfx9") {
+        if gcn.contains("950") || gcn.contains("951") {
+            return (2614.0, 5228.0, 8000.0); // MI350/MI355X FP16 peak TFLOPS & HBM3e bandwidth
+        }
         if gcn.contains("940") || gcn.contains("941") || gcn.contains("942") {
             return (1307.0, 2614.0, 5300.0); // MI300X FP16 peak TFLOPS & HBM3 bandwidth
         }
@@ -200,7 +206,7 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
         if gcn.contains("908") {
             return (184.6, 184.6, 1228.8); // MI100
         }
-        if gcn.contains("906") {
+        if gcn.contains("906") || gcn.contains("900") {
             return (26.8, 0.0, 1024.0); // Vega20 / MI50
         }
         return (100.0, 200.0, 1600.0); // generic CDNA / GFX9

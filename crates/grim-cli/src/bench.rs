@@ -6,19 +6,35 @@ use grim_tensor::Device;
 
 pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&str>) -> Result<()> {
     let device = Device::Cpu;
-    // Use provided model path or fall back to a random Llama for smoke testing.
+    // F-5: resolve catalog/cache names ("LFM2.5-350M-Q8_0", "name:gguf") to
+    // real paths before the extension dispatch, mirroring `grim run`. A bare
+    // filename without an extension previously failed with "No such file".
     let model: Box<dyn CausalLm> = if let Some(path) = model_path {
-        let lower = path.to_lowercase();
-        if lower.ends_with(".gguf") {
-            grim_engine::model_loader::load_model_from_gguf(path, device.clone())?
-        } else if lower.ends_with(".grim") {
-            grim_engine::model_loader::load_model_from_grim(path, device.clone())?
-        } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
-            grim_engine::model_loader::load_model_from_safetensors(path, device.clone())?
+        let resolved = crate::catalog::resolve_model_path(path).ok_or_else(|| {
+            grim_core::error::Error::Config(format!(
+                "model '{path}' not found in local cache or on disk"
+            ))
+        })?;
+        let path_str = resolved.to_string_lossy().to_lowercase();
+        if path_str.ends_with(".gguf") {
+            grim_engine::model_loader::load_model_from_gguf(
+                resolved.to_string_lossy().as_ref(),
+                device.clone(),
+            )?
+        } else if path_str.ends_with(".grim") {
+            grim_engine::model_loader::load_model_from_grim(
+                resolved.to_string_lossy().as_ref(),
+                device.clone(),
+            )?
+        } else if path_str.ends_with(".safetensors") || path_str.ends_with(".bin") {
+            grim_engine::model_loader::load_model_from_safetensors(
+                resolved.to_string_lossy().as_ref(),
+                device.clone(),
+            )?
         } else {
             return Err(grim_core::error::Error::Config(format!(
                 "unsupported model format for '{}'",
-                path
+                resolved.display()
             )));
         }
     } else {

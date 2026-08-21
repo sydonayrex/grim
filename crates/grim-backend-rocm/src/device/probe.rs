@@ -62,8 +62,12 @@ pub fn wavefront_size(device_ordinal: usize) -> u32 {
         crate::quantization::GcnArch::RDNA1
         | crate::quantization::GcnArch::RDNA2
         | crate::quantization::GcnArch::RDNA3
-        | crate::quantization::GcnArch::RDNA4 => 32,
-        crate::quantization::GcnArch::CDNA2 | crate::quantization::GcnArch::CDNA3 => 64,
+        | crate::quantization::GcnArch::RDNA4
+        | crate::quantization::GcnArch::UDNA => 32,
+        crate::quantization::GcnArch::CDNA1
+        | crate::quantization::GcnArch::CDNA2
+        | crate::quantization::GcnArch::CDNA3
+        | crate::quantization::GcnArch::CDNA4 => 64,
         _ => {
             let mut val: i32 = 0;
             let _guard = DeviceGuard::set(device_ordinal as i32);
