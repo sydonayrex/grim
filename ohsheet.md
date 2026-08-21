@@ -398,3 +398,36 @@ change-first** (Frank-bold). The prompted personas' simulated probe answers inte
 ---
 
 *Notional test artifact. Per-session findings routed to `docs/results/` per Appendix A; this file is the rolled cross-persona sheet.*
+
+---
+
+## §9. Post-remediation re-verification (fit-it-damn-you.md implementation, 2026-08-21)
+
+Implemented WS-A/E1/C/D/F/B(honest)/G/E3 + parallel-committed fixes (5e61d8e, de23936). All re-scores below are **live-verified** on this host (RTX 4070 + gfx1036 + CPU), clean build, `--features cubecl`.
+
+### Fixed (live-verified)
+| Task | Was | Now | Evidence |
+|---|---|---|---|
+| 2.1 config | FAIL | **PASS** | `--config` wired via `GRIM_CONFIG_PATH` (main.rs:837/1002 → lib.rs:2535/3577) |
+| 2.2 OpenAI drop-in | PARTIAL | **PASS** | content-array messages → 200 (live); image parts → honest 422 |
+| 3.2 KV tiers | PARTIAL | **PASS** | `/status.kv_cache.tiers{gpu,host_ram,nvme}` live; `grim scheduler` renders |
+| 9.1 backend switch | FAIL | **PASS** | `GRIM_BACKEND=cuda` → hard error "Rebuild with --features cuda…"; cpu logs `Using CPU (forced)`; rocm coherent |
+| 11.1 spec observability | PARTIAL | **PASS** | `/status.speculation{enabled,strategy,accepted_tokens}` live |
+| 11.2 KV spill obs | PARTIAL | **PASS** | tier bytes in `/status` |
+| 12.2 backend flag | PARTIAL | **PASS** | `serve --backend` exists (main.rs:72); unavailable → loud error |
+| 13.1 wasm plugin | FAIL | **PASS** | `default=["wasm-sandbox"]`; grants load-time enforced (loud `Error::Backend`); 24 tests green |
+| 16.1 metrics | PARTIAL | **PASS** | Prometheus `text/plain; version=0.0.4` default (curl-verified), real counters, JSON via Accept |
+| 16.2 garage | PARTIAL | **PASS** | `grim garage` subcommand; SPA util% tile (sysfs `gpu_busy_percent`) |
+| 17.1 CI gating | PASS* | **PASS** | `cubecl` in grim-backend-rocm `default` — bare `cargo test` = shipping path |
+| 17.2 docs | PARTIAL | **PASS** | crate counts de-brittled; README/cli.md truth pass; kebab-case flags fixed |
+| 18.1 sandbox default | FAIL | **PASS** | default-on sandbox; deny-by-default test-pinned |
+| 2.4 adapter load | FAIL | **PARTIAL** | `POST /v1/adapters/load` + `grim adapter load/list/unload`; logits-pairs load real weights; per-layer → honest 409 + `grim merge` pointer |
+| 1.1 serve timing | PARTIAL | **PARTIAL** | 46 s → **5.8 s**/8 tok (live); backend honored; output correctness still open (below) |
+| 12.1 vulkan | FAIL | **PARTIAL** | serve path hard-errors (no vulkan loader); `run`-path still silent zero-output (below) |
+
+### New tally: PASS 32 · PARTIAL 7 · FAIL 3 (was 18/15/9). Clean PASS 76%.
+
+### Open defects (bounded, next session)
+1. **Engine scheduler-forward degeneracy (P1.1 core):** serve (stream + non-stream) emits `"SSSSSSSS"` while `grim run` direct `CausalLm::forward` is coherent on the same tokens. Ruled out: prompt (token-identical, GRIM_DEBUG_PROMPT), backend (CPU forced), prefill positions (0..n correct), sampling (varied tokens at temp>0). Suspect: `Engine::drive_forward` session/KV state for LFM2 hybrid shortconv. Diagnostics left in place: `GRIM_DEBUG_PROMPT=1` (prompt + step-0 top-5 logits).
+2. **Vulkan run-path zero output (12.1):** `Device: vulkan`, prompt encoded, 0 tokens, exit 0. Needs decode-loop diagnosis or a loud error.
+3. **Not implemented (lower priority):** `train --compare-modes` (1.4/4.1), `bench --ppl` (10.2), `GRIM_KV_SPILL_MIB` knob (3.2b), installer script (15.1/WS-H), multimodal deep pipelines (5.x/6.x — honest 422/501 + real CLI errors in place; encoder structs real, wiring awaits vision/ASR/diffusion checkpoints).

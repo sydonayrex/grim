@@ -425,6 +425,16 @@ impl Engine {
         self.total_tokens_generated
     }
 
+    /// Invalidate radix prefix cache and reclaim unreferenced KV blocks.
+    /// Returns the number of reclaimed blocks.
+    pub fn reset_prefix_cache(&mut self) -> usize {
+        if let Ok(mut pool) = self.block_pool.lock() {
+            pool.reset_prefix_cache()
+        } else {
+            0
+        }
+    }
+
     pub fn register_model(&mut self, id: &str, model: Box<dyn CausalLm>) {
         self.register_speculative(id, model, None, None, None);
     }

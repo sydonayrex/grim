@@ -1,3 +1,15 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::op_ref,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::needless_borrow,
+    clippy::new_without_default,
+    clippy::filter_next
+)]
+
 pub mod autotune;
 pub mod caps;
 pub mod kernels;

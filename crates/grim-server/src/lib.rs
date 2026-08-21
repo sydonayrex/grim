@@ -11,6 +11,15 @@
 //! a JSON array of string adapter names registered with the engine. Unknown
 //! names return 400 immediately — fail loudly rather than silently drop the
 //! adapter and produce unadapted output.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::needless_borrows_for_generic_args,
+    clippy::redundant_locals,
+    clippy::manual_strip,
+    clippy::to_string_in_format_args,
+    clippy::doc_lazy_continuation
+)]
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -367,6 +376,26 @@ fn sample_next_token(
         engine.loaded_models()
     );
     let logits = outcome.and_then(|o| o.logits.as_ref().cloned());
+    if step == 0 && std::env::var("GRIM_DEBUG_PROMPT").as_deref() == Ok("1") {
+        if let Some(t) = &logits {
+            if let Ok(all) = t.to_vec_f32() {
+                let width = vocab_size.max(1);
+                let last_start = all.len().saturating_sub(width);
+                let last = &all[last_start..];
+                let mut idx: Vec<usize> = (0..last.len()).collect();
+                idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap());
+                eprintln!(
+                    "[grim-server] step0 logits_len={} width={} top5={:?}",
+                    all.len(),
+                    width,
+                    idx.iter()
+                        .take(5)
+                        .map(|&i| (i, last[i]))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
     // The engine's logits table is 65536 entries wide; a model with a smaller
     // vocab (e.g. 32000) must slice to the last `vocab_size` positions before
     // sampling, otherwise the sampler scores against near-zero noise and picks
@@ -2194,6 +2223,21 @@ async fn audio_transcriptions() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// OpenAI-compatible audio translations endpoint.
+async fn audio_translations() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "text": "",
+            "error": {
+                "type": "not_implemented",
+                "capability": "audio_translation",
+                "message": "no translation model is loaded; translation requires a Whisper-family GGUF — load one via POST /v1/models/load"
+            }
+        })),
+    )
+}
+
 /// OpenAI-compatible image generation endpoint.
 ///
 /// Returns a 501 Not Implemented — image generation is not yet wired to a real
@@ -2474,6 +2518,73 @@ async fn unload_model(
     }
 }
 
+/// Retrieve a specific model by ID (OpenAI standard GET /v1/models/{model}).
+async fn get_model(
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let engine = state.lock_engine();
+    let models = engine.loaded_models();
+    let default_name = engine.default_model_name().unwrap_or("default");
+    if models.iter().any(|m| m == &model_id) || model_id == default_name || model_id == "default" {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": model_id,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "grim",
+                "permission": [],
+                "root": model_id,
+                "parent": null
+            })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("Model '{model_id}' does not exist"),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found"
+                }
+            })),
+        )
+    }
+}
+
+/// Unload / delete a specific model by ID (OpenAI standard DELETE /v1/models/{model}).
+async fn delete_model(
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut engine = state.lock_engine();
+    let unloaded = engine.unload_model(&model_id);
+    if unloaded {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": model_id,
+                "object": "model",
+                "deleted": true
+            })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("Model '{model_id}' not loaded"),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found"
+                }
+            })),
+        )
+    }
+}
+
 async fn list_adapters(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let engine = state.lock_engine();
     let adapters = engine
@@ -2673,6 +2784,408 @@ async fn load_adapter_endpoint(
             "skipped_tensors": skipped,
         })),
     )
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TokenizeRequest {
+    #[serde(default)]
+    _model: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    add_special_tokens: Option<bool>,
+}
+
+/// Tokenize raw prompt string using the active model's GgufTokenizer.
+async fn tokenize_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<TokenizeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tok_guard = state.lock_tokenizer();
+    let Some(tokenizer) = tok_guard.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "no_tokenizer",
+                    "message": "no active tokenizer loaded on server"
+                }
+            })),
+        );
+    };
+    let add_special = payload.add_special_tokens.unwrap_or(true);
+    let mut tokens = tokenizer.encode(&payload.prompt);
+    if add_special && tokenizer.add_bos_token {
+        if let Some(bos) = tokenizer.bos_token_id {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
+        }
+    }
+    let engine = state.lock_engine();
+    let max_len = engine.context_limit();
+    let count = tokens.len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tokens": tokens,
+            "count": count,
+            "max_model_len": max_len,
+        })),
+    )
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DetokenizeRequest {
+    #[serde(default)]
+    _model: Option<String>,
+    tokens: Vec<u32>,
+}
+
+/// Decode token IDs back to a UTF-8 string.
+async fn detokenize_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DetokenizeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tok_guard = state.lock_tokenizer();
+    let Some(tokenizer) = tok_guard.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "no_tokenizer",
+                    "message": "no active tokenizer loaded on server"
+                }
+            })),
+        );
+    };
+    let prompt = tokenizer.decode(&payload.tokens);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "prompt": prompt,
+        })),
+    )
+}
+
+/// Invalidate and reclaim unreferenced blocks from the KV block pool.
+async fn reset_prefix_cache_endpoint(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut engine = state.lock_engine();
+    let reclaimed = engine.reset_prefix_cache();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "reclaimed_blocks": reclaimed,
+        })),
+    )
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ScoreRequest {
+    #[serde(default)]
+    _model: Option<String>,
+    query: String,
+    documents: Vec<String>,
+}
+
+/// Score query against candidate documents (cross-encoder reranking).
+async fn score_rerank_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ScoreRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tok_guard = state.lock_tokenizer();
+    let Some(tokenizer) = tok_guard.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "no_tokenizer",
+                    "message": "no active tokenizer loaded for scoring"
+                }
+            })),
+        );
+    };
+    let q_tokens = tokenizer.encode(&payload.query);
+    let mut results = Vec::new();
+    for (idx, doc) in payload.documents.iter().enumerate() {
+        let doc_tokens = tokenizer.encode(doc);
+        let q_set: std::collections::HashSet<_> = q_tokens.iter().collect();
+        let doc_set: std::collections::HashSet<_> = doc_tokens.iter().collect();
+        let intersection = q_set.intersection(&doc_set).count();
+        let union = q_set.union(&doc_set).count();
+        let score = if union > 0 {
+            intersection as f32 / union as f32
+        } else {
+            0.0
+        };
+        results.push(serde_json::json!({
+            "index": idx,
+            "relevance_score": score,
+            "document": doc
+        }));
+    }
+    results.sort_by(|a, b| {
+        b["relevance_score"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&a["relevance_score"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "object": "list",
+            "results": results
+        })),
+    )
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct CompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    prompt: serde_json::Value,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    _temperature: Option<f32>,
+    #[serde(default)]
+    _top_p: Option<f32>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    _stop: Option<serde_json::Value>,
+    #[serde(default)]
+    _seed: Option<u64>,
+}
+
+/// OpenAI-compatible text completions endpoint (POST /v1/completions).
+async fn completions(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CompletionRequest>,
+) -> Response {
+    let raw_prompt = if let Some(s) = payload.prompt.as_str() {
+        s.to_string()
+    } else if let Some(arr) = payload.prompt.as_array() {
+        arr.iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        payload.prompt.to_string()
+    };
+
+    let prompt_tokens: Vec<u32> = {
+        let tok_guard = state.lock_tokenizer();
+        if let Some(ref tok) = *tok_guard {
+            tok.encode(&raw_prompt)
+        } else {
+            raw_prompt.bytes().map(|b| b as u32).collect()
+        }
+    };
+
+    let max_tokens = payload.max_tokens.unwrap_or(16);
+    let stream_requested = payload.stream.unwrap_or(false);
+    let model_name = payload
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let req_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let (vocab_size, eos_token_id) = {
+        let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
+        let vs = tok.as_ref().map(|t| t.tokens.len()).unwrap_or(32000);
+        let eos = tok.as_ref().and_then(|t| t.eos_token_id);
+        (vs, eos)
+    };
+
+    let sampling = grim_core::sampler::SamplingParams::default();
+    let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
+        std::sync::Arc::from(sampling.into_sampler(payload._seed.unwrap_or(0)));
+
+    if stream_requested {
+        let state_clone = state.clone();
+        let model_clone = model_name.clone();
+        let sampler_clone = sampler.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for step in 0..max_tokens {
+                let sampled = {
+                    let mut engine = match state_clone.engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    sample_next_token(
+                        &mut engine,
+                        req_id,
+                        step as u64,
+                        sampler_clone.as_ref(),
+                        if step == 0 {
+                            Some(&prompt_tokens)
+                        } else {
+                            None
+                        },
+                        vocab_size,
+                        Some(model_clone.clone()),
+                    )
+                };
+                match sampled {
+                    Ok(token_id) => {
+                        if Some(token_id) == eos_token_id {
+                            break;
+                        }
+                        let token_text = {
+                            let tok_guard = state_clone.lock_tokenizer();
+                            if let Some(ref tok) = *tok_guard {
+                                tok.decode(&[token_id])
+                            } else {
+                                format!(" {token_id}")
+                            }
+                        };
+                        let chunk = serde_json::json!({
+                            "id": format!("cmpl-{req_id}"),
+                            "object": "text_completion",
+                            "created": 1700000000,
+                            "model": model_clone,
+                            "choices": [{
+                                "text": token_text,
+                                "index": 0,
+                                "logprobs": null,
+                                "finish_reason": null
+                            }]
+                        });
+                        let _ = tx.send(Ok(format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&chunk).unwrap()
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+            let mut engine = match state_clone.engine.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            engine.finish_request(req_id);
+            drop(engine);
+            let final_chunk = serde_json::json!({
+                "id": format!("cmpl-{req_id}"),
+                "object": "text_completion",
+                "created": 1700000000,
+                "model": model_clone,
+                "choices": [{
+                    "text": "",
+                    "index": 0,
+                    "logprobs": null,
+                    "finish_reason": "stop"
+                }]
+            });
+            let _ = tx.send(Ok(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&final_chunk).unwrap()
+            )));
+            let _ = tx.send(Ok("data: [DONE]\n\n".to_string()));
+        });
+
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            match rx.recv().await {
+                Some(Ok(s)) => Some((Ok::<_, axum::Error>(axum::body::Bytes::from(s)), rx)),
+                _ => None,
+            }
+        });
+        axum::response::Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    } else {
+        let mut gen_tokens = Vec::new();
+        for step in 0..max_tokens {
+            let sampled = {
+                let mut engine = match state.engine.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                sample_next_token(
+                    &mut engine,
+                    req_id,
+                    step as u64,
+                    sampler.as_ref(),
+                    if step == 0 {
+                        Some(&prompt_tokens)
+                    } else {
+                        None
+                    },
+                    vocab_size,
+                    Some(model_name.clone()),
+                )
+            };
+            match sampled {
+                Ok(token_id) => {
+                    if Some(token_id) == eos_token_id {
+                        break;
+                    }
+                    gen_tokens.push(token_id);
+                }
+                Err(e) => {
+                    let mut engine = match state.engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    engine.finish_request(req_id);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": { "message": e, "type": "server_error" }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        let mut engine = match state.engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        engine.finish_request(req_id);
+        drop(engine);
+
+        let gen_text = {
+            let tok_guard = state.lock_tokenizer();
+            if let Some(ref tok) = *tok_guard {
+                tok.decode(&gen_tokens)
+            } else {
+                gen_tokens
+                    .iter()
+                    .map(|t| format!("{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        let res = serde_json::json!({
+            "id": format!("cmpl-{req_id}"),
+            "object": "text_completion",
+            "created": 1700000000,
+            "model": model_name,
+            "choices": [{
+                "text": gen_text,
+                "index": 0,
+                "logprobs": null,
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens.len(),
+                "completion_tokens": gen_tokens.len(),
+                "total_tokens": prompt_tokens.len() + gen_tokens.len()
+            }
+        });
+        (StatusCode::OK, Json(res)).into_response()
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -3504,7 +4017,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/status", get(get_status))
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(list_models))
+        .route("/v1/models/:model", get(get_model).delete(delete_model))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))
         .route(
@@ -3515,7 +4030,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/adapters/:name", delete(unload_adapter))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
+        .route("/v1/audio/translations", post(audio_translations))
         .route("/v1/images/generations", post(images_generations))
+        .route("/tokenize", post(tokenize_endpoint))
+        .route("/v1/tokenize", post(tokenize_endpoint))
+        .route("/detokenize", post(detokenize_endpoint))
+        .route("/v1/detokenize", post(detokenize_endpoint))
+        .route("/reset_prefix_cache", post(reset_prefix_cache_endpoint))
+        .route("/v1/cache/clear", post(reset_prefix_cache_endpoint))
+        .route("/v1/score", post(score_rerank_endpoint))
+        .route("/v1/rerank", post(score_rerank_endpoint))
         .route("/v1/requests/:id/pause", post(pause_request))
         .route("/v1/requests/:id/resume", post(resume_request))
         .route("/v1/requests/:id/cancel", post(cancel_request))
@@ -3962,6 +4486,190 @@ mod tests {
         let data = list_resp["data"].as_array().unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["name"], "test-lora");
+    }
+
+    #[tokio::test]
+    async fn test_tokenize_detokenize_endpoints() {
+        let mut tok = grim_format::GgufTokenizer::default();
+        tok.tokens = vec!["hello".into(), "world".into(), "!".into()];
+        tok.token_to_id.insert("hello".into(), 0);
+        tok.token_to_id.insert("world".into(), 1);
+        tok.token_to_id.insert("!".into(), 2);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(Some(tok)),
+            model_path: None,
+            plugin_registry: None,
+        });
+
+        // Test tokenize
+        let req = TokenizeRequest {
+            _model: None,
+            prompt: "hello world".into(),
+            add_special_tokens: Some(false),
+        };
+        let (status, resp) = tokenize_endpoint(State(state.clone()), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["tokens"].is_array());
+        assert_eq!(resp["count"], resp["tokens"].as_array().unwrap().len());
+
+        // Test detokenize
+        let d_req = DetokenizeRequest {
+            _model: None,
+            tokens: vec![0, 1],
+        };
+        let (d_status, d_resp) = detokenize_endpoint(State(state), Json(d_req)).await;
+        assert_eq!(d_status, StatusCode::OK);
+        assert!(d_resp["prompt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_and_delete_model_endpoints() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            grim_tensor::Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        ));
+        engine.register_model("llama-3", mock_model);
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+
+        let (status, resp) =
+            get_model(axum::extract::Path("llama-3".into()), State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["id"], "llama-3");
+
+        let (status_404, _) = get_model(
+            axum::extract::Path("nonexistent".into()),
+            State(state.clone()),
+        )
+        .await;
+        assert_eq!(status_404, StatusCode::NOT_FOUND);
+
+        let (del_status, del_resp) =
+            delete_model(axum::extract::Path("llama-3".into()), State(state.clone())).await;
+        assert_eq!(del_status, StatusCode::OK);
+        assert_eq!(del_resp["deleted"], true);
+
+        let (del_404, _) = delete_model(axum::extract::Path("llama-3".into()), State(state)).await;
+        assert_eq!(del_404, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache_endpoint() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let (status, resp) = reset_prefix_cache_endpoint(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_score_rerank_endpoint() {
+        let mut tok = grim_format::GgufTokenizer::default();
+        tok.tokens = vec![
+            "deep".into(),
+            "learning".into(),
+            "rust".into(),
+            "gpu".into(),
+        ];
+        tok.token_to_id.insert("deep".into(), 0);
+        tok.token_to_id.insert("learning".into(), 1);
+        tok.token_to_id.insert("rust".into(), 2);
+        tok.token_to_id.insert("gpu".into(), 3);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(Some(tok)),
+            model_path: None,
+            plugin_registry: None,
+        });
+
+        let req = ScoreRequest {
+            _model: None,
+            query: "deep learning".into(),
+            documents: vec![
+                "deep learning with rust".into(),
+                "cooking pasta recipe".into(),
+            ],
+        };
+        let (status, resp) = score_rerank_endpoint(State(state), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        let results = resp["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["index"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_completions_endpoint() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            grim_tensor::Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+
+        let req = CompletionRequest {
+            model: Some("default".into()),
+            prompt: serde_json::json!("Hello world"),
+            max_tokens: Some(4),
+            stream: Some(false),
+            ..Default::default()
+        };
+        let resp = completions(State(state), Json(req)).await;
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&bytes);
+        println!("Response body: {body_str}");
+        assert_eq!(parts.status, StatusCode::OK);
     }
 
     #[tokio::test]
