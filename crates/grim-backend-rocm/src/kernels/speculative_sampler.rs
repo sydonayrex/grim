@@ -101,6 +101,57 @@ __global__ void grim_speculative_rejection_sample(
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU Direct Logits Argmax Sampler (Zero-CPU Greedy Token Selection)
+// ---------------------------------------------------------------------------
+// Grid: (batch_size, 1)
+// Block: (256, 1)
+// ---------------------------------------------------------------------------
+__global__ void grim_sample_logits_argmax(
+    const float* __restrict__ logits,  // [batch_size, vocab_size]
+    int* __restrict__ out_tokens,       // [batch_size]
+    int batch_size,
+    int vocab_size
+) {
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (b >= batch_size) return;
+
+    const float* b_logits = &logits[b * vocab_size];
+
+    __shared__ float s_max_val[256];
+    __shared__ int s_max_idx[256];
+
+    float local_max = -1e30f;
+    int local_idx = 0;
+
+    for (int v = tid; v < vocab_size; v += blockDim.x) {
+        float val = b_logits[v];
+        if (val > local_max) {
+            local_max = val;
+            local_idx = v;
+        }
+    }
+
+    s_max_val[tid] = local_max;
+    s_max_idx[tid] = local_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_max_val[tid + stride] > s_max_val[tid]) {
+                s_max_val[tid] = s_max_val[tid + stride];
+                s_max_idx[tid] = s_max_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_tokens[b] = s_max_idx[0];
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -111,5 +162,6 @@ mod tests {
     #[test]
     fn kernel_source_contains_speculative_sampler() {
         assert!(KERNEL_SOURCE.contains("grim_speculative_rejection_sample"));
+        assert!(KERNEL_SOURCE.contains("grim_sample_logits_argmax"));
     }
 }
