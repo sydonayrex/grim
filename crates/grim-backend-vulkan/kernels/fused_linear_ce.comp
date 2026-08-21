@@ -1,0 +1,95 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint batch;
+    uint hidden_dim;
+    uint vocab_size;
+} params;
+
+layout(std430, binding = 0) readonly buffer H { float hidden[]; }; // [batch, hidden_dim]
+layout(std430, binding = 1) readonly buffer W { float lm_head[]; }; // [vocab_size, hidden_dim]
+layout(std430, binding = 2) readonly buffer T { uint targets[]; }; // [batch]
+layout(std430, binding = 3) writeonly buffer Loss { float loss_out[]; }; // [batch]
+layout(std430, binding = 4) writeonly buffer Lse { float lse_out[]; }; // [batch]
+
+shared float s_sub_max[32];
+shared float s_sub_sum[32];
+shared float s_target_logit;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= params.batch) return;
+
+    uint target = targets[row];
+    float local_max = -1e20;
+    float local_sum = 0.0;
+    float target_l = 0.0;
+    bool is_target = false;
+
+    for (uint v = tid; v < params.vocab_size; v += 256u) {
+        float logit = 0.0;
+        uint w_base = v * params.hidden_dim;
+        uint h_base = row * params.hidden_dim;
+
+        for (uint d = 0; d < params.hidden_dim; ++d) {
+            logit += hidden[h_base + d] * lm_head[w_base + d];
+        }
+
+        if (v == target) {
+            target_l = logit;
+            is_target = true;
+        }
+
+        if (logit > local_max) {
+            local_sum = local_sum * exp(local_max - logit) + 1.0;
+            local_max = logit;
+        } else {
+            local_sum += exp(logit - local_max);
+        }
+    }
+
+    if (is_target) {
+        s_target_logit = target_l;
+    }
+    barrier();
+
+    #ifdef GL_KHR_shader_subgroup_arithmetic
+    float sub_m = subgroupMax(local_max);
+    if (subgroupElect()) {
+        s_sub_max[gl_SubgroupID] = sub_m;
+    }
+    barrier();
+
+    float global_m = (tid < gl_NumSubgroups) ? s_sub_max[tid] : -1e20;
+    global_m = subgroupMax(global_m);
+    barrier();
+
+    float scaled_sum = local_sum * exp(local_max - global_m);
+    float sub_s = subgroupAdd(scaled_sum);
+    if (subgroupElect()) {
+        s_sub_sum[gl_SubgroupID] = sub_s;
+    }
+    barrier();
+
+    float global_s = (tid < gl_NumSubgroups) ? s_sub_sum[tid] : 0.0;
+    global_s = subgroupAdd(global_s);
+
+    if (tid == 0u) {
+        float lse = global_m + log(max(global_s, 1e-8));
+        float loss = lse - s_target_logit;
+        lse_out[row] = lse;
+        loss_out[row] = loss;
+    }
+    #else
+    if (tid == 0u) {
+        float lse = local_max + log(max(local_sum, 1e-8));
+        float loss = lse - target_l;
+        lse_out[row] = lse;
+        loss_out[row] = loss;
+    }
+    #endif
+}

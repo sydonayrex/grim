@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform Params {
+    uint m;
+    uint n;
+    uint k;
+    uint group_size;
+} params;
+
+layout(std430, binding = 0) readonly buffer A { float a[]; }; // [M, K]
+layout(std430, binding = 1) readonly buffer B { uint b_packed[]; }; // [K/8, N] packed 4-bit weights
+layout(std430, binding = 2) readonly buffer S { float scales[]; }; // [K/group_size, N]
+layout(std430, binding = 3) writeonly buffer C { float c[]; }; // [M, N]
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row >= params.m || col >= params.n) return;
+
+    float acc = 0.0;
+    uint num_packed_k = params.k / 8u;
+
+    for (uint pk = 0; pk < num_packed_k; ++pk) {
+        uint k_start = pk * 8u;
+        uint scale_idx = (k_start / max(params.group_size, 1u)) * params.n + col;
+        float s = scales[scale_idx];
+
+        uint packed_val = b_packed[pk * params.n + col];
+
+        for (uint ki = 0; ki < 8u; ++ki) {
+            uint k_curr = k_start + ki;
+            int q_val = int((packed_val >> (ki * 4u)) & 0x0Fu) - 8;
+            float w_val = float(q_val) * s;
+            acc += a[row * params.k + k_curr] * w_val;
+        }
+    }
+
+    c[row * params.n + col] = acc;
+}
