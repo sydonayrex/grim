@@ -403,56 +403,19 @@ impl Qwen35Block {
 
             cache.k_cache.extend_from_slice(&k_all);
             cache.v_cache.extend_from_slice(&v_all);
-            let total_kv = cache.k_cache.len() / kv_dim;
-            let group = (self.num_heads / self.num_kv_heads).max(1);
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-            for t in 0..seq_len {
-                let q_pos = positions[t] as usize;
-                for h in 0..self.num_heads {
-                    let kvh = h / group;
-                    let q_base = (t * self.num_heads + h) * self.head_dim;
-                    let mut max_l = f32::NEG_INFINITY;
-                    let mut logits = vec![0.0f32; total_kv];
-                    for s in 0..total_kv {
-                        let kv_pos = cache.current_pos + s;
-                        if kv_pos > q_pos {
-                            logits[s] = f32::NEG_INFINITY;
-                        } else {
-                            let k_base = (s * self.num_kv_heads + kvh) * self.head_dim;
-                            let mut dot = 0.0f32;
-                            for d in 0..self.head_dim {
-                                dot += q_all[q_base + d] * cache.k_cache[k_base + d];
-                            }
-                            let l = dot * scale;
-                            logits[s] = l;
-                            if l > max_l {
-                                max_l = l;
-                            }
-                        }
-                    }
-                    let mut exp_sum = 0.0f32;
-                    for s in 0..total_kv {
-                        if logits[s] != f32::NEG_INFINITY {
-                            logits[s] = (logits[s] - max_l).exp();
-                            exp_sum += logits[s];
-                        } else {
-                            logits[s] = 0.0;
-                        }
-                    }
-                    let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
-                    let out_base = (t * self.num_heads + h) * self.head_dim;
-                    for s in 0..total_kv {
-                        let p = logits[s] * inv_sum;
-                        if p > 0.0 {
-                            let v_base = (s * self.num_kv_heads + kvh) * self.head_dim;
-                            for d in 0..self.head_dim {
-                                out_branch[out_base + d] += p * cache.v_cache[v_base + d];
-                            }
-                        }
-                    }
-                }
-            }
+            let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
+                &q_all,
+                cache.k_cache.as_slice(),
+                cache.v_cache.as_slice(),
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                &device,
+            )?;
+            out_branch = attn_tensor.to_vec_f32()?;
         } else {
             // SSM short-conv path with fused attn_qkv
             if let Some(ref qkv_lin) = self.attn_qkv {

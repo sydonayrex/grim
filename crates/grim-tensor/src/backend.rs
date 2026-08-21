@@ -829,6 +829,52 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Matrix-absorbed MLA decode (DeepSeek-family multi-latent attention).
+    ///
+    /// Contracts:
+    /// - `q_absorbed`: `[1, num_heads, kv_lora_rank]` — query with `w_kc`
+    ///   absorbed (q_nope @ w_kcᵀ), post-RoPE handling
+    /// - `q_rope`: `[1, num_heads, qk_rope_dim]` — rotated query part
+    /// - `kv_cache`: `[seq_len, num_kv_heads(=1), kv_lora_rank + qk_rope_dim]`
+    ///   — compressed latent KV (kv_a_layernorm'ed c_kv + rope key)
+    /// - `w_uv`: `[num_heads * v_head_dim, kv_lora_rank]` — absorbed
+    ///   up+value projection (optional; None ⇒ output stays in latent space)
+    /// - `out_shape`: `[1, num_heads, v_head_dim]`
+    ///
+    /// Scale: `1/sqrt(kv_lora_rank + qk_rope_dim)`.
+    ///
+    /// Default: returns `Err(Unimplemented)`; loaders fall back to the
+    /// scalar latent-space loop.
+    fn mla_absorbed_decode(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "mla_absorbed_decode not implemented for this backend".into(),
+        ))
+    }
+
     /// QKV attention calculation on device.
     ///
     /// Contracts:
@@ -871,6 +917,41 @@ pub trait BackendDevice: Send + Sync {
         );
         Err(crate::error::Error::Unimplemented(
             "qkv_attention not implemented for this backend".into(),
+        ))
+    }
+
+    /// QKV attention with ALiBi position bias (baichuan/mpt/jais/gptneox
+    /// class models). Same contract as [`BackendDevice::qkv_attention`], plus
+    /// `alibi_slopes`: `[num_heads]` per-head slopes. Score bias for query at
+    /// absolute position `i` and key at `j` is `slopes[h] * (j - i)`.
+    ///
+    /// Default: `Err(Unimplemented)` — callers fall back to
+    /// `qkv_attention`-style host paths.
+    fn qkv_attention_alibi(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        alibi_slopes: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            alibi_slopes,
+            out_shape,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_alibi not implemented for this backend".into(),
         ))
     }
 

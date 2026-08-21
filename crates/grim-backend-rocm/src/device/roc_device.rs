@@ -4014,6 +4014,50 @@ impl BackendDevice for RocmDevice {
         Ok((Box::new(dx_storage), handle))
     }
 
+    fn mla_absorbed_decode(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let q_abs = q_absorbed
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_absorbed is not RocmStorage".into()))?;
+        let q_r = q_rope
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_rope is not RocmStorage".into()))?;
+        let kv = kv_cache
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: kv_cache is not RocmStorage".into()))?;
+        let o = out
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: out is not RocmStorage".into()))?;
+        let w = w_uv
+            .map(|s| {
+                s.as_any()
+                    .downcast_ref::<RocmStorage>()
+                    .ok_or_else(|| Error::Backend("mla_absorbed_decode: w_uv is not RocmStorage".into()))
+            })
+            .transpose()?;
+        self.launch_mla_absorbed_decode(
+            q_abs, q_r, kv, w, o, num_heads, kv_lora_rank, qk_rope_dim, v_head_dim, seq_len,
+        )?;
+        Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
+            self.active_stream(),
+        ))))
+    }
+
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -4160,6 +4204,8 @@ impl BackendDevice for RocmDevice {
         let mut oproj_ptr: u64 = 0;
         let mut odim: i32 = 0;
         let mut fuseo: i32 = 0;
+        let mut alibi_ptr: u64 = 0;
+        let mut has_alibi: i32 = 0;
 
         // Prior RoPE / cache ops were enqueued on the same stream, so stream
         // ordering already guarantees they complete before this kernel reads
@@ -4173,7 +4219,16 @@ impl BackendDevice for RocmDevice {
             && out_max.is_none()
             && out_sum.is_none()
         {
-            let num_splits = (kv_seq_len / 256).clamp(2, 64);
+            let num_splits = self.flash_decode_split_count(
+                q_s,
+                k_s,
+                v_s,
+                &storage,
+                config.num_heads,
+                config.num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+            );
             let stream = self.launch_flash_decode(
                 q_s,
                 k_s,
@@ -4210,12 +4265,14 @@ impl BackendDevice for RocmDevice {
                 arg(&mut oproj_ptr),
                 arg(&mut odim),
                 arg(&mut fuseo),
+                arg(&mut alibi_ptr),
+                arg(&mut has_alibi),
             ],
         )?;
 
         let _ = (
             qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, oproj_ptr,
-            odim, fuseo,
+            odim, fuseo, alibi_ptr, has_alibi,
         );
 
         // No post-launch sync: the output storage is returned to the caller
@@ -4223,6 +4280,116 @@ impl BackendDevice for RocmDevice {
         // ordered by the single active stream. A sync here would serialize
         // the CPU against every attention of every layer of every token.
 
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+
+    fn qkv_attention_alibi(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        alibi_slopes: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let slopes_s = as_rocm(alibi_slopes)?;
+        if !q_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+            || !slopes_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "qkv_attention_alibi: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 {
+            return Err(Error::Shape(
+                "qkv_attention_alibi: out_shape must be [seq, heads, head_dim]".into(),
+            ));
+        }
+        let (seq_len, num_heads, head_dim) = (out_dims[0], out_dims[1], out_dims[2]);
+        if slopes_s.shape().elem_count() < num_heads {
+            return Err(Error::Shape(
+                "qkv_attention_alibi: alibi_slopes must hold num_heads entries".into(),
+            ));
+        }
+
+        let window_lo_i: i32 = match window {
+            None => 0,
+            Some(w) => (cache_offset as usize)
+                .saturating_sub(w.saturating_sub(1)) as i32,
+        };
+        let config = QkvAttentionFusionConfig {
+            enabled: true,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_seq_len: seq_len,
+            wavefront_size: self.props.wavefront_size as u32,
+            quant_mode: QuantMode::Fp32,
+        };
+        let launch = config.hip_launch_params();
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let out_ptr = dev_ptr(&storage)?;
+
+        let mut qptr = dev_ptr(q_s)?;
+        let mut kptr = dev_ptr(k_s)?;
+        let mut vptr = dev_ptr(v_s)?;
+        let mut optr = out_ptr;
+        let mut max_ptr: u64 = 0;
+        let mut sum_ptr: u64 = 0;
+        let mut nh = num_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut co = cache_offset as i32;
+        let mut isd: f32 = 1.0 / (head_dim as f32).sqrt();
+        let mut wlo = window_lo_i;
+        let mut oproj_ptr: u64 = 0;
+        let mut odim: i32 = 0;
+        let mut fuseo: i32 = 0;
+        let mut alibi_ptr = dev_ptr(slopes_s)?;
+        let mut has_alibi: i32 = 1;
+
+        let stream = self.launch_compute_kernel(
+            "grim_qkv_attention",
+            launch.grid_dim,
+            launch.block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut max_ptr),
+                arg(&mut sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
+                arg(&mut wlo),
+                arg(&mut oproj_ptr),
+                arg(&mut odim),
+                arg(&mut fuseo),
+                arg(&mut alibi_ptr),
+                arg(&mut has_alibi),
+            ],
+        )?;
+        let _ = (
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo,
+            oproj_ptr, odim, fuseo, alibi_ptr, has_alibi,
+        );
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
@@ -9675,6 +9842,113 @@ impl RocmDevice {
         )
     }
 
+    /// Split-KV count for FlashDecoding: consult the autotuner (persisted in
+    /// `.autotune_cache/{gpu_target}.json`) keyed by
+    /// `(num_heads, head_dim, kv_len)`; on miss return the static heuristic.
+    /// With `GRIM_ATTENTION_AUTOTUNE=1` (and outside stream capture), a miss
+    /// instead benchmarks candidate split counts with real launches and
+    /// records the winner — same treatment as GEMM tiles (ADR 0001 §5).
+    #[allow(clippy::too_many_arguments)]
+    fn flash_decode_split_count(
+        &self,
+        q_s: &RocmStorage,
+        k_s: &RocmStorage,
+        v_s: &RocmStorage,
+        out: &RocmStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_seq_len: usize,
+    ) -> usize {
+        let heuristic = (kv_seq_len / 256).clamp(2, 64);
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let key = crate::autotune::KernelKey {
+            kernel: "grim_flash_decode",
+            gpu_arch: arch_leak,
+            m: num_heads,
+            n: head_dim,
+            k: kv_seq_len.clamp(1, 1 << 16),
+        };
+        let Ok(mut tuner) = self.autotuner.lock() else {
+            return heuristic;
+        };
+        if let Some(cfg) = tuner.lookup(key) {
+            return cfg.tile_kv.max(1) as usize;
+        }
+        let tune_enabled = std::env::var("GRIM_ATTENTION_AUTOTUNE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !tune_enabled || self.active_capture_stream().is_some() {
+            return heuristic;
+        }
+
+        // Bench candidate splits: real launches on the active stream, timed
+        // wall-clock (launch + synchronize). Each candidate runs 3 iterations
+        // after 1 warmup; the minimum wins.
+        let mut candidates: Vec<usize> = [2usize, 4, 8, 16, 32, 64]
+            .into_iter()
+            .filter(|&s| s <= kv_seq_len.max(2))
+            .collect();
+        if !candidates.contains(&heuristic) {
+            candidates.push(heuristic);
+        }
+        let mut best = (heuristic, f64::INFINITY);
+        for &splits in &candidates {
+            let mut best_ms = f64::INFINITY;
+            for iter in 0..4 {
+                if let Err(e) = self.launch_flash_decode(
+                    q_s, k_s, v_s, out, num_heads, num_kv_heads, head_dim, kv_seq_len, splits,
+                ) {
+                    // A failing candidate (e.g. LDS overflow at high split
+                    // counts) is simply not viable; skip it.
+                    let _ = e;
+                    best_ms = f64::INFINITY;
+                    break;
+                }
+                if iter == 0 {
+                    continue; // warmup
+                }
+                let t = std::time::Instant::now();
+                if let Err(e) = self.launch_flash_decode(
+                    q_s, k_s, v_s, out, num_heads, num_kv_heads, head_dim, kv_seq_len, splits,
+                ) {
+                    let _ = e;
+                    best_ms = f64::INFINITY;
+                    break;
+                }
+                let stream = self.active_stream();
+                if unsafe { hipStreamSynchronize(stream) } != hipSuccess {
+                    best_ms = f64::INFINITY;
+                    break;
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                best_ms = best_ms.min(ms);
+            }
+            if best_ms < best.1 {
+                best = (splits, best_ms);
+            }
+        }
+        if best.1.is_finite() {
+            let cfg = crate::autotune::AutotuneConfig {
+                block_dim: 256,
+                tile_kv: best.0 as u32,
+                grid_stride: 1,
+                cycles_per_invocation: (best.1 * 1e6) as u64,
+                spec_gamma: 4,
+                spec_acceptance_threshold: 0.6,
+                spec_alpha: 0.0,
+            };
+            let _ = tuner.record(key, cfg);
+            let _ = self.save_autotune_cache(std::path::Path::new(&format!(
+                ".autotune_cache/{}.json",
+                self.gpu_target
+            )));
+            best.0
+        } else {
+            heuristic
+        }
+    }
+
     /// Launch Marlin-style Interleaved W4A16 GEMM.
     pub fn launch_marlin_gemm_w4a16(
         &self,
@@ -10967,6 +11241,8 @@ impl RocmDevice {
         let mut oproj_ptr = o_proj_ptr;
         let mut odim = o_dim as i32;
         let mut fuseo: i32 = 1;
+        let mut alibi_ptr: u64 = 0;
+        let mut has_alibi: i32 = 0;
 
         let stream = self.launch_compute_kernel(
             "grim_qkv_attention",
@@ -10990,11 +11266,13 @@ impl RocmDevice {
                 arg(&mut oproj_ptr),
                 arg(&mut odim),
                 arg(&mut fuseo),
+                arg(&mut alibi_ptr),
+                arg(&mut has_alibi),
             ],
         )?;
         let _ = (
             qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo,
-            oproj_ptr, odim, fuseo,
+            oproj_ptr, odim, fuseo, alibi_ptr, has_alibi,
         );
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }

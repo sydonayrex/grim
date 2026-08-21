@@ -524,74 +524,26 @@ impl GlimmerBlock {
         q_3d: &Tensor,
         full_k: &[f32],
         full_v: &[f32],
-        past_len: usize,
+        _past_len: usize,
         q_len: usize,
-        kv_len: usize,
+        _kv_len: usize,
     ) -> Result<Tensor> {
         let cfg = &self._cfg;
         let qd = q_3d.to_vec_f32()?;
-        let num_head_dims = cfg.local_num_heads * cfg.head_dim;
-        let scale = cfg.qk_scale_factor / (cfg.head_dim as f32).sqrt();
-        let kv_stride = cfg.local_num_kv_heads * cfg.head_dim;
-        let mut out = vec![0.0f32; q_len * num_head_dims];
-
-        for h in 0..cfg.local_num_heads {
-            let kvh = (h * cfg.local_num_kv_heads) / cfg.local_num_heads;
-            for t in 0..q_len {
-                let causal_limit = past_len + t;
-                let window_start = match cfg.sliding_window {
-                    Some(w) => causal_limit.saturating_sub(w - 1),
-                    None => 0,
-                };
-                let mut scores = vec![0.0f32; kv_len];
-                for t2 in window_start..=causal_limit {
-                    let mut dot = 0.0f32;
-                    for d in 0..cfg.head_dim {
-                        dot += qd[t * num_head_dims + h * cfg.head_dim + d]
-                            * full_k[t2 * kv_stride + kvh * cfg.head_dim + d];
-                    }
-                    scores[t2] = dot * scale;
-                }
-                for t2 in causal_limit + 1..kv_len {
-                    scores[t2] = f32::NEG_INFINITY;
-                }
-                if window_start > 0 {
-                    for t2 in 0..window_start {
-                        scores[t2] = f32::NEG_INFINITY;
-                    }
-                }
-                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores {
-                    *s = (*s - mx).exp();
-                    sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= sum;
-                }
-                for d in 0..cfg.head_dim {
-                    let mut acc = 0.0f32;
-                    for t2 in 0..kv_len {
-                        acc += scores[t2] * full_v[t2 * kv_stride + kvh * cfg.head_dim + d];
-                    }
-                    out[t * num_head_dims + h * cfg.head_dim + d] = acc;
-                }
-            }
-        }
-
-        let dev = pick_device_for_storage_device(self.wo.weight().device());
-        let storage = dev.from_cpu(
-            &out,
-            &Shape::new(vec![q_len, num_head_dims]),
-            grim_tensor::DType::F32,
-        )?;
-        Ok(Tensor::new(
-            Arc::from(storage),
-            Shape::new(vec![q_len, num_head_dims]),
-            grim_tensor::DType::F32,
-            grim_tensor::QuantProvenance::default(),
-            self.wo.weight().device().clone(),
-        ))
+        // Shared helper keeps this layer's exact scale and per-layer sliding
+        // window; causal limit is past_len + t.
+        crate::shared_attention::fused_or_scalar_attention_scaled(
+            &qd,
+            full_k,
+            full_v,
+            cfg.local_num_heads,
+            cfg.local_num_kv_heads,
+            cfg.head_dim,
+            q_len,
+            cfg.sliding_window,
+            cfg.qk_scale_factor / (cfg.head_dim as f32).sqrt(),
+            self.wo.weight().device(),
+        )
     }
 }
 

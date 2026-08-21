@@ -501,8 +501,8 @@ impl Lfm2Block {
                 });
             }
 
-            let (k_hist, v_hist) = match cache.as_mut().unwrap() {
-                Lfm2LayerCache::Attention { k, v, .. } => (k, v),
+            let (k_hist, v_hist) = match cache.as_ref().unwrap() {
+                Lfm2LayerCache::Attention { k, v, .. } => (k.as_slice(), v.as_slice()),
                 _ => {
                     return Err(grim_core::error::Error::Session(
                         "Mismatched Attention layer cache".into(),
@@ -510,49 +510,15 @@ impl Lfm2Block {
                 }
             };
 
-            let total_kv_tokens = k_hist.len() / kv_stride;
-            let num_head_dims = self.num_heads * self.head_dim;
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-            let mut attn_out_vec = vec![0.0f32; steps * num_head_dims];
-
-            for t in 0..steps {
-                let past_tokens = (total_kv_tokens - steps) + t;
-                for h in 0..self.num_heads {
-                    let kvh = (h * self.num_kv_heads) / self.num_heads;
-                    let mut scores = vec![0.0f32; past_tokens + 1];
-                    for t2 in 0..=past_tokens {
-                        let mut dot = 0.0f32;
-                        for d in 0..self.head_dim {
-                            dot += q_rot_vec[t * num_head_dims + h * self.head_dim + d]
-                                * k_hist[t2 * kv_stride + kvh * self.head_dim + d];
-                        }
-                        scores[t2] = dot * scale;
-                    }
-
-                    let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum_s = 0.0f32;
-                    for s in &mut scores {
-                        *s = (*s - max_s).exp();
-                        sum_s += *s;
-                    }
-                    for s in &mut scores {
-                        *s /= sum_s;
-                    }
-
-                    for d in 0..self.head_dim {
-                        let mut acc = 0.0f32;
-                        for t2 in 0..=past_tokens {
-                            acc += scores[t2] * v_hist[t2 * kv_stride + kvh * self.head_dim + d];
-                        }
-                        attn_out_vec[t * num_head_dims + h * self.head_dim + d] = acc;
-                    }
-                }
-            }
-
-            let attn_tensor = device_tensor(
-                attn_out_vec,
-                Shape::new(vec![steps, num_head_dims]),
+            let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
+                &q_rot_vec,
+                k_hist,
+                v_hist,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                steps,
+                None,
                 norm_x.device(),
             )?;
             self.wo.as_ref().unwrap().forward(&attn_tensor)?

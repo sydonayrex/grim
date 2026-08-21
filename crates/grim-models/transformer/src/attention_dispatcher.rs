@@ -93,6 +93,54 @@ impl AttentionDispatcher {
         }
     }
 
+    /// Execute a StandardGqa attention request end-to-end.
+    ///
+    /// This is the wiring point between the dispatcher's tier classification
+    /// and actual execution: the shared fused-or-scalar path
+    /// (`shared_attention::fused_or_scalar_attention`) tries the device
+    /// kernel (`BackendDevice::qkv_attention` — Tier 1/2 depending on the
+    /// backend's implementation) and falls back to the reference scalar loop
+    /// (Tier 3) when the backend returns `Unimplemented`. The selected tier
+    /// is returned alongside the result for logging/telemetry.
+    ///
+    /// Non-GQA topologies (MLA, paged-quantized, Sage) are dispatched by
+    /// their owning paths: MLA via `BackendDevice::mla_absorbed_decode` in
+    /// the DeepSeek loaders, paged via `block.rs::paged_self_attention`,
+    /// Sage via the ROCm `sage_attention` entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_gqa(
+        q: &[f32],
+        k_history: &[f32],
+        v_history: &[f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        steps: usize,
+        window: Option<usize>,
+        device: &grim_tensor::Device,
+    ) -> grim_core::error::Result<(Tensor, AttentionTier)> {
+        let topology = AttentionTopology::StandardGqa {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sm_scale: 1.0 / (head_dim as f32).sqrt(),
+        };
+        let is_gpu = !matches!(device, grim_tensor::Device::Cpu);
+        let tier = Self::select_tier(&topology, false, is_gpu);
+        let out = crate::shared_attention::fused_or_scalar_attention(
+            q,
+            k_history,
+            v_history,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            steps,
+            window,
+            device,
+        )?;
+        Ok((out, tier))
+    }
+
     /// Derive the output tensor shape for an attention forward invocation.
     pub fn output_shape(q: &Tensor, req: &AttentionRequest) -> Vec<usize> {
         let q_dims = q.shape().dims();
