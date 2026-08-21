@@ -512,6 +512,23 @@ impl KvBlockPool {
     pub fn clear_demote_queue(&mut self) {
         self.recently_zero.clear();
     }
+
+    /// Invalidate and clear all prefix tree nodes and reclaim unreferenced blocks.
+    /// Returns the number of newly reclaimed blocks.
+    pub fn reset_prefix_cache(&mut self) -> usize {
+        let before_free = self.free_list.len();
+        self.prefix_tree = RadixTree::new(BLOCK_SIZE);
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            let rc = self.ref_counts.get(&i).copied().unwrap_or(0);
+            if rc == 0 && !self.free_list.contains(&i) {
+                block.num_tokens = 0;
+                block.received = false;
+                self.free_list.push_back(i);
+            }
+        }
+        self.recently_zero.clear();
+        self.free_list.len().saturating_sub(before_free)
+    }
 }
 
 /// Logical → physical block mapping for one sequence.
