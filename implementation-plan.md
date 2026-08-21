@@ -379,3 +379,283 @@ Per grim-format-plan + grim-rocm-ffi house rules:
   grim-backend-vulkan`.
 - No ad-hoc /tmp verify scripts (blocked pattern). Use the project's own
   harnesses.
+
+---
+
+# Part III — Barriers remediation (WI-X series) · 2026-08-21 full-project review
+
+Derived from the five-dimension review (performance, stability, inference
+speed, training VRAM, usability). Same contract as Part II: verified symbols
+only, per-WI done-check. Ordering: X9 (test-race) and X10 (CI) gate all GPU
+claims; X1/X2 are the throughput compounders; X12/X13 unblock training.
+
+Dependency map:
+
+```
+X9 (device-init race)  ── gates every GRIM_RUN_GPU_TESTS claim below
+X10 (CI)               ── gates regression protection for all others
+X2 (arena KV)          ── independent; compounds with X1
+X1 (batched decode)    ── biggest single serving ceiling
+X3 (GPU sampler)       ── independent of X1/X2
+X4 (prefill MFMA)      ── profile-gated decision, needs X10 for honest numbers
+X5 (attn autotune)     ── after X9 (needs GPU benching)
+X6 (MXFP4 default-on)  ── gated on WI-E1 eval numbers
+X7 (KV-quant reach)    ── independent bug-fix class
+X8 (lock hygiene)      ── mechanical sweep, do early
+X11 (kimi_k3 rope)     ── correctness, small
+X12 (optimizers real)  ── training VRAM headline
+X13 (grad checkpoint)  ── after X12 (shares tape surgery)
+X14 (OOM backoff)      ── after X12
+X15 (RCCL or guard)    ── independent
+X16 (env consolidation)── mechanical but wide
+X17 (doctor toolchain) ── smallest; do first of usability
+```
+
+Recommended execution order:
+**X17 → X8 → X11 → X9 → X10 → X2 → X7 → X3 → X12 → X13 → X14 → X1 → X5 → X6 → X15 → X16 → X4**.
+
+---
+
+## WI-X17 — doctor toolchain check · usability, S
+
+**Scope.** `grim doctor` verifies the JIT compile toolchain instead of failing
+at first model load.
+
+**Touch points**
+- `crates/grim-cli/src/doctor.rs`: new `check_toolchain(report)` alongside
+  `check_gpu_backend` — probe `clang --version`, `llvm-config`, ROCm libs
+  (`libhipblas.so`/`librocblas.so` per README requirements), write access to
+  the hsaco cache dir (`kernels/jit_cache.rs` disk-cache location), and warn
+  when multiple rustup toolchains have touched `target/` (stale-artifact
+  E0514 class).
+
+**Done-check.** `grim doctor` on a machine missing clang prints an actionable
+remedy line naming `pacman -S clang` (or distro equivalent) before any load
+attempt. `cargo test -p grim-cli --lib doctor`.
+
+## WI-X8 — lock-poisoning hygiene sweep · stability, M
+
+**Scope.** Eliminate panic-on-poisoned-lock across hot crates: rocm 278,
+server 153, engine 73, core 51 non-test `.unwrap()` sites; mutex locks become
+`unwrap_or_else(|e| e.into_inner())` (pattern already used ~200× in
+grim-server).
+
+**Touch points**
+- `crates/grim-backend-rocm/src/device/roc_device.rs`,
+  `crates/grim-server/src/lib.rs`, `crates/grim-engine/src/lib.rs`,
+  `crates/grim-core/src/**`.
+- Mechanical rule: `.lock().unwrap()` → `.lock().unwrap_or_else(|e| e.into_inner())`.
+  Non-mutex unwraps audited case-by-case; genuinely infallible ones get
+  `.expect("invariant: …")` with the invariant named.
+
+**Done-check.** `grep -rn 'lock().unwrap()' crates/{server,engine,backend-rocm,core}/src | wc -l` == 0.
+Full workspace test pass unchanged.
+
+## WI-X11 — kimi_k3 rope-history correctness · stability, S
+
+**Scope.** The causal-mask fix landed in the crashed agent's partial edit;
+the rope-key caching half must be verified or completed (deepseek2.rs got the
+full fix — cache rows `[latent ‖ rope_key]`; kimi_k3 keeps nope/rope split).
+
+**Touch points**
+- `crates/grim-models/transformer/src/kimi_k3.rs` (~288–337 region): confirm
+  history rope keys come from cache, not `&k_rope_v[0..]`.
+
+**Done-check.** New `#[cfg(test)]` asserting decode step 2 attends with cached
+rope keys (pattern: deepseek2 `test_mla_latent_attention_matches_uncompressed`);
+`cargo test -p grim-models-transformer --lib kimi_k3`.
+
+## WI-X9 — engine GPU test device-init race · stability, M
+
+**Scope.** Root-cause the crash running `cargo test -p grim-engine` (observed
+as a memory race / abort during concurrent HIP init). Hypothesis: multiple
+tests construct `RocmDevice` concurrently while hipRTC JIT compiles; the hsaco
+disk cache (`kernels/jit_cache.rs`, `device/jit_cache.rs`) does read-modify-
+write without cross-process locking.
+
+**Tasks**
+1. Reproduce minimally: `cargo test -p grim-engine -- --test-threads=N` sweep;
+   bisect to the pair of tests that collide.
+2. Add file-lock (fs2/fd-lock or advisory flock) around hsaco cache dir
+   writes in `device/jit_cache.rs`; serialize first-device-init behind a
+   `OnceLock<Arc<RocmDevice>>` helper in tests.
+3. Re-run full engine suite 10× clean.
+
+**Done-check.** `for i in $(seq 10); do cargo test -p grim-engine || break; done`
+— 10 consecutive green runs; then flip GPU suites from env-gated to
+default-on for the shared runner (see X10).
+
+## WI-X10 — CI matrix + eval gate · stability, L
+
+**Scope.** One workflow beyond today's lone `.github/workflows/rust-clippy.yml`:
+(a) ubuntu job: `cargo test --workspace --exclude grim-backend-vulkan`;
+(b) self-hosted gfx1036 job: `GRIM_RUN_GPU_TESTS=1 cargo test -p
+grim-backend-rocm --tests` + one WI-E1 eval smoke (ppl delta < 2% vs golden);
+(c) clippy `-D warnings` on changed crates. Concurrency-cancel + 30-min
+job timeout.
+
+**Done-check.** Red CI on an intentionally seeded attention off-by-one within
+one push; green on revert.
+
+## WI-X2 — device-arena KV for unified attention · inference speed, M
+
+**Scope.** `shared_attention::fused_or_scalar_attention` uploads the whole
+K/V history host→device every call. Give it block.rs's arena discipline
+(`cache_append_kv` D2D append at `block.rs:774–810`) so loaders pay O(new
+tokens) H2D, not O(context).
+
+**Touch points**
+- `crates/grim-models/transformer/src/shared_attention.rs`: accept an
+  optional `KvArena` (device K/V + past_len); fall back to full upload when
+  absent. Mirror `block.rs` arena struct.
+- Rewire the 17 batch-1 loaders' caches to hold the arena handle (cache
+  structs already carry `k_dev/v_dev` fields where fused paths exist, e.g.
+  `Lfm2LayerCache::Attention`).
+
+**Done-check.** CPU parity tests unchanged-green; GPU counter (hipProfilerSDK
+marker or existing perf_gate harness) shows H2D bytes/token flat in context
+length; `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --test
+qkv_attention`.
+
+## WI-X7 — KV-quant reachability fix · perf/stability, S
+
+**Scope.** Engine comment at lib.rs:199 admits the real `LloydMaxCompressor`
+path was left unreachable in some construction order. Audit both compressor
+wiring branches; make int4/int8 paged-KV compression actually engage under
+config, else delete the dead branch.
+
+**Done-check.** Unit test constructing the engine with kv-quant config asserts
+`kv_compressor.is_some()` and a round-trip compress/decompress on a synthetic
+paged block (`grim-kvquant` tests as reference).
+
+## WI-X3 — sampler on device · inference speed, M
+
+**Scope.** Temperature/top-k/top-p sampling currently implies logits D2H per
+token. Extend the zero-CPU argmax path (recent GPU-native sampler commit)
+to the stochastic pipeline: GPU top-k filter + Gumbel/phoenix-style sampled
+argmax, D2H only the chosen token id.
+
+**Touch points**
+- `crates/grim-core/src/sampler.rs` (`SamplerConfig.top_p/top_k`, lines 81–103):
+  add a `Device` dispatch so greedy stays on GPU argmax and stochastic uses a
+  new `sample_on_device` when logits are RocmStorage.
+- `crates/grim-backend-rocm/src/kernels/`: one kernel (block-reduce max,
+  filter, cumulative-sum via single wave when vocab ≤ wave lanes × chunks).
+
+**Done-check.** Distribution equivalence test: CPU-reference multinomial vs
+GPU path over 100k draws, chi-square within tolerance; ITL delta measured by
+`grim-cli bench` on fixed prompt.
+
+## WI-X12 — make PagedAdamW + AdamW8bit real · training VRAM, M
+
+**Scope.** `adamw.rs` declares the variants (~156–174) but line 327 rejects
+all but dense: *"declared but not yet implemented (Phase 7)"*. Implement two:
+
+1. `AdamW8bit`: moment buffers as Q8_0 blocks (Q8_0 quant helpers already in
+   `injection.rs:406`) — 2× optimizer-state reduction vs fp32 moments.
+2. `PagedAdamW`: cold moment pages to host RAM behind a dirty-set; page-in on
+   touch (design mirrors grim-memory crate's pool).
+
+**Touch points**: `crates/grim-autograd/src/adamw.rs` (match arms),
+`crates/grim-cli/src/train.rs` optimizer selection.
+
+**Done-check.** Convergence parity: 500-step tiny-LM SFT, final loss within
+3% of dense AdamW; peak VRAM delta logged via rocprofiler count; unit tests
+for quantize/dequantize moment round-trip.
+
+## WI-X13 — gradient checkpointing · training VRAM, L
+
+**Scope.** Zero checkpointing exists (grep: none in tape/backward). Add
+segment-wise recompute to `Tape`: mark segment boundaries every N layers,
+free intermediate activations at segment end, recompute on backward.
+
+**Touch points**: `crates/grim-autograd/src/tape.rs` (TapeEntry flag +
+`drain_and_step` two-pass), `crates/grim-cli/src/train.rs` `--checkpoint-segs N`.
+
+**Done-check.** Activation memory scales O(N_layers / segs) on a synthetic
+deep MLP (assert via allocation counter); loss identical (bitwise tolerance
+1e-6) to no-checkpoint run on same seed.
+
+## WI-X14 — train-loop OOM backoff · stability, S
+
+**Scope.** No OOM handling in `train.rs`. Wrap the step in HIP error
+classification; on `hipErrorOutOfMemory`: halve micro-batch, retry once,
+then abort with a message stating the largest successful batch.
+
+**Done-check.** Forced-OOM test (absurd batch size) exits with the actionable
+message, not a panic; `cargo test -p grim-cli --lib train`.
+
+## WI-X1 — batched decode through the scheduler · inference speed, L
+
+**Scope.** Biggest ceiling: server funnels every request through one
+`Mutex<Engine>` with `&mut step_one(request_id, …)` per token; the wired
+`Scheduler` (chunked prefill, admission control) can't co-schedule because
+execution is single-owner. Move to grouped execution: scheduler admits N
+requests; engine gathers their next tokens into one `[sum_steps, …]` forward
+(paged KV already block-addressed; `qkv_attention` takes seq_len>1), splits
+results per request. Server drops to short-scope locks: enqueue → drive-batch
+→ collect, never holding the lock across tokenization/rendering.
+
+**Touch points**
+- `crates/grim-engine/src/lib.rs`: new `step_batch(&mut self, [(request_id,
+  input_ids, positions); N])` beside `step_one` (which becomes N=1).
+- `crates/grim-server/src/lib.rs`: request loop refactored onto a worker that
+  drains the scheduler queue per tick (34 lock sites shrink to the worker).
+- Sampling/splitting per-request after the joint forward.
+
+**Done-check.** Two concurrent streaming requests show interleaved tokens and
+combined tok/s ≥ 1.5× single-stream on gfx1036 (bench harness, fixed prompts);
+per-request outputs byte-identical to solo runs (greedy).
+
+## WI-X5 — attention autotune parity completion · perf, M
+
+**Scope.** Only flash-decode split counts consult the autotuner today. Extend
+`KernelKey` coverage to `grim_qkv_attention` launch geometry *within safe
+axes* (grid-y = num_heads is fixed by correctness; tune LDS staging chunk and
+wave-partition hint exposed as kernel args), plus paged variant tile. Bench
+harness: `time_kernel_ms` sweep recorded into `.autotune_cache` (ADR §5).
+
+**Done-check.** ≥5% mean decode-kernel time improvement on the bench shape set
+or documented no-win; autotune entries persist across restarts.
+
+## WI-X6 — MXFP4 default-on · perf, S
+
+**Scope.** `GRIM_LFM2_MXFP4_QKV` env gate defaults off, so LFM2-family serves
+F32 reference math. After WI-E1 golden numbers exist: flip default to on,
+keep env escape hatch (`=0`), update loader docs.
+
+**Done-check.** Eval suite ppl delta within tolerance vs F32 goldens; bench
+shows expected tok/s uplift; gate removal noted in ADR 0001 §5 follow-ups.
+
+## WI-X15 — RCCL all-reduce or honest single-GPU guard · training, M
+
+**Scope.** Multi-GPU training silently falls back to CPU round-trip
+all-reduce (`train.rs:879–886`). Either implement RCCL collectives via
+`rccl.h` (ring all-reduce on f32 grads) or hard-error multi-rank configs
+without RCCL with a clear message.
+
+**Done-check.** 2-rank gradient agreement test (same seed → identical params)
+through the RCCL path, or the explicit error on missing librccl.
+
+## WI-X16 — env-var consolidation · usability, M
+
+**Scope.** 71 distinct `GRIM_*` vars. Move behavior flags into `grim.toml`
+(template exists at repo root) behind a typed `RuntimeEnv` reader
+(`grim-core::env_config::RuntimeEnv::from_env` pattern already exists):
+file value first, env override second. No behavior removal — unknown keys
+warn once.
+
+**Done-check.** `grep -rhoE "GRIM_[A-Z_0-9]+" crates | sort -u | wc -l`
+drops to ≤25 (debug/test escapes remain env-only); docs/configuration.md
+updated; `grim doctor` prints effective config source per key.
+
+## WI-X4 — prefill attention: profile then decide · perf, L (gated)
+
+**Scope.** No MFMA flash-class prefill kernel (ADR deferral). With X10's CI
+bench in place: rocprof prefill shapes (512/2k/8k prompt, llama-class dims)
+against current kernel; record in ADR 0001. Decision rule: if TTFT share of
+prefill attention > 30% and an MFMA flash port wins ≥ 25%, open the port WI;
+else close the question permanently.
+
+**Done-check.** Numbers + decision recorded in ADR 0001 appendix; either a
+new WI opened or the defer made permanent.
