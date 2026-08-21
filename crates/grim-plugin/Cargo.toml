@@ -28,6 +28,6 @@ grim-backend-cpu = { workspace = true }
 wat = "1.0"
 
 [features]
-default = []
+default = ["wasm-sandbox"]
 wasm-sandbox = ["wasmtime"]
 dylib-loading = ["libloading"]

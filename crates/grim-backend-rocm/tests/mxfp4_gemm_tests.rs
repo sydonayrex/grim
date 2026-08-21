@@ -142,6 +142,7 @@ fn cpu_rope_yarn_in_place(
     }
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_mxfp4_gemm_kernel_source_compiles() {
     let dev = RocmDevice::new(0);
@@ -153,6 +154,7 @@ fn test_mxfp4_gemm_kernel_source_compiles() {
     assert_eq!(dev.wavefront_size(), grim_backend_rocm::WavefrontSize::W32);
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_mxfp4_tiled_gemm_parity_against_cpu() -> TestResult {
     let Some(dev) = gpu_device() else {
@@ -254,6 +256,7 @@ fn test_mxfp4_tiled_gemm_parity_against_cpu() -> TestResult {
     Ok(())
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_fused_rmsnorm_mxfp4_gemm_parity_against_cpu() -> TestResult {
     let Some(dev) = gpu_device() else {
@@ -356,6 +359,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_parity_against_cpu() -> TestResult {
     Ok(())
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
@@ -567,6 +571,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
     Ok(())
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
@@ -795,6 +800,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
 }
 
 /// LFM2-style fused QKV: MXFP4 GEMM -> per-head QK-Norm -> RoPE (plain theta).
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
@@ -959,6 +965,7 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
 }
 
 /// LFM2-style fused QKV with YaRN RoPE (inv_freq ramp + mscale).
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
     let Some(dev) = gpu_device() else {

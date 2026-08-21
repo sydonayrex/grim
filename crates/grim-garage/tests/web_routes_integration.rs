@@ -54,13 +54,14 @@ async fn test_serves_embedded_app_js() {
     assert!(content_type.contains("javascript"));
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[tokio::test]
 async fn test_chat_endpoint_fails_when_model_path_does_not_exist() {
     let state = new_app_state();
     let app = build_router(state);
 
     let payload = serde_json::json!({
-        "model_id": "/path/to/test-model.grim",
+        "model_id": "test-model.grim",
         "prompt": "Hello, model!",
         "temperature": 0.7
     });

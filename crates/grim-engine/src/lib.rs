@@ -1589,8 +1589,11 @@ mod tests {
             let offset = payload.len() as u64;
             buf.write_all(&offset.to_le_bytes()).unwrap();
 
-            let size = dims.iter().product::<usize>() * 4;
-            payload.resize(payload.len() + size, 0);
+            let count = dims.iter().product::<usize>();
+            for i in 0..count {
+                let val = ((i % 100) as f32 * 0.01 + 0.01).to_le_bytes();
+                payload.extend_from_slice(&val);
+            }
         }
 
         while buf.len() % 32 != 0 {

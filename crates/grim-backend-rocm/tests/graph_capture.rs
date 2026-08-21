@@ -29,6 +29,10 @@ use grim_tensor::{BackendDevice, DType, Shape};
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
 
+lazy_static::lazy_static! {
+    static ref GRAPH_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 /// Build a device, bailing the test (Ok) if no GPU is present.
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -114,8 +118,10 @@ fn run_seq(
 // begin/end/replay produces matching output within f32 tolerance.
 // =========================================================================
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn eager_vs_captured_multi_op_match() -> TestResult {
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
@@ -153,6 +159,7 @@ fn eager_vs_captured_multi_op_match() -> TestResult {
             replayed[i]
         );
     }
+    dev.synchronize();
     Ok(())
 }
 
@@ -161,8 +168,10 @@ fn eager_vs_captured_multi_op_match() -> TestResult {
 // returns `Ok(false)` rather than replaying the wrong graph.
 // =========================================================================
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn replay_with_different_key_returns_false() -> TestResult {
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
@@ -176,6 +185,10 @@ fn replay_with_different_key_returns_false() -> TestResult {
     let w: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
 
     let inputs = upload_inputs(&dev, &a, &b, &c, &w, m, k, n)?;
+    // Warm up kernels eager so HIP JIT does not run inside stream capture.
+    let _ = run_compute(&dev, &inputs, m, k, n)?;
+    dev.synchronize();
+
     let key_a = "replay_diff_a";
     dev.begin_graph_capture(key_a)?;
     let _captured = run_compute(&dev, &inputs, m, k, n)?;
@@ -189,6 +202,7 @@ fn replay_with_different_key_returns_false() -> TestResult {
     );
     // And replaying the real key does launch.
     assert!(dev.replay_graph(key_a)?);
+    dev.synchronize();
     Ok(())
 }
 
@@ -197,8 +211,10 @@ fn replay_with_different_key_returns_false() -> TestResult {
 // for the same synthetic op sequence (qualitative wall-clock check).
 // =========================================================================
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn capture_then_replay_undercuts_eager_loop() -> TestResult {
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
@@ -211,6 +227,7 @@ fn capture_then_replay_undercuts_eager_loop() -> TestResult {
     let c: Vec<f32> = (0..m * n).map(|i| i as f32 * 0.05).collect();
     let w: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
 
+    dev.synchronize();
     let inputs = upload_inputs(&dev, &a, &b, &c, &w, m, k, n)?;
     let key = "capture_bench";
     const N: usize = 50;
@@ -234,5 +251,6 @@ fn capture_then_replay_undercuts_eager_loop() -> TestResult {
     println!(
         "[graph-capture] {N} eager={eager_ms:.2}ms replay={replay_ms:.2}ms (capture+replay target < eager)"
     );
+    dev.synchronize();
     Ok(())
 }

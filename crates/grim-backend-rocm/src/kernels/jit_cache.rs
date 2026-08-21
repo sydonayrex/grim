@@ -164,6 +164,7 @@ mod tests {
             cu_count,
             multiprocessor_count: cu_count,
             mem_bandwidth_gb_s: 500.0,
+            peak_flops_fp16: 8.0e12,
             p2p_topology: P2PTopology {
                 device_count: 1,
                 links: vec![vec![LinkType::NoLink]],

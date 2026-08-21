@@ -193,6 +193,7 @@ impl DylibPluginLoader {
     ///
     /// Uses a streaming reader so large plugin binaries do not need to be fully
     /// loaded into RAM.
+    #[allow(dead_code)]
     pub(crate) fn compute_sha256_file(path: &Path) -> Result<String> {
         let mut file = std::fs::File::open(path)
             .map_err(|e| Error::Backend(format!("cannot open plugin file: {e}")))?;

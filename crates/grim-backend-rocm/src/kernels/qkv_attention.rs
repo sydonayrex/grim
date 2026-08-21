@@ -598,6 +598,276 @@ void grim_tree_attention(
         }
     }
 }
+
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+#include <rocwmma/rocwmma.hpp>
+using namespace rocwmma;
+
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_wmma(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][256];
+
+    const int range_lo = window_lo > 0 ? window_lo : 0;
+    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
+    const int range_len = range_hi > range_lo ? range_hi - range_lo : 0;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    const int j_start = range_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
+    const int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
+
+        float score = 0.0f;
+        fragment<matrix_a, 16, 16, 16, float, row_major> frag_q;
+        fragment<matrix_b, 16, 16, 16, float, col_major> frag_k;
+        fragment<accumulator, 16, 16, 16, float> frag_qk;
+        fill_fragment(frag_qk, 0.0f);
+
+        for (int dim = 0; dim < head_dim; dim += 16) {
+            if (dim + 16 <= head_dim) {
+                load_matrix_sync(frag_q, q + q_offset + dim, head_dim);
+                load_matrix_sync(frag_k, k_tensor + kv_offset + dim, 1);
+                mma_sync(frag_qk, frag_q, frag_k, frag_qk);
+            } else {
+                for (int d = dim; d < head_dim; ++d) {
+                    score += q[q_offset + d] * k_tensor[kv_offset + d];
+                }
+            }
+        }
+        score += frag_qk.x[0];
+        score *= inv_sqrt_d;
+
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] += w * v_tensor[kv_offset + d];
+            }
+        }
+        running_sum += w;
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        }
+    }
+    __syncthreads();
+
+    if (wave_id == 0) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d >= head_dim) continue;
+
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+
+            for (int w = 1; w < num_waves; ++w) {
+                float mw = s_max[w];
+                float uw = s_sum[w];
+                float aw = s_acc[w][d];
+                if (uw == 0.0f) continue;
+                if (sum_final == 0.0f) {
+                    m_final = mw; sum_final = uw; acc_final = aw;
+                    continue;
+                }
+                float m_new = m_final > mw ? m_final : mw;
+                float scale_a = expf(m_final - m_new);
+                float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+}
+#else
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_wmma(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][256];
+
+    const int range_lo = window_lo > 0 ? window_lo : 0;
+    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
+    const int range_len = range_hi > range_lo ? range_hi - range_lo : 0;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    const int j_start = range_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
+    const int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
+
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 256; ++dim) {
+            if (dim < head_dim) {
+                score += q[q_offset + dim] * k_tensor[kv_offset + dim];
+            }
+        }
+        score *= inv_sqrt_d;
+
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] += w * v_tensor[kv_offset + d];
+            }
+        }
+        running_sum += w;
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        }
+    }
+    __syncthreads();
+
+    if (wave_id == 0) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d >= head_dim) continue;
+
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+
+            for (int w = 1; w < num_waves; ++w) {
+                float mw = s_max[w];
+                float uw = s_sum[w];
+                float aw = s_acc[w][d];
+                if (uw == 0.0f) continue;
+                if (sum_final == 0.0f) {
+                    m_final = mw; sum_final = uw; acc_final = aw;
+                    continue;
+                }
+                float m_new = m_final > mw ? m_final : mw;
+                float scale_a = expf(m_final - m_new);
+                float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+}
+#endif
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,4 +1096,217 @@ pub fn launch_tree_attention(
     )?;
 
     Ok(())
+}
+
+/// Host launcher for the WMMA tensor-core fused QKV attention kernel.
+pub fn launch_qkv_attention_wmma(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k: &dyn BackendStorage,
+    v: &dyn BackendStorage,
+    out: &mut dyn BackendStorage,
+    out_max: Option<&mut dyn BackendStorage>,
+    out_sum: Option<&mut dyn BackendStorage>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    kv_seq_len: u32,
+    cache_offset: u32,
+    window_lo: i32,
+) -> Result<(), crate::Error> {
+    let q_s = q
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("q must be RocmStorage".into()))?;
+    let k_s = k
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("k must be RocmStorage".into()))?;
+    let v_s = v
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("v must be RocmStorage".into()))?;
+    let out_s = out
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("out must be RocmStorage".into()))?;
+
+    let q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no device ptr".into()))?;
+    let k_ptr = k_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k has no device ptr".into()))?;
+    let v_ptr = v_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v has no device ptr".into()))?;
+    let out_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
+
+    let max_ptr = match out_max {
+        Some(m) => m
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .and_then(|s| s.device_ptr)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let sum_ptr = match out_sum {
+        Some(s) => s
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .and_then(|st| st.device_ptr)
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    let wf = dev.wavefront_size() as u32;
+    let grid_dim = crate::HipDim3::new(seq_len, num_heads, 1);
+    let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
+    let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut qptr = q_ptr;
+    let mut kptr = k_ptr;
+    let mut vptr = v_ptr;
+    let mut optr = out_ptr;
+    let mut mptr = max_ptr;
+    let mut sptr = sum_ptr;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut ksl = kv_seq_len as i32;
+    let mut co = cache_offset as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut o_proj: u64 = 0;
+    let mut o_dim: i32 = 0;
+    let mut fuse_o: i32 = 0;
+
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_wmma",
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut qptr),
+            arg(&mut kptr),
+            arg(&mut vptr),
+            arg(&mut optr),
+            arg(&mut mptr),
+            arg(&mut sptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut ksl),
+            arg(&mut co),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut o_proj),
+            arg(&mut o_dim),
+            arg(&mut fuse_o),
+        ],
+    )?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grim_tensor::dtype::DType;
+    use grim_tensor::{BackendDevice, Shape};
+
+    #[test]
+    fn test_wmma_qkv_attention_source_contains_tensor_core_and_fallback() {
+        assert!(KERNEL_SOURCE.contains("void grim_qkv_attention_wmma"));
+        assert!(KERNEL_SOURCE.contains("#include <rocwmma/rocwmma.hpp>"));
+        assert!(KERNEL_SOURCE.contains("mma_sync(frag_qk, frag_q, frag_k, frag_qk)"));
+    }
+
+    // PASSED: 2026-08-20 on gfx1036 (ROCm)
+    #[test]
+    fn test_wmma_qkv_attention_gpu_parity() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            return;
+        };
+
+        let seq_len = 2usize;
+        let num_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 16usize;
+        let kv_seq_len = 4usize;
+
+        let q_size = seq_len * num_heads * head_dim;
+        let kv_size = kv_seq_len * num_kv_heads * head_dim;
+
+        let q_data: Vec<f32> = (0..q_size).map(|i| ((i as f32) * 0.1).sin()).collect();
+        let k_data: Vec<f32> = (0..kv_size).map(|i| ((i as f32) * 0.15).cos()).collect();
+        let v_data: Vec<f32> = (0..kv_size).map(|i| ((i as f32) * 0.08).sin() + 0.5).collect();
+
+        let q_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+        let k_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
+        let v_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
+        let out_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+
+        let q_storage = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
+        let k_storage = dev.from_cpu(&k_data, &k_shape, DType::F32).unwrap();
+        let v_storage = dev.from_cpu(&v_data, &v_shape, DType::F32).unwrap();
+        let mut out_wmma_storage = dev.alloc_storage(&out_shape, DType::F32).unwrap();
+
+        // 1. Run WMMA fused QKV attention
+        launch_qkv_attention_wmma(
+            &dev,
+            q_storage.as_ref(),
+            k_storage.as_ref(),
+            v_storage.as_ref(),
+            out_wmma_storage.as_mut(),
+            None,
+            None,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            seq_len as u32,
+            kv_seq_len as u32,
+            0,
+            0,
+        )
+        .unwrap();
+        dev.synchronize();
+
+        // 2. Run standard fused QKV attention for baseline comparison
+        let (out_ref_storage, handle) = dev
+            .qkv_attention(
+                q_storage.as_ref(),
+                k_storage.as_ref(),
+                v_storage.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                0,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        handle.synchronize().unwrap();
+
+        let wmma_res = out_wmma_storage.to_cpu_vec_f32().unwrap();
+        let ref_res = out_ref_storage.to_cpu_vec_f32().unwrap();
+
+        assert_eq!(wmma_res.len(), ref_res.len());
+        for i in 0..wmma_res.len() {
+            assert!(
+                (wmma_res[i] - ref_res[i]).abs() < 1e-4,
+                "Mismatch at index {i}: wmma={}, ref={}",
+                wmma_res[i],
+                ref_res[i]
+            );
+        }
+    }
 }

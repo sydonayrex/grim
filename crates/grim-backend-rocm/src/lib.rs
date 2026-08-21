@@ -154,7 +154,9 @@ pub use fusion::{
     QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, SplitKGemmConfig, WmmaGemmConfig, concat_qkv_weights, hipDim3,
 };
 
-pub use kernels::qkv_attention::{BlockTableEntry, launch_paged_attention, launch_tree_attention};
+pub use kernels::qkv_attention::{
+    BlockTableEntry, launch_paged_attention, launch_qkv_attention_wmma, launch_tree_attention,
+};
 pub use kernels::tile_picker::run_install_tune;
 
 pub use quantization::QuantMode;

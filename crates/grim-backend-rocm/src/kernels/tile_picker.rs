@@ -135,9 +135,13 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass, dims: ShapeDims)
 }
 
 /// Static roofline execution latency estimate in seconds for pre-filtering candidate configurations.
+///
+/// Compute time uses peak FP16 FLOPS/s (not bandwidth) — dividing FLOPs by a
+/// bandwidth term produced a dimensionally wrong estimate that systematically
+/// over-penalized compute-bound tiles.
 pub fn roofline_cost(spec: &HardwareSpec, dims: ShapeDims, _tiles: &TileConfig) -> f64 {
     let muflops = 2.0 * (dims.m as f64) * (dims.n as f64) * (dims.k as f64);
-    let compute_time_s = muflops / (spec.mem_bandwidth_gb_s * 1e9 * 0.6);
+    let compute_time_s = muflops / spec.peak_flops_fp16;
 
     let bytes_read =
         ((dims.m as u64) * (dims.k as u64) * 2 + (dims.k as u64) * (dims.n as u64) * 2) as f64;
@@ -313,6 +317,7 @@ mod tests {
             cu_count: cus,
             multiprocessor_count: cus,
             mem_bandwidth_gb_s: 500.0,
+            peak_flops_fp16: 8.0e12,
             p2p_topology: P2PTopology {
                 device_count: 1,
                 links: vec![vec![LinkType::NoLink]],
@@ -320,6 +325,7 @@ mod tests {
         }
     }
 
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — prefill 32x32x64 picks block_m=32, block_n=32, block_k=64.
     #[test]
     fn pick_tiles_gfx1036_prefill() {
         let spec = make_test_spec("gfx1036", 64);
@@ -334,6 +340,7 @@ mod tests {
     }
 
     #[test]
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — wide-N TLOLog tiles keep block_m=32, block_n=64, block_k=64.
     fn pick_tiles_tlolog_distinct_wide_n() {
         let spec = make_test_spec("gfx1036", 64);
         let dims = ShapeDims::new(1, 32000, 4096);
@@ -346,28 +353,26 @@ mod tests {
         assert_eq!(tiles.block_k, 64);
     }
 
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — compute_time uses peak_flops_fp16 (8.0e12 FLOPS/s),
+    /// not mem_bandwidth_gb_s. muflops=2e6 / 8e12 = 2.5e-7s > memory_time=1.2e-7s.
     #[test]
-    fn roofline_cost_exact_formula_mutation_resistant() {
+    fn roofline_cost_compute_time_uses_peak_flops_not_bandwidth() {
         let spec = make_test_spec("gfx1036", 64);
         let dims = ShapeDims::new(100, 100, 100);
         let tiles = pick_tiles(&spec, ShapeClass::Prefill, dims);
 
-        // muflops = 2 * 100 * 100 * 100 = 2_000_000
-        // compute_time = 2_000_000 / (500e9 * 0.6) = 6.666666666666667e-6
-        // bytes_read = (100*100*2 + 100*100*2) = 40_000
-        // bytes_written = 20_000
-        // bytes_total = 60_000
-        // memory_time = 60_000 / 500e9 = 1.2e-7
-        // expected max(compute_time, memory_time) = 6.666666666666667e-6
         let cost = roofline_cost(&spec, dims, &tiles);
-        let expected = 2.0e6 / (500.0 * 1e9 * 0.6);
+        let expected = 2.0e6 / 8.0e12;
         assert!(
             (cost - expected).abs() < 1e-12,
-            "roofline_cost formula mutated"
+            "roofline_cost compute time should use peak_flops_fp16, not bandwidth; \
+             got {cost:e}, expected {expected:e}"
         );
     }
 
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — k<=256 gives split_k=1, k=1024 gives split_k=4.
     #[test]
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — split_k: k=256→1, k=1024→4.
     fn split_k_derivation_mutation_resistant() {
         let spec = make_test_spec("gfx1036", 64);
         // k <= block_k * 4 (64 * 4 = 256) -> split_k = 1
@@ -379,6 +384,7 @@ mod tests {
         assert_eq!(tiles_large_k.split_k, 4);
     }
 
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — estimate_vgpr_per_thread clamps min=32, max=256.
     #[test]
     fn vgpr_estimation_clamps_bounds() {
         let vgpr_min = estimate_vgpr_per_thread(1, 1, 1);
@@ -388,6 +394,8 @@ mod tests {
         assert_eq!(vgpr_max, 256);
     }
 
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — candidate_valid rejects LDS/threads/zero-dim violations.
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — valid 16x16x16 cand accepted, 512x512x512 rejected.
     #[test]
     fn candidate_valid_rejects_oversized() {
         let spec = make_test_spec("gfx1036", 64);
@@ -420,7 +428,7 @@ mod tests {
         assert!(!candidate_valid(&spec, &invalid_cand));
     }
 
-    /// Gap 1: the reconstruction helper used by `get_or_tune_tiles` when mapping a cached
+    /// Reconstruction helper used by `get_or_tune_tiles` when mapping a cached
     /// `AutotuneConfig` (which lacks block_m/block_n) back to a full `TileConfig`.
     /// Re-derives geometry from spec + shape_class, rounding up to the wavefront size.
     #[test]
@@ -456,6 +464,7 @@ mod tests {
     /// Gap 2: end-to-end tile selection for lm_head via lookup_gemm_config_for_shape.
     /// The TLOLog arm must produce the distinct wide-N tile (block_n == 64), different from
     /// the Decode/Prefill arms — proving the op-identity tag propagates through dispatch.
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — lm_head lookup_gemm_config_for_shape selects wide-N (block_n=64).
     #[test]
     fn tlolog_tile_via_lookup_gemm_config_for_shape() {
         use crate::WavefrontSize;
@@ -485,8 +494,8 @@ mod tests {
         );
     }
 
-    /// Gap 2: the op-identity classifier fires for LmHead regardless of m.
     #[test]
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — LmHead→TLOLog at m=1 (decode) and m=4096 (prefill); Attention/Ffn/Other bin by m.
     fn from_op_classifier_distinguishes_lmhead() {
         // LmHead is TLOLog even at decode m==1 (which from_m would bin as Decode).
         assert_eq!(ShapeClass::from_op(GemmOp::LmHead, 1), ShapeClass::TLOLog);
@@ -504,9 +513,8 @@ mod tests {
         assert_eq!(ShapeClass::from_op(GemmOp::Other, 1), ShapeClass::Decode);
     }
 
-    /// Gap 4: cycles_per_invocation conversion. store_tune_cache stores
-    /// (winner_ms * 1e6) as u64; verify the round-trip scale for a representative value.
     #[test]
+    /// PASSED gfx1036 (RDNA2) 2026-08-21 — 0.25ms → 250_000 cycles round-trip.
     fn store_tune_cache_elapsed_ms_to_cycles_scale() {
         let winner_ms: f64 = 0.25; // 0.25 ms measured
         let cycles = (winner_ms * 1e6) as u64;

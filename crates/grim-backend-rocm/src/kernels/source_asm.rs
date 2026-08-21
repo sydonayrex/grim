@@ -143,6 +143,7 @@ mod source_asm_self_tests {
             cu_count: 1,
             max_threads_per_block: 1024,
             mem_bandwidth_gb_s: 1000.0,
+            peak_flops_fp16: 8.0e12,
             multiprocessor_count: 1,
             p2p_topology: topology,
         };
