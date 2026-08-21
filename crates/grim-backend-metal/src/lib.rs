@@ -2806,6 +2806,181 @@ impl BackendDevice for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )
+    }
+
+    fn mla_q_kv_norm_split(
+        &self,
+        q_raw: &dyn BackendStorage,
+        kv_raw: &dyn BackendStorage,
+        q_norm_w: &dyn BackendStorage,
+        kv_norm_w: &dyn BackendStorage,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_dim: usize,
+        eps: f32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let (q_norm, h1) = self.rms_norm(q_raw, q_norm_w, eps, q_raw.shape())?;
+        let (kv_norm, h2) = self.rms_norm(kv_raw, kv_norm_w, eps, kv_raw.shape())?;
+        h1.synchronize()?;
+        h2.synchronize()?;
+
+        let q_vec = q_norm.to_cpu_vec_f32()?;
+        let kv_vec = kv_norm.to_cpu_vec_f32()?;
+
+        let q_shape = q_raw.shape().dims();
+        let seq = q_shape[0];
+        let q_dim = q_shape.last().copied().unwrap_or(qk_nope_dim + qk_rope_dim);
+        let kv_shape = kv_raw.shape().dims();
+        let kv_dim = kv_shape.last().copied().unwrap_or(qk_rope_dim + v_dim);
+
+        let mut q_nope_vec = Vec::with_capacity(seq * qk_nope_dim);
+        let mut q_rope_vec = Vec::with_capacity(seq * qk_rope_dim);
+        let mut k_rope_vec = Vec::with_capacity(seq * qk_rope_dim);
+        let mut v_vec = Vec::with_capacity(seq * v_dim);
+
+        for s in 0..seq {
+            let q_row = &q_vec[s * q_dim..(s + 1) * q_dim];
+            q_nope_vec.extend_from_slice(&q_row[..qk_nope_dim.min(q_row.len())]);
+            q_rope_vec.extend_from_slice(&q_row[qk_nope_dim.min(q_row.len())..]);
+
+            let kv_row = &kv_vec[s * kv_dim..(s + 1) * kv_dim];
+            k_rope_vec.extend_from_slice(&kv_row[..qk_rope_dim.min(kv_row.len())]);
+            v_vec.extend_from_slice(&kv_row[qk_rope_dim.min(kv_row.len())..]);
+        }
+
+        let q_nope_storage = self.from_cpu(
+            &q_nope_vec,
+            &Shape::new(vec![seq, qk_nope_dim]),
+            q_raw.dtype(),
+        )?;
+        let q_rope_storage = self.from_cpu(
+            &q_rope_vec,
+            &Shape::new(vec![seq, qk_rope_dim]),
+            q_raw.dtype(),
+        )?;
+        let k_rope_storage = self.from_cpu(
+            &k_rope_vec,
+            &Shape::new(vec![seq, qk_rope_dim]),
+            kv_raw.dtype(),
+        )?;
+        let v_storage =
+            self.from_cpu(&v_vec, &Shape::new(vec![seq, v_dim]), kv_raw.dtype())?;
+
+        Ok((
+            q_nope_storage,
+            q_rope_storage,
+            k_rope_storage,
+            v_storage,
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    fn fused_adamw_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut p_vec = p.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let mut m_vec = m.to_cpu_vec_f32()?;
+        let mut v_vec = v.to_cpu_vec_f32()?;
+
+        for i in 0..total.min(p_vec.len()) {
+            let grad = g_vec[i];
+            let mut param = p_vec[i];
+            if weight_decay != 0.0 {
+                param -= lr * weight_decay * param;
+            }
+            let m_val = beta1 * m_vec[i] + (1.0 - beta1) * grad;
+            let v_val = beta2 * v_vec[i] + (1.0 - beta2) * grad * grad;
+            m_vec[i] = m_val;
+            v_vec[i] = v_val;
+
+            let m_hat = m_val / bc1.max(1e-7);
+            let v_hat = v_val / bc2.max(1e-7);
+            param -= lr * m_hat / (v_hat.sqrt() + eps);
+            p_vec[i] = param;
+        }
+
+        let _ = self.from_cpu(&p_vec, p.shape(), p.dtype())?;
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut p_vec = p.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let mut m_vec = exp_avg.to_cpu_vec_f32()?;
+
+        for i in 0..total.min(p_vec.len()) {
+            let grad = g_vec[i];
+            let mut param = p_vec[i];
+            if weight_decay != 0.0 {
+                param -= lr * weight_decay * param;
+            }
+            let c = beta1 * m_vec[i] + (1.0 - beta1) * grad;
+            let update = if c > 0.0 {
+                1.0
+            } else if c < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            param -= lr * update;
+            p_vec[i] = param;
+            m_vec[i] = beta2 * m_vec[i] + (1.0 - beta2) * grad;
+        }
+
+        let _ = self.from_cpu(&p_vec, p.shape(), p.dtype())?;
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+
     fn rope(
         &self,
         x: &dyn BackendStorage,

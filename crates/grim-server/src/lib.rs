@@ -336,6 +336,15 @@ const DEFAULT_MAX_TOKENS: u64 = 2048;
 /// same model name produce independent draws.
 const REQUEST_SEED_SALT: u64 = 0x5A17_C0DE_1337_BEEF;
 
+/// F-4 (WI-TOOLS): synthetic system instruction prepended when a request
+/// carries `tools` but the model's chat template provides no output contract
+/// of its own. Names the exact delimiters the post-hoc parser understands so
+/// the model's completion can actually be extracted into `tool_calls`.
+const TOOL_INSTRUCTION_PROMPT: &str = "You have access to the tools listed in this conversation. \
+When the user's request requires a tool, respond with ONLY the tool call in this exact format and no other text:\n\
+<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n\
+If no tool is needed, answer normally in plain text.";
+
 /// Monotonic millisecond clock for seeding stochastic samplers.
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -1345,6 +1354,27 @@ async fn chat_completions(
     // matching OpenAI semantics: the template gets no `tools` and the parser
     // is bypassed, so the model produces an ordinary completion.
     let tools_active = !tools.is_empty() && tool_choice != Some(grim_format::ToolChoice::None);
+
+    // F-4 (WI-TOOLS): when tool calling is active and the model's embedded
+    // template does not itself instruct the model on the output convention,
+    // prepend a synthetic system message spelling out the exact wire format.
+    // Without this, a template that merely renders "List of tools: [...]"
+    // gives the model no output contract, so it answers in prose and the
+    // parser never sees a call.
+    let messages = if tools_active && !messages.iter().any(|m| m.role == "system") {
+        let mut with_tools = Vec::with_capacity(messages.len() + 1);
+        with_tools.push(grim_format::ChatMessage {
+            role: "system".to_string(),
+            content: TOOL_INSTRUCTION_PROMPT.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+        with_tools.extend(messages.iter().cloned());
+        with_tools
+    } else {
+        messages.to_vec()
+    };
 
     // `template_family` drives WI-TOOLS-4's per-family output parsing. We
     // resolve it from the loaded tokenizer's embedded chat template so the same

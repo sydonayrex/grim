@@ -1502,3 +1502,669 @@ kernel void grim_moe_fused_dispatch(
     out[tok * hidden + h] = acc;
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek MLA Matrix-Absorbed Decode Kernel
+// ---------------------------------------------------------------------------
+kernel void grim_mla_decode(
+    device const float* q_absorbed [[buffer(0)]], // [num_heads, kv_lora_rank]
+    device const float* q_rope [[buffer(1)]],     // [num_heads, qk_rope_dim]
+    device const float* kv_cache [[buffer(2)]],   // [seq_len, kv_lora_rank + qk_rope_dim]
+    device float* out [[buffer(3)]],              // [num_heads, kv_lora_rank]
+    constant int& num_heads [[buffer(4)]],
+    constant int& kv_lora_rank [[buffer(5)]],
+    constant int& qk_rope_dim [[buffer(6)]],
+    constant int& seq_len [[buffer(7)]],
+    constant float& inv_sqrt_d [[buffer(8)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    if (int(h) >= num_heads) return;
+
+    int total_kv_dim = kv_lora_rank + qk_rope_dim;
+    int q_c_base = int(h) * kv_lora_rank;
+    int q_r_base = int(h) * qk_rope_dim;
+
+    threadgroup float s_scores[4096];
+
+    for (int j = 0; j < seq_len; ++j) {
+        int token_base = j * total_kv_dim;
+        float dot = 0.0f;
+
+        for (int d = int(tid); d < kv_lora_rank; d += int(bdim)) {
+            dot += q_absorbed[q_c_base + d] * kv_cache[token_base + d];
+        }
+        for (int d = int(tid); d < qk_rope_dim; d += int(bdim)) {
+            dot += q_rope[q_r_base + d] * kv_cache[token_base + kv_lora_rank + d];
+        }
+
+        dot = simd_sum(dot);
+        if (tid == 0) {
+            s_scores[j] = dot * inv_sqrt_d;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float m = -1e20f;
+        for (int j = 0; j < seq_len; ++j) {
+            if (s_scores[j] > m) m = s_scores[j];
+        }
+        float sum_exp = 0.0f;
+        for (int j = 0; j < seq_len; ++j) {
+            s_scores[j] = exp(s_scores[j] - m);
+            sum_exp += s_scores[j];
+        }
+        float inv_sum = 1.0f / max(sum_exp, 1e-8f);
+        for (int j = 0; j < seq_len; ++j) {
+            s_scores[j] *= inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int out_base = int(h) * kv_lora_rank;
+    for (int d = int(tid); d < kv_lora_rank; d += int(bdim)) {
+        float acc = 0.0f;
+        for (int j = 0; j < seq_len; ++j) {
+            int token_base = j * total_kv_dim;
+            acc += s_scores[j] * kv_cache[token_base + d];
+        }
+        out[out_base + d] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block-Quantized SageAttention Kernel
+// ---------------------------------------------------------------------------
+kernel void grim_sage_attention(
+    device const float* q_in [[buffer(0)]],
+    device const float* k_in [[buffer(1)]],
+    device const float* v_in [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant int& num_heads [[buffer(4)]],
+    constant int& num_kv_heads [[buffer(5)]],
+    constant int& head_dim [[buffer(6)]],
+    constant int& kv_seq_len [[buffer(7)]],
+    constant float& scale [[buffer(8)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    if (int(h) >= num_heads) return;
+
+    int gqa_ratio = num_heads / max(num_kv_heads, 1);
+    int kv_h = int(h) / max(gqa_ratio, 1);
+    int q_base = int(h) * head_dim;
+
+    threadgroup float s_scores[4096];
+
+    for (int j = 0; j < kv_seq_len; ++j) {
+        int k_base = (j * num_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        for (int d = int(tid); d < head_dim; d += int(bdim)) {
+            dot += q_in[q_base + d] * k_in[k_base + d];
+        }
+        dot = simd_sum(dot);
+        if (tid == 0) {
+            s_scores[j] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float max_s = -1e20f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            if (s_scores[j] > max_s) max_s = s_scores[j];
+        }
+        float sum_e = 0.0f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            s_scores[j] = exp(s_scores[j] - max_s);
+            sum_e += s_scores[j];
+        }
+        float inv_sum = 1.0f / max(sum_e, 1e-8f);
+        for (int j = 0; j < kv_seq_len; ++j) {
+            s_scores[j] *= inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int out_base = int(h) * head_dim;
+    for (int d = int(tid); d < head_dim; d += int(bdim)) {
+        float acc = 0.0f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            int v_base = (j * num_kv_heads + kv_h) * head_dim;
+            acc += s_scores[j] * v_in[v_base + d];
+        }
+        out[out_base + d] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multimodal 3D Rotary Position Embedding (M-RoPE)
+// ---------------------------------------------------------------------------
+kernel void grim_mrope(
+    device float* q [[buffer(0)]],
+    device float* k [[buffer(1)]],
+    device const int* positions [[buffer(2)]],
+    constant int& num_tokens [[buffer(3)]],
+    constant int& num_q_heads [[buffer(4)]],
+    constant int& num_k_heads [[buffer(5)]],
+    constant int& head_dim [[buffer(6)]],
+    constant int& rotary_dim [[buffer(7)]],
+    constant int& section_t [[buffer(8)]],
+    constant int& section_h [[buffer(9)]],
+    constant int& section_w [[buffer(10)]],
+    constant float& rope_theta [[buffer(11)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint pair_idx [[thread_position_in_threadgroup]]
+) {
+    int t = int(gid.x);
+    int head_idx = int(gid.y);
+
+    int total_heads = num_q_heads + num_k_heads;
+    if (t >= num_tokens || head_idx >= total_heads || int(pair_idx) >= (rotary_dim / 2)) return;
+
+    bool is_q = (head_idx < num_q_heads);
+    int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+
+    int pos_t = positions[t * 3 + 0];
+    int pos_h = positions[t * 3 + 1];
+    int pos_w = positions[t * 3 + 2];
+
+    int pos = pos_t;
+    if (int(pair_idx) >= section_t && int(pair_idx) < (section_t + section_h)) {
+        pos = pos_h;
+    } else if (int(pair_idx) >= (section_t + section_h)) {
+        pos = pos_w;
+    }
+
+    float freq = 1.0f / pow(rope_theta, (2.0f * float(pair_idx)) / float(rotary_dim));
+    float angle = float(pos) * freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    int idx0 = 2 * int(pair_idx);
+    int idx1 = 2 * int(pair_idx) + 1;
+
+    if (is_q) {
+        int base = (t * num_q_heads + local_head) * head_dim;
+        float x0 = q[base + idx0];
+        float x1 = q[base + idx1];
+        q[base + idx0] = x0 * cos_val - x1 * sin_val;
+        q[base + idx1] = x0 * sin_val + x1 * cos_val;
+    } else {
+        int base = (t * num_k_heads + local_head) * head_dim;
+        float x0 = k[base + idx0];
+        float x1 = k[base + idx1];
+        k[base + idx0] = x0 * cos_val - x1 * sin_val;
+        k[base + idx1] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Marlin 4-bit Fast GEMM Kernel
+// ---------------------------------------------------------------------------
+kernel void grim_marlin_gemm(
+    device const float* a [[buffer(0)]],
+    device const uint* b_packed [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* c [[buffer(3)]],
+    constant int& m [[buffer(4)]],
+    constant int& n [[buffer(5)]],
+    constant int& k [[buffer(6)]],
+    constant int& group_size [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int col = int(gid.x);
+
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int num_packed_k = k / 8;
+
+    for (int pk = 0; pk < num_packed_k; ++pk) {
+        int k_start = pk * 8;
+        int scale_idx = (k_start / max(group_size, 1)) * n + col;
+        float s = scales[scale_idx];
+
+        uint packed_val = b_packed[pk * n + col];
+
+        for (int ki = 0; ki < 8; ++ki) {
+            int k_curr = k_start + ki;
+            int q_val = int((packed_val >> (ki * 4)) & 0x0F) - 8;
+            float w_val = float(q_val) * s;
+            acc += a[row * k + k_curr] * w_val;
+        }
+    }
+
+    c[row * n + col] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// On-Device Fused Linear Cross-Entropy Loss
+// ---------------------------------------------------------------------------
+kernel void grim_fused_linear_ce(
+    device const float* hidden [[buffer(0)]],
+    device const float* lm_head [[buffer(1)]],
+    device const uint* targets [[buffer(2)]],
+    device float* loss_out [[buffer(3)]],
+    device float* lse_out [[buffer(4)]],
+    constant int& batch [[buffer(5)]],
+    constant int& hidden_dim [[buffer(6)]],
+    constant int& vocab_size [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    if (int(row) >= batch) return;
+
+    uint target = targets[row];
+    float local_max = -1e20f;
+    float local_sum = 0.0f;
+    float target_l = 0.0f;
+    bool is_target = false;
+
+    for (int v = int(tid); v < vocab_size; v += int(bdim)) {
+        float logit = 0.0f;
+        int w_base = v * hidden_dim;
+        int h_base = int(row) * hidden_dim;
+
+        for (int d = 0; d < hidden_dim; ++d) {
+            logit += hidden[h_base + d] * lm_head[w_base + d];
+        }
+
+        if (uint(v) == target) {
+            target_l = logit;
+            is_target = true;
+        }
+
+        if (logit > local_max) {
+            local_sum = local_sum * exp(local_max - logit) + 1.0f;
+            local_max = logit;
+        } else {
+            local_sum += exp(logit - local_max);
+        }
+    }
+
+    threadgroup float s_max;
+    threadgroup float s_target;
+    threadgroup float s_sum;
+
+    if (tid == 0) {
+        s_max = -1e20f;
+        s_target = 0.0f;
+        s_sum = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (is_target) {
+        s_target = target_l;
+    }
+
+    float global_m = simd_max(local_max);
+    if (tid == 0) {
+        s_max = global_m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scaled_sum = local_sum * exp(local_max - s_max);
+    float global_s = simd_sum(scaled_sum);
+    if (tid == 0) {
+        s_sum = global_s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float lse = s_max + log(max(s_sum, 1e-8f));
+        loss_out[row] = lse - s_target;
+        lse_out[row] = lse;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// On-Device Fused AdamW & Lion Optimizers
+// ---------------------------------------------------------------------------
+kernel void grim_fused_adamw(
+    device float* p [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* m [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    constant int& total [[buffer(4)]],
+    constant float& lr [[buffer(5)]],
+    constant float& beta1 [[buffer(6)]],
+    constant float& beta2 [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    constant float& weight_decay [[buffer(9)]],
+    constant float& bc1 [[buffer(10)]],
+    constant float& bc2 [[buffer(11)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (int(idx) >= total) return;
+
+    float grad = g[idx];
+    float param = p[idx];
+
+    if (weight_decay != 0.0f) {
+        param -= lr * weight_decay * param;
+    }
+
+    float m_val = beta1 * m[idx] + (1.0f - beta1) * grad;
+    float v_val = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
+
+    m[idx] = m_val;
+    v[idx] = v_val;
+
+    float m_hat = m_val / max(bc1, 1e-7f);
+    float v_hat = v_val / max(bc2, 1e-7f);
+
+    param -= lr * m_hat / (sqrt(v_hat) + eps);
+    p[idx] = param;
+}
+
+kernel void grim_fused_lion(
+    device float* p [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* exp_avg [[buffer(2)]],
+    constant int& total [[buffer(3)]],
+    constant float& lr [[buffer(4)]],
+    constant float& beta1 [[buffer(5)]],
+    constant float& beta2 [[buffer(6)]],
+    constant float& weight_decay [[buffer(7)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (int(idx) >= total) return;
+
+    float grad = g[idx];
+    float param = p[idx];
+    float m = exp_avg[idx];
+
+    if (weight_decay != 0.0f) {
+        param -= lr * weight_decay * param;
+    }
+
+    float c = beta1 * m + (1.0f - beta1) * grad;
+    float update = (c > 0.0f) ? 1.0f : ((c < 0.0f) ? -1.0f : 0.0f);
+
+    param -= lr * update;
+    p[idx] = param;
+
+    exp_avg[idx] = beta2 * m + (1.0f - beta2) * grad;
+}
+
+// ---------------------------------------------------------------------------
+// FlashDecode Split-K Attention & Softmax Merge
+// ---------------------------------------------------------------------------
+kernel void grim_flash_decode_split_k(
+    device const float* q_in [[buffer(0)]],
+    device const float* k_in [[buffer(1)]],
+    device const float* v_in [[buffer(2)]],
+    device float* v_partial [[buffer(3)]],
+    device float* m_partial [[buffer(4)]],
+    device float* l_partial [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& num_kv_heads [[buffer(7)]],
+    constant int& head_dim [[buffer(8)]],
+    constant int& kv_seq_len [[buffer(9)]],
+    constant int& num_splits [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    int h = int(gid.x);
+    int split_idx = int(gid.y);
+
+    if (h >= num_heads || split_idx >= num_splits) return;
+
+    int gqa_ratio = num_heads / max(num_kv_heads, 1);
+    int kv_h = h / max(gqa_ratio, 1);
+
+    int chunk_len = (kv_seq_len + num_splits - 1) / num_splits;
+    int start_pos = split_idx * chunk_len;
+    int end_pos = min(start_pos + chunk_len, kv_seq_len);
+
+    if (start_pos >= end_pos) {
+        if (tid == 0) {
+            int split_offset = h * num_splits + split_idx;
+            m_partial[split_offset] = -1e20f;
+            l_partial[split_offset] = 0.0f;
+        }
+        for (int d = int(tid); d < head_dim; d += int(bdim)) {
+            v_partial[(h * num_splits + split_idx) * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+
+    int local_len = end_pos - start_pos;
+    int q_base = h * head_dim;
+
+    threadgroup float s_scores[2048];
+
+    for (int i = 0; i < local_len; ++i) {
+        int pos = start_pos + i;
+        int k_base = (pos * num_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        for (int d = int(tid); d < head_dim; d += int(bdim)) {
+            dot += q_in[q_base + d] * k_in[k_base + d];
+        }
+        dot = simd_sum(dot);
+        if (tid == 0) {
+            s_scores[i] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float local_max = -1e20f;
+        for (int i = 0; i < local_len; ++i) {
+            if (s_scores[i] > local_max) local_max = s_scores[i];
+        }
+        float local_sum = 0.0f;
+        for (int i = 0; i < local_len; ++i) {
+            s_scores[i] = exp(s_scores[i] - local_max);
+            local_sum += s_scores[i];
+        }
+        int split_offset = h * num_splits + split_idx;
+        m_partial[split_offset] = local_max;
+        l_partial[split_offset] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int out_base = (h * num_splits + split_idx) * head_dim;
+    for (int d = int(tid); d < head_dim; d += int(bdim)) {
+        float acc = 0.0f;
+        for (int i = 0; i < local_len; ++i) {
+            int pos = start_pos + i;
+            int v_base = (pos * num_kv_heads + kv_h) * head_dim;
+            acc += s_scores[i] * v_in[v_base + d];
+        }
+        v_partial[out_base + d] = acc;
+    }
+}
+
+kernel void grim_softmax_merge(
+    device const float* v_partial [[buffer(0)]],
+    device const float* m_partial [[buffer(1)]],
+    device const float* l_partial [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant int& num_heads [[buffer(4)]],
+    constant int& num_splits [[buffer(5)]],
+    constant int& head_dim [[buffer(6)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    if (int(h) >= num_heads) return;
+
+    threadgroup float s_global_max;
+    threadgroup float s_global_sum;
+    threadgroup float s_weights[64];
+
+    if (tid == 0) {
+        float m_max = -1e20f;
+        for (int s = 0; s < num_splits; ++s) {
+            float m = m_partial[int(h) * num_splits + s];
+            if (m > m_max) m_max = m;
+        }
+        s_global_max = m_max;
+
+        float total_l = 0.0f;
+        for (int s = 0; s < num_splits; ++s) {
+            float m = m_partial[int(h) * num_splits + s];
+            float l = l_partial[int(h) * num_splits + s];
+            float w = l * exp(m - m_max);
+            s_weights[s] = w;
+            total_l += w;
+        }
+        s_global_sum = max(total_l, 1e-8f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sum = 1.0f / s_global_sum;
+    int out_base = int(h) * head_dim;
+
+    for (int d = int(tid); d < head_dim; d += int(bdim)) {
+        float final_v = 0.0f;
+        for (int s = 0; s < num_splits; ++s) {
+            float v_val = v_partial[(int(h) * num_splits + s) * head_dim + d];
+            float m = m_partial[int(h) * num_splits + s];
+            float exp_scale = exp(m - s_global_max);
+            final_v += v_val * exp_scale;
+        }
+        out[out_base + d] = final_v * inv_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paged Quantized KV Attention
+// ---------------------------------------------------------------------------
+kernel void grim_qkv_attention_paged_dequant(
+    device const float* q_in [[buffer(0)]],
+    device const uint* block_table [[buffer(1)]],
+    device const char* k_pages_int8 [[buffer(2)]],
+    device const float* k_scales [[buffer(3)]],
+    device const char* v_pages_int8 [[buffer(4)]],
+    device const float* v_scales [[buffer(5)]],
+    device float* out [[buffer(6)]],
+    constant int& num_heads [[buffer(7)]],
+    constant int& num_kv_heads [[buffer(8)]],
+    constant int& head_dim [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& page_size [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    if (int(h) >= num_heads) return;
+
+    int gqa_ratio = num_heads / max(num_kv_heads, 1);
+    int kv_h = int(h) / max(gqa_ratio, 1);
+    int q_base = int(h) * head_dim;
+
+    threadgroup float s_scores[4096];
+
+    for (int j = 0; j < kv_seq_len; ++j) {
+        int block_idx = j / page_size;
+        int page_offset = j % page_size;
+        uint phys_block = block_table[block_idx];
+
+        int k_entry = (int(phys_block) * page_size + page_offset) * (num_kv_heads * head_dim) + kv_h * head_dim;
+        int scale_entry = (int(phys_block) * page_size + page_offset) * num_kv_heads + kv_h;
+        float ks = k_scales[scale_entry];
+
+        float dot = 0.0f;
+        for (int d = int(tid); d < head_dim; d += int(bdim)) {
+            float k_val = float(k_pages_int8[k_entry + d]) * ks;
+            dot += q_in[q_base + d] * k_val;
+        }
+
+        dot = simd_sum(dot);
+        if (tid == 0) {
+            s_scores[j] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float max_s = -1e20f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            if (s_scores[j] > max_s) max_s = s_scores[j];
+        }
+        float sum_e = 0.0f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            s_scores[j] = exp(s_scores[j] - max_s);
+            sum_e += s_scores[j];
+        }
+        float inv_sum = 1.0f / max(sum_e, 1e-8f);
+        for (int j = 0; j < kv_seq_len; ++j) {
+            s_scores[j] *= inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int out_base = int(h) * head_dim;
+    for (int d = int(tid); d < head_dim; d += int(bdim)) {
+        float acc = 0.0f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            int block_idx = j / page_size;
+            int page_offset = j % page_size;
+            uint phys_block = block_table[block_idx];
+
+            int v_entry = (int(phys_block) * page_size + page_offset) * (num_kv_heads * head_dim) + kv_h * head_dim;
+            int scale_entry = (int(phys_block) * page_size + page_offset) * num_kv_heads + kv_h;
+            float vs = v_scales[scale_entry];
+
+            float v_val = float(v_pages_int8[v_entry + d]) * vs;
+            acc += s_scores[j] * v_val;
+        }
+        out[out_base + d] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU Speculative Token Acceptor
+// ---------------------------------------------------------------------------
+kernel void grim_speculative_acceptor(
+    device const float* target_probs [[buffer(0)]],
+    device const float* draft_probs [[buffer(1)]],
+    device const int* draft_tokens [[buffer(2)]],
+    device const float* uniform_rands [[buffer(3)]],
+    device int* accepted_tokens [[buffer(4)]],
+    device int* accepted_lens [[buffer(5)]],
+    constant int& batch_size [[buffer(6)]],
+    constant int& num_draft_tokens [[buffer(7)]],
+    constant int& vocab_size [[buffer(8)]],
+    uint b [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (int(b) >= batch_size) return;
+
+    if (tid == 0) {
+        int accepted_count = 0;
+        for (int k = 0; k < num_draft_tokens; ++k) {
+            int draft_tok = draft_tokens[int(b) * num_draft_tokens + k];
+            if (draft_tok < 0 || draft_tok >= vocab_size) {
+                break;
+            }
+
+            int t_idx = (int(b) * (num_draft_tokens + 1) + k) * vocab_size + draft_tok;
+            int d_idx = (int(b) * num_draft_tokens + k) * vocab_size + draft_tok;
+
+            float p = target_probs[t_idx];
+            float q = draft_probs[d_idx];
+            float r = uniform_rands[int(b) * (num_draft_tokens + 1) + k];
+
+            float accept_prob = (q > 0.0f) ? min(1.0f, p / q) : 1.0f;
+
+            if (r <= accept_prob) {
+                accepted_tokens[int(b) * (num_draft_tokens + 1) + accepted_count] = draft_tok;
+                accepted_count++;
+            } else {
+                break;
+            }
+        }
+        accepted_lens[b] = accepted_count;
+    }
+}
