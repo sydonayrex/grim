@@ -26,6 +26,7 @@ fn test_vulkan_modern_kernels_spirv_embedded() {
         VulkanKernel::SoftmaxMerge,
         VulkanKernel::QkvAttentionPagedDequant,
         VulkanKernel::SpeculativeAcceptor,
+        VulkanKernel::CooperativeMatrixGemm,
         VulkanKernel::RmsNorm,
         VulkanKernel::AddRmsNorm,
     ];

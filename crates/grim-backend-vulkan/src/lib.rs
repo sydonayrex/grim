@@ -4738,6 +4738,8 @@ pub enum VulkanKernel {
     QkvAttentionPagedDequant,
     /// GPU speculative draft token acceptance and prefix evaluation.
     SpeculativeAcceptor,
+    /// Cooperative matrix hardware accelerated GEMM.
+    CooperativeMatrixGemm,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -4804,6 +4806,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::SoftmaxMerge => SPIRV_SOFTMAX_MERGE,
         VulkanKernel::QkvAttentionPagedDequant => SPIRV_QKV_ATTENTION_PAGED_DEQUANT,
         VulkanKernel::SpeculativeAcceptor => SPIRV_SPECULATIVE_ACCEPTOR,
+        VulkanKernel::CooperativeMatrixGemm => SPIRV_COOPERATIVE_MATRIX_GEMM,
     }
 }
 
@@ -4843,6 +4846,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedQuantGemmQ80
         | VulkanKernel::FusedQuantGemmFp8
         | VulkanKernel::FusedLion
+        | VulkanKernel::CooperativeMatrixGemm
         | VulkanKernel::SiluMulBackward => 3,
         VulkanKernel::QkvAttention
         | VulkanKernel::QkvAttentionSwa
