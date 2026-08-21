@@ -3,6 +3,15 @@
 //! Backend (`discovery`, `jobs`, `rocm`, `routes`) runs an axum HTTP server
 //! on `127.0.0.1:8741` (WI-4: loopback by default, matching `grim serve`)
 //! and serves `/api/*`, `/sse/metrics/:id`, and web UI.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unused_enumerate_index,
+    clippy::match_single_binding,
+    clippy::clone_on_copy,
+    clippy::manual_contains,
+    clippy::let_and_return
+)]
 
 pub mod backend;
 pub mod dataloader;

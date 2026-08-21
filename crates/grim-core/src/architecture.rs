@@ -105,6 +105,11 @@ pub enum ModelArchitecture {
     GraniteHybrid,
     Chameleon,
     WavTokenizerDec,
+    Whisper,
+    Kokoro,
+    StyleTts2,
+    Vocos,
+    DiT,
     Plm,
     BailingMoe,
     BailingMoe2,
@@ -260,6 +265,13 @@ impl ModelArchitecture {
             "granite-hybrid" => Self::GraniteHybrid,
             "chameleon" => Self::Chameleon,
             "wavtokenizer-dec" | "wavtokenizer_dec" | "wavtokenizer" => Self::WavTokenizerDec,
+            "whisper" => Self::Whisper,
+            "kokoro" => Self::Kokoro,
+            "styletts2" | "style-tts2" | "style_tts2" => Self::StyleTts2,
+            "vocos" => Self::Vocos,
+            // MeanVC2 and other flow-matching voice models declare
+            // `"model_type": "DiT"` in their config.json.
+            "dit" => Self::DiT,
             "plm" => Self::Plm,
             "bailingmoe" => Self::BailingMoe,
             "bailingmoe2" => Self::BailingMoe2,
@@ -413,6 +425,11 @@ impl ModelArchitecture {
             Self::GraniteHybrid => "granite-hybrid",
             Self::Chameleon => "chameleon",
             Self::WavTokenizerDec => "wavtokenizer-dec",
+            Self::Whisper => "whisper",
+            Self::Kokoro => "kokoro",
+            Self::StyleTts2 => "styletts2",
+            Self::Vocos => "vocos",
+            Self::DiT => "dit",
             Self::Plm => "plm",
             Self::BailingMoe => "bailingmoe",
             Self::BailingMoe2 => "bailingmoe2",
@@ -481,6 +498,15 @@ impl ModelArchitecture {
             | Self::GemmaEmbedding
             | Self::PanguEmbed
             | Self::LlamaEmbed => ModalityHint::VisionEncoder,
+            // Audio families: ASR enc-dec (Whisper) and codec decoders
+            // (WavTokenizer) route through the enc-dec hint; TTS
+            // (Kokoro/StyleTTS2) and vocoders (Vocos/iSTFTNet) get their own
+            // hints matching the KokoroConfig/VocosConfig ModelConfig impls.
+            Self::Whisper | Self::WavTokenizerDec => ModalityHint::AudioEncoderDecoder,
+            Self::Kokoro | Self::StyleTts2 => ModalityHint::TextToSpeech,
+            Self::Vocos => ModalityHint::AudioVocoder,
+            // Diffusion transformers (MeanVC2-style mel CFM backbones).
+            Self::DiT => ModalityHint::Diffusion,
             Self::T5 | Self::T5Encoder => ModalityHint::TextInTextOut,
             _ => ModalityHint::TextInTextOut,
         }
@@ -1445,6 +1471,60 @@ mod tests {
             ModelArchitecture::from_str("unknown_arch"),
             ModelArchitecture::Unknown
         );
+    }
+
+    /// Audio model families found in `models/audio/` (Kokoro-82m TTS,
+    /// MeanVC2 voice conversion with its `"model_type": "DiT"` config) plus
+    /// Whisper ASR must parse and route to the right modality hint instead
+    /// of collapsing into `Unknown`/`TextInTextOut`.
+    #[test]
+    fn test_audio_architecture_parsing_and_modality() {
+        assert_eq!(
+            ModelArchitecture::from_str("whisper"),
+            ModelArchitecture::Whisper
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("kokoro"),
+            ModelArchitecture::Kokoro
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("styletts2"),
+            ModelArchitecture::StyleTts2
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("vocos"),
+            ModelArchitecture::Vocos
+        );
+        // MeanVC2 ships `config_40ms_40ms.json` with `"model_type": "DiT"`.
+        assert_eq!(ModelArchitecture::from_str("DiT"), ModelArchitecture::DiT);
+        assert_eq!(
+            ModelArchitecture::from_str("wavtokenizer-dec"),
+            ModelArchitecture::WavTokenizerDec
+        );
+
+        for arch in [
+            ModelArchitecture::Whisper,
+            ModelArchitecture::WavTokenizerDec,
+        ] {
+            assert_eq!(
+                arch.modality(),
+                ModalityHint::AudioEncoderDecoder,
+                "{arch:?} must hint AudioEncoderDecoder"
+            );
+        }
+        assert_eq!(
+            ModelArchitecture::Kokoro.modality(),
+            ModalityHint::TextToSpeech
+        );
+        assert_eq!(
+            ModelArchitecture::StyleTts2.modality(),
+            ModalityHint::TextToSpeech
+        );
+        assert_eq!(
+            ModelArchitecture::Vocos.modality(),
+            ModalityHint::AudioVocoder
+        );
+        assert_eq!(ModelArchitecture::DiT.modality(), ModalityHint::Diffusion);
     }
 
     #[test]

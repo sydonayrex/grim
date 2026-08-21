@@ -18,7 +18,13 @@ use grim_tensor::{ArithType, Device, Shape, Tensor};
 use grim_core::rng::SimpleRng;
 
 /// Whisper-shaped config.
-#[derive(Debug, Clone)]
+///
+/// Serde-serializable so it can be built straight from a model's
+/// `config.json` (every audio checkpoint in `models/audio/` ships one) via
+/// [`WhisperConfig::from_hf`], which accepts both the HuggingFace
+/// transformers key set (`d_model`, `encoder_layers`, …) and OpenAI's
+/// original Whisper key set (`n_audio_state`, `n_audio_layer`, …).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhisperConfig {
     pub vocab_size: usize,
     pub n_mels: usize,
@@ -32,12 +38,86 @@ pub struct WhisperConfig {
     pub rms_norm_eps: f32,
 }
 
+impl Default for WhisperConfig {
+    /// whisper-tiny shape — the smallest widely deployed reference config.
+    fn default() -> Self {
+        Self {
+            vocab_size: 51864,
+            n_mels: 80,
+            d_model: 384,
+            num_enc_layers: 4,
+            num_dec_layers: 4,
+            num_heads: 6,
+            ffn_dim: 1536,
+            max_audio_len: 3000,
+            max_text_len: 448,
+            rms_norm_eps: 1e-5,
+        }
+    }
+}
+
+impl WhisperConfig {
+    /// Build a config from a parsed `config.json`.
+    ///
+    /// Accepts HuggingFace transformers Whisper keys (preferred) and falls
+    /// back to OpenAI's original naming when the HF keys are absent. Any
+    /// missing field keeps its [`Default`] value, so partial configs (like
+    /// Kokoro/MeanVC2-style minimal JSON) still load.
+    pub fn from_hf(json: &serde_json::Value) -> Self {
+        let get = |keys: &[&str]| -> Option<serde_json::Value> {
+            keys.iter().find_map(|k| json.get(*k)).cloned()
+        };
+        let as_usize =
+            |v: Option<serde_json::Value>| v.and_then(|v| v.as_u64()).map(|v| v as usize);
+        let d = Self::default();
+        let num_heads = as_usize(get(&[
+            "encoder_attention_heads",
+            "n_audio_head",
+            "n_text_head",
+        ]))
+        .unwrap_or(d.num_heads);
+        let ffn_dim =
+            as_usize(get(&["encoder_ffn_dim", "d_ff", "n_audio_state"])).unwrap_or(d.ffn_dim);
+        Self {
+            vocab_size: as_usize(get(&["vocab_size", "n_vocab"])).unwrap_or(d.vocab_size),
+            n_mels: as_usize(get(&["num_mel_bins", "n_mels"])).unwrap_or(d.n_mels),
+            d_model: as_usize(get(&[
+                "d_model",
+                "n_audio_state",
+                "n_text_state",
+                "hidden_size",
+            ]))
+            .unwrap_or(d.d_model),
+            num_enc_layers: as_usize(get(&["encoder_layers", "n_audio_layer"]))
+                .unwrap_or(d.num_enc_layers),
+            num_dec_layers: as_usize(get(&["decoder_layers", "n_text_layer"]))
+                .unwrap_or(d.num_dec_layers),
+            num_heads,
+            ffn_dim,
+            max_audio_len: as_usize(get(&["max_source_positions", "n_audio_ctx"]))
+                .unwrap_or(d.max_audio_len),
+            max_text_len: as_usize(get(&["max_target_positions", "n_text_ctx"]))
+                .unwrap_or(d.max_text_len),
+            rms_norm_eps: json
+                .get("layer_norm_eps")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(d.rms_norm_eps),
+        }
+    }
+}
+
 impl ModelConfig for WhisperConfig {
     fn name(&self) -> &str {
         "whisper"
     }
     fn modality(&self) -> ModalityHint {
         ModalityHint::AudioEncoderDecoder
+    }
+    /// Decoder context window — the server enforces prompt + max_tokens
+    /// against this for Whisper models like any other generative model.
+    fn context_length(&self) -> u64 {
+        self.max_text_len as u64
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -971,6 +1051,12 @@ impl Whisper {
         let ids_data = input_ids.to_vec_f32()?;
         let ids: Vec<u32> = ids_data.iter().map(|x| *x as u32).collect();
         let seq_len = ids.len();
+        if seq_len > self.cfg.max_text_len {
+            return Err(Error::Shape(format!(
+                "Whisper text too long: {} > max {}",
+                seq_len, self.cfg.max_text_len
+            )));
+        }
         let emb = self.tok_emb.forward(&ids, seq_len, self.cfg.d_model)?;
         // Decoder positional embeddings. `decode_step` is passed the full id
         // prefix and recomputes attention over it, so absolute positions start
@@ -1064,6 +1150,113 @@ mod tests {
             Error::Shape(_) => {}
             other => panic!("expected Shape error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn whisper_rejects_text_longer_than_context() {
+        let mut c = cfg();
+        c.max_text_len = 4;
+        let w = Whisper::random(Device::Cpu, c);
+        let mel = cpu_tensor(
+            (0..16 * 8).map(|i| (i as f32) * 0.01).collect(),
+            Shape::new(vec![16, 8]),
+        );
+        let enc = w.encode(&mel).unwrap();
+        let ids = cpu_tensor(vec![1.0f32; 5], Shape::new(vec![5]));
+        match w.decode_step(&enc, &ids) {
+            Err(Error::Shape(msg)) => assert!(msg.contains("text too long"), "{msg}"),
+            Ok(_) => panic!("expected Shape error, got Ok"),
+            other => panic!("expected Shape error, got {:?}", other),
+        }
+    }
+
+    /// HuggingFace transformers key set (`openai/whisper-tiny` config.json).
+    #[test]
+    fn whisper_config_from_hf_transformers_keys() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "model_type": "whisper",
+                "vocab_size": 51865,
+                "num_mel_bins": 80,
+                "d_model": 384,
+                "encoder_layers": 4,
+                "decoder_layers": 4,
+                "encoder_attention_heads": 6,
+                "decoder_attention_heads": 6,
+                "encoder_ffn_dim": 1536,
+                "max_source_positions": 1500,
+                "max_target_positions": 448
+            }"#,
+        )
+        .unwrap();
+        let c = WhisperConfig::from_hf(&json);
+        assert_eq!(c.vocab_size, 51865);
+        assert_eq!(c.n_mels, 80);
+        assert_eq!(c.d_model, 384);
+        assert_eq!(c.num_enc_layers, 4);
+        assert_eq!(c.num_dec_layers, 4);
+        assert_eq!(c.num_heads, 6);
+        assert_eq!(c.ffn_dim, 1536);
+        assert_eq!(c.max_audio_len, 1500);
+        assert_eq!(c.max_text_len, 448);
+    }
+
+    /// OpenAI's original Whisper key set (`n_audio_state`, …) as used by the
+    /// reference checkpoints released alongside `models/audio/`.
+    #[test]
+    fn whisper_config_from_openai_keys() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "n_vocab": 51864,
+                "n_mels": 80,
+                "n_audio_ctx": 3000,
+                "n_audio_state": 384,
+                "n_audio_head": 6,
+                "n_audio_layer": 4,
+                "n_text_ctx": 448,
+                "n_text_state": 384,
+                "n_text_head": 6,
+                "n_text_layer": 4
+            }"#,
+        )
+        .unwrap();
+        let c = WhisperConfig::from_hf(&json);
+        assert_eq!(c.vocab_size, 51864);
+        assert_eq!(c.d_model, 384);
+        assert_eq!(c.num_enc_layers, 4);
+        assert_eq!(c.num_dec_layers, 4);
+        assert_eq!(c.max_audio_len, 3000);
+        assert_eq!(c.max_text_len, 448);
+    }
+
+    /// Partial configs (minimal JSON like the Kokoro/MeanVC2 configs ship)
+    /// must fall back to defaults instead of failing.
+    #[test]
+    fn whisper_config_partial_json_uses_defaults() {
+        let json: serde_json::Value = serde_json::from_str(r#"{ "num_mel_bins": 128 }"#).unwrap();
+        let c = WhisperConfig::from_hf(&json);
+        assert_eq!(c.n_mels, 128);
+        assert_eq!(c.d_model, WhisperConfig::default().d_model);
+    }
+
+    #[test]
+    fn whisper_config_serde_roundtrip() {
+        let c = WhisperConfig::default();
+        let s = serde_json::to_string(&c).unwrap();
+        let back: WhisperConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.vocab_size, c.vocab_size);
+        assert_eq!(back.d_model, c.d_model);
+        assert_eq!(back.rms_norm_eps, c.rms_norm_eps);
+    }
+
+    #[test]
+    fn whisper_config_reports_context_length_and_modality() {
+        let c = cfg();
+        assert_eq!(ModelConfig::context_length(&c), c.max_text_len as u64);
+        assert_eq!(
+            ModelConfig::modality(&c),
+            grim_core::model::ModalityHint::AudioEncoderDecoder
+        );
     }
 }
 

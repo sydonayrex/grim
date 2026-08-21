@@ -24,8 +24,9 @@ pub use error::{Error, Result, TensorError};
 pub use hyperparams::{ArchHyperparameters, HyperparameterExtractor, MetadataLookup};
 pub use kv_cache::KvCache;
 pub use model::{
-    CausalLm, DiffusionModel, Encoder, EncoderDecoderLm, ModalityHint, Model, ModelConfig,
-    NoiseScheduler, SsmState, StatefulSequence,
+    AudioVocoder, CausalLm, DiffusionModel, Encoder, EncoderDecoderLm, ModalityHint, Model,
+    ModelConfig, NoiseScheduler, SsmState, StatefulSequence, TextToSpeechModel,
+    VoiceConversionModel,
 };
 pub use paths::{grim_config_dir, grim_log_dir, grim_models_dir, grim_plugins_dir, home_dir};
 pub use sampler::Sampler;

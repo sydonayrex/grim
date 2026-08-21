@@ -12,6 +12,8 @@ grim-nn = { workspace = true }
 grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [features]

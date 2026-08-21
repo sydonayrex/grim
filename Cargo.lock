@@ -2448,6 +2448,8 @@ dependencies = [
  "grim-core",
  "grim-nn",
  "grim-tensor",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
@@ -2577,6 +2579,7 @@ dependencies = [
  "grim-disagg",
  "grim-engine",
  "grim-format",
+ "grim-models-audio",
  "grim-models-transformer",
  "grim-plugin",
  "grim-scheduler",

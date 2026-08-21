@@ -50,6 +50,9 @@ pub enum ModalityHint {
     AudioEncoderDecoder,
     Diffusion,
     MultimodalInTextOut,
+    TextToSpeech,
+    VoiceConversion,
+    AudioVocoder,
 }
 
 /// Inputs for multimodal causal models (text + vision patches + audio mel frames).
@@ -149,4 +152,22 @@ pub trait DiffusionModel: Model {
 /// DDIM, Euler, DPM++, Karras — registry-driven so models bring their own.
 pub trait NoiseScheduler: Send + Sync {
     fn step(&self, model_output: &Tensor, latents: &Tensor, timestep: u32) -> Result<Tensor>;
+}
+
+/// Text-to-speech synthesis models (e.g. Kokoro, StyleTTS2).
+pub trait TextToSpeechModel: Model {
+    /// Synthesizes raw audio waveform samples from input phoneme/token IDs and style conditioning.
+    fn synthesize(&self, phoneme_ids: &[u32], style: &Tensor, speed: f32) -> Result<Tensor>;
+}
+
+/// Voice conversion and speech-to-speech models (e.g. MeanVC2, FastU2++).
+pub trait VoiceConversionModel: Model {
+    /// Converts source mel spectrogram / audio features into target voice audio features.
+    fn convert_voice(&self, source_mel: &Tensor, target_style: &Tensor) -> Result<Tensor>;
+}
+
+/// Neural audio vocoders (e.g. Vocos, iSTFTNet, HiFi-GAN).
+pub trait AudioVocoder: Model {
+    /// Decodes intermediate mel-spectrogram or latent features into raw time-domain audio samples.
+    fn mel_to_audio(&self, mel: &Tensor) -> Result<Tensor>;
 }

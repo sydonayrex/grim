@@ -470,6 +470,11 @@ impl Engine {
             .and_then(|s| s.parse::<usize>().ok());
 
         let dev = model.device().clone();
+        // Preserve the model's own modality hint (audio enc-dec, TTS, VC,
+        // vocoder, diffusion…) so serving-layer routing sees the truth.
+        // Hardcoding TextInTextOut misreported every non-text model that
+        // registered through this path, including the audio models.
+        let modality = model.config().modality();
         let wrapped = SpeculativeCausalLm::auto(
             model,
             draft,
@@ -480,7 +485,7 @@ impl Engine {
         );
         let config: Box<dyn ModelConfig> = Box::new(grim_core::config::GenericModelConfig {
             name: id.to_string(),
-            modality: grim_core::model::ModalityHint::TextInTextOut,
+            modality,
         });
         self.models.insert(
             id.to_string(),
@@ -617,10 +622,17 @@ impl Engine {
                 decode_count += 1;
                 let dec_start = Instant::now();
                 let outcome = self.drive_decode_with_outcome(id)?;
-                decode_elapsed += dec_start.elapsed();
-                if let Some(ref o) = outcome {
+                // Record the decode outcome so `last_outcome(id)` reflects
+                // THIS step's logits. Without this insert the server kept
+                // sampling from the stale step-0 prefill logits and emitted
+                // the same token forever.
+                if let Some(o) = outcome.clone() {
                     total_accepted += o.accepted_tokens;
                 }
+                if let Some(o) = outcome {
+                    self.last_outcomes.insert(id, o);
+                }
+                decode_elapsed += dec_start.elapsed();
             }
         }
         for &id in &output.decode_ids {
@@ -628,10 +640,13 @@ impl Engine {
                 decode_count += 1;
                 let dec_start = Instant::now();
                 let outcome = self.drive_decode_with_outcome(id)?;
-                decode_elapsed += dec_start.elapsed();
-                if let Some(ref o) = outcome {
+                if let Some(o) = outcome.clone() {
                     total_accepted += o.accepted_tokens;
                 }
+                if let Some(o) = outcome {
+                    self.last_outcomes.insert(id, o);
+                }
+                decode_elapsed += dec_start.elapsed();
             }
         }
 
