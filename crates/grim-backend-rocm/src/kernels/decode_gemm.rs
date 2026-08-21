@@ -25,9 +25,11 @@ extern "C" __global__ void grim_decode_gemm_f16(
     const int row = idx / N;
     const int col = idx % N;
 
+    const _Float16* a_row = A + row * stride_a;
     float acc = 0.0f;
+
     for (int k = 0; k < K; ++k) {
-        float a_val = (float)A[row * stride_a + k];
+        float a_val = (float)a_row[k];
         float b_val = (float)B[k * stride_b + col];
         acc += a_val * b_val;
     }

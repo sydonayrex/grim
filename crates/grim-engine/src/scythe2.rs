@@ -1091,6 +1091,80 @@ impl ScytheRing {
     pub fn dequeue(&self) -> u32 {
         self.tail.fetch_add(1, Ordering::AcqRel) % self.capacity
     }
+
+    /// Enqueue a GEMM operation (opcode 1=ColGEMM, 2=RowGEMM).
+    pub fn enqueue_gemm(
+        &self,
+        opcode: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        input_ptr: u64,
+        weight_ptr: u64,
+        output_ptr: u64,
+        peer_ptr: u64,
+    ) -> Result<u32, ScytheTaskDescriptor> {
+        let desc = ScytheTaskDescriptor {
+            opcode,
+            m,
+            n,
+            k,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            peer_ptr,
+            status: 0,
+        };
+        self.enqueue(desc)
+    }
+
+    /// Enqueue a fused QKV attention operation (opcode 3).
+    pub fn enqueue_attention(
+        &self,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        q_ptr: u64,
+        k_ptr: u64,
+        out_ptr: u64,
+        v_ptr: u64,
+    ) -> Result<u32, ScytheTaskDescriptor> {
+        let desc = ScytheTaskDescriptor {
+            opcode: 3,
+            m: seq_len,
+            n: num_heads,
+            k: head_dim,
+            input_ptr: q_ptr,
+            weight_ptr: k_ptr,
+            output_ptr: out_ptr,
+            peer_ptr: v_ptr,
+            status: 0,
+        };
+        self.enqueue(desc)
+    }
+
+    /// Enqueue an RMSNorm operation (opcode 4).
+    pub fn enqueue_norm(
+        &self,
+        num_tokens: u32,
+        hidden_dim: u32,
+        input_ptr: u64,
+        weight_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<u32, ScytheTaskDescriptor> {
+        let desc = ScytheTaskDescriptor {
+            opcode: 4,
+            m: num_tokens,
+            n: 0,
+            k: hidden_dim,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            peer_ptr: 0,
+            status: 0,
+        };
+        self.enqueue(desc)
+    }
 }
 
 // ── Tests (WI-4 + WI-7 gates) ─────────────────────────────────────────────────
@@ -1396,6 +1470,19 @@ mod tests {
         );
         // FP32 is zero (the default / no-quant case).
         assert_eq!(moe_quant_mode::FP32, 0);
+    }
+
+    #[test]
+    fn scythe_ring_enqueue_opcodes_1_through_4() {
+        let ring = ScytheRing::new(16);
+        let gemm_slot = ring.enqueue_gemm(1, 1, 128, 64, 0x1000, 0x2000, 0x3000, 0).unwrap();
+        assert_eq!(gemm_slot, 0);
+
+        let attn_slot = ring.enqueue_attention(2, 4, 16, 0x1000, 0x2000, 0x3000, 0x4000).unwrap();
+        assert_eq!(attn_slot, 1);
+
+        let norm_slot = ring.enqueue_norm(2, 64, 0x1000, 0x2000, 0x3000).unwrap();
+        assert_eq!(norm_slot, 2);
     }
 
     #[test]
