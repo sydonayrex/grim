@@ -130,6 +130,13 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("mrope", load_kernel("mrope")),
         ("marlin_gemm", load_kernel("marlin_gemm")),
         ("fused_linear_ce", load_kernel("fused_linear_ce")),
+        ("flash_decode_split_k", load_kernel("flash_decode_split_k")),
+        ("softmax_merge", load_kernel("softmax_merge")),
+        (
+            "qkv_attention_paged_dequant",
+            load_kernel("qkv_attention_paged_dequant"),
+        ),
+        ("speculative_acceptor", load_kernel("speculative_acceptor")),
     ]
 }
 
@@ -191,6 +198,10 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/mrope.comp");
     println!("cargo:rerun-if-changed=kernels/marlin_gemm.comp");
     println!("cargo:rerun-if-changed=kernels/fused_linear_ce.comp");
+    println!("cargo:rerun-if-changed=kernels/flash_decode_split_k.comp");
+    println!("cargo:rerun-if-changed=kernels/softmax_merge.comp");
+    println!("cargo:rerun-if-changed=kernels/qkv_attention_paged_dequant.comp");
+    println!("cargo:rerun-if-changed=kernels/speculative_acceptor.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 

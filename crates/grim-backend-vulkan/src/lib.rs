@@ -4730,6 +4730,14 @@ pub enum VulkanKernel {
     MarlinGemm,
     /// On-device fused linear cross-entropy forward loss computation.
     FusedLinearCe,
+    /// FlashDecode Split-K parallel sequence attention.
+    FlashDecodeSplitK,
+    /// Softmax reduction and partial tile merging for FlashDecode Split-K.
+    SoftmaxMerge,
+    /// Paged QKV attention with INT8/FP8 dynamic KV cache dequantization.
+    QkvAttentionPagedDequant,
+    /// GPU speculative draft token acceptance and prefix evaluation.
+    SpeculativeAcceptor,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -4792,6 +4800,10 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Mrope => SPIRV_MROPE,
         VulkanKernel::MarlinGemm => SPIRV_MARLIN_GEMM,
         VulkanKernel::FusedLinearCe => SPIRV_FUSED_LINEAR_CE,
+        VulkanKernel::FlashDecodeSplitK => SPIRV_FLASH_DECODE_SPLIT_K,
+        VulkanKernel::SoftmaxMerge => SPIRV_SOFTMAX_MERGE,
+        VulkanKernel::QkvAttentionPagedDequant => SPIRV_QKV_ATTENTION_PAGED_DEQUANT,
+        VulkanKernel::SpeculativeAcceptor => SPIRV_SPECULATIVE_ACCEPTOR,
     }
 }
 
@@ -4839,6 +4851,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::SageAttention
         | VulkanKernel::FusedAdamw
         | VulkanKernel::MarlinGemm
+        | VulkanKernel::SoftmaxMerge
         | VulkanKernel::RwkvTimeMix => 4,
         VulkanKernel::QkvAttentionPaged
         | VulkanKernel::QkvAttentionPagedSwa
@@ -4849,7 +4862,10 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::AddRmsNorm => 5,
         VulkanKernel::KvDequantAttention
         | VulkanKernel::SelectiveScan
+        | VulkanKernel::FlashDecodeSplitK
+        | VulkanKernel::SpeculativeAcceptor
         | VulkanKernel::QuantizedMatmulBackwardDxGeneric => 6,
+        VulkanKernel::QkvAttentionPagedDequant => 7,
         VulkanKernel::MulScalar
         | VulkanKernel::Sqrt
         | VulkanKernel::Recip
