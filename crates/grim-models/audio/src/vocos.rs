@@ -7,7 +7,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AudioVocoder, ModalityHint, Model, ModelConfig};
 use grim_core::rng::SimpleRng;
-use grim_nn::{Linear, RmsNorm};
+use grim_nn::{Conv1d, Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 /// Configuration parameters for Vocos neural vocoder.
@@ -50,7 +50,7 @@ impl ModelConfig for VocosConfig {
 
 /// ConvNeXt Block with 7x1 depthwise conv and point-wise expansion.
 struct ConvNeXtBlock {
-    dw_weight: Vec<f32>,
+    dw_conv: Conv1d,
     norm: RmsNorm,
     pw1: Linear,
     pw2: Linear,
@@ -59,9 +59,18 @@ struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     fn new(dim: usize, intermediate: usize, rng: &mut SimpleRng) -> Self {
-        let dw_weight = (0..dim * 7)
+        let dw_weight = (0..dim * 1 * 7)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
+        let dw_conv = Conv1d::new(
+            cpu_tensor(dw_weight, Shape::new(vec![dim, 1, 7])),
+            Some(cpu_tensor(vec![0.0; dim], Shape::new(vec![dim]))),
+            1,   // stride
+            3,   // padding
+            1,   // dilation
+            dim, // groups (depthwise)
+        );
+
         let pw1_w = (0..intermediate * dim)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
@@ -81,7 +90,7 @@ impl ConvNeXtBlock {
         );
 
         Self {
-            dw_weight,
+            dw_conv,
             norm: RmsNorm {
                 weight: cpu_tensor(vec![1.0; dim], Shape::new(vec![dim])),
                 eps: 1e-6,
@@ -97,24 +106,8 @@ impl ConvNeXtBlock {
         let seq_len = x.shape().dims()[0];
         let dim = self.dim;
 
-        // 1. Depthwise 1D conv (kernel size 7, padding 3)
-        let mut dw_out = vec![0.0f32; seq_len * dim];
-        for i in 0..seq_len {
-            for d in 0..dim {
-                let mut sum = 0.0f32;
-                for k in 0..7 {
-                    let in_idx = i as isize + k as isize - 3;
-                    if in_idx >= 0 && in_idx < seq_len as isize {
-                        let w_val = self.dw_weight[d * 7 + k];
-                        let in_val = x_vec[in_idx as usize * dim + d];
-                        sum += w_val * in_val;
-                    }
-                }
-                dw_out[i * dim + d] = sum;
-            }
-        }
-
-        let dw_tensor = cpu_tensor(dw_out, Shape::new(vec![seq_len, dim]));
+        // 1. Depthwise 1D conv (kernel size 7, padding 3) via Conv1d
+        let dw_tensor = self.dw_conv.forward(x)?;
         let norm_out = self.norm.forward(&dw_tensor)?;
 
         // 2. Pointwise MLP with GELU activation

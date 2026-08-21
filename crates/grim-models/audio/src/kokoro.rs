@@ -9,7 +9,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{ModalityHint, Model, ModelConfig, TextToSpeechModel};
 use grim_core::rng::SimpleRng;
-use grim_nn::{Embedding, Linear, RmsNorm};
+use grim_nn::{Conv1d, ConvTranspose1d, Embedding, Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 /// Configuration parameters for Kokoro-82M TTS.
@@ -199,6 +199,9 @@ pub struct Kokoro {
     text_proj: Linear,
     style_proj: Linear,
     mel_decoder: Linear,
+    upsamplers: Vec<ConvTranspose1d>,
+    resblocks: Vec<Conv1d>,
+    conv_post: Conv1d,
 }
 
 impl Kokoro {
@@ -261,6 +264,62 @@ impl Kokoro {
             )),
         );
 
+        let mut upsamplers = Vec::new();
+        let mut resblocks = Vec::new();
+        let mut curr_channels = config.n_mels;
+
+        for (rate, &kernel) in config
+            .upsample_rates
+            .iter()
+            .zip(&config.upsample_kernel_sizes)
+        {
+            let out_channels = (curr_channels / 2).max(1);
+            let pad = (kernel - rate) / 2;
+            let w_up = (0..curr_channels * out_channels * kernel)
+                .map(|_| (rng.next_f32() - 0.5) * 0.02)
+                .collect();
+            upsamplers.push(ConvTranspose1d::new(
+                cpu_tensor(w_up, Shape::new(vec![curr_channels, out_channels, kernel])),
+                Some(cpu_tensor(
+                    vec![0.0; out_channels],
+                    Shape::new(vec![out_channels]),
+                )),
+                *rate,
+                pad,
+                0,
+                1,
+                1,
+            ));
+
+            let w_res = (0..out_channels * out_channels * 3)
+                .map(|_| (rng.next_f32() - 0.5) * 0.02)
+                .collect();
+            resblocks.push(Conv1d::new(
+                cpu_tensor(w_res, Shape::new(vec![out_channels, out_channels, 3])),
+                Some(cpu_tensor(
+                    vec![0.0; out_channels],
+                    Shape::new(vec![out_channels]),
+                )),
+                1,
+                1,
+                1,
+                1,
+            ));
+            curr_channels = out_channels;
+        }
+
+        let w_post = (0..1 * curr_channels * 7)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let conv_post = Conv1d::new(
+            cpu_tensor(w_post, Shape::new(vec![1, curr_channels, 7])),
+            Some(cpu_tensor(vec![0.0; 1], Shape::new(vec![1]))),
+            1,
+            3,
+            1,
+            1,
+        );
+
         Self {
             config,
             device,
@@ -269,6 +328,9 @@ impl Kokoro {
             text_proj,
             style_proj,
             mel_decoder,
+            upsamplers,
+            resblocks,
+            conv_post,
         }
     }
 }
@@ -343,20 +405,18 @@ impl TextToSpeechModel for Kokoro {
         let mel_frames = self.mel_decoder.forward(&acoustic_tensor)?;
 
         // 5. iSTFTNet waveform synthesis: upsample mel-spectrogram to audio samples
-        let mel_vec = mel_frames.to_vec_f32()?;
-        let total_upsample: usize = self.config.upsample_rates.iter().product();
-        let total_samples = seq_len * total_upsample;
-        let mut audio_pcm = vec![0.0f32; total_samples];
+        let mut cur_audio = mel_frames;
+        for (up, res) in self.upsamplers.iter().zip(&self.resblocks) {
+            let up_out = up.forward(&cur_audio)?;
+            cur_audio = res.forward(&up_out)?;
+        }
 
-        for i in 0..seq_len {
-            let mel_slice = &mel_vec[i * self.config.n_mels..(i + 1) * self.config.n_mels];
-            let energy: f32 =
-                mel_slice.iter().map(|&v| v.abs()).sum::<f32>() / (self.config.n_mels as f32);
-            for s in 0..total_upsample {
-                let idx = i * total_upsample + s;
-                let phase = (s as f32) / (total_upsample as f32) * std::f32::consts::TAU;
-                audio_pcm[idx] = (energy * 0.1 * phase.sin()).clamp(-1.0, 1.0);
-            }
+        let post_out = self.conv_post.forward(&cur_audio)?;
+        let audio_vec = post_out.to_vec_f32()?;
+        let total_samples = audio_vec.len();
+        let mut audio_pcm = vec![0.0f32; total_samples];
+        for i in 0..total_samples {
+            audio_pcm[i] = audio_vec[i].clamp(-1.0, 1.0);
         }
 
         Ok(cpu_tensor(audio_pcm, Shape::new(vec![total_samples])))

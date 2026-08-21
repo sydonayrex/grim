@@ -9,10 +9,13 @@ pub mod onnx;
 pub mod safetensors;
 pub mod spec;
 pub mod tokenizer;
+pub mod torch;
 pub mod tprov;
 /// WI-R6: training-state `.grim.train` sidecar (adapters, optimizer, error matrix).
 pub mod train;
 pub mod weight_format;
+
+pub use torch::{PthProvider, TorchTensorEntry};
 
 pub use convert::{
     GpuDequant, convert_gguf_to_grim, convert_to_grim, convert_to_grim_with_dequant,

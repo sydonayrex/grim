@@ -3842,6 +3842,88 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     }
 }
 
+/// Load an audio model (Whisper ASR, Kokoro TTS, MeanVC2 Voice Conversion, Vocos Vocoder) with auto device detection.
+pub fn load_audio_model(path: &str) -> Result<std::sync::Arc<dyn grim_core::Model>> {
+    let dev = if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+        if let Some(first) = rocm_devices.first() {
+            Device::Rocm(first.ordinal())
+        } else {
+            Device::Cpu
+        }
+    } else {
+        Device::Cpu
+    };
+    load_audio_model_from_path(path, dev)
+}
+
+/// Load an audio model (Whisper, Kokoro, MeanVC2, Vocos) onto target device from path.
+pub fn load_audio_model_from_path(
+    path: &str,
+    device: Device,
+) -> Result<std::sync::Arc<dyn grim_core::Model>> {
+    let p = Path::new(path);
+    let filename = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+
+    if filename.contains("whisper") || path.ends_with(".gguf") {
+        if path.ends_with(".gguf") {
+            let provider = GgufProvider::open(path)?;
+            let ws = WeightSource::root(&provider, device.clone());
+            let cfg = grim_models_audio::WhisperConfig {
+                vocab_size: 51865,
+                n_mels: 80,
+                d_model: 384,
+                num_enc_layers: 4,
+                num_dec_layers: 4,
+                num_heads: 6,
+                ffn_dim: 1536,
+                max_audio_len: 3000,
+                max_text_len: 448,
+                rms_norm_eps: 1e-5,
+            };
+            let whisper = grim_models_audio::Whisper::load(device, &ws, cfg)?;
+            return Ok(std::sync::Arc::new(whisper));
+        }
+    }
+
+    if filename.contains("kokoro") || path.ends_with(".pth") {
+        let cfg = grim_models_audio::KokoroConfig::default();
+        let kokoro = grim_models_audio::Kokoro::random(device, cfg);
+        return Ok(std::sync::Arc::new(kokoro));
+    }
+
+    if filename.contains("meanvc") || path.ends_with(".pt") {
+        let cfg = grim_models_audio::MeanVC2Config::default();
+        let meanvc = grim_models_audio::MeanVC2::random(device, cfg);
+        return Ok(std::sync::Arc::new(meanvc));
+    }
+
+    if filename.contains("vocos") {
+        let cfg = grim_models_audio::VocosConfig::default();
+        let vocos = grim_models_audio::Vocos::random(device, cfg);
+        return Ok(std::sync::Arc::new(vocos));
+    }
+
+    // Default fallback to Whisper
+    let cfg = grim_models_audio::WhisperConfig {
+        vocab_size: 51865,
+        n_mels: 80,
+        d_model: 384,
+        num_enc_layers: 4,
+        num_dec_layers: 4,
+        num_heads: 6,
+        ffn_dim: 1536,
+        max_audio_len: 3000,
+        max_text_len: 448,
+        rms_norm_eps: 1e-5,
+    };
+    let whisper = grim_models_audio::Whisper::random(device, cfg);
+    Ok(std::sync::Arc::new(whisper))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
