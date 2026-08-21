@@ -4724,6 +4724,12 @@ pub enum VulkanKernel {
     FusedAdamw,
     /// On-device fused Lion parameter update.
     FusedLion,
+    /// Multimodal 3D Rotary Position Embedding (M-RoPE).
+    Mrope,
+    /// Marlin 4-bit / 8-bit fast GEMM with 2-way thread interleaving.
+    MarlinGemm,
+    /// On-device fused linear cross-entropy forward loss computation.
+    FusedLinearCe,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -4783,6 +4789,9 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::SageAttention => SPIRV_SAGE_ATTENTION,
         VulkanKernel::FusedAdamw => SPIRV_FUSED_ADAMW,
         VulkanKernel::FusedLion => SPIRV_FUSED_LION,
+        VulkanKernel::Mrope => SPIRV_MROPE,
+        VulkanKernel::MarlinGemm => SPIRV_MARLIN_GEMM,
+        VulkanKernel::FusedLinearCe => SPIRV_FUSED_LINEAR_CE,
     }
 }
 
@@ -4805,6 +4814,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::Matmul64Bf16
         | VulkanKernel::Rope
         | VulkanKernel::RopeYarn
+        | VulkanKernel::Mrope
         | VulkanKernel::FusedDequantGemmQ4K
         | VulkanKernel::FusedDequantGemmQ5K
         | VulkanKernel::FusedDequantGemmQ6K
@@ -4828,12 +4838,14 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::MlaDecode
         | VulkanKernel::SageAttention
         | VulkanKernel::FusedAdamw
+        | VulkanKernel::MarlinGemm
         | VulkanKernel::RwkvTimeMix => 4,
         VulkanKernel::QkvAttentionPaged
         | VulkanKernel::QkvAttentionPagedSwa
         | VulkanKernel::TreeAttention
         | VulkanKernel::QuantizedMatmulBackwardDx
         | VulkanKernel::QuantizedMatmulBackwardDxQ8_0
+        | VulkanKernel::FusedLinearCe
         | VulkanKernel::AddRmsNorm => 5,
         VulkanKernel::KvDequantAttention
         | VulkanKernel::SelectiveScan

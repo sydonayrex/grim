@@ -19,6 +19,9 @@ fn test_vulkan_modern_kernels_spirv_embedded() {
         VulkanKernel::SageAttention,
         VulkanKernel::FusedAdamw,
         VulkanKernel::FusedLion,
+        VulkanKernel::Mrope,
+        VulkanKernel::MarlinGemm,
+        VulkanKernel::FusedLinearCe,
         VulkanKernel::RmsNorm,
         VulkanKernel::AddRmsNorm,
     ];
