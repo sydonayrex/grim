@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint batch_size;
+    uint num_draft_tokens;
+    uint vocab_size;
+} params;
+
+layout(std430, binding = 0) readonly buffer TargetProbs { float target_probs[]; };
+layout(std430, binding = 1) readonly buffer DraftProbs { float draft_probs[]; };
+layout(std430, binding = 2) readonly buffer DraftTokens { int draft_tokens[]; };
+layout(std430, binding = 3) readonly buffer UniformRands { float uniform_rands[]; };
+layout(std430, binding = 4) writeonly buffer AcceptedTokens { int accepted_tokens[]; };
+layout(std430, binding = 5) writeonly buffer AcceptedLens { int accepted_lens[]; };
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (b >= params.batch_size) return;
+
+    if (tid == 0u) {
+        int accepted_count = 0;
+        for (uint k = 0; k < params.num_draft_tokens; ++k) {
+            int draft_tok = draft_tokens[b * params.num_draft_tokens + k];
+            if (draft_tok < 0 || uint(draft_tok) >= params.vocab_size) {
+                break;
+            }
+
+            uint t_idx = (b * (params.num_draft_tokens + 1u) + k) * params.vocab_size + uint(draft_tok);
+            uint d_idx = (b * params.num_draft_tokens + k) * params.vocab_size + uint(draft_tok);
+
+            float p = target_probs[t_idx];
+            float q = draft_probs[d_idx];
+            float r = uniform_rands[b * (params.num_draft_tokens + 1u) + k];
+
+            float accept_prob = (q > 0.0) ? min(1.0, p / q) : 1.0;
+
+            if (r <= accept_prob) {
+                accepted_tokens[b * (params.num_draft_tokens + 1u) + uint(accepted_count)] = draft_tok;
+                accepted_count++;
+            } else {
+                break;
+            }
+        }
+        accepted_lens[b] = accepted_count;
+    }
+}

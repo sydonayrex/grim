@@ -22,6 +22,10 @@ fn test_vulkan_modern_kernels_spirv_embedded() {
         VulkanKernel::Mrope,
         VulkanKernel::MarlinGemm,
         VulkanKernel::FusedLinearCe,
+        VulkanKernel::FlashDecodeSplitK,
+        VulkanKernel::SoftmaxMerge,
+        VulkanKernel::QkvAttentionPagedDequant,
+        VulkanKernel::SpeculativeAcceptor,
         VulkanKernel::RmsNorm,
         VulkanKernel::AddRmsNorm,
     ];

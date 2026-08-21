@@ -82,5 +82,6 @@ fn test_vocos_neural_vocoder() {
     let audio = vocos
         .mel_to_audio(&mel)
         .expect("Vocoder synthesis should succeed");
-    assert_eq!(audio.shape().dims(), &[num_frames * 16]);
+    // iSTFT waveform length = (num_frames - 1) * hop_length + n_fft = 9 * 16 + 64 = 208.
+    assert_eq!(audio.shape().dims(), &[208]);
 }
