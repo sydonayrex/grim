@@ -223,6 +223,7 @@ fn job_summary_to_ui_job(s: JobSummaryDto) -> UiJob {
             crate::jobs::TrainingMode::TurboFinetune => "TurboFinetune".into(),
             crate::jobs::TrainingMode::KvOmni => "KvOmni".into(),
             crate::jobs::TrainingMode::SpectralQLoRA => "SpectralQLoRA".into(),
+            crate::jobs::TrainingMode::CompressDistill => "Compress-Distill".into(),
         },
     }
 }

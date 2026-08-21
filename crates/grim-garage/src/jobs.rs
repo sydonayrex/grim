@@ -180,6 +180,8 @@ pub enum TrainingMode {
     SpectralQLoRA,
     /// Contrast-Omni: contrastive multi-modal training across text/audio/visual.
     ContrastOmni,
+    /// CompressDistill: teacher->student distillation with quantized student target (§WI-E4).
+    CompressDistill,
 }
 
 /// One per-step metric sample: step id, loss, tokens processed.
@@ -613,6 +615,7 @@ fn initial_loss(mode: TrainingMode) -> f64 {
         | TrainingMode::KvOmni
         | TrainingMode::SpectralQLoRA
         | TrainingMode::ContrastOmni
+        | TrainingMode::CompressDistill
         | TrainingMode::OmniGrad => 2.3,
         TrainingMode::Orpo
         | TrainingMode::Dpo
@@ -2381,7 +2384,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             | TrainingMode::ContrastOmni
             | TrainingMode::TurboFinetune
             | TrainingMode::KvOmni
-            | TrainingMode::SpectralQLoRA => {
+            | TrainingMode::SpectralQLoRA
+            | TrainingMode::CompressDistill => {
                 let (x_tensor, targets) = if let Some(ref mut dl) = dataloader {
                     match dl.next_batch() {
                         Ok((inputs, labels)) => {

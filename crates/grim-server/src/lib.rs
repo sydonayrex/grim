@@ -2547,7 +2547,7 @@ async fn metrics_endpoint(
     // Keep metrics and status on one contract so probes and dashboards cannot
     // disagree about backend, model, or KV state. Legacy counters remain.
     let mut snapshot = get_status(State(state.clone())).await.0;
-    let (active_sessions, block_pool_usage, preemption_count, scheduler_snapshot) = {
+    let (active_sessions, block_pool_usage, preemption_count, scheduler_snapshot, last_ttft, last_itl, spec_tele) = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let active = engine.adapter_count();
         let sched = engine.scheduler_snapshot();
@@ -2557,7 +2557,10 @@ async fn metrics_endpoint(
         } else {
             0.0
         };
-        (active, pool_usage, sched.paused_requests, sched)
+        let ttft = engine.last_ttft_ms();
+        let itl = engine.last_itl_ms();
+        let spec = engine.speculative_telemetry(None);
+        (active, pool_usage, sched.paused_requests, sched, ttft, itl, spec)
     };
 
     if let Some(object) = snapshot.as_object_mut() {
@@ -2570,6 +2573,14 @@ async fn metrics_endpoint(
             "preemption_count".into(),
             serde_json::json!(preemption_count),
         );
+        object.insert("ttft_ms".into(), serde_json::json!(last_ttft));
+        object.insert("itl_ms".into(), serde_json::json!(last_itl));
+        if let Some(ref st) = spec_tele {
+            object.insert("speculative_accept_rate_ema".into(), serde_json::json!(st.accept_rate_ema));
+            object.insert("speculative_strategy".into(), serde_json::json!(st.strategy));
+            object.insert("speculative_drafted_tokens".into(), serde_json::json!(st.total_drafted_tokens));
+            object.insert("speculative_accepted_tokens".into(), serde_json::json!(st.total_accepted_tokens));
+        }
     }
 
     let accept = headers
@@ -2599,7 +2610,7 @@ async fn metrics_endpoint(
         * 1024.0
         * 1024.0
         * 1024.0) as u64;
-    let prometheus_text = format!(
+    let mut prometheus_text = format!(
         "# HELP grim_active_sessions Active LoRA adapters and inference sessions\n\
          # TYPE grim_active_sessions gauge\n\
          grim_active_sessions {active_sessions}\n\
@@ -2631,6 +2642,37 @@ async fn metrics_endpoint(
         scheduler_snapshot.waiting_requests,
         scheduler_snapshot.admitted_requests,
     );
+
+    if let Some(ttft) = last_ttft {
+        prometheus_text.push_str(&format!(
+            "# HELP grim_time_to_first_token_ms Latency to produce first token in milliseconds\n\
+             # TYPE grim_time_to_first_token_ms gauge\n\
+             grim_time_to_first_token_ms {ttft:.2}\n"
+        ));
+    }
+    if let Some(itl) = last_itl {
+        prometheus_text.push_str(&format!(
+            "# HELP grim_inter_token_latency_ms Inter-token decode latency in milliseconds\n\
+             # TYPE grim_inter_token_latency_ms gauge\n\
+             grim_inter_token_latency_ms {itl:.2}\n"
+        ));
+    }
+    if let Some(ref st) = spec_tele {
+        prometheus_text.push_str(&format!(
+            "# HELP grim_speculative_accept_rate_ema Exponential moving average of speculative acceptance rate\n\
+             # TYPE grim_speculative_accept_rate_ema gauge\n\
+             grim_speculative_accept_rate_ema {:.4}\n\
+             # HELP grim_speculative_drafted_tokens_total Total draft tokens proposed\n\
+             # TYPE grim_speculative_drafted_tokens_total counter\n\
+             grim_speculative_drafted_tokens_total {}\n\
+             # HELP grim_speculative_accepted_tokens_total Total draft tokens accepted\n\
+             # TYPE grim_speculative_accepted_tokens_total counter\n\
+             grim_speculative_accepted_tokens_total {}\n",
+            st.accept_rate_ema,
+            st.total_drafted_tokens,
+            st.total_accepted_tokens,
+        ));
+    }
 
     (
         [(
@@ -5123,6 +5165,43 @@ mod tests {
     async fn dashboard_html_references_stats_endpoint() {
         let axum::response::Html(html) = dashboard_html().await;
         assert!(html.contains("fetch('/api/stats')"));
+        assert!(html.contains("spec-strat"));
+        assert!(html.contains("spec-accept"));
+    }
+
+    #[tokio::test]
+    async fn test_stats_endpoint_surfaces_latency_and_spec_telemetry() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let axum::Json(val) = stats_endpoint(State(state)).await;
+        assert!(val.get("itl_ms").is_some());
+        assert!(val.get("ttft_ms").is_some());
+        assert!(val.get("speculative").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_surfaces_latency_and_spec_telemetry() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        let resp = metrics_endpoint(headers, State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     use axum::{
@@ -7476,10 +7555,33 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
         Some(tps) => serde_json::json!(tps),
         None => serde_json::Value::Null,
     };
+    let ttft_json = match engine.last_ttft_ms() {
+        Some(ttft) => serde_json::json!(ttft),
+        None => serde_json::Value::Null,
+    };
+    let itl_json = match engine.last_itl_ms() {
+        Some(itl) => serde_json::json!(itl),
+        None => serde_json::Value::Null,
+    };
+    let spec_json = match engine.speculative_telemetry(None) {
+        Some(tele) => serde_json::json!({
+            "strategy": tele.strategy,
+            "accept_rate_ema": tele.accept_rate_ema,
+            "steps_observed": tele.steps_observed,
+            "total_drafted_tokens": tele.total_drafted_tokens,
+            "total_accepted_tokens": tele.total_accepted_tokens,
+            "min_accept_rate": tele.min_accept_rate,
+            "should_adapt": tele.should_adapt,
+        }),
+        None => serde_json::Value::Null,
+    };
 
     serde_json::json!({
         "model_name": model_name,
         "tokens_per_sec": tps_json,
+        "ttft_ms": ttft_json,
+        "itl_ms": itl_json,
+        "speculative": spec_json,
         "kv_cache": {
             "used": kv_used,
             "total": kv_total,
@@ -7574,8 +7676,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <div class="row"><span class="label">Adapters</span><span id="adapters" class="val">0</span></div>
   </div>
   <div class="card">
-    <h3>Perf</h3>
+    <h3>Perf & Speculation</h3>
     <div class="row"><span class="label">Token/s</span><span id="tps" class="val">—</span></div>
+    <div class="row"><span class="label">ITL</span><span id="itl" class="val">—</span></div>
+    <div class="row"><span class="label">TTFT</span><span id="ttft" class="val">—</span></div>
+    <div class="row"><span class="label">Spec Strategy</span><span id="spec-strat" class="val">—</span></div>
+    <div class="row"><span class="label">Accept Rate</span><span id="spec-accept" class="val">—</span></div>
     <div class="row"><span class="label">GPU</span><span id="gpu-name" class="val">—</span></div>
     <div class="row"><span class="label">Mem</span><span id="gpu-mem" class="val">—</span></div>
   </div>
@@ -7628,6 +7734,15 @@ async function poll(){
     const tpsEl=document.getElementById('tps');
     tpsEl.textContent=(tps!==null&&tps!==undefined)?tps.toFixed(1):'—';
     tpsEl.className='val '+(tps>20?'green':tps>5?'yellow':'red');
+
+    const itl=d.itl_ms;
+    document.getElementById('itl').textContent=(itl!==null&&itl!==undefined)?itl.toFixed(1)+' ms':'—';
+    const ttft=d.ttft_ms;
+    document.getElementById('ttft').textContent=(ttft!==null&&ttft!==undefined)?ttft.toFixed(1)+' ms':'—';
+    const spec=d.speculative;
+    document.getElementById('spec-strat').textContent=spec?.strategy || '—';
+    document.getElementById('spec-accept').textContent=(spec?.accept_rate_ema!==undefined&&spec?.accept_rate_ema!==null)?(spec.accept_rate_ema*100).toFixed(1)+'%':'—';
+
     document.getElementById('adapters').textContent=d.adapters_active??0;
 
     const kvPct=pct(d.kv_cache.used,d.kv_cache.total);

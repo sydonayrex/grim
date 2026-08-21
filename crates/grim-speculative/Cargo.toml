@@ -13,6 +13,7 @@ grim-backend-cpu = { workspace = true }
 grim-models-transformer = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 grim-backend-cpu = { workspace = true }

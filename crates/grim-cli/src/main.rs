@@ -298,6 +298,21 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
     },
+    /// Evaluate model on benchmark datasets (PPL, GSM8k).
+    Eval {
+        /// Model name or path to evaluate.
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Tasks to run (e.g. 'ppl', 'gsm8k', or 'ppl,gsm8k').
+        #[arg(short, long, default_value = "ppl")]
+        task: String,
+        /// Path to write output evaluation metrics JSON.
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Port if evaluating against a running server (for gsm8k).
+        #[arg(short, long, default_value_t = 11434)]
+        port: u16,
+    },
     /// Launch the Grim Garage telemetry and fine-tuning dashboard web service.
     Garage {
         /// Address to bind the garage service (default 127.0.0.1:8741).
@@ -1250,6 +1265,14 @@ async fn main() -> Result<()> {
             model,
         } => {
             bench::cmd_bench(tokens, concurrency, model.as_deref()).await?;
+        }
+        Commands::Eval {
+            model,
+            task,
+            output,
+            port,
+        } => {
+            eval::cmd_eval(model, task, output, port).await?;
         }
         Commands::Tune { device, output_dir } => {
             if let Err(e) = tune::cmd_tune(device, output_dir) {

@@ -198,6 +198,7 @@ impl GarageClient {
                 TrainingMode::VllmOpt => "VllmOpt",
                 TrainingMode::OmniloPrune => "OmniloPrune",
                 TrainingMode::ContrastOmni => "ContrastOmni",
+                TrainingMode::CompressDistill => "CompressDistill",
                 TrainingMode::TurboFinetune => "TurboFinetune",
                 TrainingMode::KvOmni => "KvOmni",
                 TrainingMode::SpectralQLoRA => "SpectralQLoRA",

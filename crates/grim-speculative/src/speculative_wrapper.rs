@@ -35,6 +35,25 @@ pub enum Strategy {
     NativeMtp,
 }
 
+/// Runtime speculative decoding telemetry (§5.3).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpeculativeTelemetry {
+    /// Active speculative decoding strategy (`plain`, `dspark`, or `native_mtp`).
+    pub strategy: String,
+    /// Exponential moving average of acceptance rate across decode steps.
+    pub accept_rate_ema: f64,
+    /// Total count of observed decode steps.
+    pub steps_observed: u64,
+    /// Total count of draft tokens proposed across all observed decode steps.
+    pub total_drafted_tokens: u64,
+    /// Total count of draft tokens accepted by target verification.
+    pub total_accepted_tokens: u64,
+    /// Minimum acceptance rate threshold before triggering draft adaptation.
+    pub min_accept_rate: f64,
+    /// Whether acceptance rate has drifted below the threshold warranting draft refresh.
+    pub should_adapt: bool,
+}
+
 /// The wrapper: holds a target + the chosen strategy + bundle handles.
 pub struct SpeculativeCausalLm {
     target: Box<dyn CausalLm>,
@@ -150,6 +169,32 @@ impl SpeculativeCausalLm {
 
     pub fn strategy(&self) -> Strategy {
         self.strategy
+    }
+
+    /// Query runtime speculative decoding telemetry snapshot.
+    pub fn telemetry(&self) -> SpeculativeTelemetry {
+        let (state, config) = {
+            let sched = self.scheduler.lock().unwrap();
+            (sched.adaptation_state.clone(), sched.adaptation_config)
+        };
+        let should_adapt = if state.steps_observed < config.min_steps_before_trigger {
+            false
+        } else {
+            state.accept_rate_ema < config.min_accept_rate
+        };
+        SpeculativeTelemetry {
+            strategy: match self.strategy {
+                Strategy::Plain => "plain".to_string(),
+                Strategy::DSpark => "dspark".to_string(),
+                Strategy::NativeMtp => "native_mtp".to_string(),
+            },
+            accept_rate_ema: state.accept_rate_ema,
+            steps_observed: state.steps_observed,
+            total_drafted_tokens: state.total_drafted_tokens,
+            total_accepted_tokens: state.total_accepted_tokens,
+            min_accept_rate: config.min_accept_rate,
+            should_adapt,
+        }
     }
 
     /// Run one speculative decode step. Returns the verified logits
@@ -394,6 +439,11 @@ impl SpeculativeCausalLm {
         }
         if let Some(kv) = session.kv_mut() {
             kv.commit(accepted_count)?;
+        }
+
+        {
+            let mut sched = self.scheduler.lock().unwrap();
+            sched.record_acceptance(accepted_count, verify_len);
         }
 
         // CRIT-7: Return logits for accepted tokens (rows S..S+accepted)
