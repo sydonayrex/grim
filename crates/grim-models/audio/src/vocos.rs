@@ -78,9 +78,9 @@ impl ConvNeXtBlock {
         let dw_conv = Conv1d::new(
             cpu_tensor(dw_weight, Shape::new(vec![dim, 1, 7])),
             Some(cpu_tensor(vec![0.0; dim], Shape::new(vec![dim]))),
-            1, // stride
-            3, // padding
-            1, // dilation
+            1,   // stride
+            3,   // padding
+            1,   // dilation
             dim, // groups (depthwise)
         );
 
@@ -198,7 +198,10 @@ impl Vocos {
             .collect();
         let stem = Conv1d::new(
             cpu_tensor(stem_w, Shape::new(vec![config.dim, config.input_dim, 7])),
-            Some(cpu_tensor(vec![0.0; config.dim], Shape::new(vec![config.dim]))),
+            Some(cpu_tensor(
+                vec![0.0; config.dim],
+                Shape::new(vec![config.dim]),
+            )),
             1,
             3,
             1,
@@ -237,6 +240,11 @@ impl Vocos {
         }
     }
 
+    /// The learned iSTFT synthesis window (or its Hann fallback).
+    pub fn istft_window(&self) -> &[f32] {
+        &self.window
+    }
+
     /// Load weights from a real Vocos checkpoint (`backbone.*`, `head.*`
     /// naming as produced by the official Vocos training stack).
     pub fn load(_device: Device, ws: &WeightSource<'_>, config: VocosConfig) -> Result<Self> {
@@ -262,8 +270,7 @@ impl Vocos {
             )?);
         }
 
-        let final_norm =
-            LayerNorm::load(&backbone.scoped("final_layer_norm"), config.dim, 1e-6)?;
+        let final_norm = LayerNorm::load(&backbone.scoped("final_layer_norm"), config.dim, 1e-6)?;
         let head = Linear::load(
             &ws.scoped("head").pp("out"),
             config.dim,

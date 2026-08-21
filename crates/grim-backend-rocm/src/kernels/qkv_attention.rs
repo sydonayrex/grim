@@ -105,7 +105,7 @@ void grim_qkv_attention(
     // head dimensions up to 256.
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_acc[8][260];
 
     // Causal KV range for this query: [lo, hi) where:
     //   hi = min(abs_i + 1, kv_seq_len)  (standard causal upper bound)
@@ -332,7 +332,7 @@ void grim_qkv_attention_paged(
     // WI 1.4.2: per-wavefront partials published to LDS for the wave-0 merge.
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_acc[8][260];
 
     // Per-wavefront KV slice over [window_lo, abs_i+1), partitioned by wavefront.
     // window_lo == 0 is full causal; >=0 is the sliding-window lower bound.
@@ -500,7 +500,7 @@ void grim_tree_attention(
     // WI 1.4.2: per-wavefront partials published to LDS for the wave-0 merge.
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_acc[8][260];
 
     // Per-wavefront KV slice [j_start, j_end) over the flattened page/token
     // index space [0, kv_seq_len). Same stride partition as the non-paged kernel.
@@ -640,7 +640,7 @@ void grim_qkv_attention_wmma(
 
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_acc[8][260];
 
     const int range_lo = window_lo > 0 ? window_lo : 0;
     const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
@@ -778,7 +778,7 @@ void grim_qkv_attention_wmma(
 
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_acc[8][260];
 
     const int range_lo = window_lo > 0 ? window_lo : 0;
     const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
@@ -981,7 +981,7 @@ void grim_qkv_attention_paged_quant(
 
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_acc[8][260];
 
     const int range_lo = window_lo > 0 ? window_lo : 0;
     const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;

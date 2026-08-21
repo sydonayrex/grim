@@ -73,7 +73,9 @@ pub fn use_managed_allocation(ordinal: usize, bytes: usize) -> bool {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_else(|| total.saturating_mul(9) / 10);
-    should_use_managed("auto", free, total, bytes as u64, budget)
+    // Reserve 64 MB cushion to prevent driver OOM locks.
+    let effective_free = free.saturating_sub(64 * 1024 * 1024);
+    should_use_managed("auto", effective_free, total, bytes as u64, budget)
 }
 
 /// Pure form of the residency decision, kept separate from HIP telemetry so
