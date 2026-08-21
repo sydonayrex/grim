@@ -44,6 +44,7 @@ rocm = []
 jit-hw-adaptive = ["rocm"]
 multi-gpu-kernel = ["rocm"]
 rocm-profile = ["rocm"]
+ncu = []
 
 rocm-aiter = ["rocm"]
 # grim-sonnet F8 — Composable Kernel (ck_tile) GEMM used to expose a

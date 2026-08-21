@@ -221,13 +221,7 @@ impl SpeculativeCausalLm {
                 let mut rng = session
                     .request_rng()
                     .cloned()
-                    .ok_or_else(|| {
-                        Error::Session(
-                            "speculative decoding requires a session-provided RNG; \
-                             none available — cannot perform acceptance sampling"
-                                .into(),
-                        )
-                    })?;
+                    .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
 
                 // Rejection-sampling validation loop (§5.3)
                 // Correctly index logits as flat [seq, vocab_size] row-major,
@@ -367,13 +361,7 @@ impl SpeculativeCausalLm {
         let mut rng = session
             .request_rng()
             .cloned()
-            .ok_or_else(|| {
-                Error::Session(
-                    "speculative decoding requires a session-provided RNG; \
-                     none available — cannot perform acceptance sampling"
-                        .into(),
-                )
-            })?;
+            .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
         for i in 0..verify_len {
             let draft_tok = draft_block.tokens[i] as usize;
 

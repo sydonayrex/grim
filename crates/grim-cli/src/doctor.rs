@@ -113,21 +113,10 @@ fn check_unit_file(
             report.unit_file_exists = Some(true);
             println!("[OK]  Systemd unit file exists at {}", path);
 
-            // Verify ExecStart uses 'grim run --serve' not obsolete 'grim serve'.
-            if content.contains("grim serve") {
-                report.errors.push(format!(
-                    "Systemd unit at {} contains obsolete 'grim serve' in ExecStart — \
-                     should be 'grim run --serve --config'",
-                    path
-                ));
-                eprintln!(
-                    "[ERR] Systemd unit at {} contains obsolete 'grim serve' in ExecStart.",
-                    path
-                );
-                report.unit_file_verifies = Some(false);
-            } else if content.contains("grim run --serve") {
+            // Verify ExecStart uses 'grim serve' or 'grim run --serve'.
+            if content.contains("grim serve") || content.contains("grim run --serve") {
                 report.unit_file_verifies = Some(true);
-                println!("[OK]  Systemd unit ExecStart uses 'grim run --serve'.");
+                println!("[OK]  Systemd unit ExecStart uses valid grim entry point.");
             } else {
                 report
                     .warnings

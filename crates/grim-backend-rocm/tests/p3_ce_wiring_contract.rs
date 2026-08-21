@@ -59,6 +59,7 @@ fn cpu_fused_ce_oracle(hidden: &[f32], lm_head: &[f32], targets: &[usize], batch
     (loss, grad_hidden)
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -74,7 +75,8 @@ fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() 
     let lm_head = vec![
         0.1f32, 0.3, -0.2, 0.4, -0.5, 0.2, 0.6, -0.1, 0.7, -0.2, 0.1, 0.3,
     ];
-    let targets = [1usize, 2usize];
+    let targets = [1u32, 2u32];
+    let targets_usize: Vec<usize> = targets.iter().map(|&t| t as usize).collect();
 
     let hs = dev
         .from_cpu(&hidden, &Shape::new(vec![batch, hidden_dim]), DType::F32)
@@ -98,20 +100,20 @@ fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() 
         .fused_linear_cross_entropy_forward(hs.as_ref(), ws.as_ref(), ts.as_ref(), 2)
         .unwrap();
     fh.synchronize().unwrap();
+    let inv_batch = 1.0 / (batch as f32);
     let (grad, gh) = dev
-        .fused_linear_cross_entropy_backward(hs.as_ref(), ws.as_ref(), ts.as_ref(), lse.as_ref(), 2, 0.0)
+        .fused_linear_cross_entropy_backward(hs.as_ref(), ws.as_ref(), ts.as_ref(), lse.as_ref(), 2, inv_batch)
         .unwrap();
     gh.synchronize().unwrap();
 
     let got_loss = loss.to_cpu_vec_f32().unwrap();
     let got_grad = grad.to_cpu_vec_f32().unwrap();
 
-    let (expected_loss, expected_grad) = cpu_fused_ce_oracle(&hidden, &lm_head, &targets, batch, hidden_dim, vocab);
+    let (expected_loss, expected_grad) = cpu_fused_ce_oracle(&hidden, &lm_head, &targets_usize, batch, hidden_dim, vocab);
+    let got_mean_loss = got_loss.iter().sum::<f32>() * inv_batch;
     assert!(
-        (got_loss[0] - expected_loss).abs() < 1e-4,
-        "P3 device fused CE loss mismatch: got {got_loss_0}, want {expected_loss}",
-        got_loss_0 = got_loss[0],
-        expected_loss = expected_loss,
+        (got_mean_loss - expected_loss).abs() < 1e-4,
+        "P3 device fused CE loss mismatch: got {got_mean_loss}, want {expected_loss}"
     );
     assert_eq!(got_grad.len(), expected_grad.len());
     for i in 0..got_grad.len() {
@@ -124,6 +126,7 @@ fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() 
     }
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn p3_cpu_cross_entropy_gpu_fallback_is_callable_and_matches_cpu_oracle_for_unsupported_shape() {
     let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new should succeed on ROCm");

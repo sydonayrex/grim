@@ -2630,6 +2630,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 };
 
                 // Derivative of numerically-stable softplus: sigmoid(x).
+                #[allow(dead_code)]
                 fn softplus_grad(x: f32) -> f32 {
                     1.0 / (1.0 + (-x).exp().min(1e10))
                 }

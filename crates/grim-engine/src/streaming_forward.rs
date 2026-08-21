@@ -427,7 +427,6 @@ impl StreamingBlockForward {
         }
         let q_shape = Shape::new(vec![1, total_tokens * cfg.num_heads, cfg.head_dim]);
         let k_shape = Shape::new(vec![1, total_tokens * cfg.num_kv_heads, cfg.head_dim]);
-        let out_shape_3d = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
 
         // Reshape Q/K to 3D [1, total_tokens*num_heads, head_dim] for the
@@ -484,7 +483,7 @@ impl StreamingBlockForward {
             total_tokens,
             0,
             None,
-            &out_shape_3d,
+            &out_shape_2d,
             None,
             None,
         )?;

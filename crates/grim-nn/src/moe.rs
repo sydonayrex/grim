@@ -589,7 +589,6 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 KQuantScheme::IQ2XXS => 2,
                 KQuantScheme::IQ2XS => 2,
                 KQuantScheme::IQ2S => 2,
-                _ => 8, // fallback
             };
             (elem_count * bits + 7) / 8
         }
@@ -603,7 +602,6 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 BlockDtype::Fp8 => 8,
                 BlockDtype::Fp4Block16 => 4,
                 BlockDtype::Fp8Block16 => 8,
-                _ => 8, // fallback
             };
             (elem_count * bits + 7) / 8
         }

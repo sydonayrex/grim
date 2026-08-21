@@ -208,7 +208,7 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
             // Partner GEMM result lives in the adjacent lane (col ^ 1); both
             // lanes of a RoPE pair are in the same warp, so one shuffle
             // replaces the full partner-column dot-product recompute.
-            float partner_acc = __shfl_xor_sync(0xffffffffffffffffULL, acc, 1);
+            float partner_acc = __shfl_xor(acc, 1, warpSize);
 
             if (is_odd) {
                 q_val = partner_acc * sin_a + acc * cos_a;
@@ -237,7 +237,7 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
             cos_a *= mscale;
             sin_a *= mscale;
 
-            float partner_acc = __shfl_xor_sync(0xffffffffffffffffULL, acc, 1);
+            float partner_acc = __shfl_xor(acc, 1, warpSize);
 
             if (is_odd) {
                 k_val = partner_acc * sin_a + acc * cos_a;
@@ -436,7 +436,7 @@ grim_mxfp4_splitk_reduce(
 // per-head reduction (which needs the whole head vector) out of the GEMM grid.
 // Grid: (M * (num_q_heads + 2*num_kv_heads) + 63) / 64 threads, block 64.
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(64)
+__global__ void __launch_bounds__(256)
 grim_qk_norm_rope(
     const float* __restrict__ gemm_out,   // [M, N_total] raw QKV (N_total = N_q + 2*N_k)
     const float* __restrict__ gamma_q,     // [head_dim] Q-norm weight
@@ -614,7 +614,7 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("mxfp4_decode_fast"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_splitk"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_splitk_reduce"));
-        assert!(KERNEL_SOURCE.contains("__shfl_xor_sync"));
+        assert!(KERNEL_SOURCE.contains("__shfl_xor"));
         assert!(KERNEL_SOURCE.contains("mxfp4_block_scale"));
     }
 }

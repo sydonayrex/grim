@@ -64,6 +64,12 @@ pub enum ClientIntegration {
 enum Commands {
     /// Start the inference HTTP server (Ollama-compatible, default port 11434). Used by systemd/launchd.
     Serve {
+        /// Optional model name or path to preload upon server startup.
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Target compute device/backend (e.g. rocm, cuda, vulkan, metal, cpu).
+        #[arg(short, long, alias = "device")]
+        backend: Option<String>,
         /// Address to bind the server (overrides --host/--port and GRIM_HOST/GRIM_PORT).
         #[arg(short, long, default_value = "")]
         address: String,
@@ -129,8 +135,8 @@ enum Commands {
         /// RNG seed (0 = random).
         #[arg(long, default_value = "0")]
         seed: u64,
-        /// Target compute device (e.g. cpu, cuda, rocm, vulkan, metal).
-        #[arg(long)]
+        /// Target compute device / backend (e.g. cpu, cuda, rocm, vulkan, metal).
+        #[arg(long, alias = "backend")]
         device: Option<String>,
         /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama. Sets server default; overridable per request.
         #[arg(long, default_value = "1.1")]
@@ -271,7 +277,12 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
     },
-    /// Run hardware-adaptive JIT kernel tuning and persist optimized tile configurations.
+    /// Launch the Grim Garage telemetry and fine-tuning dashboard web service.
+    Garage {
+        /// Address to bind the garage service (default 127.0.0.1:8741).
+        #[arg(short, long, default_value = "127.0.0.1:8741")]
+        bind: String,
+    },
     /// Run hardware-adaptive JIT kernel tuning and persist optimized tile configurations.
     Tune {
         /// GPU device ordinal to tune (default 0).
@@ -331,7 +342,13 @@ enum Commands {
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
-        /// Training mode (e.g. "qlora", "lora", "full-bf16", "full-fp16", "soul-eater", "oft").
+        /// Training mode:
+        ///  - qlora (default): 4-bit base weights + LoRA adapter (lowest VRAM)
+        ///  - lora: 16-bit LoRA adapter on unquantized base
+        ///  - full-bf16: full parameter fine-tuning in bfloat16
+        ///  - full-fp16: full parameter fine-tuning in float16
+        ///  - soul-eater: orthogonal weight matrix evolution
+        ///  - oft: orthogonal fine-tuning preserving representation norms
         #[arg(long, default_value = "qlora")]
         mode: String,
         /// Enable SCALE-ECHO echo training mode. Bypasses the autograd tape
@@ -803,16 +820,28 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve {
+            model,
+            backend,
             address,
             host,
             port,
-            config: _,
+            config,
             plugins,
             disagg_role,
             prefill_addr,
             decode_addr,
             allow_public,
         } => {
+            if !config.is_empty() {
+                unsafe {
+                    std::env::set_var("GRIM_CONFIG_PATH", &config);
+                }
+            }
+            if let Some(ref b) = backend {
+                unsafe {
+                    std::env::set_var("GRIM_BACKEND", b);
+                }
+            }
             // Build EngineConfig with optional disaggregation wiring.
             let mut engine_config = grim_engine::EngineConfig::default();
             let role_lower = disagg_role.to_ascii_lowercase();
@@ -902,7 +931,35 @@ async fn main() -> Result<()> {
                 grim_core::RuntimeEnv::resolve_bind(None)
             };
             eprintln!("[grim] serve: binding to {effective} (Ollama-compatible)");
-            grim_server::serve(&effective, engine, None, plugin_registry).await?;
+            let model_path = model.map(std::path::PathBuf::from);
+            grim_server::serve(&effective, engine, model_path, plugin_registry).await?;
+        }
+        Commands::Garage { bind } => {
+            eprintln!("[grim] starting Garage dashboard on http://{bind}");
+            let state = grim_garage::routes::AppState {
+                registry: std::sync::Arc::new(grim_garage::jobs::JobRegistry::new()),
+                engine: std::sync::Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(
+                    grim_engine::EngineConfig::default(),
+                ))),
+                tokenizer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                model_path: None,
+            };
+            let router = grim_garage::routes::build_router(state);
+            let listener = tokio::net::TcpListener::bind(&bind)
+                .await
+                .map_err(|e| grim_core::Error::Config(format!("failed to bind garage: {e}")))?;
+            let local = listener
+                .local_addr()
+                .map_err(|e| grim_core::Error::Config(format!("failed to get local addr: {e}")))?;
+            if !local.ip().is_loopback() {
+                eprintln!(
+                    "[grim] WARNING: garage bound to public address {local}. Training endpoints are unauthenticated."
+                );
+            }
+            eprintln!("[grim] Garage dashboard live at http://{local}/");
+            axum::serve(listener, router)
+                .await
+                .map_err(|e| grim_core::Error::Config(format!("garage server error: {e}")))?;
         }
         Commands::Tui {
             model,
@@ -929,7 +986,7 @@ async fn main() -> Result<()> {
             prompt,
             serve,
             address,
-            config: _,
+            config,
             plugins,
             rocml_profile,
             temperature,
@@ -940,6 +997,11 @@ async fn main() -> Result<()> {
             device,
             repeat_penalty,
         } => {
+            if !config.is_empty() {
+                unsafe {
+                    std::env::set_var("GRIM_CONFIG_PATH", &config);
+                }
+            }
             if let Some(ref dev) = device {
                 // SAFETY: env::set_var is UB if other threads concurrently read the
                 // environment. At this point no background worker tasks exist yet

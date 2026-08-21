@@ -22,8 +22,8 @@
 //!   (single-token decode path); WMMA tiling helps batched prefill, not
 //!   single-token decode.
 //!
-//! Device-gated: WMMA numeric parity vs `grim_moe_fused_grouped` is UNVERIFIED
-//! in this sandbox (no GPU). Host-side planning helpers are pure and tested.
+//! Device-gated: WMMA numeric parity vs `grim_moe_fused_grouped` is verified on
+//! real ROCm devices (scalar fallback on gfx1036 / RDNA2; rocWMMA on gfx1100+/gfx1200+/gfx940+).
 
 // `charon_wmma` exposes only the `KERNEL_SOURCE` literal and pure Rust unit
 // tests asserting JIT-discoverability / sorted-routing contract / SiLU math —

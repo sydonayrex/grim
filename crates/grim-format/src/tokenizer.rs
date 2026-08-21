@@ -627,6 +627,47 @@ impl GgufTokenizer {
     }
 }
 
+fn deserialize_chat_content<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ContentVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ContentVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or an array of content parts")
+        }
+
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v.to_string())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut text_parts = Vec::new();
+            while let Some(elem) = seq.next_element::<serde_json::Value>()? {
+                if let Some(s) = elem.as_str() {
+                    text_parts.push(s.to_string());
+                } else if let Some(obj) = elem.as_object() {
+                    if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                        text_parts.push(t.to_string());
+                    }
+                }
+            }
+            Ok(text_parts.join("\n"))
+        }
+    }
+
+    deserializer.deserialize_any(ContentVisitor)
+}
+
 /// A single chat message in an OpenAI-style `messages` array.
 ///
 /// `tool_calls` carries one or more tool invocations an assistant message
@@ -637,6 +678,7 @@ impl GgufTokenizer {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(deserialize_with = "deserialize_chat_content")]
     pub content: String,
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallMsg>>,

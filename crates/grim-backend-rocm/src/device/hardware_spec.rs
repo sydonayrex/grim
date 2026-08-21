@@ -24,6 +24,9 @@ pub struct HardwareSpec {
     pub multiprocessor_count: u32,
     /// Estimated memory bandwidth in GB/s.
     pub mem_bandwidth_gb_s: f64,
+    /// Peak FP16 FLOPS/s derived from architecture table (TFLOPS * 1e12).
+    /// Used by roofline cost estimation to separate compute-bound from memory-bound tiles.
+    pub peak_flops_fp16: f64,
     /// Inter-device P2P topology link matrix.
     pub p2p_topology: P2PTopology,
 }
@@ -61,11 +64,16 @@ impl From<&RocmDevice> for HardwareSpec {
         let max_threads = probe::max_threads_per_block(ordinal);
         let cus = probe::active_cu_count(ordinal);
 
-        let bandwidth = CapabilityProfiler::new()
+        let (bandwidth, peak_flops) = CapabilityProfiler::new()
             .capabilities()
             .get(ordinal)
-            .map(|cap| cap.hbm_bandwidth_gbps as f64)
-            .unwrap_or(500.0);
+            .map(|cap| {
+                (
+                    cap.hbm_bandwidth_gbps as f64,
+                    (cap.tflops_fp16 as f64) * 1e12,
+                )
+            })
+            .unwrap_or((500.0, 8.0e12));
 
         HardwareSpec {
             gcn_arch: arch,
@@ -75,6 +83,7 @@ impl From<&RocmDevice> for HardwareSpec {
             cu_count: cus,
             multiprocessor_count: cus,
             mem_bandwidth_gb_s: bandwidth,
+            peak_flops_fp16: peak_flops,
             p2p_topology: P2PTopology {
                 device_count: 1,
                 links: vec![vec![LinkType::NoLink]],
@@ -99,6 +108,7 @@ mod tests {
             cu_count: 64,
             multiprocessor_count: 64,
             mem_bandwidth_gb_s: 500.0,
+            peak_flops_fp16: 8.0e12,
             p2p_topology: P2PTopology {
                 device_count: 1,
                 links: vec![vec![LinkType::PeerDirect]],

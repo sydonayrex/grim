@@ -453,6 +453,7 @@ fn job_status_round_trips_cancelled_through_serde_lowercase() {
     assert_eq!(back, JobStatus::Cancelled);
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[tokio::test]
 async fn cancel_signals_worker_and_status_transitions_to_cancelled() {
     use std::sync::Arc;
@@ -865,6 +866,7 @@ fn probe_rocm_devices_returns_vec_even_when_no_gpu() {
     }
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[tokio::test]
 async fn test_garage_worker_soul_eater_mode() {
     use std::io::Write;

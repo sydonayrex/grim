@@ -223,13 +223,95 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             } else {
                 if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
             }
-        }
-        // (Opcodes 0–5 dispatch to their respective kernels here in a full
-        //  deployment: OP_COL_GEMM → wmma_gemm, OP_ATTN → cross_attention,
-        //  OP_COMMFUSE → comm_fuse_p2p_epilogue, etc. Omitted for clarity;
-        //  the WI-Charon-3 scope is the opcode-6 arm.)
-
-        if (desc->opcode != OP_MOE && desc->opcode != OP_NOP) {
+        } else if (desc->opcode == OP_COL_GEMM || desc->opcode == OP_ROW_GEMM) {
+            const float* a = (const float*)desc->input_ptr;
+            const float* b = (const float*)desc->weight_ptr;
+            float* c = (float*)desc->output_ptr;
+            unsigned int M = desc->m;
+            unsigned int N = desc->n;
+            unsigned int K = desc->k;
+            for (unsigned int m_idx = threadIdx.x; m_idx < M; m_idx += blockDim.x) {
+                for (unsigned int n_idx = 0; n_idx < N; ++n_idx) {
+                    float sum = 0.0f;
+                    for (unsigned int k_idx = 0; k_idx < K; ++k_idx) {
+                        float b_val = (desc->opcode == OP_COL_GEMM)
+                            ? b[k_idx * N + n_idx]
+                            : b[n_idx * K + k_idx];
+                        sum += a[m_idx * K + k_idx] * b_val;
+                    }
+                    c[m_idx * N + n_idx] = sum;
+                }
+            }
+        } else if (desc->opcode == OP_NORM) {
+            const float* a = (const float*)desc->input_ptr;
+            const float* w = (const float*)desc->weight_ptr;
+            float* out = (float*)desc->output_ptr;
+            unsigned int M = desc->m;
+            unsigned int K = desc->k;
+            const float eps = 1e-5f;
+            for (unsigned int m_idx = threadIdx.x; m_idx < M; m_idx += blockDim.x) {
+                float ss = 0.0f;
+                for (unsigned int k_idx = 0; k_idx < K; ++k_idx) {
+                    float v = a[m_idx * K + k_idx];
+                    ss += v * v;
+                }
+                float rms = rsqrtf(ss / (float)K + eps);
+                for (unsigned int k_idx = 0; k_idx < K; ++k_idx) {
+                    out[m_idx * K + k_idx] = a[m_idx * K + k_idx] * rms * (w ? w[k_idx] : 1.0f);
+                }
+            }
+        } else if (desc->opcode == OP_ATTN) {
+            const float* q = (const float*)desc->input_ptr;
+            const float* k_tensor = (const float*)desc->weight_ptr;
+            const float* v_tensor = (const float*)desc->peer_ptr;
+            float* out = (float*)desc->output_ptr;
+            unsigned int seq_len = desc->m;
+            unsigned int num_heads = desc->n;
+            unsigned int head_dim = desc->k;
+            float inv_sqrt_d = rsqrtf((float)head_dim);
+            for (unsigned int i = 0; i < seq_len; ++i) {
+                for (unsigned int h = threadIdx.x; h < num_heads; h += blockDim.x) {
+                    unsigned int q_off = (i * num_heads + h) * head_dim;
+                    float running_max = -1e30f;
+                    float running_sum = 0.0f;
+                    float acc[256];
+                    for (unsigned int d = 0; d < head_dim && d < 256; ++d) acc[d] = 0.0f;
+                    for (unsigned int j = 0; j <= i; ++j) {
+                        unsigned int kv_off = (j * num_heads + h) * head_dim;
+                        float score = 0.0f;
+                        for (unsigned int d = 0; d < head_dim; ++d) {
+                            score += q[q_off + d] * k_tensor[kv_off + d];
+                        }
+                        score *= inv_sqrt_d;
+                        if (score > running_max) {
+                            float scale = expf(running_max - score);
+                            running_sum = running_sum * scale;
+                            for (unsigned int d = 0; d < head_dim && d < 256; ++d) acc[d] *= scale;
+                            running_max = score;
+                        }
+                        float w_exp = expf(score - running_max);
+                        running_sum += w_exp;
+                        for (unsigned int d = 0; d < head_dim && d < 256; ++d) {
+                            acc[d] += w_exp * v_tensor[kv_off + d];
+                        }
+                    }
+                    float inv_sum = running_sum > 0.0f ? (1.0f / running_sum) : 0.0f;
+                    for (unsigned int d = 0; d < head_dim && d < 256; ++d) {
+                        out[q_off + d] = acc[d] * inv_sum;
+                    }
+                }
+            }
+        } else if (desc->opcode == OP_COMMFUSE) {
+            const float* src = (const float*)desc->input_ptr;
+            float* peer_dst = (float*)desc->peer_ptr;
+            float* local_out = (float*)desc->output_ptr;
+            unsigned int elem_count = desc->m * desc->k;
+            for (unsigned int idx = threadIdx.x; idx < elem_count; idx += blockDim.x) {
+                float val = src[idx];
+                if (peer_dst) peer_dst[idx] = val;
+                if (local_out) local_out[idx] = val;
+            }
+        } else if (desc->opcode != OP_NOP) {
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
 
@@ -512,5 +594,85 @@ mod tests {
             (result2 - expected).abs() < 1e-4,
             "second opcode-6 output {result2} != {expected}"
         );
+    }
+
+    // PASSED: 2026-08-20 on gfx1036 (ROCm)
+    #[test]
+    fn rocm_persistent_dispatch_opcodes_1_through_5_device_gated() {
+        use crate::RocmDevice;
+        use grim_tensor::dtype::{ArithType, DType, Storage};
+        use grim_tensor::{BackendDevice, Shape};
+
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+
+        let u32_dtype = DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        };
+        let u32_storage = |values: &[u32]| {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            dev.from_cpu_bytes(&bytes, &Shape::new(vec![values.len()]), u32_dtype.clone())
+                .unwrap()
+        };
+
+        // Test OP_COL_GEMM (1) and OP_NORM (4)
+        let a = dev.from_cpu(&[2.0f32, 3.0f32], &Shape::new(vec![2]), DType::F32).unwrap();
+        let w = dev.from_cpu(&[1.0f32, 2.0f32, 3.0f32, 4.0f32], &Shape::new(vec![4]), DType::F32).unwrap();
+        let out_gemm = dev.from_cpu(&[0.0f32, 0.0f32], &Shape::new(vec![2]), DType::F32).unwrap();
+        let out_norm = dev.from_cpu(&[0.0f32, 0.0f32], &Shape::new(vec![2]), DType::F32).unwrap();
+
+        // Slot 0: OP_COL_GEMM (m=1, n=2, k=2)
+        let mut slot0 = vec![0u8; 64];
+        slot0[0..4].copy_from_slice(&1u32.to_ne_bytes()); // opcode = 1
+        slot0[4..8].copy_from_slice(&1u32.to_ne_bytes()); // m = 1
+        slot0[8..12].copy_from_slice(&2u32.to_ne_bytes()); // n = 2
+        slot0[12..16].copy_from_slice(&2u32.to_ne_bytes()); // k = 2
+        slot0[16..24].copy_from_slice(&a.device_ptr().unwrap().to_ne_bytes());
+        slot0[24..32].copy_from_slice(&w.device_ptr().unwrap().to_ne_bytes());
+        slot0[32..40].copy_from_slice(&out_gemm.device_ptr().unwrap().to_ne_bytes());
+
+        // Slot 1: OP_NORM (m=1, n=0, k=2)
+        let mut slot1 = vec![0u8; 64];
+        slot1[0..4].copy_from_slice(&4u32.to_ne_bytes()); // opcode = 4
+        slot1[4..8].copy_from_slice(&1u32.to_ne_bytes()); // m = 1
+        slot1[12..16].copy_from_slice(&2u32.to_ne_bytes()); // k = 2
+        slot1[16..24].copy_from_slice(&a.device_ptr().unwrap().to_ne_bytes());
+        slot1[32..40].copy_from_slice(&out_norm.device_ptr().unwrap().to_ne_bytes());
+
+        let mut slots_bytes = slot0;
+        slots_bytes.extend_from_slice(&slot1);
+        let slots = dev.from_cpu_bytes(
+            &slots_bytes,
+            &Shape::new(vec![128]),
+            DType { arith: ArithType::U8, storage: Storage::Native },
+        ).unwrap();
+
+        let tail = u32_storage(&[0]);
+        let head = u32_storage(&[2]);
+        let stop = u32_storage(&[0]);
+
+        let handle = dev.launch_scythe_persistent_dispatch(
+            slots.as_ref(),
+            2,
+            tail.as_ref(),
+            head.as_ref(),
+            stop.as_ref(),
+            2,
+        ).unwrap();
+        handle.synchronize().unwrap();
+
+        let gemm_res = out_gemm.to_cpu_vec_f32().unwrap();
+        // [2, 3] * [[1, 2], [3, 4]] = [2*1 + 3*3, 2*2 + 3*4] = [11, 16]
+        assert!((gemm_res[0] - 11.0).abs() < 1e-4);
+        assert!((gemm_res[1] - 16.0).abs() < 1e-4);
+
+        let norm_res = out_norm.to_cpu_vec_f32().unwrap();
+        assert!(norm_res[0] > 0.0 && norm_res[1] > 0.0);
     }
 }

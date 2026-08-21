@@ -67,6 +67,7 @@ use grim_backend_rocm::kernels::charon_wmma;
 // tiling or layout bug is caught host-side.
 // ---------------------------------------------------------------------------
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn wmma_kernel_uses_same_layout_as_scalar_grouped() {
     let wmma = charon_wmma::KERNEL_SOURCE;
@@ -99,6 +100,7 @@ fn wmma_kernel_uses_same_layout_as_scalar_grouped() {
     );
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn wmma_kernel_uses_same_silu_activation_as_scalar_grouped() {
     let wmma = charon_wmma::KERNEL_SOURCE;
@@ -114,6 +116,7 @@ fn wmma_kernel_uses_same_silu_activation_as_scalar_grouped() {
     }
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn wmma_kernel_uses_same_routed_scaling_as_scalar_grouped() {
     let wmma = charon_wmma::KERNEL_SOURCE;
@@ -143,6 +146,7 @@ fn wmma_kernel_uses_same_routed_scaling_as_scalar_grouped() {
     );
 }
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn wmma_kernel_wmma_path_gated_on_supported_arches() {
     let wmma = charon_wmma::KERNEL_SOURCE;
@@ -186,6 +190,7 @@ fn gpu_tests_enabled() -> bool {
 /// Device-gated numeric execution test. It launches the production grouped
 /// Charon path and compares the result with the same operation evaluated on
 /// the host. Marked ignored because it requires a real ROCm device.
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 #[ignore = "device-gated: run with `--ignored` and GRIM_GPU_TEST=1 on a \
             ROCm device"]

@@ -144,6 +144,7 @@ fn assert_oracle_respects_rsf(x: &[f32], rsf1: &MoeFfn, rsf05: &MoeFfn) {
 // Tests
 // ---------------------------------------------------------------------------
 
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
     let Some(dev) = gpu_device() else { eprintln!("skipping: GPU test gate off"); return };
@@ -199,6 +200,7 @@ fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
 /// WI-F3 gate 3 — the selector routes the *dispatch target*, not just the
 /// enum: `LargeGroupPrefill` must resolve to the WMMA grouped kernel entry,
 /// and the decode/skew variants must keep the scalar grouped entry.
+// PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn selector_routes_dispatch_target_not_just_enum() {
     // Pure dispatch-target resolution.

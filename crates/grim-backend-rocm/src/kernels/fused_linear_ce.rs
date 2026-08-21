@@ -5,17 +5,15 @@
 /// Eliminates single-thread bottleneck on large vocabulary models (128k+).
 pub const FUSED_LINEAR_CE_KERNEL_SOURCE: &str = r#"
 __device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 32; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffffffffffffULL, val, offset));
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down(val, offset, warpSize));
     }
     return val;
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 32; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffffffffffffULL, val, offset);
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        val += __shfl_down(val, offset, warpSize);
     }
     return val;
 }
@@ -58,20 +56,25 @@ extern "C" __global__ void grim_fused_linear_ce_forward(
     __shared__ float s_sum[64];
     __shared__ float s_target;
 
+    if (tid == 0) {
+        s_target = 0.0f;
+    }
+    __syncthreads();
+
     if (has_target) {
         s_target = target_logit;
     }
     __syncthreads();
 
-    int lane = tid % 32;
-    int wid = tid / 32;
+    int lane = tid % warpSize;
+    int wid = tid / warpSize;
 
     float w_max = warp_reduce_max(local_max);
     // Broadcast warp max
-    w_max = __shfl_sync(0xffffffffffffffffULL, w_max, 0);
+    w_max = __shfl(w_max, 0, warpSize);
 
     // Rescale sum to warp max
-    float w_sum = local_sum * expf(local_max - w_max);
+    float w_sum = (local_max > -1e30f) ? (local_sum * expf(local_max - w_max)) : 0.0f;
     w_sum = warp_reduce_sum(w_sum);
 
     if (lane == 0) {
@@ -81,14 +84,16 @@ extern "C" __global__ void grim_fused_linear_ce_forward(
     __syncthreads();
 
     if (tid == 0) {
-        int num_warps = (bdim + 31) / 32;
+        int num_warps = (bdim + warpSize - 1) / warpSize;
         float block_max = -3.402823466e+38f;
         for (int w = 0; w < num_warps; ++w) {
             block_max = fmaxf(block_max, s_max[w]);
         }
         float block_sum = 0.0f;
         for (int w = 0; w < num_warps; ++w) {
-            block_sum += s_sum[w] * expf(s_max[w] - block_max);
+            if (s_max[w] > -1e30f) {
+                block_sum += s_sum[w] * expf(s_max[w] - block_max);
+            }
         }
         float lse = block_max + logf(block_sum);
         lse_out[row] = lse;

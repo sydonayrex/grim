@@ -52,6 +52,23 @@ pub async fn cmd_scheduler(addr: &str) -> Result<()> {
 
         println!("  Memory Usage    : {:.2} GB / {:.2} GB ({:.1}%)", used_gb, total_gb, pct);
         println!("  Block Count     : {} used / {} total", blocks_used, blocks_total);
+
+        if let Some(tiers) = kv.get("tiers") {
+            let gpu_bytes = tiers["gpu_bytes"].as_u64().unwrap_or(0);
+            let ram_bytes = tiers["host_ram_bytes"].as_u64().unwrap_or(0);
+            let nvme_bytes = tiers["nvme_bytes"].as_u64().unwrap_or(0);
+            println!("  Tiers (VRAM/RAM): {:.2} GB GPU / {:.2} GB Host / {:.2} GB NVMe",
+                gpu_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                nvme_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+    }
+
+    if let Some(spec) = val.get("speculation") {
+        println!("\n--- Speculative Decoding ---");
+        println!("  Enabled         : {}", spec["enabled"].as_bool().unwrap_or(false));
+        println!("  Strategy        : {}", spec["strategy"].as_str().unwrap_or("none"));
     }
 
     println!();

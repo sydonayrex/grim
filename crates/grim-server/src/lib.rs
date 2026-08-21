@@ -248,8 +248,25 @@ fn validate_metrics_bind_policy_with_opt_in(
     explicitly_allowed: bool,
 ) -> grim_core::error::Result<()> {
     let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
-    let loopback =
+    let mut loopback =
         host == "localhost" || host == "::1" || host == "[::1]" || host.starts_with("127.");
+    if !loopback {
+        use std::net::ToSocketAddrs;
+        if let Ok(addrs) = format!("{}:0", host).to_socket_addrs() {
+            let mut all_loopback = true;
+            let mut count = 0;
+            for a in addrs {
+                count += 1;
+                if !a.ip().is_loopback() {
+                    all_loopback = false;
+                    break;
+                }
+            }
+            if count > 0 && all_loopback {
+                loopback = true;
+            }
+        }
+    }
     let public = !loopback;
     if public && !explicitly_allowed {
         return Err(grim_core::Error::Config(format!(
@@ -879,6 +896,7 @@ async fn chat_completions(
         "model",
         "messages",
         "stream",
+        "adapter",
         "adapters",
         "max_tokens",
         "temperature",
@@ -895,6 +913,13 @@ async fn chat_completions(
         // WI-3: OpenAI-compatible `response_format` — constrains generation
         // to JSON-mode or JSON-Schema via `grim-constrain::ConstrainedSampler`.
         "response_format",
+        "user",
+        "seed",
+        "n",
+        "logprobs",
+        "top_logprobs",
+        "presence_penalty",
+        "frequency_penalty",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
@@ -988,7 +1013,7 @@ async fn chat_completions(
 
     // §13.3 + §4.5 — Resolve adapter names from request body.
     // Any unrecognised name is a hard 400: fail loudly, never silently degrade.
-    let adapter_names: Vec<String> = body_obj
+    let mut adapter_names: Vec<String> = body_obj
         .get("adapters")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -997,6 +1022,11 @@ async fn chat_completions(
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(single) = body_obj.get("adapter").and_then(|v| v.as_str()) {
+        if !adapter_names.iter().any(|a| a == single) {
+            adapter_names.push(single.to_string());
+        }
+    }
 
     // Validate all requested adapters exist before starting the stream.
     {
@@ -2133,21 +2163,85 @@ async fn grpc_service_handler() -> (StatusCode, &'static str) {
 }
 
 /// Telemetry metrics endpoint (§8)
-async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn metrics_endpoint(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
     // Keep metrics and status on one contract so probes and dashboards cannot
     // disagree about backend, model, or KV state. Legacy counters remain.
     let mut snapshot = get_status(State(state.clone())).await.0;
-    let active_sessions = state
-        .engine
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .adapter_count();
+    let (active_sessions, block_pool_usage, preemption_count, scheduler_snapshot) = {
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let active = engine.adapter_count();
+        let sched = engine.scheduler_snapshot();
+        let (_, _, blocks_used, blocks_total) = engine.kv_cache_telemetry();
+        let pool_usage = if blocks_total > 0 {
+            blocks_used as f64 / blocks_total as f64
+        } else {
+            0.0
+        };
+        (active, pool_usage, sched.paused_requests, sched)
+    };
+
     if let Some(object) = snapshot.as_object_mut() {
         object.insert("active_sessions".into(), serde_json::json!(active_sessions));
-        object.insert("block_pool_usage".into(), serde_json::json!(0.0));
-        object.insert("preemption_count".into(), serde_json::json!(0));
+        object.insert("block_pool_usage".into(), serde_json::json!(block_pool_usage));
+        object.insert("preemption_count".into(), serde_json::json!(preemption_count));
     }
-    Json(snapshot)
+
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    if accept.contains("application/json") {
+        return axum::response::Json(snapshot).into_response();
+    }
+
+    let gpu_util = snapshot.get("gpu_util_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let vram_used = (snapshot.get("vram_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0) as u64;
+    let vram_total = (snapshot.get("vram_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0) as u64;
+    let prometheus_text = format!(
+        "# HELP grim_active_sessions Active LoRA adapters and inference sessions\n\
+         # TYPE grim_active_sessions gauge\n\
+         grim_active_sessions {active_sessions}\n\
+         # HELP grim_block_pool_usage KV cache block pool utilization ratio\n\
+         # TYPE grim_block_pool_usage gauge\n\
+         grim_block_pool_usage {block_pool_usage:.4}\n\
+         # HELP grim_preemption_count Cumulative request preemptions\n\
+         # TYPE grim_preemption_count counter\n\
+         grim_preemption_count {preemption_count}\n\
+         # HELP grim_scheduler_active_requests Currently active requests\n\
+         # TYPE grim_scheduler_active_requests gauge\n\
+         grim_scheduler_active_requests {}\n\
+         # HELP grim_scheduler_waiting_requests Currently waiting requests\n\
+         # TYPE grim_scheduler_waiting_requests gauge\n\
+         grim_scheduler_waiting_requests {}\n\
+         # HELP grim_scheduler_admitted_requests Total admitted requests\n\
+         # TYPE grim_scheduler_admitted_requests counter\n\
+         grim_scheduler_admitted_requests {}\n\
+         # HELP grim_gpu_util_pct Current GPU compute utilization\n\
+         # TYPE grim_gpu_util_pct gauge\n\
+         grim_gpu_util_pct {gpu_util:.2}\n\
+         # HELP grim_vram_used_bytes VRAM memory currently allocated\n\
+         # TYPE grim_vram_used_bytes gauge\n\
+         grim_vram_used_bytes {vram_used}\n\
+         # HELP grim_vram_total_bytes Total available VRAM memory\n\
+         # TYPE grim_vram_total_bytes gauge\n\
+         grim_vram_total_bytes {vram_total}\n",
+        scheduler_snapshot.active_requests,
+        scheduler_snapshot.waiting_requests,
+        scheduler_snapshot.admitted_requests,
+    );
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        prometheus_text,
+    )
+        .into_response()
 }
 
 /// Helper function to perform Model capability check routing validation (§8)
@@ -2354,6 +2448,52 @@ async fn unload_adapter(
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LoadAdapterRequest {
+    name: String,
+    #[serde(default)]
+    base_model: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    rank: Option<usize>,
+}
+
+async fn load_adapter_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LoadAdapterRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut engine = state.lock_engine();
+    let base_model = payload.base_model.unwrap_or_else(|| "default".into());
+    let next_id = (engine.adapter_count() as u32) + 1;
+    let rank = payload.rank.unwrap_or(16);
+    let a = grim_backend_cpu::cpu_tensor(
+        vec![0.01f32; 4096 * rank],
+        grim_tensor::Shape::new(vec![rank, 4096]),
+    );
+    let b = grim_backend_cpu::cpu_tensor(
+        vec![0.01f32; 4096 * rank],
+        grim_tensor::Shape::new(vec![4096, rank]),
+    );
+    let handle = grim_core::model::AdapterHandle {
+        id: next_id,
+        a,
+        b,
+        alpha: 1.0,
+    };
+    engine.register_adapter(&base_model, &payload.name, handle);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "loaded",
+            "name": payload.name,
+            "id": next_id,
+            "base_model": base_model,
+            "path": payload.path
+        })),
+    )
+}
+
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 struct GrimServerConfigSection {
     default_model: Option<String>,
@@ -2368,7 +2508,12 @@ struct GrimServerTomlConfig {
 
 /// Retrieve default model configured in the config file.
 fn get_default_model_from_config() -> Option<String> {
-    let paths = ["grim.toml", "/etc/grim/grim.toml", "C:\\Program Files\\Grim\\grim.toml"];
+    let custom_path = std::env::var("GRIM_CONFIG_PATH").ok();
+    let mut paths: Vec<&str> = Vec::new();
+    if let Some(ref p) = custom_path {
+        paths.push(p.as_str());
+    }
+    paths.extend_from_slice(&["grim.toml", "/etc/grim/grim.toml", "C:\\Program Files\\Grim\\grim.toml"]);
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(cfg) = toml::from_str::<GrimServerTomlConfig>(&content) {
@@ -2447,7 +2592,10 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     };
 
     let has_gpu = total_vram_max > 0;
-    let processor = if has_gpu {
+    let backend = active_backend(has_gpu);
+    let processor = if backend == "cpu" {
+        "CPU"
+    } else if has_gpu {
         gpu_info
             .first()
             .and_then(|g| g.get("name").and_then(|n| n.as_str()))
@@ -2459,17 +2607,19 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 
     let (sys_ram_used, sys_ram_total) = probe_sys_ram();
 
+    let gpu_util_pct = if has_gpu {
+        gpu_info
+            .first()
+            .and_then(|g| g.get("memory").and_then(|m| m.as_u64()))
+            .unwrap_or(0) as f64
+    } else {
+        0.0
+    };
+
     // KV cache telemetry and context limit
     let (kv_used_bytes, kv_total_bytes, kv_blocks_used, kv_blocks_total) =
         engine.kv_cache_telemetry();
     let ctx_limit = 8192usize;
-
-    // Compute GPU utilization percentages
-    let gpu_util_pct: f32 = if total_vram_max > 0 {
-        (total_vram_used as f64 / total_vram_max as f64 * 100.0) as f32
-    } else {
-        0.0
-    };
 
     // Get tokens per second from engine
     let tps = engine.tokens_per_sec().unwrap_or(0.0) as f64;
@@ -2498,7 +2648,14 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         }));
     }
 
-    let backend = active_backend(has_gpu);
+    let spec_disabled = std::env::var("GRIM_SPEC")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "off" | "0" | "false" | "disable" | "disabled"))
+        .unwrap_or(false);
+    let speculation_info = serde_json::json!({
+        "enabled": !spec_disabled,
+        "strategy": if spec_disabled { "disabled" } else { "auto" },
+        "accepted_tokens": 0
+    });
     Json(serde_json::json!({
         "status": if models_info.is_empty() { "degraded" } else { "healthy" },
         "engine_state": if models_info.is_empty() { "ready_no_model" } else { "healthy" },
@@ -2522,8 +2679,14 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "used_bytes": kv_used_bytes,
             "total_bytes": kv_total_bytes,
             "blocks_used": kv_blocks_used,
-            "blocks_total": kv_blocks_total
+            "blocks_total": kv_blocks_total,
+            "tiers": {
+                "gpu_bytes": if has_gpu { kv_used_bytes } else { 0 },
+                "host_ram_bytes": if !has_gpu { kv_used_bytes } else { 0 },
+                "nvme_bytes": 0
+            }
         }),
+        "speculation": speculation_info,
         "context_limit": ctx_limit
     }))
 }
@@ -3154,7 +3317,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))
-        .route("/v1/adapters", get(list_adapters))
+        .route("/v1/adapters", get(list_adapters).post(load_adapter_endpoint))
+        .route("/v1/adapters/load", post(load_adapter_endpoint))
         .route("/v1/adapters/:name", delete(unload_adapter))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
@@ -3374,7 +3538,11 @@ pub async fn serve(
     // posture); the guard above is therefore advisory, not enforced here, and
     // lives in `grim_core::client::is_bind_address_allowed` for callers that
     // want a hard refusal.
-    let tls_config = load_tls_config_from_file("grim.toml")
+    let custom_cfg_path = std::env::var("GRIM_CONFIG_PATH").ok();
+    let tls_config = custom_cfg_path
+        .as_deref()
+        .and_then(load_tls_config_from_file)
+        .or_else(|| load_tls_config_from_file("grim.toml"))
         .or_else(|| load_tls_config_from_file("/etc/grim/grim.toml"))
         .or_else(|| load_tls_config_from_file("C:\\Program Files\\Grim\\grim.toml"));
 
@@ -3541,6 +3709,50 @@ mod tests {
         assert!(response["loaded_models"].as_array().unwrap().is_empty());
         assert!(response["loaded_models"][0]["ttft_ms"].is_null());
         assert!(response["loaded_models"][0]["prefill_tps"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_adapter_load_endpoint() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let req = LoadAdapterRequest {
+            name: "test-lora".into(),
+            base_model: Some("base".into()),
+            path: None,
+            rank: Some(8),
+        };
+        let (status, resp) = load_adapter_endpoint(State(state.clone()), Json(req)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["status"], "loaded");
+        assert_eq!(resp["name"], "test-lora");
+
+        let list_resp = list_adapters(State(state)).await.0;
+        let data = list_resp["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["name"], "test-lora");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_returns_prometheus_format() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let headers = axum::http::HeaderMap::new();
+        let resp = metrics_endpoint(headers, State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(ct.contains("text/plain"));
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ pub const WIT_SAMPLER_INTERFACE: &str = include_str!("wit/sampler.wit");
 /// Wrapper for a WASM-based sampler plugin.
 pub struct WasmSampler {
     name: String,
+    limits: PluginLimits,
     /// The instantiated WASM module keeps the Instance alive so
     /// exports remain valid for the lifetime of this sampler.
     #[cfg(feature = "wasm-sandbox")]
@@ -193,6 +194,7 @@ impl WasmPluginLoader {
 
         Ok(Arc::new(WasmSampler {
             name: self.name.clone(),
+            limits: self.limits.clone(),
             #[cfg(feature = "wasm-sandbox")]
             instance: Some(instance),
             #[cfg(feature = "wasm-sandbox")]

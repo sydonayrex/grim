@@ -36,7 +36,7 @@ cd Grim
 
 ## Step 2: Build the project
 
-Build all 28 crates in release mode:
+Build all 29 crates in release mode:
 
 ```bash
 cargo build --release
@@ -94,7 +94,7 @@ cargo test -p <crate-name>
 
 ```
 grim/
-├── Cargo.toml              # Workspace definition (28 crates)
+├── Cargo.toml              # Workspace definition (29 crates)
 ├── crates/                 # Individual crates
 │   ├── grim-tensor/        # Core tensor abstractions (DType, Device, Shape)
 │   ├── grim-tensor-graph/  # Fusion patterns for tensor operations

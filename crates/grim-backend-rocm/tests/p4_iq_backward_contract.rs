@@ -1,3 +1,4 @@
+#![allow(dead_code, non_snake_case)]
 //! P4 contract tests for IQ/GQuant backward kernels (implement.md §P4).
 //!
 //! Implement.md §P4: the IQ/GQuant backward kernels are the remaining gap after

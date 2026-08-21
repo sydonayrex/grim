@@ -35,6 +35,7 @@ grim-format = { workspace = true }
     grim-nn = { workspace = true }
     grim-autograd = { workspace = true }
     grim-garage = { workspace = true }
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 windows-service = "0.8.1"

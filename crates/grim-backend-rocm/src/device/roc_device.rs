@@ -179,6 +179,7 @@ pub struct RocmDevice {
     /// Tuning-mode + occupancy + tuning-solution store for this device.
     /// [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
     /// tuning solution storage]
+    #[allow(dead_code)]
     pub(crate) tuning: Mutex<crate::autotune::AutotunerConfig>,
 
     pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
@@ -581,9 +582,9 @@ impl RocmDevice {
             retained_pins: Mutex::new(Vec::new()),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
-            /// Tuning-mode + occupancy + tuning-solution store for this device.
-            /// [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
-            /// tuning solution storage]
+            // Tuning-mode + occupancy + tuning-solution store for this device.
+            // [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
+            // tuning solution storage]
             tuning: Mutex::new(crate::autotune::AutotunerConfig::default()),
 
             module_cache: Mutex::new(HashMap::new()),
@@ -4022,14 +4023,26 @@ impl BackendDevice for RocmDevice {
         };
         let config = {
             let out_dims = out_shape.dims();
-            if out_dims.len() != 3 {
+            let (seq_len, num_heads, head_dim) = if out_dims.len() == 3 {
+                (out_dims[0], out_dims[1], out_dims[2])
+            } else if out_dims.len() == 2 {
+                let seq_len = out_dims[0];
+                let hidden_dim = out_dims[1];
+                let q_dims = q.shape().dims();
+                let head_dim = if q_dims.len() == 3 {
+                    q_dims[2]
+                } else if q_dims.len() == 2 && num_kv_heads > 0 {
+                    q_dims[1] / num_kv_heads
+                } else {
+                    hidden_dim / num_kv_heads.max(1)
+                };
+                let num_heads = if head_dim > 0 { hidden_dim / head_dim } else { 1 };
+                (seq_len, num_heads, head_dim)
+            } else {
                 return Err(Error::Shape(
-                    "qkv_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into(),
+                    "qkv_attention expects 2-D [seq_len, hidden_dim] or 3-D [seq_len, num_heads, head_dim] output shape".into(),
                 ));
-            }
-            let seq_len = out_dims[0];
-            let num_heads = out_dims[1];
-            let head_dim = out_dims[2];
+            };
             QkvAttentionFusionConfig {
                 enabled: true,
                 num_heads,
