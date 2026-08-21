@@ -136,7 +136,7 @@ enum Commands {
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
         /// Path to plugins directory.
-        #[arg(short, long, default_value = "plugins")]
+        #[arg(long, default_value = "plugins")]
         plugins: String,
         /// Preferred ROCm profile (cdna2/cdna3/rdna2/rdna3/rdna4/auto). Never forces conversion on its own.
         #[arg(long)]
@@ -444,8 +444,10 @@ enum Commands {
     },
     /// Query live continuous batching scheduler queues and KV cache memory tiers.
     Scheduler {
-        /// Server address to query (defaults to 127.0.0.1:11434).
-        #[arg(short, long, default_value = "127.0.0.1:11434")]
+        /// Server address to query. Defaults to GRIM_HOST/GRIM_PORT env (or
+        /// 127.0.0.1:11434) so a server started on a non-default port is found
+        /// without re-typing the address (F-2).
+        #[arg(short, long, default_value = "")]
         addr: String,
     },
     /// Runtime LoRA adapter management against a live server (load/list/unload
@@ -1262,7 +1264,14 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Scheduler { addr } => {
-            scheduler::cmd_scheduler(&addr).await?;
+            // F-2: empty --addr resolves through GRIM_HOST/GRIM_PORT so a
+            // server on a non-default port is found without re-typing it.
+            let resolved = if addr.is_empty() {
+                grim_core::RuntimeEnv::resolve_bind(None)
+            } else {
+                addr
+            };
+            scheduler::cmd_scheduler(&resolved).await?;
         }
         Commands::Adapter { cmd } => {
             adapter::cmd_adapter(cmd).await?;

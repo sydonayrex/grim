@@ -21,6 +21,7 @@ grim-constrain = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-models-transformer = { workspace = true }
 grim-models-audio = { workspace = true }
+grim-models-diffusion = { workspace = true }
 grim-disagg = { workspace = true }
 thiserror = { workspace = true }
 axum = "0.7"

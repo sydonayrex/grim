@@ -2338,6 +2338,7 @@ dependencies = [
  "grim-kvtransport",
  "grim-memory",
  "grim-models-audio",
+ "grim-models-diffusion",
  "grim-models-mamba",
  "grim-models-transformer",
  "grim-models-vision",
@@ -2460,7 +2461,10 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-core",
+ "grim-nn",
  "grim-tensor",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
@@ -2581,6 +2585,7 @@ dependencies = [
  "grim-engine",
  "grim-format",
  "grim-models-audio",
+ "grim-models-diffusion",
  "grim-models-transformer",
  "grim-plugin",
  "grim-scheduler",
