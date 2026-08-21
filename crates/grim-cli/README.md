@@ -1,6 +1,6 @@
 # `grim-cli`
 
-`grim-cli` is the primary executable binary and command-line interface for the Grim framework. It exposes commands for serving OpenAI-compatible APIs, interactive terminal chat, model downloads, hardware pre-flight diagnostics, quantization, benchmarking, and adapter fine-tuning.
+`grim-cli` is the primary executable binary and command-line interface for the Grim framework. It exposes commands for serving OpenAI- and Ollama-compatible APIs, one-shot and interactive inference, model downloads, hardware pre-flight diagnostics, model conversion and quantization, benchmarking, and adapter fine-tuning.
 
 ## Boundaries
 
@@ -78,20 +78,20 @@ flowchart TD
 
 ## Public API Overview
 
-`grim-cli` produces the `grim` binary. Subcommands include:
+`grim-cli` produces the `grim-cli` binary (conventionally installed as `grim`; see `docs/howto/install-grim.md`). Subcommands include:
 
-- **`serve`**: Bootstraps the HTTP server with OpenAI and Ollama compatible endpoints.
-- **`run`**: Runs a single prompt or interactive REPL session from the command line.
-- **`chat`**: Multi-turn chat session with automatic template sanitization.
+- **`serve`**: Bootstraps the HTTP server with OpenAI- and Ollama-compatible endpoints. `--model <name-or-path>` optionally preloads a model at startup.
+- **`run`**: Runs a single prompt or interactive REPL session from the command line (`--serve` starts the HTTP server with the model preloaded). Interactive multi-turn chat lives here and in the `tui` diagnostics interface — there is no separate `chat` subcommand.
 - **`pull` / `dl`**: Downloads model checkpoints from Hugging Face or Ollama registries.
-- **`convert` / `oxidize`**: Converts GGUF or SafeTensors weights into optimized `.grim` files.
+- **`convert`**: One-shot conversion of GGUF, GGML, SafeTensors, or PyTorch weights into optimized `.grim` files. Quantization is part of conversion (`--target-bpw`); there is no separate `quantize` subcommand.
+- **`oxidizer`**: Full evolutionary conversion pipeline (`grim oxidizer convert` runs calibrate → search → write).
 - **`doctor`**: Diagnostic tool checking hardware drivers, VRAM fit (`--model`), and ROCm/CUDA/Vulkan availability.
-- **`train`**: Fine-tunes LoRA, QLoRA, LoRA+, PiSSA, and VeRA adapters with deterministic `--seed`.
-- **`eval`**: Evaluates model loss, perplexity, and benchmark accuracy.
-- **`bench`**: Measures token generation speed, TTFT, and throughput.
-- **`quantize`**: Calibrates and quantizes model weights into Q8_0, Q4_K, Q5_K, and FP8 formats.
-- **`inspect`**: Inspects tensor headers and metadata of `.grim` and `.gguf` files.
-- **`export`**: Merges trained adapters back into base model checkpoints.
+- **`train`**: Fine-tunes adapters (`--mode qlora|lora|full-bf16|full-fp16|soul-eater|oft`) with optional PiSSA init, OLoRA penalty, LoRA+ ratios, held-out `--eval-dataset`, and deterministic `--seed`.
+- **`merge`**: Bakes a trained adapter sidecar permanently into a base `.grim` model file (adapter export).
+- **`bench`**: Measures token generation speed with configurable `--tokens` and `--concurrency`.
+- **`templates`**: `list` / `inspect` / `render` chat template families (e.g. `grim templates inspect chatml`).
+- **`verify` / `provenance`**: Inspect `.grim` file structure and compression (`verify`); verify model integrity, checksums, and catalog provenance (`provenance`).
+- Run `grim --help` for the full list (`tui`, `garage`, `tune`, `scheduler`, `spec`, `plugin`, `arch-plugin`, `service`, `rm`, `cp`, `stop`, `ps`, `list`, `status`, `check`, `show`, `use`, `login`, `start`, `reap`, `multimodal`).
 
 ## Usage Example
 
@@ -99,14 +99,21 @@ flowchart TD
 # 1. Inspect hardware environment and model fit
 grim doctor --model models/llama-3.2-1b.gguf
 
-# 2. Run inference server on port 8080
-grim serve --port 8080 --model models/llama-3.2-1b.gguf
+# 2. Pull a model, then start the inference server on port 8080
+#    (serve also accepts --model <name-or-path> to preload at startup)
+grim pull llama3
+grim serve --port 8080
 
-# 3. Train a LoRA adapter with deterministic seed
+# 3. Chat over the OpenAI-compatible API; the model is named per request
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"Hello, world!"}]}'
+
+# 4. Train a LoRA adapter with deterministic seed
 grim train \
   --model models/llama-3.2-1b.gguf \
-  --data data/train.jsonl \
-  --output adapters/my-lora.grim \
+  --dataset data/train.jsonl \
+  --output adapters/my-lora.grim.train \
   --seed 42 \
   --lr 1e-4 \
   --epochs 3
@@ -126,8 +133,8 @@ grim train \
 
 ## Build Flags, Feature Flags, and Environment Variables
 
-- `default = ["rocm"]`: ROCm GPU backend enabled by default.
+- `default = ["rocm"]`: ROCm GPU backend enabled by default (via `grim-backend-rocm/cubecl`).
+- `rocm`: Enables the ROCm backend via `cubecl`.
 - `cuda`: Enables NVIDIA CUDA compilation.
-- `vulkan`: Enables Vulkan compute compilation.
-- `metal`: Enables Apple Metal compilation on macOS.
-- **Environment variables**: `GRIM_HOST`, `GRIM_PORT`, `GRIM_BACKEND`, `GRIM_LOG`.
+- `wasm-sandbox`: Enables the WASM plugin sandbox in `grim-plugin`.
+- **Environment variables**: `GRIM_HOST`, `GRIM_PORT`, `GRIM_BACKEND`, `GRIM_CONFIG_PATH`, `GRIM_LOG_DIR`.

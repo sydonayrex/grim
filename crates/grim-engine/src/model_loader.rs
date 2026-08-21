@@ -3633,8 +3633,50 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     let is_grim = path.ends_with(".grim");
     let is_safetensors = path.ends_with(".safetensors");
 
-    // Check for forced device first
-    if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
+    // Check for forced device first. `GRIM_BACKEND` is canonical (set by the
+    // install script and by `serve --backend`); `GRIM_FORCE_DEVICE` is a
+    // legacy alias. An explicitly requested backend must actually be
+    // available — never silently degrade to a different device (WS-E1).
+    let forced = std::env::var("GRIM_BACKEND")
+        .or_else(|_| std::env::var("GRIM_FORCE_DEVICE"))
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "auto");
+    if let Some(s) = forced {
+        // Cheap capability check per backend, reusing the same probes the
+        // selection chain below uses.
+        let prefix = s.split(':').next().unwrap_or("").trim();
+        let available = match prefix {
+            "cpu" => true,
+            "rocm" => grim_backend_rocm::RocmDevice::probe()
+                .map(|d| !d.is_empty())
+                .unwrap_or(false),
+            "metal" => grim_backend_metal::MetalDevice::probe()
+                .map(|d| !d.is_empty())
+                .unwrap_or(false),
+            #[cfg(feature = "cuda")]
+            "cuda" => grim_backend_cuda::CudaDevice::probe()
+                .map(|d| !d.is_empty())
+                .unwrap_or(false),
+            #[cfg(not(feature = "cuda"))]
+            "cuda" => false,
+            // The engine-side loader has no Vulkan path; report that honestly
+            // rather than silently running on a different backend.
+            "vulkan" => false,
+            other => {
+                return Err(Error::Config(format!(
+                    "unknown backend '{other}' requested via GRIM_BACKEND \
+                     (expected rocm|cuda|vulkan|metal|cpu|auto)"
+                )));
+            }
+        };
+        if !available {
+            return Err(Error::Config(format!(
+                "backend '{prefix}' requested via GRIM_BACKEND but unavailable \
+                 (not compiled in or no device). Rebuild with --features {prefix} \
+                 or unset GRIM_BACKEND for auto-detection."
+            )));
+        }
         match s.as_str() {
             #[cfg(feature = "cuda")]
             "cuda" => {

@@ -60,9 +60,22 @@ mod tests {
 
     #[test]
     fn test_auto_configure_hsa_override_known_consumer_targets() {
+        unsafe {
+            std::env::remove_var("HSA_OVERRIDE_GFX_VERSION");
+        }
         assert_eq!(auto_configure_hsa_override("gfx1036"), Some("10.3.0"));
+        // Reset HSA_OVERRIDE_GFX_VERSION so the second call sees "not already set".
+        unsafe {
+            std::env::remove_var("HSA_OVERRIDE_GFX_VERSION");
+        }
         assert_eq!(auto_configure_hsa_override("gfx1103"), Some("11.0.0"));
+        unsafe {
+            std::env::remove_var("HSA_OVERRIDE_GFX_VERSION");
+        }
         assert_eq!(auto_configure_hsa_override("gfx1150"), Some("11.5.0"));
+        unsafe {
+            std::env::remove_var("HSA_OVERRIDE_GFX_VERSION");
+        }
         assert_eq!(auto_configure_hsa_override("gfx90a"), None);
     }
 }

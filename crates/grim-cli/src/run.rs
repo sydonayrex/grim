@@ -58,18 +58,41 @@ fn tp_ordinal(devices: &[grim_backend_rocm::RocmDevice]) -> Option<usize> {
 }
 
 /// Auto-detect best available device. Probed once, reused by interactive REPL.
-fn probe_device() -> (Device, String) {
+/// An explicitly requested backend must be available — never silently
+/// degrade to CPU (WS-E1).
+fn probe_device() -> Result<(Device, String)> {
     // `GRIM_BACKEND` is canonical (set by the install script); `GRIM_FORCE_DEVICE`
     // is accepted as a legacy alias for backward compatibility.
-    let s = std::env::var("GRIM_BACKEND").or_else(|_| std::env::var("GRIM_FORCE_DEVICE"));
-    if let Ok(s) = s {
-        let s_lower = s.trim().to_ascii_lowercase();
-        let prefix = s_lower.split(':').next().unwrap_or("").trim();
-        match prefix {
+    let requested = std::env::var("GRIM_BACKEND").or_else(|_| std::env::var("GRIM_FORCE_DEVICE"));
+    probe_device_with(requested.ok().as_deref())
+}
+
+/// Hard error for an explicitly requested backend that is unavailable in
+/// this build or on this host (WS-E1: no silent CPU fallback).
+fn backend_unavailable(name: &str, why: &str) -> grim_core::error::Error {
+    grim_core::error::Error::Config(format!(
+        "backend '{name}' requested via GRIM_BACKEND but unavailable ({why}). \
+         Rebuild with --features {name} or unset GRIM_BACKEND for auto-detection."
+    ))
+}
+
+/// Resolve the device for an explicit selection string (`"rocm"`, `"cuda:1"`,
+/// `"auto"`, ...); `None` means auto-detect. Split from [`probe_device`] so
+/// the unavailable-backend error path is unit-testable without mutating the
+/// process environment. `auto`/unset keep the probe-chain-with-fallback
+/// behavior; any other explicitly named backend that is not compiled in or
+/// has no device is a hard error.
+fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
+    if let Some(s) = requested
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "auto")
+    {
+        let prefix = s.split(':').next().unwrap_or("").trim();
+        return match prefix {
             "cuda" => {
                 #[cfg(feature = "cuda")]
                 {
-                    let ord_req = s_lower
+                    let ord_req = s
                         .split(':')
                         .nth(1)
                         .and_then(|x| x.parse::<u32>().ok())
@@ -80,94 +103,74 @@ fn probe_device() -> (Device, String) {
                             .find(|d| d.ordinal() == ord_req)
                             .or_else(|| cuda_devices.first())
                         {
-                            return (
+                            return Ok((
                                 Device::Cuda(dev.ordinal()),
                                 format!("cuda:{}", dev.ordinal()),
-                            );
+                            ));
                         }
                     }
-                    eprintln!(
-                        "[grim] WARNING: requested backend 'cuda' unavailable (no CUDA devices found). Falling back to CPU."
-                    );
-                    (Device::Cpu, "cpu".into())
+                    Err(backend_unavailable("cuda", "no CUDA device found"))
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    eprintln!(
-                        "[grim] WARNING: requested backend 'cuda' unavailable (binary compiled without '--features cuda'). Falling back to CPU."
-                    );
-                    (Device::Cpu, "cpu".into())
+                    Err(backend_unavailable("cuda", "not compiled in"))
                 }
             }
             "rocm" => {
-                let ord_req = s_lower
-                    .split(':')
-                    .nth(1)
-                    .and_then(|x| x.parse::<usize>().ok());
+                let ord_req = s.split(':').nth(1).and_then(|x| x.parse::<usize>().ok());
                 if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
                     if let Some(req) = ord_req {
                         if let Some(dev) = rocm_devices.iter().find(|d| d.ordinal() == req) {
-                            return (
+                            return Ok((
                                 Device::Rocm(dev.ordinal()),
                                 format!("rocm:{}", dev.ordinal()),
-                            );
+                            ));
                         }
                     }
                     if let Some(ord) = tp_ordinal(&rocm_devices) {
-                        return (Device::Rocm(ord), format!("rocm:{}", ord));
+                        return Ok((Device::Rocm(ord), format!("rocm:{}", ord)));
                     }
                     if let Some(first) = rocm_devices.first() {
-                        return (
+                        return Ok((
                             Device::Rocm(first.ordinal()),
                             format!("rocm:{}", first.ordinal()),
-                        );
+                        ));
                     }
                 }
-                eprintln!(
-                    "[grim] WARNING: requested backend 'rocm' unavailable (no ROCm devices probed). Falling back to CPU."
-                );
-                (Device::Cpu, "cpu".into())
+                Err(backend_unavailable("rocm", "no ROCm devices probed"))
             }
             "metal" => {
-                let ord_req = s_lower
+                let ord_req = s
                     .split(':')
                     .nth(1)
                     .and_then(|x| x.parse::<usize>().ok())
                     .unwrap_or(0);
-                let Some((_free, total)) = grim_backend_metal::vram_info(ord_req) else {
-                    eprintln!(
-                        "[grim] WARNING: requested backend 'metal' unavailable (host unsupported or no Metal device found). Falling back to CPU."
-                    );
-                    return (Device::Cpu, "cpu".into());
-                };
-                if total > 0 {
-                    return (Device::Metal(ord_req), format!("metal:{ord_req}"));
+                match grim_backend_metal::vram_info(ord_req) {
+                    Some((_free, total)) if total > 0 => {
+                        Ok((Device::Metal(ord_req), format!("metal:{ord_req}")))
+                    }
+                    _ => Err(backend_unavailable(
+                        "metal",
+                        "host unsupported or no Metal device found",
+                    )),
                 }
-                eprintln!(
-                    "[grim] WARNING: requested backend 'metal' unavailable (no Metal VRAM found). Falling back to CPU."
-                );
-                (Device::Cpu, "cpu".into())
             }
             "vulkan" => {
                 if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
                     if !vulkan_devices.is_empty() {
-                        return (Device::Vulkan, "vulkan".into());
+                        return Ok((Device::Vulkan, "vulkan".into()));
                     }
                 }
-                eprintln!(
-                    "[grim] WARNING: requested backend 'vulkan' unavailable (no Vulkan devices found). Falling back to CPU."
-                );
-                (Device::Cpu, "cpu".into())
+                Err(backend_unavailable("vulkan", "no Vulkan devices found"))
             }
-            "cpu" => (Device::Cpu, "cpu".into()),
-            other => {
-                eprintln!(
-                    "[grim] WARNING: unknown requested backend '{other}'. Falling back to CPU."
-                );
-                (Device::Cpu, "cpu".into())
-            }
-        }
-    } else if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+            "cpu" => Ok((Device::Cpu, "cpu".into())),
+            other => Err(grim_core::error::Error::Config(format!(
+                "unknown backend '{other}' requested via GRIM_BACKEND \
+                 (expected rocm|cuda|vulkan|metal|cpu|auto)"
+            ))),
+        };
+    }
+    if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
         if let Some(first) = rocm_devices.first() {
             // Under multi-process TP, pin this rank process to its own GPU.
             let ordinal = tp_ordinal(&rocm_devices).unwrap_or_else(|| first.ordinal());
@@ -177,7 +180,7 @@ fn probe_device() -> (Device, String) {
                 "[grim] ROCm GPU {} detected (wavefront={}, xnack={})",
                 ordinal, wavefront, xnack
             );
-            (Device::Rocm(ordinal), format!("rocm:{}", ordinal))
+            Ok((Device::Rocm(ordinal), format!("rocm:{}", ordinal)))
         } else {
             // ROCm available but no devices; check Metal → CUDA → Vulkan fallback.
             #[cfg(target_vendor = "apple")]
@@ -187,7 +190,7 @@ fn probe_device() -> (Device, String) {
                 };
                 if total > 0 {
                     eprintln!("[grim] Metal GPU detected");
-                    return (Device::Metal(0), "metal:0".into());
+                    return Ok((Device::Metal(0), "metal:0".into()));
                 }
             }
             #[cfg(feature = "cuda")]
@@ -195,32 +198,32 @@ fn probe_device() -> (Device, String) {
                 if let Some(first) = cuda_devices.first() {
                     let ordinal = first.ordinal();
                     eprintln!("[grim] CUDA GPU {} detected", ordinal);
-                    return (Device::Cuda(ordinal), format!("cuda:{}", ordinal));
+                    return Ok((Device::Cuda(ordinal), format!("cuda:{}", ordinal)));
                 }
             }
             if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
                 if !vulkan_devices.is_empty() {
                     eprintln!("[grim] Vulkan GPU detected");
-                    (Device::Vulkan, "vulkan".into())
+                    Ok((Device::Vulkan, "vulkan".into()))
                 } else {
                     eprintln!("[grim] No GPU detected; using CPU backend.");
-                    (Device::Cpu, "cpu".into())
+                    Ok((Device::Cpu, "cpu".into()))
                 }
             } else {
                 eprintln!("[grim] No GPU detected; using CPU backend.");
-                (Device::Cpu, "cpu".into())
+                Ok((Device::Cpu, "cpu".into()))
             }
         }
     } else {
         // Check Metal on Apple platforms first, then Vulkan as fallback
         #[cfg(target_vendor = "apple")]
         {
-            let Some((free, total)) = grim_backend_metal::vram_info(0) else {
-                return (Device::Cpu, "cpu".into());
+            let Some((_free, total)) = grim_backend_metal::vram_info(0) else {
+                return Ok((Device::Cpu, "cpu".into()));
             };
             if total > 0 {
                 eprintln!("[grim] Metal GPU detected");
-                return (Device::Metal(0), "metal:0".into());
+                return Ok((Device::Metal(0), "metal:0".into()));
             }
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -228,12 +231,12 @@ fn probe_device() -> (Device, String) {
             if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
                 if !vulkan_devices.is_empty() {
                     eprintln!("[grim] Vulkan GPU detected");
-                    return (Device::Vulkan, "vulkan".into());
+                    return Ok((Device::Vulkan, "vulkan".into()));
                 }
             }
         }
         eprintln!("[grim] GPU runtime not available; using CPU backend.");
-        (Device::Cpu, "cpu".into())
+        Ok((Device::Cpu, "cpu".into()))
     }
 }
 
@@ -280,7 +283,7 @@ pub async fn cmd_run(
         && (model_path_str.to_lowercase().ends_with(".safetensors")
             || model_path_str.to_lowercase().ends_with(".bin"));
 
-    let (device, device_name) = probe_device();
+    let (device, device_name) = probe_device()?;
 
     if serve {
         let mut engine = Engine::new(EngineConfig::default());
@@ -647,7 +650,7 @@ pub fn init_generation(
         && (model_path_str.to_lowercase().ends_with(".safetensors")
             || model_path_str.to_lowercase().ends_with(".bin"));
 
-    let (device, _device_name) = probe_device();
+    let (device, _device_name) = probe_device()?;
 
     let model: Box<dyn CausalLm> = if use_gguf {
         eprintln!("[grim] Loading GGUF model: {}", model_path_str);
@@ -810,7 +813,7 @@ pub async fn cmd_run_interactive(
         && (model_path_str.to_lowercase().ends_with(".safetensors")
             || model_path_str.to_lowercase().ends_with(".bin"));
 
-    let (device, device_name) = probe_device();
+    let (device, device_name) = probe_device()?;
 
     // ---- model (loaded once) ----
     let model: Box<dyn CausalLm> = if use_gguf {
@@ -1012,5 +1015,60 @@ pub async fn cmd_run_interactive(
         }
         std::io::stdout().flush().unwrap();
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requested_unavailable_backend_errors_loudly() {
+        // On the default (no-cuda) build this exercises the "not compiled in"
+        // path; on a cuda build without a GPU it exercises "no device". In
+        // both cases it must hard-error naming the backend and the env var —
+        // never silently fall back to CPU (WS-E1).
+        match probe_device_with(Some("cuda")) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("cuda"), "error must name the backend: {msg}");
+                assert!(
+                    msg.contains("GRIM_BACKEND"),
+                    "error must name the env var: {msg}"
+                );
+            }
+            // A cuda build with a live device legitimately resolves cuda.
+            Ok((Device::Cuda(_), name)) => assert!(name.starts_with("cuda")),
+            Ok((_dev, name)) => panic!("GRIM_BACKEND=cuda silently resolved to {name}"),
+        }
+    }
+
+    #[test]
+    fn requested_cpu_always_works() {
+        let (dev, name) = probe_device_with(Some("cpu")).expect("cpu is always available");
+        assert!(matches!(dev, Device::Cpu));
+        assert_eq!(name, "cpu");
+    }
+
+    #[test]
+    fn unknown_backend_is_rejected() {
+        let msg = probe_device_with(Some("quantum")).unwrap_err().to_string();
+        assert!(
+            msg.contains("quantum"),
+            "error must name the backend: {msg}"
+        );
+        assert!(
+            msg.contains("GRIM_BACKEND"),
+            "error must name the env var: {msg}"
+        );
+    }
+
+    #[test]
+    fn auto_and_unset_keep_the_fallback_chain() {
+        // `auto` and unset must never hard-error: the probe chain falls back
+        // through GPU backends down to CPU.
+        assert!(probe_device_with(Some("auto")).is_ok());
+        assert!(probe_device_with(None).is_ok());
+        assert!(probe_device_with(Some("")).is_ok());
     }
 }
