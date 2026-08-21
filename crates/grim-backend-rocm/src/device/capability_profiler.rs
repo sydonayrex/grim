@@ -266,19 +266,38 @@ pub fn vram_info(ordinal: usize) -> (u64, u64) {
 /// endpoint never re-dlopens or re-initializes rsmi per request (WI-1 gate 4:
 /// the query must not block the endpoint for more than ~5ms).
 pub fn compute_utilization(ordinal: usize) -> Option<u32> {
-    let lib = RsmiLib::load()?;
-    let mut busy: u32 = 0;
-    // SAFETY: `busy` is a local with stable address; `rsmi_dev_busy_percent_get`
-    // writes one u32. rsmi is initialized once at load time (see `RsmiLib`).
-    let status = unsafe {
-        let f: Symbol<'_, RsmiBusyFn> = lib.handle().get(b"rsmi_dev_busy_percent_get").ok()?;
-        f(ordinal as u32, &mut busy)
-    };
-    if status == RSMI_STATUS_SUCCESS && busy <= 100 {
-        Some(busy)
-    } else {
-        None
+    if let Some(lib) = RsmiLib::load() {
+        let mut busy: u32 = 0;
+        let status = unsafe {
+            if let Ok(f) = lib.handle().get::<RsmiBusyFn>(b"rsmi_dev_busy_percent_get") {
+                f(ordinal as u32, &mut busy)
+            } else {
+                1
+            }
+        };
+        if status == RSMI_STATUS_SUCCESS && busy <= 100 {
+            return Some(busy);
+        }
     }
+
+    // Direct sysfs fallback for consumer AMD GPUs / APUs on Linux
+    let candidates = [
+        format!("/sys/class/drm/card{}/device/gpu_busy_percent", ordinal),
+        format!("/sys/class/drm/card{}/device/gpu_busy_percent", ordinal + 1),
+        "/sys/class/drm/card0/device/gpu_busy_percent".into(),
+        "/sys/class/drm/card1/device/gpu_busy_percent".into(),
+    ];
+    for path in &candidates {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(val) = content.trim().parse::<u32>() {
+                if val <= 100 {
+                    return Some(val);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 type RsmiBusyFn = unsafe extern "C" fn(u32, *mut u32) -> u32;

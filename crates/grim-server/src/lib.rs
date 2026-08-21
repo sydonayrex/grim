@@ -2608,10 +2608,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let (sys_ram_used, sys_ram_total) = probe_sys_ram();
 
     let gpu_util_pct = if has_gpu {
-        gpu_info
-            .first()
-            .and_then(|g| g.get("memory").and_then(|m| m.as_u64()))
-            .unwrap_or(0) as f64
+        grim_backend_rocm::compute_utilization(0).map(|u| u as f64).unwrap_or(0.0)
     } else {
         0.0
     };
@@ -2619,7 +2616,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     // KV cache telemetry and context limit
     let (kv_used_bytes, kv_total_bytes, kv_blocks_used, kv_blocks_total) =
         engine.kv_cache_telemetry();
-    let ctx_limit = 8192usize;
+    let ctx_limit = engine.context_limit();
+    let total_tokens = engine.total_tokens_generated();
 
     // Get tokens per second from engine
     let tps = engine.tokens_per_sec().unwrap_or(0.0) as f64;
@@ -2633,7 +2631,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     for m in models {
         models_info.push(serde_json::json!({
             "name": m,
-            "params": "8B",
+            "params": serde_json::Value::Null,
             "vram_gb": total_vram_used as f64 / (1024.0 * 1024.0 * 1024.0),
             "vram_total_gb": total_vram_max as f64 / (1024.0 * 1024.0 * 1024.0),
             "gpu_util_pct": gpu_util_pct,
@@ -2654,7 +2652,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let speculation_info = serde_json::json!({
         "enabled": !spec_disabled,
         "strategy": if spec_disabled { "disabled" } else { "auto" },
-        "accepted_tokens": 0
+        "accepted_tokens": total_tokens
     });
     Json(serde_json::json!({
         "status": if models_info.is_empty() { "degraded" } else { "healthy" },

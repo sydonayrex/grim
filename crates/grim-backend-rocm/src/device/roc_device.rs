@@ -288,6 +288,9 @@ impl RocmDevice {
 
     /// Fallible constructor that propagates the `hipSetDevice` error. [see: `probe()`, `RocmDevice::new`]
     pub fn try_new(ordinal: usize) -> Result<Self> {
+        let detected = detect_gpu_arch(ordinal as i32);
+        crate::rocm_detect::auto_configure_hsa_override(&detected);
+
         unsafe {
             let set_status = hipSetDevice(ordinal as i32);
             if set_status != hipSuccess {
