@@ -6,14 +6,13 @@
 //!   `x_out = x + Attn(LN_attn(x)) + MLP(LN_mlp(x))`.
 //! - **Rotary Embedding (RoPE)**: Applied to queries and keys per attention head.
 
-use std::sync::Arc;
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::error::{Error, Result};
+use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 // ---------------------------------------------------------------------------
 // LayerNorm

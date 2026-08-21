@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 
 use grim_core::error::{Error, Result};
 use grim_core::model::AdapterHandle;
-use grim_core::rng::SimpleRng;
 use grim_core::session::SessionT;
 use grim_core::{CausalLm, Model, ModelConfig};
 use grim_tensor::{ArithType, Device, Tensor};

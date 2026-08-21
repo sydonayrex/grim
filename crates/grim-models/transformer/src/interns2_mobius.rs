@@ -6,11 +6,11 @@
 //! - **SwiGLU FFN**: $w_1$ (gate), $w_3$ (up), and $w_2$ (down) feed-forward projections with RMSNorm normalization.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::error::{Error, Result};
+use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
-use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
+use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 // ---------------------------------------------------------------------------
 // Config

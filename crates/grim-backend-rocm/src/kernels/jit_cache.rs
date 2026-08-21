@@ -195,7 +195,7 @@ mod tests {
             &spec,
             0x1234567890abcdefu64,
         );
-        let s = key.to_key_string();
+        let _s = key.to_key_string();
         let key2 = JitCacheKey::from_spec(
             "grim_qkv_attention",
             "gfx90a",
@@ -210,7 +210,7 @@ mod tests {
     fn hsaco_kernel_cache_insert_and_get() {
         let cache = HsacoKernelCache::new();
         let key = "test_key_1";
-        let path = std::path::PathBuf::from("/tmp/test_kernel.ptx");
+        let _path = std::path::PathBuf::from("/tmp/test_kernel.ptx");
         let src = "kernel void test() {}";
         cache.cache_kernel(key, src, &[0u8; 8], "test_kernel").expect("cache_kernel should succeed");
         let got = cache.get_cached_kernel(key);

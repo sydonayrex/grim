@@ -24,7 +24,6 @@
 //! Reference: rockit-holon.md H.4 (FlashInfer-Bench-style apply() dynamic substitution),
 //! H.3 step 1 (persist reduced-space measured samples); WRECK-1 in wreck-it.md.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

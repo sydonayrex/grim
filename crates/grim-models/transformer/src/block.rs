@@ -1164,7 +1164,7 @@ mod tests {
         let q = block.wq.forward(&x_norm).unwrap();
         let k = block.wk.forward(&x_norm).unwrap();
         let v = block.wv.forward(&x_norm).unwrap();
-        let q_rot = block
+        let _q_rot = block
             .apply_rope_multi_head(&q, &positions, cfg.local_num_heads)
             .unwrap();
         let k_rot = block
@@ -1186,7 +1186,7 @@ mod tests {
         )));
         let kv = PagedKvCache::new(pool, cfg.local_num_kv_heads, cfg.head_dim, BLOCK_SIZE);
         let mut inner = Inner::with_kv(Device::Cpu, Box::new(kv));
-        let mut sess: &mut dyn grim_core::session::SessionT = &mut inner;
+        let sess: &mut dyn grim_core::session::SessionT = &mut inner;
         // Append the 4 post-RoPE K/V tokens one at a time (decode-style) so
         // the page layout matches what the paged kernel expects.
         for t in 0..4 {

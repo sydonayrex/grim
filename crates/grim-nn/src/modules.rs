@@ -1824,7 +1824,7 @@ impl MlaAttention {
         let kv_vec = kv_b.to_vec_f32()?;
 
         let qn_stride = self.num_heads * self.qk_nope_head_dim;
-        let qr_stride = self.num_heads * self.qk_rope_head_dim;
+        let _qr_stride = self.num_heads * self.qk_rope_head_dim;
         let v_stride = self.num_heads * self.v_head_dim;
 
         // Split Q into per-head [nope | rope] and KV into per-head [nope | rope | v].

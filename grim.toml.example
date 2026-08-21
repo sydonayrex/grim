@@ -1,0 +1,22 @@
+[server]
+default_model = "model.grim"
+max_batched_tokens = 4096
+max_num_seqs = 64
+target_ttft_ms = 200
+target_itl_ms = 30
+
+[train]
+dataset = ["./data/train.jsonl"]
+mix_weights = []
+dedup = false
+lora_plus_ratio = 1.0
+relora_reset_steps = 0
+use_oft = false
+oft_rank = 8
+eval = "./data/eval.jsonl"
+eval_every_steps = 50
+eval_warmup_steps = 10
+
+[template]
+family = "chatml"
+override_path = ""

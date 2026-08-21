@@ -70,6 +70,15 @@ curl -X POST http://localhost:11434/v1/chat/completions \
   }'
 ```
 
+## Sampling
+
+Grim supports fine-grained sampling parameter configuration:
+
+- **Server Defaults**: When launching `grim run --serve` or `grim serve`, command-line flags (`--temperature`, `--top-p`, `--top-k`, `--repeat-penalty`, `--seed`) set the default sampling policy for requests that omit these parameters.
+- **Per-Request Overrides**: Clients sending requests to `POST /v1/chat/completions` or `POST /api/generate` can override any sampling parameter per request in the JSON payload (e.g. `"temperature": 0.2`, `"top_p": 0.95`).
+
+---
+
 ## What Can Go Wrong
 
 - **Model not found**: If the requested model is not downloaded or the path is incorrect, Grim will return a missing model error. **Recovery**: Ensure the model is available by running `grim check` or pull it using `grim dl`.

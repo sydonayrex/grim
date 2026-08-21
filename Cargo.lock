@@ -2255,7 +2255,6 @@ dependencies = [
  "grim-backend-metal",
  "grim-backend-rocm",
  "grim-backend-vulkan",
- "grim-constrain",
  "grim-core",
  "grim-disagg",
  "grim-engine",
@@ -2280,6 +2279,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "windows-service",
  "zstd",
 ]
@@ -2586,6 +2586,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tower",
  "wat",
 ]

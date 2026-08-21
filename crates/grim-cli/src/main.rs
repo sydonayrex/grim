@@ -7,21 +7,27 @@ pub mod arch_plugin;
 pub mod bench;
 pub mod catalog;
 pub mod client;
+pub mod config;
 pub mod cp;
 pub mod doctor;
 pub mod echo;
+pub mod eval;
+pub mod multimodal;
 pub mod oxidizer;
 pub mod plugin;
 pub mod progress;
+pub mod provenance;
 pub mod reap;
 pub mod rm;
 pub mod run;
+pub mod scheduler;
 pub mod server;
 pub mod service;
 pub mod show;
 pub mod spec;
 pub mod start;
 pub mod stop;
+pub mod template_registry;
 pub mod train;
 pub mod tui;
 pub mod tune;
@@ -108,13 +114,13 @@ enum Commands {
         /// Preferred ROCm profile (cdna2/cdna3/rdna2/rdna3/rdna4/auto). Never forces conversion on its own.
         #[arg(long)]
         rocml_profile: Option<String>,
-        /// Sampling temperature (0 = greedy).
+        /// Sampling temperature (0 = greedy). Sets server default; overridable per request.
         #[arg(long, default_value = "0.7")]
         temperature: f32,
-        /// Top-p (nucleus) sampling threshold.
+        /// Top-p (nucleus) sampling threshold. Sets server default; overridable per request.
         #[arg(long, default_value = "0.9")]
         top_p: f32,
-        /// Top-k sampling limit (0 = disabled).
+        /// Top-k sampling limit (0 = disabled). Sets server default; overridable per request.
         #[arg(long, default_value = "40")]
         top_k: u32,
         /// Maximum tokens to generate.
@@ -126,7 +132,7 @@ enum Commands {
         /// Target compute device (e.g. cpu, cuda, rocm, vulkan, metal).
         #[arg(long)]
         device: Option<String>,
-        /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama.
+        /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama. Sets server default; overridable per request.
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
     },
@@ -266,6 +272,7 @@ enum Commands {
         model: Option<String>,
     },
     /// Run hardware-adaptive JIT kernel tuning and persist optimized tile configurations.
+    /// Run hardware-adaptive JIT kernel tuning and persist optimized tile configurations.
     Tune {
         /// GPU device ordinal to tune (default 0).
         #[arg(long, default_value_t = 0)]
@@ -274,10 +281,11 @@ enum Commands {
         #[arg(short, long)]
         output_dir: Option<String>,
     },
-    /// Quantize a model.
-    Quantize,
     /// Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
     Train {
+        /// Quick preset: sets low-rank LoRA defaults for rapid experimentation.
+        #[arg(long)]
+        quick: bool,
         /// Base model path or catalog name.
         #[arg(short, long)]
         model: String,
@@ -323,7 +331,7 @@ enum Commands {
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
-        /// Training mode (e.g. "qlora", "lora", "full-bf16", "full-fp16", "soul-eater").
+        /// Training mode (e.g. "qlora", "lora", "full-bf16", "full-fp16", "soul-eater", "oft").
         #[arg(long, default_value = "qlora")]
         mode: String,
         /// Enable SCALE-ECHO echo training mode. Bypasses the autograd tape
@@ -355,9 +363,61 @@ enum Commands {
         /// Weight of the OLoRA orthogonality penalty.
         #[arg(long, default_value_t = 1.0)]
         olora_lambda: f32,
+        /// LoRA+: differential learning rate ratio for B matrix (default: 1.0).
+        #[arg(long, default_value_t = 1.0)]
+        lora_plus_ratio: f32,
+        /// ReLoRA: merge adapters into base weights and reset momentum every N steps (0 = disabled).
+        #[arg(long, default_value_t = 0)]
+        relora_reset_steps: usize,
+        /// Use OFT (Orthogonal Fine-Tuning) instead of standard LoRA.
+        #[arg(long)]
+        use_oft: bool,
+        /// OFT rank. Lower = more parameter efficient.
+        #[arg(long, default_value_t = 8)]
+        oft_rank: usize,
+        /// Held-out evaluation dataset path.
+        #[arg(long)]
+        eval_dataset: Option<String>,
+        /// Run evaluation every N steps. 0 = disabled.
+        #[arg(long, default_value_t = 0)]
+        eval_every_steps: usize,
+        /// Warmup steps before starting evaluation.
+        #[arg(long, default_value_t = 0)]
+        eval_warmup_steps: usize,
+        /// Additional training dataset paths for multi-file weighted mixing.
+        #[arg(long = "dataset-path")]
+        dataset_paths: Vec<String>,
+        /// Mixing weights per dataset path, comma-separated (e.g. "1.0,2.0").
+        #[arg(long)]
+        mix_weights: Option<String>,
+        /// Deduplicate identical token sequences across mixed datasets.
+        #[arg(long)]
+        dedup: bool,
+    },
+    /// Manage and inspect chat templates.
+    Templates {
+        #[command(subcommand)]
+        cmd: TemplatesCmd,
+    },
+    /// Multimodal commands (Vision, Audio, Diffusion).
+    Multimodal {
+        #[command(subcommand)]
+        cmd: multimodal::MultimodalCmd,
+    },
+    /// Query live continuous batching scheduler queues and KV cache memory tiers.
+    Scheduler {
+        /// Server address to query (defaults to 127.0.0.1:11434).
+        #[arg(short, long, default_value = "127.0.0.1:11434")]
+        addr: String,
+    },
+    /// Verify model integrity, checksums, and catalog provenance.
+    Provenance {
+        /// Path to model file to inspect.
+        path: std::path::PathBuf,
     },
     /// Convert a model file to ROCm-optimized .grim format using Oxidizer.
     /// Supports GGUF (.gguf), GGML (.ggml), safetensors (.safetensors), and PyTorch (.bin).
+    /// Tip: Use `grim oxidizer convert` for the full calibrate -> search -> write evolutionary pipeline.
     Convert {
         /// Path to input model file (.gguf, .ggml, .safetensors, or .bin).
         #[arg(short, long)]
@@ -449,6 +509,7 @@ enum Commands {
         model: Option<std::path::PathBuf>,
     },
     /// ROCm-optimized GGUF conversion tool — calibrate, search, and convert.
+    /// Tip: For one-shot GGUF -> .grim conversion, use `grim convert`.
     Oxidizer {
         #[command(subcommand)]
         subcommand: OxidizerCommands,
@@ -461,6 +522,25 @@ enum Commands {
         /// Verbose output (show per-tensor details).
         #[arg(short, long)]
         verbose: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TemplatesCmd {
+    /// List all known built-in chat template families.
+    List,
+    /// Inspect the Jinja template and description of a chat template family.
+    Inspect {
+        /// Name of the template family (e.g. "chatml", "llama3", "qwen", "mistral", "gemma").
+        family: String,
+    },
+    /// Render a template family against a JSON file containing a messages array.
+    Render {
+        /// Name of the template family.
+        family: String,
+        /// Path to JSON file containing a list of {role, content} objects.
+        #[arg(short, long)]
+        input: String,
     },
 }
 
@@ -1080,20 +1160,20 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Quantize => {
-            // WI-5: the redirect previously named `grim oxidize`, which is not
-            // a real subcommand — following it produced a clap "unrecognized
-            // subcommand" error, so the stub sent users to a dead end. The
-            // actual commands are `oxidizer` (calibrate/search/convert
-            // pipeline) and `convert` (one-shot GGUF -> .grim).
-            println!(
-                "`grim quantize` is a stub. Quantization is available via:\n  \
-                 grim convert -i <input.gguf> -o <output.grim> --target-bpw 4.0\n  \
-                 grim oxidizer convert --help    # full calibrate -> search -> write pipeline\n\
-                 Run `grim oxidizer --help` for all conversion and quantization options."
-            );
+        Commands::Multimodal { cmd } => {
+            if let Err(e) = multimodal::cmd_multimodal(cmd) {
+                eprintln!("[grim multimodal] Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Scheduler { addr } => {
+            scheduler::cmd_scheduler(&addr).await?;
+        }
+        Commands::Provenance { path } => {
+            provenance::cmd_provenance(&path)?;
         }
         Commands::Train {
+            quick,
             model,
             dataset,
             output,
@@ -1118,15 +1198,59 @@ async fn main() -> Result<()> {
             echo_mode,
             seed,
             train_dtype,
+            lora_plus_ratio,
+            relora_reset_steps,
+            use_oft,
+            oft_rank,
+            eval_dataset,
+            eval_every_steps,
+            eval_warmup_steps,
+            dataset_paths,
+            mix_weights,
+            dedup,
         } => {
+            // Load grim.toml defaults if available
+            let cfg_toml = grim_cli::config::GrimToml::from_path("grim.toml").unwrap_or_default();
+            let effective_lora_plus = if (lora_plus_ratio - 1.0).abs() > 1e-5 {
+                lora_plus_ratio
+            } else {
+                cfg_toml.train.lora_plus_ratio
+            };
+            let effective_relora_steps = if relora_reset_steps != 0 {
+                relora_reset_steps
+            } else {
+                cfg_toml.train.relora_reset_steps
+            };
+            let effective_use_oft = use_oft || cfg_toml.train.use_oft;
+            let effective_oft_rank = if oft_rank != 8 { oft_rank } else { cfg_toml.train.oft_rank };
+            let effective_eval_ds = eval_dataset.or(cfg_toml.train.eval);
+            let effective_eval_every = if eval_every_steps != 0 { eval_every_steps } else { cfg_toml.train.eval_every_steps };
+            let effective_eval_warmup = if eval_warmup_steps != 0 { eval_warmup_steps } else { cfg_toml.train.eval_warmup_steps };
+            let mut effective_paths = dataset_paths;
+            if effective_paths.is_empty() && !cfg_toml.train.dataset.is_empty() {
+                effective_paths = cfg_toml.train.dataset;
+            }
+            let effective_mix_weights = mix_weights
+                .map(|s| s.split(',').filter_map(|w| w.trim().parse::<f32>().ok()).collect())
+                .unwrap_or(cfg_toml.train.mix_weights);
+            let effective_dedup = dedup || cfg_toml.train.dedup;
+
+            // Apply --quick preset defaults if requested
+            let (final_epochs, final_rank, final_alpha, final_device, final_mode) = if quick {
+                println!("[grim train] Using --quick LoRA preset (1 epoch, rank 8, alpha 16.0, cpu device)");
+                (1, 8, 16.0, "cpu".to_string(), "lora".to_string())
+            } else {
+                (epochs, rank, alpha, device, mode)
+            };
+
             let opts = train::TrainOptions {
                 model_path: model,
                 dataset_path: dataset,
                 output_sidecar: output,
-                epochs,
+                epochs: final_epochs,
                 lr,
-                rank,
-                alpha,
+                rank: final_rank,
+                alpha: final_alpha,
                 batch_size,
                 gradient_accumulation_steps,
                 warmup_steps,
@@ -1134,8 +1258,8 @@ async fn main() -> Result<()> {
                 max_grad_norm,
                 early_stopping_patience,
                 num_gpus,
-                device,
-                mode,
+                device: final_device,
+                mode: final_mode,
                 optimizer,
                 scheduler,
                 use_pissa,
@@ -1145,10 +1269,61 @@ async fn main() -> Result<()> {
                 seed,
                 train_dtype,
                 use_spectral_qlora: false,
+                lora_plus_ratio: effective_lora_plus,
+                relora_reset_steps: effective_relora_steps,
+                use_oft: effective_use_oft,
+                oft_rank: effective_oft_rank,
+                eval_dataset: effective_eval_ds,
+                eval_every_steps: effective_eval_every,
+                eval_warmup_steps: effective_eval_warmup,
+                dataset_paths: effective_paths,
+                mix_weights: effective_mix_weights,
+                dedup: effective_dedup,
+                quick,
             };
             if let Err(e) = train::cmd_train(opts) {
                 eprintln!("[grim train] Failed: {e}");
                 std::process::exit(1);
+            }
+        }
+        Commands::Templates { cmd } => match cmd {
+            TemplatesCmd::List => {
+                println!("{:<12} {}", "FAMILY", "DESCRIPTION");
+                println!("{:<12} {}", "------", "-----------");
+                for f in grim_cli::template_registry::TemplateRegistry::default() {
+                    println!("{:<12} {}", f.name, f.description);
+                }
+            }
+            TemplatesCmd::Inspect { family } => {
+                if let Some(f) = grim_cli::template_registry::TemplateRegistry::lookup(&family) {
+                    println!("--- {} ---\n{}\n\nJinja Template:\n{}", f.name, f.description, f.jinja);
+                } else {
+                    eprintln!("Unknown template family: '{family}'. Run 'grim templates list' for available families.");
+                    std::process::exit(1);
+                }
+            }
+            TemplatesCmd::Render { family, input } => {
+                let text = match std::fs::read_to_string(&input) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Failed to read input JSON file '{}': {}", input, e);
+                        std::process::exit(1);
+                    }
+                };
+                let msgs: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Failed to parse JSON in '{}': {}", input, e);
+                        std::process::exit(1);
+                    }
+                };
+                match grim_cli::template_registry::render_family(&family, msgs) {
+                    Ok(out) => println!("{out}"),
+                    Err(e) => {
+                        eprintln!("Render error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Commands::Merge {

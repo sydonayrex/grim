@@ -175,6 +175,8 @@ pub struct Engine {
     /// Background KV receiver server handle (started in Engine::new when
     /// disagg_config is Some and role is Decode or Colocated).
     kv_receiver: Option<grim_disagg::KvReceiverServer>,
+    /// Set GRIM_RADIX=on to enable prefix-cache reuse on prefill (WP5).
+    pub radix_enabled: bool,
 }
 
 impl Engine {
@@ -356,6 +358,9 @@ impl Engine {
             last_ttft_ms: None,
             tp_config,
             kv_receiver,
+            radix_enabled: std::env::var("GRIM_RADIX")
+                .map(|v| v == "on" || v == "1" || v == "true")
+                .unwrap_or(false),
         }
     }
 
@@ -650,6 +655,20 @@ impl Engine {
             .filter(|v| !v.is_empty() && v.len() == prompt_tokens)
             .unwrap_or_else(|| (0..prompt_tokens as u32).collect());
 
+        if self.radix_enabled && !full_input.is_empty() {
+            let (matched_blocks, matched_tokens, _exact) = {
+                let mut pool = self.block_pool.lock().unwrap();
+                pool.match_prefix_promoting(&full_input)
+            };
+            if !matched_blocks.is_empty() {
+                eprintln!(
+                    "[grim-engine] req {id} radix hit: {}/{} tokens",
+                    matched_tokens,
+                    full_input.len()
+                );
+            }
+        }
+
         let ids = grim_backend_cpu::cpu_tensor(
             full_input.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
             grim_tensor::Shape::new(vec![prompt_tokens]),
@@ -665,6 +684,17 @@ impl Engine {
             // forward already advanced it via `session.advance_pos(seq_len)`.
             // The engine does *not* double-count.
             self.last_outcomes.insert(id, outcome);
+
+            // Radix prefix cache: register computed KV blocks for future prefix reuse
+            if self.radix_enabled && !full_input.is_empty() {
+                if let Some(session) = self.sessions.get(&id) {
+                    if let Some(block_table) = session.block_table() {
+                        let usize_blocks: Vec<usize> = block_table.iter().map(|&b| b as usize).collect();
+                        let mut pool = self.block_pool.lock().unwrap();
+                        pool.insert_prefix(&full_input, &usize_blocks);
+                    }
+                }
+            }
 
             // Disaggregation handoff: if disagg_router is configured for Prefill role,
             // stream real KV blocks generated during prefill over the network to the decode node.
@@ -1749,5 +1779,32 @@ mod tests {
             paged_decode.to_vec_f32().unwrap(),
             "decode logits must match between paged and non-paged paths"
         );
+    }
+
+    #[test]
+    fn prefix_cache_reuses_blocks_for_shared_prefix() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.radix_enabled = true;
+
+        let prompt1 = vec![101u32, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116];
+        let block_ids1: Vec<usize> = vec![10];
+
+        // Insert prefix for prompt1 into block pool
+        {
+            let mut pool = engine.block_pool.lock().unwrap();
+            pool.insert_prefix(&prompt1, &block_ids1);
+        }
+
+        // Query with prompt2 that shares the same prefix
+        let mut prompt2 = prompt1.clone();
+        prompt2.extend_from_slice(&[201, 202]);
+
+        let (matched_blocks, matched_tokens, _) = {
+            let mut pool = engine.block_pool.lock().unwrap();
+            pool.match_prefix_promoting(&prompt2)
+        };
+
+        assert_eq!(matched_tokens, 16);
+        assert_eq!(matched_blocks, block_ids1);
     }
 }

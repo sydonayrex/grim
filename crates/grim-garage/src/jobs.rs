@@ -2699,7 +2699,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 };
 
                 // Simple reward signal for GRPO: chosen minus rejected logp.
-                let rewards: Vec<f32> = chosen_logps
+                let _rewards: Vec<f32> = chosen_logps
                     .iter()
                     .zip(rejected_logps.iter())
                     .map(|(&c, &r)| c - r)

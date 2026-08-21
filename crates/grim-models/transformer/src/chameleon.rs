@@ -5,11 +5,11 @@
 //! - **GQA Attention & SwiGLU MLP**: Standard Grouped Query Attention with RoPE and SwiGLU feed-forward networks.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::error::{Error, Result};
+use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 use crate::falcon::LayerNorm;
 

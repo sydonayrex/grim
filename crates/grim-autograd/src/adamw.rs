@@ -361,6 +361,14 @@ impl Optimizer {
         }
     }
 
+    /// Reset momentum buffers for specified parameter IDs.
+    pub fn reset_momentum_for(&mut self, ids: &[ParamId]) {
+        match self {
+            Optimizer::AdamW(o) => o.reset_momentum_for(ids),
+            _ => {}
+        }
+    }
+
     /// Recreate this optimizer for another rank and copy its serialized
     /// moments/state into the target parameter registry. This is the
     /// rank-replica primitive: a new rank must not restart Adam moments.
@@ -469,6 +477,7 @@ pub struct AdamWConfig {
     pub beta2: f32,
     pub eps: f32,
     pub weight_decay: f32,
+    pub lora_plus_ratio: f32,
 }
 
 impl Default for AdamWConfig {
@@ -479,6 +488,7 @@ impl Default for AdamWConfig {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 0.01,
+            lora_plus_ratio: 1.0,
         }
     }
 }
@@ -520,6 +530,14 @@ impl AdamW {
         self.step(params)
     }
 
+    /// Reset momentum buffers (m and v) for specified parameter IDs.
+    pub fn reset_momentum_for(&mut self, ids: &[ParamId]) {
+        for id in ids {
+            self.m.remove(id);
+            self.v.remove(id);
+        }
+    }
+
     /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
     pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
         if param.is_frozen() {
@@ -529,7 +547,11 @@ impl AdamW {
         let beta1 = self.config.beta1;
         let beta2 = self.config.beta2;
         let eps = self.config.eps;
-        let lr = self.config.lr;
+        let lr = if id.is_b_matrix() {
+            self.config.lr * self.config.lora_plus_ratio
+        } else {
+            self.config.lr
+        };
         let weight_decay = self.config.weight_decay;
 
         let sc = if self.step_count == 0 { 1 } else { self.step_count };

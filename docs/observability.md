@@ -64,3 +64,14 @@ pub struct TrainingProgressEvent {
     pub vram_used_bytes: u64,
 }
 ```
+
+---
+
+## 4. CLI Monitoring & Inspection
+
+Grim provides CLI utilities for inspecting live engine and server state:
+
+- **`grim status`**: Shows loaded models, compute processor, active backend, and numeric VRAM / KV-cache memory usage.
+- **`grim scheduler`**: Displays live scheduler queue statistics (`running`, `waiting`, `admitted`, `paused`) and KV block pool utilization.
+- **`GET /metrics`**: Standard Prometheus scrape target for dashboard integration (e.g. Grafana).
+

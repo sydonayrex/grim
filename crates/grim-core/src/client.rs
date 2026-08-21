@@ -954,8 +954,17 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
         val["processor"].as_str().unwrap_or("unknown")
     );
     println!(
-        "Default Model     : {}\n",
+        "Default Model     : {}",
         val["default_model"].as_str().unwrap_or("none")
+    );
+
+    let vram_used = val.get("vram_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let vram_total = val.get("vram_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let kv_used = val["kv_cache"].get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let kv_total = val["kv_cache"].get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    println!(
+        "Memory Allocation : VRAM {:.2} GB / {:.2} GB  |  KV Cache {:.2} GB / {:.2} GB\n",
+        vram_used, vram_total, kv_used, kv_total
     );
 
     // Loaded models table with all metrics in the model area

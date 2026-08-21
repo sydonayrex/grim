@@ -56,6 +56,11 @@ impl ParamId {
             is_a: true,
         }
     }
+
+    /// Check if this parameter represents a LoRA B matrix (up projection).
+    pub fn is_b_matrix(&self) -> bool {
+        !self.is_a
+    }
 }
 
 /// A trainable parameter tensor paired with its gradient accumulator.
