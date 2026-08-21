@@ -44,6 +44,7 @@ pub fn auto_configure_hsa_override(detected_arch: &str) -> Option<&'static str> 
         "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036" => Some("10.3.0"),
         "gfx1101" | "gfx1102" | "gfx1103" => Some("11.0.0"),
         "gfx1150" | "gfx1151" | "gfx1152" => Some("11.5.0"),
+        "gfx1200" | "gfx1201" => Some("12.0.0"),
         _ => None,
     };
     if let Some(ver) = override_ver {

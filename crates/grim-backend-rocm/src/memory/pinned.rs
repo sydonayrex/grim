@@ -100,3 +100,38 @@ impl<T> Drop for RocmPinnedBuffer<T> {
         }
     }
 }
+
+/// A thread-safe pool of reusable pinned host buffers for high-speed PCIe DMA streaming.
+pub struct PinnedStagingPool {
+    capacity_elements: usize,
+    free_buffers: std::sync::Mutex<Vec<RocmPinnedBuffer<u8>>>,
+}
+
+impl PinnedStagingPool {
+    /// Create a new pinned staging pool with pre-allocated buffer capacity.
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity_elements: capacity_bytes,
+            free_buffers: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Acquire a pinned host buffer of at least `min_bytes` capacity.
+    pub fn acquire(&self, min_bytes: usize) -> Result<RocmPinnedBuffer<u8>> {
+        let mut lock = self.free_buffers.lock().unwrap();
+        if let Some(pos) = lock.iter().position(|b| b.len() >= min_bytes) {
+            Ok(lock.swap_remove(pos))
+        } else {
+            let alloc_size = min_bytes.max(self.capacity_elements);
+            RocmPinnedBuffer::alloc(alloc_size)
+        }
+    }
+
+    /// Release a buffer back into the pool for reuse.
+    pub fn release(&self, buffer: RocmPinnedBuffer<u8>) {
+        let mut lock = self.free_buffers.lock().unwrap();
+        if lock.len() < 8 {
+            lock.push(buffer);
+        }
+    }
+}
