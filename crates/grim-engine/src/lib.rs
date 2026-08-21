@@ -415,6 +415,16 @@ impl Engine {
         }
     }
 
+    /// Maximum context limit (max batched tokens) configured for this engine.
+    pub fn context_limit(&self) -> usize {
+        self.config.max_batched_tokens
+    }
+
+    /// Total count of tokens generated since engine startup.
+    pub fn total_tokens_generated(&self) -> u64 {
+        self.total_tokens_generated
+    }
+
     pub fn register_model(&mut self, id: &str, model: Box<dyn CausalLm>) {
         self.register_speculative(id, model, None, None, None);
     }

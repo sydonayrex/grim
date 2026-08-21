@@ -33,3 +33,36 @@ fn workspace_root() -> PathBuf {
 pub fn rocm_include_dir() -> Option<PathBuf> {
     resolve_rocm_include_dir(&workspace_root())
 }
+
+/// Auto-configure `HSA_OVERRIDE_GFX_VERSION` for consumer GPUs / APUs
+/// if the variable is not explicitly set in the environment.
+pub fn auto_configure_hsa_override(detected_arch: &str) -> Option<&'static str> {
+    if std::env::var("HSA_OVERRIDE_GFX_VERSION").is_ok() {
+        return None;
+    }
+    let override_ver = match detected_arch {
+        "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036" => Some("10.3.0"),
+        "gfx1101" | "gfx1102" | "gfx1103" => Some("11.0.0"),
+        "gfx1150" | "gfx1151" | "gfx1152" => Some("11.5.0"),
+        _ => None,
+    };
+    if let Some(ver) = override_ver {
+        unsafe {
+            std::env::set_var("HSA_OVERRIDE_GFX_VERSION", ver);
+        }
+    }
+    override_ver
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auto_configure_hsa_override_known_consumer_targets() {
+        assert_eq!(auto_configure_hsa_override("gfx1036"), Some("10.3.0"));
+        assert_eq!(auto_configure_hsa_override("gfx1103"), Some("11.0.0"));
+        assert_eq!(auto_configure_hsa_override("gfx1150"), Some("11.5.0"));
+        assert_eq!(auto_configure_hsa_override("gfx90a"), None);
+    }
+}

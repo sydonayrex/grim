@@ -15,10 +15,15 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);
+    #[cfg(feature = "q4k")]
     s.push_str(crate::kernels::q4k_gemm::KERNEL_SOURCE);
+    #[cfg(feature = "q5k")]
     s.push_str(crate::kernels::q5k_gemm::KERNEL_SOURCE);
+    #[cfg(feature = "q6k")]
     s.push_str(crate::kernels::q6k_gemm::KERNEL_SOURCE);
+    #[cfg(feature = "q2k")]
     s.push_str(crate::kernels::q2k_gemm::KERNEL_SOURCE);
+    #[cfg(feature = "q3k")]
     s.push_str(crate::kernels::q3k_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);

@@ -55,6 +55,62 @@ rocm-aiter = ["rocm"]
 cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys", "rocm"]
 rccl = ["rocm"]
 
+# ── Quant variant feature gates ─────────────────────────────────────────────
+# Each gate controls one quant family's kernel modules, their wmma/charon/moe
+# siblings, and the corresponding HsaoKernelCache wiring. All gates default OFF
+# so the crate compiles lean in `--no-default-features` mode and each variant
+# can be opt-in verified independently (cargo check --features q4k,q5k,fp8).
+#
+# Families present in src/kernels/mod.rs and src/kernels/{family}/*.rs:
+#   q2k, q3k, q4k, q5k, q6k, q8_0, iq2/iq3/iq4, fp8, mxfp4, mxfp8
+# Each gate enables the same set of submodules for that family:
+#   - {family}_gemm          (fused forward + backward, where present)
+#   - {family}_dequant        (standalone dequant, where present)
+#   - charon sibling:        charon.rs emits grim_moe_fused_grouped_{variant}
+#   - wmma sibling:          wmma_gemm.rs emits grim_fused_dequant_gemm_wmma_{variant}
+#   - cache type:            HsaoKernelCache registers the variant's KERNEL_SOURCE
+#                            via kernels::source_asm / kernels::jit_cache
+#                            (no additional gate needed — registration is in mod.rs)
+# Parity check (see docs/VERIFICATION_QUANT_PARITY.md):
+#   for each enabled feature F:
+#     1. src/kernels/mod.rs has `#[cfg(feature = "F")]` pub mod {family}
+#     2. src/kernels/{family}/*.rs compiles (cargo check --features F)
+#     3. charon.rs emits the {variant} kernel symbol for that family
+#     4. wmma_gemm.rs emits the {variant} wmma symbol for that family
+#     5. HsaoKernelCache key includes the {variant} marker (source_asm assembly)
+#   end
+#
+# Families without a dedicated gate today (present in mod.rs, always-on):
+#   q8_0_dequant — kept unconditionally because Q8_0 is the KV-cache dequant
+#                    default path (kernels::kv_dequant_attention hardcodes q8_0 byte
+#                    layout and the test suite exercises it as the baseline).
+#   fp8_standalone + fp8_gemm_rdna4 — kept unconditionally because fp8 is a
+#                    first-class compute dtype (E4M3) with native MFMA on gfx1200
+#                    and the charon forward/backward paths reference fp8 symbols
+#                    unconditionally.
+#   mxfp4_gemm + mxfp_standalone — kept unconditionally because mxfp4 is the
+#                    primary 4-bit training/inference dtype on RDNA4 and charon
+#                    emits grim_moe_fused_grouped_mxfp4 unconditionally.
+#   iq_dequant + iq_gemm — kept unconditionally because IQ-family dequant kernels
+#                    are the crowd-tier baseline for Q2_XXS/Q3_XXS/Q4_XXS and the
+#                    test suite exercises them in parity tests.
+# Rationale: gating q8_0/fp8/mxfp4/iq would require auditing every caller that
+# assumes those symbols exist (charon.rs, wmma_gemm.rs, kv_dequant_attention.rs,
+# source_asm.rs, jit_cache.rs). The gated families below (q2k/q3k/q4k/q5k/q6k)
+# are the isolated GEMM paths with no cross-module symbol dependencies outside
+# their own {family} directory, so they're the safe first-cut for feature gating.
+q2k = []
+q3k = []
+q4k = []
+q5k = []
+q6k = []
+# Future gates (not yet wired — listed for parity, not enabled):
+# mxfp4 = []
+# mxfp8 = []
+# fp8 = []
+# iq = []
+# q8_0 = []
+
 [dev-dependencies]
 grim-quant = { workspace = true }
 grim-nn = { workspace = true }

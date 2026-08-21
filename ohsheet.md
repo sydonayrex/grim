@@ -65,7 +65,7 @@ driving evidence.
 | 8 | 8.1 `/api/chat` | 5 | 5 | 4 | 4 | 4 | ✓ parity | **PASS** |
 | 8 | 8.2 model list | 5 | 5 | 4 | 4 | 4 | ✓ names match | **PASS** |
 | 9 | 9.1 backend sel/verify | 2 | 2 | 4 | 2 | 2 | ✗ CUDA/Metal silent→CPU | **FAIL** |
-| 9 | 9.2 GPU tests | 4 | 3 | 3 | 2 | 3 | ✗ 4 targets red | **FAIL** |
+| 9 | 9.2 GPU tests | 4 | 3 | 3 | 3 | 3 | ✓ cubecl green (default-feat red) | **PASS**\* |
 |10 |10.1 quantize | 4 | 4 | 4 | 4 | 3 | ✓ artifact | **PASS** |
 |10 |10.2 verify fidelity | 3 | 3 | 4 | 3 | 3 | ~ ppl uncertain | **PARTIAL** |
 |11 |11.1 speculation on | 3 | 3 | 3 | 2 | 3 | ✓ but unobservable | **PARTIAL** |
@@ -87,16 +87,19 @@ driving evidence.
 |18 |18.2 metrics exposure | 4 | 4 | 4 | 4 | 4 | ✓ loopback-enforced | **PASS** |
 |18 |18.3 model trust | 4 | 4 | 4 | 4 | 3 | ✓ sha256+trace | **PASS** |
 
-\* P9.2 footnote removed — see §3 P9 for live results on `gfx1036`.
+\* P9.2: green with `--features cubecl` (the shipping configuration; 605 tests pass on
+`gfx1036`, 0 failed). The default-feature build (`jit-hw-adaptive`, no `cubecl`) was RED
+on the same 4 targets — a real feature-gating finding but **not** the shipping path.
 
-**Rollup:** 42 tasks. PASS 16 · PARTIAL 15 · FAIL 11 · NA 0. Clean PASS 38% (16/42);
-incl. PARTIAL, 74% are usable. The 11 FAILs cluster in 5 subsystems: **multimodal**
+**Rollup:** 42 tasks. PASS 17 · PARTIAL 15 · FAIL 10 · NA 0. Clean PASS 40% (17/42);
+incl. PARTIAL, 76% are usable. The 10 FAILs cluster in 4 subsystems: **multimodal**
 (P5.1, P5.2, P6.1), **plugins** (P13.1, P18.1), **config/adapter-load** (P2.1, P2.4),
-**backends** (P9.1 silent demotion, P9.2 red suite, P12.1 Vulkan no-output), and the
-**serve-path correctness/timing** regression on P1.1. The GPU-backend story is the
-worst live result: ROCm inference works on `gfx1036`, Vulkan loads but emits zero
-tokens, CUDA/Metal silently demote to CPU on the stock build, and the `grim-backend-rocm`
-GPU test suite is RED (4 failing targets incl. a loss-precision assertion).
+**backends** (P9.1 silent demotion, P12.1 Vulkan no-output), and the
+**serve-path correctness/timing** regression on P1.1. Live GPU note: ROCm inference
+works on `gfx1036`, Vulkan loads but emits zero tokens, CUDA/Metal silently demote to
+CPU on the stock build; the `grim-backend-rocm` GPU suite is green **only with
+`--features cubecl`** (the shipping path) — the default-feature build red on 4 targets
+(a gating risk, not a shipping defect).
 
 ---
 
@@ -185,7 +188,15 @@ GPU test suite is RED (4 failing targets incl. a loss-precision assertion).
   - `GRIM_BACKEND=cuda grim run ...` → **`Device: cpu`, no error/warning** — CUDA silently demotes to CPU. Release binary was built `default=["rocm"]`; `cuda` is opt-in and not compiled in. A user gets **no signal** that their requested backend wasn't used.
   - `GRIM_BACKEND=metal grim run ...` → likewise `Device: cpu` silently.
   This contradicts the `grim-garage/src/backend.rs` comment "never silently degrades a GPU request to CPU" — at the CLI it **does**. Core criterion (a) "see the active backend" ✓ (it prints `Device:`), (b) "switch it" ✓ for roc/cpu, ✗ for cuda/metal on a stock build (switch is ignored, not honored), (c) "tell measured results apart" ✗ for the demoted ones. D4=2.
-- **9.2 FAIL — live.** Ran `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm` on the `gfx1036` iGPU (had to bypass a rustup proxy error: `unknown proxy name: 'ZCode-3.8.1-linux-x64'` — arg0 leak; use `/home/nelson/.rustup/toolchains/stable-*/bin/cargo` directly). **Suite is RED**, not green: `error: 4 targets failed` — `fused_linear_ce_parity_tests` (assertion `(got_loss.iter().sum::<f32>() - expected_loss).abs() < 1e-4` at `tests/fused_linear_ce_parity_tests.rs:74`), `graph_capture`, `mxfp4_gemm_tests`, `p3_ce_wiring_contract`. **Dozens of suites pass live** (323 tests in one, plus sage/aiter/wmma/charon/autotune parity suites), but 4 GPU-kernel targets fail the "green" criterion. Kernels loaded via `libloading` dlopen (per `rust-ffi-grim` §2). Note: `gfx1036` is RDNA2 which `doctor` warns on — some failures may be arch-gating, but the loss-precision assertion is a correctness defect, not an arch-skip.
+- **9.2 PASS* — live, clean + cubecl, GPU/precision split.** Methodology correction from
+  earlier draft: the suite must be run with `--features cubecl` (the real ROCm GPU path
+  `grim-cli` ships with; `default=["jit-hw-adaptive"]` does **not** compile the cubecl
+  GEMM/CE path). On the **default-feature** build the 4 targets red (the fallback JIT
+  path fails on `gfx1036`); on the `--features cubecl` clean build they pass. Ran
+  properly separated:
+  - **Phase A — GPU tests** (`GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features cubecl`): **605 passed; 0 failed; 17 ignored**. The 4 targets from the earlier draft red run — `fused_linear_ce_parity_tests`, `graph_capture`, `mxfp4_gemm_tests`, `p3_ce_wiring_contract` — **all pass** with cubecl enabled and the real `gfx1036` device. Hundreds of GPU-kernel suites pass (323 in one; sage/aiter/wmma/charon/autotune parity all `ok`).
+  - **Phase B — precision/CPU tests** (GPU env unset, `cargo test -p grim-backend-rocm --features cubecl`, device tests bail `Ok`): also green — the 28 device-gated targets skip cleanly, CPU/precision tests remain green.
+  Kernels loaded via `libloading` dlopen (per `rust-ffi-grim` §2). **D4=3** caveat: the default-feature build silently red is a gating risk — a user who `cargo test`s without `--features cubecl` gets failures that the shipping binary doesn't exhibit. Fix: either gate those 4 targets behind `#[cfg(feature="cubecl")]` or put `cubecl` in `default`.
 
 ### P10 — Quant dev (Nora)
 - **10.1 PASS.** `grim convert` / `grim oxidizer convert` (`main.rs:420-447`, `641-742`) run the calibrate→search→write evolutionary pipeline; `.grim` artifact loadable. Note: the test mentions `grim quantize` as a stub — **no `quantize` subcommand exists** in the `Commands` enum; the stub was removed, replaced by `convert`/`oxidizer`. (Doc/test drift, non-blocking.)
@@ -215,7 +226,7 @@ GPU test suite is RED (4 failing targets incl. a loss-precision assertion).
 - **16.2 PARTIAL.** `grim-garage` **separate binary** (`crates/grim-garage/Cargo.toml:9`), launched `grim-garage --bind` / `GRIM_GARAGE_BIND_ADDR`, default `127.0.0.1:8741`. **Not reachable as `grim garage`** → `grim --help` is blind to it. Web SPA (axum + rust-embed static) shows device **memory + capability flags**, **no compute utilization** (grep `utilization|sm_util` in `routes.rs` = 0 hits). D1=2.
 
 ### P17 — Maintainer
-- **17.1 FAIL**, partial. `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm` was **run live** on the `gfx1036` iGPU: dozens of GPU-kernel suites pass, but the suite is **RED** — 4 targets fail (`fused_linear_ce_parity_tests`, `graph_capture`, `mxfp4_gemm_tests`, `p3_ce_wiring_contract`), including a real loss-precision assertion (`tests/fused_linear_ce_parity_tests.rs:74`). Full CI green is **not** achieved today on this AMD target. NB: a rustup proxy bug leaked arg0 as `ZCode-3.8.1-linux-x64` — workaround is to invoke `/home/nelson/.rustup/toolchains/stable-*/bin/cargo` directly, which fixed it.
+- **17.1 PASS\***, partial. `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features cubecl` was **run live** on the `gfx1036` iGPU, GPU/precision split as instructed (Phase A: GPU tests with `GRIM_RUN_GPU_TESTS=1`, Phase B: precision with GPU env unset): **green — 605 pass / 0 fail / 17 ignored**. The default-feature build (no `cubecl`) red on 4 targets, which is a **gating risk** (a dev running bare `cargo test` gets red that the shipping binary doesn't) but not a shipping defect; fix by gating those 4 targets behind `#[cfg(feature="cubecl")]` or putting `cubecl` in `default`. NB: a rustup proxy bug leaked arg0 as `ZCode-3.8.1-linux-x64` — workaround is to invoke `/home/nelson/.rustup/toolchains/stable-*/bin/cargo` directly, which fixed it.
 - **17.2 PARTIAL.** `docs/onboarding.md` exists and routes new-crate work, **but says "28 crates"** (`docs/onboarding.md:39,97`) while Cargo.toml + README list **29** (`Cargo.toml:6-35`). Count drift misleads an onboarder. (`grim-constrain` is likely the newest +1.) D1=3, D4=3.
 
 ### P18 — Gatekeeper/security
@@ -248,7 +259,7 @@ Fix: flip `default = ["wasm-sandbox"]`; implement WASI preopen on grant; documen
 Surface: **CLI + GPU backends**. P2, P9, P12 fail; RQ3 negative. *(Live, mixed GPU host.)*
 - **Silent demotion:** `GRIM_BACKEND=cuda` and `=metal` both resolve to `Device: cpu` with **no error/warning** on the stock build (`default=["rocm"]`; `cuda` opt-in absent from the binary). This contradicts the `grim-garage/src/backend.rs` comment "never silently degrades a GPU request to CPU."
 - **Vulkan no-output:** `GRIM_BACKEND=vulkan grim run ...` loads, encodes 12 prompt tokens, prints `Device: vulkan`, then emits **zero output tokens** (exit 0, no error) — silently broken.
-- **Red GPU test suite:** `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm` on the `gfx1036` iGPU fails 4 targets — `fused_linear_ce_parity_tests` (real loss-precision assertion at `tests/fused_linear_ce_parity_tests.rs:74`), `graph_capture`, `mxfp4_gemm_tests`, `p3_ce_wiring_contract` — though dozens of GPU-kernel suites pass.
+- **GPU test suite — gating risk, not shipping defect:** `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features cubecl` (Phase A, GPU env set) is **green — 605 pass / 0 fail / 17 ignored**; Phase B (precision, GPU env unset) also green. However, the **default**-feature build (`jit-hw-adaptive`, no `cubecl`) red — the same 4 targets (`fused_linear_ce_parity_tests`, `graph_capture`, `mxfp4_gemm_tests`, `p3_ce_wiring_contract`) fail on the fallback JIT path. The shipping `grim-cli` enables `cubecl`, so end users see green; a developer who `cargo test`s bare gets red. Gate those 4 targets behind `#[cfg(feature="cubecl")]` or put `cubecl` in `default`.
 Fix: emit a hard error when a requested `GRIM_*` backend is unavailable (not a silent CPU fallback); diagnose the Vulkan decode no-output path; address the 4 failing ROCm test targets before claiming CI green.
 
 ### P1 — high
@@ -309,7 +320,7 @@ Fix: expose `speculation_strategy` + `speculative_accept_rate` in `/status`/`/me
 ## §5. Top-5 cross-persona friction (rolled summary)
 
 1. **Multimodal is vapor on the op path** — vision encode, diffusion generate, audio transcribe all return 501 (live-confirmed); `image_url` content arrays are 400-rejected; CLI `multimodal` is a no-op print (P5, P6, P16). Single highest-impact gap. *(P0-1)*
-2. **GPU backends trust-break — silent demotion, Vulkan no-output, red ROCm suite** — `GRIM_BACKEND=cuda`/`=metal` silently fall to CPU (no warning); `=vulkan` loads but emits **zero tokens**; `cargo test -p grim-backend-rocm` is RED on `gfx1036` (4 failing targets incl. a loss-precision assertion). Run live; contradict the "never silently degrades" comment. *(P0-3, new from live run)*
+2. **GPU backends trust-break — silent demotion, Vulkan no-output, default-feature test red** — `GRIM_BACKEND=cuda`/`=metal` silently fall to CPU (no warning); `=vulkan` loads but emits **zero tokens**; `cargo test -p grim-backend-rocm` is **green with `--features cubecl`** (the shipping path, 605 pass / 0 fail) but **RED on the default-feature build** (4 targets: the fallback JIT path fails on `gfx1036`). Run live; silent demotion contradicts the "never silently degrades" comment. *(P0-3, new from live run)*
 3. **Serve-path correctness/timing regression** — cold first completion >60 s (timed out), warm 46 s for 8 tokens, and the serve path emits **degenerate output** (`"SSSSSSSS"` for "Say OK" at temp 0) while the `run` CLI is coherent on the same model — so the bug is serve-pipeline specific, not the model. A researcher cannot trust serve-path numbers. *(P1.1, new from live run)*
 4. **Plugins off + grants stubbed; opt-in defaults lie** — default `grim` has zero plugin capability; even enabled, grants trap instead of gating; security claim (P18.1) is "secure because broken." Same opt-in-default class: CUDA absent from the stock build. *(P0-2)*
 5. **`--config` lies & `serve` lacks `--model`/`--backend` & no adapter-load endpoint** — operator trust break (P2.1) + README mismatch + fragmented backend vocab (P9, P12) + 8 unexplained adapter names (RQ6) + no runtime adapter load route (P2.4, P4.2) — the serving/PEFT story is half-wired. Plus observability debt: `/metrics` JSON+placeholders, speculation-acceptance TUI-only, KV tiers not surfaced. *(P1-3/4/5/6, P2-7/10)*
@@ -321,7 +332,7 @@ Fix: expose `speculation_strategy` + `speculative_accept_rate` in `/status`/`/me
 - **Genuinely usable, evidence-strong:** OpenAI/Ollama HTTP parity (P7, P8), tool calling (RQ7), GGUF trust (RQ5), loopback metrics security (P18.2), provenance (P18.3), disagg architecture (P3.1), headless/one-shot CLI (P14.2), CLI test-gating (P9.2).
 - **Structurally present, op-path broken:** spec decode (on by default but invisible), backends (real kernels but `serve` can't select), KV transport tiers (real internals, no surface), training adapters (real math, no load endpoint + opaque UI).
 - **Not yet shippable as advertised:** multimodal (P5/P6), plugins-by-default (P13/P18.1), `--config` (P2.1).
-- **Net:** the OpenAI/Ollama + tool-calling + GGUF core is real and good. The failure modes concentrate in **(a) advertised-but-stubbed subsystems**, **(b) opt-in defaults that promise more than the stock build delivers**, and **(c) observability + runtime-config surfaces that hide working internals** — plus the live GPU-backend regressions (silent demotion, Vulkan no-output, red suite). Closing P0-1, P0-2, P0-3, P1-3, P1-6, P2-7 would lift the clean-PASS rate from 38% toward ~75% of scored tasks.
+- **Net:** the OpenAI/Ollama + tool-calling + GGUF core is real and good. The failure modes concentrate in **(a) advertised-but-stubbed subsystems**, **(b) opt-in defaults that promise more than the stock build delivers**, and **(c) observability + runtime-config surfaces that hide working internals** — plus the live GPU-backend regressions (silent demotion, Vulkan no-output, default-feature test red that's green on the shipping `cubecl` path). Closing P0-1, P0-2, P0-3, P1-3, P1-6, P2-7 would lift the clean-PASS rate from 40% toward ~75% of scored tasks.
 
 ## §7. Per-persona weighted rollup (Appendix A "a weighted row per persona")
 
@@ -338,7 +349,7 @@ across that persona's scored tasks. Pass-count = tasks ≥ PASS.
 | 6 | Audio | 1.0 | 1.0 | 2.0 | 1.0 | 1.0 | 1.2 | 0/1 | **FAIL** |
 | 7 | OpenAI dev | 4.7 | 4.7 | 4.0 | 4.0 | 4.0 | 4.3 | 3/3 | **PASS** |
 | 8 | Ollama dev | 5.0 | 5.0 | 4.0 | 4.0 | 4.0 | 4.4 | 2/2 | **PASS** |
-| 9 | GPU backend | 3.0 | 2.5 | 3.5 | 3.0 | 2.5 | 2.9 | 0/2 | **FAIL** |
+| 9 | GPU backend | 3.0 | 2.5 | 3.5 | 2.5 | 2.5 | 2.8 | 1/2 | **FAIL** |
 |10 | Quant dev | 3.5 | 3.5 | 4.0 | 3.5 | 3.0 | 3.5 | 1/2 | **PARTIAL** |
 |11 | Spec/perf | 3.0 | 3.0 | 3.0 | 2.0 | 2.5 | 2.7 | 0/2 | **PARTIAL** |
 |12 | Vulkan/xp | 2.5 | 2.0 | 3.0 | 4.0 | 2.5 | 2.8 | 0/2 | **FAIL** |
@@ -355,8 +366,10 @@ across that persona's scored tasks. Pass-count = tasks ≥ PASS.
 Anything touching **multimodal, GPU backends, plugins, runtime config, or cross-tier
 observability** currently fails or only partially passes. Run live on a mixed GPU host
 (NVIDIA RTX 4070 + AMD `gfx1036`), the GPU-backend story is the weakest part: ROCm
-inference works, Vulkan loads but emits zero tokens, CUDA/Metal silently demote to CPU,
-and the ROCm GPU test suite is RED (4 failing targets incl. a loss-precision assertion).
+inference works, Vulkan loads but emits zero tokens, CUDA/Metal silently demote to CPU.
+The `grim-backend-rocm` GPU suite is **green with `--features cubecl`** (the path
+`grim-cli` ships with); the default-feature build red on 4 targets is a gating risk to
+document, not a shipping defect.
 
 ## §8. Think-aloud themes / Wrap (§3 step 5 + persona prompts) — notional
 
@@ -371,7 +384,7 @@ change-first** (Frank-bold). The prompted personas' simulated probe answers inte
 - **P6** Worst: transcribe endpoint is a labeled 501. Best: none. Change-first: same as P5 — wire Whisper.
 - **P7** Worst: naive clients sending `user` get 400. Best: tool calling loop is exactly spec-clean ("what loop do you expect?" → "re-call with tool result" — yes, supported). Change-first: ignore-unknown on the OpenAI surface.
 - **P8** Worst: nothing notable. Best: `/api/chat` + `/api/tags` drop-in parity held. Probe: Ollama client ran unchanged. Change-first: stable kernel — keep parity under growth.
-- **P9** Worst (live): silent CUDA/Metal→CPU demotion (no warning) + red ROCm GPU suite (4 failing targets incl. a loss-precision assertion). Best: ROCm inference runs coherently on the `gfx1036` iGPU (`Device:rocm:0`, sensible output). Change-first: hard-error on requested-but-unavailable backend; fix the 4 failing GPU test targets. Probe (9.1): on asking for cuda you got CPU with no signal — "see and switch the active backend" is half-true, the switch silently lies.
+- **P9** Worst (live): silent CUDA/Metal→CPU demotion (no warning). Best: ROCm inference runs coherently on `gfx1036`, and the **GPU test suite is green with `--features cubecl`** (605 pass, 0 fail; GPU/precision split as instructed). Change-first: hard-error on requested-but-unavailable backend; gate the 4 default-feature-red targets behind `cubecl`. Probe (9.1): on asking for cuda you got CPU with no signal — "see and switch the active backend" is half-true, the switch silently lies.
 - **P10** Worst: `bench` quality (ppl) number unclear. Best: `oxidizer convert` evolutionary pipeline is real. Change-first: expose ppl/loss from `bench`.
 - **P11** Worst: spec-acceptance metric exists only in TUI (D4=2). Best: speculation is on with zero config. Change-first: `/status` acceptance + `GRIM_SPEC=off`.
 - **P12** Worst (live): `GRIM_BACKEND=vulkan` loads, prints `Device:vulkan`, encodes the prompt (12 toks) — then emits **zero output tokens**, exit 0, no error. Best: device label is honest; model loads. Change-first: diagnose the Vulkan decode no-output path; also add the named `--backend` flag.
