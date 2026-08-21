@@ -6,7 +6,7 @@ use grim_core::grim_plugins_dir;
 use grim_core::hyperparams::{HyperparameterExtractor, MetadataLookup};
 use grim_core::model::CausalLm;
 use grim_format::{
-    GgufProvider,
+    GgufProvider, PthProvider,
     gguf::GgufValue,
     tprov::{RemappingTensorProvider, SafetensorsProvider},
 };
@@ -3895,16 +3895,18 @@ pub fn load_audio_model_from_path(
         return Ok(std::sync::Arc::new(kokoro));
     }
 
+    if filename.contains("vocos") {
+        let provider = PthProvider::load_from_file(path)?;
+        let ws = WeightSource::root(&provider, device.clone());
+        let cfg = infer_vocos_config(&provider)?;
+        let vocos = grim_models_audio::Vocos::load(device, &ws, cfg)?;
+        return Ok(std::sync::Arc::new(vocos));
+    }
+
     if filename.contains("meanvc") || path.ends_with(".pt") {
         let cfg = grim_models_audio::MeanVC2Config::default();
         let meanvc = grim_models_audio::MeanVC2::random(device, cfg);
         return Ok(std::sync::Arc::new(meanvc));
-    }
-
-    if filename.contains("vocos") {
-        let cfg = grim_models_audio::VocosConfig::default();
-        let vocos = grim_models_audio::Vocos::random(device, cfg);
-        return Ok(std::sync::Arc::new(vocos));
     }
 
     // Default fallback to Whisper
@@ -3922,6 +3924,52 @@ pub fn load_audio_model_from_path(
     };
     let whisper = grim_models_audio::Whisper::random(device, cfg);
     Ok(std::sync::Arc::new(whisper))
+}
+
+/// Infer a `VocosConfig` from checkpoint tensor shapes.
+///
+/// Reads `backbone.embed.weight` (`[dim, input_dim, 7]`), counts
+/// `backbone.convnext.N` blocks, derives `intermediate_dim` from block 0's
+/// `pwconv1.weight`, and derives `n_fft` from `head.istft.window` (hop is
+/// `n_fft / 2`, the standard Vocos setting).
+fn infer_vocos_config(provider: &PthProvider) -> Result<grim_models_audio::VocosConfig> {
+    use grim_tensor::provider::TensorProvider;
+
+    let mut cfg = grim_models_audio::VocosConfig::default();
+
+    if let Ok(meta) = provider.meta("backbone.embed.weight") {
+        if meta.shape.len() == 3 {
+            cfg.dim = meta.shape[0];
+            cfg.input_dim = meta.shape[1];
+        }
+    }
+
+    let num_layers = provider
+        .tensor_names()
+        .iter()
+        .filter_map(|n| n.strip_prefix("backbone.convnext."))
+        .filter_map(|rest| rest.split('.').next())
+        .filter_map(|idx| idx.parse::<usize>().ok())
+        .max()
+        .map(|m| m + 1);
+    if let Some(n) = num_layers {
+        cfg.num_layers = n;
+    }
+
+    if let Ok(meta) = provider.meta("backbone.convnext.0.pwconv1.weight") {
+        if !meta.shape.is_empty() {
+            cfg.intermediate_dim = meta.shape[0];
+        }
+    }
+
+    if let Ok(meta) = provider.meta("head.istft.window") {
+        if let Some(first) = meta.shape.first() {
+            cfg.n_fft = *first;
+            cfg.hop_length = cfg.n_fft / 2;
+        }
+    }
+
+    Ok(cfg)
 }
 
 /// Specialized loader for Diffusion Models (Flux 2 MM-DiT and 2D UNet).
