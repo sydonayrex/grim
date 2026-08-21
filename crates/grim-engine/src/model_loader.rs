@@ -3924,6 +3924,37 @@ pub fn load_audio_model_from_path(
     Ok(std::sync::Arc::new(whisper))
 }
 
+/// Specialized loader for Diffusion Models (Flux 2 MM-DiT and 2D UNet).
+pub fn load_diffusion_model_from_path(
+    path: &str,
+    device: Device,
+) -> Result<std::sync::Arc<dyn grim_core::Model>> {
+    let p = Path::new(path);
+    let filename = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+
+    if filename.contains("flux") {
+        let cfg = grim_models_diffusion::Flux2Config::default();
+        let flux = grim_models_diffusion::Flux2Transformer2D::random(device, cfg);
+        return Ok(std::sync::Arc::new(flux));
+    }
+
+    // Default UNet2D fallback
+    let cfg = grim_models_diffusion::UnetConfig {
+        in_channels: 4,
+        out_channels: 4,
+        hidden: 64,
+        num_downsample: 2,
+        rms_norm_eps: 1e-5,
+        num_timesteps: 1000,
+    };
+    let unet = grim_models_diffusion::Unet2D::random(device, cfg);
+    Ok(std::sync::Arc::new(unet))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

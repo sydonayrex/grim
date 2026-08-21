@@ -20,6 +20,7 @@ grim-models-transformer = { workspace = true }
 grim-models-mamba = { workspace = true }
 grim-models-vision = { workspace = true }
 grim-models-audio = { workspace = true }
+grim-models-diffusion = { workspace = true }
 grim-format = { workspace = true }
 grim-speculative = { workspace = true }
 grim-kvquant = { workspace = true }

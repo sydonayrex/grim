@@ -12,6 +12,10 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
+    // F-1: the IQ-family fused dequant+GEMM kernels (incl. grim_fused_dequant_gemm_q8_0)
+    // live in their own translation unit and were never appended to the JIT source, so
+    // hipRTC failed with "use of undeclared identifier" at first `run` forward on RDNA2.
+    s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);

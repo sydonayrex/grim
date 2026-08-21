@@ -256,10 +256,8 @@ mod tests {
         let sched = EulerScheduler::linear(10, 0.0001, 0.02);
         assert_eq!(sched.sigmas.len(), 10);
         assert_eq!(sched.timesteps.len(), 10);
-        // sigma grows with added noise: descending timestep → larger sigma.
-        let s0 = sched.timesteps[0] as usize;
-        let sl = sched.timesteps[sched.timesteps.len() - 1] as usize;
-        assert!(sched.sigmas[s0] > sched.sigmas[sl]);
+        // sigma grows with added noise: first step (largest timestep) -> largest sigma.
+        assert!(sched.sigmas[0] > sched.sigmas[sched.sigmas.len() - 1]);
         // timesteps are descending.
         for w in sched.timesteps.windows(2) {
             assert!(w[0] > w[1]);
