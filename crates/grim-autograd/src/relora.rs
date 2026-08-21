@@ -18,7 +18,11 @@ pub fn merge_and_zero(
 ) {
     assert_eq!(a.len(), rank * in_features, "a shape mismatch");
     assert_eq!(b.len(), out_features * rank, "b shape mismatch");
-    assert_eq!(base.len(), out_features * in_features, "base shape mismatch");
+    assert_eq!(
+        base.len(),
+        out_features * in_features,
+        "base shape mismatch"
+    );
 
     for i in 0..out_features {
         for j in 0..in_features {
@@ -53,7 +57,15 @@ mod tests {
         let mut b = vec![0.1f32; out_features * rank];
         let mut base = vec![1.0f32; out_features * in_features];
 
-        merge_and_zero(rank, in_features, out_features, scale, &mut a, &mut b, &mut base);
+        merge_and_zero(
+            rank,
+            in_features,
+            out_features,
+            scale,
+            &mut a,
+            &mut b,
+            &mut base,
+        );
 
         // Expected merged base: 1.0 + 0.5 * (0.1*0.1 + 0.1*0.1) = 1.0 + 0.5 * 0.02 = 1.01
         for val in &base {

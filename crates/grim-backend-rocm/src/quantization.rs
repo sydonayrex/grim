@@ -163,7 +163,7 @@ impl fmt::Display for Fp8NativeFormat {
     }
 }
 
-    /// Per-arch capability bitmap. The struct is the *output* of the gate; [see: `capability.supports(mode)`]
+/// Per-arch capability bitmap. The struct is the *output* of the gate; [see: `capability.supports(mode)`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct QuantCapability {
     fp32: bool,
@@ -203,7 +203,13 @@ impl fmt::Display for QuantCapability {
         write!(
             f,
             "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={} int8_w8a8={}",
-            self.fp32, self.f16, self.bf16, self.fp8, self.mxfp4_emulated, self.mxfp8_emulated, self.int8_w8a8
+            self.fp32,
+            self.f16,
+            self.bf16,
+            self.fp8,
+            self.mxfp4_emulated,
+            self.mxfp8_emulated,
+            self.int8_w8a8
         )
     }
 }
@@ -283,7 +289,11 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
         }
         QuantMode::Fp32 => QuantMode::Fp32,
         QuantMode::Int8W8A8 => {
-            if caps.int8_w8a8 { requested } else { QuantMode::Fp32 }
+            if caps.int8_w8a8 {
+                requested
+            } else {
+                QuantMode::Fp32
+            }
         }
     }
 }
@@ -412,21 +422,29 @@ mod self_tests {
     fn quant_capability_int8_w8a8_arch_table() {
         // CDNA3 (gfx940) and RDNA3 (gfx1100) should both report int8_w8a8.
         let cdna3 = arch_capability(GcnArch::CDNA3);
-        assert!(cdna3.int8_w8a8,
-            "CDNA3 should support Int8W8A8 (int8 MFMA: mfma_i32_32x32x16_i8)");
+        assert!(
+            cdna3.int8_w8a8,
+            "CDNA3 should support Int8W8A8 (int8 MFMA: mfma_i32_32x32x16_i8)"
+        );
         let rna3 = arch_capability(GcnArch::RDNA3);
-        assert!(rna3.int8_w8a8,
-            "RDNA3 should support Int8W8A8 (int8 MFMA / dot product path)");
+        assert!(
+            rna3.int8_w8a8,
+            "RDNA3 should support Int8W8A8 (int8 MFMA / dot product path)"
+        );
         let rna4 = arch_capability(GcnArch::RDNA4);
-        assert!(rna4.int8_w8a8,
-            "RDNA4 should support Int8W8A8 (int8 MFMA path)");
+        assert!(
+            rna4.int8_w8a8,
+            "RDNA4 should support Int8W8A8 (int8 MFMA path)"
+        );
     }
 
     #[test]
     fn quant_capability_int8_w8a8_missing_on_rna1() {
         let rna1 = arch_capability(GcnArch::RDNA1);
-        assert!(!rna1.int8_w8a8,
-            "RDNA1 should NOT support Int8W8A8 (no int8 MFMA)");
+        assert!(
+            !rna1.int8_w8a8,
+            "RDNA1 should NOT support Int8W8A8 (no int8 MFMA)"
+        );
     }
 
     #[test]
@@ -446,14 +464,18 @@ mod self_tests {
 
     #[test]
     fn smooth_quant_calibration_empty_layers_ok() {
-        let cal = SmoothQuantCalibration { layer_scales: Vec::new() };
+        let cal = SmoothQuantCalibration {
+            layer_scales: Vec::new(),
+        };
         assert!(cal.layer_scales.is_empty());
         let _ = cal.clone();
     }
 
     #[test]
     fn smooth_quant_calibration_layer_scales_created() {
-        let mut cal = SmoothQuantCalibration { layer_scales: Vec::new() };
+        let mut cal = SmoothQuantCalibration {
+            layer_scales: Vec::new(),
+        };
         cal.layer_scales.push(SmoothQuantActScales::new(64));
         cal.layer_scales.push(SmoothQuantActScales::new(128));
         assert_eq!(cal.layer_scales.len(), 2);
@@ -468,6 +490,9 @@ mod self_tests {
         // with observed maxes.
         let scales = SmoothQuantActScales::new(32);
         let all_ones = scales.channels.iter().all(|&s| (s - 1.0).abs() < 1e-6);
-        assert!(all_ones, "default calibration should start with 1.0 identity scales");
+        assert!(
+            all_ones,
+            "default calibration should start with 1.0 identity scales"
+        );
     }
 }

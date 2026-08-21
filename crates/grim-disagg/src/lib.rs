@@ -117,12 +117,7 @@ impl Default for DisaggConfig {
 pub trait DisaggRouterT: Send + Sync {
     /// Dispatch a prefill task — sends the request's real KV blocks (its
     /// logical→physical block table) from the local pool to the prefill node.
-    fn dispatch_prefill(
-        &self,
-        request_id: u64,
-        tokens: &[u32],
-        block_ids: &[usize],
-    ) -> Result<()>;
+    fn dispatch_prefill(&self, request_id: u64, tokens: &[u32], block_ids: &[usize]) -> Result<()>;
     /// Transfer real KV blocks (identified by physical `block_ids`) from the
     /// local pool to the decode node.
     fn transfer_kv_cache(&self, request_id: u64, block_ids: &[usize]) -> Result<()>;
@@ -294,12 +289,7 @@ impl DisaggRouter {
 
 impl DisaggRouterT for DisaggRouter {
     /// Dispatch a prefill task to a dedicated prefill engine.
-    fn dispatch_prefill(
-        &self,
-        request_id: u64,
-        tokens: &[u32],
-        block_ids: &[usize],
-    ) -> Result<()> {
+    fn dispatch_prefill(&self, request_id: u64, tokens: &[u32], block_ids: &[usize]) -> Result<()> {
         self.extract_and_send_prefill(request_id, tokens, block_ids)
     }
 

@@ -2385,7 +2385,11 @@ mod tests {
         // Call with tag 9 (Array) - function will read elem_type and count from stream
         // depth starts at 0, and after 65 recursive calls we reach depth=65 which exceeds the limit
         let result = read_gguf_value_with_tag(&mut cursor, 9, 0);
-        assert!(result.is_err(), "expected error for deeply nested array, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected error for deeply nested array, got {:?}",
+            result
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("GGUF array nesting exceeds max depth"),
@@ -2414,9 +2418,16 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         // Call with tag 9 (Array)
         let result = read_gguf_value_with_tag(&mut cursor, 9, 0);
-        assert!(result.is_ok(), "expected success for array at depth limit, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected success for array at depth limit, got {:?}",
+            result
+        );
         // Verify we got an array (the outermost wrapper)
         let value = result.unwrap();
-        assert!(matches!(value, GgufValue::Array(_)), "expected array at depth limit");
+        assert!(
+            matches!(value, GgufValue::Array(_)),
+            "expected array at depth limit"
+        );
     }
 }

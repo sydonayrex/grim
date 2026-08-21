@@ -7,9 +7,7 @@
 //! 3. `backup2` bolt-on merged adapter weights preserve backward gradient fidelity.
 //! 4. ROCm GPU path moved to `grim-backend-rocm/tests/quant_backward_gpu.rs`.
 
-use grim_format::train::{
-    TrainFpFormat, decode_f32s_from, encode_f32s_as, f32_to_bf16_bytes,
-};
+use grim_format::train::{TrainFpFormat, decode_f32s_from, encode_f32s_as, f32_to_bf16_bytes};
 use grim_quant::{dequant_q4k, dequant_q80, quant_q4k, quant_q80};
 /// Maximum allowed RMS relative error for Q8_0 (8-bit).
 const MAX_RMS_REL_ERROR_Q8: f32 = 0.05;
@@ -210,12 +208,18 @@ fn quant_backward_audit_fail_check_corrupted_data() {
 fn mixed_precision_bf16_backward_gemm_dx_numerics() {
     let (m, k, n) = (8, 64, 64);
     let dy: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.03).sin()).collect();
-    let b_orig: Vec<f32> = (0..k * n).map(|i| ((i * 7) as f32 * 0.017).sin() * 3.0).collect();
+    let b_orig: Vec<f32> = (0..k * n)
+        .map(|i| ((i * 7) as f32 * 0.017).sin() * 3.0)
+        .collect();
 
     let dx_ref = compute_dx(&dy, &b_orig, m, n, k);
 
     let b_bf16 = encode_f32s_as(&b_orig, TrainFpFormat::Bf16);
-    assert_eq!(b_bf16.len(), b_orig.len() * 2, "bf16 blob must be 2 bytes/element");
+    assert_eq!(
+        b_bf16.len(),
+        b_orig.len() * 2,
+        "bf16 blob must be 2 bytes/element"
+    );
     let b_decoded = decode_f32s_from(&b_bf16, TrainFpFormat::Bf16).expect("bf16 decode");
     let dx_bf16 = compute_dx(&dy, &b_decoded, m, n, k);
 
@@ -232,12 +236,18 @@ fn mixed_precision_fp16_backward_gemm_dx_numerics() {
     let (m, k, n) = (8, 64, 64);
     let dy: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.03).cos()).collect();
     // Keep magnitudes in fp16-safe range (well under 65504, above subnormal floor).
-    let b_orig: Vec<f32> = (0..k * n).map(|i| 1.0 + ((i * 5) as f32 * 0.011).cos() * 2.0).collect();
+    let b_orig: Vec<f32> = (0..k * n)
+        .map(|i| 1.0 + ((i * 5) as f32 * 0.011).cos() * 2.0)
+        .collect();
 
     let dx_ref = compute_dx(&dy, &b_orig, m, n, k);
 
     let b_f16 = encode_f32s_as(&b_orig, TrainFpFormat::Fp16Param);
-    assert_eq!(b_f16.len(), b_orig.len() * 2, "fp16 blob must be 2 bytes/element");
+    assert_eq!(
+        b_f16.len(),
+        b_orig.len() * 2,
+        "fp16 blob must be 2 bytes/element"
+    );
     let b_decoded = decode_f32s_from(&b_f16, TrainFpFormat::Fp16Param).expect("fp16 decode");
     let dx_f16 = compute_dx(&dy, &b_decoded, m, n, k);
 
@@ -255,7 +265,9 @@ fn mixed_precision_fp16_backward_gemm_dx_numerics() {
 fn mixed_precision_bf16_fail_check_corrupted_byte() {
     let (m, k, n) = (8, 64, 64);
     let dy: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.03).sin()).collect();
-    let b_orig: Vec<f32> = (0..k * n).map(|i| ((i * 7) as f32 * 0.017).sin() * 3.0).collect();
+    let b_orig: Vec<f32> = (0..k * n)
+        .map(|i| ((i * 7) as f32 * 0.017).sin() * 3.0)
+        .collect();
 
     let dx_ref = compute_dx(&dy, &b_orig, m, n, k);
 

@@ -108,13 +108,23 @@ impl DeepSeek2Mla {
             &ws.scoped("kv_a_proj_with_mqa"),
             [cfg.hidden_size, cfg.kv_lora_rank + cfg.qk_rope_head_dim],
         )?;
-        let kv_a_layernorm = RmsNorm::load(&ws.scoped("kv_a_layernorm"), cfg.kv_lora_rank, cfg.rms_norm_eps)?;
+        let kv_a_layernorm = RmsNorm::load(
+            &ws.scoped("kv_a_layernorm"),
+            cfg.kv_lora_rank,
+            cfg.rms_norm_eps,
+        )?;
 
         let kv_b_proj = Linear::load_shape(
             &ws.scoped("kv_b_proj"),
-            [cfg.kv_lora_rank, cfg.num_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim)],
+            [
+                cfg.kv_lora_rank,
+                cfg.num_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
+            ],
         )?;
-        let o_proj = Linear::load_shape(&ws.scoped("o_proj"), [cfg.num_heads * cfg.v_head_dim, cfg.hidden_size])?;
+        let o_proj = Linear::load_shape(
+            &ws.scoped("o_proj"),
+            [cfg.num_heads * cfg.v_head_dim, cfg.hidden_size],
+        )?;
 
         let rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
 
@@ -151,17 +161,26 @@ impl DeepSeek2Mla {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let in_off = s * self.num_heads * total_q_head + h * total_q_head;
-                let nope_off = s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
-                let rope_off = s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim;
+                let nope_off =
+                    s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
+                let rope_off =
+                    s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim;
 
                 q_nope_v[nope_off..nope_off + self.qk_nope_head_dim]
                     .copy_from_slice(&q_full_v[in_off..in_off + self.qk_nope_head_dim]);
-                q_rope_v[rope_off..rope_off + self.qk_rope_head_dim]
-                    .copy_from_slice(&q_full_v[in_off + self.qk_nope_head_dim..in_off + total_q_head]);
+                q_rope_v[rope_off..rope_off + self.qk_rope_head_dim].copy_from_slice(
+                    &q_full_v[in_off + self.qk_nope_head_dim..in_off + total_q_head],
+                );
             }
         }
 
-        crate::qwen35::apply_rope_neox(&mut q_rope_v, positions, self.num_heads, self.qk_rope_head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_rope_v,
+            positions,
+            self.num_heads,
+            self.qk_rope_head_dim,
+            10000.0,
+        );
 
         // 2. KV latent projection
         let kv_latent = self.kv_a_proj.forward(x)?;
@@ -175,8 +194,9 @@ impl DeepSeek2Mla {
             let in_off = s * (kv_rank + self.qk_rope_head_dim);
             kv_a_v[s * kv_rank..(s + 1) * kv_rank]
                 .copy_from_slice(&kv_latent_v[in_off..in_off + kv_rank]);
-            k_rope_v[s * self.qk_rope_head_dim..(s + 1) * self.qk_rope_head_dim]
-                .copy_from_slice(&kv_latent_v[in_off + kv_rank..in_off + kv_rank + self.qk_rope_head_dim]);
+            k_rope_v[s * self.qk_rope_head_dim..(s + 1) * self.qk_rope_head_dim].copy_from_slice(
+                &kv_latent_v[in_off + kv_rank..in_off + kv_rank + self.qk_rope_head_dim],
+            );
         }
 
         let kv_a_t = cpu_tensor(kv_a_v, Shape::new(vec![seq_len, kv_rank]));
@@ -236,23 +256,35 @@ impl DeepSeek2Mla {
 
         for s in 0..seq_len {
             for h in 0..self.num_heads {
-                let q_nope_slice = &q_nope_v[s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim
+                let q_nope_slice = &q_nope_v[s * self.num_heads * self.qk_nope_head_dim
+                    + h * self.qk_nope_head_dim
                     ..s * self.num_heads * self.qk_nope_head_dim + (h + 1) * self.qk_nope_head_dim];
-                let q_rope_slice = &q_rope_v[s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim
+                let q_rope_slice = &q_rope_v[s * self.num_heads * self.qk_rope_head_dim
+                    + h * self.qk_rope_head_dim
                     ..s * self.num_heads * self.qk_rope_head_dim + (h + 1) * self.qk_rope_head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_nope_slice = &k_all_v[t * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim
-                        ..t * self.num_heads * self.qk_nope_head_dim + (h + 1) * self.qk_nope_head_dim];
+                    let k_nope_slice = &k_all_v[t * self.num_heads * self.qk_nope_head_dim
+                        + h * self.qk_nope_head_dim
+                        ..t * self.num_heads * self.qk_nope_head_dim
+                            + (h + 1) * self.qk_nope_head_dim];
                     let k_rope_slice = if t < seq_len {
                         &k_rope_v[t * self.qk_rope_head_dim..(t + 1) * self.qk_rope_head_dim]
                     } else {
                         &k_rope_v[0..self.qk_rope_head_dim]
                     };
 
-                    let dot_nope: f32 = q_nope_slice.iter().zip(k_nope_slice.iter()).map(|(a, b)| a * b).sum();
-                    let dot_rope: f32 = q_rope_slice.iter().zip(k_rope_slice.iter()).map(|(a, b)| a * b).sum();
+                    let dot_nope: f32 = q_nope_slice
+                        .iter()
+                        .zip(k_nope_slice.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    let dot_rope: f32 = q_rope_slice
+                        .iter()
+                        .zip(k_rope_slice.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
                     scores[t] = (dot_nope + dot_rope) * scale;
                 }
 
@@ -264,7 +296,8 @@ impl DeepSeek2Mla {
                 for d in 0..self.v_head_dim {
                     let mut acc = 0.0f32;
                     for t in 0..total_kv_len {
-                        let v_val = v_all_v[t * self.num_heads * self.v_head_dim + h * self.v_head_dim + d];
+                        let v_val =
+                            v_all_v[t * self.num_heads * self.v_head_dim + h * self.v_head_dim + d];
                         acc += weights[t] * v_val;
                     }
                     attn_out[s * self.num_heads * self.v_head_dim + h * self.v_head_dim + d] = acc;
@@ -272,7 +305,10 @@ impl DeepSeek2Mla {
             }
         }
 
-        let attn_tensor = cpu_tensor(attn_out, Shape::new(vec![seq_len, self.num_heads * self.v_head_dim]));
+        let attn_tensor = cpu_tensor(
+            attn_out,
+            Shape::new(vec![seq_len, self.num_heads * self.v_head_dim]),
+        );
         Ok(self.o_proj.forward(&attn_tensor)?)
     }
 }
@@ -288,7 +324,11 @@ pub struct DeepSeek2Expert {
 }
 
 impl DeepSeek2Expert {
-    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, intermediate_size: usize) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
         let w1 = Linear::load_shape(&ws.scoped("w1"), [hidden_size, intermediate_size])?;
         let w3 = Linear::load_shape(&ws.scoped("w3"), [hidden_size, intermediate_size])?;
         let w2 = Linear::load_shape(&ws.scoped("w2"), [intermediate_size, hidden_size])?;
@@ -325,13 +365,21 @@ impl DeepSeek2Moe {
         let mut experts = Vec::with_capacity(cfg.n_routed_experts);
         let exp_ws = ws.scoped("experts");
         for e in 0..cfg.n_routed_experts {
-            let exp = DeepSeek2Expert::load(&exp_ws.scoped(&e.to_string()), cfg.hidden_size, cfg.moe_intermediate_size)?;
+            let exp = DeepSeek2Expert::load(
+                &exp_ws.scoped(&e.to_string()),
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+            )?;
             experts.push(exp);
         }
 
         let shared_experts = if cfg.n_shared_experts > 0 {
             let shared_ws = ws.scoped("shared_experts");
-            let exp = DeepSeek2Expert::load(&shared_ws, cfg.hidden_size, cfg.moe_intermediate_size * cfg.n_shared_experts)?;
+            let exp = DeepSeek2Expert::load(
+                &shared_ws,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size * cfg.n_shared_experts,
+            )?;
             Some(exp)
         } else {
             None
@@ -362,12 +410,21 @@ impl DeepSeek2Moe {
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
 
-            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum_e: f32 = exps.iter().sum();
-            let weights: Vec<f32> = exps.iter().map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor).collect();
+            let weights: Vec<f32> = exps
+                .iter()
+                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .collect();
 
-            let token_x = cpu_tensor(xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(), Shape::new(vec![1, hidden_dim]));
+            let token_x = cpu_tensor(
+                xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
+                Shape::new(vec![1, hidden_dim]),
+            );
 
             for (i, (exp_idx, _)) in topk.iter().enumerate() {
                 let w = weights[i];
@@ -406,12 +463,21 @@ pub struct DeepSeek2Block {
 
 impl DeepSeek2Block {
     pub fn load(ws: &WeightSource<'_>, cfg: &DeepSeek2Config, is_dense: bool) -> Result<Self> {
-        let attn_norm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let attn_norm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
         let self_attn = DeepSeek2Mla::load(&ws.scoped("self_attn"), cfg)?;
-        let ffn_norm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let ffn_norm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let (mlp, moe) = if is_dense {
-            let mlp = DeepSeek2Expert::load(&ws.scoped("mlp"), cfg.hidden_size, cfg.intermediate_size)?;
+            let mlp =
+                DeepSeek2Expert::load(&ws.scoped("mlp"), cfg.hidden_size, cfg.intermediate_size)?;
             (Some(mlp), None)
         } else {
             let moe = DeepSeek2Moe::load(&ws.scoped("mlp"), cfg)?;
@@ -484,7 +550,10 @@ impl DeepSeek2 {
     ) -> Result<Self> {
         let root = ws.scoped("model");
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -549,8 +618,9 @@ impl CausalLm for DeepSeek2 {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -580,4 +650,3 @@ mod tests {
         assert_eq!(cfg.n_shared_experts, 2);
     }
 }
-

@@ -699,7 +699,8 @@ impl Engine {
             if self.radix_enabled && !full_input.is_empty() {
                 if let Some(session) = self.sessions.get(&id) {
                     if let Some(block_table) = session.block_table() {
-                        let usize_blocks: Vec<usize> = block_table.iter().map(|&b| b as usize).collect();
+                        let usize_blocks: Vec<usize> =
+                            block_table.iter().map(|&b| b as usize).collect();
                         let mut pool = self.block_pool.lock().unwrap();
                         pool.insert_prefix(&full_input, &usize_blocks);
                     }
@@ -1743,9 +1744,9 @@ mod tests {
         // Classic path: session with no KV cache → model_state caches.
         let mut classic = Inner::new(model.device.clone());
         // Paged path: session backed by a shared block pool.
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(
-            grim_memory::KvBlockPool::new(1024, 1, 16),
-        ));
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
+            1024, 1, 16,
+        )));
         let kv = grim_memory::PagedKvCache::new(pool, 1, 16, 16);
         let mut paged = Inner::with_kv(model.device.clone(), Box::new(kv));
 
@@ -1757,12 +1758,15 @@ mod tests {
             vec![0.0f32, 1.0f32, 2.0f32, 3.0f32],
             grim_tensor::Shape::new(vec![4]),
         );
-        let classic_logits =
-            CausalLm::forward(&model, &mut classic, &tok, &pos, &[]).unwrap();
+        let classic_logits = CausalLm::forward(&model, &mut classic, &tok, &pos, &[]).unwrap();
         let paged_logits = CausalLm::forward(&model, &mut paged, &tok, &pos, &[]).unwrap();
         let cl = classic_logits.to_vec_f32().unwrap();
         let pl = paged_logits.to_vec_f32().unwrap();
-        let diffs: Vec<f32> = cl.iter().zip(pl.iter()).map(|(a, b)| (a - b).abs()).collect();
+        let diffs: Vec<f32> = cl
+            .iter()
+            .zip(pl.iter())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
         let max_diff = diffs.iter().copied().fold(0.0f32, f32::max);
         let argmax = diffs
             .iter()
@@ -1783,10 +1787,8 @@ mod tests {
         // One decode step at position 4 on the SAME sessions.
         let tok1 = grim_backend_cpu::cpu_tensor(vec![4.0f32], grim_tensor::Shape::new(vec![1]));
         let pos4 = grim_backend_cpu::cpu_tensor(vec![4.0f32], grim_tensor::Shape::new(vec![1]));
-        let classic_decode =
-            CausalLm::forward(&model, &mut classic, &tok1, &pos4, &[]).unwrap();
-        let paged_decode =
-            CausalLm::forward(&model, &mut paged, &tok1, &pos4, &[]).unwrap();
+        let classic_decode = CausalLm::forward(&model, &mut classic, &tok1, &pos4, &[]).unwrap();
+        let paged_decode = CausalLm::forward(&model, &mut paged, &tok1, &pos4, &[]).unwrap();
         assert_eq!(
             classic_decode.to_vec_f32().unwrap(),
             paged_decode.to_vec_f32().unwrap(),
@@ -1799,7 +1801,9 @@ mod tests {
         let mut engine = Engine::new(EngineConfig::default());
         engine.radix_enabled = true;
 
-        let prompt1 = vec![101u32, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116];
+        let prompt1 = vec![
+            101u32, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
+        ];
         let block_ids1: Vec<usize> = vec![10];
 
         // Insert prefix for prompt1 into block pool

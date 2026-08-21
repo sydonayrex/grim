@@ -332,8 +332,14 @@ impl Llama {
                     linear(cfg.intermediate_size, cfg.hidden_size),
                     tp,
                 )),
-                w_up: Some(ColumnParallelLinear::new(linear(cfg.intermediate_size, cfg.hidden_size), tp)),
-                w_down: Some(RowParallelLinear::new(linear(cfg.hidden_size, cfg.intermediate_size), tp)),
+                w_up: Some(ColumnParallelLinear::new(
+                    linear(cfg.intermediate_size, cfg.hidden_size),
+                    tp,
+                )),
+                w_down: Some(RowParallelLinear::new(
+                    linear(cfg.hidden_size, cfg.intermediate_size),
+                    tp,
+                )),
                 rope: Rope::from_config(grim_tensor::RopeConfig {
                     dim: cfg.head_dim,
                     base: cfg.rope_theta,

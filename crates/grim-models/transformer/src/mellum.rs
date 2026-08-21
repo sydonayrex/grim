@@ -107,8 +107,12 @@ impl MellumConfig {
         let moe_intermediate_size = value
             .get("moe_intermediate_size")
             .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| value.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as u64)
-            as usize;
+            .unwrap_or_else(|| {
+                value
+                    .get("intermediate_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u64
+            }) as usize;
 
         // Sliding window: may be "sliding_window" or "max_window_layers" with
         // a separate window size. Mellum2 uses "sliding_window": 1024.
@@ -121,11 +125,16 @@ impl MellumConfig {
             let direct = f("rope_theta");
             if direct > 0.0 {
                 direct
-            } else if let Some(rp) = value.get("rope_parameters").or_else(|| value.get("rope_scaling")) {
+            } else if let Some(rp) = value
+                .get("rope_parameters")
+                .or_else(|| value.get("rope_scaling"))
+            {
                 if let Some(th) = rp.get("rope_theta").and_then(|v| v.as_f64()) {
                     th as f32
                 } else if let Some(fa) = rp.get("full_attention") {
-                    fa.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(500000.0) as f32
+                    fa.get("rope_theta")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(500000.0) as f32
                 } else {
                     10000.0
                 }
@@ -254,7 +263,8 @@ impl Mellum {
         // = 0` ⇒ every layer is full-attention-with-YaRN.
         let attn_specs: Vec<LayerAttentionSpec> = (0..num_layers)
             .map(|i| {
-                let is_sliding = cfg.max_window_layers > 0 && i >= num_layers - cfg.max_window_layers;
+                let is_sliding =
+                    cfg.max_window_layers > 0 && i >= num_layers - cfg.max_window_layers;
                 let mut s = LayerAttentionSpec::full_with_rope(
                     cfg.num_heads,
                     cfg.num_kv_heads,

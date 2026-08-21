@@ -96,7 +96,11 @@ pub struct MiniMaxM3Expert {
 }
 
 impl MiniMaxM3Expert {
-    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, intermediate_size: usize) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
         let w1 = Linear::load_shape(&ws.scoped("w1"), [hidden_size, intermediate_size])?;
         let w3 = Linear::load_shape(&ws.scoped("w3"), [hidden_size, intermediate_size])?;
         let w2 = Linear::load_shape(&ws.scoped("w2"), [intermediate_size, hidden_size])?;
@@ -131,7 +135,11 @@ impl MiniMaxM3BlockSparseMoe {
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let exp_ws = ws.scoped("experts");
         for e in 0..cfg.num_experts {
-            let exp = MiniMaxM3Expert::load(&exp_ws.scoped(&e.to_string()), cfg.hidden_size, cfg.intermediate_size)?;
+            let exp = MiniMaxM3Expert::load(
+                &exp_ws.scoped(&e.to_string()),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+            )?;
             experts.push(exp);
         }
 
@@ -158,12 +166,18 @@ impl MiniMaxM3BlockSparseMoe {
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
 
-            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum_e: f32 = exps.iter().sum();
             let weights: Vec<f32> = exps.iter().map(|e| e / (sum_e + 1e-12)).collect();
 
-            let token_x = cpu_tensor(xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(), Shape::new(vec![1, hidden_dim]));
+            let token_x = cpu_tensor(
+                xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
+                Shape::new(vec![1, hidden_dim]),
+            );
 
             for (i, (exp_idx, _)) in topk.iter().enumerate() {
                 let w = weights[i];
@@ -207,8 +221,16 @@ impl MiniMaxM3Block {
         let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
-        let input_layernorm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let post_attention_layernorm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let input_layernorm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let block_sparse_moe = MiniMaxM3BlockSparseMoe::load(&ws.scoped("block_sparse_moe"), cfg)?;
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
@@ -247,8 +269,20 @@ impl MiniMaxM3Block {
         let mut q_vec = q.to_vec_f32()?;
         let mut k_vec = k.to_vec_f32()?;
 
-        crate::qwen35::apply_rope_neox(&mut q_vec, positions, self.num_heads, self.head_dim, 10000.0);
-        crate::qwen35::apply_rope_neox(&mut k_vec, positions, self.num_kv_heads, self.head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_vec,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            10000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_vec,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            10000.0,
+        );
 
         let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, kv_dim]));
@@ -281,11 +315,13 @@ impl MiniMaxM3Block {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim..t * kv_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim
+                        ..t * kv_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -354,7 +390,10 @@ impl MiniMaxM3 {
     ) -> Result<Self> {
         let root = ws.scoped("model");
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -418,8 +457,9 @@ impl CausalLm for MiniMaxM3 {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -475,4 +515,3 @@ mod tests {
         );
     }
 }
-

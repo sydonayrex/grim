@@ -6,7 +6,6 @@
 //!   `x_out = x + Attn(LN_attn(x)) + MLP(LN_mlp(x))`.
 //! - **Rotary Embedding (RoPE)**: Applied to queries and keys per attention head.
 
-
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -139,19 +138,39 @@ impl FalconBlock {
         _tp: TensorParallelConfig,
     ) -> Result<Self> {
         let qkv_out_dim = (cfg.num_heads + 2 * cfg.num_kv_heads) * cfg.head_dim;
-        let fused_qkv = Linear::load_shape(&ws.scoped("self_attention").scoped("query_key_value"), [cfg.hidden_size, qkv_out_dim])?;
-        let dense = Linear::load_shape(&ws.scoped("self_attention").scoped("dense"), [cfg.num_heads * cfg.head_dim, cfg.hidden_size])?;
+        let fused_qkv = Linear::load_shape(
+            &ws.scoped("self_attention").scoped("query_key_value"),
+            [cfg.hidden_size, qkv_out_dim],
+        )?;
+        let dense = Linear::load_shape(
+            &ws.scoped("self_attention").scoped("dense"),
+            [cfg.num_heads * cfg.head_dim, cfg.hidden_size],
+        )?;
 
-        let ln_attn = LayerNorm::load(&ws.scoped("ln_attn"), cfg.hidden_size, cfg.layer_norm_epsilon)?;
+        let ln_attn = LayerNorm::load(
+            &ws.scoped("ln_attn"),
+            cfg.hidden_size,
+            cfg.layer_norm_epsilon,
+        )?;
         let ln_mlp = if !cfg.new_decoder_architecture {
-            Some(LayerNorm::load(&ws.scoped("ln_mlp"), cfg.hidden_size, cfg.layer_norm_epsilon)?)
+            Some(LayerNorm::load(
+                &ws.scoped("ln_mlp"),
+                cfg.hidden_size,
+                cfg.layer_norm_epsilon,
+            )?)
         } else {
             None
         };
 
         let mlp_ws = ws.scoped("mlp");
-        let dense_h_to_4h = Linear::load_shape(&mlp_ws.scoped("dense_h_to_4h"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let dense_4h_to_h = Linear::load_shape(&mlp_ws.scoped("dense_4h_to_h"), [cfg.intermediate_size, cfg.hidden_size])?;
+        let dense_h_to_4h = Linear::load_shape(
+            &mlp_ws.scoped("dense_h_to_4h"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let dense_4h_to_h = Linear::load_shape(
+            &mlp_ws.scoped("dense_4h_to_h"),
+            [cfg.intermediate_size, cfg.hidden_size],
+        )?;
 
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
@@ -200,14 +219,29 @@ impl FalconBlock {
 
         for s in 0..seq_len {
             let row_offset = s * total_qkv;
-            q_data[s * q_dim..(s + 1) * q_dim].copy_from_slice(&qkv_vec[row_offset..row_offset + q_dim]);
-            k_data[s * k_dim..(s + 1) * k_dim].copy_from_slice(&qkv_vec[row_offset + q_dim..row_offset + q_dim + k_dim]);
-            v_data[s * v_dim..(s + 1) * v_dim].copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
+            q_data[s * q_dim..(s + 1) * q_dim]
+                .copy_from_slice(&qkv_vec[row_offset..row_offset + q_dim]);
+            k_data[s * k_dim..(s + 1) * k_dim]
+                .copy_from_slice(&qkv_vec[row_offset + q_dim..row_offset + q_dim + k_dim]);
+            v_data[s * v_dim..(s + 1) * v_dim]
+                .copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
         }
 
         // Apply RoPE
-        crate::qwen35::apply_rope_neox(&mut q_data, positions, self.num_heads, self.head_dim, 10000.0);
-        crate::qwen35::apply_rope_neox(&mut k_data, positions, self.num_kv_heads, self.head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_data,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            10000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_data,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            10000.0,
+        );
 
         let q_rot = cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim]));
@@ -243,11 +277,13 @@ impl FalconBlock {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads
+                        [t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -314,11 +350,7 @@ pub struct Falcon {
 }
 
 impl Falcon {
-    pub fn load(
-        device: Device,
-        ws: &grim_nn::WeightSource<'_>,
-        cfg: FalconConfig,
-    ) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: FalconConfig) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
@@ -334,8 +366,16 @@ impl Falcon {
             ws.scoped("model")
         };
 
-        let word_embeddings = Linear::load_shape(&root.scoped("word_embeddings"), [cfg.vocab_size, cfg.hidden_size])
-            .or_else(|_| Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size]))?;
+        let word_embeddings = Linear::load_shape(
+            &root.scoped("word_embeddings"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )
+        .or_else(|_| {
+            Linear::load_shape(
+                &root.scoped("embed_tokens"),
+                [cfg.vocab_size, cfg.hidden_size],
+            )
+        })?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -344,8 +384,18 @@ impl Falcon {
             layers.push(block);
         }
 
-        let ln_f = LayerNorm::load(&root.scoped("ln_f"), cfg.hidden_size, cfg.layer_norm_epsilon)
-            .or_else(|_| LayerNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.layer_norm_epsilon))?;
+        let ln_f = LayerNorm::load(
+            &root.scoped("ln_f"),
+            cfg.hidden_size,
+            cfg.layer_norm_epsilon,
+        )
+        .or_else(|_| {
+            LayerNorm::load(
+                &root.scoped("norm"),
+                cfg.hidden_size,
+                cfg.layer_norm_epsilon,
+            )
+        })?;
 
         let lm_head = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
             .unwrap_or_else(|_| word_embeddings.clone());
@@ -401,8 +451,9 @@ impl CausalLm for Falcon {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 

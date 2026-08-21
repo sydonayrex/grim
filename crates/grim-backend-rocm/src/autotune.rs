@@ -44,7 +44,7 @@ pub struct TuneKey {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ShapeClass {
     #[default]
-    Decode,  // m == 1: per-token GEMM
+    Decode, // m == 1: per-token GEMM
     Prefill, // m > 1: large-batch GEMM
     TLOLog,  // lm_head / logit-projection ONLY — tagged by op-identity, NOT by m
 }
@@ -877,43 +877,85 @@ mod tests {
 
         // Invalid: waves_per_cu_target == 0.
         let bad_waves = LaunchConfig {
-            block_m: 16, block_n: 64, block_k: 32, split_k: 1, threads: 128,
-            waves_per_cu_target: 0, max_registers: 64, vector_width: 8, lds_double_buffer: true,
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+            waves_per_cu_target: 0,
+            max_registers: 64,
+            vector_width: 8,
+            lds_double_buffer: true,
         };
         assert!(!bad_waves.is_valid(arch, smem_limit, 2));
 
         // Invalid: waves_per_cu_target > 10.
         let bad_waves_hi = LaunchConfig {
-            block_m: 16, block_n: 64, block_k: 32, split_k: 1, threads: 128,
-            waves_per_cu_target: 11, max_registers: 64, vector_width: 8, lds_double_buffer: true,
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+            waves_per_cu_target: 11,
+            max_registers: 64,
+            vector_width: 8,
+            lds_double_buffer: true,
         };
         assert!(!bad_waves_hi.is_valid(arch, smem_limit, 2));
 
         // Invalid: max_registers == 0.
         let bad_regs = LaunchConfig {
-            block_m: 16, block_n: 64, block_k: 32, split_k: 1, threads: 128,
-            waves_per_cu_target: 4, max_registers: 0, vector_width: 8, lds_double_buffer: true,
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+            waves_per_cu_target: 4,
+            max_registers: 0,
+            vector_width: 8,
+            lds_double_buffer: true,
         };
         assert!(!bad_regs.is_valid(arch, smem_limit, 2));
 
         // Invalid: max_registers > 256.
         let bad_regs_hi = LaunchConfig {
-            block_m: 16, block_n: 64, block_k: 32, split_k: 1, threads: 128,
-            waves_per_cu_target: 4, max_registers: 257, vector_width: 8, lds_double_buffer: true,
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+            waves_per_cu_target: 4,
+            max_registers: 257,
+            vector_width: 8,
+            lds_double_buffer: true,
         };
         assert!(!bad_regs_hi.is_valid(arch, smem_limit, 2));
 
         // Invalid: vector_width not 4 or 8.
         let bad_vw = LaunchConfig {
-            block_m: 16, block_n: 64, block_k: 32, split_k: 1, threads: 128,
-            waves_per_cu_target: 4, max_registers: 64, vector_width: 16, lds_double_buffer: true,
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+            waves_per_cu_target: 4,
+            max_registers: 64,
+            vector_width: 16,
+            lds_double_buffer: true,
         };
         assert!(!bad_vw.is_valid(arch, smem_limit, 2));
 
         // Invalid: vector_width == 4 is OK (valid value).
         let vw4 = LaunchConfig {
-            block_m: 16, block_n: 64, block_k: 32, split_k: 1, threads: 128,
-            waves_per_cu_target: 4, max_registers: 64, vector_width: 4, lds_double_buffer: true,
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+            waves_per_cu_target: 4,
+            max_registers: 64,
+            vector_width: 4,
+            lds_double_buffer: true,
         };
         assert!(vw4.is_valid(arch, smem_limit, 2));
     }
@@ -939,12 +981,18 @@ mod tests {
     #[test]
     fn autotune_config_spec_fields_default_values() {
         let cfg = AutotuneConfig::default();
-        assert_eq!(cfg.spec_gamma, 4,
-            "default spec_gamma should be 4 (small draft length, robust for prefill)");
-        assert!((cfg.spec_acceptance_threshold - 0.6).abs() < 1e-6,
-            "default spec_acceptance_threshold should be 0.6");
-        assert!((cfg.spec_alpha - 0.0).abs() < 1e-6,
-            "default spec_alpha should be 0.0 (greedy accept)");
+        assert_eq!(
+            cfg.spec_gamma, 4,
+            "default spec_gamma should be 4 (small draft length, robust for prefill)"
+        );
+        assert!(
+            (cfg.spec_acceptance_threshold - 0.6).abs() < 1e-6,
+            "default spec_acceptance_threshold should be 0.6"
+        );
+        assert!(
+            (cfg.spec_alpha - 0.0).abs() < 1e-6,
+            "default spec_alpha should be 0.0 (greedy accept)"
+        );
     }
 
     #[test]
@@ -969,12 +1017,17 @@ mod tests {
     fn autotune_config_spec_fields_in_defaults() {
         // Verify defaults are actually used via serde(default).
         let json = r#"{"block_dim": 64, "tile_kv": 16, "grid_stride": 1, "cycles_per_invocation": 0, "spec_acceptance_threshold": 0.5}"#;
-        let cfg: AutotuneConfig = serde_json::from_str(json).expect("deserialize with partial spec fields");
-        assert_eq!(cfg.spec_gamma, 4,
-            "missing spec_gamma should fall back to default 4");
+        let cfg: AutotuneConfig =
+            serde_json::from_str(json).expect("deserialize with partial spec fields");
+        assert_eq!(
+            cfg.spec_gamma, 4,
+            "missing spec_gamma should fall back to default 4"
+        );
         assert!((cfg.spec_acceptance_threshold - 0.5).abs() < 1e-6);
-        assert!((cfg.spec_alpha - 0.0).abs() < 1e-6,
-            "missing spec_alpha should fall back to default 0.0");
+        assert!(
+            (cfg.spec_alpha - 0.0).abs() < 1e-6,
+            "missing spec_alpha should fall back to default 0.0"
+        );
     }
 
     #[test]
@@ -985,15 +1038,23 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).expect("serialize spec_gamma=0");
         let restored: AutotuneConfig = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored.spec_gamma, 0,
-            "spec_gamma=0 should roundtrip (pause speculative decoding)");
+        assert_eq!(
+            restored.spec_gamma, 0,
+            "spec_gamma=0 should roundtrip (pause speculative decoding)"
+        );
     }
 
     #[test]
     fn autotune_config_spec_alpha_range_sanity() {
         // Values at the edges of the [0,1] acceptance range should roundtrip.
-        let cfg_low = AutotuneConfig { spec_alpha: 0.0, ..Default::default() };
-        let cfg_high = AutotuneConfig { spec_alpha: 1.0, ..Default::default() };
+        let cfg_low = AutotuneConfig {
+            spec_alpha: 0.0,
+            ..Default::default()
+        };
+        let cfg_high = AutotuneConfig {
+            spec_alpha: 1.0,
+            ..Default::default()
+        };
         let j_low = serde_json::to_string(&cfg_low).expect("serialize alpha=0");
         let j_high = serde_json::to_string(&cfg_high).expect("serialize alpha=1");
         let r_low: AutotuneConfig = serde_json::from_str(&j_low).expect("deserialize");
@@ -1010,43 +1071,57 @@ mod tests {
     fn charon_scalar_candidates_subspace_decode_prunes_m64() {
         let subspace = charon_scalar_candidates_subspace("gfx1036", 65536, ShapeClass::Decode);
         let has_m64 = subspace.iter().any(|c| c.block_m == 64);
-        assert!(!has_m64,
-            "Decode subspace should prune block_m=64 (M small in decode path)");
-        assert!(!subspace.is_empty(),
-            "Decode subspace must still produce candidates");
+        assert!(
+            !has_m64,
+            "Decode subspace should prune block_m=64 (M small in decode path)"
+        );
+        assert!(
+            !subspace.is_empty(),
+            "Decode subspace must still produce candidates"
+        );
     }
 
     #[test]
     fn charon_scalar_candidates_subspace_tlo_log_keeps_square() {
         let subspace = charon_scalar_candidates_subspace("gfx1036", 65536, ShapeClass::TLOLog);
         let has_m64_n64 = subspace.iter().any(|c| c.block_m == 64 && c.block_n == 64);
-        assert!(has_m64_n64,
-            "TLOLog subspace should include square (64,64) candidates");
+        assert!(
+            has_m64_n64,
+            "TLOLog subspace should include square (64,64) candidates"
+        );
     }
 
     #[test]
     fn charon_scalar_candidates_subspace_prefill_uses_larger_m() {
         let subspace = charon_scalar_candidates_subspace("gfx1036", 65536, ShapeClass::Prefill);
         let has_m64 = subspace.iter().any(|c| c.block_m == 64);
-        assert!(has_m64,
-            "Prefill subspace should use M=64 (large batch)");
+        assert!(has_m64, "Prefill subspace should use M=64 (large batch)");
         let has_m8 = subspace.iter().any(|c| c.block_m == 8);
-        assert!(!has_m8,
-            "Prefill subspace should prune M=8 (too small for batch)");
+        assert!(
+            !has_m8,
+            "Prefill subspace should prune M=8 (too small for batch)"
+        );
     }
 
     #[test]
     fn charon_scalar_candidates_subspace_decode_subset_of_full() {
         let full = charon_scalar_candidates("gfx1036", 65536);
         let subspace = charon_scalar_candidates_subspace("gfx1036", 65536, ShapeClass::Decode);
-        assert!(subspace.len() <= full.len(),
-            "Decode subspace should not exceed full candidate count");
+        assert!(
+            subspace.len() <= full.len(),
+            "Decode subspace should not exceed full candidate count"
+        );
         // Every subspace candidate should be in the full set (subset property).
         for sc in &subspace {
-            assert!(full.contains(sc),
+            assert!(
+                full.contains(sc),
                 "subspace candidate [{block_m}, {block_n}, {block_k}, {split_k}, {threads}] should be in full set",
-                block_m = sc.block_m, block_n = sc.block_n,
-                block_k = sc.block_k, split_k = sc.split_k, threads = sc.threads);
+                block_m = sc.block_m,
+                block_n = sc.block_n,
+                block_k = sc.block_k,
+                split_k = sc.split_k,
+                threads = sc.threads
+            );
         }
     }
 
@@ -1054,8 +1129,11 @@ mod tests {
     fn charon_scalar_candidates_subspace_non_empty_for_all_shapes() {
         for shape in [ShapeClass::Decode, ShapeClass::Prefill, ShapeClass::TLOLog] {
             let subspace = charon_scalar_candidates_subspace("gfx1036", 65536, shape);
-            assert!(!subspace.is_empty(),
-                "subspace for {:?} should produce at least one valid candidate", shape);
+            assert!(
+                !subspace.is_empty(),
+                "subspace for {:?} should produce at least one valid candidate",
+                shape
+            );
         }
     }
 
@@ -1063,8 +1141,10 @@ mod tests {
     fn charon_scalar_candidates_subspace_smems_cost_within_limit() {
         let subspace = charon_scalar_candidates_subspace("gfx1036", 65536, ShapeClass::Decode);
         for cfg in &subspace {
-            assert!(cfg.smem_cost(2) <= 65536,
-                "subspace candidate should fit within 64KB smem");
+            assert!(
+                cfg.smem_cost(2) <= 65536,
+                "subspace candidate should fit within 64KB smem"
+            );
         }
     }
 }

@@ -51,11 +51,9 @@ impl JsonSchemaConstraint {
 /// `pattern`, `additionalProperties` are **not** supported and cause a
 /// rejection — callers get a clear error instead of malformed output.
 pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSchemaCompilerError> {
-    let obj = schema
-        .as_object()
-        .ok_or_else(|| JsonSchemaCompilerError {
-            message: "json_schema must be a JSON object".to_string(),
-        })?;
+    let obj = schema.as_object().ok_or_else(|| JsonSchemaCompilerError {
+        message: "json_schema must be a JSON object".to_string(),
+    })?;
     // Reject unsupported composition keywords up front — better a 400 than
     // silently under-constrained output.
     for unsupported in &["$ref", "oneOf", "anyOf", "allOf", "format", "pattern"] {
@@ -139,7 +137,9 @@ fn validate(value: &Value, schema: &Value) -> bool {
             "array" => value.is_array(),
             "string" => value.is_string(),
             "number" => value.is_number(),
-            "integer" => value.is_number() && value.as_f64().map(|n| n.fract() == 0.0).unwrap_or(false),
+            "integer" => {
+                value.is_number() && value.as_f64().map(|n| n.fract() == 0.0).unwrap_or(false)
+            }
             "boolean" => value.as_bool().is_some(),
             "null" => value.is_null(),
             _ => return false,
@@ -209,15 +209,20 @@ mod tests {
             "type": "object",
             "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
             "required": ["name"]
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(c.is_consistent("{\"name\": \""));
         assert!(c.is_consistent("{\"name\": \"bob\", \"age\": 42}"));
-        assert!(!c.is_consistent("{\"name\": 42}"), "type violation detected");
+        assert!(
+            !c.is_consistent("{\"name\": 42}"),
+            "type violation detected"
+        );
     }
 
     #[test]
     fn test_enum_constraint() {
-        let c = compile_json_schema(serde_json::json!({"type": "string", "enum": ["a", "b"]})).unwrap();
+        let c =
+            compile_json_schema(serde_json::json!({"type": "string", "enum": ["a", "b"]})).unwrap();
         assert!(c.is_consistent("\"a\""));
         assert!(!c.is_consistent("\"c\""), "enum violation detected");
     }

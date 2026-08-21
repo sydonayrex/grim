@@ -104,7 +104,13 @@ fn build_oracle(fw: &FlatWeights) -> MoeFfn {
     let gw = well_separated_router_gate();
     let router_gate =
         Linear::from_tensor(cpu_tensor(gw, Shape::new(vec![NUM_EXPERTS, HIDDEN])), None);
-    let router = MoeRouter::new(router_gate, RouterKind::SoftmaxTopK, TOP_K, NUM_EXPERTS, None);
+    let router = MoeRouter::new(
+        router_gate,
+        RouterKind::SoftmaxTopK,
+        TOP_K,
+        NUM_EXPERTS,
+        None,
+    );
     let mut eg = Vec::with_capacity(NUM_EXPERTS);
     let mut eu = Vec::with_capacity(NUM_EXPERTS);
     let mut ed = Vec::with_capacity(NUM_EXPERTS);
@@ -221,8 +227,7 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             for i in 0..HIDDEN {
                 let mut acc = 0.0f32;
                 for j in 0..INTER {
-                    acc += gate_w[j * HIDDEN + i] * d_h_gate[j]
-                        + up_w[j * HIDDEN + i] * d_h_up[j];
+                    acc += gate_w[j * HIDDEN + i] * d_h_gate[j] + up_w[j * HIDDEN + i] * d_h_up[j];
                 }
                 d_x[t * HIDDEN + i] += acc;
             }
@@ -252,7 +257,13 @@ fn flatten_experts(weights: &[Vec<f32>]) -> Vec<f32> {
 
 /// RMS relative error between device and host reference.
 fn rms_rel_err(device: &[f32], host: &[f32]) -> f32 {
-    assert_eq!(device.len(), host.len(), "length mismatch: device={} host={}", device.len(), host.len());
+    assert_eq!(
+        device.len(),
+        host.len(),
+        "length mismatch: device={} host={}",
+        device.len(),
+        host.len()
+    );
     let mut sum_sq = 0.0f64;
     let mut count = 0usize;
     for (&d, &h) in device.iter().zip(host.iter()) {
@@ -315,13 +326,40 @@ fn p2_charon_backward_device_verifier() {
     let host = analytical_backward(&fw);
 
     // Assert non-trivial reference (at least one entry is nonzero per grad).
-    let dgw_max: f32 = host.d_gate_w.iter().flatten().copied().map(f32::abs).fold(0.0, f32::max);
-    let duw_max: f32 = host.d_up_w.iter().flatten().copied().map(f32::abs).fold(0.0, f32::max);
-    let ddw_max: f32 = host.d_down_w.iter().flatten().copied().map(f32::abs).fold(0.0, f32::max);
+    let dgw_max: f32 = host
+        .d_gate_w
+        .iter()
+        .flatten()
+        .copied()
+        .map(f32::abs)
+        .fold(0.0, f32::max);
+    let duw_max: f32 = host
+        .d_up_w
+        .iter()
+        .flatten()
+        .copied()
+        .map(f32::abs)
+        .fold(0.0, f32::max);
+    let ddw_max: f32 = host
+        .d_down_w
+        .iter()
+        .flatten()
+        .copied()
+        .map(f32::abs)
+        .fold(0.0, f32::max);
     let dx_max: f32 = host.d_x.iter().copied().map(f32::abs).fold(0.0, f32::max);
-    assert!(dgw_max > 1e-6, "host d_gate_w is all-zero — reference degenerate");
-    assert!(duw_max > 1e-6, "host d_up_w is all-zero — reference degenerate");
-    assert!(ddw_max > 1e-6, "host d_down_w is all-zero — reference degenerate");
+    assert!(
+        dgw_max > 1e-6,
+        "host d_gate_w is all-zero — reference degenerate"
+    );
+    assert!(
+        duw_max > 1e-6,
+        "host d_up_w is all-zero — reference degenerate"
+    );
+    assert!(
+        ddw_max > 1e-6,
+        "host d_down_w is all-zero — reference degenerate"
+    );
     assert!(dx_max > 1e-6, "host d_x is all-zero — reference degenerate");
 
     // Compare device vs host per grad buffer.
@@ -356,8 +394,5 @@ fn p2_charon_backward_device_verifier() {
 
     let dx_err = rms_rel_err(&result.d_x, &host.d_x);
     eprintln!("d_x: rms_rel_err = {dx_err:.6} (tol={tol})");
-    assert!(
-        dx_err <= tol,
-        "P2 d_x: RMS rel err {dx_err} exceeds {tol}"
-    );
+    assert!(dx_err <= tol, "P2 d_x: RMS rel err {dx_err} exceeds {tol}");
 }

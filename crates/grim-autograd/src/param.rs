@@ -337,9 +337,13 @@ impl TrainableParams {
                         // without this, param.grad may be read before the NCCL
                         // collective has finished writing it. [P1-15 fix.]
                         // Downcast through storage rather than Device (Device has no as_any).
-                        if let Some(_rocm) = param.grad.storage().as_ref().as_any().downcast_ref::<
-                            grim_backend_rocm::RocmStorage,
-                        >() {
+                        if let Some(_rocm) = param
+                            .grad
+                            .storage()
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        {
                             // ROCm path: synchronize via the device handle stored in the storage
                             // (synchronize is called implicitly by the subsequent mul_scalar handle)
                         }

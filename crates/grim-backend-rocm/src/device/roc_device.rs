@@ -61,9 +61,9 @@ use crate::{
     QuantMode,
     ROCBLAS_GEMM_FLAGS_NONE,
     RmsNormMatMulFusionConfig,
+    RocblasHandle,
     RocblasInt,
     RocblasOperation,
-    RocblasHandle,
     RocmCachingAllocator,
     RocmDeviceProps,
     RocmHandle,
@@ -112,7 +112,6 @@ use crate::{
     hipSuccess,
     jit_compile_hsaco,
     linear_launch,
-    warp_rows_launch,
     rocblas_create_handle,
     rocblas_destroy_handle,
     rocblas_gemm_ex,
@@ -122,6 +121,7 @@ use crate::{
     rocblas_status_success,
     select_gemm_algo,
     upload_device_buffer,
+    warp_rows_launch,
 };
 
 /// Return type for [`RocmDevice::charon_grouped_backward_roundtrip`].
@@ -642,7 +642,7 @@ impl RocmDevice {
                             crate::quantization::GcnArch::RDNA4
                         )
                     }
-                }
+                },
             ),
             wmma_gemm_enabled: AtomicBool::new(matches!(
                 crate::quantization::gcn_arch(&gpu_target),
@@ -742,9 +742,7 @@ impl RocmDevice {
             .resolved_kernel_cache
             .lock()
             .ok()
-            .and_then(|c| {
-                c.iter().find(|(k, _)| k.0 == entry).map(|(_, &f)| f)
-            })?;
+            .and_then(|c| c.iter().find(|(k, _)| k.0 == entry).map(|(_, &f)| f))?;
         if func.is_null() {
             return None;
         }
@@ -1057,7 +1055,9 @@ impl RocmDevice {
         self.ensure_graph_capture_mgr();
         let mgr = self.graph_capture_mgr.lock().unwrap();
         let mgr = mgr.as_ref().ok_or_else(|| {
-            Error::Backend("decode_graph_capture_and_replay: graph capture manager not initialized".into())
+            Error::Backend(
+                "decode_graph_capture_and_replay: graph capture manager not initialized".into(),
+            )
         })?;
         mgr.get_or_capture(key, |stream| {
             if let Ok(h) = self.get_rocblas_handle() {
@@ -1384,9 +1384,10 @@ impl RocmDevice {
         // compute-dispatch on the active stream (via `active_stream()`) can
         // wait on it. Reuse a single event across uploads.
         let event = {
-            let mut guard = self.upload_event.lock().map_err(|_| {
-                Error::Backend("upload_event mutex poisoned".into())
-            })?;
+            let mut guard = self
+                .upload_event
+                .lock()
+                .map_err(|_| Error::Backend("upload_event mutex poisoned".into()))?;
             match *guard {
                 Some(e) => e,
                 None => {
@@ -1453,13 +1454,19 @@ impl RocmDevice {
     /// fallback performs for F32 weights on GPU: the input storage is read and
     /// written entirely in device memory, so transposing a weight that is
     /// already resident on the device costs no host transfer.
-    pub fn transpose_f32_2d(&self, src: &dyn BackendStorage, a: usize, b: usize) -> Result<Box<dyn BackendStorage>> {
+    pub fn transpose_f32_2d(
+        &self,
+        src: &dyn BackendStorage,
+        a: usize,
+        b: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
         let src_s = src
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("transpose_f32_2d: src is not RocmStorage".into()))?;
         let out_shape = Shape::new(vec![b, a]);
-        let storage = RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let storage =
+            RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut in_ptr = dev_ptr(src_s)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let total = a
@@ -1839,7 +1846,9 @@ impl BackendDevice for RocmDevice {
         // zeroing stays stream-ordered instead of blocking the host (the old
         // default-stream hipMemset was a device-wide serialization point).
         let res = match self.active_capture_stream() {
-            Some(capture_stream) => unsafe { hipMemsetAsync(dev_ptr_void, 0, storage.bytes, capture_stream) },
+            Some(capture_stream) => unsafe {
+                hipMemsetAsync(dev_ptr_void, 0, storage.bytes, capture_stream)
+            },
             None => unsafe { hipMemsetAsync(dev_ptr_void, 0, storage.bytes, self.active_stream()) },
         };
 
@@ -2481,7 +2490,8 @@ impl BackendDevice for RocmDevice {
         let p_s = as_rocm(p)?;
         let g_s = as_rocm(g)?;
         let exp_s = as_rocm(exp_avg)?;
-        if !p_s.device_ptr_is_valid() || !g_s.device_ptr_is_valid() || !exp_s.device_ptr_is_valid() {
+        if !p_s.device_ptr_is_valid() || !g_s.device_ptr_is_valid() || !exp_s.device_ptr_is_valid()
+        {
             return Err(Error::Backend(
                 "fused_lion_step: inputs lack a valid device pointer".into(),
             ));
@@ -2644,12 +2654,16 @@ impl BackendDevice for RocmDevice {
         let w_s = as_rocm(weight)?;
         let g_s = as_rocm(out_grad)?;
         if !x_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid() || !g_s.device_ptr_is_valid() {
-            return Err(Error::Backend("rmsnorm_backward: missing device pointer".into()));
+            return Err(Error::Backend(
+                "rmsnorm_backward: missing device pointer".into(),
+            ));
         }
         let row_len = *w_shape.dims().last().unwrap_or(&1);
         let total = x_shape.elem_count();
-        let dx_storage = RocmStorage::alloc_gpu(x_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let dw_storage = RocmStorage::alloc_gpu(w_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let dx_storage =
+            RocmStorage::alloc_gpu(x_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let dw_storage =
+            RocmStorage::alloc_gpu(w_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_ptr = dev_ptr(w_s)?;
         let mut g_ptr = dev_ptr(g_s)?;
@@ -2691,12 +2705,15 @@ impl BackendDevice for RocmDevice {
         let c_s = as_rocm(cos)?;
         let s_s = as_rocm(sin)?;
         if !g_s.device_ptr_is_valid() || !c_s.device_ptr_is_valid() || !s_s.device_ptr_is_valid() {
-            return Err(Error::Backend("rope_backward: missing device pointer".into()));
+            return Err(Error::Backend(
+                "rope_backward: missing device pointer".into(),
+            ));
         }
         let half_dim = cos.shape().elem_count();
         let head_dim = half_dim * 2;
         let total_tokens = out_shape.elem_count() / head_dim.max(1);
-        let dx_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let dx_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut g_ptr = dev_ptr(g_s)?;
         let mut c_ptr = dev_ptr(c_s)?;
         let mut s_ptr = dev_ptr(s_s)?;
@@ -2734,11 +2751,14 @@ impl BackendDevice for RocmDevice {
         let g_s = as_rocm(out_grad)?;
         let s_s = as_rocm(softmax_out)?;
         if !g_s.device_ptr_is_valid() || !s_s.device_ptr_is_valid() {
-            return Err(Error::Backend("softmax_backward: missing device pointer".into()));
+            return Err(Error::Backend(
+                "softmax_backward: missing device pointer".into(),
+            ));
         }
         let row_len = *out_shape.dims().last().unwrap_or(&1);
         let total = out_shape.elem_count();
-        let dx_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let dx_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut g_ptr = dev_ptr(g_s)?;
         let mut s_ptr = dev_ptr(s_s)?;
         let mut dx_ptr = dev_ptr(&dx_storage)?;
@@ -2792,10 +2812,7 @@ impl BackendDevice for RocmDevice {
         let dw_storage =
             RocmStorage::alloc_gpu(&dw_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let ids_shape = Shape::new(vec![num_tokens]);
-        let ids_bytes: Vec<u8> = token_ids
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
+        let ids_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
         let ids_storage = RocmStorage::copy_from_host_raw_bytes(
             &ids_bytes,
             &ids_shape,
@@ -3029,7 +3046,8 @@ impl BackendDevice for RocmDevice {
         quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let quant_format = crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true);
+        let quant_format =
+            crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true);
         self.kv_dequant_attention_impl(
             q,
             k_tensor,
@@ -3421,7 +3439,9 @@ impl BackendDevice for RocmDevice {
                     (base, ptr)
                 };
 
-                let use_fused = self.mxfp4_fused_dequant_gemm_enabled.load(Ordering::Relaxed);
+                let use_fused = self
+                    .mxfp4_fused_dequant_gemm_enabled
+                    .load(Ordering::Relaxed);
                 if use_fused {
                     self.launch_fused_dequant_gemm_mxfp4(
                         a_storage,
@@ -4039,7 +4059,11 @@ impl BackendDevice for RocmDevice {
                 } else {
                     hidden_dim / num_kv_heads.max(1)
                 };
-                let num_heads = if head_dim > 0 { hidden_dim / head_dim } else { 1 };
+                let num_heads = if head_dim > 0 {
+                    hidden_dim / head_dim
+                } else {
+                    1
+                };
                 (seq_len, num_heads, head_dim)
             } else {
                 return Err(Error::Shape(
@@ -4142,7 +4166,12 @@ impl BackendDevice for RocmDevice {
         // per-token pipeline).
 
         // Split-KV FlashDecoding acceleration for long-context single-token decode
-        if seq_len == 1 && kv_seq_len >= 1024 && window.is_none() && out_max.is_none() && out_sum.is_none() {
+        if seq_len == 1
+            && kv_seq_len >= 1024
+            && window.is_none()
+            && out_max.is_none()
+            && out_sum.is_none()
+        {
             let num_splits = (kv_seq_len / 256).clamp(2, 64);
             let stream = self.launch_flash_decode(
                 q_s,
@@ -4184,8 +4213,8 @@ impl BackendDevice for RocmDevice {
         )?;
 
         let _ = (
-            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd,
-            oproj_ptr, odim, fuseo,
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, oproj_ptr,
+            odim, fuseo,
         );
 
         // No post-launch sync: the output storage is returned to the caller
@@ -4618,14 +4647,26 @@ impl BackendDevice for RocmDevice {
                 if inputs.len() == 1 {
                     // Single tensor: direct cross-GPU all-reduce.
                     let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
-                    rccl_handle.sum_gradients_device(send_ptr, out_ptr, total, stream_u64, self.ordinal)?;
+                    rccl_handle.sum_gradients_device(
+                        send_ptr,
+                        out_ptr,
+                        total,
+                        stream_u64,
+                        self.ordinal,
+                    )?;
                 } else {
                     // Multiple shards: accumulate on-device first, then all-reduce.
                     let temp_storage =
                         RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
                     let temp_ptr = dev_ptr(&temp_storage)?;
                     self.device_accumulate_f32(inputs, temp_ptr)?;
-                    rccl_handle.sum_gradients_device(temp_ptr, out_ptr, total, stream_u64, self.ordinal)?;
+                    rccl_handle.sum_gradients_device(
+                        temp_ptr,
+                        out_ptr,
+                        total,
+                        stream_u64,
+                        self.ordinal,
+                    )?;
                 }
 
                 return Ok((
@@ -4639,8 +4680,12 @@ impl BackendDevice for RocmDevice {
             // round trip per RowParallel layer per token.
             if rccl_handle.num_gpus > 1 && !is_f32 && inputs.len() == 1 {
                 if let Some(nccl_dt) = rccl_dtype {
-                    let out_storage =
-                        RocmStorage::alloc_gpu(&shape, dtype.clone(), &self.allocator, self.ordinal)?;
+                    let out_storage = RocmStorage::alloc_gpu(
+                        &shape,
+                        dtype.clone(),
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
                     let out_ptr = dev_ptr(&out_storage)?;
                     let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
                     rccl_handle.all_reduce_device(
@@ -9024,7 +9069,13 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("mxfp4_gemm_splitk: out has no device ptr".into()))?;
 
-        let num_splits: u32 = if k >= 8192 { 8 } else if k >= 4096 { 4 } else { 2 };
+        let num_splits: u32 = if k >= 8192 {
+            8
+        } else if k >= 4096 {
+            4
+        } else {
+            2
+        };
         let partials = RocmStorage::alloc_gpu(
             &Shape::from_slice(&[num_splits as usize, m, n]),
             dtype_f32(),
@@ -9106,12 +9157,12 @@ impl RocmDevice {
         let dy_ptr = dy_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dy has no device ptr".into()))?;
-        let b_codes_ptr = b_codes_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: b_codes has no device ptr".into()))?;
-        let b_exps_ptr = b_exps_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: b_exps has no device ptr".into()))?;
+        let b_codes_ptr = b_codes_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("mxfp4_backward_gemm: b_codes has no device ptr".into())
+        })?;
+        let b_exps_ptr = b_exps_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("mxfp4_backward_gemm: b_exps has no device ptr".into())
+        })?;
         let dx_ptr = dx_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dx has no device ptr".into()))?;
@@ -9158,9 +9209,9 @@ impl RocmDevice {
         k: usize,
         eps: f32,
     ) -> Result<*mut c_void> {
-        let x_ptr = x_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_rmsnorm_mxfp4_gemm: x has no device ptr".into()))?;
+        let x_ptr = x_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_gemm: x has no device ptr".into())
+        })?;
         let gamma_ptr = gamma_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_rmsnorm_mxfp4_gemm: gamma has no device ptr".into())
         })?;
@@ -9334,12 +9385,12 @@ impl RocmDevice {
         eps: f32,
         max_seq_len: usize,
     ) -> Result<*mut c_void> {
-        let gamma_q_ptr = gamma_q_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_q has no device ptr".into()))?;
-        let gamma_k_ptr = gamma_k_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_k has no device ptr".into()))?;
+        let gamma_q_ptr = gamma_q_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_q has no device ptr".into())
+        })?;
+        let gamma_k_ptr = gamma_k_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_k has no device ptr".into())
+        })?;
 
         let n_q = num_q_heads * head_dim;
         let n_k = num_kv_heads * head_dim;
@@ -9369,12 +9420,12 @@ impl RocmDevice {
         // Phase 1: MXFP4 GEMM -> gemm_out (C = x @ W_qkv)
         self.launch_mxfp4_gemm_tiled(
             x_storage,
-            w_codes_storage
-                .device_ptr_u64()
-                .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: codes ptr".into()))?,
-            w_exps_storage
-                .device_ptr_u64()
-                .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: exps ptr".into()))?,
+            w_codes_storage.device_ptr_u64().ok_or_else(|| {
+                Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: codes ptr".into())
+            })?,
+            w_exps_storage.device_ptr_u64().ok_or_else(|| {
+                Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: exps ptr".into())
+            })?,
             gemm_storage,
             m,
             n_total,
@@ -9566,15 +9617,15 @@ impl RocmDevice {
         v_head_dim: usize,
         seq_len: usize,
     ) -> Result<*mut c_void> {
-        let q_abs_ptr = q_absorbed
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_absorbed has no device ptr".into()))?;
-        let q_rope_ptr = q_rope
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_rope has no device ptr".into()))?;
-        let kv_ptr = kv_cache
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: kv_cache has no device ptr".into()))?;
+        let q_abs_ptr = q_absorbed.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_decode: q_absorbed has no device ptr".into())
+        })?;
+        let q_rope_ptr = q_rope.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_decode: q_rope has no device ptr".into())
+        })?;
+        let kv_ptr = kv_cache.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_decode: kv_cache has no device ptr".into())
+        })?;
         let out_ptr = out
             .device_ptr
             .ok_or_else(|| Error::Backend("mla_absorbed_decode: out has no device ptr".into()))?;
@@ -9831,12 +9882,12 @@ impl RocmDevice {
         let lse_b_ptr = lse_b_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("merge_attn_states: lse_b has no device ptr".into()))?;
-        let out_m_ptr = out_merged_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("merge_attn_states: out_merged has no device ptr".into()))?;
-        let lse_m_ptr = lse_merged_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("merge_attn_states: lse_merged has no device ptr".into()))?;
+        let out_m_ptr = out_merged_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("merge_attn_states: out_merged has no device ptr".into())
+        })?;
+        let lse_m_ptr = lse_merged_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("merge_attn_states: lse_merged has no device ptr".into())
+        })?;
 
         let block_dim = HipDim3::new(head_dim.max(32).next_power_of_two() as u32, 1, 1);
         let grid_dim = HipDim3::new(num_tokens as u32, num_heads as u32, 1);
@@ -9888,15 +9939,15 @@ impl RocmDevice {
         let v_ptr = value_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("reshape_preshuffled: value has no device ptr".into()))?;
-        let kc_ptr = k_cache_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("reshape_preshuffled: k_cache has no device ptr".into()))?;
-        let vc_ptr = v_cache_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("reshape_preshuffled: v_cache has no device ptr".into()))?;
-        let sm_ptr = slot_mapping_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("reshape_preshuffled: slot_mapping has no device ptr".into()))?;
+        let kc_ptr = k_cache_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("reshape_preshuffled: k_cache has no device ptr".into())
+        })?;
+        let vc_ptr = v_cache_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("reshape_preshuffled: v_cache has no device ptr".into())
+        })?;
+        let sm_ptr = slot_mapping_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("reshape_preshuffled: slot_mapping has no device ptr".into())
+        })?;
 
         let block_dim = HipDim3::new(head_dim as u32, 1, 1);
         let grid_dim = HipDim3::new(num_tokens as u32, num_heads as u32, 1);
@@ -9947,21 +9998,21 @@ impl RocmDevice {
         let q_ptr = q_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("preshuffled_paged_attn: q has no device ptr".into()))?;
-        let kc_ptr = k_cache_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: k_cache has no device ptr".into()))?;
-        let vc_ptr = v_cache_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: v_cache has no device ptr".into()))?;
-        let bt_ptr = block_tables_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: block_tables has no device ptr".into()))?;
-        let cl_ptr = context_lens_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: context_lens has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: out has no device ptr".into()))?;
+        let kc_ptr = k_cache_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("preshuffled_paged_attn: k_cache has no device ptr".into())
+        })?;
+        let vc_ptr = v_cache_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("preshuffled_paged_attn: v_cache has no device ptr".into())
+        })?;
+        let bt_ptr = block_tables_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("preshuffled_paged_attn: block_tables has no device ptr".into())
+        })?;
+        let cl_ptr = context_lens_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("preshuffled_paged_attn: context_lens has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("preshuffled_paged_attn: out has no device ptr".into())
+        })?;
 
         let block_dim = HipDim3::new(head_dim.max(32).next_power_of_two() as u32, 1, 1);
         let grid_dim = HipDim3::new(num_seqs as u32, num_heads as u32, 1);
@@ -10091,9 +10142,9 @@ impl RocmDevice {
         let ur_ptr = uniform_rands_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("spec_sample: uniform_rands has no device ptr".into()))?;
-        let at_ptr = accepted_tokens_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("spec_sample: accepted_tokens has no device ptr".into()))?;
+        let at_ptr = accepted_tokens_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("spec_sample: accepted_tokens has no device ptr".into())
+        })?;
         let al_ptr = accepted_lens_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("spec_sample: accepted_lens has no device ptr".into()))?;
@@ -10877,8 +10928,14 @@ impl RocmDevice {
 
         // atomicAdd accumulation across heads requires a zeroed output;
         // async memset on the active stream keeps it stream-ordered.
-        let res =
-            unsafe { hipMemsetAsync(out_ptr as *mut c_void, 0, storage.bytes, self.active_stream()) };
+        let res = unsafe {
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                storage.bytes,
+                self.active_stream(),
+            )
+        };
         if res != hipSuccess {
             return Err(Error::Backend(format!(
                 "fused_attn_o_proj: hipMemsetAsync failed with status {res}"
@@ -10938,7 +10995,6 @@ impl RocmDevice {
         );
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
-
 
     pub(crate) fn launch_compute_kernel_with_solution(
         &self,
@@ -11767,7 +11823,8 @@ impl RocmDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
-        quant_format: crate::fusion::KvQuantFormat, quant_bits: u32,
+        quant_format: crate::fusion::KvQuantFormat,
+        quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let config = {

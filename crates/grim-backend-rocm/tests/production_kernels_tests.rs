@@ -217,7 +217,8 @@ fn test_mla_absorbed_decode_parity() -> TestResult {
 
     let q_nope_dev = BackendDevice::from_cpu(&dev, &q_nope_data, &q_nope_shape, DType::F32)?;
     let q_pe_dev = BackendDevice::from_cpu(&dev, &q_pe_data, &q_pe_shape, DType::F32)?;
-    let packed_kv_dev = BackendDevice::from_cpu(&dev, &packed_kv_data, &packed_kv_shape, DType::F32)?;
+    let packed_kv_dev =
+        BackendDevice::from_cpu(&dev, &packed_kv_data, &packed_kv_shape, DType::F32)?;
     let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F32)?;
 
     let q_nope_s = grim_backend_rocm::device::util::as_rocm(q_nope_dev.as_ref())?;
@@ -280,24 +281,10 @@ fn test_marlin_gemm_w4a16_parity() -> TestResult {
     let scales_shape = Shape::from_slice(&[n, k / 16]);
     let out_shape = Shape::from_slice(&[m, n]);
 
-    let a_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&a_f16),
-        &a_shape,
-        DType::F16,
-    )?;
-    let b_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&b_w4),
-        &b_shape,
-        DType::U32,
-    )?;
-    let scales_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&scales_f16),
-        &scales_shape,
-        DType::F16,
-    )?;
+    let a_dev = BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&a_f16), &a_shape, DType::F16)?;
+    let b_dev = BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&b_w4), &b_shape, DType::U32)?;
+    let scales_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&scales_f16), &scales_shape, DType::F16)?;
     let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F16)?;
 
     let a_s = grim_backend_rocm::device::util::as_rocm(a_dev.as_ref())?;
@@ -360,12 +347,7 @@ fn test_bitnet_gemm_w158a8_parity() -> TestResult {
     let out_shape = Shape::from_slice(&[m, n]);
 
     let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
-    let b_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        &b_ternary_packed,
-        &b_shape,
-        DType::U8,
-    )?;
+    let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_ternary_packed, &b_shape, DType::U8)?;
     let scales_dev = BackendDevice::from_cpu(&dev, &scales_b, &scales_shape, DType::F32)?;
     let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F32)?;
 

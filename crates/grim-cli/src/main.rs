@@ -1148,13 +1148,19 @@ async fn main() -> Result<()> {
         } => {
             client::download_model(&model, output).await?;
             // Auto-install architecture plugin if model reference is Hugging Face
-            if model.starts_with("hf:") || (model.contains('/') && !model.starts_with("http://") && !model.starts_with("https://")) {
+            if model.starts_with("hf:")
+                || (model.contains('/')
+                    && !model.starts_with("http://")
+                    && !model.starts_with("https://"))
+            {
                 let clean_ref = model.trim_start_matches("hf:");
                 let parts: Vec<&str> = clean_ref.split('/').collect();
                 if parts.len() >= 2 {
                     let org_repo = format!("{}/{}", parts[0], parts[1]);
                     if let Err(e) = arch_plugin::cmd_arch_plugin_generate(&org_repo, None).await {
-                        eprintln!("[grim] note: could not auto-generate arch plugin for {org_repo}: {e}");
+                        eprintln!(
+                            "[grim] note: could not auto-generate arch plugin for {org_repo}: {e}"
+                        );
                     }
                 }
             }
@@ -1284,22 +1290,40 @@ async fn main() -> Result<()> {
                 cfg_toml.train.relora_reset_steps
             };
             let effective_use_oft = use_oft || cfg_toml.train.use_oft;
-            let effective_oft_rank = if oft_rank != 8 { oft_rank } else { cfg_toml.train.oft_rank };
+            let effective_oft_rank = if oft_rank != 8 {
+                oft_rank
+            } else {
+                cfg_toml.train.oft_rank
+            };
             let effective_eval_ds = eval_dataset.or(cfg_toml.train.eval);
-            let effective_eval_every = if eval_every_steps != 0 { eval_every_steps } else { cfg_toml.train.eval_every_steps };
-            let effective_eval_warmup = if eval_warmup_steps != 0 { eval_warmup_steps } else { cfg_toml.train.eval_warmup_steps };
+            let effective_eval_every = if eval_every_steps != 0 {
+                eval_every_steps
+            } else {
+                cfg_toml.train.eval_every_steps
+            };
+            let effective_eval_warmup = if eval_warmup_steps != 0 {
+                eval_warmup_steps
+            } else {
+                cfg_toml.train.eval_warmup_steps
+            };
             let mut effective_paths = dataset_paths;
             if effective_paths.is_empty() && !cfg_toml.train.dataset.is_empty() {
                 effective_paths = cfg_toml.train.dataset;
             }
             let effective_mix_weights = mix_weights
-                .map(|s| s.split(',').filter_map(|w| w.trim().parse::<f32>().ok()).collect())
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|w| w.trim().parse::<f32>().ok())
+                        .collect()
+                })
                 .unwrap_or(cfg_toml.train.mix_weights);
             let effective_dedup = dedup || cfg_toml.train.dedup;
 
             // Apply --quick preset defaults if requested
             let (final_epochs, final_rank, final_alpha, final_device, final_mode) = if quick {
-                println!("[grim train] Using --quick LoRA preset (1 epoch, rank 8, alpha 16.0, cpu device)");
+                println!(
+                    "[grim train] Using --quick LoRA preset (1 epoch, rank 8, alpha 16.0, cpu device)"
+                );
                 (1, 8, 16.0, "cpu".to_string(), "lora".to_string())
             } else {
                 (epochs, rank, alpha, device, mode)
@@ -1358,9 +1382,14 @@ async fn main() -> Result<()> {
             }
             TemplatesCmd::Inspect { family } => {
                 if let Some(f) = grim_cli::template_registry::TemplateRegistry::lookup(&family) {
-                    println!("--- {} ---\n{}\n\nJinja Template:\n{}", f.name, f.description, f.jinja);
+                    println!(
+                        "--- {} ---\n{}\n\nJinja Template:\n{}",
+                        f.name, f.description, f.jinja
+                    );
                 } else {
-                    eprintln!("Unknown template family: '{family}'. Run 'grim templates list' for available families.");
+                    eprintln!(
+                        "Unknown template family: '{family}'. Run 'grim templates list' for available families."
+                    );
                     std::process::exit(1);
                 }
             }
@@ -1387,7 +1416,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        }
+        },
         Commands::Merge {
             model,
             adapter,
@@ -1541,7 +1570,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-Commands::Doctor {
+        Commands::Doctor {
             addr,
             service_name,
             exec_path,

@@ -339,10 +339,9 @@ impl GgufProvider {
     /// fresh `Vec`). `GgufTensorInfo.offset` is relative to the tensor-data
     /// section start, which begins at `self.data_start`.
     fn slice_tensor(&self, info: &GgufTensorInfo) -> Result<Vec<u8>> {
-        let start = self
-            .data_start
-            .checked_add(info.offset)
-            .ok_or_else(|| Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name)))?;
+        let start = self.data_start.checked_add(info.offset).ok_or_else(|| {
+            Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name))
+        })?;
         self.read_region(start, info.size_bytes as usize)
     }
 
@@ -444,8 +443,9 @@ impl SafetensorsProvider {
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot reopen safetensors file '{path}': {e}")))?;
         let mmap = unsafe {
-            memmap2::Mmap::map(&file)
-                .map_err(|e| Error::Backend(format!("cannot mmap safetensors file '{path}': {e}")))?
+            memmap2::Mmap::map(&file).map_err(|e| {
+                Error::Backend(format!("cannot mmap safetensors file '{path}': {e}"))
+            })?
         };
         Ok(Self {
             info,
@@ -1173,6 +1173,10 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
         // Enumerate under the remapped (loader-side) names so a
         // `WeightSource` prefetch keyed by those names lines up with the
         // `full_name` keys the loader actually requests.
-        self.inner.tensor_names().into_iter().map(|n| (self.remap)(&n)).collect()
+        self.inner
+            .tensor_names()
+            .into_iter()
+            .map(|n| (self.remap)(&n))
+            .collect()
     }
 }

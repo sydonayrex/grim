@@ -191,8 +191,7 @@ impl RadixTree {
             };
             if n != self.root && !has_children {
                 if let Some(p) = parent {
-                    let key = self
-                        .nodes[p]
+                    let key = self.nodes[p]
                         .children
                         .iter()
                         .find(|(_, v)| **v == n)
@@ -272,9 +271,13 @@ mod tests {
         let mut tree = RadixTree::new(16);
         let base: Vec<u32> = (0..32).collect(); // two shared blocks
         let mut a = base.clone();
-        a.extend_from_slice(&[100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116]); // +1 block
+        a.extend_from_slice(&[
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
+        ]); // +1 block
         let mut b = base.clone();
-        b.extend_from_slice(&[200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216]); // +1 block (diverges)
+        b.extend_from_slice(&[
+            200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
+        ]); // +1 block (diverges)
 
         tree.insert(&a, &[10, 11, 12]);
         // b shares the first two blocks (same content) but diverges at block 3.

@@ -54,6 +54,10 @@ mod tests {
         // Synthetic forward returning constant cross-entropy loss = ln(2) ~= 0.693147
         let report = perplexity::<_, String>(&dataset, |_seq| Ok(2.0f64.ln())).unwrap();
         assert_eq!(report.tokens, 6);
-        assert!((report.ppl - 2.0).abs() < 1e-5, "expected ppl = 2.0, got {}", report.ppl);
+        assert!(
+            (report.ppl - 2.0).abs() < 1e-5,
+            "expected ppl = 2.0, got {}",
+            report.ppl
+        );
     }
 }

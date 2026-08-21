@@ -112,9 +112,13 @@ fn toy_overfit_loss_decreases() {
         let b2_id = tape.register_param(pb2, params.get(pb2).unwrap().data.clone());
 
         // True LoRA forward on CPU (lora_accumulate), recorded on the tape.
-        let h_id = lora_stage(&mut tape, &dev, base1_id, x_id, &base1, &input, a1_id, b1_id, pa1, pb1);
+        let h_id = lora_stage(
+            &mut tape, &dev, base1_id, x_id, &base1, &input, a1_id, b1_id, pa1, pb1,
+        );
         let h = tape.get(h_id).unwrap().clone();
-        let logits_id = lora_stage(&mut tape, &dev, base2_id, h_id, &base2, &h, a2_id, b2_id, pa2, pb2);
+        let logits_id = lora_stage(
+            &mut tape, &dev, base2_id, h_id, &base2, &h, a2_id, b2_id, pa2, pb2,
+        );
         let logits = tape.get(logits_id).unwrap().clone();
 
         let (loss, loss_grad) = cross_entropy_loss(&logits, &target).unwrap();

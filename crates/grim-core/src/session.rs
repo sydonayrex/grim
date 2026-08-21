@@ -180,17 +180,13 @@ impl SessionT for Inner {
         self.kv.as_deref_mut()
     }
     fn has_paged_kv(&self) -> bool {
-        self.kv
-            .as_deref()
-            .map_or(false, |kv| kv.has_paged_kv())
+        self.kv.as_deref().map_or(false, |kv| kv.has_paged_kv())
     }
     fn block_table(&self) -> Option<&[u32]> {
         self.kv.as_deref().and_then(|kv| kv.block_table())
     }
     fn paged_kv_handles(&self, layer: usize) -> Option<(Tensor, Tensor, usize)> {
-        self.kv
-            .as_deref()
-            .and_then(|kv| kv.paged_kv_handles(layer))
+        self.kv.as_deref().and_then(|kv| kv.paged_kv_handles(layer))
     }
     fn rollback_kv_to(&mut self, len: usize) -> Result<()> {
         if let Some(kv) = self.kv.as_deref_mut() {

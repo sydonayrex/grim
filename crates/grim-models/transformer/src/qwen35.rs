@@ -96,7 +96,9 @@ impl Qwen35LayerCache {
     pub fn new(cfg: &Qwen35Config) -> Self {
         let conv_dim = cfg.hidden_size.max(cfg.ssm_d_inner) * 2;
         let conv_size = (cfg.ssm_d_conv.max(1) - 1) * conv_dim;
-        let ssm_size = cfg.ssm_n_group.max(1) * cfg.ssm_d_state.max(1) * (cfg.ssm_d_inner / cfg.ssm_n_group.max(1));
+        let ssm_size = cfg.ssm_n_group.max(1)
+            * cfg.ssm_d_state.max(1)
+            * (cfg.ssm_d_inner / cfg.ssm_n_group.max(1));
         Self {
             k_cache: Vec::new(),
             v_cache: Vec::new(),
@@ -166,20 +168,74 @@ impl Qwen35Block {
 
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
-        let (wq, wk, wv, wo, attn_q_norm, attn_k_norm, attn_qkv, attn_gate, ssm_out) = if is_full_attention {
-            let wq = Linear::load_column_parallel(&ws.pp("attn_q"), cfg.hidden_size, q_dim.max(12288), false, tp).ok();
-            let wk = Linear::load_column_parallel(&ws.pp("attn_k"), cfg.hidden_size, kv_dim, false, tp).ok();
-            let wv = Linear::load_column_parallel(&ws.pp("attn_v"), cfg.hidden_size, kv_dim, false, tp).ok();
-            let wo = Linear::load_row_parallel(&ws.pp("attn_output"), q_dim, cfg.hidden_size, false, tp).ok();
-            let attn_q_norm = RmsNorm::load(&ws.pp("attn_q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
-            let attn_k_norm = RmsNorm::load(&ws.pp("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
-            (wq, wk, wv, wo, attn_q_norm, attn_k_norm, None, None, None)
-        } else {
-            let attn_qkv = Linear::load_column_parallel(&ws.pp("attn_qkv"), cfg.hidden_size, qkv_dim.max(10240), false, tp).ok();
-            let attn_gate = Linear::load_column_parallel(&ws.pp("attn_gate"), cfg.hidden_size, q_dim.max(6144), false, tp).ok();
-            let ssm_out = Linear::load_row_parallel(&ws.pp("ssm_out"), q_dim.max(6144), cfg.hidden_size, false, tp).ok();
-            (None, None, None, None, None, None, attn_qkv, attn_gate, ssm_out)
-        };
+        let (wq, wk, wv, wo, attn_q_norm, attn_k_norm, attn_qkv, attn_gate, ssm_out) =
+            if is_full_attention {
+                let wq = Linear::load_column_parallel(
+                    &ws.pp("attn_q"),
+                    cfg.hidden_size,
+                    q_dim.max(12288),
+                    false,
+                    tp,
+                )
+                .ok();
+                let wk = Linear::load_column_parallel(
+                    &ws.pp("attn_k"),
+                    cfg.hidden_size,
+                    kv_dim,
+                    false,
+                    tp,
+                )
+                .ok();
+                let wv = Linear::load_column_parallel(
+                    &ws.pp("attn_v"),
+                    cfg.hidden_size,
+                    kv_dim,
+                    false,
+                    tp,
+                )
+                .ok();
+                let wo = Linear::load_row_parallel(
+                    &ws.pp("attn_output"),
+                    q_dim,
+                    cfg.hidden_size,
+                    false,
+                    tp,
+                )
+                .ok();
+                let attn_q_norm =
+                    RmsNorm::load(&ws.pp("attn_q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+                let attn_k_norm =
+                    RmsNorm::load(&ws.pp("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+                (wq, wk, wv, wo, attn_q_norm, attn_k_norm, None, None, None)
+            } else {
+                let attn_qkv = Linear::load_column_parallel(
+                    &ws.pp("attn_qkv"),
+                    cfg.hidden_size,
+                    qkv_dim.max(10240),
+                    false,
+                    tp,
+                )
+                .ok();
+                let attn_gate = Linear::load_column_parallel(
+                    &ws.pp("attn_gate"),
+                    cfg.hidden_size,
+                    q_dim.max(6144),
+                    false,
+                    tp,
+                )
+                .ok();
+                let ssm_out = Linear::load_row_parallel(
+                    &ws.pp("ssm_out"),
+                    q_dim.max(6144),
+                    cfg.hidden_size,
+                    false,
+                    tp,
+                )
+                .ok();
+                (
+                    None, None, None, None, None, None, attn_qkv, attn_gate, ssm_out,
+                )
+            };
 
         let (ssm_conv1d, ssm_conv_vec) = if let Ok(t) = ws.get_unconstrained("ssm_conv1d.weight") {
             let vec = t.to_vec_f32().ok();
@@ -188,13 +244,40 @@ impl Qwen35Block {
             (None, None)
         };
 
-        let ssm_a = ws.get_unconstrained("ssm_a").ok().and_then(|t| t.to_vec_f32().ok());
-        let ssm_alpha = Linear::load_column_parallel(&ws.pp("ssm_alpha"), cfg.hidden_size, cfg.ssm_dt_rank, false, tp).ok();
-        let ssm_beta = Linear::load_column_parallel(&ws.pp("ssm_beta"), cfg.hidden_size, cfg.ssm_dt_rank, false, tp).ok();
-        let ssm_dt_bias = ws.get_unconstrained("ssm_dt.bias").ok().and_then(|t| t.to_vec_f32().ok());
-        let ssm_norm = ws.get_unconstrained("ssm_norm.weight").ok().and_then(|t| t.to_vec_f32().ok());
+        let ssm_a = ws
+            .get_unconstrained("ssm_a")
+            .ok()
+            .and_then(|t| t.to_vec_f32().ok());
+        let ssm_alpha = Linear::load_column_parallel(
+            &ws.pp("ssm_alpha"),
+            cfg.hidden_size,
+            cfg.ssm_dt_rank,
+            false,
+            tp,
+        )
+        .ok();
+        let ssm_beta = Linear::load_column_parallel(
+            &ws.pp("ssm_beta"),
+            cfg.hidden_size,
+            cfg.ssm_dt_rank,
+            false,
+            tp,
+        )
+        .ok();
+        let ssm_dt_bias = ws
+            .get_unconstrained("ssm_dt.bias")
+            .ok()
+            .and_then(|t| t.to_vec_f32().ok());
+        let ssm_norm = ws
+            .get_unconstrained("ssm_norm.weight")
+            .ok()
+            .and_then(|t| t.to_vec_f32().ok());
 
-        let post_attention_norm = if let Ok(m) = RmsNorm::load(&ws.pp("post_attention_norm"), cfg.hidden_size, cfg.rms_norm_eps) {
+        let post_attention_norm = if let Ok(m) = RmsNorm::load(
+            &ws.pp("post_attention_norm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        ) {
             m
         } else {
             RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?
@@ -303,8 +386,20 @@ impl Qwen35Block {
             };
 
             // Apply RoPE to Q and K
-            apply_rope_neox(&mut q_all, positions, self.num_heads, self.head_dim, self.rope_theta);
-            apply_rope_neox(&mut k_all, positions, self.num_kv_heads, self.head_dim, self.rope_theta);
+            apply_rope_neox(
+                &mut q_all,
+                positions,
+                self.num_heads,
+                self.head_dim,
+                self.rope_theta,
+            );
+            apply_rope_neox(
+                &mut k_all,
+                positions,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rope_theta,
+            );
 
             cache.k_cache.extend_from_slice(&k_all);
             cache.v_cache.extend_from_slice(&v_all);
@@ -383,11 +478,7 @@ impl Qwen35Block {
             }
         }
 
-        let branch_tensor = device_tensor(
-            out_branch,
-            Shape::new(vec![seq_len, q_dim]),
-            &device,
-        )?;
+        let branch_tensor = device_tensor(out_branch, Shape::new(vec![seq_len, q_dim]), &device)?;
 
         let proj_out = if let Some(ref wo) = self.wo {
             wo.forward(&branch_tensor)?
@@ -447,7 +538,11 @@ impl Qwen35 {
 
         eprintln!(
             "[grim] Initializing Qwen3.5/3.8 hybrid model: layers={}, hidden={}, vocab={}, interval={}, devices={:?}",
-            cfg.num_layers, cfg.hidden_size, cfg.vocab_size, cfg.full_attention_interval, available_devices
+            cfg.num_layers,
+            cfg.hidden_size,
+            cfg.vocab_size,
+            cfg.full_attention_interval,
+            available_devices
         );
 
         let first_device = available_devices[0].clone();
@@ -466,7 +561,8 @@ impl Qwen35 {
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let layer_device = available_devices[i * available_devices.len() / cfg.num_layers].clone();
+            let layer_device =
+                available_devices[i * available_devices.len() / cfg.num_layers].clone();
             if i % 10 == 0 || i + 1 == cfg.num_layers {
                 eprintln!(
                     "[grim] Loading layer {}/{} on {}...",
@@ -499,7 +595,8 @@ impl Qwen35 {
             cfg.vocab_size,
             false,
             tp,
-        ).or_else(|_| {
+        )
+        .or_else(|_| {
             Linear::load(
                 &ws.with_device(last_device).pp("output"),
                 cfg.hidden_size,
@@ -567,7 +664,9 @@ impl CausalLm for Qwen35 {
         };
 
         let seq_len = ids.len();
-        let mut h = self.tok_embeddings.forward(&ids, seq_len, self.cfg.hidden_size)?;
+        let mut h = self
+            .tok_embeddings
+            .forward(&ids, seq_len, self.cfg.hidden_size)?;
 
         if session.model_state().is_none() {
             let fresh: Vec<Qwen35LayerCache> = (0..self.blocks.len())

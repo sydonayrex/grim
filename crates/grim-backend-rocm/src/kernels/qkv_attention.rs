@@ -1431,7 +1431,7 @@ pub fn launch_qkv_attention_wmma(
 #[repr(i32)]
 pub enum KvCacheQuantFormat {
     Int8 = 0,
-    Int4 = 1,     // W4A16 packed 4-bit nibbles
+    Int4 = 1, // W4A16 packed 4-bit nibbles
     Fp8E4M3 = 2,
     Fp8E5M2 = 3,
     Fp4E2M1 = 4,
@@ -1589,7 +1589,9 @@ mod tests {
 
         let q_data: Vec<f32> = (0..q_size).map(|i| ((i as f32) * 0.1).sin()).collect();
         let k_data: Vec<f32> = (0..kv_size).map(|i| ((i as f32) * 0.15).cos()).collect();
-        let v_data: Vec<f32> = (0..kv_size).map(|i| ((i as f32) * 0.08).sin() + 0.5).collect();
+        let v_data: Vec<f32> = (0..kv_size)
+            .map(|i| ((i as f32) * 0.08).sin() + 0.5)
+            .collect();
 
         let q_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
         let k_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
@@ -1675,8 +1677,14 @@ mod tests {
         let q_storage = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
 
         let block_tables_data = vec![
-            BlockTableEntry { block_id: 0, page_size },
-            BlockTableEntry { block_id: 1, page_size },
+            BlockTableEntry {
+                block_id: 0,
+                page_size,
+            },
+            BlockTableEntry {
+                block_id: 1,
+                page_size,
+            },
         ];
         let bt_bytes: Vec<u8> = block_tables_data
             .iter()
@@ -1691,7 +1699,10 @@ mod tests {
             .from_cpu_bytes(
                 &bt_bytes,
                 &Shape::new(vec![block_tables_data.len() * 8]),
-                DType { arith: ArithType::U8, storage: Storage::Native },
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
             )
             .unwrap();
 
@@ -1703,14 +1714,20 @@ mod tests {
             .from_cpu_bytes(
                 &k_bytes,
                 &Shape::new(vec![total_page_elems]),
-                DType { arith: ArithType::U8, storage: Storage::Native },
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
             )
             .unwrap();
         let v_storage = dev
             .from_cpu_bytes(
                 &v_bytes,
                 &Shape::new(vec![total_page_elems]),
-                DType { arith: ArithType::U8, storage: Storage::Native },
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
             )
             .unwrap();
 

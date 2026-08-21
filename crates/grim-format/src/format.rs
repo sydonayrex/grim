@@ -1815,7 +1815,10 @@ mod tests {
             let written = file.write(&mut out).unwrap();
             let e = &written[0];
             let payload: Vec<u8> = (0u8..255).cycle().take(256).collect();
-            let outliers: Vec<u8> = (200u8..=255).cycle().take(4 * OUTLIER_RECORD_BYTES).collect();
+            let outliers: Vec<u8> = (200u8..=255)
+                .cycle()
+                .take(4 * OUTLIER_RECORD_BYTES)
+                .collect();
             out.seek(SeekFrom::Start(e.payload_offset)).unwrap();
             out.write_all(&payload).unwrap();
             out.seek(SeekFrom::Start(e.outlier_offset)).unwrap();
@@ -1848,7 +1851,10 @@ mod tests {
         f.read_exact(&mut outliers).unwrap();
         assert_eq!(
             outliers,
-            (200u8..=255).cycle().take(4 * OUTLIER_RECORD_BYTES).collect::<Vec<_>>()
+            (200u8..=255)
+                .cycle()
+                .take(4 * OUTLIER_RECORD_BYTES)
+                .collect::<Vec<_>>()
         );
     }
 

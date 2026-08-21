@@ -19,7 +19,7 @@
 //! RESULT: 19/19 PASS. All tests are CPU-side arch table logic — no GPU calls.
 //!   Verified on the dual-GPU RDNA4 box.
 
-use grim_backend_rocm::quantization::{arch_capability, gcn_arch, GcnArch, QuantMode};
+use grim_backend_rocm::quantization::{GcnArch, QuantMode, arch_capability, gcn_arch};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;

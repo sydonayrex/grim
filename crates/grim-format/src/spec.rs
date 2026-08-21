@@ -695,9 +695,7 @@ pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<(Vec<(u32, f32)>, usiz
 
     // Bound allocation from untrusted input: each index costs ≥1 varint byte
     // and each value 1 byte, so `count` can never exceed the remaining buffer.
-    let count = count
-        .min(buf.len().saturating_sub(cursor))
-        .min(1_000_000);
+    let count = count.min(buf.len().saturating_sub(cursor)).min(1_000_000);
 
     let mut indices: Vec<u32> = Vec::with_capacity(count);
     let mut prev_idx: u64 = 0;

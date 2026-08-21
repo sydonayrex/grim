@@ -2593,7 +2593,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     // mode's initial loss rather than from the previously-stored
                     // `loss`. The previous "loss * 0.9" was correct for SFT but
                     // trapped RL modes at zero forever.
-                     Err(e) => {
+                    Err(e) => {
                         eprintln!("[grim-garage] worker: {} step failed: {e}", id);
                         let _ = registry
                             .update_status_and_broadcast(&id, JobStatus::Failed)
@@ -2708,8 +2708,13 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 // _legacy_loss_and_grads was computed but discarded — pure wasted compute.
                 // [P2-14 fix: removed dead _legacy_loss_and_grads call.]
-                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) =
-                    preference_loss_and_grads(mode, &chosen_logps, &rejected_logps, &ref_chosen, &ref_rejected);
+                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) = preference_loss_and_grads(
+                    mode,
+                    &chosen_logps,
+                    &rejected_logps,
+                    &ref_chosen,
+                    &ref_rejected,
+                );
 
                 // Backward: VJP the per-sample log-probability gradients through
                 // the model's logits so the LoRA adapters receive real signals.

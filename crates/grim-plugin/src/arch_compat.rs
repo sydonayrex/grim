@@ -124,7 +124,13 @@ struct RawHfConfig {
     model_type: Option<String>,
     #[serde(rename = "hidden_size", alias = "d_model", alias = "dim")]
     hidden_size: Option<usize>,
-    #[serde(rename = "num_hidden_layers", alias = "num_layers", alias = "n_layer", alias = "n_layers", alias = "num_blocks")]
+    #[serde(
+        rename = "num_hidden_layers",
+        alias = "num_layers",
+        alias = "n_layer",
+        alias = "n_layers",
+        alias = "num_blocks"
+    )]
     num_hidden_layers: Option<usize>,
     #[serde(rename = "vocab_size")]
     vocab_size: Option<usize>,
@@ -134,9 +140,18 @@ struct RawHfConfig {
     layer_norm_eps: Option<f32>,
     #[serde(rename = "rope_theta")]
     rope_theta: Option<f32>,
-    #[serde(rename = "num_attention_heads", alias = "num_heads", alias = "n_head", alias = "n_heads")]
+    #[serde(
+        rename = "num_attention_heads",
+        alias = "num_heads",
+        alias = "n_head",
+        alias = "n_heads"
+    )]
     num_attention_heads: Option<usize>,
-    #[serde(rename = "num_key_value_heads", alias = "num_kv_heads", alias = "n_kv_head")]
+    #[serde(
+        rename = "num_key_value_heads",
+        alias = "num_kv_heads",
+        alias = "n_kv_head"
+    )]
     num_key_value_heads: Option<usize>,
     #[serde(rename = "head_dim")]
     head_dim: Option<usize>,

@@ -1172,27 +1172,29 @@ pub fn reframe_mxfp4_gguf(raw: &[u8], num_values: usize) -> Result<Vec<u8>> {
             .par_chunks_mut(CHUNK_BLOCKS * 16)
             .zip(exps.par_chunks_mut(CHUNK_BLOCKS))
             .enumerate()
-            .for_each(|(chunk_idx, (c_chunk, e_chunk)): (usize, (&mut [u8], &mut [u8]))| {
-                let start_b = chunk_idx * CHUNK_BLOCKS;
-                let chunk_blocks = e_chunk.len();
-                for b_local in 0..chunk_blocks {
-                    let b = start_b + b_local;
-                    let raw_offset = b * 17;
-                    e_chunk[b_local] = raw[raw_offset];
+            .for_each(
+                |(chunk_idx, (c_chunk, e_chunk)): (usize, (&mut [u8], &mut [u8]))| {
+                    let start_b = chunk_idx * CHUNK_BLOCKS;
+                    let chunk_blocks = e_chunk.len();
+                    for b_local in 0..chunk_blocks {
+                        let b = start_b + b_local;
+                        let raw_offset = b * 17;
+                        e_chunk[b_local] = raw[raw_offset];
 
-                    let qs = &raw[raw_offset + 1..raw_offset + 17];
-                    let out_c = &mut c_chunk[b_local * 16..(b_local + 1) * 16];
+                        let qs = &raw[raw_offset + 1..raw_offset + 17];
+                        let out_c = &mut c_chunk[b_local * 16..(b_local + 1) * 16];
 
-                    // Lower 16 elements (0..15) packed into 8 bytes
-                    for k in 0..8 {
-                        out_c[k] = (qs[2 * k] & 0x0F) | ((qs[2 * k + 1] & 0x0F) << 4);
+                        // Lower 16 elements (0..15) packed into 8 bytes
+                        for k in 0..8 {
+                            out_c[k] = (qs[2 * k] & 0x0F) | ((qs[2 * k + 1] & 0x0F) << 4);
+                        }
+                        // Upper 16 elements (16..31) packed into 8 bytes
+                        for k in 0..8 {
+                            out_c[8 + k] = (qs[2 * k] >> 4) | ((qs[2 * k + 1] >> 4) << 4);
+                        }
                     }
-                    // Upper 16 elements (16..31) packed into 8 bytes
-                    for k in 0..8 {
-                        out_c[8 + k] = (qs[2 * k] >> 4) | ((qs[2 * k + 1] >> 4) << 4);
-                    }
-                }
-            });
+                },
+            );
     } else {
         for b in 0..blocks {
             let raw_offset = b * 17;
@@ -1740,7 +1742,10 @@ pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
             sub_scales[s] = sc.clamp(1, 63);
         }
 
-        let max_sc = sub_scales.iter().map(|&s| s.max(1) as f32).fold(0.0f32, f32::max);
+        let max_sc = sub_scales
+            .iter()
+            .map(|&s| s.max(1) as f32)
+            .fold(0.0f32, f32::max);
         let d = if max_sc > 0.0 { max_sc / 63.0 } else { 1.0 };
 
         // Normalize sub-scales to [1..63] relative to d
@@ -1799,9 +1804,7 @@ pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
 
         out.extend_from_slice(&ql);
         out.extend_from_slice(&qh);
-        out.extend_from_slice(
-            &sub_scales.map(|s| s as u8),
-        );
+        out.extend_from_slice(&sub_scales.map(|s| s as u8));
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
     }
 
@@ -2024,7 +2027,10 @@ pub fn f32_to_mxfp4_e2m1(v: f32, shared_exp: u8) -> u8 {
 /// block decodes to at most `6.0 * 2^(exp - 127)` (the E2M1 max), avoiding
 /// overflow/clamping. `k` must be a multiple of 32.
 pub fn quant_mxfp4_matrix(data: &[f32], rows: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
-    assert!(k % 32 == 0, "quant_mxfp4_matrix: k must be a multiple of 32");
+    assert!(
+        k % 32 == 0,
+        "quant_mxfp4_matrix: k must be a multiple of 32"
+    );
     let exps_per_row = k / 32;
     let mut codes = vec![0u8; rows * k / 2];
     let mut exps = vec![0u8; rows * exps_per_row];
@@ -2227,11 +2233,7 @@ pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(num_blocks * 170);
     for chunk in data.chunks(SUPER) {
         let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let scale = if max_val > 0.0 {
-            max_val / 127.0
-        } else {
-            1.0
-        };
+        let scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
         let d_f16 = f32_to_f16(scale).to_le_bytes();
         out.extend_from_slice(&d_f16);
 

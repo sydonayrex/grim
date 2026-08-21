@@ -101,11 +101,7 @@ fn bytes_to_f32s(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
             if data.len() % 2 != 0 {
                 return None;
             }
-            Some(
-                data.chunks_exact(2)
-                    .map(|c| f16_to_f32_le(c))
-                    .collect(),
-            )
+            Some(data.chunks_exact(2).map(|c| f16_to_f32_le(c)).collect())
         }
         TrainFpFormat::Fp8E4M3 | TrainFpFormat::Fp8E5M2 | TrainFpFormat::Fp4 => None,
     }
@@ -355,8 +351,11 @@ impl TrainState {
         buf.write_all(&TRAIN_MAGIC)
             .map_err(|e| Error::Backend(format!("train magic write failed: {e}")))?;
 
-        let dtypes_tags: std::collections::BTreeMap<&str, u8> =
-            self.dtypes.iter().map(|(k, v)| (k.as_str(), v.as_u8())).collect();
+        let dtypes_tags: std::collections::BTreeMap<&str, u8> = self
+            .dtypes
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_u8()))
+            .collect();
         let header = serde_json::json!({
             "step": self.step,
             "fp_format": self.fp_format.as_u8(),

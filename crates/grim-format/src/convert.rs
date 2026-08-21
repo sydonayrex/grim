@@ -1186,8 +1186,12 @@ mod tests {
         let mut expected_attn_floats = initial_sq_floats.clone();
         let _ = grim_quant::apply_smoothquant_scale(&mut expected_attn_floats, dim, dim, None);
         grim_quant::spinquant_rotate(&mut expected_attn_floats, dim, 0.01, 5);
-        let expected_attn_payload_size =
-            crate::format::normals_packed_size_for_wave(count_sq, 0, 8, crate::format::WaveSize::W64);
+        let expected_attn_payload_size = crate::format::normals_packed_size_for_wave(
+            count_sq,
+            0,
+            8,
+            crate::format::WaveSize::W64,
+        );
         let mut expected_attn_payload = Vec::with_capacity(expected_attn_payload_size as usize);
         crate::format::pack_row_bpw_for_wave(
             &mut expected_attn_payload,
@@ -1202,8 +1206,12 @@ mod tests {
         let mut expected_ffn_floats = initial_sq_floats.clone();
         let _ = grim_quant::apply_smoothquant_scale(&mut expected_ffn_floats, dim, dim, None);
         // Note: NO spinquant_rotate
-        let expected_ffn_payload_size =
-            crate::format::normals_packed_size_for_wave(count_sq, 0, 8, crate::format::WaveSize::W64);
+        let expected_ffn_payload_size = crate::format::normals_packed_size_for_wave(
+            count_sq,
+            0,
+            8,
+            crate::format::WaveSize::W64,
+        );
         let mut expected_ffn_payload = Vec::with_capacity(expected_ffn_payload_size as usize);
         crate::format::pack_row_bpw_for_wave(
             &mut expected_ffn_payload,

@@ -16,8 +16,8 @@ use grim_models_mamba::{
 };
 use grim_models_transformer::{
     Bloom, BloomConfig, Chameleon, ChameleonConfig, CogVlm, CogVlmConfig, CogVlmVisionConfig,
-    CommandRConfig, DeepSeek, DeepSeek2, DeepSeek2Config, DeepSeek32, DeepSeek32Config, DeepSeek4,
-    DeepSeek4Config, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig, DiffusionGemma,
+    CommandRConfig, DeepSeek, DeepSeek2, DeepSeek2Config, DeepSeek4, DeepSeek4Config, DeepSeek32,
+    DeepSeek32Config, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig, DiffusionGemma,
     DiffusionGemmaConfig, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma3n,
     Gemma3nConfig, GemmaConfig, Glm52, Glm52Config, Gpt2, Gpt2Config, HunyuanVl, HunyuanVlConfig,
     HunyuanVlVisionConfig, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
@@ -703,7 +703,7 @@ fn load_model_from_config(
 
     let tp = resolve_tp_config()?;
     let ws = WeightSource::root(provider, device.clone()).with_tp_config(tp);
-            ws.prefetch_all();
+    ws.prefetch_all();
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -832,9 +832,7 @@ fn load_model_from_config(
             let m = Phi2::load_tp(device.clone(), &ws, phi_cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Qwen
-        | ModelArchitecture::Qwen2
-        | ModelArchitecture::Qwen3 => {
+        ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 => {
             let qwen_cfg = QwenConfig {
                 vocab_size,
                 hidden_size,
@@ -933,10 +931,7 @@ fn load_model_from_config(
                     attention_factor: 1.2772588722239782,
                 }),
             };
-            eprintln!(
-                "[grim] Loading Mellum model with config: {:?}",
-                mellum_cfg
-            );
+            eprintln!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
             let m = Mellum::load_tp(device.clone(), &ws, mellum_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2271,9 +2266,7 @@ fn load_model_with_providers(
             let m = SmolLm2::load_tp(device.clone(), &ws, smollm2_cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Qwen
-        | ModelArchitecture::Qwen2
-        | ModelArchitecture::Qwen3 => {
+        ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 => {
             let qwen_cfg = QwenConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2315,8 +2308,12 @@ fn load_model_with_providers(
                     if min_free != u64::MAX && min_free > 0 {
                         let headroom = 1536 * 1024 * 1024;
                         let avail = min_free.saturating_sub(headroom);
-                        let attn_layers_per_gpu = (hparams.num_layers / devices.len().max(1)).max(1) / hparams.full_attention_interval.unwrap_or(4).max(1);
-                        let kv_bytes_per_tok = (2 * hparams.num_kv_heads * hparams.head_dim * 4 * attn_layers_per_gpu).max(1) as u64;
+                        let attn_layers_per_gpu = (hparams.num_layers / devices.len().max(1))
+                            .max(1)
+                            / hparams.full_attention_interval.unwrap_or(4).max(1);
+                        let kv_bytes_per_tok =
+                            (2 * hparams.num_kv_heads * hparams.head_dim * 4 * attn_layers_per_gpu)
+                                .max(1) as u64;
                         let max_safe = (avail / kv_bytes_per_tok) as usize;
                         if max_safe < hparams.max_seq_len {
                             let clamped = max_safe.max(1024);
@@ -2341,7 +2338,10 @@ fn load_model_with_providers(
                 ssm_n_group: hparams.ssm_n_group.unwrap_or(16),
                 devices: resolve_discrete_rocm_devices(&device),
             };
-            eprintln!("[grim] Loading Qwen3.5/3.8 model with config: {:?}", qwen35_cfg);
+            eprintln!(
+                "[grim] Loading Qwen3.5/3.8 model with config: {:?}",
+                qwen35_cfg
+            );
             let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2417,10 +2417,7 @@ fn load_model_with_providers(
                     attention_factor: 1.2772588722239782,
                 }),
             };
-            eprintln!(
-                "[grim] Loading Mellum model with config: {:?}",
-                mellum_cfg
-            );
+            eprintln!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
             let m = Mellum::load_tp(device.clone(), &ws, mellum_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2914,7 +2911,9 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(hparams.intermediate_size),
+                moe_intermediate_size: hparams
+                    .expert_feed_forward_length
+                    .unwrap_or(hparams.intermediate_size),
                 n_routed_experts: hparams.expert_count.unwrap_or(64),
                 n_shared_experts: 2,
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(6),
@@ -2941,7 +2940,9 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(hparams.intermediate_size),
+                moe_intermediate_size: hparams
+                    .expert_feed_forward_length
+                    .unwrap_or(hparams.intermediate_size),
                 n_routed_experts: hparams.expert_count.unwrap_or(256),
                 n_shared_experts: 1,
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(8),
@@ -2968,7 +2969,9 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(hparams.intermediate_size),
+                moe_intermediate_size: hparams
+                    .expert_feed_forward_length
+                    .unwrap_or(hparams.intermediate_size),
                 n_routed_experts: hparams.expert_count.unwrap_or(256),
                 n_shared_experts: 1,
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(6),
@@ -3949,7 +3952,10 @@ mod tests {
 
         // The fix: config_raw must be Some(contents), not Some(path_string).
         let config_raw_str = config_raw.expect("sibling config.json must be read");
-        assert_eq!(config_raw_str, config_json, "must return file contents, not path");
+        assert_eq!(
+            config_raw_str, config_json,
+            "must return file contents, not path"
+        );
 
         // And that it parses correctly via resolve_arch_compat_spec.
         let spec = resolve_arch_compat_spec("test-arch", Some(&config_raw_str))
@@ -4030,7 +4036,8 @@ mod tests {
         // grim_plugins_dir() reads the env var at call time, so we can override it.
         let plugins_dir = grim_core::paths::grim_plugins_dir();
         assert_eq!(
-            plugins_dir, tmp_dir.path(),
+            plugins_dir,
+            tmp_dir.path(),
             "GRIM_PLUGINS_DIR override must be honoured"
         );
 
@@ -4078,8 +4085,7 @@ mod tests {
             "num_layers": 12
         }"#;
 
-        let spec = resolve_arch_compat_spec("test-arch", Some(inline_json))
-            .expect("must resolve");
+        let spec = resolve_arch_compat_spec("test-arch", Some(inline_json)).expect("must resolve");
         // The inline config must win.
         assert_eq!(spec.hidden_size, 2048, "inline config must take priority");
         assert_eq!(spec.num_layers, 12, "inline config must take priority");

@@ -622,10 +622,22 @@ mod tests {
         };
 
         // Test OP_COL_GEMM (1) and OP_NORM (4)
-        let a = dev.from_cpu(&[2.0f32, 3.0f32], &Shape::new(vec![2]), DType::F32).unwrap();
-        let w = dev.from_cpu(&[1.0f32, 2.0f32, 3.0f32, 4.0f32], &Shape::new(vec![4]), DType::F32).unwrap();
-        let out_gemm = dev.from_cpu(&[0.0f32, 0.0f32], &Shape::new(vec![2]), DType::F32).unwrap();
-        let out_norm = dev.from_cpu(&[0.0f32, 0.0f32], &Shape::new(vec![2]), DType::F32).unwrap();
+        let a = dev
+            .from_cpu(&[2.0f32, 3.0f32], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let w = dev
+            .from_cpu(
+                &[1.0f32, 2.0f32, 3.0f32, 4.0f32],
+                &Shape::new(vec![4]),
+                DType::F32,
+            )
+            .unwrap();
+        let out_gemm = dev
+            .from_cpu(&[0.0f32, 0.0f32], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let out_norm = dev
+            .from_cpu(&[0.0f32, 0.0f32], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
 
         // Slot 0: OP_COL_GEMM (m=1, n=2, k=2)
         let mut slot0 = vec![0u8; 64];
@@ -647,24 +659,31 @@ mod tests {
 
         let mut slots_bytes = slot0;
         slots_bytes.extend_from_slice(&slot1);
-        let slots = dev.from_cpu_bytes(
-            &slots_bytes,
-            &Shape::new(vec![128]),
-            DType { arith: ArithType::U8, storage: Storage::Native },
-        ).unwrap();
+        let slots = dev
+            .from_cpu_bytes(
+                &slots_bytes,
+                &Shape::new(vec![128]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
+            )
+            .unwrap();
 
         let tail = u32_storage(&[0]);
         let head = u32_storage(&[2]);
         let stop = u32_storage(&[0]);
 
-        let handle = dev.launch_scythe_persistent_dispatch(
-            slots.as_ref(),
-            2,
-            tail.as_ref(),
-            head.as_ref(),
-            stop.as_ref(),
-            2,
-        ).unwrap();
+        let handle = dev
+            .launch_scythe_persistent_dispatch(
+                slots.as_ref(),
+                2,
+                tail.as_ref(),
+                head.as_ref(),
+                stop.as_ref(),
+                2,
+            )
+            .unwrap();
         handle.synchronize().unwrap();
 
         let gemm_res = out_gemm.to_cpu_vec_f32().unwrap();

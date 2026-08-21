@@ -1090,13 +1090,28 @@ impl TensorNamingRegistry {
                         format!("{il_p}ffn.w_down.weight"),
                         format!("{gg_p}ffn_down.weight"),
                     );
-                    map.insert(format!("{il_p}ssm.conv1d.weight"), format!("{gg_p}ssm_conv1d.weight"));
+                    map.insert(
+                        format!("{il_p}ssm.conv1d.weight"),
+                        format!("{gg_p}ssm_conv1d.weight"),
+                    );
                     map.insert(format!("{il_p}ssm.a"), format!("{gg_p}ssm_a"));
-                    map.insert(format!("{il_p}ssm.alpha.weight"), format!("{gg_p}ssm_alpha.weight"));
-                    map.insert(format!("{il_p}ssm.beta.weight"), format!("{gg_p}ssm_beta.weight"));
+                    map.insert(
+                        format!("{il_p}ssm.alpha.weight"),
+                        format!("{gg_p}ssm_alpha.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ssm.beta.weight"),
+                        format!("{gg_p}ssm_beta.weight"),
+                    );
                     map.insert(format!("{il_p}ssm.dt.bias"), format!("{gg_p}ssm_dt.bias"));
-                    map.insert(format!("{il_p}ssm.norm.weight"), format!("{gg_p}ssm_norm.weight"));
-                    map.insert(format!("{il_p}ssm.out.weight"), format!("{gg_p}ssm_out.weight"));
+                    map.insert(
+                        format!("{il_p}ssm.norm.weight"),
+                        format!("{gg_p}ssm_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ssm.out.weight"),
+                        format!("{gg_p}ssm_out.weight"),
+                    );
                 }
             }
             ModelArchitecture::Mellum => {
@@ -1502,7 +1517,9 @@ mod tests {
     fn test_p2_26a_family_hf_mappings() {
         let falcon = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Falcon, 32);
         assert_eq!(
-            falcon.get("transformer.h.0.input_layernorm.weight").unwrap(),
+            falcon
+                .get("transformer.h.0.input_layernorm.weight")
+                .unwrap(),
             "blk.0.attn_norm.weight"
         );
         assert_eq!(
@@ -1512,7 +1529,9 @@ mod tests {
             "blk.0.attn_qkv.weight"
         );
         assert_eq!(
-            falcon.get("transformer.h.0.self_attention.dense.weight").unwrap(),
+            falcon
+                .get("transformer.h.0.self_attention.dense.weight")
+                .unwrap(),
             "blk.0.attn_output.weight"
         );
         assert_eq!(
@@ -1553,20 +1572,29 @@ mod tests {
             gptj.get("transformer.h.0.mlp.fc_out.weight").unwrap(),
             "blk.0.ffn_down.weight"
         );
-        assert_eq!(gptj.get("transformer.wte.weight").unwrap(), "token_embd.weight");
-        assert_eq!(gptj.get("transformer.ln_f.weight").unwrap(), "output_norm.weight");
+        assert_eq!(
+            gptj.get("transformer.wte.weight").unwrap(),
+            "token_embd.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.ln_f.weight").unwrap(),
+            "output_norm.weight"
+        );
 
         let neox = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::GptNeoX, 32);
         assert_eq!(
-            neox.get("gpt_neox.layers.0.attention.query_key_value.weight").unwrap(),
+            neox.get("gpt_neox.layers.0.attention.query_key_value.weight")
+                .unwrap(),
             "blk.0.attn_qkv.weight"
         );
         assert_eq!(
-            neox.get("gpt_neox.layers.0.attention.dense.weight").unwrap(),
+            neox.get("gpt_neox.layers.0.attention.dense.weight")
+                .unwrap(),
             "blk.0.attn_output.weight"
         );
         assert_eq!(
-            neox.get("gpt_neox.layers.0.input_layernorm.weight").unwrap(),
+            neox.get("gpt_neox.layers.0.input_layernorm.weight")
+                .unwrap(),
             "blk.0.attn_norm.weight"
         );
         assert_eq!(
@@ -1596,7 +1624,10 @@ mod tests {
             mpt.get("transformer.blocks.0.norm_2.weight").unwrap(),
             "blk.0.ffn_norm.weight"
         );
-        assert_eq!(mpt.get("transformer.wte.weight").unwrap(), "token_embd.weight");
+        assert_eq!(
+            mpt.get("transformer.wte.weight").unwrap(),
+            "token_embd.weight"
+        );
         assert_eq!(
             mpt.get("transformer.norm_f.weight").unwrap(),
             "output_norm.weight"
@@ -1604,7 +1635,8 @@ mod tests {
 
         let bloom = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Bloom, 24);
         assert_eq!(
-            bloom.get("transformer.h.0.self_attention.query_key_value.weight")
+            bloom
+                .get("transformer.h.0.self_attention.query_key_value.weight")
                 .unwrap(),
             "blk.0.attn_qkv.weight"
         );

@@ -185,7 +185,9 @@ pub fn self_heal_sidecar(model_path: &Path) {
 /// only — payload bytes are never touched — so it is cheap on the catalog
 /// scan path. Non-`.grim` files or missing tags leave the entry untouched.
 pub fn apply_grim_tags(entry: &mut ModelEntry, model_path: &Path) {
-    if !entry.preferred_dtype.is_empty() || model_path.extension().map(|e| e != "grim").unwrap_or(true) {
+    if !entry.preferred_dtype.is_empty()
+        || model_path.extension().map(|e| e != "grim").unwrap_or(true)
+    {
         return;
     }
     if let Ok(mut file) = std::fs::File::open(model_path) {

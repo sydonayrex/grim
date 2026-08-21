@@ -371,7 +371,13 @@ impl Tape {
         trainable_params: &mut crate::param::TrainableParams,
         optimizer: &mut crate::adamw::Optimizer,
     ) -> Result<HashMap<TensorId, Tensor>> {
-        let grads = crate::backward::backward_step(self, loss_grad, loss_tensor_id, trainable_params, optimizer)?;
+        let grads = crate::backward::backward_step(
+            self,
+            loss_grad,
+            loss_tensor_id,
+            trainable_params,
+            optimizer,
+        )?;
         self.clear();
         Ok(grads)
     }
@@ -480,12 +486,15 @@ mod tests {
         );
 
         let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
-        let mut optimizer = crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
+        let mut optimizer =
+            crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
 
         assert_eq!(tape.len(), 1);
         let initial_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
 
-        let grads = tape.drain_and_step(loss_grad, out, &mut params, &mut optimizer).unwrap();
+        let grads = tape
+            .drain_and_step(loss_grad, out, &mut params, &mut optimizer)
+            .unwrap();
 
         // Check grads returned, tape cleared, and params updated by optimizer step
         assert!(grads.contains_key(&base));

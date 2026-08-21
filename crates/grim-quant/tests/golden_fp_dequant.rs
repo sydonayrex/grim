@@ -266,15 +266,27 @@ fn mxfp4_gguf_golden_split_nibble_order() {
     for i in 0..64 {
         let (block, e, code) = if i < 32 {
             let j = i % 16;
-            let code = if i < 16 { (j + 1) as u8 } else { (16 - j) as u8 };
+            let code = if i < 16 {
+                (j + 1) as u8
+            } else {
+                (16 - j) as u8
+            };
             (0, 127u8, code)
         } else {
             let j = i % 16;
-            let code = if i < 48 { (15 - j) as u8 } else { (j + 1) as u8 };
+            let code = if i < 48 {
+                (15 - j) as u8
+            } else {
+                (j + 1) as u8
+            };
             (1, 130u8, code)
         };
         let want = grim_quant::mxfp4_e2m1_to_f32(code, e);
-        close(out[i], want, &format!("mxfp4 gguf block{block}[{i}] code={code:#x}"));
+        close(
+            out[i],
+            want,
+            &format!("mxfp4 gguf block{block}[{i}] code={code:#x}"),
+        );
     }
 }
 

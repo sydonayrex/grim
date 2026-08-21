@@ -382,7 +382,8 @@ mod tests {
         std::fs::write(&temp_file, b"test plugin content").expect("write temp file");
 
         // Compute the correct hash
-        let correct_hash = DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash");
+        let correct_hash =
+            DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash");
 
         // Create a manifest with the correct hash - should fail because file isn't a valid .so
         let _manifest = PluginManifest {
@@ -449,8 +450,12 @@ mod tests {
         // Verify against a known value (computed externally)
         // SHA256("test content for sha256") = 587c8c2b5c9d1e5b3f6a7e8d9c0b1a2f3e4d5c6b7a8d9e0f1a2b3c4d5e6f7a8b
         // We'll just verify it's consistent by computing twice
-        let computed2 = DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash again");
-        assert_eq!(computed, computed2, "SHA-256 computation should be deterministic");
+        let computed2 =
+            DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash again");
+        assert_eq!(
+            computed, computed2,
+            "SHA-256 computation should be deterministic"
+        );
 
         let _ = std::fs::remove_file(&temp_file);
     }

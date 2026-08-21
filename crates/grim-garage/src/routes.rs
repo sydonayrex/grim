@@ -1423,7 +1423,12 @@ async fn chat_handler(
         // fall back to token == 0 (common but not universal). Never hardcode
         // token == 2 which is wrong for Llama-3-family tokenizers.
         // [P2-13 fix: tokenizer-aware EOS detection; propagate sampler errors.]
-        let eos_id = state.tokenizer.lock().unwrap().as_ref().and_then(|t| t.eos_token_id);
+        let eos_id = state
+            .tokenizer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|t| t.eos_token_id);
         if token == eos_id.unwrap_or(0) || token == 0 {
             break;
         }

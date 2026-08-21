@@ -503,7 +503,10 @@ mod tests {
         let legacy_k_blocks = KERNEL_SOURCE.matches("quant_bits == 8").count()
             + KERNEL_SOURCE.matches("else {").count();
         // There's one "else {" for the K dequant branch and one for V.
-        assert!(legacy_k_blocks >= 2, "Legacy paths must have K and V dequant blocks");
+        assert!(
+            legacy_k_blocks >= 2,
+            "Legacy paths must have K and V dequant blocks"
+        );
     }
 
     #[test]

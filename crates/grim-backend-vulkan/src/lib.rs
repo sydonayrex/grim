@@ -1164,12 +1164,12 @@ fn alloc_host_visible_staging_buffer(
         };
         vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
 
-        let mappable =
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        let mappable = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         let memory_type_index = (0..mem_properties.memory_type_count)
             .find(|i| {
                 (reqs.memory_type_bits & (1 << i)) != 0
-                    && (mem_properties.memory_types[*i as usize].property_flags & mappable) == mappable
+                    && (mem_properties.memory_types[*i as usize].property_flags & mappable)
+                        == mappable
             })
             .ok_or_else(|| Error::Backend("staging: no mappable memory type".into()))?;
 
@@ -1508,8 +1508,12 @@ impl VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
         let total_work = (seq_len * num_heads) as u32;
@@ -2038,8 +2042,12 @@ impl VulkanDevice {
             (ctx.device, ctx.physical_device)
         };
 
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(&out_shape, output_dtype, ctx_device, ctx_physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            &out_shape,
+            output_dtype,
+            ctx_device,
+            ctx_physical_device,
+        )?;
         let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
@@ -2323,8 +2331,12 @@ impl VulkanDevice {
         };
         let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
 
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         // Try GPU dispatch first
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
@@ -2419,8 +2431,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Add).to_vec();
@@ -2458,8 +2474,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Mul).to_vec();
@@ -2498,8 +2518,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::SiluMul).to_vec();
@@ -2542,8 +2566,18 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let df = VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
-        let de = VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let df = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let de = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
         let buffers = [e_s.buffer, g_s.buffer, dw_s.buffer, df.buffer, de.buffer];
         let push = push_params(out_shape.elem_count() as u32, 0, 0, 0, 0, 0.0);
         run_compute_shader(
@@ -2583,8 +2617,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -2641,10 +2679,18 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let y_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
-        let norm_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let y_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let norm_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let size = out_shape.elem_count();
         let x_dims = x.shape().dims();
@@ -2694,8 +2740,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -2734,8 +2784,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         // Upload indices to GPU buffer temp
         let idx_shape = Shape::new(vec![indices.len()]);
@@ -2933,8 +2987,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
         let buffers = [
             q_s.buffer,
             k_s.buffer,
@@ -3038,8 +3096,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
         let buffers = [
             q_s.buffer,
             k_s.buffer,
@@ -3126,8 +3188,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
         let buffers = [
             q_s.buffer,
             k_s.buffer,
@@ -3174,8 +3240,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::MulScalar).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -3204,8 +3274,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Sqrt).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -3234,8 +3308,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Recip).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -3268,8 +3346,12 @@ impl BackendDevice for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);

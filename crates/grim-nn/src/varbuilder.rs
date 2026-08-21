@@ -302,7 +302,6 @@ impl<'a> WeightSource<'a> {
         self.tensors.meta(&name).is_ok()
     }
 
-
     fn clone_prefix(&self) -> WeightSource<'a> {
         WeightSource {
             tensors: self.tensors,

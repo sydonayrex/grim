@@ -146,7 +146,13 @@ impl GemmaBlock {
         let q_r = reshape_heads(&q, new_tokens, self.num_heads, self.head_dim)?;
         let k_r = reshape_heads(&k, new_tokens, self.num_kv_heads, self.head_dim)?;
         let q = apply_rope_per_head(&q_r, positions, &self.rope, self.num_heads, self.head_dim)?;
-        let k = apply_rope_per_head(&k_r, positions, &self.rope, self.num_kv_heads, self.head_dim)?;
+        let k = apply_rope_per_head(
+            &k_r,
+            positions,
+            &self.rope,
+            self.num_kv_heads,
+            self.head_dim,
+        )?;
 
         let k_t = cpu_tensor(
             k.to_vec_f32()?,
@@ -179,8 +185,7 @@ impl GemmaBlock {
             &kv_head,
         );
 
-        let attn_out_t =
-            cpu_tensor(attn_out, grim_tensor::Shape::new(vec![new_tokens, q_row]));
+        let attn_out_t = cpu_tensor(attn_out, grim_tensor::Shape::new(vec![new_tokens, q_row]));
         let attn_out = self.wo.forward(&attn_out_t)?;
         let x_res1 = add_tensors(x, &attn_out).map_err(grim_core::Error::Tensor)?;
 
@@ -191,7 +196,6 @@ impl GemmaBlock {
         let ffn_out = self.ffn_down.forward(&activated)?;
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
-
 }
 
 pub struct Gemma {
@@ -274,8 +278,7 @@ impl Model for Gemma {
 impl CausalLm for Gemma {
     fn new_session(&self) -> Box<dyn SessionT> {
         let mut session = Inner::new(self.device.clone());
-        let caches: Vec<Option<crate::kv_attention::RefKvCache>> =
-            vec![None; self.layers.len()];
+        let caches: Vec<Option<crate::kv_attention::RefKvCache>> = vec![None; self.layers.len()];
         session.set_model_state(Box::new(caches));
         Box::new(session)
     }
@@ -392,7 +395,10 @@ mod tests {
     use grim_tensor::{Shape, Tensor};
 
     fn lin(in_dim: usize, out_dim: usize) -> Linear {
-        let w = cpu_tensor(vec![0.01f32; out_dim * in_dim], Shape::new(vec![out_dim, in_dim]));
+        let w = cpu_tensor(
+            vec![0.01f32; out_dim * in_dim],
+            Shape::new(vec![out_dim, in_dim]),
+        );
         Linear::from_tensor(w, None)
     }
 
@@ -454,7 +460,11 @@ mod tests {
 
         let a = cached.to_vec_f32().unwrap();
         let b = stateless.to_vec_f32().unwrap();
-        let diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         assert!(diff > 1e-5, "decode ignored cached prefix (diff={diff})");
         assert_eq!(cache.past_len, 3, "cache should hold prompt + decode");
     }
@@ -467,13 +477,19 @@ mod tests {
         let n = 3usize;
         let prompt = t((0..p * 8).map(|i| (i as f32) * 0.05).collect(), vec![p, 8]);
         let mut cache = RefKvCache::new();
-        let _ = blk.forward_cached(&prompt, &(0..p as u32).collect::<Vec<_>>(), &mut cache).unwrap();
+        let _ = blk
+            .forward_cached(&prompt, &(0..p as u32).collect::<Vec<_>>(), &mut cache)
+            .unwrap();
         assert_eq!(cache.past_len, p);
         for i in 0..n {
-            let tok = t((0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(), vec![1, 8]);
-            let _ = blk.forward_cached(&tok, &[(p + i) as u32], &mut cache).unwrap();
+            let tok = t(
+                (0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(),
+                vec![1, 8],
+            );
+            let _ = blk
+                .forward_cached(&tok, &[(p + i) as u32], &mut cache)
+                .unwrap();
         }
         assert_eq!(cache.past_len, p + n);
     }
 }
-

@@ -253,7 +253,8 @@ impl RwkvBlock {
 
         // Use time-mix output (tm_data) in the residual, not att_out.
         // [P1-32 fix: use tm_data in residual.]
-        let x_res1 = add_tensors(x, &cpu_tensor(tm_data, Shape::new(vec![1, dim]))).map_err(grim_core::Error::Tensor)?;
+        let x_res1 = add_tensors(x, &cpu_tensor(tm_data, Shape::new(vec![1, dim])))
+            .map_err(grim_core::Error::Tensor)?;
         let x_res1_data = x_res1.to_vec_f32()?;
 
         // Channel-mix: project through key/receptance/value weights.
@@ -379,7 +380,9 @@ impl Rwkv {
              sharding needs a bespoke plan",
         )
         .map_err(grim_core::Error::Unimplemented)?;
-        let emb_weight = ws.pp("emb").get(Shape::new(vec![cfg.vocab_size, cfg.hidden_size]), "weight")?
+        let emb_weight = ws
+            .pp("emb")
+            .get(Shape::new(vec![cfg.vocab_size, cfg.hidden_size]), "weight")?
             .to_vec_f32()?;
         // RWKV embedding is [vocab_size, hidden_size] — use as a gather table,
         // NOT a Linear matrix multiply.

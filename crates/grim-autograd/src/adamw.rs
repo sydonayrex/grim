@@ -399,7 +399,11 @@ impl Optimizer {
     }
 
     /// Update a single parameter using the configured optimizer (LOMO streaming step).
-    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
         match self {
             Optimizer::AdamW(o) => o.step_param(id, param),
             Optimizer::Lion(o) => o.step_param(id, param),
@@ -539,7 +543,11 @@ impl AdamW {
     }
 
     /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
-    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
         if param.is_frozen() {
             param.zero_grad()?;
             return Ok(());
@@ -554,7 +562,11 @@ impl AdamW {
         };
         let weight_decay = self.config.weight_decay;
 
-        let sc = if self.step_count == 0 { 1 } else { self.step_count };
+        let sc = if self.step_count == 0 {
+            1
+        } else {
+            self.step_count
+        };
         let bias_correction1 = 1.0 - beta1.powi(sc as i32);
         let bias_correction2 = 1.0 - beta2.powi(sc as i32);
 
@@ -765,9 +777,8 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
 
 /// Decode a sidecar blob back to f32 values according to its `TrainFpFormat`.
 fn decode_blob_f32s(bytes: &[u8], fmt: TrainFpFormat) -> Result<Vec<f32>> {
-    grim_format::train::decode_f32s_from(bytes, fmt).ok_or_else(|| {
-        Error::Backend(format!("invalid byte slice length for {fmt:?} blob"))
-    })
+    grim_format::train::decode_f32s_from(bytes, fmt)
+        .ok_or_else(|| Error::Backend(format!("invalid byte slice length for {fmt:?} blob")))
 }
 
 /// Persist only the parameter data + step count (no optimizer moments).
@@ -881,7 +892,11 @@ impl Lion {
     }
 
     /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
-    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
         if param.is_frozen() {
             param.zero_grad()?;
             return Ok(());
@@ -2321,7 +2336,11 @@ impl MAdam {
     }
 
     /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
-    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
         if param.is_frozen() {
             param.zero_grad()?;
             return Ok(());
@@ -2335,7 +2354,11 @@ impl MAdam {
         let gamma = self.config.gamma;
         let wd = self.config.weight_decay;
 
-        let sc = if self.step_count == 0 { 1 } else { self.step_count };
+        let sc = if self.step_count == 0 {
+            1
+        } else {
+            self.step_count
+        };
         let bc1 = 1.0 - beta1.powi(sc as i32);
         let bc2 = 1.0 - beta2.powi(sc as i32);
 
@@ -2575,7 +2598,11 @@ impl LionVote {
     }
 
     /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
-    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
         if param.is_frozen() {
             param.zero_grad()?;
             return Ok(());
@@ -2611,7 +2638,11 @@ impl LionVote {
             }
         }
         let agreement = (positive_votes as f32 / elem_count as f32 - 0.5).abs() * 2.0;
-        let scale_factor = if agreement > threshold { 1.0 } else { 0.5 + 0.5 * agreement };
+        let scale_factor = if agreement > threshold {
+            1.0
+        } else {
+            0.5 + 0.5 * agreement
+        };
 
         let mut exp_new = Vec::with_capacity(elem_count);
         let mut new_data = Vec::with_capacity(elem_count);
@@ -2815,7 +2846,10 @@ mod tests {
         lionvote.step(&mut params).unwrap();
 
         let p_val = params.get(pid_b).unwrap().data.to_vec_f32().unwrap();
-        assert!(p_val[0] < 2.0, "LionVote step must decrease param along gradient");
+        assert!(
+            p_val[0] < 2.0,
+            "LionVote step must decrease param along gradient"
+        );
 
         let state = lionvote.save_to_train_state(&params);
         assert_eq!(state.step, 1);
@@ -2829,7 +2863,9 @@ mod tests {
             .unwrap(),
         );
         let mut lionvote2 = LionVote::new(LionVoteConfig::default());
-        lionvote2.load_from_train_state(&mut params2, &state).unwrap();
+        lionvote2
+            .load_from_train_state(&mut params2, &state)
+            .unwrap();
 
         let restored = params2.get(pid_b).unwrap().data.to_vec_f32().unwrap();
         for (a, b) in p_val.iter().zip(&restored) {
@@ -3146,7 +3182,12 @@ mod tests {
 
             opt.step_param(pid, &mut tp).unwrap();
             let after = tp.data.to_vec_f32().unwrap();
-            assert_ne!(after, vec![1.0f32; 4], "Optimizer {:?} must update param via step_param", kind);
+            assert_ne!(
+                after,
+                vec![1.0f32; 4],
+                "Optimizer {:?} must update param via step_param",
+                kind
+            );
         }
     }
 }

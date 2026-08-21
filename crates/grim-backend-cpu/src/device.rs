@@ -776,10 +776,18 @@ impl BackendDevice for CpuDevice {
                     }
                 }
                 if std::env::var("GRIM_DBG_ATTN").is_ok() && t == 2 && h == 0 {
-                    eprintln!("[classic_dbg] t=2 h=0 scores={scores:?} q_abs={q_abs} kv_stride={kv_stride} nh={num_heads} hd={head_dim}");
-                    let qslice: Vec<f32> = (0..head_dim).map(|d| qd[t * num_head_dims + h * head_dim + d]).collect();
-                    let k0: Vec<f32> = (0..head_dim).map(|d| kd[0 * kv_stride + kvh * head_dim + d]).collect();
-                    let k1: Vec<f32> = (0..head_dim).map(|d| kd[1 * kv_stride + kvh * head_dim + d]).collect();
+                    eprintln!(
+                        "[classic_dbg] t=2 h=0 scores={scores:?} q_abs={q_abs} kv_stride={kv_stride} nh={num_heads} hd={head_dim}"
+                    );
+                    let qslice: Vec<f32> = (0..head_dim)
+                        .map(|d| qd[t * num_head_dims + h * head_dim + d])
+                        .collect();
+                    let k0: Vec<f32> = (0..head_dim)
+                        .map(|d| kd[kvh * head_dim + d])
+                        .collect();
+                    let k1: Vec<f32> = (0..head_dim)
+                        .map(|d| kd[1 * kv_stride + kvh * head_dim + d])
+                        .collect();
                     eprintln!("[classic_dbg] q={qslice:?} k0={k0:?} k1={k1:?}");
                 }
                 // Stable softmax
@@ -1158,10 +1166,19 @@ impl BackendDevice for CpuDevice {
                     }
                 }
                 if std::env::var("GRIM_DBG_ATTN").is_ok() && t == 2 && h == 0 {
-                    eprintln!("[paged_dbg] t=2 h=0 scores={scores:?} q_abs={q_abs} kv_stride={kv_stride} nh={num_heads} hd={head_dim} bt={:?} ps={page_size}", btd);
-                    let qslice: Vec<f32> = (0..head_dim).map(|d| qd[t * num_head_dims + h * head_dim + d]).collect();
-                    let k0: Vec<f32> = (0..head_dim).map(|d| kd[0 * kv_stride + kvh * head_dim + d]).collect();
-                    let k1: Vec<f32> = (0..head_dim).map(|d| kd[1 * kv_stride + kvh * head_dim + d]).collect();
+                    eprintln!(
+                        "[paged_dbg] t=2 h=0 scores={scores:?} q_abs={q_abs} kv_stride={kv_stride} nh={num_heads} hd={head_dim} bt={:?} ps={page_size}",
+                        btd
+                    );
+                    let qslice: Vec<f32> = (0..head_dim)
+                        .map(|d| qd[t * num_head_dims + h * head_dim + d])
+                        .collect();
+                    let k0: Vec<f32> = (0..head_dim)
+                        .map(|d| kd[kvh * head_dim + d])
+                        .collect();
+                    let k1: Vec<f32> = (0..head_dim)
+                        .map(|d| kd[1 * kv_stride + kvh * head_dim + d])
+                        .collect();
                     eprintln!("[paged_dbg] q={qslice:?} k0={k0:?} k1={k1:?}");
                 }
 
@@ -1185,8 +1202,8 @@ impl BackendDevice for CpuDevice {
                         } else {
                             block_idx_in_seq
                         };
-                        let v_offset = (block_id * page_size + offset_in_block) * kv_stride
-                            + kvh * head_dim;
+                        let v_offset =
+                            (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
                         acc += scores[t2] * vd[v_offset + d];
                     }
                     out[t * num_head_dims + h * head_dim + d] = acc;
@@ -1484,7 +1501,9 @@ impl BackendDevice for CpuDevice {
             grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
         ) {
             let b_dequant = grim_quant::dequant_q80(&b_bytes, k * n).map_err(|e| {
-                Error::Backend(format!("CPU quantized_matmul_backward_dx Q8_0 dequant: {e}"))
+                Error::Backend(format!(
+                    "CPU quantized_matmul_backward_dx Q8_0 dequant: {e}"
+                ))
             })?;
             gemm_dispatch(dy_data, &b_dequant, &mut dx_vec, m, k, n);
             return Ok((
@@ -1608,10 +1627,9 @@ impl BackendStorage for CpuStorage {
         if self.data.len() > 0 || self.dtype.storage == Storage::Native {
             return Ok((*self.data).clone());
         }
-        let raw = self
-            .raw_bytes
-            .as_deref()
-            .ok_or_else(|| Error::Backend("to_cpu_vec_f32: quantized storage with no raw_bytes".into()))?;
+        let raw = self.raw_bytes.as_deref().ok_or_else(|| {
+            Error::Backend("to_cpu_vec_f32: quantized storage with no raw_bytes".into())
+        })?;
         // Quantized storage with raw_bytes: dequantize to f32 (mirrors the ROCm
         // `to_cpu_vec_f32` host-dequant fallback) rather than casting bytes to f32,
         // which would produce one f32 per byte and blow past the element count.
@@ -1637,23 +1655,13 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::Nf4 => grim_quant::dequant_nf4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::Fp8 => grim_quant::dequant_fp8(raw, n),
-                grim_tensor::dtype::FloatPackScheme::MxFp4 => {
-                    grim_quant::dequant_mxfp4(raw, n)
-                }
-                grim_tensor::dtype::FloatPackScheme::MxFp8 => {
-                    grim_quant::dequant_mxfp8(raw, n)
-                }
+                grim_tensor::dtype::FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(raw, n),
+                grim_tensor::dtype::FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(raw, n),
             },
             Storage::Block(block_type) => match block_type {
-                grim_tensor::dtype::BlockDtype::Fp4 => {
-                    grim_quant::dequant_fp4(raw, n)
-                }
-                grim_tensor::dtype::BlockDtype::Nf4 => {
-                    grim_quant::dequant_nf4(raw, n)
-                }
-                grim_tensor::dtype::BlockDtype::Fp8 => {
-                    grim_quant::dequant_fp8(raw, n)
-                }
+                grim_tensor::dtype::BlockDtype::Fp4 => grim_quant::dequant_fp4(raw, n),
+                grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(raw, n),
+                grim_tensor::dtype::BlockDtype::Fp8 => grim_quant::dequant_fp8(raw, n),
                 grim_tensor::dtype::BlockDtype::Fp4Block16 => {
                     grim_quant::dequant_fp4_block16(raw, n)
                 }
@@ -1913,8 +1921,14 @@ mod tests {
             .collect();
 
         let q = cpu_tensor(q_data.clone(), Shape::new(vec![seq, num_heads, head_dim]));
-        let k = cpu_tensor(k_data.clone(), Shape::new(vec![kv_seq, num_kv_heads, head_dim]));
-        let v = cpu_tensor(v_data.clone(), Shape::new(vec![kv_seq, num_kv_heads, head_dim]));
+        let k = cpu_tensor(
+            k_data.clone(),
+            Shape::new(vec![kv_seq, num_kv_heads, head_dim]),
+        );
+        let v = cpu_tensor(
+            v_data.clone(),
+            Shape::new(vec![kv_seq, num_kv_heads, head_dim]),
+        );
         let out_shape = Shape::new(vec![seq, num_heads, head_dim]);
 
         // Dense reference
@@ -1997,7 +2011,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            dense.iter().zip(paged.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
+            dense
+                .iter()
+                .zip(paged.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
             "paged attention must be bit-exact with dense; dense={dense:?} paged={paged:?}"
         );
     }

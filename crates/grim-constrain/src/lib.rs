@@ -12,9 +12,9 @@
 //!   altering, so no existing sampler needs changes.
 
 pub mod json_fsm;
-pub mod schema;
 pub mod sampler;
+pub mod schema;
 
-pub use json_fsm::{apply_mask, FsmCheck, JsonState, TokenMaskCache};
-pub use schema::{compile_json_schema, JsonSchemaCompilerError};
-pub use sampler::{constrained_json_object, ConstrainedSampler, Constraint};
+pub use json_fsm::{FsmCheck, JsonState, TokenMaskCache, apply_mask};
+pub use sampler::{ConstrainedSampler, Constraint, constrained_json_object};
+pub use schema::{JsonSchemaCompilerError, compile_json_schema};

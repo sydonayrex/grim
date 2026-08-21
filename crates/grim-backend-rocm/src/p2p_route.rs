@@ -304,7 +304,10 @@ fn take_staging(stream: *mut c_void, len: usize) -> Result<StagingGuard<'static>
         // SAFETY: the lock is held for the whole lease, so the buffer cannot
         // be swapped out or freed underneath us; same-stream reuse is
         // additionally queue-ordered by `stream` itself.
-        let ptr = unsafe { std::ptr::NonNull::new_unchecked(guard.as_ref().unwrap().buf.as_device_ptr()) }.as_ptr();
+        let ptr = unsafe {
+            std::ptr::NonNull::new_unchecked(guard.as_ref().unwrap().buf.as_device_ptr())
+        }
+        .as_ptr();
         return Ok(StagingGuard {
             _lock: guard,
             _one_shot: None,

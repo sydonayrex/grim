@@ -2,7 +2,9 @@
 //! Extend-path chunking, LSE state merging, BatchReorderer, and Preshuffled vector-tiled KV-cache.
 
 use grim_backend_rocm::RocmDevice;
-use grim_backend_rocm::device::batch_orchestrator::{BatchReorderer, RequestCategory, SequenceMeta};
+use grim_backend_rocm::device::batch_orchestrator::{
+    BatchReorderer, RequestCategory, SequenceMeta,
+};
 use grim_tensor::{BackendDevice, Shape, dtype::DType};
 use std::panic;
 
@@ -164,7 +166,17 @@ fn test_extend_chunk_and_lse_merge_parity() -> TestResult {
 
     // Step 1: Chunk 1 [0..64)
     dev.launch_extend_attention_chunk(
-        q_s, k_s, v_s, o1_s, l1_s, num_tokens, num_heads, num_kv_heads, head_dim, 0, chunk_size,
+        q_s,
+        k_s,
+        v_s,
+        o1_s,
+        l1_s,
+        num_tokens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        0,
+        chunk_size,
     )?;
     // Step 2: Chunk 2 [64..128)
     dev.launch_extend_attention_chunk(
@@ -287,24 +299,12 @@ fn test_preshuffled_paged_attention_parity() -> TestResult {
     let kc_dev = BackendDevice::zeros(&dev, &k_cache_shape, DType::F32)?;
     let vc_dev = BackendDevice::zeros(&dev, &v_cache_shape, DType::F32)?;
 
-    let sm_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&slot_mapping),
-        &slot_shape,
-        DType::U32,
-    )?;
-    let bt_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&block_tables),
-        &bt_shape,
-        DType::U32,
-    )?;
-    let cl_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&context_lens),
-        &cl_shape,
-        DType::U32,
-    )?;
+    let sm_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&slot_mapping), &slot_shape, DType::U32)?;
+    let bt_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&block_tables), &bt_shape, DType::U32)?;
+    let cl_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&context_lens), &cl_shape, DType::U32)?;
     let out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
@@ -332,17 +332,7 @@ fn test_preshuffled_paged_attention_parity() -> TestResult {
 
     // Step 2: Preshuffled Paged Attention Decode
     dev.launch_preshuffled_paged_attention(
-        q_s,
-        kc_s,
-        vc_s,
-        bt_s,
-        cl_s,
-        out_s,
-        num_seqs,
-        num_heads,
-        head_dim,
-        block_size,
-        max_blocks,
+        q_s, kc_s, vc_s, bt_s, cl_s, out_s, num_seqs, num_heads, head_dim, block_size, max_blocks,
     )?;
     dev.synchronize();
 

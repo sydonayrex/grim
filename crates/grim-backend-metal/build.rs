@@ -15,7 +15,7 @@ fn main() {
 
         // Try compiling to AIR
         let status_air = Command::new("xcrun")
-            .args(&[
+            .args([
                 "-sdk",
                 "macosx",
                 "metal",
@@ -30,7 +30,7 @@ fn main() {
             if status.success() {
                 // Try compiling to metallib
                 let status_lib = Command::new("xcrun")
-                    .args(&[
+                    .args([
                         "-sdk",
                         "macosx",
                         "metallib",

@@ -89,10 +89,7 @@ pub struct ChameleonBlock {
 
 impl ChameleonBlock {
     /// Loads Chameleon transformer layer weights with optional per-head Q/K LayerNorms.
-    pub fn load(
-        ws: &WeightSource<'_>,
-        cfg: &ChameleonConfig,
-    ) -> Result<Self> {
+    pub fn load(ws: &WeightSource<'_>, cfg: &ChameleonConfig) -> Result<Self> {
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
 
@@ -103,20 +100,39 @@ impl ChameleonBlock {
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
         let (q_norm, k_norm) = if cfg.swin_norm {
-            let qn = LayerNorm::load(&attn_ws.scoped("q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
-            let kn = LayerNorm::load(&attn_ws.scoped("k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+            let qn =
+                LayerNorm::load(&attn_ws.scoped("q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+            let kn =
+                LayerNorm::load(&attn_ws.scoped("k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
             (qn, kn)
         } else {
             (None, None)
         };
 
-        let attn_norm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ffn_norm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let attn_norm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let ffn_norm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let mlp_ws = ws.scoped("mlp");
-        let w_gate = Linear::load_shape(&mlp_ws.scoped("gate_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_up = Linear::load_shape(&mlp_ws.scoped("up_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_down = Linear::load_shape(&mlp_ws.scoped("down_proj"), [cfg.intermediate_size, cfg.hidden_size])?;
+        let w_gate = Linear::load_shape(
+            &mlp_ws.scoped("gate_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_up = Linear::load_shape(
+            &mlp_ws.scoped("up_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_down = Linear::load_shape(
+            &mlp_ws.scoped("down_proj"),
+            [cfg.intermediate_size, cfg.hidden_size],
+        )?;
 
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
@@ -162,7 +178,8 @@ impl ChameleonBlock {
             let mut q_normed = vec![0.0f32; seq_len * q_dim];
             for s in 0..seq_len {
                 for h in 0..self.num_heads {
-                    let slice = &q_v[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                    let slice =
+                        &q_v[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
                     let head_t = cpu_tensor(slice.to_vec(), Shape::new(vec![1, self.head_dim]));
                     let head_out = qn.forward(&head_t)?.to_vec_f32()?;
                     q_normed[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim]
@@ -179,7 +196,8 @@ impl ChameleonBlock {
             let mut k_normed = vec![0.0f32; seq_len * k_dim];
             for s in 0..seq_len {
                 for h in 0..self.num_kv_heads {
-                    let slice = &kv_vec[s * k_dim + h * self.head_dim..s * k_dim + (h + 1) * self.head_dim];
+                    let slice =
+                        &kv_vec[s * k_dim + h * self.head_dim..s * k_dim + (h + 1) * self.head_dim];
                     let head_t = cpu_tensor(slice.to_vec(), Shape::new(vec![1, self.head_dim]));
                     let head_out = kn.forward(&head_t)?.to_vec_f32()?;
                     k_normed[s * k_dim + h * self.head_dim..s * k_dim + (h + 1) * self.head_dim]
@@ -191,8 +209,20 @@ impl ChameleonBlock {
             k.to_vec_f32()?
         };
 
-        crate::qwen35::apply_rope_neox(&mut q_vec, positions, self.num_heads, self.head_dim, 10000.0);
-        crate::qwen35::apply_rope_neox(&mut k_vec, positions, self.num_kv_heads, self.head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_vec,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            10000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_vec,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            10000.0,
+        );
 
         let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, k_dim]));
@@ -225,11 +255,13 @@ impl ChameleonBlock {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads
+                        [t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -312,7 +344,10 @@ impl Chameleon {
     ) -> Result<Self> {
         let root = ws.scoped("model");
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -376,8 +411,9 @@ impl CausalLm for Chameleon {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -406,4 +442,3 @@ mod tests {
         assert_eq!(cfg.swin_norm, true);
     }
 }
-

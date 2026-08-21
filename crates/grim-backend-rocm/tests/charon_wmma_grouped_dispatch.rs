@@ -88,14 +88,29 @@ fn deterministic_activations() -> Vec<f32> {
 
 fn build_moe_oracle(routed_scaling_factor: f32) -> MoeFfn {
     let (gate, up, down) = deterministic_expert_weights();
-    let rgate = Linear::from_tensor(cpu_tensor(deterministic_router_gate(), Shape::new(vec![NUM_EXPERTS, HIDDEN])), None);
+    let rgate = Linear::from_tensor(
+        cpu_tensor(
+            deterministic_router_gate(),
+            Shape::new(vec![NUM_EXPERTS, HIDDEN]),
+        ),
+        None,
+    );
     let mut eg = Vec::with_capacity(NUM_EXPERTS);
     let mut eu = Vec::with_capacity(NUM_EXPERTS);
     let mut ed = Vec::with_capacity(NUM_EXPERTS);
     for e in 0..NUM_EXPERTS {
-        eg.push(Linear::from_tensor(cpu_tensor(gate[e].clone(), Shape::new(vec![INTER, HIDDEN])), None));
-        eu.push(Linear::from_tensor(cpu_tensor(up[e].clone(), Shape::new(vec![INTER, HIDDEN])), None));
-        ed.push(Linear::from_tensor(cpu_tensor(down[e].clone(), Shape::new(vec![HIDDEN, INTER])), None));
+        eg.push(Linear::from_tensor(
+            cpu_tensor(gate[e].clone(), Shape::new(vec![INTER, HIDDEN])),
+            None,
+        ));
+        eu.push(Linear::from_tensor(
+            cpu_tensor(up[e].clone(), Shape::new(vec![INTER, HIDDEN])),
+            None,
+        ));
+        ed.push(Linear::from_tensor(
+            cpu_tensor(down[e].clone(), Shape::new(vec![HIDDEN, INTER])),
+            None,
+        ));
     }
     let bank = ExpertBank::from_linears(eg, eu, ed);
     let router = MoeRouter::new(rgate, RouterKind::SoftmaxTopK, TOP_K, NUM_EXPERTS, None);
@@ -116,7 +131,10 @@ fn flatten_expert_weights() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 /// Oracle-integrity precondition (closes the G-A3 documentation-only gap):
@@ -126,8 +144,16 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// inlined so it runs regardless of test invocation order.
 fn assert_oracle_respects_rsf(x: &[f32], rsf1: &MoeFfn, rsf05: &MoeFfn) {
     let xt = cpu_tensor(x.to_vec(), Shape::new(vec![BATCH, HIDDEN]));
-    let out1 = rsf1.forward(&xt).expect("oracle rsf=1.0").to_vec_f32().expect("vec");
-    let out05 = rsf05.forward(&xt).expect("oracle rsf=0.5").to_vec_f32().expect("vec");
+    let out1 = rsf1
+        .forward(&xt)
+        .expect("oracle rsf=1.0")
+        .to_vec_f32()
+        .expect("vec");
+    let out05 = rsf05
+        .forward(&xt)
+        .expect("oracle rsf=0.5")
+        .to_vec_f32()
+        .expect("vec");
     let mut max_dev = 0.0f32;
     for i in 0..out1.len() {
         max_dev = max_dev.max((out05[i] - 0.5 * out1[i]).abs());
@@ -147,7 +173,10 @@ fn assert_oracle_respects_rsf(x: &[f32], rsf1: &MoeFfn, rsf05: &MoeFfn) {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
-    let Some(dev) = gpu_device() else { eprintln!("skipping: GPU test gate off"); return };
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
 
     let routed_scaling_factor = 1.7f32; // non-trivial: not 1.0, exercises rsf multiply
     let x_vec = deterministic_activations();
@@ -160,7 +189,11 @@ fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
     assert_oracle_respects_rsf(&x_vec, &rsf1, &rsf05);
 
     let moe = build_moe_oracle(routed_scaling_factor);
-    let cpu_v = moe.forward(&x).expect("oracle forward").to_vec_f32().expect("vec");
+    let cpu_v = moe
+        .forward(&x)
+        .expect("oracle forward")
+        .to_vec_f32()
+        .expect("vec");
 
     let (indices, weights) = moe.router.route(&x).expect("router route");
     let assignment =
@@ -169,13 +202,23 @@ fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
     // top-k>1, multi-expert case confirmed by construction (TOP_K=2,
     // NUM_EXPERTS=4); assert the routing actually spans >1 expert.
     let distinct: std::collections::BTreeSet<_> = indices.iter().flatten().collect();
-    assert!(distinct.len() > 1, "synthetic routing must span multiple experts");
+    assert!(
+        distinct.len() > 1,
+        "synthetic routing must span multiple experts"
+    );
 
     let (gw, uw, dw) = flatten_expert_weights();
     let gpu_v = dev
         .charon_grouped_dispatch_wmma_roundtrip(
-            &x_vec, &gw, &uw, &dw, &assignment,
-            BATCH, HIDDEN, INTER, routed_scaling_factor,
+            &x_vec,
+            &gw,
+            &uw,
+            &dw,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
         )
         .expect("wmma grouped roundtrip");
 
@@ -189,12 +232,22 @@ fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
     // Also must match the scalar grouped kernel path (same routing/weights).
     let scalar_v = dev
         .charon_grouped_dispatch_roundtrip(
-            &x_vec, &gw, &uw, &dw, &assignment,
-            BATCH, HIDDEN, INTER, routed_scaling_factor,
+            &x_vec,
+            &gw,
+            &uw,
+            &dw,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
         )
         .expect("scalar grouped roundtrip");
     let diff2 = max_abs_diff(&gpu_v, &scalar_v);
-    assert!(diff2 <= 1e-3, "WMMA vs scalar grouped max-abs-err {diff2} exceeds 1e-3");
+    assert!(
+        diff2 <= 1e-3,
+        "WMMA vs scalar grouped max-abs-err {diff2} exceeds 1e-3"
+    );
 }
 
 /// WI-F3 gate 3 — the selector routes the *dispatch target*, not just the

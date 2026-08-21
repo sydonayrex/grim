@@ -10,7 +10,7 @@
 //! checkpoint-gated follow-up (must be verified against a real checkpoint
 //! before wiring, per the plan's no-guessing rule).
 
-use grim_nn::sparse_attention::{IndexerScorer, SparseAttentionSelector, SparseAttentionConfig};
+use grim_nn::sparse_attention::{IndexerScorer, SparseAttentionConfig, SparseAttentionSelector};
 
 /// Hand-computed dot-product scorer: score = q·k for one head.
 struct DotScorer {
@@ -64,29 +64,39 @@ fn selector_clamps_topk_to_history_len() {
     };
     let sel = SparseAttentionSelector::new(cfg).expect("valid config");
     let top = sel.select(0, &scorer).expect("select");
-    assert_eq!(top, vec![1, 0], "top-k clamps to available history, ranked by score");
+    assert_eq!(
+        top,
+        vec![1, 0],
+        "top-k clamps to available history, ranked by score"
+    );
 }
 
 #[test]
 fn selector_rejects_bad_config() {
-    assert!(SparseAttentionSelector::new(SparseAttentionConfig {
-        index_head_dim: 0,
-        index_n_heads: 2,
-        index_topk: 8,
-    })
-    .is_err());
-    assert!(SparseAttentionSelector::new(SparseAttentionConfig {
-        index_head_dim: 128,
-        index_n_heads: 0,
-        index_topk: 8,
-    })
-    .is_err());
-    assert!(SparseAttentionSelector::new(SparseAttentionConfig {
-        index_head_dim: 128,
-        index_n_heads: 2,
-        index_topk: 0,
-    })
-    .is_err());
+    assert!(
+        SparseAttentionSelector::new(SparseAttentionConfig {
+            index_head_dim: 0,
+            index_n_heads: 2,
+            index_topk: 8,
+        })
+        .is_err()
+    );
+    assert!(
+        SparseAttentionSelector::new(SparseAttentionConfig {
+            index_head_dim: 128,
+            index_n_heads: 0,
+            index_topk: 8,
+        })
+        .is_err()
+    );
+    assert!(
+        SparseAttentionSelector::new(SparseAttentionConfig {
+            index_head_dim: 128,
+            index_n_heads: 2,
+            index_topk: 0,
+        })
+        .is_err()
+    );
 }
 
 #[test]

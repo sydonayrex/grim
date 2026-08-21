@@ -115,8 +115,7 @@ fn test_mrope_numerical_parity() -> TestResult {
                     pos_w
                 };
 
-                let freq = 1.0f32
-                    / rope_theta.powf((2.0f32 * pair_idx as f32) / rotary_dim as f32);
+                let freq = 1.0f32 / rope_theta.powf((2.0f32 * pair_idx as f32) / rotary_dim as f32);
                 let angle = pos as f32 * freq;
                 let cos_val = angle.cos();
                 let sin_val = angle.sin();
@@ -140,8 +139,7 @@ fn test_mrope_numerical_parity() -> TestResult {
                     pos_w
                 };
 
-                let freq = 1.0f32
-                    / rope_theta.powf((2.0f32 * pair_idx as f32) / rotary_dim as f32);
+                let freq = 1.0f32 / rope_theta.powf((2.0f32 * pair_idx as f32) / rotary_dim as f32);
                 let angle = pos as f32 * freq;
                 let cos_val = angle.cos();
                 let sin_val = angle.sin();
@@ -160,12 +158,8 @@ fn test_mrope_numerical_parity() -> TestResult {
 
     let q_dev = BackendDevice::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
     let k_dev = BackendDevice::from_cpu(&dev, &k_data, &k_shape, DType::F32)?;
-    let pos_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&positions),
-        &pos_shape,
-        DType::U32,
-    )?;
+    let pos_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
     let k_s = grim_backend_rocm::device::util::as_rocm(k_dev.as_ref())?;
@@ -221,20 +215,17 @@ fn test_speculative_rejection_sampler_parity() -> TestResult {
     // Target probs: [batch_size, num_draft_tokens + 1, vocab_size]
     let target_probs = vec![
         // Token 0: high prob on token 1
-        0.1f32, 0.8f32, 0.05f32, 0.05f32,
-        // Token 1: high prob on token 2
+        0.1f32, 0.8f32, 0.05f32, 0.05f32, // Token 1: high prob on token 2
         0.05f32, 0.05f32, 0.8f32, 0.1f32,
         // Token 2: high prob on token 0 (draft has token 3 -> will reject)
-        0.85f32, 0.05f32, 0.05f32, 0.05f32,
-        // Bonus Token 3:
+        0.85f32, 0.05f32, 0.05f32, 0.05f32, // Bonus Token 3:
         0.1f32, 0.1f32, 0.1f32, 0.7f32,
     ];
 
     // Draft probs: [batch_size, num_draft_tokens, vocab_size]
     let draft_probs = vec![
         // Draft 0: predicts token 1 with prob 0.8
-        0.1f32, 0.8f32, 0.05f32, 0.05f32,
-        // Draft 1: predicts token 2 with prob 0.75
+        0.1f32, 0.8f32, 0.05f32, 0.05f32, // Draft 1: predicts token 2 with prob 0.75
         0.05f32, 0.1f32, 0.75f32, 0.1f32,
         // Draft 2: incorrectly predicts token 3 with prob 0.9
         0.02f32, 0.03f32, 0.05f32, 0.9f32,
@@ -254,12 +245,8 @@ fn test_speculative_rejection_sampler_parity() -> TestResult {
 
     let tp_dev = BackendDevice::from_cpu(&dev, &target_probs, &tp_shape, DType::F32)?;
     let dp_dev = BackendDevice::from_cpu(&dev, &draft_probs, &dp_shape, DType::F32)?;
-    let dt_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&draft_tokens),
-        &dt_shape,
-        DType::U32,
-    )?;
+    let dt_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&draft_tokens), &dt_shape, DType::U32)?;
     let ur_dev = BackendDevice::from_cpu(&dev, &uniform_rands, &ur_shape, DType::F32)?;
     let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::U32)?;
     let len_dev = BackendDevice::zeros(&dev, &len_shape, DType::U32)?;
@@ -287,7 +274,11 @@ fn test_speculative_rejection_sampler_parity() -> TestResult {
     let mut out_tokens = vec![0i32; num_draft_tokens + 1];
     let mut out_lens = vec![0i32; 1];
 
-    let bytes = out_dev.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let bytes = out_dev
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let mut host_tokens = vec![0u8; out_tokens.len() * 4];
     grim_backend_rocm::check_hip("DtoH tokens", unsafe {
         grim_backend_rocm::hipMemcpy(
@@ -305,7 +296,11 @@ fn test_speculative_rejection_sampler_parity() -> TestResult {
         );
     }
 
-    let len_s = len_dev.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let len_s = len_dev
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let mut host_lens = vec![0u8; 4];
     grim_backend_rocm::check_hip("DtoH len", unsafe {
         grim_backend_rocm::hipMemcpy(
@@ -316,11 +311,7 @@ fn test_speculative_rejection_sampler_parity() -> TestResult {
         )
     })?;
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            host_lens.as_ptr() as *const i32,
-            out_lens.as_mut_ptr(),
-            1,
-        );
+        std::ptr::copy_nonoverlapping(host_lens.as_ptr() as *const i32, out_lens.as_mut_ptr(), 1);
     }
 
     // Token 0 (1) accepted, Token 1 (2) accepted, Token 2 (3) rejected -> sampled token 0 from residual

@@ -91,7 +91,11 @@ impl JsonState {
                 '}' => {
                     if self.stack.last() == Some(&Bracket::Object) {
                         self.stack.pop();
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                         true
                     } else {
                         false
@@ -100,7 +104,11 @@ impl JsonState {
                 ']' => {
                     if self.stack.last() == Some(&Bracket::Array) {
                         self.stack.pop();
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                         true
                     } else {
                         false
@@ -134,7 +142,11 @@ impl JsonState {
                 '}' => {
                     if self.stack.last() == Some(&Bracket::Object) {
                         self.stack.pop();
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                         true
                     } else {
                         false
@@ -177,7 +189,11 @@ impl JsonState {
                 '}' => {
                     if self.stack.last() == Some(&Bracket::Object) {
                         self.stack.pop();
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                         true
                     } else if self.stack.is_empty() {
                         self.mode = Mode::Done;
@@ -189,7 +205,11 @@ impl JsonState {
                 ']' => {
                     if self.stack.last() == Some(&Bracket::Array) {
                         self.stack.pop();
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                         true
                     } else {
                         false
@@ -223,7 +243,11 @@ impl JsonState {
                     if self.mode == Mode::StringKey {
                         self.mode = Mode::ExpectColon;
                     } else {
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                     }
                     true
                 } else if c.is_control() {
@@ -259,7 +283,11 @@ impl JsonState {
                 if (n as usize) < expected.len() && c == expected[n as usize] as char {
                     let next = n + 1;
                     if next == 4 {
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                     } else {
                         self.mode = Mode::LitTrue(next);
                     }
@@ -274,7 +302,11 @@ impl JsonState {
                 if (n as usize) < expected.len() && c == expected[n as usize] as char {
                     let next = n + 1;
                     if next == 5 {
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                     } else {
                         self.mode = Mode::LitFalse(next);
                     }
@@ -289,7 +321,11 @@ impl JsonState {
                 if (n as usize) < expected.len() && c == expected[n as usize] as char {
                     let next = n + 1;
                     if next == 4 {
-                        self.mode = if self.stack.is_empty() { Mode::Done } else { Mode::ExpectSep };
+                        self.mode = if self.stack.is_empty() {
+                            Mode::Done
+                        } else {
+                            Mode::ExpectSep
+                        };
                     } else {
                         self.mode = Mode::LitNull(next);
                     }
@@ -315,7 +351,9 @@ impl JsonState {
                 break;
             }
         }
-        let root_done = valid && state.stack.is_empty() && (matches!(state.mode, Mode::Done | Mode::ExpectSep) || state.is_done());
+        let root_done = valid
+            && state.stack.is_empty()
+            && (matches!(state.mode, Mode::Done | Mode::ExpectSep) || state.is_done());
         FsmCheck {
             next_state: state,
             valid,

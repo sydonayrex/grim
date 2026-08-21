@@ -32,7 +32,8 @@ impl VulkanCaps {
     ) -> Self {
         // AMD RDNA 3+ (gfx1100+): device_id in 0x7440–0x75ff range.
         // These support native FP32 atomic add on SSBOs via ACO.
-        let supports_fp32_atomic_add = vendor_id == 0x1002 && device_id >= 0x7440 && device_id <= 0x75ff;
+        let supports_fp32_atomic_add =
+            vendor_id == 0x1002 && device_id >= 0x7440 && device_id <= 0x75ff;
         Self {
             device_name,
             vendor_id,

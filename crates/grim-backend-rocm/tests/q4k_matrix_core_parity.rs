@@ -15,9 +15,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::quant_q4k;
-use grim_tensor::{
-    ArithType, BackendDevice, DType, KQuantScheme, Shape, Storage,
-};
+use grim_tensor::{ArithType, BackendDevice, DType, KQuantScheme, Shape, Storage};
 use std::panic;
 
 /// Build a RocmDevice if the GPU test environment is enabled.
@@ -74,8 +72,8 @@ fn test_q4k_matrix_core_vs_scalar_parity() {
     // Upload to the ROCm device — `quantized_matmul` requires `RocmStorage`,
     // not `CpuStorage` (the previous version passed CPU tensors and hit
     // "matmul: input a is not RocmStorage").
-    let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)
-        .expect("upload A to device");
+    let a_dev =
+        BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32).expect("upload A to device");
     let q4k_dtype = DType {
         arith: ArithType::F32,
         storage: Storage::KQuant(KQuantScheme::Q4K),

@@ -88,9 +88,19 @@ pub struct Glm52Expert {
 }
 
 impl Glm52Expert {
-    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, intermediate_size: usize) -> Result<Self> {
-        let dense_h_to_4h = Linear::load_shape(&ws.scoped("dense_h_to_4h"), [hidden_size, intermediate_size])?;
-        let dense_4h_to_h = Linear::load_shape(&ws.scoped("dense_4h_to_h"), [intermediate_size, hidden_size])?;
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
+        let dense_h_to_4h = Linear::load_shape(
+            &ws.scoped("dense_h_to_4h"),
+            [hidden_size, intermediate_size],
+        )?;
+        let dense_4h_to_h = Linear::load_shape(
+            &ws.scoped("dense_4h_to_h"),
+            [intermediate_size, hidden_size],
+        )?;
         Ok(Self {
             dense_h_to_4h,
             dense_4h_to_h,
@@ -122,7 +132,11 @@ impl Glm52Moe {
         let exp_ws = ws.scoped("experts");
         let mut experts = Vec::with_capacity(cfg.num_experts);
         for e in 0..cfg.num_experts {
-            let expert = Glm52Expert::load(&exp_ws.scoped(&e.to_string()), cfg.hidden_size, cfg.intermediate_size)?;
+            let expert = Glm52Expert::load(
+                &exp_ws.scoped(&e.to_string()),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+            )?;
             experts.push(expert);
         }
         Ok(Self {
@@ -150,7 +164,10 @@ impl Glm52Moe {
             let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
 
             // Softmax over top-k
-            let max_logit = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_logit = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_logit).exp()).collect();
             let sum_exp: f32 = exps.iter().sum();
             let weights: Vec<f32> = exps.iter().map(|e| e / (sum_exp + 1e-12)).collect();
@@ -190,11 +207,25 @@ pub struct Glm52Block {
 impl Glm52Block {
     pub fn load(ws: &WeightSource<'_>, cfg: &Glm52Config) -> Result<Self> {
         let qkv_out_dim = (cfg.num_attention_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim;
-        let fused_qkv = Linear::load_shape(&ws.scoped("self_attention").scoped("query_key_value"), [cfg.hidden_size, qkv_out_dim])?;
-        let dense = Linear::load_shape(&ws.scoped("self_attention").scoped("dense"), [cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size])?;
+        let fused_qkv = Linear::load_shape(
+            &ws.scoped("self_attention").scoped("query_key_value"),
+            [cfg.hidden_size, qkv_out_dim],
+        )?;
+        let dense = Linear::load_shape(
+            &ws.scoped("self_attention").scoped("dense"),
+            [cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size],
+        )?;
 
-        let input_layernorm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let post_attention_layernorm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let input_layernorm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let mlp = Glm52Moe::load(&ws.scoped("mlp"), cfg)?;
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
@@ -235,13 +266,28 @@ impl Glm52Block {
 
         for s in 0..seq_len {
             let row_offset = s * total_qkv;
-            q_data[s * q_dim..(s + 1) * q_dim].copy_from_slice(&qkv_vec[row_offset..row_offset + q_dim]);
-            k_data[s * k_dim..(s + 1) * k_dim].copy_from_slice(&qkv_vec[row_offset + q_dim..row_offset + q_dim + k_dim]);
-            v_data[s * v_dim..(s + 1) * v_dim].copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
+            q_data[s * q_dim..(s + 1) * q_dim]
+                .copy_from_slice(&qkv_vec[row_offset..row_offset + q_dim]);
+            k_data[s * k_dim..(s + 1) * k_dim]
+                .copy_from_slice(&qkv_vec[row_offset + q_dim..row_offset + q_dim + k_dim]);
+            v_data[s * v_dim..(s + 1) * v_dim]
+                .copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
         }
 
-        crate::qwen35::apply_rope_neox(&mut q_data, positions, self.num_heads, self.head_dim, 10000.0);
-        crate::qwen35::apply_rope_neox(&mut k_data, positions, self.num_kv_heads, self.head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_data,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            10000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_data,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            10000.0,
+        );
 
         let q_rot = cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim]));
@@ -275,11 +321,13 @@ impl Glm52Block {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads
+                        [t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -333,11 +381,7 @@ pub struct Glm52 {
 }
 
 impl Glm52 {
-    pub fn load(
-        device: Device,
-        ws: &grim_nn::WeightSource<'_>,
-        cfg: Glm52Config,
-    ) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Glm52Config) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
@@ -353,8 +397,16 @@ impl Glm52 {
             ws.scoped("model")
         };
 
-        let word_embeddings = Linear::load_shape(&root.scoped("word_embeddings"), [cfg.vocab_size, cfg.hidden_size])
-            .or_else(|_| Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size]))?;
+        let word_embeddings = Linear::load_shape(
+            &root.scoped("word_embeddings"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )
+        .or_else(|_| {
+            Linear::load_shape(
+                &root.scoped("embed_tokens"),
+                [cfg.vocab_size, cfg.hidden_size],
+            )
+        })?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -363,12 +415,19 @@ impl Glm52 {
             layers.push(block);
         }
 
-        let final_layernorm = RmsNorm::load(&root.scoped("final_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)
-            .or_else(|_| RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps))?;
+        let final_layernorm = RmsNorm::load(
+            &root.scoped("final_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )
+        .or_else(|_| RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps))?;
 
-        let output_layer = Linear::load_shape(&root.scoped("output_layer"), [cfg.hidden_size, cfg.vocab_size])
-            .or_else(|_| Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size]))
-            .unwrap_or_else(|_| word_embeddings.clone());
+        let output_layer = Linear::load_shape(
+            &root.scoped("output_layer"),
+            [cfg.hidden_size, cfg.vocab_size],
+        )
+        .or_else(|_| Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size]))
+        .unwrap_or_else(|_| word_embeddings.clone());
 
         Ok(Self {
             cfg,
@@ -421,8 +480,9 @@ impl CausalLm for Glm52 {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -478,4 +538,3 @@ mod tests {
         );
     }
 }
-

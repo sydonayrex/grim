@@ -3,8 +3,8 @@
 //! Evaluates empirical FCP tile selection and JIT compilation across canonical GEMM workload shapes
 //! on the host ROCm GPU to pre-populate `{gpu_arch}.json` autotuner maps and compiled `.hsaco` files.
 
-use std::path::PathBuf;
 use grim_tensor::error::Result;
+use std::path::PathBuf;
 
 /// Run hardware-tuned JIT compilation and empirical FCP tile search for canonical shapes.
 ///
@@ -43,17 +43,35 @@ pub fn cmd_tune(device_ordinal: usize, output_dir: Option<String>) -> Result<()>
         println!("[grim-tune] Detected GPU Architecture: {}", spec.gcn_arch);
         println!("[grim-tune] Wavefront Size: {}", spec.wavefront_size);
         println!("[grim-tune] Compute Units: {}", spec.cu_count);
-        println!("[grim-tune] LDS per CU: {} bytes", spec.max_shared_mem_per_block);
-        println!("[grim-tune] Max Threads per Block: {}", spec.max_threads_per_block);
-        println!("[grim-tune] Memory Bandwidth: {:.1} GB/s", spec.mem_bandwidth_gb_s);
+        println!(
+            "[grim-tune] LDS per CU: {} bytes",
+            spec.max_shared_mem_per_block
+        );
+        println!(
+            "[grim-tune] Max Threads per Block: {}",
+            spec.max_threads_per_block
+        );
+        println!(
+            "[grim-tune] Memory Bandwidth: {:.1} GB/s",
+            spec.mem_bandwidth_gb_s
+        );
         println!();
-        println!("[grim-tune] Running empirical FCP search and JIT compilation on canonical shapes...");
+        println!(
+            "[grim-tune] Running empirical FCP search and JIT compilation on canonical shapes..."
+        );
 
         let tuned_count = grim_backend_rocm::run_install_tune(&device, &hsaco_dir)?;
 
         println!();
-        println!("[grim-tune] Successfully tuned and compiled {} workload shapes!", tuned_count);
-        println!("[grim-tune] Persisted autotune cache: {}/{}.json", hsaco_dir.display(), spec.gcn_arch);
+        println!(
+            "[grim-tune] Successfully tuned and compiled {} workload shapes!",
+            tuned_count
+        );
+        println!(
+            "[grim-tune] Persisted autotune cache: {}/{}.json",
+            hsaco_dir.display(),
+            spec.gcn_arch
+        );
         println!("=== Kernel Tuning Complete ===");
         Ok(())
     }
@@ -66,7 +84,9 @@ pub fn cmd_tune(device_ordinal: usize, output_dir: Option<String>) -> Result<()>
 }
 
 fn dirs_next() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".cache").join("grim").join("hsaco"))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".cache").join("grim").join("hsaco"))
 }
 
 #[cfg(test)]

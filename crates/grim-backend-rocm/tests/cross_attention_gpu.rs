@@ -229,7 +229,14 @@ fn test_cross_attention_gpu_parity() {
     let gpu_vec = gpu_out.to_cpu_vec_f32().unwrap();
 
     let cpu_vec = cpu_cross_attention(
-        &q_data, &k_data, &v_data, seq_len, enc_seq, num_heads, num_heads_k, head_dim,
+        &q_data,
+        &k_data,
+        &v_data,
+        seq_len,
+        enc_seq,
+        num_heads,
+        num_heads_k,
+        head_dim,
     );
 
     assert!(
@@ -253,12 +260,28 @@ fn cpu_reference_uses_contiguous_gqa_grouping() {
     let num_heads_k = 2_usize;
     let head_dim = 8_usize;
 
-    let (q, k, v) =
-        build_test_data(0x6A51, seq_len, enc_seq, num_heads, num_heads_k, head_dim);
+    let (q, k, v) = build_test_data(0x6A51, seq_len, enc_seq, num_heads, num_heads_k, head_dim);
 
-    let contiguous = cpu_cross_attention(&q, &k, &v, seq_len, enc_seq, num_heads, num_heads_k, head_dim);
-    let interleaved =
-        cpu_cross_attention_interleaved(&q, &k, &v, seq_len, enc_seq, num_heads, num_heads_k, head_dim);
+    let contiguous = cpu_cross_attention(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        enc_seq,
+        num_heads,
+        num_heads_k,
+        head_dim,
+    );
+    let interleaved = cpu_cross_attention_interleaved(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        enc_seq,
+        num_heads,
+        num_heads_k,
+        head_dim,
+    );
 
     assert!(
         !approx_close(&contiguous, &interleaved, 1e-6),
@@ -292,9 +315,7 @@ fn cpu_reference_uses_contiguous_gqa_grouping() {
                 sum_e += e;
             }
             for hk in 0..head_dim {
-                let acc: f32 = (0..enc_seq)
-                    .map(|j| scores[j] * v[j * dk + ko + hk])
-                    .sum();
+                let acc: f32 = (0..enc_seq).map(|j| scores[j] * v[j * dk + ko + hk]).sum();
                 direct[i * d + ho + hk] = acc / sum_e;
             }
         }

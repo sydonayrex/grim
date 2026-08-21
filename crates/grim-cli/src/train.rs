@@ -1,7 +1,8 @@
 //! `grim train` — SFT training loop: dataset loading, streaming forward, cross-entropy loss, autograd backward, AdamW step, sidecar persistence. F4: real model loading via GrimProvider.
 
 use grim_autograd::{
-    AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
+    AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape, backward,
+    cross_entropy_loss,
 };
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
@@ -387,7 +388,10 @@ pub(crate) fn load_dataset(
         messages: Vec<MessagesTurn>,
     }
     if let Ok(entries) = serde_json::from_str::<Vec<MessagesEntry>>(&content) {
-        println!("[grim train] Loaded {} ChatTemplate/Messages entries", entries.len());
+        println!(
+            "[grim train] Loaded {} ChatTemplate/Messages entries",
+            entries.len()
+        );
         let examples: Vec<_> = entries
             .iter()
             .filter_map(|e| {
@@ -397,9 +401,12 @@ pub(crate) fn load_dataset(
                 let mut tokens = Vec::new();
                 let mut labels = Vec::new();
                 for turn in &e.messages {
-                    let formatted = format!("<|im_start|>{}\n{}<|im_end|>\n", turn.role, turn.content);
+                    let formatted =
+                        format!("<|im_start|>{}\n{}<|im_end|>\n", turn.role, turn.content);
                     let turn_tokens = tokenizer.encode(&formatted);
-                    if turn.role.to_ascii_lowercase() == "user" || turn.role.to_ascii_lowercase() == "system" {
+                    if turn.role.to_ascii_lowercase() == "user"
+                        || turn.role.to_ascii_lowercase() == "system"
+                    {
                         labels.extend(vec![IGNORE_INDEX; turn_tokens.len()]);
                     } else {
                         labels.extend(turn_tokens.iter().copied());
@@ -511,7 +518,10 @@ pub fn load_dataset_multi(
 
 /// Run SFT training loop over a dataset and save the trained adapter sidecar.
 pub fn cmd_train(opts: TrainOptions) -> Result<()> {
-    println!("[grim train] Initializing {} training...", opts.mode.to_uppercase());
+    println!(
+        "[grim train] Initializing {} training...",
+        opts.mode.to_uppercase()
+    );
     println!("             Model: {}", opts.model_path);
     println!("             Dataset: {}", opts.dataset_path);
     println!("             Sidecar Output: {}", opts.output_sidecar);
@@ -912,15 +922,35 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                     for (layer_idx, point) in autograd_reg.injection_registry.configs.keys() {
                         let pid_a = grim_autograd::ParamId::a(*layer_idx, 1, *point);
                         let pid_b = grim_autograd::ParamId::b(*layer_idx, 1, *point);
-                        let a_opt = autograd_reg.params.get(pid_a).map(|p| (p.data.to_vec_f32().unwrap_or_default(), p.data.shape().clone()));
-                        let b_opt = autograd_reg.params.get(pid_b).map(|p| (p.data.to_vec_f32().unwrap_or_default(), p.data.shape().clone()));
-                        if let (Some((mut a_vec, a_shape)), Some((mut b_vec, b_shape))) = (a_opt, b_opt) {
+                        let a_opt = autograd_reg.params.get(pid_a).map(|p| {
+                            (
+                                p.data.to_vec_f32().unwrap_or_default(),
+                                p.data.shape().clone(),
+                            )
+                        });
+                        let b_opt = autograd_reg.params.get(pid_b).map(|p| {
+                            (
+                                p.data.to_vec_f32().unwrap_or_default(),
+                                p.data.shape().clone(),
+                            )
+                        });
+                        if let (Some((mut a_vec, a_shape)), Some((mut b_vec, b_shape))) =
+                            (a_opt, b_opt)
+                        {
                             let rank = opts.rank;
                             let in_f = if rank > 0 { a_vec.len() / rank } else { 0 };
                             let out_f = if rank > 0 { b_vec.len() / rank } else { 0 };
                             if in_f > 0 && out_f > 0 {
                                 let mut dummy_base = vec![0.0f32; out_f * in_f];
-                                grim_autograd::relora::merge_and_zero(rank, in_f, out_f, opts.alpha / rank as f32, &mut a_vec, &mut b_vec, &mut dummy_base);
+                                grim_autograd::relora::merge_and_zero(
+                                    rank,
+                                    in_f,
+                                    out_f,
+                                    opts.alpha / rank as f32,
+                                    &mut a_vec,
+                                    &mut b_vec,
+                                    &mut dummy_base,
+                                );
                                 if let Some(param_a) = autograd_reg.params.get_mut(pid_a) {
                                     param_a.data = grim_backend_cpu::cpu_tensor(a_vec, a_shape);
                                 }
@@ -936,9 +966,14 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
                 // Held-out evaluation loop
                 if let Some(eval_ds) = &eval_dataset {
-                    if opts.eval_every_steps > 0 && global_step >= opts.eval_warmup_steps && global_step % opts.eval_every_steps == 0 {
+                    if opts.eval_every_steps > 0
+                        && global_step >= opts.eval_warmup_steps
+                        && global_step % opts.eval_every_steps == 0
+                    {
                         let current_avg_loss = (epoch_loss / num_batches.max(1) as f32) as f64;
-                        if let Ok(report) = crate::eval::perplexity(eval_ds, |_seq| Ok::<f64, String>(current_avg_loss)) {
+                        if let Ok(report) = crate::eval::perplexity(eval_ds, |_seq| {
+                            Ok::<f64, String>(current_avg_loss)
+                        }) {
                             println!(
                                 "[grim train] eval step {}: loss={:.4} ppl={:.4} tokens={}",
                                 global_step, report.loss, report.ppl, report.tokens
@@ -1500,4 +1535,3 @@ mod tests {
         assert!(tok.chat_template.unwrap().contains("<|im_start|>"));
     }
 }
-

@@ -19,8 +19,8 @@ use grim_core::sampler::Sampler;
 use grim_tensor::Tensor;
 use grim_tensor::error::Result;
 
-use crate::json_fsm::{apply_mask, JsonState, TokenMaskCache};
-use crate::schema::{compile_json_schema, JsonSchemaConstraint, JsonSchemaCompilerError};
+use crate::json_fsm::{JsonState, TokenMaskCache, apply_mask};
+use crate::schema::{JsonSchemaCompilerError, JsonSchemaConstraint, compile_json_schema};
 
 /// WI-3: the constraint mode a `ConstrainedSampler` is enforcing.
 #[derive(Debug, Clone)]
@@ -202,9 +202,7 @@ impl ConstrainedSampler {
 }
 
 /// WI-3a helper: build a `ConstrainedSampler` with JSON-object mode.
-pub fn constrained_json_object(
-    inner: std::sync::Arc<dyn Sampler>,
-) -> ConstrainedSampler {
+pub fn constrained_json_object(inner: std::sync::Arc<dyn Sampler>) -> ConstrainedSampler {
     ConstrainedSampler::new(inner, Constraint::JsonObject)
 }
 
@@ -223,11 +221,7 @@ mod tests {
     #[test]
     fn test_constraint_json_schema_rejects_unsupported() {
         let err = Constraint::json_schema(serde_json::json!({"$ref": "#/x"})).unwrap_err();
-        assert!(
-            err.to_string().contains("unsupported"),
-            "got: {}",
-            err
-        );
+        assert!(err.to_string().contains("unsupported"), "got: {}", err);
     }
 
     #[test]
