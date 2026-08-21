@@ -321,7 +321,7 @@ fn qkv_attention_kernel(
     let q_base = (i * num_heads + h) * head_dim;
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
 
-    let mut m = f32::new(-1.0e30);
+    let mut m = f32::new(-1.0e30_f32);
     let mut l = 0.0f32;
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
@@ -469,7 +469,7 @@ fn paged_attention_kernel(
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
     let chunks = (head_dim + 63usize) / 64usize;
 
-    let mut m = f32::new(-1.0e30);
+    let mut m = f32::new(-1.0e30_f32);
     let mut l = 0.0f32;
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
@@ -629,7 +629,7 @@ fn tree_attention_kernel(
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
     let chunks = (head_dim + 63usize) / 64usize;
 
-    let mut m = f32::new(-1.0e30);
+    let mut m = f32::new(-1.0e30_f32);
     let mut l = 0.0f32;
     let mut a0 = 0.0f32;
     let mut a1 = 0.0f32;
