@@ -681,4 +681,137 @@ mod tests {
             ModelArchitecture::KimiK3
         );
     }
+
+    // --- WI-X11 regression probes (tiny synthetic MLA block) ---
+
+    fn tiny_mla() -> KimiK3Mla {
+        use grim_backend_cpu::cpu_tensor;
+        use grim_nn::Linear;
+        let (hidden, ql, rank, nh, nope, rope_d, vd) = (8usize, 4usize, 6usize, 2usize, 4usize, 2usize, 3usize);
+        let q_dim = nh * (nope + rope_d);
+        let kv_b_out = nh * (nope + vd);
+        let mut seed = 0xC0FFEEu64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut w = |rows: usize, cols: usize| {
+            let data: Vec<f32> = (0..rows * cols).map(|_| rand()).collect();
+            Linear::from_tensor(cpu_tensor(data, Shape::new(vec![rows, cols])), None)
+        };
+        KimiK3Mla {
+            q_a_proj: w(ql, hidden),
+            q_b_proj: w(q_dim, ql),
+            kv_a_proj: w(rank + rope_d, hidden),
+            kv_b_proj: w(kv_b_out, rank),
+            o_proj: w(hidden, nh * vd),
+            rope: Rope::new(rope_d, 10000.0),
+            num_heads: nh,
+            qk_nope_head_dim: nope,
+            qk_rope_head_dim: rope_d,
+            v_head_dim: vd,
+            q_lora_rank: ql,
+            kv_lora_rank: rank,
+        }
+    }
+
+    fn cpu_x(rows: usize, cols: usize) -> Tensor {
+        let mut seed = 0xBEEFu64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let data: Vec<f32> = (0..rows * cols).map(|_| rand()).collect();
+        cpu_tensor(data, Shape::new(vec![rows, cols]))
+    }
+
+    /// WI-X11a: decode must attend with the CACHED rope keys, not the current
+    /// call's buffer. Probe: poison every cached rope row after prefill; a
+    /// correct decode output changes. (The old bug read `k_rope_v[0..]` from
+    /// the current call and was blind to the cache.)
+    #[test]
+    fn decode_uses_cached_rope_keys() {
+        let mla = tiny_mla();
+        let mut cache: Option<(Tensor, Tensor, Tensor)> = None;
+        // Prefill 3 tokens at positions 0..2.
+        let _ = mla.forward(&cpu_x(3, 8), &[0, 1, 2], &mut cache).unwrap();
+        let (k0, v0, r0) = cache.as_ref().unwrap();
+        let baseline = {
+            let mut c = Some((
+                cpu_tensor(k0.to_vec_f32().unwrap(), k0.shape().clone()),
+                cpu_tensor(v0.to_vec_f32().unwrap(), v0.shape().clone()),
+                cpu_tensor(r0.to_vec_f32().unwrap(), r0.shape().clone()),
+            ));
+            mla.forward(&cpu_x(1, 8), &[3], &mut c).unwrap().to_vec_f32().unwrap()
+        };
+        // Poison the cached rope rows only.
+        let poisoned = vec![7.5f32; r0.to_vec_f32().unwrap().len()];
+        let mut c = Some((
+            cpu_tensor(k0.to_vec_f32().unwrap(), k0.shape().clone()),
+            cpu_tensor(v0.to_vec_f32().unwrap(), v0.shape().clone()),
+            cpu_tensor(poisoned, r0.shape().clone()),
+        ));
+        let perturbed = mla.forward(&cpu_x(1, 8), &[3], &mut c).unwrap().to_vec_f32().unwrap();
+        assert!(
+            baseline.iter().zip(&perturbed).any(|(a, b)| (a - b).abs() > 1e-4),
+            "decode output ignored cached rope keys — rope-history bug regressed"
+        );
+    }
+
+    /// WI-X11b: causal mask — the FIRST query of a multi-token call must not
+    /// see later tokens of the same call. Probe: change only the second
+    /// token's input; query 0's output must be bit-identical, query 1's must
+    /// differ (it attends to itself).
+    #[test]
+    fn causal_mask_blocks_future_keys() {
+        let mla = tiny_mla();
+        let mut cache: Option<(Tensor, Tensor, Tensor)> = None;
+        // Seed 2 past tokens (positions 0,1).
+        let _ = mla.forward(&cpu_x(2, 8), &[0, 1], &mut cache).unwrap();
+        let (k0, v0, r0) = cache.as_ref().unwrap();
+        let clone_cache = || {
+            (
+                cpu_tensor(k0.to_vec_f32().unwrap(), k0.shape().clone()),
+                cpu_tensor(v0.to_vec_f32().unwrap(), v0.shape().clone()),
+                cpu_tensor(r0.to_vec_f32().unwrap(), r0.shape().clone()),
+            )
+        };
+        // Two new tokens at absolute positions 2,3. `xb` differs from `xa`
+        // ONLY in the second token's hidden vector (row 1).
+        let xa = cpu_x(2, 8);
+        let mut xb = xa.to_vec_f32().unwrap();
+        for e in xb[8..].iter_mut() {
+            *e *= -1.0;
+        }
+        let xb = cpu_tensor(xb, Shape::new(vec![2, 8]));
+        let base = {
+            let mut c = Some(clone_cache());
+            mla.forward(&xa, &[2, 3], &mut c)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap()
+        };
+        let perturbed = {
+            let mut c = Some(clone_cache());
+            mla.forward(&xb, &[2, 3], &mut c)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap()
+        };
+        let head_dims = mla.num_heads * mla.v_head_dim;
+        assert!(
+            base[..head_dims]
+                .iter()
+                .zip(&perturbed[..head_dims])
+                .all(|(a, b)| (a - b).abs() < 1e-5),
+            "query at abs pos 2 changed when the LATER token changed — future leak"
+        );
+        assert!(
+            base[head_dims..]
+                .iter()
+                .zip(&perturbed[head_dims..])
+                .any(|(a, b)| (a - b).abs() > 1e-5),
+            "second query ignored its own token — probe inert"
+        );
+    }
 }
