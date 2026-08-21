@@ -48,17 +48,43 @@ pub fn resolve_tool_family(template: &str) -> ToolFamily {
     }
 }
 
-/// Map model architecture name to its expected tool-call convention (§WI-E8).
+/// F-9/WI-E8: per-architecture detector registry. Maps a model family to the
+/// tool-call convention its checkpoints emit natively, so parsing doesn't
+/// depend on template-text heuristics for known families. Unknown archs fall
+/// back to [`resolve_tool_family`], then the Auto scanner inside
+/// [`parse_tool_calls`].
 pub fn family_for_arch(arch: &str) -> ToolFamily {
-    let lower = arch.to_ascii_lowercase();
-    if lower.contains("lfm2") || lower.contains("liquid") {
-        ToolFamily::BracketFirst
-    } else if lower.contains("llama") || lower.contains("mistral") || lower.contains("qwen") {
-        ToolFamily::TagDelimited
-    } else if lower.contains("deepseek") {
-        ToolFamily::BareJson
-    } else {
-        ToolFamily::Auto
+    // Input is the GGUF `general.architecture` value (e.g. "llama", "lfm2"),
+    // optionally provider-prefixed ("hf:llama") — resolve to the part after
+    // the prefix when present. Normalize case so checkpoint casing quirks
+    // don't defeat the registry.
+    let stripped = match arch.trim().split_once(':') {
+        Some((_prefix, rest)) if !rest.is_empty() => rest,
+        _ => arch.trim(),
+    };
+    match stripped.to_ascii_lowercase().as_str() {
+        // LFM2.5 emits <|tool_call_start|>[name(args)]<|tool_call_end|>.
+        "lfm2" => ToolFamily::Auto, // Auto tries tags, then bare JSON, then bracket — correct priority
+        // Llama-3.x / Hermes descendants use <tool_call>{json}</tool_call>.
+        "llama" | "hermes" => ToolFamily::TagDelimited,
+        // Qwen2.5/3 emit <tool_call> tags too.
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" => ToolFamily::TagDelimited,
+        // DeepSeek emits bare JSON objects.
+        "deepseek" | "deepseek2" | "deepseek3" | "deepseek4" => ToolFamily::BareJson,
+        // Mistral Small v3 emits [name(args)] bracket calls.
+        "mistral" => ToolFamily::Auto,
+        _ => ToolFamily::Auto,
+    }
+}
+
+/// Combined family resolution (§WI-E8 integration): a template-derived
+/// convention wins when the template text identifies one specifically;
+/// otherwise fall back to the loaded model's GGUF architecture via
+/// [`family_for_arch`]; otherwise the Auto scanner.
+pub fn resolve_effective_tool_family(template: &str, model_arch: Option<&str>) -> ToolFamily {
+    match resolve_tool_family(template) {
+        ToolFamily::Auto => model_arch.map(family_for_arch).unwrap_or(ToolFamily::Auto),
+        specific => specific,
     }
 }
 
@@ -738,10 +764,32 @@ mod tests {
 
     #[test]
     fn test_family_for_arch() {
-        assert_eq!(family_for_arch("LFM2.5"), ToolFamily::BracketFirst);
-        assert_eq!(family_for_arch("llama-3"), ToolFamily::TagDelimited);
-        assert_eq!(family_for_arch("qwen2.5"), ToolFamily::TagDelimited);
-        assert_eq!(family_for_arch("deepseek-v3"), ToolFamily::BareJson);
+        // GGUF `general.architecture` values match exactly (case-insensitive).
+        assert_eq!(family_for_arch("lfm2"), ToolFamily::Auto);
+        assert_eq!(family_for_arch("LFM2"), ToolFamily::Auto);
+        assert_eq!(family_for_arch("llama"), ToolFamily::TagDelimited);
+        assert_eq!(family_for_arch("qwen3moe"), ToolFamily::TagDelimited);
+        assert_eq!(family_for_arch("deepseek2"), ToolFamily::BareJson);
+        assert_eq!(family_for_arch("  Llama "), ToolFamily::TagDelimited);
         assert_eq!(family_for_arch("unknown_arch"), ToolFamily::Auto);
+    }
+
+    /// Template hint wins when specific; arch fills the Auto gap.
+    #[test]
+    fn test_resolve_effective_tool_family() {
+        use super::resolve_effective_tool_family as eff;
+        // Template-specific beats arch.
+        assert_eq!(
+            eff("{% if tools %}<tool_call>", Some("lfm2")),
+            ToolFamily::TagDelimited
+        );
+        // Template Auto → arch decides.
+        assert_eq!(
+            eff("{{ message.content }}", Some("deepseek2")),
+            ToolFamily::BareJson
+        );
+        // Neither → Auto.
+        assert_eq!(eff("{{ message.content }}", None), ToolFamily::Auto);
+        assert_eq!(eff("", Some("mystery")), ToolFamily::Auto);
     }
 }
