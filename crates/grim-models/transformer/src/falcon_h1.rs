@@ -434,7 +434,7 @@ fn gqa_attn_with_cache(
     let h_dim = cfg.head_dim;
     let n_heads = cfg.num_heads;
     let n_kv = cfg.num_kv_heads;
-    let group = cfg.head_group();
+    let _group = cfg.head_group();
 
     // RoPE via the Rope module (NEOX pairing, reshaped to (1, S*heads, head_dim)).
     let q_3d = q_reshaped(q, seq_len, n_heads, h_dim);
@@ -448,57 +448,19 @@ fn gqa_attn_with_cache(
 
     cache.k_cache.extend_from_slice(&k_roped);
     cache.v_cache.extend_from_slice(v);
-    let total = cache.k_cache.len() / (n_kv * h_dim);
 
-    let scale = 1.0 / (h_dim as f32).sqrt();
-    let mut out = vec![0.0f32; seq_len * n_heads * h_dim];
-
-    for t in 0..seq_len {
-        let q_pos_t = positions[t] as usize;
-        for h in 0..n_heads {
-            let kvh = h / group;
-            let q_base = (t * n_heads + h) * h_dim;
-            let mut max_logit = f32::NEG_INFINITY;
-            let mut logits = vec![0.0f32; total];
-            for t2 in 0..total {
-                // KV position of slot t2 (monotonic, append-in-order).
-                let kv_pos = cache.current_pos + t2;
-                if kv_pos > q_pos_t {
-                    logits[t2] = f32::NEG_INFINITY;
-                } else {
-                    let k_base = (t2 * n_kv + kvh) * h_dim;
-                    let mut dot = 0.0f32;
-                    for d in 0..h_dim {
-                        dot += q_roped[q_base + d] * cache.k_cache[k_base + d];
-                    }
-                    let l = dot * scale;
-                    logits[t2] = l;
-                    if l > max_logit {
-                        max_logit = l;
-                    }
-                }
-            }
-            let mut sum = 0.0f32;
-            for l in logits.iter_mut() {
-                if l.is_finite() {
-                    *l = (*l - max_logit).exp();
-                    sum += *l;
-                } else {
-                    *l = 0.0;
-                }
-            }
-            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-            let out_base = (t * n_heads + h) * h_dim;
-            for t2 in 0..total {
-                let w = logits[t2] * inv;
-                let v_base = (t2 * n_kv + kvh) * h_dim;
-                for d in 0..h_dim {
-                    out[out_base + d] += w * cache.v_cache[v_base + d];
-                }
-            }
-        }
-    }
-    Ok(out)
+    let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
+        &q_roped,
+        &cache.k_cache,
+        &cache.v_cache,
+        n_heads,
+        n_kv,
+        h_dim,
+        seq_len,
+        None,
+        b.attn_norm.weight.device(),
+    )?;
+    Ok(attn_tensor.to_vec_f32()?)
 }
 
 /// Faithful Mamba-2 selective scan forward.

@@ -180,7 +180,7 @@ impl KimiK3Mla {
         &self,
         x: &Tensor,
         positions: &[u32],
-        kv_cache: &mut Option<(Tensor, Tensor)>,
+        kv_cache: &mut Option<(Tensor, Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
 
@@ -257,35 +257,44 @@ impl KimiK3Mla {
             }
         }
 
-        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
+        let (k_all, v_all, k_rope_all) = if let Some((prev_k, prev_v, prev_rope)) = kv_cache {
             let mut new_k = prev_k.to_vec_f32()?;
             let mut new_v = prev_v.to_vec_f32()?;
+            let mut new_rope = prev_rope.to_vec_f32()?;
             new_k.extend(k_nope_v);
             new_v.extend(v_v);
+            new_rope.extend(k_rope_v);
             let total_k_dim = self.num_heads * self.qk_nope_head_dim;
             let total_v_dim = self.num_heads * self.v_head_dim;
             let total_seq = new_k.len() / total_k_dim;
             let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, total_k_dim]));
             let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, total_v_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone()));
-            (full_k, full_v)
+            let full_rope = cpu_tensor(new_rope, Shape::new(vec![total_seq, self.qk_rope_head_dim]));
+            *kv_cache = Some((full_k.clone(), full_v.clone(), full_rope.clone()));
+            (full_k, full_v, full_rope)
         } else {
             let total_k_dim = self.num_heads * self.qk_nope_head_dim;
             let total_v_dim = self.num_heads * self.v_head_dim;
             let full_k = cpu_tensor(k_nope_v, Shape::new(vec![seq_len, total_k_dim]));
             let full_v = cpu_tensor(v_v, Shape::new(vec![seq_len, total_v_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone()));
-            (full_k, full_v)
+            let full_rope = cpu_tensor(k_rope_v, Shape::new(vec![seq_len, self.qk_rope_head_dim]));
+            *kv_cache = Some((full_k.clone(), full_v.clone(), full_rope.clone()));
+            (full_k, full_v, full_rope)
         };
 
         let total_kv_len = k_all.shape().dims()[0];
         let k_all_v = k_all.to_vec_f32()?;
         let v_all_v = v_all.to_vec_f32()?;
+        let k_rope_all_v = k_rope_all.to_vec_f32()?;
+        // Causal mask: query s (absolute position cache_offset + s) must not
+        // see future in-chunk keys.
+        let cache_offset = total_kv_len.saturating_sub(seq_len);
 
         let scale = 1.0 / ((self.qk_nope_head_dim + self.qk_rope_head_dim) as f32).sqrt();
         let mut attn_out = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
 
         for s in 0..seq_len {
+            let causal_limit = cache_offset + s;
             for h in 0..self.num_heads {
                 let q_nope_slice = &q_nope_v[s * self.num_heads * self.qk_nope_head_dim
                     + h * self.qk_nope_head_dim
@@ -294,17 +303,14 @@ impl KimiK3Mla {
                     + h * self.qk_rope_head_dim
                     ..s * self.num_heads * self.qk_rope_head_dim + (h + 1) * self.qk_rope_head_dim];
 
-                let mut scores = vec![0.0f32; total_kv_len];
-                for t in 0..total_kv_len {
+                let mut scores = vec![f32::NEG_INFINITY; total_kv_len];
+                for t in 0..=causal_limit {
                     let k_nope_slice = &k_all_v[t * self.num_heads * self.qk_nope_head_dim
                         + h * self.qk_nope_head_dim
                         ..t * self.num_heads * self.qk_nope_head_dim
                             + (h + 1) * self.qk_nope_head_dim];
-                    let k_rope_slice = if t < seq_len {
-                        &k_rope_v[t * self.qk_rope_head_dim..(t + 1) * self.qk_rope_head_dim]
-                    } else {
-                        &k_rope_v[0..self.qk_rope_head_dim]
-                    };
+                    let k_rope_slice =
+                        &k_rope_all_v[t * self.qk_rope_head_dim..(t + 1) * self.qk_rope_head_dim];
 
                     let dot_nope: f32 = q_nope_slice
                         .iter()
@@ -501,7 +507,7 @@ impl KimiK3Block {
         &self,
         x: &Tensor,
         positions: &[u32],
-        kv_cache: &mut Option<(Tensor, Tensor)>,
+        kv_cache: &mut Option<(Tensor, Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let normed_attn = self.attn_norm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed_attn, positions, kv_cache)?;

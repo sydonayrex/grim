@@ -361,6 +361,7 @@ impl Llama {
                     local_num_kv_heads: cfg.num_kv_heads,
                     kv_head_replica_factor: 1,
                 },
+                alibi_slopes: None,
             });
         }
 

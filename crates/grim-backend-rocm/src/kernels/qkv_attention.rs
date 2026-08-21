@@ -29,7 +29,11 @@ void grim_qkv_attention(
     // o_dim=0, fuse_o=0 for the unfused per-head output path.
     const float* __restrict__ o_proj_w,
     int o_dim,
-    int fuse_o
+    int fuse_o,
+    // ALiBi per-head slopes [num_heads]. When has_alibi != 0 the score for
+    // query abs_i / key j gains slopes[h] * (j - abs_i). Pass null/0 to skip.
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
 ) {
     // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
     // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts)
@@ -161,6 +165,9 @@ void grim_qkv_attention(
             partial += __shfl_xor_sync(shfl_mask, partial, off);
         }
         float score = partial * inv_sqrt_d;
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
 
         // Online-softmax update
         const float old_max = running_max;

@@ -15,6 +15,33 @@ pub enum AttentionType {
     Sliding,
 }
 
+/// Standard ALiBi slopes for `n` heads (Press et al., 2021):
+/// `slope_i = 2^(-(i+1) * 2^-(log2(n)-3))` for power-of-two `n`; non-powers
+/// of two interleave the slopes of the two nearest powers of two.
+pub fn alibi_slopes_for(num_heads: usize) -> Vec<f32> {
+    fn pow2_slopes(n: usize) -> Vec<f32> {
+        let log2n = (n as f32).log2();
+        let base = 2.0f32.powf(-(log2n - 3.0)); // 2^-(log2(n)-3)
+        (0..n)
+            .map(|i| 2.0f32.powf(-(i as f32 + 1.0) * base))
+            .collect()
+    }
+    let n = num_heads.max(1);
+    if n.count_ones() == 1 {
+        pow2_slopes(n)
+    } else {
+        let closest = 1usize << ((n as f64).log2().floor() as u32);
+        let even = pow2_slopes(2 * closest);
+        let mut slopes: Vec<f32> = pow2_slopes(closest)
+            .into_iter()
+            .zip(even.iter().step_by(2))
+            .flat_map(|(a, b)| [a, *b])
+            .collect();
+        slopes.truncate(n);
+        slopes
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LayerAttentionSpec {
     pub attn_type: AttentionType,
@@ -306,6 +333,9 @@ pub struct LlamaBlock {
     pub tp_config: TensorParallelConfig,
     pub(crate) _dev: Device,
     pub(crate) _cfg: LlamaConfigRefs,
+    /// Per-head ALiBi slopes (Press et al.). `None` = no position bias.
+    /// Score bias for query abs position `i` / key `j`: `slopes[h] * (j - i)`.
+    pub alibi_slopes: Option<Vec<f32>>,
     /// When true this layer's dense FFN is NOT applied inside
     /// `forward_with_kv_paged`; the caller (e.g. `Llama::decode_paged`)
     /// routes the post-attention residual through a `MoeBlock` instead.
@@ -471,7 +501,16 @@ impl LlamaBlock {
                 sliding_window: spec.sliding_window,
             },
             ffn_disabled: !load_dense_ffn,
+            alibi_slopes: None,
         })
+    }
+
+    /// Enable ALiBi position bias on this block (baichuan/mpt/jais/gptneox
+    /// class). Computes per-head slopes via [`alibi_slopes_for`] for the
+    /// block's head count. Builder-style: `block.with_alibi()`.
+    pub fn with_alibi(mut self) -> Self {
+        self.alibi_slopes = Some(alibi_slopes_for(self._cfg.num_heads));
+        self
     }
 
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
@@ -820,19 +859,58 @@ impl LlamaBlock {
         let _t2a = std::time::Instant::now();
 
         // Fused GQA + causal attention. ROCm and CPU implement the kernel;
-        // other backends degrade to the host fallback below.
-        let attn_out = match dev.qkv_attention(
-            q_3d.storage().as_ref(),
-            k_final,
-            v_final,
-            cfg.local_num_kv_heads,
-            kv_len,
-            old_past_len as u32,
-            self._cfg.sliding_window,
-            &out_shape,
-            None,
-            None,
-        ) {
+        // other backends degrade to the host fallback below. ALiBi models
+        // route through the bias-aware kernel variant.
+        let attn_out = if let Some(slopes) = &self.alibi_slopes {
+            let slope_shape = Shape::new(vec![cfg.local_num_heads]);
+            let slopes_st = dev.from_cpu(slopes, &slope_shape, grim_tensor::DType::F32)?;
+            match dev.qkv_attention_alibi(
+                q_3d.storage().as_ref(),
+                k_final,
+                v_final,
+                cfg.local_num_kv_heads,
+                kv_len,
+                old_past_len as u32,
+                self._cfg.sliding_window,
+                slopes_st.as_ref(),
+                &out_shape,
+            ) {
+                Ok((s, _h)) => Tensor::new(
+                    std::sync::Arc::from(s),
+                    out_shape.clone(),
+                    grim_tensor::DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    self._dev.clone(),
+                ),
+                Err(_) => {
+                    let (hk, hv) = match &host_vecs {
+                        Some((k, v)) => (k.clone(), v.clone()),
+                        None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
+                    };
+                    self.cpu_attention_fallback(
+                        &q_3d,
+                        &hk,
+                        &hv,
+                        old_past_len,
+                        q_len,
+                        kv_len,
+                        Some(slopes),
+                    )?
+                }
+            }
+        } else {
+            match dev.qkv_attention(
+                q_3d.storage().as_ref(),
+                k_final,
+                v_final,
+                cfg.local_num_kv_heads,
+                kv_len,
+                old_past_len as u32,
+                self._cfg.sliding_window,
+                &out_shape,
+                None,
+                None,
+            ) {
             Ok((s, _h)) => Tensor::new(
                 std::sync::Arc::from(s),
                 out_shape.clone(),
@@ -847,7 +925,8 @@ impl LlamaBlock {
                     Some((k, v)) => (k.clone(), v.clone()),
                     None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
                 };
-                self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len)?
+                self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len, None)?
+            }
             }
         };
         let _t2b = std::time::Instant::now();
@@ -871,6 +950,7 @@ impl LlamaBlock {
         past_len: usize,
         q_len: usize,
         kv_len: usize,
+        alibi: Option<&[f32]>,
     ) -> Result<Tensor> {
         let cfg = &self._cfg;
         let qd = q_3d.to_vec_f32()?;
@@ -890,6 +970,11 @@ impl LlamaBlock {
                             * full_k[t2 * kv_stride + kvh * cfg.head_dim + d];
                     }
                     scores[t2] = dot * scale;
+                }
+                if let Some(slopes) = alibi {
+                    for (j, s) in scores.iter_mut().enumerate() {
+                        *s += slopes[h] * (j as f32 - (past_len + t) as f32);
+                    }
                 }
                 let causal_limit = past_len + t;
                 let window_start = if let Some(w) = cfg.sliding_window {
@@ -1137,6 +1222,7 @@ mod tests {
             ffn_disabled: false,
             _dev: dev,
             _cfg: cfg,
+            alibi_slopes: None,
         }
     }
 

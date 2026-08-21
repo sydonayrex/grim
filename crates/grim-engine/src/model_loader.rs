@@ -1465,7 +1465,21 @@ fn load_model_from_config(
                 partial_rotary_factor: 1.0,
                 yarn: None,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
+            // when the GGUF carries the metadata key. ALiBi replaces RoPE.
+            if matches!(
+                model_arch,
+                ModelArchitecture::Baichuan
+                    | ModelArchitecture::Mpt
+                    | ModelArchitecture::Jais
+                    | ModelArchitecture::Jais2
+            ) {
+                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
+                for layer in m.layers.iter_mut() {
+                    *layer = std::mem::replace(layer, layer.clone()).with_alibi();
+                }
+            }
             Ok(Box::new(m))
         }
         ModelArchitecture::Chameleon => {
@@ -1935,7 +1949,21 @@ fn load_model_from_config(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
                 model_arch, llama_cfg
             );
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
+            // when the GGUF carries the metadata key. ALiBi replaces RoPE.
+            if matches!(
+                model_arch,
+                ModelArchitecture::Baichuan
+                    | ModelArchitecture::Mpt
+                    | ModelArchitecture::Jais
+                    | ModelArchitecture::Jais2
+            ) {
+                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
+                for layer in m.layers.iter_mut() {
+                    *layer = std::mem::replace(layer, layer.clone()).with_alibi();
+                }
+            }
             Ok(Box::new(m))
         }
         _ => {
@@ -2877,7 +2905,23 @@ fn load_model_with_providers(
                 partial_rotary_factor: 1.0,
                 yarn: None,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
+            // when the GGUF carries the metadata key. ALiBi replaces RoPE.
+            if lookup
+                .get_f32("att.alibi.bias_max")
+                .or_else(|| lookup.get_f32("alibi.bias_max"))
+                .is_some()
+            {
+                eprintln!(
+                    "[grim] enabling ALiBi on {} blocks",
+                    m.layers.len()
+                );
+                for layer in m.layers.iter_mut() {
+                    *layer = std::mem::replace(layer, layer.clone()).with_alibi();
+                }
+
+            }
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek => {
@@ -3536,7 +3580,23 @@ fn load_model_with_providers(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
                 model_arch, llama_cfg
             );
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
+            // when the GGUF carries the metadata key. ALiBi replaces RoPE.
+            if lookup
+                .get_f32("att.alibi.bias_max")
+                .or_else(|| lookup.get_f32("alibi.bias_max"))
+                .is_some()
+            {
+                eprintln!(
+                    "[grim] enabling ALiBi on {} blocks",
+                    m.layers.len()
+                );
+                for layer in m.layers.iter_mut() {
+                    *layer = std::mem::replace(layer, layer.clone()).with_alibi();
+                }
+
+            }
             Ok(Box::new(m))
         }
         _ => {

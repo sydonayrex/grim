@@ -124,6 +124,110 @@ fn dequant_packed_kv(
     Ok(out)
 }
 
+impl CpuDevice {
+    /// Shared scalar GQA attention core with optional ALiBi bias. Used by
+    /// both the plain and ALiBi trait methods so the reference math stays
+    /// in one place.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_inner(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        alibi: Option<&[f32]>,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_st = a_storage(q)?;
+        let k_st = a_storage(k)?;
+        let v_st = a_storage(v)?;
+        let q_dims = q_st.shape().dims();
+        let k_dims = k_st.shape().dims();
+
+        if q_dims.len() < 2 || k_dims.len() < 2 {
+            return Err(Error::Shape("qkv_attention: q/k/v must be >= 2-D".into()));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 {
+            return Err(Error::Shape("qkv_attention: out_shape mismatch".into()));
+        }
+        let seq_len = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+        if k_dims[k_dims.len() - 1] != head_dim || v_st.shape().dims().len() < 2 {
+            return Err(Error::Shape(
+                "qkv_attention: k/v last dim must match head_dim".into(),
+            ));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape(
+                "qkv_attention: num_heads must be multiple of num_kv_heads".into(),
+            ));
+        }
+        let qd = q_st.data();
+        let kd = k_st.data();
+        let vd = v_st.data();
+        let kv_stride = num_kv_heads * head_dim;
+        let num_head_dims = num_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; seq_len * num_head_dims];
+
+        for h in 0..num_heads {
+            let kvh = (h * num_kv_heads) / num_heads;
+            for t in 0..seq_len {
+                let q_abs = cache_offset as usize + t;
+                let window_start = if let Some(w) = window {
+                    (q_abs + 1).saturating_sub(w)
+                } else {
+                    0
+                };
+                let mut scores = vec![0.0f32; kv_seq_len];
+                for t2 in 0..kv_seq_len {
+                    if t2 > q_abs || t2 < window_start {
+                        scores[t2] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += qd[t * num_head_dims + h * head_dim + d]
+                                * kd[t2 * kv_stride + kvh * head_dim + d];
+                        }
+                        let bias = match alibi {
+                            Some(slopes) => slopes[h] * (t2 as f32 - q_abs as f32),
+                            None => 0.0,
+                        };
+                        scores[t2] = dot * scale + bias;
+                    }
+                }
+                // Stable softmax
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+                // Weighted V sum
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..kv_seq_len {
+                        acc += scores[t2] * vd[t2 * kv_stride + kvh * head_dim + d];
+                    }
+                    out[t * num_head_dims + h * head_dim + d] = acc;
+                }
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+}
+
 impl BackendDevice for CpuDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
@@ -719,99 +823,49 @@ impl BackendDevice for CpuDevice {
         _out_max: Option<&dyn BackendStorage>,
         _out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_st = a_storage(q)?;
-        let k_st = a_storage(k)?;
-        let v_st = a_storage(v)?;
-        let q_dims = q_st.shape().dims();
-        let k_dims = k_st.shape().dims();
+        self.qkv_attention_inner(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            None,
+            out_shape,
+        )
+    }
 
-        if q_dims.len() < 2 || k_dims.len() < 2 {
-            return Err(Error::Shape("qkv_attention: q/k/v must be >= 2-D".into()));
-        }
-        let out_dims = out_shape.dims();
-        if out_dims.len() != 3 {
-            return Err(Error::Shape("qkv_attention: out_shape mismatch".into()));
-        }
-        let seq_len = out_dims[0];
-        let num_heads = out_dims[1];
-        let head_dim = out_dims[2];
-        if k_dims[k_dims.len() - 1] != head_dim || v_st.shape().dims().len() < 2 {
+    fn qkv_attention_alibi(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        alibi_slopes: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let slopes_st = a_storage(alibi_slopes)?;
+        let num_heads = out_shape.dims()[1];
+        if slopes_st.data().len() < num_heads {
             return Err(Error::Shape(
-                "qkv_attention: k/v last dim must match head_dim".into(),
+                "qkv_attention_alibi: alibi_slopes must have num_heads entries".into(),
             ));
         }
-        if num_heads % num_kv_heads != 0 {
-            return Err(Error::Shape(
-                "qkv_attention: num_heads must be multiple of num_kv_heads".into(),
-            ));
-        }
-        let qd = q_st.data();
-        let kd = k_st.data();
-        let vd = v_st.data();
-        let kv_stride = num_kv_heads * head_dim;
-        let num_head_dims = num_heads * head_dim;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut out = vec![0.0f32; seq_len * num_head_dims];
-
-        for h in 0..num_heads {
-            let kvh = (h * num_kv_heads) / num_heads;
-            for t in 0..seq_len {
-                let q_abs = cache_offset as usize + t;
-                let window_start = if let Some(w) = window {
-                    (q_abs + 1).saturating_sub(w)
-                } else {
-                    0
-                };
-                let mut scores = vec![0.0f32; kv_seq_len];
-                for t2 in 0..kv_seq_len {
-                    if t2 > q_abs || t2 < window_start {
-                        scores[t2] = f32::NEG_INFINITY;
-                    } else {
-                        let mut dot = 0.0f32;
-                        for d in 0..head_dim {
-                            dot += qd[t * num_head_dims + h * head_dim + d]
-                                * kd[t2 * kv_stride + kvh * head_dim + d];
-                        }
-                        scores[t2] = dot * scale;
-                    }
-                }
-                if std::env::var("GRIM_DBG_ATTN").is_ok() && t == 2 && h == 0 {
-                    eprintln!(
-                        "[classic_dbg] t=2 h=0 scores={scores:?} q_abs={q_abs} kv_stride={kv_stride} nh={num_heads} hd={head_dim}"
-                    );
-                    let qslice: Vec<f32> = (0..head_dim)
-                        .map(|d| qd[t * num_head_dims + h * head_dim + d])
-                        .collect();
-                    let k0: Vec<f32> = (0..head_dim).map(|d| kd[kvh * head_dim + d]).collect();
-                    let k1: Vec<f32> = (0..head_dim)
-                        .map(|d| kd[1 * kv_stride + kvh * head_dim + d])
-                        .collect();
-                    eprintln!("[classic_dbg] q={qslice:?} k0={k0:?} k1={k1:?}");
-                }
-                // Stable softmax
-                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores {
-                    *s = (*s - mx).exp();
-                    sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= sum;
-                }
-                // Weighted V sum
-                for d in 0..head_dim {
-                    let mut acc = 0.0f32;
-                    for t2 in 0..kv_seq_len {
-                        acc += scores[t2] * vd[t2 * kv_stride + kvh * head_dim + d];
-                    }
-                    out[t * num_head_dims + h * head_dim + d] = acc;
-                }
-            }
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
+        self.qkv_attention_inner(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            Some(slopes_st.data()),
+            out_shape,
+        )
     }
 
     /// CPU **reference** implementation of fused dequantized KV-attention.

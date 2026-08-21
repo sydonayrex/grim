@@ -264,49 +264,21 @@ impl FalconBlock {
         };
 
         // GQA Attention calculation
-        let total_kv_len = k_all.shape().dims()[0];
         let q_heads = q_rot.to_vec_f32()?;
         let k_heads = k_all.to_vec_f32()?;
         let v_heads = v_all.to_vec_f32()?;
 
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let kv_group_size = (self.num_heads / self.num_kv_heads).max(1);
-
-        let mut attn_out = vec![0.0f32; seq_len * q_dim];
-
-        for s in 0..seq_len {
-            for h in 0..self.num_heads {
-                let kv_h = h / kv_group_size;
-                let q_slice =
-                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
-
-                let mut scores = vec![0.0f32; total_kv_len];
-                for t in 0..total_kv_len {
-                    let k_slice = &k_heads
-                        [t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
-                    let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
-                    scores[t] = dot * scale;
-                }
-
-                // Softmax
-                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_scores: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
-                let sum_exp: f32 = exp_scores.iter().sum();
-                let weights: Vec<f32> = exp_scores.iter().map(|e| e / (sum_exp + 1e-12)).collect();
-
-                // Weighted sum over V
-                for d in 0..self.head_dim {
-                    let mut acc = 0.0f32;
-                    for t in 0..total_kv_len {
-                        let v_val = v_heads[t * v_dim + kv_h * self.head_dim + d];
-                        acc += weights[t] * v_val;
-                    }
-                    attn_out[s * q_dim + h * self.head_dim + d] = acc;
-                }
-            }
-        }
-
-        let attn_tensor = cpu_tensor(attn_out, Shape::new(vec![seq_len, q_dim]));
+        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
+            &q_heads,
+            &k_heads,
+            &v_heads,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            seq_len,
+            None,
+            x.device(),
+        )?;
         let attn_proj = self.dense.forward(&attn_tensor)?;
 
         // 2. MLP branch (GELU)

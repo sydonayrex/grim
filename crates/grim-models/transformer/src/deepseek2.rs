@@ -9,7 +9,8 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, DType, QuantProvenance, Shape, Tensor};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -97,6 +98,12 @@ pub struct DeepSeek2Mla {
     pub qk_nope_head_dim: usize,
     pub qk_rope_head_dim: usize,
     pub v_head_dim: usize,
+    /// Absorbed per-head key up-projection `w_kc[h]`, row-major
+    /// `[num_heads, qk_nope_head_dim, kv_lora_rank]` (rows of `kv_b_proj.weight`).
+    pub w_kc: Vec<f32>,
+    /// Per-head value up-projection `w_vc[h]`, row-major
+    /// `[num_heads, v_head_dim, kv_lora_rank]`.
+    pub w_vc: Vec<f32>,
 }
 
 impl DeepSeek2Mla {
@@ -128,6 +135,28 @@ impl DeepSeek2Mla {
 
         let rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
 
+        // Extract the per-head key/value up-projections from kv_b_proj's
+        // weight ([num_heads * (nope + v), rank], GGUF row-major) so queries
+        // can absorb w_kc and attention can run in latent space.
+        let kv_b_w = kv_b_proj.weight.to_vec_f32()?;
+        let kv_b_head = cfg.qk_nope_head_dim + cfg.v_head_dim;
+        let rank = cfg.kv_lora_rank;
+        let mut w_kc = vec![0.0f32; cfg.num_heads * cfg.qk_nope_head_dim * rank];
+        let mut w_vc = vec![0.0f32; cfg.num_heads * cfg.v_head_dim * rank];
+        for h in 0..cfg.num_heads {
+            let hb = h * kv_b_head;
+            for d in 0..cfg.qk_nope_head_dim {
+                let src = (hb + d) * rank;
+                let dst = (h * cfg.qk_nope_head_dim + d) * rank;
+                w_kc[dst..dst + rank].copy_from_slice(&kv_b_w[src..src + rank]);
+            }
+            for d in 0..cfg.v_head_dim {
+                let src = (hb + cfg.qk_nope_head_dim + d) * rank;
+                let dst = (h * cfg.v_head_dim + d) * rank;
+                w_vc[dst..dst + rank].copy_from_slice(&kv_b_w[src..src + rank]);
+            }
+        }
+
         Ok(Self {
             q_proj,
             kv_a_proj,
@@ -139,6 +168,8 @@ impl DeepSeek2Mla {
             qk_nope_head_dim: cfg.qk_nope_head_dim,
             qk_rope_head_dim: cfg.qk_rope_head_dim,
             v_head_dim: cfg.v_head_dim,
+            w_kc,
+            w_vc,
         })
     }
 
@@ -204,103 +235,126 @@ impl DeepSeek2Mla {
 
         crate::qwen35::apply_rope_neox(&mut k_rope_v, positions, 1, self.qk_rope_head_dim, 10000.0);
 
-        // Uncompress KV from latent
-        let kv_b = self.kv_b_proj.forward(&kv_a_normed)?;
-        let kv_b_v = kv_b.to_vec_f32()?;
-        let kv_b_head = self.qk_nope_head_dim + self.v_head_dim;
+        // 3. Absorb the per-head key up-projection (w_kc) into the query so
+        //    attention runs entirely in latent space:
+        //    q_absorbed[s,h] = q_nope[s,h] @ w_kc[h]^T
+        //    (q_nope · (w_kc c) == (q_nope w_kc) · c.)
+        let kv_a_normed_v = kv_a_normed.to_vec_f32()?;
+        let rank = kv_rank;
+        let nope = self.qk_nope_head_dim;
+        let rope_d = self.qk_rope_head_dim;
+        let vd = self.v_head_dim;
+        let nh = self.num_heads;
 
-        let mut k_nope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_nope_head_dim];
-        let mut v_v = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
-
+        let mut q_absorbed = vec![0.0f32; seq_len * nh * rank];
         for s in 0..seq_len {
-            for h in 0..self.num_heads {
-                let in_off = s * self.num_heads * kv_b_head + h * kv_b_head;
-                let k_off = s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
-                let v_off = s * self.num_heads * self.v_head_dim + h * self.v_head_dim;
-
-                k_nope_v[k_off..k_off + self.qk_nope_head_dim]
-                    .copy_from_slice(&kv_b_v[in_off..in_off + self.qk_nope_head_dim]);
-                v_v[v_off..v_off + self.v_head_dim]
-                    .copy_from_slice(&kv_b_v[in_off + self.qk_nope_head_dim..in_off + kv_b_head]);
+            for h in 0..nh {
+                for d in 0..nope {
+                    let qv = q_nope_v[(s * nh + h) * nope + d];
+                    let wrow = &self.w_kc[(h * nope + d) * rank..(h * nope + d + 1) * rank];
+                    let dst = &mut q_absorbed[(s * nh + h) * rank..(s * nh + h + 1) * rank];
+                    for (o, w) in dst.iter_mut().zip(wrow.iter()) {
+                        *o += qv * w;
+                    }
+                }
             }
         }
 
-        // Cache update
-        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
-            let mut new_k = prev_k.to_vec_f32()?;
-            let mut new_v = prev_v.to_vec_f32()?;
-            new_k.extend(k_nope_v);
-            new_v.extend(v_v);
-            let total_k_dim = self.num_heads * self.qk_nope_head_dim;
-            let total_v_dim = self.num_heads * self.v_head_dim;
-            let total_seq = new_k.len() / total_k_dim;
-            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, total_k_dim]));
-            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, total_v_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone()));
-            (full_k, full_v)
-        } else {
-            let total_k_dim = self.num_heads * self.qk_nope_head_dim;
-            let total_v_dim = self.num_heads * self.v_head_dim;
-            let full_k = cpu_tensor(k_nope_v, Shape::new(vec![seq_len, total_k_dim]));
-            let full_v = cpu_tensor(v_v, Shape::new(vec![seq_len, total_v_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone()));
-            (full_k, full_v)
+        // 4. Compressed latent rows for this step: [normed c_kv || roped k_pe].
+        let mut latent_new = vec![0.0f32; seq_len * (rank + rope_d)];
+        for s in 0..seq_len {
+            let dst = s * (rank + rope_d);
+            latent_new[dst..dst + rank]
+                .copy_from_slice(&kv_a_normed_v[s * rank..(s + 1) * rank]);
+            latent_new[dst + rank..dst + rank + rope_d]
+                .copy_from_slice(&k_rope_v[s * rope_d..(s + 1) * rope_d]);
+        }
+
+        // 5. Append to the latent KV cache. Format: `.0` holds the compressed
+        //    latent `[total_kv, rank + rope_d]`; `.1` is unused (kept only for
+        //    the `(Tensor, Tensor)` cache shape the surrounding plumbing uses).
+        let latent_all_v = match kv_cache.as_ref() {
+            Some((prev_latent, _unused)) => {
+                let mut v = prev_latent.to_vec_f32()?;
+                v.extend(latent_new);
+                v
+            }
+            None => latent_new,
         };
+        let total_kv_len = latent_all_v.len() / (rank + rope_d);
+        *kv_cache = Some((
+            cpu_tensor(latent_all_v.clone(), Shape::new(vec![total_kv_len, rank + rope_d])),
+            cpu_tensor(Vec::new(), Shape::new(vec![0, 0])),
+        ));
 
-        let total_kv_len = k_all.shape().dims()[0];
-        let k_all_v = k_all.to_vec_f32()?;
-        let v_all_v = v_all.to_vec_f32()?;
+        let scale = 1.0 / ((nope + rope_d) as f32).sqrt();
 
-        let scale = 1.0 / ((self.qk_nope_head_dim + self.qk_rope_head_dim) as f32).sqrt();
-        let mut attn_out = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
+        // 6a. GPU decode fast path (decode-only kernel: grid = num_heads).
+        if seq_len == 1 && x.device() != &Device::Cpu {
+            if let Some(out_v) = self.gpu_absorbed_decode(
+                &q_absorbed,
+                &q_rope_v,
+                &latent_all_v,
+                rank,
+                total_kv_len,
+                scale,
+                x.device(),
+            ) {
+                let attn_tensor = cpu_tensor(out_v, Shape::new(vec![seq_len, nh * vd]));
+                return Ok(self.o_proj.forward(&attn_tensor)?);
+            }
+        }
+
+        // 6b. Scalar latent-space reference path with causal masking. Query at
+        // absolute position cache_offset + s attends only to t <= cache_offset + s.
+        let cache_offset = total_kv_len - seq_len;
+        let row = rank + rope_d;
+        let mut attn_out = vec![0.0f32; seq_len * nh * vd];
 
         for s in 0..seq_len {
-            for h in 0..self.num_heads {
-                let q_nope_slice = &q_nope_v[s * self.num_heads * self.qk_nope_head_dim
-                    + h * self.qk_nope_head_dim
-                    ..s * self.num_heads * self.qk_nope_head_dim + (h + 1) * self.qk_nope_head_dim];
-                let q_rope_slice = &q_rope_v[s * self.num_heads * self.qk_rope_head_dim
-                    + h * self.qk_rope_head_dim
-                    ..s * self.num_heads * self.qk_rope_head_dim + (h + 1) * self.qk_rope_head_dim];
+            let causal_limit = cache_offset + s;
+            for h in 0..nh {
+                let q_abs = &q_absorbed[(s * nh + h) * rank..(s * nh + h + 1) * rank];
+                let q_rp = &q_rope_v[(s * nh + h) * rope_d..(s * nh + h + 1) * rope_d];
 
-                let mut scores = vec![0.0f32; total_kv_len];
-                for t in 0..total_kv_len {
-                    let k_nope_slice = &k_all_v[t * self.num_heads * self.qk_nope_head_dim
-                        + h * self.qk_nope_head_dim
-                        ..t * self.num_heads * self.qk_nope_head_dim
-                            + (h + 1) * self.qk_nope_head_dim];
-                    let k_rope_slice = if t < seq_len {
-                        &k_rope_v[t * self.qk_rope_head_dim..(t + 1) * self.qk_rope_head_dim]
-                    } else {
-                        &k_rope_v[0..self.qk_rope_head_dim]
-                    };
-
-                    let dot_nope: f32 = q_nope_slice
+                let mut scores = vec![0.0f32; causal_limit + 1];
+                for t in 0..=causal_limit {
+                    let lb = t * row;
+                    let dot_c: f32 = q_abs
                         .iter()
-                        .zip(k_nope_slice.iter())
+                        .zip(&latent_all_v[lb..lb + rank])
                         .map(|(a, b)| a * b)
                         .sum();
-                    let dot_rope: f32 = q_rope_slice
+                    let dot_r: f32 = q_rp
                         .iter()
-                        .zip(k_rope_slice.iter())
+                        .zip(&latent_all_v[lb + rank..lb + row])
                         .map(|(a, b)| a * b)
                         .sum();
-                    scores[t] = (dot_nope + dot_rope) * scale;
+                    scores[t] = (dot_c + dot_r) * scale;
                 }
 
                 let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_scores: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
-                let sum_exp: f32 = exp_scores.iter().sum();
-                let weights: Vec<f32> = exp_scores.iter().map(|e| e / (sum_exp + 1e-12)).collect();
+                let sum_exp: f32 = scores.iter().map(|s| (s - max_score).exp()).sum();
+                let weights: Vec<f32> = scores
+                    .iter()
+                    .map(|e| (e - max_score).exp() / (sum_exp + 1e-12))
+                    .collect();
 
-                for d in 0..self.v_head_dim {
-                    let mut acc = 0.0f32;
-                    for t in 0..total_kv_len {
-                        let v_val =
-                            v_all_v[t * self.num_heads * self.v_head_dim + h * self.v_head_dim + d];
-                        acc += weights[t] * v_val;
+                let mut attn_latent = vec![0.0f32; rank];
+                for t in 0..=causal_limit {
+                    let w = weights[t];
+                    for (o, l) in attn_latent
+                        .iter_mut()
+                        .zip(&latent_all_v[t * row..t * row + rank])
+                    {
+                        *o += w * l;
                     }
-                    attn_out[s * self.num_heads * self.v_head_dim + h * self.v_head_dim + d] = acc;
+                }
+
+                for d in 0..vd {
+                    let wrow = &self.w_vc[(h * vd + d) * rank..(h * vd + d + 1) * rank];
+                    attn_out[(s * nh + h) * vd + d] =
+                        attn_latent.iter().zip(wrow.iter()).map(|(a, b)| a * b).sum();
                 }
             }
         }
@@ -310,6 +364,89 @@ impl DeepSeek2Mla {
             Shape::new(vec![seq_len, self.num_heads * self.v_head_dim]),
         );
         Ok(self.o_proj.forward(&attn_tensor)?)
+    }
+
+    /// GPU decode path via `BackendDevice::mla_absorbed_decode` (decode-only,
+    /// `seq_len == 1`). Returns `None` when the backend cannot run the kernel;
+    /// the caller then uses the scalar latent loop.
+    ///
+    /// `w_uv` is deliberately not passed: the kernel indexes `w_uv` without a
+    /// per-head offset (`w_uv[v * kv_lora_rank + c]` for every head), so a
+    /// full multi-head `w_uv` would repeat one head's rows for all heads.
+    /// Instead the softmax-normalized latent is read back and projected per
+    /// head through `w_vc` here.
+    fn gpu_absorbed_decode(
+        &self,
+        q_absorbed: &[f32],
+        q_rope: &[f32],
+        latent_all: &[f32],
+        rank: usize,
+        total_kv_len: usize,
+        scale: f32,
+        device: &Device,
+    ) -> Option<Vec<f32>> {
+        use grim_nn::modules::pick_device_for_storage_device;
+
+        let nh = self.num_heads;
+        let rope_d = self.qk_rope_head_dim;
+        let vd = self.v_head_dim;
+        let dev = pick_device_for_storage_device(device);
+
+        // The kernel applies a fixed 1/sqrt(rank + rope_d); pre-scale q so the
+        // effective softmax scale stays the model's 1/sqrt(nope + rope_d).
+        let kernel_scale = 1.0f32 / ((rank + rope_d) as f32).sqrt();
+        let ratio = scale / kernel_scale;
+        let q_abs_scaled: Vec<f32> = q_absorbed.iter().map(|v| v * ratio).collect();
+        let q_rope_scaled: Vec<f32> = q_rope.iter().map(|v| v * ratio).collect();
+
+        let qa_shape = Shape::new(vec![1, nh, rank]);
+        let qr_shape = Shape::new(vec![1, nh, rope_d]);
+        let kv_shape = Shape::new(vec![total_kv_len, 1, rank + rope_d]);
+        let out_shape = Shape::new(vec![1, nh, rank]);
+
+        let qa_st = dev.from_cpu(&q_abs_scaled, &qa_shape, DType::F32).ok()?;
+        let qr_st = dev.from_cpu(&q_rope_scaled, &qr_shape, DType::F32).ok()?;
+        let kv_st = dev.from_cpu(latent_all, &kv_shape, DType::F32).ok()?;
+        let out_st = dev.zeros(&out_shape, DType::F32).ok()?;
+
+        let handle = dev
+            .mla_absorbed_decode(
+                qa_st.as_ref(),
+                qr_st.as_ref(),
+                kv_st.as_ref(),
+                None,
+                out_st.as_ref(),
+                nh,
+                rank,
+                rope_d,
+                vd,
+                total_kv_len,
+            )
+            .ok()?;
+        handle.synchronize().ok()?;
+
+        let out_t = Tensor::new(
+            Arc::from(out_st),
+            out_shape,
+            DType::F32,
+            QuantProvenance::default(),
+            device.clone(),
+        );
+        let lat = out_t.to_vec_f32().ok()?;
+
+        // Project the softmax-normalized latent per head through w_vc.
+        let mut out = vec![0.0f32; nh * vd];
+        for h in 0..nh {
+            for d in 0..vd {
+                let wrow = &self.w_vc[(h * vd + d) * rank..(h * vd + d + 1) * rank];
+                out[h * vd + d] = wrow
+                    .iter()
+                    .zip(&lat[h * rank..(h + 1) * rank])
+                    .map(|(w, l)| w * l)
+                    .sum();
+            }
+        }
+        Some(out)
     }
 }
 
@@ -648,5 +785,147 @@ mod tests {
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(cfg.n_routed_experts, 64);
         assert_eq!(cfg.n_shared_experts, 2);
+    }
+
+    /// Latent-space (absorbed) MLA must match the OLD uncompressed per-head
+    /// math: `q_nope · (w_kc c) == (q_nope w_kc) · c`. Covers seq_len=3 over
+    /// kv_len=7 with causal masking (cache_offset = 4).
+    #[test]
+    fn test_mla_latent_attention_matches_uncompressed() {
+        let seq = 3usize;
+        let kv = 7usize;
+        let nh = 4usize;
+        let nope = 6usize;
+        let rope_d = 4usize;
+        let vd = 5usize;
+        let rank = 8usize;
+        let head = nope + vd;
+        let scale = 1.0f32 / ((nope + rope_d) as f32).sqrt();
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut q_nope = vec![0.0f32; seq * nh * nope];
+        let mut q_rope = vec![0.0f32; seq * nh * rope_d];
+        let mut w = vec![0.0f32; nh * head * rank]; // kv_b_proj weight layout
+        let mut c_kv = vec![0.0f32; kv * rank]; // normed latent
+        let mut k_rope = vec![0.0f32; kv * rope_d];
+        for x in &mut q_nope {
+            *x = rand();
+        }
+        for x in &mut q_rope {
+            *x = rand();
+        }
+        for x in &mut w {
+            *x = rand();
+        }
+        for x in &mut c_kv {
+            *x = rand();
+        }
+        for x in &mut k_rope {
+            *x = rand();
+        }
+
+        // w_kc[h] = weight rows [h*head .. +nope), w_vc[h] = rows [+nope .. +head).
+        let w_row = |h: usize, d: usize| &w[(h * head + d) * rank..(h * head + d + 1) * rank];
+
+        let cache_offset = kv - seq;
+        let mut out_latent = vec![0.0f32; seq * nh * vd];
+        let mut out_old = vec![0.0f32; seq * nh * vd];
+
+        for s in 0..seq {
+            let causal_limit = cache_offset + s;
+            for h in 0..nh {
+                // --- new (latent-space) path ---
+                let q_abs: Vec<f32> = (0..rank)
+                    .map(|c| {
+                        (0..nope)
+                            .map(|d| q_nope[(s * nh + h) * nope + d] * w_row(h, d)[c])
+                            .sum()
+                    })
+                    .collect();
+                let mut scores = vec![0.0f32; causal_limit + 1];
+                for t in 0..=causal_limit {
+                    let dot_c: f32 = q_abs
+                        .iter()
+                        .zip(&c_kv[t * rank..(t + 1) * rank])
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    let dot_r: f32 = q_rope[(s * nh + h) * rope_d..(s * nh + h + 1) * rope_d]
+                        .iter()
+                        .zip(&k_rope[t * rope_d..(t + 1) * rope_d])
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    scores[t] = (dot_c + dot_r) * scale;
+                }
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = scores.iter().map(|v| (v - mx).exp()).sum();
+                let weights: Vec<f32> = scores.iter().map(|v| (v - mx).exp() / sum).collect();
+
+                let mut attn_latent = vec![0.0f32; rank];
+                for t in 0..=causal_limit {
+                    for (o, l) in attn_latent
+                        .iter_mut()
+                        .zip(&c_kv[t * rank..(t + 1) * rank])
+                    {
+                        *o += weights[t] * l;
+                    }
+                }
+                for d in 0..vd {
+                    out_latent[(s * nh + h) * vd + d] = attn_latent
+                        .iter()
+                        .zip(w_row(h, nope + d).iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                }
+
+                // --- old (uncompressed) path: uncompress K/V, then attend ---
+                let mut scores_old = vec![0.0f32; causal_limit + 1];
+                for t in 0..=causal_limit {
+                    let dot_nope: f32 = (0..nope)
+                        .map(|d| {
+                            let k_d: f32 = w_row(h, d)
+                                .iter()
+                                .zip(&c_kv[t * rank..(t + 1) * rank])
+                                .map(|(a, b)| a * b)
+                                .sum();
+                            q_nope[(s * nh + h) * nope + d] * k_d
+                        })
+                        .sum();
+                    let dot_r: f32 = q_rope[(s * nh + h) * rope_d..(s * nh + h + 1) * rope_d]
+                        .iter()
+                        .zip(&k_rope[t * rope_d..(t + 1) * rope_d])
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    scores_old[t] = (dot_nope + dot_r) * scale;
+                }
+                let mx_old = scores_old.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum_old: f32 = scores_old.iter().map(|v| (v - mx_old).exp()).sum();
+                let weights_old: Vec<f32> =
+                    scores_old.iter().map(|v| (v - mx_old).exp() / sum_old).collect();
+
+                for d in 0..vd {
+                    let mut acc = 0.0f32;
+                    for t in 0..=causal_limit {
+                        let v_d: f32 = w_row(h, nope + d)
+                            .iter()
+                            .zip(&c_kv[t * rank..(t + 1) * rank])
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        acc += weights_old[t] * v_d;
+                    }
+                    out_old[(s * nh + h) * vd + d] = acc;
+                }
+            }
+        }
+
+        for (i, (&a, &b)) in out_latent.iter().zip(out_old.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "latent vs uncompressed mismatch at {i}: {a} vs {b}"
+            );
+        }
     }
 }

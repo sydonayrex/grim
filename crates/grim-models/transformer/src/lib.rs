@@ -122,6 +122,7 @@ pub mod qwen3vl;
 pub mod refact;
 pub mod rnd1;
 pub mod seed_oss;
+pub mod shared_attention;
 pub mod smallthinker;
 pub mod smollm2;
 pub mod smollm3;
