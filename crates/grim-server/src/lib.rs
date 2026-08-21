@@ -764,15 +764,12 @@ fn build_constrained_sampler(
     let Some(rf) = body.get("response_format") else {
         return Ok(inner);
     };
-    let obj = rf.as_object().ok_or_else(|| {
-        "response_format must be an object with a 'type' field".to_string()
+    let obj = rf
+        .as_object()
+        .ok_or_else(|| "response_format must be an object with a 'type' field".to_string())?;
+    let ty = obj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+        "response_format.type is required ('text', 'json_object', 'json_schema')".to_string()
     })?;
-    let ty = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            "response_format.type is required ('text', 'json_object', 'json_schema')".to_string()
-        })?;
     match ty {
         "text" | "text/plain" => Ok(inner),
         "json_object" => {
@@ -785,12 +782,10 @@ fn build_constrained_sampler(
         }
         "json_schema" => {
             let schema = obj.get("json_schema").cloned().ok_or_else(|| {
-                "response_format.json_schema is required when type='json_schema'"
-                    .to_string()
+                "response_format.json_schema is required when type='json_schema'".to_string()
             })?;
             use grim_constrain::{ConstrainedSampler, Constraint};
-            let constraint = Constraint::json_schema(schema)
-                .map_err(|e| e.to_string())?;
+            let constraint = Constraint::json_schema(schema).map_err(|e| e.to_string())?;
             let mut s = ConstrainedSampler::new(inner, constraint);
             if let Some(v) = vocab {
                 s = s.with_vocab(v);
@@ -2185,8 +2180,14 @@ async fn metrics_endpoint(
 
     if let Some(object) = snapshot.as_object_mut() {
         object.insert("active_sessions".into(), serde_json::json!(active_sessions));
-        object.insert("block_pool_usage".into(), serde_json::json!(block_pool_usage));
-        object.insert("preemption_count".into(), serde_json::json!(preemption_count));
+        object.insert(
+            "block_pool_usage".into(),
+            serde_json::json!(block_pool_usage),
+        );
+        object.insert(
+            "preemption_count".into(),
+            serde_json::json!(preemption_count),
+        );
     }
 
     let accept = headers
@@ -2198,9 +2199,24 @@ async fn metrics_endpoint(
         return axum::response::Json(snapshot).into_response();
     }
 
-    let gpu_util = snapshot.get("gpu_util_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let vram_used = (snapshot.get("vram_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0) as u64;
-    let vram_total = (snapshot.get("vram_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0) as u64;
+    let gpu_util = snapshot
+        .get("gpu_util_pct")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let vram_used = (snapshot
+        .get("vram_used_gb")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        * 1024.0
+        * 1024.0
+        * 1024.0) as u64;
+    let vram_total = (snapshot
+        .get("vram_total_gb")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        * 1024.0
+        * 1024.0
+        * 1024.0) as u64;
     let prometheus_text = format!(
         "# HELP grim_active_sessions Active LoRA adapters and inference sessions\n\
          # TYPE grim_active_sessions gauge\n\
@@ -2513,7 +2529,11 @@ fn get_default_model_from_config() -> Option<String> {
     if let Some(ref p) = custom_path {
         paths.push(p.as_str());
     }
-    paths.extend_from_slice(&["grim.toml", "/etc/grim/grim.toml", "C:\\Program Files\\Grim\\grim.toml"]);
+    paths.extend_from_slice(&[
+        "grim.toml",
+        "/etc/grim/grim.toml",
+        "C:\\Program Files\\Grim\\grim.toml",
+    ]);
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(cfg) = toml::from_str::<GrimServerTomlConfig>(&content) {
@@ -2608,7 +2628,9 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let (sys_ram_used, sys_ram_total) = probe_sys_ram();
 
     let gpu_util_pct = if has_gpu {
-        grim_backend_rocm::compute_utilization(0).map(|u| u as f64).unwrap_or(0.0)
+        grim_backend_rocm::compute_utilization(0)
+            .map(|u| u as f64)
+            .unwrap_or(0.0)
     } else {
         0.0
     };
@@ -2647,7 +2669,12 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     }
 
     let spec_disabled = std::env::var("GRIM_SPEC")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "off" | "0" | "false" | "disable" | "disabled"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "off" | "0" | "false" | "disable" | "disabled"
+            )
+        })
         .unwrap_or(false);
     let speculation_info = serde_json::json!({
         "enabled": !spec_disabled,
@@ -3315,7 +3342,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))
-        .route("/v1/adapters", get(list_adapters).post(load_adapter_endpoint))
+        .route(
+            "/v1/adapters",
+            get(list_adapters).post(load_adapter_endpoint),
+        )
         .route("/v1/adapters/load", post(load_adapter_endpoint))
         .route("/v1/adapters/:name", delete(unload_adapter))
         .route("/v1/embeddings", post(embeddings))
@@ -3749,7 +3779,12 @@ mod tests {
         let headers = axum::http::HeaderMap::new();
         let resp = metrics_endpoint(headers, State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/plain"));
     }
 
@@ -4971,10 +5006,7 @@ mod tests {
     /// Convenience: run one chat_completions request and return the final
     /// client-visible content — `message.content` for non-streaming, or the
     /// concatenation of all `delta.content` SSE fragments for streaming.
-    async fn send_and_get_content(
-        app: axum::Router,
-        request_body: &serde_json::Value,
-    ) -> String {
+    async fn send_and_get_content(app: axum::Router, request_body: &serde_json::Value) -> String {
         let response = app
             .oneshot(
                 Request::builder()
@@ -5083,7 +5115,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "thinking:true must be accepted");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "thinking:true must be accepted"
+        );
     }
 
     /// WI-P9 (a): the same generation request hitting the same stop sequence
@@ -5107,8 +5143,7 @@ mod tests {
             });
             let mut non_streaming = req.clone();
             non_streaming["stream"] = serde_json::Value::Bool(false);
-            let non_streaming_content =
-                send_and_get_content(app.clone(), &non_streaming).await;
+            let non_streaming_content = send_and_get_content(app.clone(), &non_streaming).await;
 
             let mut streaming = req.clone();
             streaming["stream"] = serde_json::Value::Bool(true);
@@ -5119,13 +5154,19 @@ mod tests {
             // paths must reduce to exactly ">". Pre-fix the streaming path
             // emitted nothing (stop-triggering delta dropped), so it reduced
             // to "" and the assertion failed.
-            let normalize = |c: &str| c.chars().filter(|ch| !ch.is_ascii_digit()).collect::<String>();
+            let normalize = |c: &str| {
+                c.chars()
+                    .filter(|ch| !ch.is_ascii_digit())
+                    .collect::<String>()
+            };
             assert_eq!(
-                normalize(&streaming_content), normalize(&non_streaming_content),
+                normalize(&streaming_content),
+                normalize(&non_streaming_content),
                 "stream:true content {streaming_content:?} must match stream:false content {non_streaming_content:?} (modulo the random token id) for the same stop-triggering request"
             );
             assert_eq!(
-                normalize(&streaming_content), ">",
+                normalize(&streaming_content),
+                ">",
                 "streaming must deliver the stop-triggering token's stripped text as a final delta; got {streaming_content:?}"
             );
             // The stop string is a signal, not content: neither mode may leak it.
@@ -5240,7 +5281,10 @@ mod tests {
             !content.contains("<tok:"),
             "stop string must be stripped from non-streaming content, got: {content:?}"
         );
-        assert!(content.ends_with('>'), "expected the trigger token id fragment, got: {content:?}");
+        assert!(
+            content.ends_with('>'),
+            "expected the trigger token id fragment, got: {content:?}"
+        );
     }
 
     /// P0-WI-1: streaming mode stop sequence test — asserts that when a stop
@@ -5892,13 +5936,18 @@ mod tests {
         // Type annotation forces `engine` to be `Mutex<Engine>` — if AppState
         // changes, this won't compile.
         let state: AppState = AppState {
-            engine: Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default())),
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
             tokenizer: Mutex::new(None),
             model_path: None,
             plugin_registry: None,
         };
         // Verify we can lock it (Mutex works)
-        let _guard = state.engine.lock().expect("engine mutex should not be poisoned");
+        let _guard = state
+            .engine
+            .lock()
+            .expect("engine mutex should not be poisoned");
     }
 }
 

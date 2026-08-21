@@ -413,7 +413,8 @@ mod tests {
             let mant32 = bits32 & 0x7FFFFF;
             if exp32 == 0 {
                 // subnormal fp32 → normalize then recurse
-                let val = (mant32 as f32) * 2.0f32.powi(-24) * if x < 0.0 { -1.0f32 } else { 1.0f32 };
+                let val =
+                    (mant32 as f32) * 2.0f32.powi(-24) * if x < 0.0 { -1.0f32 } else { 1.0f32 };
                 return f32_to_fp16(val);
             }
             let exp_f = (exp32 as i32) - 127; // unbiased
@@ -2316,7 +2317,9 @@ mod tests {
 
         // Deterministic pseudo-random MXFP4 codes/exps. Exponents kept in a
         // modest range so dequantized weights stay finite (E8M0 = 2^(e-127)).
-        let codes: Vec<u8> = (0..codes_len).map(|i| ((i * 37 + 11) & 0xFF) as u8).collect();
+        let codes: Vec<u8> = (0..codes_len)
+            .map(|i| ((i * 37 + 11) & 0xFF) as u8)
+            .collect();
         let exps: Vec<u8> = (0..exps_len)
             .map(|i| ((i * 53 + 7) % 8 + 124) as u8)
             .collect();
@@ -2712,7 +2715,8 @@ mod tests {
         // Verify the struct field type compiles and is accessible (reflected in
         // the field initializer at build() line ~614).
         use std::sync::Mutex;
-        let _type_check: fn() -> Mutex<Option<crate::graph_capture::GraphCaptureManager>> = || unimplemented!();
+        let _type_check: fn() -> Mutex<Option<crate::graph_capture::GraphCaptureManager>> =
+            || unimplemented!();
         let _ = _type_check;
     }
 
@@ -2724,7 +2728,15 @@ mod tests {
         use crate::graph_capture::DecodeGraphKey;
         fn _check(_dev: &RocmDevice) {
             // Method exists with correct signature — if it didn't, this wouldn't compile.
-            let _key = DecodeGraphKey { batch: 1, seq_len: 1, kv_seq_len: 1, head_dim: 64, num_heads: 1, num_kv_heads: 1, fused_dequant: false };
+            let _key = DecodeGraphKey {
+                batch: 1,
+                seq_len: 1,
+                kv_seq_len: 1,
+                head_dim: 64,
+                num_heads: 1,
+                num_kv_heads: 1,
+                fused_dequant: false,
+            };
             let _ = std::hint::black_box(_key);
         }
     }

@@ -945,4 +945,3 @@ mod tests {
         assert!((scale - 1.0).abs() < 1e-5, "OFT scale factor should be 1.0");
     }
 }
-

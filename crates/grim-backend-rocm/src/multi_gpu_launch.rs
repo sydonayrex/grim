@@ -80,7 +80,8 @@ pub fn launch_multi_gpu_kernel(
         let grid = crate::HipDim3::new(grid_m, grid_n, 1);
         let block = crate::HipDim3::new(tiles.threads, 1, 1);
 
-        let _ = device.launch_compute_kernel_with_solution(entry, grid, block, &mut args, None, 0)?;
+        let _ =
+            device.launch_compute_kernel_with_solution(entry, grid, block, &mut args, None, 0)?;
     }
 
     if let Some(rccl) = comm {

@@ -657,11 +657,17 @@ where
             .map_err(|e| Error::Backend(format!("disk write error: {e}")))?;
         downloaded += bytes.len() as u64;
 
-        if downloaded - last_report >= REPORT_INTERVAL || (total_bytes > 0 && downloaded == total_bytes) {
+        if downloaded - last_report >= REPORT_INTERVAL
+            || (total_bytes > 0 && downloaded == total_bytes)
+        {
             progress_fn(DownloadProgress {
                 status: "downloading".to_string(),
                 digest: Some(digest.clone()),
-                total: if total_bytes > 0 { Some(total_bytes) } else { None },
+                total: if total_bytes > 0 {
+                    Some(total_bytes)
+                } else {
+                    None
+                },
                 completed: Some(downloaded),
             });
             last_report = downloaded;
@@ -958,10 +964,24 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
         val["default_model"].as_str().unwrap_or("none")
     );
 
-    let vram_used = val.get("vram_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let vram_total = val.get("vram_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let kv_used = val["kv_cache"].get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0);
-    let kv_total = val["kv_cache"].get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let vram_used = val
+        .get("vram_used_gb")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let vram_total = val
+        .get("vram_total_gb")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let kv_used = val["kv_cache"]
+        .get("used_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as f64
+        / (1024.0 * 1024.0 * 1024.0);
+    let kv_total = val["kv_cache"]
+        .get("total_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as f64
+        / (1024.0 * 1024.0 * 1024.0);
     println!(
         "Memory Allocation : VRAM {:.2} GB / {:.2} GB  |  KV Cache {:.2} GB / {:.2} GB\n",
         vram_used, vram_total, kv_used, kv_total
@@ -1110,14 +1130,17 @@ pub fn check_model_cache() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_http_client() -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10));
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
     // Gate TLS cert bypass behind GRIM_INSECURE_TLS=1 for local development only.
-    if std::env::var("GRIM_INSECURE_TLS").map(|v| v == "1" || v == "true").unwrap_or(false) {
+    if std::env::var("GRIM_INSECURE_TLS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+    {
         eprintln!("[grim-core] WARNING: GRIM_INSECURE_TLS=1 — accepting invalid TLS certificates");
         builder = builder.danger_accept_invalid_certs(true);
     }
-    builder.build()
+    builder
+        .build()
         .map_err(|e| Error::Backend(format!("failed to build HTTP client: {e}")))
 }
 

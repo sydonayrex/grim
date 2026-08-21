@@ -466,7 +466,10 @@ mod tests {
     use grim_tensor::Shape;
 
     fn lin(in_dim: usize, out_dim: usize) -> Linear {
-        let w = cpu_tensor(vec![0.01f32; out_dim * in_dim], Shape::new(vec![out_dim, in_dim]));
+        let w = cpu_tensor(
+            vec![0.01f32; out_dim * in_dim],
+            Shape::new(vec![out_dim, in_dim]),
+        );
         Linear::from_tensor(w, None)
     }
 
@@ -503,10 +506,15 @@ mod tests {
     fn test_prefill_matches_cacheless() {
         let blk = tiny_block();
         let n = 3;
-        let x = cpu_tensor((0..n * 8).map(|i| (i as f32) * 0.1).collect(), Shape::new(vec![n, 8]));
+        let x = cpu_tensor(
+            (0..n * 8).map(|i| (i as f32) * 0.1).collect(),
+            Shape::new(vec![n, 8]),
+        );
         let positions: Vec<u32> = (0..n).map(|i| i as u32).collect();
 
-        let out_cached = blk.forward_cached(&x, &positions, &mut MlaLayerCache::new()).unwrap();
+        let out_cached = blk
+            .forward_cached(&x, &positions, &mut MlaLayerCache::new())
+            .unwrap();
         let out_stateless = blk.forward(&x, &positions).unwrap();
         let a = out_cached.to_vec_f32().unwrap();
         let b = out_stateless.to_vec_f32().unwrap();
@@ -529,10 +537,15 @@ mod tests {
         let blk = tiny_block();
 
         let prompt = cpu_tensor(
-            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6],
+            vec![
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+            ],
             Shape::new(vec![2, 8]),
         );
-        let dec = cpu_tensor(vec![0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9], Shape::new(vec![1, 8]));
+        let dec = cpu_tensor(
+            vec![0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+            Shape::new(vec![1, 8]),
+        );
 
         // Prefill then decode with a populated cache.
         let mut cache = MlaLayerCache::new();
@@ -545,7 +558,11 @@ mod tests {
 
         let a = cached_dec.to_vec_f32().unwrap();
         let b = stateless_dec.to_vec_f32().unwrap();
-        let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             max_diff > 1e-5,
             "decode ignored the cached prefix (cached vs stateless diff={max_diff})"
@@ -561,13 +578,23 @@ mod tests {
         let blk = tiny_block();
         let p = 4usize;
         let n = 3usize;
-        let prompt = cpu_tensor((0..p * 8).map(|i| (i as f32) * 0.05).collect(), Shape::new(vec![p, 8]));
+        let prompt = cpu_tensor(
+            (0..p * 8).map(|i| (i as f32) * 0.05).collect(),
+            Shape::new(vec![p, 8]),
+        );
         let mut cache = MlaLayerCache::new();
-        let _ = blk.forward_cached(&prompt, &(0..p as u32).collect::<Vec<_>>(), &mut cache).unwrap();
+        let _ = blk
+            .forward_cached(&prompt, &(0..p as u32).collect::<Vec<_>>(), &mut cache)
+            .unwrap();
         assert_eq!(cache.past_len, p, "after prefill");
         for i in 0..n {
-            let tok = cpu_tensor((0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(), Shape::new(vec![1, 8]));
-            let _ = blk.forward_cached(&tok, &[(p + i) as u32], &mut cache).unwrap();
+            let tok = cpu_tensor(
+                (0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(),
+                Shape::new(vec![1, 8]),
+            );
+            let _ = blk
+                .forward_cached(&tok, &[(p + i) as u32], &mut cache)
+                .unwrap();
         }
         assert_eq!(cache.past_len, p + n, "after decode steps");
     }
@@ -592,4 +619,3 @@ mod tests {
         assert!(last_p < nt * 2 * hidden, "prefill kv index OOB: {last_p}");
     }
 }
-

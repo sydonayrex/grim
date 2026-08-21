@@ -82,21 +82,20 @@ fn managed_fallback_warning_and_instrumentation_fire() {
     // Forced managed mode: even a tiny allocation goes through hipMallocManaged.
     // The env scope must cover BOTH device construction (env read once at
     // `RocmDevice::new`) and the allocation itself.
-    let storage = temp_env::with_var(
-        "GRIM_ROCM_MANAGED_ALLOCATIONS",
-        Some("always"),
-        || {
-            let device = RocmDevice::new(0);
-            device
-                .from_cpu(&vec![1.0f32; 64], &Shape::from_slice(&[64]), DType::F32)
-                .expect("forced-managed alloc must succeed")
-        },
-    );
+    let storage = temp_env::with_var("GRIM_ROCM_MANAGED_ALLOCATIONS", Some("always"), || {
+        let device = RocmDevice::new(0);
+        device
+            .from_cpu(&vec![1.0f32; 64], &Shape::from_slice(&[64]), DType::F32)
+            .expect("forced-managed alloc must succeed")
+    });
     let rocm = storage
         .as_any()
         .downcast_ref::<RocmStorage>()
         .expect("must be RocmStorage");
-    assert!(rocm.is_managed(), "forced mode must produce managed storage");
+    assert!(
+        rocm.is_managed(),
+        "forced mode must produce managed storage"
+    );
     assert!(
         grim_backend_rocm::memory::budget::managed_fallback_count() > baseline,
         "managed fallback must be recorded in the WI-P3 counter"

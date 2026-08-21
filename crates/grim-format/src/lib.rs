@@ -10,9 +10,9 @@ pub mod safetensors;
 pub mod spec;
 pub mod tokenizer;
 pub mod tprov;
-pub mod weight_format;
 /// WI-R6: training-state `.grim.train` sidecar (adapters, optimizer, error matrix).
 pub mod train;
+pub mod weight_format;
 
 pub use convert::{
     GpuDequant, convert_gguf_to_grim, convert_to_grim, convert_to_grim_with_dequant,

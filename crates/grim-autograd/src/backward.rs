@@ -185,12 +185,8 @@ pub fn backward(
                 hidden_dim,
                 weight_param,
             } => {
-                let dw = crate::ops::embedding_backward(
-                    &out_grad,
-                    token_ids,
-                    *vocab_size,
-                    *hidden_dim,
-                )?;
+                let dw =
+                    crate::ops::embedding_backward(&out_grad, token_ids, *vocab_size, *hidden_dim)?;
 
                 if let Some(pid) = weight_param {
                     if let Some(param) = trainable_params.get_mut(*pid) {
@@ -363,12 +359,8 @@ pub fn backward_step(
                 hidden_dim,
                 weight_param,
             } => {
-                let dw = crate::ops::embedding_backward(
-                    &out_grad,
-                    token_ids,
-                    *vocab_size,
-                    *hidden_dim,
-                )?;
+                let dw =
+                    crate::ops::embedding_backward(&out_grad, token_ids, *vocab_size, *hidden_dim)?;
 
                 if let Some(pid) = weight_param {
                     if let Some(param) = trainable_params.get_mut(*pid) {
@@ -396,7 +388,11 @@ fn accumulate_tensor_grad(
         let g_storage = if g.device() == existing.device() {
             g.storage().clone()
         } else {
-            std::sync::Arc::from(dev.from_cpu(&g.to_vec_f32()?, existing.shape(), grim_tensor::DType::F32)?)
+            std::sync::Arc::from(dev.from_cpu(
+                &g.to_vec_f32()?,
+                existing.shape(),
+                grim_tensor::DType::F32,
+            )?)
         };
         let (sum_storage, handle) = grim_tensor::BackendDevice::add(
             &*dev,
@@ -507,7 +503,8 @@ mod tests {
         );
 
         let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
-        let mut optimizer = crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
+        let mut optimizer =
+            crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
         let initial_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
 
         let grads = backward_step(&tape, loss_grad, out, &mut params, &mut optimizer).unwrap();

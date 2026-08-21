@@ -13,8 +13,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new(0)"))
-        .ok()
+    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")).ok()
 }
 
 /// Deterministic synthetic weight/activation filler.
@@ -55,8 +54,16 @@ fn concat_qkv_weights_layout_matches_slices() {
     assert_eq!(fused.len(), hidden * (q_dim + k_dim + v_dim));
     for r in 0..hidden {
         let row = &fused[r * (q_dim + k_dim + v_dim)..(r + 1) * (q_dim + k_dim + v_dim)];
-        assert_eq!(&row[..q_dim], &q_w[r * q_dim..(r + 1) * q_dim], "q slice row {r}");
-        assert_eq!(&row[q_dim..q_dim + k_dim], &k_w[r * k_dim..(r + 1) * k_dim], "k slice row {r}");
+        assert_eq!(
+            &row[..q_dim],
+            &q_w[r * q_dim..(r + 1) * q_dim],
+            "q slice row {r}"
+        );
+        assert_eq!(
+            &row[q_dim..q_dim + k_dim],
+            &k_w[r * k_dim..(r + 1) * k_dim],
+            "k slice row {r}"
+        );
         assert_eq!(
             &row[q_dim + k_dim..],
             &v_w[r * v_dim..(r + 1) * v_dim],
@@ -70,7 +77,10 @@ fn concat_qkv_weights_layout_matches_slices() {
 
 #[test]
 fn qkv_proj_fusion_matches_unfused() {
-    let Some(dev) = gpu_device() else { eprintln!("skipping: GPU test gate off"); return };
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
 
     let tokens = 4;
     let hidden = 64;
@@ -93,11 +103,29 @@ fn qkv_proj_fusion_matches_unfused() {
     let v = dev.from_cpu(&v_w, &w_shape(v_dim), DType::F32).unwrap();
 
     // Reference: the existing unfused path — three separate GEMM launches.
-    let (q_out, h) = BackendDevice::matmul(&dev, x.as_ref(), q.as_ref(), &Shape::from_slice(&[tokens, q_dim])).unwrap();
+    let (q_out, h) = BackendDevice::matmul(
+        &dev,
+        x.as_ref(),
+        q.as_ref(),
+        &Shape::from_slice(&[tokens, q_dim]),
+    )
+    .unwrap();
     h.synchronize().unwrap();
-    let (k_out, h) = BackendDevice::matmul(&dev, x.as_ref(), k.as_ref(), &Shape::from_slice(&[tokens, k_dim])).unwrap();
+    let (k_out, h) = BackendDevice::matmul(
+        &dev,
+        x.as_ref(),
+        k.as_ref(),
+        &Shape::from_slice(&[tokens, k_dim]),
+    )
+    .unwrap();
     h.synchronize().unwrap();
-    let (v_out, h) = BackendDevice::matmul(&dev, x.as_ref(), v.as_ref(), &Shape::from_slice(&[tokens, v_dim])).unwrap();
+    let (v_out, h) = BackendDevice::matmul(
+        &dev,
+        x.as_ref(),
+        v.as_ref(),
+        &Shape::from_slice(&[tokens, v_dim]),
+    )
+    .unwrap();
     h.synchronize().unwrap();
     let q_got = q_out.to_cpu_vec_f32().unwrap();
     let k_got = k_out.to_cpu_vec_f32().unwrap();
@@ -105,9 +133,15 @@ fn qkv_proj_fusion_matches_unfused() {
 
     // Fused path: load-time-concatenated weight, one GEMM.
     let fused_w = grim_backend_rocm::concat_qkv_weights(&q_w, &k_w, &v_w, hidden).unwrap();
-    let fw = dev.from_cpu(&fused_w, &w_shape(qkv_dim), DType::F32).unwrap();
+    let fw = dev
+        .from_cpu(&fused_w, &w_shape(qkv_dim), DType::F32)
+        .unwrap();
     let (fused_out, h) = dev
-        .fused_qkv_proj(x.as_ref(), fw.as_ref(), &Shape::from_slice(&[tokens, qkv_dim]))
+        .fused_qkv_proj(
+            x.as_ref(),
+            fw.as_ref(),
+            &Shape::from_slice(&[tokens, qkv_dim]),
+        )
         .expect("fused_qkv_proj should launch");
     h.synchronize().unwrap();
     let fused_got = fused_out.to_cpu_vec_f32().unwrap();
@@ -148,7 +182,10 @@ fn qkv_proj_fusion_matches_unfused() {
 
 #[test]
 fn qkv_proj_fused_uses_single_launch() {
-    let Some(dev) = gpu_device() else { eprintln!("skipping: GPU test gate off"); return };
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
 
     let tokens = 2;
     let hidden = 32;
@@ -159,17 +196,43 @@ fn qkv_proj_fused_uses_single_launch() {
     let w = fill(hidden, qkv_dim, 0.4);
     let x_shape = Shape::from_slice(&[tokens, hidden]);
     let x = dev.from_cpu(&x_data, &x_shape, DType::F32).unwrap();
-    let fw = dev.from_cpu(&w, &Shape::from_slice(&[hidden, qkv_dim]), DType::F32).unwrap();
+    let fw = dev
+        .from_cpu(&w, &Shape::from_slice(&[hidden, qkv_dim]), DType::F32)
+        .unwrap();
 
     // Unfused: three separate GEMM calls on column slices of the same weight —
     // each slice needs its own upload, so exercise it via three matmuls against
     // three separate weight tensors (the real pre-fusion call shape).
-    let wq = dev.from_cpu(&fill(hidden, dim, 0.1), &Shape::from_slice(&[hidden, dim]), DType::F32).unwrap();
-    let wk = dev.from_cpu(&fill(hidden, dim, 0.2), &Shape::from_slice(&[hidden, dim]), DType::F32).unwrap();
-    let wv = dev.from_cpu(&fill(hidden, dim, 0.3), &Shape::from_slice(&[hidden, dim]), DType::F32).unwrap();
+    let wq = dev
+        .from_cpu(
+            &fill(hidden, dim, 0.1),
+            &Shape::from_slice(&[hidden, dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let wk = dev
+        .from_cpu(
+            &fill(hidden, dim, 0.2),
+            &Shape::from_slice(&[hidden, dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let wv = dev
+        .from_cpu(
+            &fill(hidden, dim, 0.3),
+            &Shape::from_slice(&[hidden, dim]),
+            DType::F32,
+        )
+        .unwrap();
     dev.reset_launch_count();
     for wmat in [&wq, &wk, &wv] {
-        let (_, h) = BackendDevice::matmul(&dev, x.as_ref(), wmat.as_ref(), &Shape::from_slice(&[tokens, dim])).unwrap();
+        let (_, h) = BackendDevice::matmul(
+            &dev,
+            x.as_ref(),
+            wmat.as_ref(),
+            &Shape::from_slice(&[tokens, dim]),
+        )
+        .unwrap();
         h.synchronize().unwrap();
     }
     let unfused_count = dev.launch_count();
@@ -180,7 +243,11 @@ fn qkv_proj_fused_uses_single_launch() {
 
     dev.reset_launch_count();
     let (out, h) = dev
-        .fused_qkv_proj(x.as_ref(), fw.as_ref(), &Shape::from_slice(&[tokens, qkv_dim]))
+        .fused_qkv_proj(
+            x.as_ref(),
+            fw.as_ref(),
+            &Shape::from_slice(&[tokens, qkv_dim]),
+        )
         .unwrap();
     h.synchronize().unwrap();
     let fused_count = dev.launch_count();

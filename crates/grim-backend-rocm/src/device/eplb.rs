@@ -19,7 +19,10 @@ impl EplbPackingPlan {
     }
 
     pub fn min_load(&self) -> f32 {
-        self.rank_loads.iter().cloned().fold(f32::INFINITY, f32::min)
+        self.rank_loads
+            .iter()
+            .cloned()
+            .fold(f32::INFINITY, f32::min)
     }
 
     pub fn imbalance_ratio(&self) -> f32 {

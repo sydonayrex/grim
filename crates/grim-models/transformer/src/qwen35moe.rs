@@ -93,10 +93,16 @@ pub struct Qwen35MoeExpert {
 }
 
 impl Qwen35MoeExpert {
-    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, intermediate_size: usize) -> Result<Self> {
-        let gate_proj = Linear::load_shape(&ws.scoped("gate_proj"), [hidden_size, intermediate_size])?;
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
+        let gate_proj =
+            Linear::load_shape(&ws.scoped("gate_proj"), [hidden_size, intermediate_size])?;
         let up_proj = Linear::load_shape(&ws.scoped("up_proj"), [hidden_size, intermediate_size])?;
-        let down_proj = Linear::load_shape(&ws.scoped("down_proj"), [intermediate_size, hidden_size])?;
+        let down_proj =
+            Linear::load_shape(&ws.scoped("down_proj"), [intermediate_size, hidden_size])?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -132,7 +138,11 @@ impl Qwen35MoeLayer {
         let gate = Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts])?;
 
         let shared_expert = if let Some(shared_dim) = cfg.shared_expert_intermediate_size {
-            Some(Qwen35MoeExpert::load(&ws.scoped("shared_expert"), cfg.hidden_size, shared_dim)?)
+            Some(Qwen35MoeExpert::load(
+                &ws.scoped("shared_expert"),
+                cfg.hidden_size,
+                shared_dim,
+            )?)
         } else {
             None
         };
@@ -140,7 +150,11 @@ impl Qwen35MoeLayer {
         let mut experts = Vec::with_capacity(cfg.num_experts);
         let exp_ws = ws.scoped("experts");
         for e in 0..cfg.num_experts {
-            let exp = Qwen35MoeExpert::load(&exp_ws.scoped(&e.to_string()), cfg.hidden_size, cfg.intermediate_size)?;
+            let exp = Qwen35MoeExpert::load(
+                &exp_ws.scoped(&e.to_string()),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+            )?;
             experts.push(exp);
         }
 
@@ -169,12 +183,21 @@ impl Qwen35MoeLayer {
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
 
-            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum_e: f32 = exps.iter().sum();
-            let weights: Vec<f32> = exps.iter().map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor).collect();
+            let weights: Vec<f32> = exps
+                .iter()
+                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .collect();
 
-            let token_x = cpu_tensor(xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(), Shape::new(vec![1, hidden_dim]));
+            let token_x = cpu_tensor(
+                xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
+                Shape::new(vec![1, hidden_dim]),
+            );
 
             for (i, (exp_idx, _)) in topk.iter().enumerate() {
                 let w = weights[i];
@@ -229,8 +252,16 @@ impl Qwen35MoeBlock {
         let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
-        let attn_norm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ffn_norm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let attn_norm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let ffn_norm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let moe = Qwen35MoeLayer::load(&ws.scoped("mlp"), cfg)?;
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
@@ -269,8 +300,20 @@ impl Qwen35MoeBlock {
         let mut q_vec = q.to_vec_f32()?;
         let mut k_vec = k.to_vec_f32()?;
 
-        crate::qwen35::apply_rope_neox(&mut q_vec, positions, self.num_heads, self.head_dim, 10000.0);
-        crate::qwen35::apply_rope_neox(&mut k_vec, positions, self.num_kv_heads, self.head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_vec,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            10000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_vec,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            10000.0,
+        );
 
         let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, kv_dim]));
@@ -303,11 +346,13 @@ impl Qwen35MoeBlock {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim..t * kv_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim
+                        ..t * kv_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -377,7 +422,10 @@ impl Qwen35Moe {
     ) -> Result<Self> {
         let root = ws.scoped("model");
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -441,8 +489,9 @@ impl CausalLm for Qwen35Moe {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -472,4 +521,3 @@ mod tests {
         assert_eq!(cfg.num_experts_per_tok, 8);
     }
 }
-

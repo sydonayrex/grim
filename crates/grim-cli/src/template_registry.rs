@@ -49,13 +49,24 @@ impl TemplateRegistry {
 
 /// Render a family against messages JSON.
 pub fn render_family(family: &str, messages_val: serde_json::Value) -> Result<String, String> {
-    let f = TemplateRegistry::lookup(family).ok_or_else(|| format!("unknown template family '{family}'"))?;
-    let msgs_array = messages_val.as_array().ok_or("input must be a JSON array of message objects")?;
-    
+    let f = TemplateRegistry::lookup(family)
+        .ok_or_else(|| format!("unknown template family '{family}'"))?;
+    let msgs_array = messages_val
+        .as_array()
+        .ok_or("input must be a JSON array of message objects")?;
+
     let mut chat_messages = Vec::with_capacity(msgs_array.len());
     for m in msgs_array {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
-        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let role = m
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user")
+            .to_string();
+        let content = m
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         chat_messages.push(ChatMessage {
             role,
             content,

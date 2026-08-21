@@ -1,4 +1,5 @@
 //! Core tensor abstractions, data types, shapes, and backend-agnostic trait contracts.
+#![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod backend;
 pub mod dtype;

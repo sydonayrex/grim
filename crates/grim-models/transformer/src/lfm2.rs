@@ -406,8 +406,7 @@ impl Lfm2Block {
             let hidden = norm_x.shape().dims().last().copied().unwrap();
             let kv_stride = self.num_kv_heads * self.head_dim;
 
-            let use_fused = self.wqkv_codes.is_some()
-                && matches!(norm_x.device(), Device::Rocm(_));
+            let use_fused = self.wqkv_codes.is_some() && matches!(norm_x.device(), Device::Rocm(_));
 
             // Produce `q_rot_vec` (rotated, QK-normalized Q) and extend the
             // K/V history. Both the fused MXFP4 path and the F32 reference
@@ -645,11 +644,7 @@ impl Lfm2Block {
         );
 
         let pos_shape = Shape::new(vec![steps]);
-        let pos_storage = dev.from_cpu_bytes(
-            as_u8_slice(&positions),
-            &pos_shape,
-            DType::U32,
-        )?;
+        let pos_storage = dev.from_cpu_bytes(as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
         let handle = dev.fused_mxfp4_gemm_qk_norm_rope_kv(
             norm_x.storage().as_ref(),
@@ -802,7 +797,12 @@ fn build_fused_qkv_pack(
     attn_q_norm: &RmsNorm,
     attn_k_norm: &RmsNorm,
     cfg: &Lfm2Config,
-) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+) -> Result<(
+    Option<Tensor>,
+    Option<Tensor>,
+    Option<Tensor>,
+    Option<Tensor>,
+)> {
     let n_q = cfg.num_heads * cfg.head_dim;
     let n_k = cfg.num_kv_heads * cfg.head_dim;
     let n_v = cfg.num_kv_heads * cfg.head_dim;
@@ -1035,7 +1035,12 @@ impl CausalLm for Lfm2 {
 
 /// Reinterpret a slice of `T` as raw bytes (for `from_cpu_bytes` uploads).
 fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * std::mem::size_of::<T>()) }
+    unsafe {
+        std::slice::from_raw_parts(
+            slice.as_ptr() as *const u8,
+            slice.len() * std::mem::size_of::<T>(),
+        )
+    }
 }
 
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {

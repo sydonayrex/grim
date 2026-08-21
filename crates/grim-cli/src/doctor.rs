@@ -56,13 +56,18 @@ pub fn run_doctor(
                 eprintln!(
                     "  -> RDNA 2 COMPATIBILITY: Force RDNA2 compilation by setting environment variable: export HSA_OVERRIDE_GFX_VERSION=10.3.0"
                 );
-            } else if err.contains("VRAM") || err.contains("exceeds free VRAM") || err.contains("estimated VRAM") {
+            } else if err.contains("VRAM")
+                || err.contains("exceeds free VRAM")
+                || err.contains("estimated VRAM")
+            {
                 // WI-2: OOM-adjacent — suggest a smaller quant tier by name.
                 eprintln!(
                     "  -> VRAM INSUFFICIENT: Re-quantize to a smaller codec (Rook/Jay ~4.1 bpw instead of Raven/Jackdaw ~8 bpw, or Crow ~4.5 bpw), \
                      or reduce the model's context_length. See `WeightFormat::bpw`."
                 );
-            } else if err.contains("no supported dispatch path") || err.contains("codec unsupported") {
+            } else if err.contains("no supported dispatch path")
+                || err.contains("codec unsupported")
+            {
                 // WI-2: forced-fallback case — suggest a native-support tier.
                 eprintln!(
                     "  -> CODEC UNSUPPORTED: This codec has no native path on the detected arch. Re-quantize to Rook/Jay (MXFP4, native on RDNA2+) \
@@ -438,7 +443,9 @@ fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
     let footprint = match read_model_header(path) {
         Ok(fp) => fp,
         Err(e) => {
-            report.errors.push(format!("failed to read model header: {e}"));
+            report
+                .errors
+                .push(format!("failed to read model header: {e}"));
             eprintln!("[ERR] Failed to read model header: {e}");
             return;
         }
@@ -446,7 +453,11 @@ fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
 
     let meta = std::fs::metadata(path).ok();
     let size_bytes = meta.map(|m| m.len()).unwrap_or(0);
-    println!("  [INFO] File size: {:.2} MB ({} bytes)", size_bytes as f64 / (1024.0 * 1024.0), size_bytes);
+    println!(
+        "  [INFO] File size: {:.2} MB ({} bytes)",
+        size_bytes as f64 / (1024.0 * 1024.0),
+        size_bytes
+    );
 
     println!(
         "  [INFO] Architecture: {}, params: {:?}, quant: {:?}, weight bytes: {}",
@@ -500,14 +511,8 @@ fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
     let kv_layers = estimate_num_layers(&footprint);
     let kv_heads = estimate_num_kv_heads(&footprint);
     let head_dim = estimate_head_dim(&footprint);
-    let vram_estimate = grim_format::estimate_vram_bytes(
-        &footprint,
-        ctx,
-        1,
-        kv_layers,
-        kv_heads,
-        head_dim,
-    );
+    let vram_estimate =
+        grim_format::estimate_vram_bytes(&footprint, ctx, 1, kv_layers, kv_heads, head_dim);
     let margin = (vram_estimate as f64 * 0.10) as u64;
     if free_vram == 0 {
         report

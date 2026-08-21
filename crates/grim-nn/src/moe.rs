@@ -33,7 +33,9 @@ use grim_backend_metal::MetalDevice;
 use grim_backend_rocm::RocmDevice;
 #[cfg(feature = "vulkan-mem")]
 use grim_backend_vulkan::VulkanDevice;
-use grim_tensor::dtype::{ArithType, BlockDtype, DType, FloatPackScheme, KQuantScheme, QuantProvenance, Storage};
+use grim_tensor::dtype::{
+    ArithType, BlockDtype, DType, FloatPackScheme, KQuantScheme, QuantProvenance, Storage,
+};
 
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, BackendStorage, Device, Tensor};
@@ -609,9 +611,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
         Storage::GroupInt(_) => elem_count,
         // ResidualPacked: packed residual format with per-block scales.
         // Use bpw (bits per weight) to compute byte size.
-        Storage::ResidualPacked(config) => {
-            (elem_count * config.bpw as usize + 7) / 8
-        }
+        Storage::ResidualPacked(config) => (elem_count * config.bpw as usize + 7) / 8,
         // Native: fp16/f32/bf16
         Storage::Native => {
             match dtype.arith {
@@ -743,9 +743,24 @@ impl MoeFfn {
                 let gate_dtype = experts.gate[e].weight.dtype();
                 let up_dtype = experts.up[e].weight.dtype();
                 let down_dtype = experts.down[e].weight.dtype();
-                let gate_elem = experts.gate[e].weight.shape().dims().iter().product::<usize>();
-                let up_elem = experts.up[e].weight.shape().dims().iter().product::<usize>();
-                let down_elem = experts.down[e].weight.shape().dims().iter().product::<usize>();
+                let gate_elem = experts.gate[e]
+                    .weight
+                    .shape()
+                    .dims()
+                    .iter()
+                    .product::<usize>();
+                let up_elem = experts.up[e]
+                    .weight
+                    .shape()
+                    .dims()
+                    .iter()
+                    .product::<usize>();
+                let down_elem = experts.down[e]
+                    .weight
+                    .shape()
+                    .dims()
+                    .iter()
+                    .product::<usize>();
                 total_bytes += expert_weight_bytes(&gate_dtype, gate_elem)
                     + expert_weight_bytes(&up_dtype, up_elem)
                     + expert_weight_bytes(&down_dtype, down_elem);
@@ -1258,7 +1273,9 @@ impl MoeFfn {
         // PlanBuilder: decide which experts deserve fp16 residency under the
         // HBM budget. Called on every call with the updated hotness; the plan
         // is cached for the resident-set rebuild (cache-miss path below).
-        let plan = self.plan_builder.build(&*self.hotness.lock().unwrap(), false);
+        let plan = self
+            .plan_builder
+            .build(&*self.hotness.lock().unwrap(), false);
         *self.cached_plan.lock().unwrap() = Some(plan.clone());
 
         // Resident expert-weight fast path: the flattened gate/up/down banks

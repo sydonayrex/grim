@@ -1,4 +1,5 @@
-//! ROCm backend for Grim  primary GPU target per architecture §4.
+//! ROCm backend for Grim — primary GPU target per architecture §4.
+#![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::not_unsafe_ptr_arg_deref)]
 //!
 //! Replicates core architectural design concepts from the `rocm-rs` library ecosystem:
 //! - Safe RAII allocation handles (Drop-on-scope, zero leaks) mimicking `DeviceMemoryExt`.
@@ -73,25 +74,26 @@ pub use crate::device::handles::{
     HIP_MEM_ADVISE_UNSET_COARSE_GRAIN, HIP_MEM_ADVISE_UNSET_PREFERRED_LOCATION,
     HIP_MEM_ADVISE_UNSET_READ_MOSTLY, HipDim3, HipErrorT, HipGraphKernelNodeParams,
     HipGraphMemcpyNodeParams, HipMemcpyKind, HiprtcProgram, RocmDeviceProps, RocmHandle,
-    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipFree, hipFreeAsync,
-    hipGetDeviceCount, hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy,
-    hipGraphExecDestroy, hipGraphExtendFromGlobalStream, hipGraphInstantiate, hipGraphLaunch,
-    hipGraphUpload, hipHostFree, hipHostMalloc, hipMalloc, hipMallocManaged, hipMemAdvise,
-    hipMemGetInfo, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
+    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipEventCreate, hipEventDestroy,
+    hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
+    hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
+    hipGraphExtendFromGlobalStream, hipGraphInstantiate, hipGraphLaunch, hipGraphUpload,
+    hipHostFree, hipHostMalloc, hipMalloc, hipMallocManaged, hipMemAdvise, hipMemGetInfo,
+    hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
     hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSetDevice,
     hipStreamBeginCapture, hipStreamCreate, hipStreamDestroy, hipStreamEndCapture,
-    hipStreamSynchronize, hipStreamWaitEvent, hipSuccess, hipEventCreate, hipEventDestroy,
-    hipEventRecord, hipEventSynchronize, hiprtcAddNameExpression, hiprtcCompileProgram,
-    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
-    hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hipStreamSynchronize, hipStreamWaitEvent, hipSuccess, hiprtcAddNameExpression,
+    hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode,
+    hiprtcGetCodeSize, hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog,
+    hiprtcGetProgramLogSize,
 };
 
 pub use crate::device::rocblas::{
     ROCBLAS_GEMM_FLAGS_NONE,
+    RocblasHandle,
     RocblasInt,
     RocblasOperation,
     Rocblstatus,
-    RocblasHandle,
     arith_to_compute_dtype,
     arith_to_rocblas_dtype,
     rocblas_create_handle,
@@ -145,13 +147,16 @@ pub use crate::device::util::{
 // ROCmDevice itself: large struct + every impl lives in
 // `device::roc_device`. Re-exported here so existing callers can
 // keep using `RocmDevice::new(...)` etc. unchanged.
-pub use crate::device::roc_device::{CharonBackwardResult, FUSED_FORWARD_DISPATCH_STATS, RocmDevice};
+pub use crate::device::roc_device::{
+    CharonBackwardResult, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
+};
 
 pub use crate::rccl::RcclAllReduce;
 
 pub use fusion::{
-    KvQuantFormat, DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, KvDequantAttentionConfig,
-    QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, SplitKGemmConfig, WmmaGemmConfig, concat_qkv_weights, hipDim3,
+    DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, KvDequantAttentionConfig,
+    KvQuantFormat, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, SplitKGemmConfig,
+    WmmaGemmConfig, concat_qkv_weights, hipDim3,
 };
 
 pub use kernels::qkv_attention::{

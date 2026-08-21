@@ -466,7 +466,8 @@ mod self_tests {
         // The scalar FP8 fallback (non-MFMA) must be present for non-gfx1200 targets.
         assert!(
             KERNEL_SOURCE.contains("extern \"C\" __global__ void grim_fused_dequant_gemm_fp8")
-                && KERNEL_SOURCE.contains("extern \"C\" __global__ void grim_fused_dequant_backward_gemm_fp8"),
+                && KERNEL_SOURCE
+                    .contains("extern \"C\" __global__ void grim_fused_dequant_backward_gemm_fp8"),
             "Scalar FP8 fallback kernels must be present for non-gfx1200 targets"
         );
         // The MFMA kernel must use fp8_e4m3_to_float_hip (the shared FP8 decode helper).
@@ -489,8 +490,7 @@ mod self_tests {
             "standalone FP8 GEMM kernel must be present in compute_kernel_source"
         );
         assert!(
-            src.contains("#if defined(__gfx1200__)")
-                && src.contains("#if defined(__gfx1100__)"),
+            src.contains("#if defined(__gfx1200__)") && src.contains("#if defined(__gfx1100__)"),
             "standalone FP8 GEMM kernel must be arch-gated"
         );
     }

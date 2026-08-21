@@ -69,30 +69,48 @@ fn probe_device() -> (Device, String) {
             "cuda" => {
                 #[cfg(feature = "cuda")]
                 {
-                    let ord_req = s_lower.split(':').nth(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+                    let ord_req = s_lower
+                        .split(':')
+                        .nth(1)
+                        .and_then(|x| x.parse::<u32>().ok())
+                        .unwrap_or(0);
                     if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
-                        if let Some(dev) = cuda_devices.iter().find(|d| d.ordinal() == ord_req).or_else(|| cuda_devices.first()) {
+                        if let Some(dev) = cuda_devices
+                            .iter()
+                            .find(|d| d.ordinal() == ord_req)
+                            .or_else(|| cuda_devices.first())
+                        {
                             return (
                                 Device::Cuda(dev.ordinal()),
                                 format!("cuda:{}", dev.ordinal()),
                             );
                         }
                     }
-                    eprintln!("[grim] WARNING: requested backend 'cuda' unavailable (no CUDA devices found). Falling back to CPU.");
+                    eprintln!(
+                        "[grim] WARNING: requested backend 'cuda' unavailable (no CUDA devices found). Falling back to CPU."
+                    );
                     (Device::Cpu, "cpu".into())
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    eprintln!("[grim] WARNING: requested backend 'cuda' unavailable (binary compiled without '--features cuda'). Falling back to CPU.");
+                    eprintln!(
+                        "[grim] WARNING: requested backend 'cuda' unavailable (binary compiled without '--features cuda'). Falling back to CPU."
+                    );
                     (Device::Cpu, "cpu".into())
                 }
             }
             "rocm" => {
-                let ord_req = s_lower.split(':').nth(1).and_then(|x| x.parse::<usize>().ok());
+                let ord_req = s_lower
+                    .split(':')
+                    .nth(1)
+                    .and_then(|x| x.parse::<usize>().ok());
                 if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
                     if let Some(req) = ord_req {
                         if let Some(dev) = rocm_devices.iter().find(|d| d.ordinal() == req) {
-                            return (Device::Rocm(dev.ordinal()), format!("rocm:{}", dev.ordinal()));
+                            return (
+                                Device::Rocm(dev.ordinal()),
+                                format!("rocm:{}", dev.ordinal()),
+                            );
                         }
                     }
                     if let Some(ord) = tp_ordinal(&rocm_devices) {
@@ -105,19 +123,29 @@ fn probe_device() -> (Device, String) {
                         );
                     }
                 }
-                eprintln!("[grim] WARNING: requested backend 'rocm' unavailable (no ROCm devices probed). Falling back to CPU.");
+                eprintln!(
+                    "[grim] WARNING: requested backend 'rocm' unavailable (no ROCm devices probed). Falling back to CPU."
+                );
                 (Device::Cpu, "cpu".into())
             }
             "metal" => {
-                let ord_req = s_lower.split(':').nth(1).and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                let ord_req = s_lower
+                    .split(':')
+                    .nth(1)
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(0);
                 let Some((_free, total)) = grim_backend_metal::vram_info(ord_req) else {
-                    eprintln!("[grim] WARNING: requested backend 'metal' unavailable (host unsupported or no Metal device found). Falling back to CPU.");
+                    eprintln!(
+                        "[grim] WARNING: requested backend 'metal' unavailable (host unsupported or no Metal device found). Falling back to CPU."
+                    );
                     return (Device::Cpu, "cpu".into());
                 };
                 if total > 0 {
                     return (Device::Metal(ord_req), format!("metal:{ord_req}"));
                 }
-                eprintln!("[grim] WARNING: requested backend 'metal' unavailable (no Metal VRAM found). Falling back to CPU.");
+                eprintln!(
+                    "[grim] WARNING: requested backend 'metal' unavailable (no Metal VRAM found). Falling back to CPU."
+                );
                 (Device::Cpu, "cpu".into())
             }
             "vulkan" => {
@@ -126,12 +154,16 @@ fn probe_device() -> (Device, String) {
                         return (Device::Vulkan, "vulkan".into());
                     }
                 }
-                eprintln!("[grim] WARNING: requested backend 'vulkan' unavailable (no Vulkan devices found). Falling back to CPU.");
+                eprintln!(
+                    "[grim] WARNING: requested backend 'vulkan' unavailable (no Vulkan devices found). Falling back to CPU."
+                );
                 (Device::Cpu, "cpu".into())
             }
             "cpu" => (Device::Cpu, "cpu".into()),
             other => {
-                eprintln!("[grim] WARNING: unknown requested backend '{other}'. Falling back to CPU.");
+                eprintln!(
+                    "[grim] WARNING: unknown requested backend '{other}'. Falling back to CPU."
+                );
                 (Device::Cpu, "cpu".into())
             }
         }

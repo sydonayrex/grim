@@ -55,7 +55,12 @@ impl AutogradRegistry {
         seed: u64,
     ) -> Result<Self> {
         Self::with_scope_base_weights_seed_dtype(
-            model_config, injection_registry, scope, None, seed, grim_tensor::DType::F32,
+            model_config,
+            injection_registry,
+            scope,
+            None,
+            seed,
+            grim_tensor::DType::F32,
         )
     }
 
@@ -68,7 +73,12 @@ impl AutogradRegistry {
         dtype: grim_tensor::DType,
     ) -> Result<Self> {
         Self::with_scope_base_weights_seed_dtype(
-            model_config, injection_registry, scope, None, seed, dtype,
+            model_config,
+            injection_registry,
+            scope,
+            None,
+            seed,
+            dtype,
         )
     }
 
@@ -87,7 +97,12 @@ impl AutogradRegistry {
         base_weights: Option<&BaseWeightMap>,
     ) -> Result<Self> {
         Self::with_scope_base_weights_seed_dtype(
-            model_config, injection_registry, scope, base_weights, 0, grim_tensor::DType::F32,
+            model_config,
+            injection_registry,
+            scope,
+            base_weights,
+            0,
+            grim_tensor::DType::F32,
         )
     }
 
@@ -470,8 +485,15 @@ mod tests {
         let cfg = cfg();
         let make = |seed: u64| {
             let mut inj = LoRAInjectionRegistry::new();
-            inj.add(LoRAInjectionConfig::new(LoRAInjectionPoint::QProj, 0, 1, 4, 16.0));
-            let reg = AutogradRegistry::with_seed(cfg.clone(), inj, AutogradScope::default(), seed).unwrap();
+            inj.add(LoRAInjectionConfig::new(
+                LoRAInjectionPoint::QProj,
+                0,
+                1,
+                4,
+                16.0,
+            ));
+            let reg = AutogradRegistry::with_seed(cfg.clone(), inj, AutogradScope::default(), seed)
+                .unwrap();
             reg.params
                 .get(ParamId::a(0, 1, LoRAInjectionPoint::QProj))
                 .unwrap()
@@ -494,7 +516,13 @@ mod tests {
         // don't change when no --seed is passed.
         let cfg = cfg();
         let mut inj = LoRAInjectionRegistry::new();
-        inj.add(LoRAInjectionConfig::new(LoRAInjectionPoint::QProj, 0, 1, 4, 16.0));
+        inj.add(LoRAInjectionConfig::new(
+            LoRAInjectionPoint::QProj,
+            0,
+            1,
+            4,
+            16.0,
+        ));
 
         let legacy = AutogradRegistry::new(cfg.clone(), inj.clone()).unwrap();
         let seeded0 = AutogradRegistry::with_seed(cfg, inj, AutogradScope::default(), 0).unwrap();
@@ -513,6 +541,9 @@ mod tests {
             .data
             .to_vec_f32()
             .unwrap();
-        assert_eq!(a_legacy, a_seeded0, "seed=0 must match legacy init bit-for-bit");
+        assert_eq!(
+            a_legacy, a_seeded0,
+            "seed=0 must match legacy init bit-for-bit"
+        );
     }
 }

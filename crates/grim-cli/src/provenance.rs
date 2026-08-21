@@ -11,14 +11,19 @@ use sha2::{Digest, Sha256};
 
 /// Compute streaming SHA-256 digest of a file.
 fn compute_sha256(path: &Path) -> Result<String> {
-    let file = File::open(path)
-        .map_err(|e| Error::Config(format!("failed to open file for hashing '{}': {e}", path.display())))?;
+    let file = File::open(path).map_err(|e| {
+        Error::Config(format!(
+            "failed to open file for hashing '{}': {e}",
+            path.display()
+        ))
+    })?;
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
 
     loop {
-        let count = reader.read(&mut buffer)
+        let count = reader
+            .read(&mut buffer)
             .map_err(|e| Error::Config(format!("read error during hashing: {e}")))?;
         if count == 0 {
             break;
@@ -32,7 +37,10 @@ fn compute_sha256(path: &Path) -> Result<String> {
 /// Print comprehensive model provenance, hash, format, and catalog trust details.
 pub fn cmd_provenance(path: &Path) -> Result<()> {
     if !path.exists() {
-        return Err(Error::Config(format!("model file not found: {}", path.display())));
+        return Err(Error::Config(format!(
+            "model file not found: {}",
+            path.display()
+        )));
     }
 
     let meta = std::fs::metadata(path)
@@ -42,14 +50,21 @@ pub fn cmd_provenance(path: &Path) -> Result<()> {
 
     println!("=== Grim Model Provenance & Trust ===");
     println!("File Path         : {}", path.display());
-    println!("File Size         : {:.2} MB ({} bytes)", size_mb, size_bytes);
+    println!(
+        "File Size         : {:.2} MB ({} bytes)",
+        size_mb, size_bytes
+    );
 
     print!("Calculating SHA256: ");
     let sha256 = compute_sha256(path)?;
     println!("{sha256}");
 
     // Format and architecture detection
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let path_str = path.to_string_lossy();
 
     if ext == "grim" {
@@ -58,10 +73,19 @@ pub fn cmd_provenance(path: &Path) -> Result<()> {
             match GrimFile::read(&mut f) {
                 Ok(gf) => {
                     println!("Tensors           : {}", gf.tensors.len());
-                    println!("Target GCN        : {}", gf.metadata.target_gcn.as_deref().unwrap_or("auto"));
+                    println!(
+                        "Target GCN        : {}",
+                        gf.metadata.target_gcn.as_deref().unwrap_or("auto")
+                    );
                     println!("Wavefront Target  : Wave{}", gf.metadata.wavefront_size);
-                    println!("Preferred Dtype   : {}", gf.metadata.preferred_dtype.as_deref().unwrap_or("bf16"));
-                    println!("Quantization Method: {}", gf.metadata.quant_method.as_deref().unwrap_or("standard"));
+                    println!(
+                        "Preferred Dtype   : {}",
+                        gf.metadata.preferred_dtype.as_deref().unwrap_or("bf16")
+                    );
+                    println!(
+                        "Quantization Method: {}",
+                        gf.metadata.quant_method.as_deref().unwrap_or("standard")
+                    );
                 }
                 Err(e) => {
                     println!("Header Validation : FAILED ({e})");
@@ -73,7 +97,11 @@ pub fn cmd_provenance(path: &Path) -> Result<()> {
         if let Ok(mut f) = File::open(path) {
             match read_gguf(&mut f) {
                 Ok(gg) => {
-                    let arch = gg.metadata.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let arch = gg
+                        .metadata
+                        .get("general.architecture")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     println!("Architecture      : {arch}");
                     println!("Tensors           : {}", gg.tensors.len());
                     println!("Metadata Fields   : {}", gg.metadata.len());

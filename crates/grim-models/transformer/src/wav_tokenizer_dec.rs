@@ -80,10 +80,20 @@ pub struct AdaLayerNorm {
 }
 
 impl AdaLayerNorm {
-    pub fn load(ws: &WeightSource<'_>, num_bandwidths: usize, dim: usize, eps: f32) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        num_bandwidths: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<Self> {
         let scale = ws.scoped("scale").get([num_bandwidths, dim], "weight")?;
         let shift = ws.scoped("shift").get([num_bandwidths, dim], "weight")?;
-        Ok(Self { scale, shift, dim, eps })
+        Ok(Self {
+            scale,
+            shift,
+            dim,
+            eps,
+        })
     }
 
     /// Normalizes `x` of shape `[channels, length]` and modulates with bandwidth conditions.
@@ -145,14 +155,31 @@ pub struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     pub fn load(ws: &WeightSource<'_>, cfg: &WavTokenizerDecConfig) -> Result<Self> {
-        let dwconv_weight = ws.scoped("dwconv").get([cfg.backbone_dim, 1, cfg.backbone_kernel_size], "weight")?;
+        let dwconv_weight = ws
+            .scoped("dwconv")
+            .get([cfg.backbone_dim, 1, cfg.backbone_kernel_size], "weight")?;
         let dwconv_bias = ws.scoped("dwconv").get([cfg.backbone_dim], "bias").ok();
 
-        let norm = AdaLayerNorm::load(&ws.scoped("norm"), cfg.num_bandwidths, cfg.backbone_dim, 1e-6)?;
-        let pwconv1 = Linear::load_shape(&ws.scoped("pwconv1"), [cfg.backbone_dim, cfg.backbone_intermediate_dim])?;
-        let pwconv2 = Linear::load_shape(&ws.scoped("pwconv2"), [cfg.backbone_intermediate_dim, cfg.backbone_dim])?;
-        let gamma = ws.get([cfg.backbone_dim], "gamma")
-            .unwrap_or_else(|_| cpu_tensor(vec![1e-6f32; cfg.backbone_dim], Shape::new(vec![cfg.backbone_dim])));
+        let norm = AdaLayerNorm::load(
+            &ws.scoped("norm"),
+            cfg.num_bandwidths,
+            cfg.backbone_dim,
+            1e-6,
+        )?;
+        let pwconv1 = Linear::load_shape(
+            &ws.scoped("pwconv1"),
+            [cfg.backbone_dim, cfg.backbone_intermediate_dim],
+        )?;
+        let pwconv2 = Linear::load_shape(
+            &ws.scoped("pwconv2"),
+            [cfg.backbone_intermediate_dim, cfg.backbone_dim],
+        )?;
+        let gamma = ws.get([cfg.backbone_dim], "gamma").unwrap_or_else(|_| {
+            cpu_tensor(
+                vec![1e-6f32; cfg.backbone_dim],
+                Shape::new(vec![cfg.backbone_dim]),
+            )
+        });
 
         Ok(Self {
             dwconv_weight,
@@ -174,7 +201,11 @@ impl ConvNeXtBlock {
 
         // Depthwise 1D Conv with padding
         let dw_w = self.dwconv_weight.to_vec_f32()?;
-        let dw_b = self.dwconv_bias.as_ref().map(|b| b.to_vec_f32()).transpose()?;
+        let dw_b = self
+            .dwconv_bias
+            .as_ref()
+            .map(|b| b.to_vec_f32())
+            .transpose()?;
         let pad = self.kernel_size / 2;
         let mut conv_out = vec![0.0f32; c_dim * t_dim];
 
@@ -335,19 +366,39 @@ impl WavTokenizerDec {
         cfg: WavTokenizerDecConfig,
         _tp: TensorParallelConfig,
     ) -> Result<Self> {
-        let codebook = ws.scoped("feature_extractor").scoped("encodec").scoped("quantizer")
-            .scoped("vq").scoped("layers").scoped("0").scoped("_codebook")
+        let codebook = ws
+            .scoped("feature_extractor")
+            .scoped("encodec")
+            .scoped("quantizer")
+            .scoped("vq")
+            .scoped("layers")
+            .scoped("0")
+            .scoped("_codebook")
             .get([cfg.codebook_size, cfg.codebook_dim], "embed")
             .or_else(|_| ws.get([cfg.codebook_size, cfg.codebook_dim], "codebook.embed"))
-            .unwrap_or_else(|_| cpu_tensor(vec![0.0f32; cfg.codebook_size * cfg.codebook_dim], Shape::new(vec![cfg.codebook_size, cfg.codebook_dim])));
+            .unwrap_or_else(|_| {
+                cpu_tensor(
+                    vec![0.0f32; cfg.codebook_size * cfg.codebook_dim],
+                    Shape::new(vec![cfg.codebook_size, cfg.codebook_dim]),
+                )
+            });
 
         let backbone_ws = ws.scoped("backbone");
-        let embed_conv = Linear::load_shape(&backbone_ws.scoped("embed"), [cfg.latent_dim, cfg.backbone_dim])?;
-        let norm = AdaLayerNorm::load(&backbone_ws.scoped("norm"), cfg.num_bandwidths, cfg.backbone_dim, 1e-6)?;
+        let embed_conv = Linear::load_shape(
+            &backbone_ws.scoped("embed"),
+            [cfg.latent_dim, cfg.backbone_dim],
+        )?;
+        let norm = AdaLayerNorm::load(
+            &backbone_ws.scoped("norm"),
+            cfg.num_bandwidths,
+            cfg.backbone_dim,
+            1e-6,
+        )?;
 
         let mut blocks = Vec::with_capacity(cfg.backbone_num_blocks);
         for i in 0..cfg.backbone_num_blocks {
-            let block = ConvNeXtBlock::load(&backbone_ws.scoped("convnext").scoped(&i.to_string()), &cfg)?;
+            let block =
+                ConvNeXtBlock::load(&backbone_ws.scoped("convnext").scoped(&i.to_string()), &cfg)?;
             blocks.push(block);
         }
 
@@ -426,7 +477,11 @@ impl CausalLm for WavTokenizerDec {
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let ids: Vec<usize> = input_ids.to_vec_f32()?.iter().map(|&f| f as usize).collect();
+        let ids: Vec<usize> = input_ids
+            .to_vec_f32()?
+            .iter()
+            .map(|&f| f as usize)
+            .collect();
         let audio = self.decode_codes(&ids, 0)?;
         session.advance_pos(ids.len());
         Ok(audio)
@@ -445,4 +500,3 @@ mod tests {
         assert_eq!(cfg.sample_rate, 24000);
     }
 }
-

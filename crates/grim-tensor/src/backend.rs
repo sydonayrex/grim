@@ -337,7 +337,20 @@ pub trait BackendDevice: Send + Sync {
         bc2: f32,
         total: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
-        let _ = (p, g, m, v, lr, beta1, beta2, eps, weight_decay, bc1, bc2, total);
+        let _ = (
+            p,
+            g,
+            m,
+            v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            bc1,
+            bc2,
+            total,
+        );
         Err(crate::error::Error::Unimplemented(
             "fused_adamw_step not implemented for this backend".into(),
         ))
@@ -378,7 +391,21 @@ pub trait BackendDevice: Send + Sync {
         bc2: f32,
         total: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
-        let _ = (p, g, m, v, lr, beta1, beta2, eps, gamma, weight_decay, bc1, bc2, total);
+        let _ = (
+            p,
+            g,
+            m,
+            v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            gamma,
+            weight_decay,
+            bc1,
+            bc2,
+            total,
+        );
         Err(crate::error::Error::Unimplemented(
             "fused_madam_step not implemented for this backend".into(),
         ))
@@ -666,8 +693,26 @@ pub trait BackendDevice: Send + Sync {
         max_seq_len: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let _ = (
-            x, gamma_q, gamma_k, w_codes, w_exps, q_out, k_cache, v_cache, out_all, positions, m,
-            k, num_q_heads, num_kv_heads, head_dim, rotary_dim, rope_theta, inv_freq, mscale, eps,
+            x,
+            gamma_q,
+            gamma_k,
+            w_codes,
+            w_exps,
+            q_out,
+            k_cache,
+            v_cache,
+            out_all,
+            positions,
+            m,
+            k,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rope_theta,
+            inv_freq,
+            mscale,
+            eps,
             max_seq_len,
         );
         Err(crate::error::Error::Unimplemented(

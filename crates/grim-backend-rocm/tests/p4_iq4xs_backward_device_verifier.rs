@@ -80,7 +80,11 @@ fn device_decode_iq4xs(block: &[u8], in_sb: usize) -> f32 {
 /// [N][K], one superblock per 256 weights of each row) and compute
 /// dX[m][k] = Σₙ dY[m][n] · B_deq[n][k].
 fn iq4xs_backward_dx_host(dy: &[f32], packed_b: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
-    assert_eq!(k % 256, 0, "device row layout requires K to be a multiple of 256");
+    assert_eq!(
+        k % 256,
+        0,
+        "device row layout requires K to be a multiple of 256"
+    );
     let row_bytes = (k / 256) * 136;
     assert_eq!(packed_b.len(), n * row_bytes);
     let mut dx = vec![0.0f32; m * k];
@@ -123,9 +127,7 @@ fn p4_iq4xs_backward_device_verifier_matches_host_reference() {
     let n = 4;
     let k = 256; // must be a multiple of 256: blocks_per_row = K/256 = 1
 
-    let dy_host: Vec<f32> = (0..m * n)
-        .map(|i| ((i as f32) * 0.25).cos())
-        .collect();
+    let dy_host: Vec<f32> = (0..m * n).map(|i| ((i as f32) * 0.25).cos()).collect();
 
     // B in device layout order: flat [N][K] row-major (row n holds that
     // output row's K weights, packed as K/256 superblocks per row).

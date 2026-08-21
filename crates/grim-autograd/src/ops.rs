@@ -1241,12 +1241,20 @@ pub fn apply_and_record_lora(
             let a_storage = if matches!(param_a.data.device(), grim_tensor::Device::Rocm(_)) {
                 param_a.data.storage().clone()
             } else {
-                Arc::from(dev.from_cpu(&param_a.data.to_vec_f32()?, param_a.data.shape(), DType::F32)?)
+                Arc::from(dev.from_cpu(
+                    &param_a.data.to_vec_f32()?,
+                    param_a.data.shape(),
+                    DType::F32,
+                )?)
             };
             let b_storage = if matches!(param_b.data.device(), grim_tensor::Device::Rocm(_)) {
                 param_b.data.storage().clone()
             } else {
-                Arc::from(dev.from_cpu(&param_b.data.to_vec_f32()?, param_b.data.shape(), DType::F32)?)
+                Arc::from(dev.from_cpu(
+                    &param_b.data.to_vec_f32()?,
+                    param_b.data.shape(),
+                    DType::F32,
+                )?)
             };
             let (out_storage, handle) = dev.lora_accumulate(
                 base.storage().as_ref(),
@@ -1501,11 +1509,7 @@ pub fn rmsnorm_backward(
 /// - For pairs $(g_0, g_1)$ rotated by $(\cos \theta, \sin \theta)$, the backward gradient is:
 ///   $dx_0 = g_0 \cos \theta + g_1 \sin \theta$
 ///   $dx_1 = -g_0 \sin \theta + g_1 \cos \theta$
-pub fn rope_backward(
-    out_grad: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> Result<Tensor> {
+pub fn rope_backward(out_grad: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(out_grad);
     if let grim_tensor::Device::Rocm(_) = out_grad.device() {
         if let Ok((dx_st, _handle)) = dev.rope_backward(
@@ -1586,10 +1590,7 @@ pub fn rope_backward(
 /// - `softmax_out`: Forward softmax probabilities $s$, $\sum_j s_j = 1$.
 /// - `out_grad`: Incoming loss gradient $g$.
 /// - Returns $dx_i = s_i \cdot (g_i - \sum_j g_j \cdot s_j)$.
-pub fn softmax_backward(
-    out_grad: &Tensor,
-    softmax_out: &Tensor,
-) -> Result<Tensor> {
+pub fn softmax_backward(out_grad: &Tensor, softmax_out: &Tensor) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(out_grad);
     if let grim_tensor::Device::Rocm(_) = out_grad.device() {
         if let Ok((dx_st, _handle)) = dev.softmax_backward(
@@ -1670,9 +1671,12 @@ pub fn embedding_backward(
     if matches!(out_grad.device(), grim_tensor::Device::Rocm(_)) {
         let dev = crate::pick_device_for_tensor(out_grad);
         let shape = grim_tensor::Shape::new(vec![vocab_size, hidden_dim]);
-        if let Ok((storage, handle)) =
-            dev.embedding_backward(out_grad.storage().as_ref(), token_ids, vocab_size, hidden_dim)
-        {
+        if let Ok((storage, handle)) = dev.embedding_backward(
+            out_grad.storage().as_ref(),
+            token_ids,
+            vocab_size,
+            hidden_dim,
+        ) {
             handle.synchronize()?;
             return Ok(Tensor::new(
                 Arc::from(storage),
@@ -2119,7 +2123,9 @@ mod tests {
         let batch = 1;
 
         let x = tensor(
-            (0..in_features).map(|i| (i as f32 + 1.0) / 10.0).collect::<Vec<f32>>(),
+            (0..in_features)
+                .map(|i| (i as f32 + 1.0) / 10.0)
+                .collect::<Vec<f32>>(),
             vec![batch, in_features],
         );
         let w_base = tensor(
@@ -2148,14 +2154,17 @@ mod tests {
         );
         let scale = 1.0;
         let out_grad = tensor(
-            (0..out_features * batch).map(|_i| 1.0).collect::<Vec<f32>>(),
+            (0..out_features * batch)
+                .map(|_i| 1.0)
+                .collect::<Vec<f32>>(),
             vec![batch, out_features],
         );
 
-        let (_, grad_w, grad_a, grad_b, grad_m) = match dora_backward(&out_grad, &x, &w_base, &a, &b, &m, scale) {
-            Ok(result) => result,
-            Err(e) => panic!("dora_backward failed: {:?}", e),
-        };
+        let (_, grad_w, grad_a, grad_b, grad_m) =
+            match dora_backward(&out_grad, &x, &w_base, &a, &b, &m, scale) {
+                Ok(result) => result,
+                Err(e) => panic!("dora_backward failed: {:?}", e),
+            };
 
         // Shape checks
         assert_eq!(grad_w.shape().dims(), vec![out_features, in_features]);
@@ -2366,7 +2375,8 @@ mod tests {
         assert_eq!(out.len(), rows * cols);
 
         let out_grad = vec![1.0f32; rows * cols];
-        let (grad_w, grad_r) = oft_backward(&out_grad, &w, &r_factor, scale, rows, cols, rank).unwrap();
+        let (grad_w, grad_r) =
+            oft_backward(&out_grad, &w, &r_factor, scale, rows, cols, rank).unwrap();
         assert_eq!(grad_w.len(), rows * cols);
         assert_eq!(grad_r.len(), rank * cols);
 
@@ -2381,8 +2391,16 @@ mod tests {
             let out_pos = oft_forward(&w, &r_pos, scale, rows, cols, rank).unwrap();
             let out_neg = oft_forward(&w, &r_neg, scale, rows, cols, rank).unwrap();
 
-            let loss_pos: f32 = out_pos.iter().zip(out_grad.iter()).map(|(a, g)| a * g).sum();
-            let loss_neg: f32 = out_neg.iter().zip(out_grad.iter()).map(|(a, g)| a * g).sum();
+            let loss_pos: f32 = out_pos
+                .iter()
+                .zip(out_grad.iter())
+                .map(|(a, g)| a * g)
+                .sum();
+            let loss_neg: f32 = out_neg
+                .iter()
+                .zip(out_grad.iter())
+                .map(|(a, g)| a * g)
+                .sum();
             let num_grad = (loss_pos - loss_neg) / (2.0 * eps);
 
             assert!(
@@ -2409,13 +2427,17 @@ pub fn oft_forward(
     if w.len() != rows * cols {
         return Err(Error::Backend(format!(
             "oft_forward: w length {} != {}x{}",
-            w.len(), rows, cols
+            w.len(),
+            rows,
+            cols
         )));
     }
     if r_factor.len() != rank * cols {
         return Err(Error::Backend(format!(
             "oft_forward: r_factor length {} != {}x{}",
-            r_factor.len(), rank, cols
+            r_factor.len(),
+            rank,
+            cols
         )));
     }
 
@@ -2459,7 +2481,9 @@ pub fn oft_backward(
         return Err(Error::Backend("oft_backward: dimension mismatch".into()));
     }
     if r_factor.len() != rank * cols {
-        return Err(Error::Backend("oft_backward: r_factor length mismatch".into()));
+        return Err(Error::Backend(
+            "oft_backward: r_factor length mismatch".into(),
+        ));
     }
 
     let mut tmp = vec![0.0f32; rank * rows];
@@ -2500,7 +2524,8 @@ pub fn oft_backward(
         for j in 0..cols {
             let mut s = 0.0f32;
             for i in 0..rows {
-                s += out_grad[i * cols + j] * tmp[k * rows + i] + out_tmp[k * rows + i] * w[i * cols + j];
+                s += out_grad[i * cols + j] * tmp[k * rows + i]
+                    + out_tmp[k * rows + i] * w[i * cols + j];
             }
             grad_r[k * cols + j] = scale * s;
         }

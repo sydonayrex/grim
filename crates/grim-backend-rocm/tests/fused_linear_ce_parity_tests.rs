@@ -72,7 +72,12 @@ fn fused_linear_ce_matches_cpu_oracle() {
             }
         }
     }
-    assert!((got_loss.iter().sum::<f32>() - expected_loss).abs() < 5e-4, "got: {}, expected: {}", got_loss.iter().sum::<f32>(), expected_loss);
+    assert!(
+        (got_loss.iter().sum::<f32>() - expected_loss).abs() < 5e-4,
+        "got: {}, expected: {}",
+        got_loss.iter().sum::<f32>(),
+        expected_loss
+    );
     for (got, expected) in got_grad.iter().zip(expected_grad) {
         assert!((got - expected).abs() < 5e-4, "{got} != {expected}");
     }

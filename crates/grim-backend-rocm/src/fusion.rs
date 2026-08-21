@@ -168,8 +168,20 @@ impl KvQuantFormat {
     /// migrate to explicit KvQuantFormat::Q4K. `quant_bits == 8` maps to Q8_0.
     pub fn from_legacy_quant_bits(quant_bits: u8, use_legacy_path: bool) -> Self {
         match quant_bits {
-            4 => if use_legacy_path { Self::LegacyNibble } else { Self::Q4K },
-            8 => if use_legacy_path { Self::LegacyInt8 } else { Self::Q8_0 },
+            4 => {
+                if use_legacy_path {
+                    Self::LegacyNibble
+                } else {
+                    Self::Q4K
+                }
+            }
+            8 => {
+                if use_legacy_path {
+                    Self::LegacyInt8
+                } else {
+                    Self::Q8_0
+                }
+            }
             _ => Self::Fp16,
         }
     }
@@ -275,10 +287,7 @@ pub fn concat_qkv_weights(
     v_w: &[f32],
     hidden: usize,
 ) -> crate::Result<Vec<f32>> {
-    if hidden == 0
-        || q_w.len() % hidden != 0
-        || k_w.len() % hidden != 0
-        || v_w.len() % hidden != 0
+    if hidden == 0 || q_w.len() % hidden != 0 || k_w.len() % hidden != 0 || v_w.len() % hidden != 0
     {
         return Err(crate::Error::Shape(format!(
             "concat_qkv_weights: weights must be row-major [hidden, _] with hidden={hidden} (got lens {}/{}/{})",

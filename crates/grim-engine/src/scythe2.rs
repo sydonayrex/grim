@@ -1475,10 +1475,14 @@ mod tests {
     #[test]
     fn scythe_ring_enqueue_opcodes_1_through_4() {
         let ring = ScytheRing::new(16);
-        let gemm_slot = ring.enqueue_gemm(1, 1, 128, 64, 0x1000, 0x2000, 0x3000, 0).unwrap();
+        let gemm_slot = ring
+            .enqueue_gemm(1, 1, 128, 64, 0x1000, 0x2000, 0x3000, 0)
+            .unwrap();
         assert_eq!(gemm_slot, 0);
 
-        let attn_slot = ring.enqueue_attention(2, 4, 16, 0x1000, 0x2000, 0x3000, 0x4000).unwrap();
+        let attn_slot = ring
+            .enqueue_attention(2, 4, 16, 0x1000, 0x2000, 0x3000, 0x4000)
+            .unwrap();
         assert_eq!(attn_slot, 1);
 
         let norm_slot = ring.enqueue_norm(2, 64, 0x1000, 0x2000, 0x3000).unwrap();

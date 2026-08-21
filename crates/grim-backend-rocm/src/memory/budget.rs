@@ -88,8 +88,10 @@ fn should_use_managed(mode: &str, free: u64, total: u64, bytes: u64, budget: u64
 
 #[cfg(test)]
 mod tests {
-    use super::{managed_fallback_count, managed_fallback_warned, note_managed_fallback,
-                reset_managed_fallback_instrumentation, should_use_managed};
+    use super::{
+        managed_fallback_count, managed_fallback_warned, note_managed_fallback,
+        reset_managed_fallback_instrumentation, should_use_managed,
+    };
 
     #[test]
     fn forced_mode_uses_managed_memory() {
@@ -125,17 +127,27 @@ mod tests {
     #[test]
     fn managed_fallback_is_observable_and_warns_once() {
         reset_managed_fallback_instrumentation();
-        assert_eq!(managed_fallback_count(), 0, "instrumentation must start clean");
+        assert_eq!(
+            managed_fallback_count(),
+            0,
+            "instrumentation must start clean"
+        );
         assert!(!managed_fallback_warned(), "no warning before any fallback");
 
         note_managed_fallback(0, 4096);
         assert_eq!(managed_fallback_count(), 1);
-        assert!(managed_fallback_warned(), "first fallback must surface the warning");
+        assert!(
+            managed_fallback_warned(),
+            "first fallback must surface the warning"
+        );
 
         // Second fallback: counter keeps counting, warning does not repeat.
         note_managed_fallback(0, 8192);
         assert_eq!(managed_fallback_count(), 2);
-        assert!(managed_fallback_warned(), "warning flag stays set after first emit");
+        assert!(
+            managed_fallback_warned(),
+            "warning flag stays set after first emit"
+        );
     }
 
     /// WI-P3 negative case: allocation that does NOT hit the managed path must
@@ -146,7 +158,11 @@ mod tests {
         reset_managed_fallback_instrumentation();
         // should_use_managed("", ...) = ordinary allocation path.
         assert!(!should_use_managed("", 1000, 2000, 1, 2000));
-        assert_eq!(managed_fallback_count(), 0, "no fallback recorded for a fit");
+        assert_eq!(
+            managed_fallback_count(),
+            0,
+            "no fallback recorded for a fit"
+        );
         assert!(!managed_fallback_warned(), "no warning for a fit");
     }
 }

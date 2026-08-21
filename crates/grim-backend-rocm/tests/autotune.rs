@@ -128,7 +128,7 @@ fn autotune_config_partial_eq_when_all_fields_match() -> TestResult {
         tile_kv: 64,
         grid_stride: 1,
         cycles_per_invocation: 12_345,
-    ..Default::default()
+        ..Default::default()
     };
     let b = a; // Copy
     assert_eq!(a, b);
@@ -201,7 +201,7 @@ fn get_or_tune_cache_hit_avoids_rerunning_benchmark() -> TestResult {
             tile_kv: 64,
             grid_stride: 1,
             cycles_per_invocation: 1,
-        ..Default::default()
+            ..Default::default()
         })
     })?;
     assert_eq!(bench_runs, 1, "closure must run on cache miss");
@@ -213,7 +213,7 @@ fn get_or_tune_cache_hit_avoids_rerunning_benchmark() -> TestResult {
             tile_kv: 99,
             grid_stride: 9,
             cycles_per_invocation: 999,
-        ..Default::default()
+            ..Default::default()
         })
     })?;
     assert_eq!(bench_runs, 1, "closure must not run on cache hit");
@@ -253,7 +253,7 @@ fn get_or_tune_distinct_keys_run_closure_independently() -> TestResult {
                 tile_kv: 32,
                 grid_stride: 1,
                 cycles_per_invocation: 0,
-            ..Default::default()
+                ..Default::default()
             })
         })
         .map_err(|e| format!("b: {}", e))?;
@@ -306,7 +306,7 @@ fn autotune_config_serde_roundtrip() -> TestResult {
         tile_kv: 64,
         grid_stride: 1,
         cycles_per_invocation: 9_999,
-    ..Default::default()
+        ..Default::default()
     };
     let s = serde_json::to_string(&cfg)?;
     let d: AutotuneConfig = serde_json::from_str(&s)?;
@@ -329,7 +329,7 @@ fn autotuner_load_save_round_trips_via_buffer() -> TestResult {
         tile_kv: 128,
         grid_stride: 2,
         cycles_per_invocation: 1,
-    ..Default::default()
+        ..Default::default()
     };
     tuner.record(key, cfg)?;
     let buf = tuner.to_json_bytes()?;

@@ -3003,7 +3003,11 @@ impl BackendDevice for CudaDevice {
                 let mut h = vec![0.0f32; dim_dstate];
                 for s in 0..dim_dstate {
                     let state_idx = (b_idx * dim_dinner + d_idx) * dim_dstate + s;
-                    h[s] = if state_v.len() > state_idx { state_v[state_idx] } else { 0.0 };
+                    h[s] = if state_v.len() > state_idx {
+                        state_v[state_idx]
+                    } else {
+                        0.0
+                    };
                 }
                 let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
 
@@ -3259,7 +3263,9 @@ impl BackendDevice for CudaDevice {
                     let b_bytes = b_storage.bytes();
                     let real_packed_size = n * blocks_per_col * 34;
 
-                    let (_scales_storage, scales_device_ptr, b_data_offset) = if b_bytes == real_packed_size {
+                    let (_scales_storage, scales_device_ptr, b_data_offset) = if b_bytes
+                        == real_packed_size
+                    {
                         // Real packed: extract f16 scales from headers.
                         let mut host_packed = vec![0u8; b_bytes];
                         if let Some(dev_ptr) = b_storage.device_ptr {
@@ -3284,7 +3290,8 @@ impl BackendDevice for CudaDevice {
                                 let scale = half::f16::from_le_bytes([
                                     host_packed[block_offset],
                                     host_packed[block_offset + 1],
-                                ]).to_f32();
+                                ])
+                                .to_f32();
                                 scales_host[col * blocks_per_col + block] = scale;
                             }
                         }
@@ -3295,7 +3302,9 @@ impl BackendDevice for CudaDevice {
                             self.ordinal,
                         )?;
                         let sptr = scales_storage.device_ptr.ok_or_else(|| {
-                            Error::Backend("quantized_matmul: failed to upload scales buffer".into())
+                            Error::Backend(
+                                "quantized_matmul: failed to upload scales buffer".into(),
+                            )
                         })? as *const c_void;
                         (Some(scales_storage), sptr, 2usize) // kernel skips 2-byte f16 header per block
                     } else {
@@ -3324,13 +3333,23 @@ impl BackendDevice for CudaDevice {
                             )));
                         };
                         let sptr = scales_storage.device_ptr.ok_or_else(|| {
-                            Error::Backend("quantized_matmul: failed to upload scales buffer".into())
+                            Error::Backend(
+                                "quantized_matmul: failed to upload scales buffer".into(),
+                            )
                         })? as *const c_void;
                         (Some(scales_storage), sptr, 0usize) // no f16 header to skip
                     };
 
-                    let handle = self
-                        .launch_quantized_matmul_q8_0(a_ptr, b_ptr, scales_device_ptr, out_ptr, m, n, k, b_data_offset)?;
+                    let handle = self.launch_quantized_matmul_q8_0(
+                        a_ptr,
+                        b_ptr,
+                        scales_device_ptr,
+                        out_ptr,
+                        m,
+                        n,
+                        k,
+                        b_data_offset,
+                    )?;
                     return Ok((Box::new(out_storage), handle));
                 }
             }
@@ -3412,7 +3431,8 @@ impl BackendDevice for CudaDevice {
                         for block in 0..blocks_per_col {
                             let block_offset = (col * blocks_per_col + block) * 34;
                             let scale_bytes = &b_bytes[block_offset..block_offset + 2];
-                            let scale = half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+                            let scale =
+                                half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
                             for i in 0..32 {
                                 let byte_offset = block_offset + 2 + i;
                                 let q_val = b_bytes
@@ -4457,9 +4477,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_gpu_fast_path() {
-    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
-    // contention false negatives (cuBLAS context thrashing under concurrent loads).
-    std::thread::sleep(std::time::Duration::from_secs(3));
+        // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+        // contention false negatives (cuBLAS context thrashing under concurrent loads).
+        std::thread::sleep(std::time::Duration::from_secs(3));
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
@@ -4503,9 +4523,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_empty_scales_defaults() {
-    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
-    // contention false negatives (cuBLAS context thrashing under concurrent loads).
-    std::thread::sleep(std::time::Duration::from_secs(3));
+        // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+        // contention false negatives (cuBLAS context thrashing under concurrent loads).
+        std::thread::sleep(std::time::Duration::from_secs(3));
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
@@ -4545,9 +4565,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_cpu_fallback() {
-    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
-    // contention false negatives (cuBLAS context thrashing under concurrent loads).
-    std::thread::sleep(std::time::Duration::from_secs(3));
+        // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+        // contention false negatives (cuBLAS context thrashing under concurrent loads).
+        std::thread::sleep(std::time::Duration::from_secs(3));
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];

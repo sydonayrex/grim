@@ -21,7 +21,14 @@ use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{ArithType, DType, Storage};
 use grim_tensor::{BackendDevice, Shape};
 
-fn cpu_fused_ce_oracle(hidden: &[f32], lm_head: &[f32], targets: &[usize], batch: usize, hidden_dim: usize, vocab: usize) -> (f32, Vec<f32>) {
+fn cpu_fused_ce_oracle(
+    hidden: &[f32],
+    lm_head: &[f32],
+    targets: &[usize],
+    batch: usize,
+    hidden_dim: usize,
+    vocab: usize,
+) -> (f32, Vec<f32>) {
     let mut loss = 0.0f32;
     let mut grad_hidden = vec![0.0f32; hidden.len()];
     let inv_batch = 1.0 / (batch as f32);
@@ -52,7 +59,8 @@ fn cpu_fused_ce_oracle(hidden: &[f32], lm_head: &[f32], targets: &[usize], batch
         grad_logits[targets[b]] -= 1.0;
         for d in 0..hidden_dim {
             for v in 0..vocab {
-                grad_hidden[b * hidden_dim + d] += grad_logits[v] * lm_head[v * hidden_dim + d] * inv_batch;
+                grad_hidden[b * hidden_dim + d] +=
+                    grad_logits[v] * lm_head[v * hidden_dim + d] * inv_batch;
             }
         }
     }
@@ -102,14 +110,22 @@ fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() 
     fh.synchronize().unwrap();
     let inv_batch = 1.0 / (batch as f32);
     let (grad, gh) = dev
-        .fused_linear_cross_entropy_backward(hs.as_ref(), ws.as_ref(), ts.as_ref(), lse.as_ref(), 2, inv_batch)
+        .fused_linear_cross_entropy_backward(
+            hs.as_ref(),
+            ws.as_ref(),
+            ts.as_ref(),
+            lse.as_ref(),
+            2,
+            inv_batch,
+        )
         .unwrap();
     gh.synchronize().unwrap();
 
     let got_loss = loss.to_cpu_vec_f32().unwrap();
     let got_grad = grad.to_cpu_vec_f32().unwrap();
 
-    let (expected_loss, expected_grad) = cpu_fused_ce_oracle(&hidden, &lm_head, &targets_usize, batch, hidden_dim, vocab);
+    let (expected_loss, expected_grad) =
+        cpu_fused_ce_oracle(&hidden, &lm_head, &targets_usize, batch, hidden_dim, vocab);
     let got_mean_loss = got_loss.iter().sum::<f32>() * inv_batch;
     assert!(
         (got_mean_loss - expected_loss).abs() < 1e-4,
@@ -139,7 +155,9 @@ fn p3_cpu_cross_entropy_gpu_fallback_is_callable_and_matches_cpu_oracle_for_unsu
     let logits_storage = dev
         .from_cpu(&logits, &Shape::new(vec![batch, vocab]), DType::F32)
         .unwrap();
-    let (loss, grad_storage) = dev.cross_entropy_gpu(logits_storage.as_ref(), &targets, None).unwrap();
+    let (loss, grad_storage) = dev
+        .cross_entropy_gpu(logits_storage.as_ref(), &targets, None)
+        .unwrap();
     let got_loss = loss;
     let grad = grad_storage.to_cpu_vec_f32().unwrap();
 

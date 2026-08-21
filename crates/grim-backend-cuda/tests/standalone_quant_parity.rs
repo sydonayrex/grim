@@ -170,7 +170,11 @@ fn test_fused_quant_gemm_q8_0() {
         }
     }
     let b_packed = grim_quant::quant_q80(&b_col_major).expect("quant_q80");
-    assert_eq!(b_packed.len(), n * (k / 32) * 34, "Q8_0 packed size mismatch");
+    assert_eq!(
+        b_packed.len(),
+        n * (k / 32) * 34,
+        "Q8_0 packed size mismatch"
+    );
 
     let a_shape = Shape::new(vec![m, k]);
     let b_shape = Shape::new(vec![k, n]); // logical shape is still [k, n]
@@ -178,14 +182,16 @@ fn test_fused_quant_gemm_q8_0() {
 
     let a = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
     // Upload B as KQuant(Q80) storage so the dispatch sees real packed Q8_0 bytes.
-    let b = dev.from_cpu_bytes(
-        &b_packed,
-        &b_shape,
-        DType {
-            arith: ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q80),
-        },
-    ).unwrap();
+    let b = dev
+        .from_cpu_bytes(
+            &b_packed,
+            &b_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(KQuantScheme::Q80),
+            },
+        )
+        .unwrap();
 
     let (out, handle) = dev
         .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Q8_0, &out_shape)

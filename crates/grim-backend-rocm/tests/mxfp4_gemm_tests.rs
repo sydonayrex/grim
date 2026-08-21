@@ -492,12 +492,8 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
             storage: Storage::Native,
         },
     )?;
-    let pos_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&positions),
-        &pos_shape,
-        DType::U32,
-    )?;
+    let pos_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = BackendDevice::zeros(&dev, &kv_cache_shape, DType::F32)?;
@@ -725,12 +721,8 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
         },
     )?;
     let inv_freq_dev = BackendDevice::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
-    let pos_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        as_u8_slice(&positions),
-        &pos_shape,
-        DType::U32,
-    )?;
+    let pos_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = BackendDevice::zeros(&dev, &kv_cache_shape, DType::F32)?;
@@ -827,9 +819,17 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
     let positions: Vec<u32> = vec![0, 1];
 
     let shared_exp = 127u8;
-    let w_orig: Vec<f32> = (0..n_total * k).map(|i| (i as f32 * 0.02).cos() * 1.2).collect();
-    let w_codes: Vec<u8> = w_orig.iter().map(|&v| f32_to_mxfp4_e2m1(v, shared_exp)).collect();
-    let w_dequant: Vec<f32> = w_codes.iter().map(|&c| mxfp4_e2m1_to_f32(c, shared_exp)).collect();
+    let w_orig: Vec<f32> = (0..n_total * k)
+        .map(|i| (i as f32 * 0.02).cos() * 1.2)
+        .collect();
+    let w_codes: Vec<u8> = w_orig
+        .iter()
+        .map(|&v| f32_to_mxfp4_e2m1(v, shared_exp))
+        .collect();
+    let w_dequant: Vec<f32> = w_codes
+        .iter()
+        .map(|&c| mxfp4_e2m1_to_f32(c, shared_exp))
+        .collect();
 
     // CPU oracle: GEMM -> per-head QK-Norm -> RoPE
     let mut q_expected = vec![0.0f32; m * n_q];
@@ -870,8 +870,24 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
             v_expected[mi * n_v + d] = qkv[n_q + n_k + d];
         }
     }
-    cpu_rope_in_place(&mut q_expected, m, num_q_heads, head_dim, rotary_dim, theta, &positions);
-    cpu_rope_in_place(&mut k_expected, m, num_kv_heads, head_dim, rotary_dim, theta, &positions);
+    cpu_rope_in_place(
+        &mut q_expected,
+        m,
+        num_q_heads,
+        head_dim,
+        rotary_dim,
+        theta,
+        &positions,
+    );
+    cpu_rope_in_place(
+        &mut k_expected,
+        m,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        theta,
+        &positions,
+    );
 
     let mut w_packed = vec![0u8; (n_total * k) / 2];
     for j in 0..(n_total * k) {
@@ -899,15 +915,22 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
         &dev,
         &w_packed,
         &w_shape,
-        DType { arith: ArithType::F32, storage: Storage::FloatPack(FloatPackScheme::MxFp4) },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::FloatPack(FloatPackScheme::MxFp4),
+        },
     )?;
     let exps_dev = BackendDevice::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
-        DType { arith: ArithType::U8, storage: Storage::Native },
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
     )?;
-    let pos_dev = BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = BackendDevice::zeros(&dev, &kv_shape, DType::F32)?;
@@ -944,7 +967,10 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
 
     for (i, (&a, &e)) in q_actual.iter().zip(q_expected.iter()).enumerate() {
         let err = (a - e).abs();
-        assert!(err < 1e-3, "Q mismatch at {i}: actual={a}, expected={e}, err={err}");
+        assert!(
+            err < 1e-3,
+            "Q mismatch at {i}: actual={a}, expected={e}, err={err}"
+        );
     }
     for row in 0..m {
         let pos = positions[row] as usize;
@@ -996,13 +1022,23 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
 
     let x_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.08).sin()).collect();
     let gamma_q: Vec<f32> = vec![1.0f32; head_dim];
-    let gamma_k: Vec<f32> = (0..head_dim).map(|d| 1.0f32 + 0.1f32 * (d as f32)).collect();
+    let gamma_k: Vec<f32> = (0..head_dim)
+        .map(|d| 1.0f32 + 0.1f32 * (d as f32))
+        .collect();
     let positions: Vec<u32> = vec![0, 1];
 
     let shared_exp = 127u8;
-    let w_orig: Vec<f32> = (0..n_total * k).map(|i| (i as f32 * 0.02).cos() * 1.2).collect();
-    let w_codes: Vec<u8> = w_orig.iter().map(|&v| f32_to_mxfp4_e2m1(v, shared_exp)).collect();
-    let w_dequant: Vec<f32> = w_codes.iter().map(|&c| mxfp4_e2m1_to_f32(c, shared_exp)).collect();
+    let w_orig: Vec<f32> = (0..n_total * k)
+        .map(|i| (i as f32 * 0.02).cos() * 1.2)
+        .collect();
+    let w_codes: Vec<u8> = w_orig
+        .iter()
+        .map(|&v| f32_to_mxfp4_e2m1(v, shared_exp))
+        .collect();
+    let w_dequant: Vec<f32> = w_codes
+        .iter()
+        .map(|&c| mxfp4_e2m1_to_f32(c, shared_exp))
+        .collect();
 
     // CPU oracle: GEMM -> per-head QK-Norm -> YaRN RoPE
     let mut q_expected = vec![0.0f32; m * n_q];
@@ -1046,10 +1082,34 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
     }
     let rotary_half = rotary_dim / 2;
     let inv_freq = cpu_yarn_inv_freq(
-        rotary_half, head_dim, theta, yarn_factor, original_max_pos, beta_fast, beta_slow,
+        rotary_half,
+        head_dim,
+        theta,
+        yarn_factor,
+        original_max_pos,
+        beta_fast,
+        beta_slow,
     );
-    cpu_rope_yarn_in_place(&mut q_expected, m, num_q_heads, head_dim, rotary_dim, &inv_freq, mscale, &positions);
-    cpu_rope_yarn_in_place(&mut k_expected, m, num_kv_heads, head_dim, rotary_dim, &inv_freq, mscale, &positions);
+    cpu_rope_yarn_in_place(
+        &mut q_expected,
+        m,
+        num_q_heads,
+        head_dim,
+        rotary_dim,
+        &inv_freq,
+        mscale,
+        &positions,
+    );
+    cpu_rope_yarn_in_place(
+        &mut k_expected,
+        m,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        &inv_freq,
+        mscale,
+        &positions,
+    );
 
     let mut w_packed = vec![0u8; (n_total * k) / 2];
     for j in 0..(n_total * k) {
@@ -1079,16 +1139,23 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
         &dev,
         &w_packed,
         &w_shape,
-        DType { arith: ArithType::F32, storage: Storage::FloatPack(FloatPackScheme::MxFp4) },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::FloatPack(FloatPackScheme::MxFp4),
+        },
     )?;
     let exps_dev = BackendDevice::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
-        DType { arith: ArithType::U8, storage: Storage::Native },
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
     )?;
     let inv_freq_dev = BackendDevice::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
-    let pos_dev = BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev =
+        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = BackendDevice::zeros(&dev, &kv_shape, DType::F32)?;
@@ -1125,7 +1192,10 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
 
     for (i, (&a, &e)) in q_actual.iter().zip(q_expected.iter()).enumerate() {
         let err = (a - e).abs();
-        assert!(err < 1e-3, "Q mismatch at {i}: actual={a}, expected={e}, err={err}");
+        assert!(
+            err < 1e-3,
+            "Q mismatch at {i}: actual={a}, expected={e}, err={err}"
+        );
     }
     for row in 0..m {
         let pos = positions[row] as usize;

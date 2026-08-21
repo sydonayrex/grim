@@ -79,7 +79,8 @@ impl DeltaNetAttention {
         let q_proj = Linear::load_shape(&ws.scoped("q_proj"), [cfg.hidden_size, q_dim])?;
         let k_proj = Linear::load_shape(&ws.scoped("k_proj"), [cfg.hidden_size, q_dim])?;
         let v_proj = Linear::load_shape(&ws.scoped("v_proj"), [cfg.hidden_size, q_dim])?;
-        let beta_proj = Linear::load_shape(&ws.scoped("beta_proj"), [cfg.hidden_size, cfg.num_heads])?;
+        let beta_proj =
+            Linear::load_shape(&ws.scoped("beta_proj"), [cfg.hidden_size, cfg.num_heads])?;
         let o_proj = Linear::load_shape(&ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
         Ok(Self {
@@ -94,11 +95,7 @@ impl DeltaNetAttention {
     }
 
     /// Forward pass updating per-head state matrix $S \in \mathbb{R}^{H \times D \times D}$.
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        state: &mut Option<Vec<f32>>,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, state: &mut Option<Vec<f32>>) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -181,14 +178,31 @@ pub struct DeltaNetBlock {
 
 impl DeltaNetBlock {
     pub fn load(ws: &WeightSource<'_>, cfg: &DeltaNetBaseConfig) -> Result<Self> {
-        let attn_norm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let attn_norm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
         let attn = DeltaNetAttention::load(&ws.scoped("self_attn"), cfg)?;
-        let ffn_norm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let ffn_norm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let mlp_ws = ws.scoped("mlp");
-        let w_gate = Linear::load_shape(&mlp_ws.scoped("gate_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_up = Linear::load_shape(&mlp_ws.scoped("up_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_down = Linear::load_shape(&mlp_ws.scoped("down_proj"), [cfg.intermediate_size, cfg.hidden_size])?;
+        let w_gate = Linear::load_shape(
+            &mlp_ws.scoped("gate_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_up = Linear::load_shape(
+            &mlp_ws.scoped("up_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_down = Linear::load_shape(
+            &mlp_ws.scoped("down_proj"),
+            [cfg.intermediate_size, cfg.hidden_size],
+        )?;
 
         Ok(Self {
             attn_norm,
@@ -200,11 +214,7 @@ impl DeltaNetBlock {
         })
     }
 
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        state: &mut Option<Vec<f32>>,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, state: &mut Option<Vec<f32>>) -> Result<Tensor> {
         let normed_attn = self.attn_norm.forward(x)?;
         let attn_out = self.attn.forward(&normed_attn, state)?;
 
@@ -265,7 +275,10 @@ impl DeltaNetBase {
     ) -> Result<Self> {
         let root = ws.scoped("model");
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -324,8 +337,9 @@ impl CausalLm for DeltaNetBase {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -354,4 +368,3 @@ mod tests {
         assert_eq!(cfg.chunk_size, 64);
     }
 }
-

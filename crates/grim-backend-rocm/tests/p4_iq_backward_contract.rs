@@ -94,7 +94,8 @@ fn p4_iq4xs_backward_source_has_no_per_mac_div_mod_pattern() {
     );
     // Extract ONLY the iq4xs backward kernel text (from its `__global__` line to
     // the closing `}` before the next kernel or EOF).
-    let kernel_start = src.find("__global__ void grim_fused_dequant_backward_gemm_iq4xs")
+    let kernel_start = src
+        .find("__global__ void grim_fused_dequant_backward_gemm_iq4xs")
         .expect("P4: IQ4XS backward kernel __global__ line must be present");
     // Find the end: the next `__global__` or the closing `}` of the extern block.
     let rest = &src[kernel_start..];
@@ -112,8 +113,10 @@ fn p4_iq4xs_backward_source_has_no_per_mac_div_mod_pattern() {
     // We check that the kernel does NOT declare both as local vars (the "sb_idx"
     // and "in_sb" tokens appearing as declarations, not as comment references or
     // in the blocks_per_row structural line).
-    let has_sb_idx_decl = kernel_text.contains("int sb_idx") || kernel_text.contains("const int sb_idx");
-    let has_in_sb_decl = kernel_text.contains("int in_sb") || kernel_text.contains("const int in_sb");
+    let has_sb_idx_decl =
+        kernel_text.contains("int sb_idx") || kernel_text.contains("const int sb_idx");
+    let has_in_sb_decl =
+        kernel_text.contains("int in_sb") || kernel_text.contains("const int in_sb");
     assert!(
         !(has_sb_idx_decl && has_in_sb_decl),
         "P4: IQ4XS backward kernel must NOT declare per-MAC sb_idx/in_sb locals after the rewrite"
@@ -148,9 +151,7 @@ fn p4_iq4xs_backward_host_decomposition_is_well_defined_for_small_contrived_case
     let k = 4;
 
     // Deterministic dY.
-    let dY: Vec<f32> = (0..m * n)
-        .map(|i| ((i as f32) * 0.25).cos())
-        .collect();
+    let dY: Vec<f32> = (0..m * n).map(|i| ((i as f32) * 0.25).cos()).collect();
 
     // Deterministic FP32 weight matrix B (k rows x n cols). Direct FP32, not via
     // quant round-trip (which is lossy and platform-dependent); the host reference
@@ -170,13 +171,22 @@ fn p4_iq4xs_backward_host_decomposition_is_well_defined_for_small_contrived_case
     let dx_ref_2 = iq4xs_backward_dx_host(&dY, &b_f32, m, n, k);
     assert_eq!(dx_ref.len(), dx_ref_2.len());
     for i in 0..dx_ref.len() {
-        assert_eq!(dx_ref[i], dx_ref_2[i], "P4 host backward reference must be deterministic");
+        assert_eq!(
+            dx_ref[i], dx_ref_2[i],
+            "P4 host backward reference must be deterministic"
+        );
     }
 
     // Sanity: the reference is not trivially zero for a non-trivial dY + B.
     let any_nonzero = dx_ref.iter().any(|&x| x.abs() > 1e-6);
-    assert!(any_nonzero, "P4 host backward reference must be non-trivial for the contrived case");
-    assert!(dx_ref.len() == m * k, "P4 host backward reference must have shape [m*k]");
+    assert!(
+        any_nonzero,
+        "P4 host backward reference must be non-trivial for the contrived case"
+    );
+    assert!(
+        dx_ref.len() == m * k,
+        "P4 host backward reference must have shape [m*k]"
+    );
 }
 
 /// Host-side backward decomposition contract: the host reference must match the
@@ -189,9 +199,7 @@ fn p4_iq4xs_backward_host_reference_matches_analytical_matmul_for_small_contrive
     let n = 4;
     let k = 4;
 
-    let dY: Vec<f32> = (0..m * n)
-        .map(|i| ((i as f32) * 0.25).cos())
-        .collect();
+    let dY: Vec<f32> = (0..m * n).map(|i| ((i as f32) * 0.25).cos()).collect();
 
     let b_f32: Vec<f32> = (0..k * n)
         .map(|i| {
@@ -216,6 +224,9 @@ fn p4_iq4xs_backward_host_reference_matches_analytical_matmul_for_small_contrive
     // The host backward reference must equal the analytical matmul on the FP32 B.
     let dx_ref = iq4xs_backward_dx_host(&dY, &b_f32, m, n, k);
     for i in 0..dx_analytical.len() {
-        assert_eq!(dx_analytical[i], dx_ref[i], "P4 host reference must match analytical matmul on FP32 B");
+        assert_eq!(
+            dx_analytical[i], dx_ref[i],
+            "P4 host reference must match analytical matmul on FP32 B"
+        );
     }
 }

@@ -55,13 +55,19 @@ pub struct SparseAttentionSelector {
 impl SparseAttentionSelector {
     pub fn new(cfg: SparseAttentionConfig) -> Result<Self> {
         if cfg.index_head_dim == 0 {
-            return Err(Error::Backend("sparse-attention index_head_dim must be > 0".into()));
+            return Err(Error::Backend(
+                "sparse-attention index_head_dim must be > 0".into(),
+            ));
         }
         if cfg.index_n_heads == 0 {
-            return Err(Error::Backend("sparse-attention index_n_heads must be > 0".into()));
+            return Err(Error::Backend(
+                "sparse-attention index_n_heads must be > 0".into(),
+            ));
         }
         if cfg.index_topk == 0 {
-            return Err(Error::Backend("sparse-attention index_topk must be > 0".into()));
+            return Err(Error::Backend(
+                "sparse-attention index_topk must be > 0".into(),
+            ));
         }
         Ok(Self { cfg })
     }

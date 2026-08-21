@@ -54,10 +54,7 @@ pub struct PackedStepStats {
 /// `max_tokens_per_group` still get their own group so nothing is dropped.
 ///
 /// Returns groups of indices into `sequences`.
-pub fn group_sequences(
-    sequences: &[TokenSequence],
-    cfg: &PackedStepConfig,
-) -> Vec<Vec<usize>> {
+pub fn group_sequences(sequences: &[TokenSequence], cfg: &PackedStepConfig) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::with_capacity(cfg.max_seqs_per_group);
     let mut current_tokens = 0usize;
@@ -89,7 +86,11 @@ pub fn group_sequences(
 /// The caller performs the optimizer step once per returned group — use
 /// [`PackedStepStats::num_groups`] — so N short samples cost one step instead
 /// of N.
-pub fn packed_step<F>(sequences: &[TokenSequence], cfg: &PackedStepConfig, mut forward_backward: F) -> Result<PackedStepStats>
+pub fn packed_step<F>(
+    sequences: &[TokenSequence],
+    cfg: &PackedStepConfig,
+    mut forward_backward: F,
+) -> Result<PackedStepStats>
 where
     F: FnMut(&TokenSequence) -> Result<f32>,
 {
@@ -192,9 +193,7 @@ mod tests {
     fn packed_step_propagates_errors() {
         let seqs = vec![seq(4)];
         let cfg = PackedStepConfig::default();
-        let res = packed_step(&seqs, &cfg, |_| {
-            Err(Error::Backend("boom".into()))
-        });
+        let res = packed_step(&seqs, &cfg, |_| Err(Error::Backend("boom".into())));
         assert!(res.is_err());
     }
 

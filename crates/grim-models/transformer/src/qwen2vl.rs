@@ -61,7 +61,8 @@ impl Qwen2VlVisionEncoder {
         let patch_embed = Linear::load_shape(&ws.scoped("patch_embed"), [in_dim, cfg.hidden_size])?;
         let norm = RmsNorm::load(&ws.scoped("norm"), cfg.hidden_size, 1e-6)?;
         let merger_in = cfg.hidden_size * cfg.spatial_merge_size * cfg.spatial_merge_size;
-        let merger_proj = Linear::load_shape(&ws.scoped("merger"), [merger_in, cfg.out_hidden_size])?;
+        let merger_proj =
+            Linear::load_shape(&ws.scoped("merger"), [merger_in, cfg.out_hidden_size])?;
 
         Ok(Self {
             patch_embed,
@@ -180,13 +181,30 @@ impl Qwen2VlBlock {
         let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
-        let attn_norm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ffn_norm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let attn_norm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let ffn_norm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         let mlp_ws = ws.scoped("mlp");
-        let w_gate = Linear::load_shape(&mlp_ws.scoped("gate_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_up = Linear::load_shape(&mlp_ws.scoped("up_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_down = Linear::load_shape(&mlp_ws.scoped("down_proj"), [cfg.intermediate_size, cfg.hidden_size])?;
+        let w_gate = Linear::load_shape(
+            &mlp_ws.scoped("gate_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_up = Linear::load_shape(
+            &mlp_ws.scoped("up_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_down = Linear::load_shape(
+            &mlp_ws.scoped("down_proj"),
+            [cfg.intermediate_size, cfg.hidden_size],
+        )?;
 
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
@@ -226,8 +244,20 @@ impl Qwen2VlBlock {
         let mut q_vec = q.to_vec_f32()?;
         let mut k_vec = k.to_vec_f32()?;
 
-        crate::qwen35::apply_rope_neox(&mut q_vec, positions, self.num_heads, self.head_dim, 1000000.0);
-        crate::qwen35::apply_rope_neox(&mut k_vec, positions, self.num_kv_heads, self.head_dim, 1000000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_vec,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            1000000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_vec,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            1000000.0,
+        );
 
         let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, k_dim]));
@@ -260,11 +290,13 @@ impl Qwen2VlBlock {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads
+                        [t * k_dim + kv_h * self.head_dim..t * k_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -348,11 +380,18 @@ impl Qwen2Vl {
         let root = ws.scoped("model");
 
         let vision_encoder = {
-            let v_ws = if ws.has_tensor("visual.patch_embed.weight") { ws.scoped("visual") } else { root.scoped("visual") };
+            let v_ws = if ws.has_tensor("visual.patch_embed.weight") {
+                ws.scoped("visual")
+            } else {
+                root.scoped("visual")
+            };
             Qwen2VlVisionEncoder::load(&v_ws, &cfg.vision_config).ok()
         };
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -417,8 +456,9 @@ impl CausalLm for Qwen2Vl {
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
             if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]
-                    .copy_from_slice(&embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size]);
+                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+                );
             }
         }
 
@@ -447,4 +487,3 @@ mod tests {
         assert_eq!(cfg.mrope_section, [16, 24, 24]);
     }
 }
-

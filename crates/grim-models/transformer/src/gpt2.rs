@@ -302,8 +302,7 @@ impl Model for Gpt2 {
 impl CausalLm for Gpt2 {
     fn new_session(&self) -> Box<dyn SessionT> {
         let mut session = Inner::new(self.device.clone());
-        let caches: Vec<Option<crate::kv_attention::RefKvCache>> =
-            vec![None; self.layers.len()];
+        let caches: Vec<Option<crate::kv_attention::RefKvCache>> = vec![None; self.layers.len()];
         session.set_model_state(Box::new(caches));
         Box::new(session)
     }
@@ -365,7 +364,9 @@ mod tests {
     fn lin(in_dim: usize, out_dim: usize) -> Linear {
         // Ramp weights (not uniform) so the prior-context influence during
         // decode is large enough to distinguish from a stateless forward.
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32) * 0.01 + 0.01).collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| (i as f32) * 0.01 + 0.01)
+            .collect();
         let w = cpu_tensor(w, Shape::new(vec![out_dim, in_dim]));
         Linear::from_tensor(w, None)
     }
@@ -398,7 +399,10 @@ mod tests {
     fn test_prefill_matches_cacheless() {
         let blk = tiny_block();
         let n = 3;
-        let x = cpu_tensor((0..n * 8).map(|i| (i as f32) * 0.1).collect(), Shape::new(vec![n, 8]));
+        let x = cpu_tensor(
+            (0..n * 8).map(|i| (i as f32) * 0.1).collect(),
+            Shape::new(vec![n, 8]),
+        );
         let a = blk
             .forward_cached(&x, &mut RefKvCache::new())
             .unwrap()
@@ -430,7 +434,11 @@ mod tests {
 
         let a = cached.to_vec_f32().unwrap();
         let b = stateless.to_vec_f32().unwrap();
-        let diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         assert!(diff > 1e-5, "decode ignored cached prefix (diff={diff})");
         assert_eq!(cache.past_len, 3, "cache should hold prompt + decode");
     }
@@ -441,15 +449,20 @@ mod tests {
         let blk = tiny_block();
         let p = 4usize;
         let n = 3usize;
-        let prompt = cpu_tensor((0..p * 8).map(|i| (i as f32) * 0.05).collect(), Shape::new(vec![p, 8]));
+        let prompt = cpu_tensor(
+            (0..p * 8).map(|i| (i as f32) * 0.05).collect(),
+            Shape::new(vec![p, 8]),
+        );
         let mut cache = RefKvCache::new();
         let _ = blk.forward_cached(&prompt, &mut cache).unwrap();
         assert_eq!(cache.past_len, p);
         for i in 0..n {
-            let tok = cpu_tensor((0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(), Shape::new(vec![1, 8]));
+            let tok = cpu_tensor(
+                (0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(),
+                Shape::new(vec![1, 8]),
+            );
             let _ = blk.forward_cached(&tok, &mut cache).unwrap();
         }
         assert_eq!(cache.past_len, p + n);
     }
 }
-

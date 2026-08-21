@@ -66,7 +66,7 @@ pub enum TraceQuantFormat {
     Fp8,
     Mxfp4,
     Mxfp8,
-    Iqs4Xs,   // IQ4_XS (IQ4_NL-adjacent inline format used by charon paths)
+    Iqs4Xs, // IQ4_XS (IQ4_NL-adjacent inline format used by charon paths)
     Q4K,
     Q5K,
     Q6K,
@@ -138,8 +138,15 @@ impl KernelTrace {
 
     /// Build an in-memory trace entry. Callers must only call this after the candidate
     /// passed a parity check; the struct itself does not re-verify.
-    pub fn new(kernel: &str, gpu_arch: &str, m_class: TraceShapeClass, format: TraceQuantFormat,
-               solution: AutotuneConfig, latency_us: u64, parity_ok: bool) -> Self {
+    pub fn new(
+        kernel: &str,
+        gpu_arch: &str,
+        m_class: TraceShapeClass,
+        format: TraceQuantFormat,
+        solution: AutotuneConfig,
+        latency_us: u64,
+        parity_ok: bool,
+    ) -> Self {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -150,7 +157,11 @@ impl KernelTrace {
             m_class,
             format,
             solution,
-            evaluation: TraceEval { parity_ok, latency_us, ts },
+            evaluation: TraceEval {
+                parity_ok,
+                latency_us,
+                ts,
+            },
         }
     }
 }
@@ -170,15 +181,23 @@ impl TraceTable {
     /// Lookup a validated winner for (kernel, m_class, format). Returns the `AutotuneConfig`
     /// iff the matching entry is eligible (parity_ok). Returns `None` if nothing matching,
     /// or if the matching entry failed parity (so dispatch must fall back to autotune).
-    pub fn lookup(&self, kernel: &str, gpu_arch: &str, m_class: TraceShapeClass,
-                  format: TraceQuantFormat) -> Option<AutotuneConfig> {
-        self.entries.iter().find(|e| {
-            e.kernel == kernel
-            && e.gpu_arch == gpu_arch
-            && e.m_class == m_class
-            && e.format == format
-            && e.eligible_for_dispatch()
-        }).map(|e| e.solution)
+    pub fn lookup(
+        &self,
+        kernel: &str,
+        gpu_arch: &str,
+        m_class: TraceShapeClass,
+        format: TraceQuantFormat,
+    ) -> Option<AutotuneConfig> {
+        self.entries
+            .iter()
+            .find(|e| {
+                e.kernel == kernel
+                    && e.gpu_arch == gpu_arch
+                    && e.m_class == m_class
+                    && e.format == format
+                    && e.eligible_for_dispatch()
+            })
+            .map(|e| e.solution)
     }
 
     /// Insert a validated winner. This is the apply() write-path — callers must have
@@ -187,16 +206,17 @@ impl TraceTable {
         if !trace.evaluation.parity_ok {
             return Err(Error::Backend(
                 "TraceTable::insert: refusing to insert a trace entry with parity_ok=false; \
-                 unvalidated configs must never be promoted".into(),
+                 unvalidated configs must never be promoted"
+                    .into(),
             ));
         }
         // Replace any prior entry for the same (kernel, gpu_arch, m_class, format) tuple
         // so the table always reflects the latest validated winner.
         self.entries.retain(|e| {
             !(e.kernel == trace.kernel
-              && e.gpu_arch == trace.gpu_arch
-              && e.m_class == trace.m_class
-              && e.format == trace.format)
+                && e.gpu_arch == trace.gpu_arch
+                && e.m_class == trace.m_class
+                && e.format == trace.format)
         });
         self.entries.push(trace);
         Ok(())
@@ -209,11 +229,16 @@ impl TraceTable {
     }
 
     pub fn eligible_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.eligible_for_dispatch()).count()
+        self.entries
+            .iter()
+            .filter(|e| e.eligible_for_dispatch())
+            .count()
     }
 
     /// Total rows stored (including ineligible, for diagnostics).
-    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Load a trace table from disk. File may be missing (first run) — that's not an error.
@@ -320,15 +345,25 @@ impl SampleLogger {
     /// Construct a logger bound to `path`. The path is stored; writes happen on each
     /// `log_candidate` call.
     pub fn at(path: PathBuf, gpu_arch: &str) -> Self {
-        Self { file: path, arch: gpu_arch.to_string() }
+        Self {
+            file: path,
+            arch: gpu_arch.to_string(),
+        }
     }
 
     /// Append one candidate sample as a JSONL line. Best-effort: warn on failure, never
     /// propagate.
-    pub fn log_candidate<K>(&self, kernel: K, m_class: TraceShapeClass, format: TraceQuantFormat,
-                             tile_config: AutotuneConfig, grid_x: u32, block_x: u32,
-                             waves: u32, latency_us: u64)
-    where
+    pub fn log_candidate<K>(
+        &self,
+        kernel: K,
+        m_class: TraceShapeClass,
+        format: TraceQuantFormat,
+        tile_config: AutotuneConfig,
+        grid_x: u32,
+        block_x: u32,
+        waves: u32,
+        latency_us: u64,
+    ) where
         K: std::fmt::Display,
     {
         let record = SampleRecord {
@@ -353,14 +388,21 @@ impl SampleLogger {
                 return;
             }
         };
-        match fs::OpenOptions::new().create(true).append(true).open(&self.file) {
+        match fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)
+        {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{line}") {
                     log::warn!("sample_log: append to {} failed: {e}", self.file.display());
                 }
             }
             Err(e) => {
-                log::warn!("sample_log: cannot open {} for append: {e}", self.file.display());
+                log::warn!(
+                    "sample_log: cannot open {} for append: {e}",
+                    self.file.display()
+                );
             }
         }
     }
@@ -391,11 +433,26 @@ impl SampleLogger {
     /// richer dataset WRECK-2/3 wants. This wrapper logs the winner only, which is the
     /// minimum viable sample. Sites that want the full per-candidate log should call
     /// `log_candidate` directly inside their loop.
-    pub fn wrap<K, F>(self, kernel: K, m_class: TraceShapeClass, format: TraceQuantFormat,
-                       grid_x: u32, block_x: u32, waves: u32, bench: F) -> BenchLogged<K, F>
+    pub fn wrap<K, F>(
+        self,
+        kernel: K,
+        m_class: TraceShapeClass,
+        format: TraceQuantFormat,
+        grid_x: u32,
+        block_x: u32,
+        waves: u32,
+        bench: F,
+    ) -> BenchLogged<K, F>
     where
         K: std::fmt::Display + Clone,
-        F: FnOnce(&K, TraceShapeClass, TraceQuantFormat, u32, u32, u32) -> Result<(AutotuneConfig, u64)>,
+        F: FnOnce(
+            &K,
+            TraceShapeClass,
+            TraceQuantFormat,
+            u32,
+            u32,
+            u32,
+        ) -> Result<(AutotuneConfig, u64)>,
     {
         BenchLogged {
             logger: self,
@@ -426,14 +483,35 @@ pub struct BenchLogged<K, F> {
 impl<K, F> BenchLogged<K, F>
 where
     K: std::fmt::Display + Clone,
-    F: FnOnce(&K, TraceShapeClass, TraceQuantFormat, u32, u32, u32) -> Result<(AutotuneConfig, u64)>,
+    F: FnOnce(
+        &K,
+        TraceShapeClass,
+        TraceQuantFormat,
+        u32,
+        u32,
+        u32,
+    ) -> Result<(AutotuneConfig, u64)>,
 {
     /// Run the wrapped bench, log the winner sample, return the winner config.
     pub fn run(self) -> Result<AutotuneConfig> {
-        let (cfg, latency_us) = (self.bench)(&self.kernel, self.m_class, self.format,
-                                              self.grid_x, self.block_x, self.waves)?;
-        self.logger.log_candidate(&self.kernel, self.m_class, self.format,
-                                  cfg, self.grid_x, self.block_x, self.waves, latency_us);
+        let (cfg, latency_us) = (self.bench)(
+            &self.kernel,
+            self.m_class,
+            self.format,
+            self.grid_x,
+            self.block_x,
+            self.waves,
+        )?;
+        self.logger.log_candidate(
+            &self.kernel,
+            self.m_class,
+            self.format,
+            cfg,
+            self.grid_x,
+            self.block_x,
+            self.waves,
+            latency_us,
+        );
         Ok(cfg)
     }
 }
@@ -465,7 +543,10 @@ pub struct LatencyPredictor {
 
 impl LatencyPredictor {
     pub fn new(table: TraceTable, shortlist_factor: f32) -> Self {
-        Self { table, shortlist_factor }
+        Self {
+            table,
+            shortlist_factor,
+        }
     }
 
     /// Predict per-config latency for a single candidate using a simple model:
@@ -473,14 +554,27 @@ impl LatencyPredictor {
     /// single historical trace row for the (kernel, arch, shape_class, fp16) key.
     ///
     /// Returns None when no historical trace exists (fall through to full bench).
-    pub fn predict_latency(&self, kernel: &str, arch: &str, m_class: TraceShapeClass, cfg: &AutotuneConfig) -> Option<f32> {
+    pub fn predict_latency(
+        &self,
+        kernel: &str,
+        arch: &str,
+        m_class: TraceShapeClass,
+        cfg: &AutotuneConfig,
+    ) -> Option<f32> {
         let entry = self.table.entries().iter().find(|e| {
-            e.kernel == kernel && e.gpu_arch == arch && e.m_class == m_class
-            && e.format == TraceQuantFormat::Fp16 && e.eligible_for_dispatch()
+            e.kernel == kernel
+                && e.gpu_arch == arch
+                && e.m_class == m_class
+                && e.format == TraceQuantFormat::Fp16
+                && e.eligible_for_dispatch()
         })?;
         let base_latency = entry.evaluation.latency_us as f32;
         let mean_block_dim = entry.solution.block_dim as f32;
-        let norm = if mean_block_dim > 0.0 { (cfg.block_dim as f32) / mean_block_dim } else { 1.0 };
+        let norm = if mean_block_dim > 0.0 {
+            (cfg.block_dim as f32) / mean_block_dim
+        } else {
+            1.0
+        };
         Some(base_latency * norm)
     }
 
@@ -488,7 +582,13 @@ impl LatencyPredictor {
     /// predicted latency is more than `shortlist_factor` times the best predicted
     /// latency are dropped. If prediction fails (no trace data), returns all
     /// candidates unchanged.
-    pub fn shortlist(&self, kernel: &str, arch: &str, m_class: TraceShapeClass, candidates: Vec<AutotuneConfig>) -> Vec<AutotuneConfig> {
+    pub fn shortlist(
+        &self,
+        kernel: &str,
+        arch: &str,
+        m_class: TraceShapeClass,
+        candidates: Vec<AutotuneConfig>,
+    ) -> Vec<AutotuneConfig> {
         if candidates.is_empty() {
             return candidates;
         }
@@ -496,7 +596,8 @@ impl LatencyPredictor {
             .into_iter()
             .map(|c| (c, self.predict_latency(kernel, arch, m_class, &c)))
             .collect();
-        let valid: Vec<(AutotuneConfig, f32)> = preds.iter()
+        let valid: Vec<(AutotuneConfig, f32)> = preds
+            .iter()
             .filter_map(|(c, p)| {
                 if let Some(v) = p {
                     Some((c.clone(), *v))
@@ -511,7 +612,8 @@ impl LatencyPredictor {
         }
         let best_latency = valid.iter().map(|(_, p)| *p).fold(1e30f32, f32::min);
         let threshold = best_latency * self.shortlist_factor;
-        valid.into_iter()
+        valid
+            .into_iter()
             .filter(|(_, p)| *p <= threshold)
             .map(|(c, _)| c)
             .collect()
@@ -563,11 +665,15 @@ mod tests {
 
     impl std::ops::Deref for TempDirHandle {
         type Target = Path;
-        fn deref(&self) -> &Path { &self.path }
+        fn deref(&self) -> &Path {
+            &self.path
+        }
     }
 
     impl AsRef<Path> for TempDirHandle {
-        fn as_ref(&self) -> &Path { &self.path }
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
     }
 
     // Helper: write a trace table JSON to a temp dir and load it back.
@@ -584,11 +690,25 @@ mod tests {
 
     #[test]
     fn trace_eligible_only_when_parity_ok() {
-        let ok = KernelTrace::new("k", "gfx1036", TraceShapeClass::Decode,
-                                  TraceQuantFormat::Fp16, AutotuneConfig::default(), 100, true);
+        let ok = KernelTrace::new(
+            "k",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            100,
+            true,
+        );
         assert!(ok.eligible_for_dispatch());
-        let bad = KernelTrace::new("k", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, AutotuneConfig::default(), 200, false);
+        let bad = KernelTrace::new(
+            "k",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            200,
+            false,
+        );
         assert!(!bad.eligible_for_dispatch());
     }
 
@@ -599,8 +719,15 @@ mod tests {
     #[test]
     fn trace_table_rejects_unvalidated_entries() {
         let mut t = TraceTable::default();
-        let bad = KernelTrace::new("k", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, AutotuneConfig::default(), 200, false);
+        let bad = KernelTrace::new(
+            "k",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            200,
+            false,
+        );
         let r = t.insert(bad);
         assert!(r.is_err());
         assert_eq!(t.len(), 0);
@@ -613,8 +740,15 @@ mod tests {
     #[test]
     fn trace_table_accepts_validated_entries() {
         let mut t = TraceTable::default();
-        let good = KernelTrace::new("k", "gfx1036", TraceShapeClass::Decode,
-                                    TraceQuantFormat::Fp16, AutotuneConfig::default(), 100, true);
+        let good = KernelTrace::new(
+            "k",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            100,
+            true,
+        );
         t.insert(good).unwrap();
         assert_eq!(t.len(), 1);
         assert_eq!(t.eligible_count(), 1);
@@ -637,10 +771,22 @@ mod tests {
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
         };
-        let row = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, cfg, 100, true);
+        let row = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            cfg,
+            100,
+            true,
+        );
         t.insert(row).unwrap();
-        let got = t.lookup("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16);
+        let got = t.lookup(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+        );
         assert_eq!(got.map(|c| c.block_dim), Some(256));
     }
 
@@ -652,40 +798,100 @@ mod tests {
     fn trace_table_lookup_miss_wrong_kernel() {
         let mut t = TraceTable::default();
         let cfg = AutotuneConfig::default();
-        let row = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, cfg, 100, true);
+        let row = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            cfg,
+            100,
+            true,
+        );
         t.insert(row).unwrap();
-        assert!(t.lookup("matmul", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16).is_none());
+        assert!(
+            t.lookup(
+                "matmul",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn trace_table_lookup_miss_wrong_arch() {
         let mut t = TraceTable::default();
         let cfg = AutotuneConfig::default();
-        let row = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, cfg, 100, true);
+        let row = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            cfg,
+            100,
+            true,
+        );
         t.insert(row).unwrap();
-        assert!(t.lookup("qkv", "gfx1200", TraceShapeClass::Decode, TraceQuantFormat::Fp16).is_none());
+        assert!(
+            t.lookup(
+                "qkv",
+                "gfx1200",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn trace_table_lookup_miss_wrong_format() {
         let mut t = TraceTable::default();
         let cfg = AutotuneConfig::default();
-        let row = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, cfg, 100, true);
+        let row = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            cfg,
+            100,
+            true,
+        );
         t.insert(row).unwrap();
-        assert!(t.lookup("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Mxfp4).is_none());
+        assert!(
+            t.lookup(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Mxfp4
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn trace_table_lookup_miss_wrong_shape_class() {
         let mut t = TraceTable::default();
         let cfg = AutotuneConfig::default();
-        let row = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, cfg, 100, true);
+        let row = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            cfg,
+            100,
+            true,
+        );
         t.insert(row).unwrap();
-        assert!(t.lookup("qkv", "gfx1036", TraceShapeClass::Prefill, TraceQuantFormat::Fp16).is_none());
+        assert!(
+            t.lookup(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Prefill,
+                TraceQuantFormat::Fp16
+            )
+            .is_none()
+        );
     }
 
     // =========================================================================
@@ -700,16 +906,43 @@ mod tests {
     fn trace_table_lookup_prefers_eligible_over_ineligible() {
         let mut t = TraceTable::default();
         // Insert an eligible winner first.
-        let good = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                     TraceQuantFormat::Fp16, AutotuneConfig { block_dim: 256, ..AutotuneConfig::default() }, 100, true);
+        let good = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig {
+                block_dim: 256,
+                ..AutotuneConfig::default()
+            },
+            100,
+            true,
+        );
         t.insert(good).unwrap();
         // Insert an "later" ineligible one for the same key — should be dropped.
-        let bad = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                    TraceQuantFormat::Fp16, AutotuneConfig { block_dim: 64, ..AutotuneConfig::default() }, 50, false);
+        let bad = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig {
+                block_dim: 64,
+                ..AutotuneConfig::default()
+            },
+            50,
+            false,
+        );
         let r = t.insert(bad);
         assert!(r.is_err(), "insert of ineligible row must be rejected");
         // The eligible row should still be found.
-        let got = t.lookup("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16).unwrap();
+        let got = t
+            .lookup(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+            )
+            .unwrap();
         assert_eq!(got.block_dim, 256);
     }
 
@@ -720,14 +953,41 @@ mod tests {
     #[test]
     fn trace_table_insert_replaces_same_key() {
         let mut t = TraceTable::default();
-        let v1 = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, AutotuneConfig { block_dim: 128, ..AutotuneConfig::default() }, 100, true);
+        let v1 = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig {
+                block_dim: 128,
+                ..AutotuneConfig::default()
+            },
+            100,
+            true,
+        );
         t.insert(v1).unwrap();
-        let v2 = KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                   TraceQuantFormat::Fp16, AutotuneConfig { block_dim: 256, ..AutotuneConfig::default() }, 80, true);
+        let v2 = KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig {
+                block_dim: 256,
+                ..AutotuneConfig::default()
+            },
+            80,
+            true,
+        );
         t.insert(v2).unwrap();
         // Table should have exactly one entry for that key tuple, with the newer value.
-        let got = t.lookup("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16).unwrap();
+        let got = t
+            .lookup(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+            )
+            .unwrap();
         assert_eq!(got.block_dim, 256);
         assert_eq!(t.len(), 1);
     }
@@ -739,13 +999,34 @@ mod tests {
     #[test]
     fn load_trace_table_roundtrip() {
         let dir = make_temp_dir();
-        let cfg = AutotuneConfig { block_dim: 128, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 1, spec_gamma: 4, spec_acceptance_threshold: 0.6, spec_alpha: 0.0 };
-        let rows = vec![
-            KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg, 100, true),
-        ];
+        let cfg = AutotuneConfig {
+            block_dim: 128,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 1,
+            spec_gamma: 4,
+            spec_acceptance_threshold: 0.6,
+            spec_alpha: 0.0,
+        };
+        let rows = vec![KernelTrace::new(
+            "qkv",
+            "gfx1036",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            cfg,
+            100,
+            true,
+        )];
         write_trace_json(dir.as_ref(), "gfx1036", rows);
         let loaded = load_trace_table(dir.as_ref(), "gfx1036");
-        let got = loaded.lookup("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16).unwrap();
+        let got = loaded
+            .lookup(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+            )
+            .unwrap();
         assert_eq!(got.block_dim, 128);
         assert_eq!(loaded.eligible_count(), 1);
     }
@@ -759,7 +1040,16 @@ mod tests {
         let dir = make_temp_dir();
         let loaded = load_trace_table(dir.as_ref(), "gfx1036");
         assert_eq!(loaded.len(), 0);
-        assert!(loaded.lookup("x", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16).is_none());
+        assert!(
+            loaded
+                .lookup(
+                    "x",
+                    "gfx1036",
+                    TraceShapeClass::Decode,
+                    TraceQuantFormat::Fp16
+                )
+                .is_none()
+        );
     }
 
     // =========================================================================
@@ -783,13 +1073,30 @@ mod tests {
     fn save_and_load_trace_table_roundtrip() {
         let dir = make_temp_dir();
         let mut table = TraceTable::default();
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode,
-                                      TraceQuantFormat::Fp16, AutotuneConfig::default(), 100, true))
-              .unwrap();
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                AutotuneConfig::default(),
+                100,
+                true,
+            ))
+            .unwrap();
         save_trace_table(dir.as_ref(), "gfx1036", &table);
         let loaded = load_trace_table(dir.as_ref(), "gfx1036");
-        assert_eq!(loaded.lookup("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16)
-                       .map(|c| c.block_dim), Some(256));
+        assert_eq!(
+            loaded
+                .lookup(
+                    "qkv",
+                    "gfx1036",
+                    TraceShapeClass::Decode,
+                    TraceQuantFormat::Fp16
+                )
+                .map(|c| c.block_dim),
+            Some(256)
+        );
     }
 
     // =========================================================================
@@ -801,10 +1108,21 @@ mod tests {
         let dir = make_temp_dir();
         let path = SampleLogger::new(dir.as_ref(), "gfx1036");
         let logger = SampleLogger::at(path.clone(), "gfx1036");
-        logger.log_candidate("qkv", TraceShapeClass::Decode, TraceQuantFormat::Fp16,
-                              AutotuneConfig::default(), 1, 256, 8, 100);
+        logger.log_candidate(
+            "qkv",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            1,
+            256,
+            8,
+            100,
+        );
         let text = std::fs::read_to_string(&path).unwrap();
-        let line = text.lines().next().expect("sample log must have at least one line");
+        let line = text
+            .lines()
+            .next()
+            .expect("sample log must have at least one line");
         let parsed: SampleRecord = serde_json::from_str(line).unwrap();
         assert_eq!(parsed.kernel, "qkv");
         assert_eq!(parsed.gpu_arch, "gfx1036");
@@ -815,8 +1133,16 @@ mod tests {
         assert_eq!(parsed.waves, 8);
         assert_eq!(parsed.latency_us, 100);
         // Two candidates = two lines.
-        logger.log_candidate("qkv", TraceShapeClass::Decode, TraceQuantFormat::Fp16,
-                              AutotuneConfig::default(), 1, 128, 4, 50);
+        logger.log_candidate(
+            "qkv",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            1,
+            128,
+            4,
+            50,
+        );
         let text2 = std::fs::read_to_string(&path).unwrap();
         // Non-empty lines only — ignore any blank trailing newline.
         let lines: Vec<&str> = text2.lines().filter(|l| !l.is_empty()).collect();
@@ -835,17 +1161,43 @@ mod tests {
         let dir = make_temp_dir();
         let path = SampleLogger::new(dir.as_ref(), "gfx1036");
         let logger = SampleLogger::at(path.clone(), "gfx1036");
-        let bench = |_: &String, _: TraceShapeClass, _: TraceQuantFormat,
-                     grid_x: u32, block_x: u32, _: u32| -> Result<(AutotuneConfig, u64)> {
-            Ok((AutotuneConfig { block_dim: grid_x as u32 * block_x, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 0, spec_gamma: 4, spec_acceptance_threshold: 0.6, spec_alpha: 0.0 }, 77))
+        let bench = |_: &String,
+                     _: TraceShapeClass,
+                     _: TraceQuantFormat,
+                     grid_x: u32,
+                     block_x: u32,
+                     _: u32|
+         -> Result<(AutotuneConfig, u64)> {
+            Ok((
+                AutotuneConfig {
+                    block_dim: grid_x as u32 * block_x,
+                    tile_kv: 64,
+                    grid_stride: 1,
+                    cycles_per_invocation: 0,
+                    spec_gamma: 4,
+                    spec_acceptance_threshold: 0.6,
+                    spec_alpha: 0.0,
+                },
+                77,
+            ))
         };
-        let logged = logger.wrap("qkv".to_string(), TraceShapeClass::Decode, TraceQuantFormat::Fp16,
-                                 1, 256, 8, bench);
+        let logged = logger.wrap(
+            "qkv".to_string(),
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            1,
+            256,
+            8,
+            bench,
+        );
         let cfg = logged.run().unwrap();
         assert_eq!(cfg.block_dim, 256);
         // Verify the sample log got the winner (first JSONL line).
         let text = std::fs::read_to_string(&path).unwrap();
-        let first_line = text.lines().next().expect("sample log must have at least one line");
+        let first_line = text
+            .lines()
+            .next()
+            .expect("sample log must have at least one line");
         let parsed: SampleRecord = serde_json::from_str(first_line).unwrap();
         assert_eq!(parsed.tile_config.block_dim, 256);
         assert_eq!(parsed.latency_us, 77);
@@ -866,8 +1218,16 @@ mod tests {
         std::fs::create_dir(&subdir).unwrap();
         let subdir_for_logger = subdir.clone();
         let logger = SampleLogger::at(subdir_for_logger, "gfx1036");
-        logger.log_candidate("qkv", TraceShapeClass::Decode, TraceQuantFormat::Fp16,
-                              AutotuneConfig::default(), 1, 256, 8, 100);
+        logger.log_candidate(
+            "qkv",
+            TraceShapeClass::Decode,
+            TraceQuantFormat::Fp16,
+            AutotuneConfig::default(),
+            1,
+            256,
+            8,
+            100,
+        );
         // Must not panic. We can't easily assert the warn (no log capture here),
         // but the function must return.
         assert!(true);
@@ -883,9 +1243,18 @@ mod tests {
     #[test]
     fn shape_class_convert_roundtrip() {
         use crate::autotune::ShapeClass;
-        assert_eq!(TraceShapeClass::from(ShapeClass::Decode), TraceShapeClass::Decode);
-        assert_eq!(TraceShapeClass::from(ShapeClass::Prefill), TraceShapeClass::Prefill);
-        assert_eq!(TraceShapeClass::from(ShapeClass::TLOLog), TraceShapeClass::TLOLog);
+        assert_eq!(
+            TraceShapeClass::from(ShapeClass::Decode),
+            TraceShapeClass::Decode
+        );
+        assert_eq!(
+            TraceShapeClass::from(ShapeClass::Prefill),
+            TraceShapeClass::Prefill
+        );
+        assert_eq!(
+            TraceShapeClass::from(ShapeClass::TLOLog),
+            TraceShapeClass::TLOLog
+        );
     }
 
     // =========================================================================
@@ -928,13 +1297,34 @@ mod tests {
     fn latency_predictor_empty_table_shortlists_everything() {
         let predictor = LatencyPredictor::new(TraceTable::default(), 2.0);
         let cfgs = vec![
-            AutotuneConfig { block_dim: 64, tile_kv: 32, grid_stride: 1, cycles_per_invocation: 0, ..Default::default() },
-            AutotuneConfig { block_dim: 128, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 0, ..Default::default() },
-            AutotuneConfig { block_dim: 256, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 0, ..Default::default() },
+            AutotuneConfig {
+                block_dim: 64,
+                tile_kv: 32,
+                grid_stride: 1,
+                cycles_per_invocation: 0,
+                ..Default::default()
+            },
+            AutotuneConfig {
+                block_dim: 128,
+                tile_kv: 64,
+                grid_stride: 1,
+                cycles_per_invocation: 0,
+                ..Default::default()
+            },
+            AutotuneConfig {
+                block_dim: 256,
+                tile_kv: 64,
+                grid_stride: 1,
+                cycles_per_invocation: 0,
+                ..Default::default()
+            },
         ];
         let shortlist = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, cfgs);
-        assert_eq!(shortlist.len(), 3,
-            "empty table should return all candidates (no prediction data)");
+        assert_eq!(
+            shortlist.len(),
+            3,
+            "empty table should return all candidates (no prediction data)"
+        );
     }
 
     #[test]
@@ -948,10 +1338,42 @@ mod tests {
         // Insert a trace with known latency, then verify shortlisting drops
         // worse candidates when trace data exists.
         let mut table = TraceTable::default();
-        let cfg_good = AutotuneConfig { block_dim: 128, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 100, ..Default::default() };
-        let cfg_poor = AutotuneConfig { block_dim: 64, tile_kv: 32, grid_stride: 1, cycles_per_invocation: 500, ..Default::default() };
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg_good, 100, true)).unwrap();
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg_good, 100, true)).unwrap();
+        let cfg_good = AutotuneConfig {
+            block_dim: 128,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 100,
+            ..Default::default()
+        };
+        let cfg_poor = AutotuneConfig {
+            block_dim: 64,
+            tile_kv: 32,
+            grid_stride: 1,
+            cycles_per_invocation: 500,
+            ..Default::default()
+        };
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg_good,
+                100,
+                true,
+            ))
+            .unwrap();
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg_good,
+                100,
+                true,
+            ))
+            .unwrap();
 
         let predictor = LatencyPredictor::new(table, 1.5);
         // When both candidates have the same predicted latency (same mean trace),
@@ -973,7 +1395,10 @@ mod tests {
     #[test]
     fn latency_predictor_predict_latency_returns_none_without_traces() {
         let predictor = LatencyPredictor::new(TraceTable::default(), 2.0);
-        let cfg = AutotuneConfig { block_dim: 128, ..Default::default() };
+        let cfg = AutotuneConfig {
+            block_dim: 128,
+            ..Default::default()
+        };
         let pred = predictor.predict_latency("qkv", "gfx1036", TraceShapeClass::Decode, &cfg);
         assert!(pred.is_none(), "no trace rows → prediction should be None");
     }
@@ -981,11 +1406,30 @@ mod tests {
     #[test]
     fn latency_predictor_predict_latency_with_traces() {
         let mut table = TraceTable::default();
-        let cfg = AutotuneConfig { block_dim: 128, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 100, ..Default::default() };
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg, 100, true)).unwrap();
+        let cfg = AutotuneConfig {
+            block_dim: 128,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 100,
+            ..Default::default()
+        };
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg,
+                100,
+                true,
+            ))
+            .unwrap();
         let predictor = LatencyPredictor::new(table, 2.0);
         let pred = predictor.predict_latency("qkv", "gfx1036", TraceShapeClass::Decode, &cfg);
-        assert!(pred.is_some(), "trace rows exist → prediction should be Some");
+        assert!(
+            pred.is_some(),
+            "trace rows exist → prediction should be Some"
+        );
         let val = pred.unwrap();
         assert!(val > 0.0, "predicted latency should be positive");
     }
@@ -994,27 +1438,97 @@ mod tests {
     fn latency_predictor_shortlist_factor_respected() {
         // Insert two traces at very different latencies to check the factor threshold.
         let mut table = TraceTable::default();
-        let cfg_a = AutotuneConfig { block_dim: 64, tile_kv: 32, grid_stride: 1, cycles_per_invocation: 50, ..Default::default() };
-        let cfg_b = AutotuneConfig { block_dim: 256, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 500, ..Default::default() };
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg_a, 100, true)).unwrap();
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg_b, 500, true)).unwrap();
+        let cfg_a = AutotuneConfig {
+            block_dim: 64,
+            tile_kv: 32,
+            grid_stride: 1,
+            cycles_per_invocation: 50,
+            ..Default::default()
+        };
+        let cfg_b = AutotuneConfig {
+            block_dim: 256,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 500,
+            ..Default::default()
+        };
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg_a,
+                100,
+                true,
+            ))
+            .unwrap();
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg_b,
+                500,
+                true,
+            ))
+            .unwrap();
 
         let predictor = LatencyPredictor::new(table, 2.0);
         // cfg_b has 10x higher latency than cfg_a in trace; with factor 2.0,
         // cfg_b should be dropped. cfg_a survives.
         let cfgs = vec![cfg_a.clone(), cfg_b.clone()];
         let shortlist = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, cfgs);
-        assert!(shortlist.contains(&cfg_a), "low-latency cfg_a should survive");
-        assert!(!shortlist.contains(&cfg_b), "high-latency cfg_b should be dropped with factor 2.0");
+        assert!(
+            shortlist.contains(&cfg_a),
+            "low-latency cfg_a should survive"
+        );
+        assert!(
+            !shortlist.contains(&cfg_b),
+            "high-latency cfg_b should be dropped with factor 2.0"
+        );
     }
 
     #[test]
     fn latency_predictor_shortlist_preserves_best_worst_ratio() {
         let mut table = TraceTable::default();
-        let cfg_fast = AutotuneConfig { block_dim: 128, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 50, ..Default::default() };
-        let cfg_slow = AutotuneConfig { block_dim: 256, tile_kv: 128, grid_stride: 1, cycles_per_invocation: 500, ..Default::default() };
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg_fast, 50, true)).unwrap();
-        table.insert(KernelTrace::new("qkv", "gfx1036", TraceShapeClass::Decode, TraceQuantFormat::Fp16, cfg_slow, 500, true)).unwrap();
+        let cfg_fast = AutotuneConfig {
+            block_dim: 128,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 50,
+            ..Default::default()
+        };
+        let cfg_slow = AutotuneConfig {
+            block_dim: 256,
+            tile_kv: 128,
+            grid_stride: 1,
+            cycles_per_invocation: 500,
+            ..Default::default()
+        };
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg_fast,
+                50,
+                true,
+            ))
+            .unwrap();
+        table
+            .insert(KernelTrace::new(
+                "qkv",
+                "gfx1036",
+                TraceShapeClass::Decode,
+                TraceQuantFormat::Fp16,
+                cfg_slow,
+                500,
+                true,
+            ))
+            .unwrap();
 
         let predictor = LatencyPredictor::new(table, 10.0);
         let cfgs = vec![cfg_fast.clone(), cfg_slow.clone()];

@@ -214,7 +214,10 @@ impl ModelFootprint {
         let mut ctx = None;
 
         if let Some(ref gguf_meta) = grim.metadata.gguf_metadata {
-            if let Some(a) = gguf_meta.get("general.architecture").and_then(|v| v.as_str()) {
+            if let Some(a) = gguf_meta
+                .get("general.architecture")
+                .and_then(|v| v.as_str())
+            {
                 arch = a.to_string();
             }
             ctx = gguf_meta

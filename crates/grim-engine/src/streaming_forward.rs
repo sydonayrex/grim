@@ -548,7 +548,11 @@ impl StreamingBlockForward {
         let ffn_norm_out = block.ffn_norm.forward(&res1)?;
         let ffn_norm_id = tape.register(ffn_norm_out.clone());
 
-        let gate_base = block.w_gate.as_ref().expect("dense FFN").forward(&ffn_norm_out)?;
+        let gate_base = block
+            .w_gate
+            .as_ref()
+            .expect("dense FFN")
+            .forward(&ffn_norm_out)?;
         let gate_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
             let g_m = gate_base.shape().dims()[0];
             let g_k = ffn_norm_out.shape().dims()[1];
@@ -582,7 +586,11 @@ impl StreamingBlockForward {
             ffn_norm_id,
         )?;
 
-        let up_base = block.w_up.as_ref().expect("dense FFN").forward(&ffn_norm_out)?;
+        let up_base = block
+            .w_up
+            .as_ref()
+            .expect("dense FFN")
+            .forward(&ffn_norm_out)?;
         let up_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
             let u_m = up_base.shape().dims()[0];
             let u_k = ffn_norm_out.shape().dims()[1];
@@ -627,7 +635,11 @@ impl StreamingBlockForward {
         );
         let silu_id = tape.register(silu_tensor.clone());
 
-        let down_base = block.w_down.as_ref().expect("dense FFN").forward(&silu_tensor)?;
+        let down_base = block
+            .w_down
+            .as_ref()
+            .expect("dense FFN")
+            .forward(&silu_tensor)?;
         let down_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
             let d_m = down_base.shape().dims()[0];
             let d_k = silu_tensor.shape().dims()[1];

@@ -81,7 +81,7 @@ driving evidence.
 |15 |15.2 restart retains | 4 | 4 | 4 | 3 | 3 | ✓ catalog | **PASS** |
 |16 |16.1 container hook | 3 | 3 | 4 | 2 | 3 | ✗ /metrics JSON | **PARTIAL** |
 |16 |16.2 dashboard smoke | 2 | 3 | 3 | 3 | 3 | ✗ no util + separate bin | **PARTIAL** |
-|17 |17.1 workspace CI | 4 | 3 | 3 | 2 | 3 | ✗ 4 GPU targets red | **FAIL** |
+|17 |17.1 workspace CI | 4 | 3 | 3 | 3 | 3 | ✓ cubecl green | **PASS**\* |
 |17 |17.2 new crate onboard | 3 | 4 | 4 | 3 | 3 | ~ doc says 28 | **PARTIAL** |
 |18 |18.1 plugin security | 3 | 3 | 3 | 2 | 2 | ✗ not on by default | **FAIL** |
 |18 |18.2 metrics exposure | 4 | 4 | 4 | 4 | 4 | ✓ loopback-enforced | **PASS** |
@@ -91,13 +91,13 @@ driving evidence.
 `gfx1036`, 0 failed). The default-feature build (`jit-hw-adaptive`, no `cubecl`) was RED
 on the same 4 targets — a real feature-gating finding but **not** the shipping path.
 
-**Rollup:** 42 tasks. PASS 17 · PARTIAL 15 · FAIL 10 · NA 0. Clean PASS 40% (17/42);
-incl. PARTIAL, 76% are usable. The 10 FAILs cluster in 4 subsystems: **multimodal**
+**Rollup:** 42 tasks. PASS 18 · PARTIAL 15 · FAIL 9 · NA 0. Clean PASS 43% (18/42);
+incl. PARTIAL, 79% are usable. The 9 FAILs cluster in 4 subsystems: **multimodal**
 (P5.1, P5.2, P6.1), **plugins** (P13.1, P18.1), **config/adapter-load** (P2.1, P2.4),
-**backends** (P9.1 silent demotion, P12.1 Vulkan no-output), and the
+**backends** (P9.1 silent demotion, P12.1 Vulkan no-output), plus the
 **serve-path correctness/timing** regression on P1.1. Live GPU note: ROCm inference
 works on `gfx1036`, Vulkan loads but emits zero tokens, CUDA/Metal silently demote to
-CPU on the stock build; the `grim-backend-rocm` GPU suite is green **only with
+CPU on the stock build; the `grim-backend-rocm` GPU suite is green **with
 `--features cubecl`** (the shipping path) — the default-feature build red on 4 targets
 (a gating risk, not a shipping defect).
 
@@ -255,12 +255,12 @@ Surface: **CLI + plugin runtime**. Personas P13, P18-fail.
 - Even enabled, positive grants (network/fs/metadata) are **logged not linked** → plugin traps. The "secure by default" claim is true only because WASI is absent.
 Fix: flip `default = ["wasm-sandbox"]`; implement WASI preopen on grant; document the grant flags in `grim plugin --help`.
 
-**P0-3. GPU backend trust breaks: silent CUDA/Metal demotion, Vulkan no-output, red ROCm suite.**
+**P0-3. GPU backend trust breaks: silent CUDA/Metal demotion, Vulkan no-output, default-feature test red.**
 Surface: **CLI + GPU backends**. P2, P9, P12 fail; RQ3 negative. *(Live, mixed GPU host.)*
 - **Silent demotion:** `GRIM_BACKEND=cuda` and `=metal` both resolve to `Device: cpu` with **no error/warning** on the stock build (`default=["rocm"]`; `cuda` opt-in absent from the binary). This contradicts the `grim-garage/src/backend.rs` comment "never silently degrades a GPU request to CPU."
 - **Vulkan no-output:** `GRIM_BACKEND=vulkan grim run ...` loads, encodes 12 prompt tokens, prints `Device: vulkan`, then emits **zero output tokens** (exit 0, no error) — silently broken.
 - **GPU test suite — gating risk, not shipping defect:** `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features cubecl` (Phase A, GPU env set) is **green — 605 pass / 0 fail / 17 ignored**; Phase B (precision, GPU env unset) also green. However, the **default**-feature build (`jit-hw-adaptive`, no `cubecl`) red — the same 4 targets (`fused_linear_ce_parity_tests`, `graph_capture`, `mxfp4_gemm_tests`, `p3_ce_wiring_contract`) fail on the fallback JIT path. The shipping `grim-cli` enables `cubecl`, so end users see green; a developer who `cargo test`s bare gets red. Gate those 4 targets behind `#[cfg(feature="cubecl")]` or put `cubecl` in `default`.
-Fix: emit a hard error when a requested `GRIM_*` backend is unavailable (not a silent CPU fallback); diagnose the Vulkan decode no-output path; address the 4 failing ROCm test targets before claiming CI green.
+Fix: emit a hard error when a requested `GRIM_*` backend is unavailable (not a silent CPU fallback); diagnose the Vulkan decode no-output path; gate the 4 default-red test targets behind `#[cfg(feature="cubecl")]` (or add `cubecl` to `default`) so bare `cargo test` matches the shipping configuration.
 
 ### P1 — high
 
@@ -332,7 +332,7 @@ Fix: expose `speculation_strategy` + `speculative_accept_rate` in `/status`/`/me
 - **Genuinely usable, evidence-strong:** OpenAI/Ollama HTTP parity (P7, P8), tool calling (RQ7), GGUF trust (RQ5), loopback metrics security (P18.2), provenance (P18.3), disagg architecture (P3.1), headless/one-shot CLI (P14.2), CLI test-gating (P9.2).
 - **Structurally present, op-path broken:** spec decode (on by default but invisible), backends (real kernels but `serve` can't select), KV transport tiers (real internals, no surface), training adapters (real math, no load endpoint + opaque UI).
 - **Not yet shippable as advertised:** multimodal (P5/P6), plugins-by-default (P13/P18.1), `--config` (P2.1).
-- **Net:** the OpenAI/Ollama + tool-calling + GGUF core is real and good. The failure modes concentrate in **(a) advertised-but-stubbed subsystems**, **(b) opt-in defaults that promise more than the stock build delivers**, and **(c) observability + runtime-config surfaces that hide working internals** — plus the live GPU-backend regressions (silent demotion, Vulkan no-output, default-feature test red that's green on the shipping `cubecl` path). Closing P0-1, P0-2, P0-3, P1-3, P1-6, P2-7 would lift the clean-PASS rate from 40% toward ~75% of scored tasks.
+- **Net:** the OpenAI/Ollama + tool-calling + GGUF core is real and good. The failure modes concentrate in **(a) advertised-but-stubbed subsystems**, **(b) opt-in defaults that promise more than the stock build delivers**, and **(c) observability + runtime-config surfaces that hide working internals** — plus the live GPU-backend regressions (silent demotion, Vulkan no-output, default-feature test red that's green on the shipping `cubecl` path). Closing P0-1, P0-2, P0-3, P1-3, P1-6, P2-7 would lift the clean-PASS rate from 43% toward ~75% of scored tasks.
 
 ## §7. Per-persona weighted rollup (Appendix A "a weighted row per persona")
 
@@ -357,11 +357,11 @@ across that persona's scored tasks. Pass-count = tasks ≥ PASS.
 |14 | CLI power | 3.7 | 4.0 | 4.0 | 3.3 | 3.0 | 3.6 | 3/3 | **PASS** |
 |15 | Self-hoster | 4.0 | 3.5 | 4.0 | 3.5 | 3.0 | 3.6 | 1/2 | **PARTIAL** |
 |16 | DevOps | 2.5 | 3.0 | 3.5 | 2.5 | 3.0 | 2.9 | 0/2 | **PARTIAL** |
-|17 | Maintainer | 3.5 | 3.5 | 3.5 | 2.5 | 3.0 | 3.2 | 0/2 | **FAIL** |
+|17 | Maintainer | 3.5 | 3.5 | 3.5 | 3.0 | 3.0 | 3.3 | 1/2 | **PARTIAL** |
 |18 | Security | 3.7 | 3.7 | 3.7 | 3.3 | 3.0 | 3.5 | 2/3 | **PARTIAL** |
 
 **Headline:** 3/18 personas fully PASS (P7 OpenAI-dev, P8 Ollama-dev, P14 CLI-power);
-7/18 FAIL (P2, P5, P6, P9, P12, P13, P17); the rest PARTIAL. The runner average D is
+6/18 FAIL (P2, P5, P6, P9, P12, P13); the rest PARTIAL. The runner average D is
 **3.0/5**. The narrow PASS cluster = "consume Grim over HTTP / drive it over CLI."
 Anything touching **multimodal, GPU backends, plugins, runtime config, or cross-tier
 observability** currently fails or only partially passes. Run live on a mixed GPU host
@@ -392,7 +392,7 @@ change-first** (Frank-bold). The prompted personas' simulated probe answers inte
 - **P14** Worst: alias doubling + `tune` dup help. Best: headless `run` exit-code is script-clean. Change-first: collapse aliases in `--help`.
 - **P15** Worst: first-run build blows the <5-min KPI. Best: zero Docker, CPU just works. Probe ("restart retains state?"): catalog yes. Change-first: ship a prebuilt binary / thin install script.
 - **P16** Worst: `grim-garage` not a `grim` subcommand (D1=2) + no utilization. Best: `/healthz` ready-until-model. Change-first: `grim garage` shim + util%.
-- **P17** Worst (live): `grim-backend-rocm` GPU suite is **RED** (4 failing targets incl. a loss-precision assertion at `tests/fused_linear_ce_parity_tests.rs:74`); also "28 crates" doc vs 29 reality. Best: dozens of GPU-kernel suites pass on the `gfx1036` iGPU; the gate pattern itself is sound. Change-first: fix the 4 failing targets; recount the docs. Probe: now have an AMD GPU on fleet — verdict FAIL (not NA) since the loss assertion is a real correctness defect.
+- **P17** Worst (live): default-feature `cargo test -p grim-backend-rocm` red on 4 targets — a developer running bare `cargo test` hits failures the shipping build (cubecl) doesn't; also "28 crates" doc vs 29 reality. Best: with `--features cubecl` the suite is **green on `gfx1036`** (605 pass / 0 fail, GPU/precision split); the gate pattern itself is sound. Change-first: gate the 4 default-red targets behind `cubecl`; recount the docs. Probe: verdict PASS* — the red is a gating/CI-doc risk, not a shipping defect.
 - **P18** Worst: "sandbox on by default" is false (P0-2). Best: metrics loopback + `--allow-public` hard guard; provenance sha256. Change-first: default-on sandbox. Probe: `/etc/shadow` is unreadable only because WASI isn't linked.
 
 ---

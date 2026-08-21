@@ -210,10 +210,7 @@ impl KvBlockPool {
     /// (Phase 2.2: the "cache hit but demoted" path). Returns the matched
     /// block ids, the number of matched tokens, and whether any promotion
     /// occurred.
-    pub fn match_prefix_promoting(
-        &mut self,
-        tokens: &[u32],
-    ) -> (Vec<BlockId>, usize, bool) {
+    pub fn match_prefix_promoting(&mut self, tokens: &[u32]) -> (Vec<BlockId>, usize, bool) {
         let (matched, n) = self.prefix_tree.match_prefix(tokens);
         let mut promoted = false;
         for &bid in &matched {
@@ -266,10 +263,7 @@ impl KvBlockPool {
     /// blocks for any non-matching tail, insert, and return all block ids
     /// plus the count of tokens that were reused. Used where the caller
     /// does not split match/prefill/insert (e.g. eager one-shot paths).
-    pub fn find_or_share_prefix_tokens(
-        &mut self,
-        tokens: &[u32],
-    ) -> Result<(Vec<BlockId>, usize)> {
+    pub fn find_or_share_prefix_tokens(&mut self, tokens: &[u32]) -> Result<(Vec<BlockId>, usize)> {
         let (matched, matched_tokens) = self.prefix_tree.match_prefix(tokens);
         let total_blocks = tokens.len().div_ceil(BLOCK_SIZE);
         let mut all_blocks = matched.clone();
@@ -626,7 +620,11 @@ impl PagedKvCache {
         page_size_: usize,
     ) -> Self {
         let capacity = pool.lock().unwrap().capacity();
-        let page_size = if page_size_ == 0 { BLOCK_SIZE } else { page_size_ };
+        let page_size = if page_size_ == 0 {
+            BLOCK_SIZE
+        } else {
+            page_size_
+        };
         let np = capacity * page_size;
         let _elem_per_page = np * num_heads * head_dim;
         Self {
@@ -649,11 +647,7 @@ impl PagedKvCache {
         }
     }
 
-    pub fn set_device(
-        &mut self,
-        device: Device,
-        backend: Arc<dyn grim_tensor::BackendDevice>,
-    ) {
+    pub fn set_device(&mut self, device: Device, backend: Arc<dyn grim_tensor::BackendDevice>) {
         self.device = Some(device);
         self.backend = Some(backend);
         let n = self.k_pages.len().max(self.v_pages.len());
@@ -676,14 +670,13 @@ impl PagedKvCache {
         let dims = vec![self.capacity * self.page_size, stride];
         let k_storage =
             dev.from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32)?;
-        let v_storage = dev
-            .from_cpu(&self.v_pages[layer], &Shape::new(dims), DType::F32)?;
+        let v_storage = dev.from_cpu(&self.v_pages[layer], &Shape::new(dims), DType::F32)?;
         Ok((Arc::from(k_storage), Arc::from(v_storage)))
     }
 }
 
 impl KvCache for PagedKvCache {
-        fn append_slot(&mut self) -> Result<()> {
+    fn append_slot(&mut self) -> Result<()> {
         self.committed_tokens += 1;
         let req_blocks = self.committed_tokens.div_ceil(BLOCK_SIZE);
         if self.table.len() < req_blocks {
@@ -899,7 +892,8 @@ impl KvCache for PagedKvCache {
                 self.page_size,
             ))
         } else {
-            let k = grim_backend_cpu::cpu_tensor(self.k_pages[layer].clone(), Shape::new(dims.clone()));
+            let k =
+                grim_backend_cpu::cpu_tensor(self.k_pages[layer].clone(), Shape::new(dims.clone()));
             let v = grim_backend_cpu::cpu_tensor(self.v_pages[layer].clone(), Shape::new(dims));
             Some((k, v, self.page_size))
         }

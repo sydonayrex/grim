@@ -73,10 +73,17 @@ pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
                 println!("Image Input : {}", image.display());
                 println!("Model       : {model}");
                 if !image.exists() {
-                    return Err(Error::Config(format!("image file not found: {}", image.display())));
+                    return Err(Error::Config(format!(
+                        "image file not found: {}",
+                        image.display()
+                    )));
                 }
-                println!("\n[grim vision] Vision models (Qwen2-VL, CogVLM, Gemma-3N, Hunyuan-VL) are integrated in `grim-models-vision`.");
-                println!("[grim vision] HTTP Endpoint: POST /v1/chat/completions with image_url payload.");
+                println!(
+                    "\n[grim vision] Vision models (Qwen2-VL, CogVLM, Gemma-3N, Hunyuan-VL) are integrated in `grim-models-vision`."
+                );
+                println!(
+                    "[grim vision] HTTP Endpoint: POST /v1/chat/completions with image_url payload."
+                );
                 Ok(())
             }
         },
@@ -86,20 +93,31 @@ pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
                 println!("Audio Input : {}", audio.display());
                 println!("Model       : {model}");
                 if !audio.exists() {
-                    return Err(Error::Config(format!("audio file not found: {}", audio.display())));
+                    return Err(Error::Config(format!(
+                        "audio file not found: {}",
+                        audio.display()
+                    )));
                 }
-                println!("\n[grim audio] Audio decoder integrated in `grim-models-audio` (WavTokenizer / Whisper layout).");
+                println!(
+                    "\n[grim audio] Audio decoder integrated in `grim-models-audio` (WavTokenizer / Whisper layout)."
+                );
                 println!("[grim audio] HTTP Endpoint: POST /v1/audio/transcriptions.");
                 Ok(())
             }
         },
         MultimodalCmd::Diffusion { cmd } => match cmd {
-            DiffusionCmd::Generate { prompt, output, model } => {
+            DiffusionCmd::Generate {
+                prompt,
+                output,
+                model,
+            } => {
                 println!("=== Grim Multimodal: Diffusion ===");
                 println!("Prompt      : \"{prompt}\"");
                 println!("Output File : {}", output.display());
                 println!("Model       : {model}");
-                println!("\n[grim diffusion] Diffusion pipeline integrated in `grim-models-diffusion` (Diffusion Gemma).");
+                println!(
+                    "\n[grim diffusion] Diffusion pipeline integrated in `grim-models-diffusion` (Diffusion Gemma)."
+                );
                 println!("[grim diffusion] HTTP Endpoint: POST /v1/images/generations.");
                 Ok(())
             }

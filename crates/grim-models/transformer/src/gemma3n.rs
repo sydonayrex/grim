@@ -102,15 +102,42 @@ impl Gemma3nBlock {
         let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
-        let input_layernorm = RmsNorm::load(&ws.scoped("input_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let post_attention_layernorm = RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let post_ffw_layernorm = RmsNorm::load(&ws.scoped("post_feedforward_layernorm"), cfg.hidden_size, cfg.rms_norm_eps)
-            .or_else(|_| RmsNorm::load(&ws.scoped("post_attention_layernorm"), cfg.hidden_size, cfg.rms_norm_eps))?;
+        let input_layernorm = RmsNorm::load(
+            &ws.scoped("input_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            &ws.scoped("post_attention_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let post_ffw_layernorm = RmsNorm::load(
+            &ws.scoped("post_feedforward_layernorm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )
+        .or_else(|_| {
+            RmsNorm::load(
+                &ws.scoped("post_attention_layernorm"),
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )
+        })?;
 
         let mlp_ws = ws.scoped("mlp");
-        let w_gate = Linear::load_shape(&mlp_ws.scoped("gate_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_up = Linear::load_shape(&mlp_ws.scoped("up_proj"), [cfg.hidden_size, cfg.intermediate_size])?;
-        let w_down = Linear::load_shape(&mlp_ws.scoped("down_proj"), [cfg.intermediate_size, cfg.hidden_size])?;
+        let w_gate = Linear::load_shape(
+            &mlp_ws.scoped("gate_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_up = Linear::load_shape(
+            &mlp_ws.scoped("up_proj"),
+            [cfg.hidden_size, cfg.intermediate_size],
+        )?;
+        let w_down = Linear::load_shape(
+            &mlp_ws.scoped("down_proj"),
+            [cfg.intermediate_size, cfg.hidden_size],
+        )?;
 
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
         let query_scale = 1.0 / (cfg.query_pre_attn_scalar.sqrt());
@@ -153,8 +180,20 @@ impl Gemma3nBlock {
         let mut q_vec = q.to_vec_f32()?;
         let mut k_vec = k.to_vec_f32()?;
 
-        crate::qwen35::apply_rope_neox(&mut q_vec, positions, self.num_heads, self.head_dim, 10000.0);
-        crate::qwen35::apply_rope_neox(&mut k_vec, positions, self.num_kv_heads, self.head_dim, 10000.0);
+        crate::qwen35::apply_rope_neox(
+            &mut q_vec,
+            positions,
+            self.num_heads,
+            self.head_dim,
+            10000.0,
+        );
+        crate::qwen35::apply_rope_neox(
+            &mut k_vec,
+            positions,
+            self.num_kv_heads,
+            self.head_dim,
+            10000.0,
+        );
 
         let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, kv_dim]));
@@ -187,11 +226,13 @@ impl Gemma3nBlock {
         for s in 0..seq_len {
             for h in 0..self.num_heads {
                 let kv_h = h / kv_group_size;
-                let q_slice = &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
+                let q_slice =
+                    &q_heads[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
 
                 let mut scores = vec![0.0f32; total_kv_len];
                 for t in 0..total_kv_len {
-                    let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim..t * kv_dim + (kv_h + 1) * self.head_dim];
+                    let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim
+                        ..t * kv_dim + (kv_h + 1) * self.head_dim];
                     let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                     scores[t] = dot * scale;
                 }
@@ -278,7 +319,10 @@ impl Gemma3n {
     ) -> Result<Self> {
         let root = ws.scoped("model");
 
-        let tok_embeddings = Linear::load_shape(&root.scoped("embed_tokens"), [cfg.vocab_size, cfg.hidden_size])?;
+        let tok_embeddings = Linear::load_shape(
+            &root.scoped("embed_tokens"),
+            [cfg.vocab_size, cfg.hidden_size],
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -377,4 +421,3 @@ mod tests {
         assert_eq!(cfg.head_dim, 256);
     }
 }
-

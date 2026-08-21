@@ -36,7 +36,9 @@ fn mxfp4_framed_variable_exponent_parity() -> TestResult {
     let mut rng = 12345u64;
     for _ in 0..(n * exps_per_row) {
         // cheap LCG; exponents in a plausible E8M0 range
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         block_exps.push(118u8 + (rng & 0x1F) as u8); // 118..149
     }
 
@@ -88,16 +90,26 @@ fn mxfp4_framed_variable_exponent_parity() -> TestResult {
         storage: Storage::FloatPack(FloatPackScheme::MxFp4),
     };
     let a_dev = BackendDevice::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
-    let b_dev = BackendDevice::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
+    let b_dev =
+        BackendDevice::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
     let out_shape = Shape::from_slice(&[m, n]);
-    let (out_dev, _h) = dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], QuantFormat::Fp4, &out_shape)?;
+    let (out_dev, _h) = dev.quantized_matmul(
+        a_dev.as_ref(),
+        b_dev.as_ref(),
+        &[],
+        QuantFormat::Fp4,
+        &out_shape,
+    )?;
     dev.synchronize();
 
     let actual = out_dev.to_cpu_vec_f32()?;
     assert_eq!(actual.len(), expected.len());
     for (i, (&a, &v)) in actual.iter().zip(expected.iter()).enumerate() {
         let err = (a - v).abs();
-        assert!(err < 1e-2, "GPU/CPU mismatch at {i}: actual={a}, expected={v}, err={err}");
+        assert!(
+            err < 1e-2,
+            "GPU/CPU mismatch at {i}: actual={a}, expected={v}, err={err}"
+        );
     }
     Ok(())
 }
@@ -116,7 +128,10 @@ fn mxfp4_framed_quantized_matmul_parity() -> TestResult {
     let b_orig: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.03).cos() * 1.5).collect();
 
     // Codes packed even-low / odd-high (grim framing convention).
-    let codes: Vec<u8> = b_orig.iter().map(|&v| f32_to_mxfp4_e2m1(v, shared_exp)).collect();
+    let codes: Vec<u8> = b_orig
+        .iter()
+        .map(|&v| f32_to_mxfp4_e2m1(v, shared_exp))
+        .collect();
     let mut packed = vec![0u8; (n * k) / 2];
     for (j, &c) in codes.iter().enumerate() {
         if j % 2 == 0 {
@@ -141,7 +156,10 @@ fn mxfp4_framed_quantized_matmul_parity() -> TestResult {
         .map(|&v| mxfp4_e2m1_to_f32(f32_to_mxfp4_e2m1(v, shared_exp), shared_exp))
         .collect();
     for (i, (&o, &d)) in oracle_dequant.iter().zip(b_dequant.iter()).enumerate() {
-        assert!((o - d).abs() < 1e-6, "host dequant mismatch at {i}: {o} vs {d}");
+        assert!(
+            (o - d).abs() < 1e-6,
+            "host dequant mismatch at {i}: {o} vs {d}"
+        );
     }
     let mut expected = vec![0.0f32; m * n];
     for mi in 0..m {
@@ -161,12 +179,8 @@ fn mxfp4_framed_quantized_matmul_parity() -> TestResult {
     let a_dev = BackendDevice::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
     // Framed weight stored with its logical [out, in] shape (as
     // `transpose_last_two` only relabels quantized ROCm tensors).
-    let b_dev = BackendDevice::from_cpu_bytes(
-        &dev,
-        &framed,
-        &Shape::from_slice(&[k, n]),
-        mxfp4_dtype,
-    )?;
+    let b_dev =
+        BackendDevice::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
     let out_shape = Shape::from_slice(&[m, n]);
     let (out_dev, _h) = dev.quantized_matmul(
         a_dev.as_ref(),

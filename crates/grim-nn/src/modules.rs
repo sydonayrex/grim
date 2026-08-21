@@ -403,7 +403,6 @@ impl Linear {
         Self::load(ws, shape[0], shape[1], false)
     }
 
-
     /// Load a column-parallel shard (dim==0): each rank gets `out_dim / world_size`
     /// rows of the weight matrix. Bias is loaded unsharded (same on all ranks).
     pub fn load_column_parallel(
@@ -805,7 +804,6 @@ impl LayerNorm {
         Ok(grim_backend_cpu::cpu_tensor(out, x.shape().clone()))
     }
 }
-
 
 // ---------- Embedding ----------
 

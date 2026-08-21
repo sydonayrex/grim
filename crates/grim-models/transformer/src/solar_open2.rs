@@ -178,7 +178,6 @@ impl SolarOpen2Block {
                         rms_norm_eps: 1e-5,
                         max_seq_len: cfg.max_seq_len,
                     },
-
                 )?;
                 (None, Some(dnet))
             }

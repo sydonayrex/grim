@@ -323,7 +323,7 @@ impl RsmiLib {
         });
         opt.as_ref()
     }
-fn handle(&self) -> &libloading::Library {
+    fn handle(&self) -> &libloading::Library {
         &self.lib
     }
 }

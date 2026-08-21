@@ -68,7 +68,11 @@ fn dequant_q6k_element_host(block: &[u8; 210], in_sb: usize) -> f32 {
 
     let ql_offset = n * 64 + l + if quarter & 1 != 0 { 32 } else { 0 };
     let ql_byte = ql[ql_offset];
-    let nibble = if quarter & 2 != 0 { ql_byte >> 4 } else { ql_byte & 0x0F };
+    let nibble = if quarter & 2 != 0 {
+        ql_byte >> 4
+    } else {
+        ql_byte & 0x0F
+    };
 
     let qh_byte = qh[n * 32 + l];
     let qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
@@ -176,7 +180,11 @@ fn test_q6k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         .zip(c_gpu.iter())
         .map(|(r, g)| (r - g).abs())
         .fold(0.0f32, f32::max);
-    let rel = if max_abs == 0.0 { max_err } else { max_err / max_abs };
+    let rel = if max_abs == 0.0 {
+        max_err
+    } else {
+        max_err / max_abs
+    };
     assert!(
         rel < 2e-5,
         "Q6_K forward GEMM max_rel_err {rel:.3e} (max_abs {max_abs}) exceeds 2e-5"
