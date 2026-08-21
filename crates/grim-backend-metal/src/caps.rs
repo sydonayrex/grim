@@ -18,6 +18,10 @@ pub struct MetalCaps {
     pub supports_fp16: bool,
     pub supports_bf16: bool,
     pub supports_fp8: bool,
+    /// True on Apple Silicon with hardware SIMD-group matrix multiply (Apple GPU Family 7+ / M1+).
+    pub supports_simdgroup_matrix: bool,
+    /// Apple Silicon Unified Memory flag (zero-copy between CPU & GPU).
+    pub unified_memory: bool,
     pub epoch: u64,
 }
 
@@ -33,6 +37,8 @@ impl MetalCaps {
             supports_fp16: true,
             supports_bf16: true,
             supports_fp8: gpu_family >= 8, // Apple M3/M4 / GPUFamily8+ supports FP8
+            supports_simdgroup_matrix: gpu_family >= 7, // Apple M1+ supports simdgroup_matrix
+            unified_memory: true,          // Apple Silicon unified memory
             epoch: 0,
         };
 
