@@ -155,7 +155,8 @@ pub use fusion::{
 };
 
 pub use kernels::qkv_attention::{
-    BlockTableEntry, launch_paged_attention, launch_qkv_attention_wmma, launch_tree_attention,
+    BlockTableEntry, KvCacheQuantFormat, launch_paged_attention, launch_paged_attention_quant,
+    launch_qkv_attention_wmma, launch_tree_attention,
 };
 pub use kernels::tile_picker::run_install_tune;
 

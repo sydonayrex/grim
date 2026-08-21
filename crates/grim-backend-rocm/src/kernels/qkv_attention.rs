@@ -868,6 +868,219 @@ void grim_qkv_attention_wmma(
     }
 }
 #endif
+
+__device__ inline float dequant_kv_element(
+    const unsigned char* data,
+    int idx,
+    int quant_format,
+    float scale,
+    float bias
+) {
+    if (quant_format == 0) { // INT8 (signed i8)
+        signed char val = (signed char)data[idx];
+        return ((float)val) * scale + bias;
+    } else if (quant_format == 1) { // INT4 / W4A16 (packed signed nibbles)
+        int byte_idx = idx >> 1;
+        unsigned char b = data[byte_idx];
+        int nibble = (idx & 1) ? ((int)(b >> 4)) : ((int)(b & 0x0F));
+        if (nibble >= 8) nibble -= 16;
+        return ((float)nibble) * scale + bias;
+    } else if (quant_format == 2) { // FP8_E4M3
+        unsigned char b = data[idx];
+        int sign = (b >> 7) & 1;
+        int exp = (b >> 3) & 0x0F;
+        int mant = b & 0x07;
+        float val = 0.0f;
+        if (exp == 0) {
+            val = (float)mant / 8.0f * (1.0f / 64.0f);
+        } else if (exp == 15 && mant == 7) {
+            val = 0.0f;
+        } else {
+            val = (1.0f + (float)mant / 8.0f) * ldexpf(1.0f, exp - 7);
+        }
+        return (sign ? -val : val) * scale;
+    } else if (quant_format == 3) { // FP8_E5M2
+        unsigned char b = data[idx];
+        int sign = (b >> 7) & 1;
+        int exp = (b >> 2) & 0x1F;
+        int mant = b & 0x03;
+        float val = 0.0f;
+        if (exp == 0) {
+            val = (float)mant / 4.0f * (1.0f / 16384.0f);
+        } else if (exp == 31) {
+            val = 0.0f;
+        } else {
+            val = (1.0f + (float)mant / 4.0f) * ldexpf(1.0f, exp - 15);
+        }
+        return (sign ? -val : val) * scale;
+    } else if (quant_format == 4) { // FP4_E2M1 (packed 4-bit)
+        int byte_idx = idx >> 1;
+        unsigned char b = data[byte_idx];
+        int nibble = (idx & 1) ? (b >> 4) : (b & 0x0F);
+        int sign = (nibble >> 3) & 1;
+        int exp = (nibble >> 1) & 0x03;
+        int mant = nibble & 1;
+        float val = (exp == 0) ? ((float)mant * 0.25f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
+        return (sign ? -val : val) * scale;
+    } else if (quant_format == 5) { // MXFP4 (OCP E2M1 with shared block-32 scale)
+        int byte_idx = idx >> 1;
+        unsigned char b = data[byte_idx];
+        int nibble = (idx & 1) ? (b >> 4) : (b & 0x0F);
+        int sign = (nibble >> 3) & 1;
+        int exp = (nibble >> 1) & 0x03;
+        int mant = nibble & 1;
+        float val = (exp == 0) ? ((float)mant * 0.25f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
+        return (sign ? -val : val) * scale;
+    } else if (quant_format == 6) { // MXFP8 (OCP E4M3 with shared block-32 scale)
+        unsigned char b = data[idx];
+        int sign = (b >> 7) & 1;
+        int exp = (b >> 3) & 0x0F;
+        int mant = b & 0x07;
+        float val = (exp == 0) ? ((float)mant / 512.0f) : ((1.0f + (float)mant / 8.0f) * ldexpf(1.0f, exp - 7));
+        return (sign ? -val : val) * scale;
+    }
+    return 0.0f;
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_paged_quant(
+    const float* __restrict__ q,
+    const BlockTableEntry* __restrict__ block_tables,
+    const unsigned char* __restrict__ k_pages,
+    const unsigned char* __restrict__ v_pages,
+    float* __restrict__ out,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_blocks,
+    int page_size,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    int quant_format,
+    float k_scale,
+    float k_bias,
+    float v_scale,
+    float v_bias
+) {
+    const int batch_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    if (batch_idx >= 1 && blockIdx.z > 0) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (batch_idx * num_heads + h) * head_dim;
+    const int abs_i = cache_offset;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][256];
+
+    const int range_lo = window_lo > 0 ? window_lo : 0;
+    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
+    const int range_len = range_hi > range_lo ? range_hi - range_lo : 0;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    const int j_start = range_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
+    const int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const int page_stride = page_size * num_kv_heads * head_dim;
+
+    for (int j = j_start; j < j_end; ++j) {
+        const int page_idx = j / page_size;
+        const int page_offset = j % page_size;
+        if (page_idx >= max_blocks) continue;
+
+        const BlockTableEntry entry = block_tables[batch_idx * max_blocks + page_idx];
+        const int physical_block = entry.block_id;
+
+        const int elem_offset = physical_block * page_stride + (page_offset * num_kv_heads + kv_head) * head_dim;
+
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 256; ++dim) {
+            if (dim < head_dim) {
+                float k_val = dequant_kv_element(k_pages, elem_offset + dim, quant_format, k_scale, k_bias);
+                score += q[q_offset + dim] * k_val;
+            }
+        }
+        score *= inv_sqrt_d;
+
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_val = dequant_kv_element(v_pages, elem_offset + d, quant_format, v_scale, v_bias);
+                out_acc[chunk] += w * v_val;
+            }
+        }
+        running_sum += w;
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        }
+    }
+    __syncthreads();
+
+    if (wave_id == 0) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d >= head_dim) continue;
+
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+
+            for (int w = 1; w < num_waves; ++w) {
+                float mw = s_max[w];
+                float uw = s_sum[w];
+                float aw = s_acc[w][d];
+                if (uw == 0.0f) continue;
+                if (sum_final == 0.0f) {
+                    m_final = mw; sum_final = uw; acc_final = aw;
+                    continue;
+                }
+                float m_new = m_final > mw ? m_final : mw;
+                float scale_a = expf(m_final - m_new);
+                float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+}
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1213,10 +1426,138 @@ pub fn launch_qkv_attention_wmma(
     Ok(())
 }
 
+/// Quantization formats for KV-cache attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum KvCacheQuantFormat {
+    Int8 = 0,
+    Int4 = 1,     // W4A16 packed 4-bit nibbles
+    Fp8E4M3 = 2,
+    Fp8E5M2 = 3,
+    Fp4E2M1 = 4,
+    MxFp4 = 5,
+    MxFp8 = 6,
+}
+
+/// Host launcher for quantized and microscaled paged KV-cache attention.
+pub fn launch_paged_attention_quant(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    block_tables: &dyn BackendStorage,
+    k_pages: &dyn BackendStorage,
+    v_pages: &dyn BackendStorage,
+    out: &mut dyn BackendStorage,
+    batch: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    max_blocks: u32,
+    page_size: u32,
+    kv_seq_len: u32,
+    cache_offset: u32,
+    window_lo: i32,
+    quant_format: KvCacheQuantFormat,
+    k_scale: f32,
+    k_bias: f32,
+    v_scale: f32,
+    v_bias: f32,
+) -> Result<(), crate::Error> {
+    let q_s = q
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("q must be RocmStorage".into()))?;
+    let block_tables_s = block_tables
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("block_tables must be RocmStorage".into()))?;
+    let k_pages_s = k_pages
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("k_pages must be RocmStorage".into()))?;
+    let v_pages_s = v_pages
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("v_pages must be RocmStorage".into()))?;
+    let out_s = out
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("out must be RocmStorage".into()))?;
+
+    let q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no device ptr".into()))?;
+    let block_tables_ptr = block_tables_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("block_tables has no device ptr".into()))?;
+    let k_pages_ptr = k_pages_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_pages has no device ptr".into()))?;
+    let v_pages_ptr = v_pages_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_pages has no device ptr".into()))?;
+    let out_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
+
+    let wf = dev.wavefront_size() as u32;
+    let grid_dim = crate::HipDim3::new(batch, num_heads, 1);
+    let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
+    let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+
+    let mut qptr = q_ptr;
+    let mut btptr = block_tables_ptr;
+    let mut kptr = k_pages_ptr;
+    let mut vptr = v_pages_ptr;
+    let mut optr = out_ptr;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut mb = max_blocks as i32;
+    let mut ps = page_size as i32;
+    let mut ksl = kv_seq_len as i32;
+    let mut co = cache_offset as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut qf = quant_format as i32;
+    let mut ks = k_scale;
+    let mut kb = k_bias;
+    let mut vs = v_scale;
+    let mut vb = v_bias;
+
+    dev.launch_compute_kernel(
+        "grim_qkv_attention_paged_quant",
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut qptr),
+            arg(&mut btptr),
+            arg(&mut kptr),
+            arg(&mut vptr),
+            arg(&mut optr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut mb),
+            arg(&mut ps),
+            arg(&mut ksl),
+            arg(&mut co),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut qf),
+            arg(&mut ks),
+            arg(&mut kb),
+            arg(&mut vs),
+            arg(&mut vb),
+        ],
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grim_tensor::dtype::DType;
+    use grim_tensor::dtype::{ArithType, DType, Storage};
     use grim_tensor::{BackendDevice, Shape};
 
     #[test]
@@ -1224,6 +1565,7 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("void grim_qkv_attention_wmma"));
         assert!(KERNEL_SOURCE.contains("#include <rocwmma/rocwmma.hpp>"));
         assert!(KERNEL_SOURCE.contains("mma_sync(frag_qk, frag_q, frag_k, frag_qk)"));
+        assert!(KERNEL_SOURCE.contains("void grim_qkv_attention_paged_quant"));
     }
 
     // PASSED: 2026-08-20 on gfx1036 (ROCm)
@@ -1307,6 +1649,112 @@ mod tests {
                 wmma_res[i],
                 ref_res[i]
             );
+        }
+    }
+
+    // PASSED: 2026-08-20 on gfx1036 (ROCm)
+    #[test]
+    fn test_paged_attention_quant_formats_gpu() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            return;
+        };
+
+        let batch = 1u32;
+        let num_heads = 2u32;
+        let num_kv_heads = 2u32;
+        let head_dim = 16u32;
+        let page_size = 4u32;
+        let max_blocks = 2u32;
+        let kv_seq_len = 4u32;
+
+        let q_data = vec![1.0f32; (batch * num_heads * head_dim) as usize];
+        let q_shape = Shape::new(vec![batch as usize, num_heads as usize, head_dim as usize]);
+        let q_storage = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
+
+        let block_tables_data = vec![
+            BlockTableEntry { block_id: 0, page_size },
+            BlockTableEntry { block_id: 1, page_size },
+        ];
+        let bt_bytes: Vec<u8> = block_tables_data
+            .iter()
+            .flat_map(|b| {
+                let mut v = Vec::new();
+                v.extend_from_slice(&b.block_id.to_ne_bytes());
+                v.extend_from_slice(&b.page_size.to_ne_bytes());
+                v
+            })
+            .collect();
+        let bt_storage = dev
+            .from_cpu_bytes(
+                &bt_bytes,
+                &Shape::new(vec![block_tables_data.len() * 8]),
+                DType { arith: ArithType::U8, storage: Storage::Native },
+            )
+            .unwrap();
+
+        let total_page_elems = (max_blocks * page_size * num_kv_heads * head_dim) as usize;
+        let k_bytes = vec![2u8; total_page_elems];
+        let v_bytes = vec![3u8; total_page_elems];
+
+        let k_storage = dev
+            .from_cpu_bytes(
+                &k_bytes,
+                &Shape::new(vec![total_page_elems]),
+                DType { arith: ArithType::U8, storage: Storage::Native },
+            )
+            .unwrap();
+        let v_storage = dev
+            .from_cpu_bytes(
+                &v_bytes,
+                &Shape::new(vec![total_page_elems]),
+                DType { arith: ArithType::U8, storage: Storage::Native },
+            )
+            .unwrap();
+
+        let out_shape = Shape::new(vec![batch as usize, num_heads as usize, head_dim as usize]);
+        let mut out_storage = dev.alloc_storage(&out_shape, DType::F32).unwrap();
+
+        // Verify across INT8, INT4 / W4A16, FP8, FP4, MXFP4, MXFP8
+        for fmt in [
+            KvCacheQuantFormat::Int8,
+            KvCacheQuantFormat::Int4,
+            KvCacheQuantFormat::Fp8E4M3,
+            KvCacheQuantFormat::Fp8E5M2,
+            KvCacheQuantFormat::Fp4E2M1,
+            KvCacheQuantFormat::MxFp4,
+            KvCacheQuantFormat::MxFp8,
+        ] {
+            launch_paged_attention_quant(
+                &dev,
+                q_storage.as_ref(),
+                bt_storage.as_ref(),
+                k_storage.as_ref(),
+                v_storage.as_ref(),
+                out_storage.as_mut(),
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                max_blocks,
+                page_size,
+                kv_seq_len,
+                0,
+                0,
+                fmt,
+                0.5f32,
+                0.0f32,
+                0.5f32,
+                0.0f32,
+            )
+            .unwrap();
+            dev.synchronize();
+
+            let out_vec = out_storage.to_cpu_vec_f32().unwrap();
+            assert_eq!(out_vec.len(), (batch * num_heads * head_dim) as usize);
+            assert!(out_vec[0].is_finite());
         }
     }
 }
