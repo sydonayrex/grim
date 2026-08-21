@@ -166,6 +166,7 @@ pub struct Engine {
     tokens_per_sec_ema: f32,
     total_tokens_generated: u64,
     last_ttft_ms: Option<f64>,
+    last_itl_ms: Option<f64>,
     /// Tensor-parallel config stamped onto each `LoadedModel`. Populated in
     /// `Engine::new` when TP is active (one OS process per rank, Design A);
     /// `None` for single-device operation. The actual per-rank device + RCCL
@@ -358,6 +359,7 @@ impl Engine {
             tokens_per_sec_ema: 0.0,
             total_tokens_generated: 0,
             last_ttft_ms: None,
+            last_itl_ms: None,
             tp_config,
             kv_receiver,
             radix_enabled: std::env::var("GRIM_RADIX")
@@ -398,6 +400,27 @@ impl Engine {
     /// latency value for that state.
     pub fn last_ttft_ms(&self) -> Option<f64> {
         self.last_ttft_ms
+    }
+
+    /// Most recent measured inter-token latency in milliseconds. `None` means no
+    /// completed decode step has been observed yet; callers must not invent a
+    /// latency value for that state.
+    pub fn last_itl_ms(&self) -> Option<f64> {
+        self.last_itl_ms
+    }
+
+    /// Runtime speculative decoding telemetry for a specific model, or the
+    /// first loaded model if `model_id` is None. Returns `None` if no model
+    /// is loaded.
+    pub fn speculative_telemetry(
+        &self,
+        model_id: Option<&str>,
+    ) -> Option<grim_speculative::SpeculativeTelemetry> {
+        let model = match model_id {
+            Some(id) => self.models.get(id)?,
+            None => self.models.values().next()?,
+        };
+        Some(model.model.telemetry())
     }
 
     /// Snapshot of scheduler queues for status and metrics consumers.
@@ -659,7 +682,9 @@ impl Engine {
             self.last_ttft_ms = Some(ttft_ms);
         }
         let itl_ms = if decode_count > 0 {
-            decode_elapsed.as_secs_f64() * 1000.0 / decode_count as f64
+            let itl = decode_elapsed.as_secs_f64() * 1000.0 / decode_count as f64;
+            self.last_itl_ms = Some(itl);
+            itl
         } else {
             0.0
         };
@@ -1066,6 +1091,9 @@ mod tests {
         let config = EngineConfig::default();
         let engine = Engine::new(config);
         assert_eq!(engine.tokens_per_sec(), None);
+        assert_eq!(engine.last_ttft_ms(), None);
+        assert_eq!(engine.last_itl_ms(), None);
+        assert!(engine.speculative_telemetry(None).is_none());
         let (used_b, total_b, b_used, b_total) = engine.kv_cache_telemetry();
         assert_eq!(used_b, 0);
         assert!(total_b > 0);

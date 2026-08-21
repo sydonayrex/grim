@@ -5697,4 +5697,209 @@ mod tests {
             assert!(!rewritten.bytes.is_empty());
         }
     }
+
+    #[test]
+    fn test_gemm_packed_matches_dequant_then_gemm() {
+        for &k in &[256, 512, 1536] {
+            let m = 2;
+            let n = 3;
+            let mut a = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                a.push(((i % 17) as f32 - 8.0) * 0.1);
+            }
+            let mut b_f32 = Vec::with_capacity(n * k);
+            for i in 0..(n * k) {
+                b_f32.push(((i % 19) as f32 - 9.0) * 0.1);
+            }
+
+            // Q8_0 test
+            let mut b_q80_bytes = Vec::new();
+            for col in 0..n {
+                let row = &b_f32[col * k..(col + 1) * k];
+                let q = quant_q80(row).expect("quant_q80");
+                b_q80_bytes.extend_from_slice(&q);
+            }
+            let packed_c_q80 = gemm_q8_0_packed(&a, &b_q80_bytes, m, n, k).expect("gemm_q8_0_packed");
+            let dequant_b_q80 = dequant_q80(&b_q80_bytes, n * k).expect("dequant_q80");
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected = 0.0f32;
+                    for l in 0..k {
+                        expected += a[row * k + l] * dequant_b_q80[col * k + l];
+                    }
+                    let actual = packed_c_q80[row * n + col];
+                    assert!(
+                        (actual - expected).abs() < 1e-3,
+                        "Q8_0 k={k} mismatch: actual={actual}, expected={expected}"
+                    );
+                }
+            }
+
+            // Q4_K test
+            let mut b_q4k_bytes = Vec::new();
+            for col in 0..n {
+                let row = &b_f32[col * k..(col + 1) * k];
+                let q = quant_q4k(row).expect("quant_q4k");
+                b_q4k_bytes.extend_from_slice(&q);
+            }
+            let packed_c_q4k = gemm_q4k_packed(&a, &b_q4k_bytes, m, n, k).expect("gemm_q4k_packed");
+            let dequant_b_q4k = dequant_q4k(&b_q4k_bytes, n * k).expect("dequant_q4k");
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected = 0.0f32;
+                    for l in 0..k {
+                        expected += a[row * k + l] * dequant_b_q4k[col * k + l];
+                    }
+                    let actual = packed_c_q4k[row * n + col];
+                    assert!(
+                        (actual - expected).abs() < 1e-3,
+                        "Q4_K k={k} mismatch: actual={actual}, expected={expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed Q8_0 weights.
+/// A has shape [m, k], B has shape [n, k] (in packed Q8_0 bytes).
+pub fn gemm_q8_0_packed(
+    a: &[f32],
+    b_q80_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    if k % 32 != 0 {
+        return Err(Error::Backend(format!(
+            "gemm_q8_0_packed: k ({k}) must be a multiple of 32"
+        )));
+    }
+    let blocks_per_row = k / 32;
+    let stride_b = blocks_per_row * 34;
+    if b_q80_bytes.len() < n * stride_b {
+        return Err(Error::Backend(format!(
+            "gemm_q8_0_packed: buffer too short: expected {}, got {}",
+            n * stride_b,
+            b_q80_bytes.len()
+        )));
+    }
+    if a.len() < m * k {
+        return Err(Error::Backend(format!(
+            "gemm_q8_0_packed: input a too short: expected {}, got {}",
+            m * k,
+            a.len()
+        )));
+    }
+
+    let mut c = vec![0.0f32; m * n];
+
+    for row_m in 0..m {
+        let a_row = &a[row_m * k..(row_m + 1) * k];
+        for col_n in 0..n {
+            let b_row = &b_q80_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+            let mut dot = 0.0f32;
+            let mut b_pos = 0;
+            for blk in 0..blocks_per_row {
+                let scale = f16_to_f32(b_row[b_pos], b_row[b_pos + 1]);
+                b_pos += 2;
+                let a_sub = &a_row[blk * 32..(blk + 1) * 32];
+                let mut sum_i = 0.0f32;
+                for l in 0..32 {
+                    let q = b_row[b_pos + l] as i8 as f32;
+                    sum_i += a_sub[l] * q;
+                }
+                dot += scale * sum_i;
+                b_pos += 32;
+            }
+            c[row_m * n + col_n] = dot;
+        }
+    }
+
+    Ok(c)
+}
+
+/// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed Q4_K weights.
+/// A has shape [m, k], B has shape [n, k] (in packed Q4_K bytes: 144 bytes per 256 weights).
+pub fn gemm_q4k_packed(
+    a: &[f32],
+    b_q4k_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    if k % 256 != 0 {
+        return Err(Error::Backend(format!(
+            "gemm_q4k_packed: k ({k}) must be a multiple of 256"
+        )));
+    }
+    let blocks_per_row = k / 256;
+    let stride_b = blocks_per_row * 144;
+    if b_q4k_bytes.len() < n * stride_b {
+        return Err(Error::Backend(format!(
+            "gemm_q4k_packed: buffer too short: expected {}, got {}",
+            n * stride_b,
+            b_q4k_bytes.len()
+        )));
+    }
+    if a.len() < m * k {
+        return Err(Error::Backend(format!(
+            "gemm_q4k_packed: input a too short: expected {}, got {}",
+            m * k,
+            a.len()
+        )));
+    }
+
+    let mut c = vec![0.0f32; m * n];
+
+    for row_m in 0..m {
+        let a_row = &a[row_m * k..(row_m + 1) * k];
+        for col_n in 0..n {
+            let b_row = &b_q4k_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+            let mut dot = 0.0f32;
+            let mut pos = 0;
+            for blk in 0..blocks_per_row {
+                let a_blk = &a_row[blk * 256..(blk + 1) * 256];
+                let d = f16_to_f32(b_row[pos], b_row[pos + 1]);
+                let min = f16_to_f32(b_row[pos + 2], b_row[pos + 3]);
+                let scales = &b_row[pos + 4..pos + 16];
+                let qs = &b_row[pos + 16..pos + 144];
+
+                let mut q_idx = 0;
+                let mut is = 0;
+                let mut a_offset = 0;
+
+                for _ in 0..4 {
+                    let (sc1, m1) = get_scale_min_k4(is, scales);
+                    let d1 = d * sc1;
+                    let m1_val = min * m1;
+
+                    let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                    let d2 = d * sc2;
+                    let m2_val = min * m2;
+
+                    for l in 0..32 {
+                        let q1 = (qs[q_idx + l] & 0x0F) as f32;
+                        let w = d1 * q1 - m1_val;
+                        dot += a_blk[a_offset + l] * w;
+                    }
+                    a_offset += 32;
+
+                    for l in 0..32 {
+                        let q2 = (qs[q_idx + l] >> 4) as f32;
+                        let w = d2 * q2 - m2_val;
+                        dot += a_blk[a_offset + l] * w;
+                    }
+                    a_offset += 32;
+
+                    q_idx += 32;
+                    is += 2;
+                }
+                pos += 144;
+            }
+            c[row_m * n + col_n] = dot;
+        }
+    }
+
+    Ok(c)
 }

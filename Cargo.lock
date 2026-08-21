@@ -2228,6 +2228,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "grim-backend-tests"
+version = "0.1.0"
+dependencies = [
+ "grim-backend-cpu",
+ "grim-backend-cuda",
+ "grim-backend-rocm",
+ "grim-quant",
+ "grim-tensor",
+ "rand",
+]
+
+[[package]]
 name = "grim-backend-vulkan"
 version = "0.1.0"
 dependencies = [
@@ -2614,6 +2626,7 @@ dependencies = [
  "grim-models-transformer",
  "grim-tensor",
  "rand",
+ "serde",
  "thiserror 1.0.69",
 ]
 

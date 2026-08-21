@@ -37,6 +37,6 @@ pub use llama_mtp_adapter::LlamaMtpAdapter;
 pub use mamba_speculative::{MambaSpeculativeEngine, MambaStepState};
 pub use markov_head::MarkovHead;
 pub use native_mtp::NativeMtp;
-pub use speculative_wrapper::{SpeculativeCausalLm, Strategy};
+pub use speculative_wrapper::{SpeculativeCausalLm, SpeculativeTelemetry, Strategy};
 pub use tiny_draft_backbone::TinyDraftBackbone;
 pub use uniform_markov_head::UniformMarkovHead;

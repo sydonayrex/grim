@@ -18,6 +18,8 @@ pub enum ToolFamily {
     /// Bare-JSON convention (some Mistral/Qwen variants emit a raw JSON object).
     #[allow(dead_code)]
     BareJson,
+    /// LFM2.5 bracket-first convention.
+    BracketFirst,
     /// Unknown template — scanner tries conventions in order.
     Auto,
 }
@@ -46,6 +48,20 @@ pub fn resolve_tool_family(template: &str) -> ToolFamily {
     }
 }
 
+/// Map model architecture name to its expected tool-call convention (§WI-E8).
+pub fn family_for_arch(arch: &str) -> ToolFamily {
+    let lower = arch.to_ascii_lowercase();
+    if lower.contains("lfm2") || lower.contains("liquid") {
+        ToolFamily::BracketFirst
+    } else if lower.contains("llama") || lower.contains("mistral") || lower.contains("qwen") {
+        ToolFamily::TagDelimited
+    } else if lower.contains("deepseek") {
+        ToolFamily::BareJson
+    } else {
+        ToolFamily::Auto
+    }
+}
+
 /// Parse a completion string for tool calls under a given family convention.
 ///
 /// Returns `ParseOutcome { calls: Some(..), .. }` on a clean parse, or
@@ -56,9 +72,19 @@ pub fn resolve_tool_family(template: &str) -> ToolFamily {
 /// we fall back to the other convention so a mislabeled template still works
 /// in the obvious way (rather than giving up). `Auto` tries both in order.
 pub fn parse_tool_calls(completion: &str, family: ToolFamily) -> ParseOutcome {
+    if family == ToolFamily::BracketFirst {
+        let bracket = parse_bracket_call(completion);
+        if let Some(calls) = bracket.calls {
+            return ParseOutcome {
+                calls: Some(calls),
+                diagnostic: bracket.diagnostic,
+            };
+        }
+    }
+
     let (first, second) = match family {
         ToolFamily::BareJson => (parse_bare_json(completion), parse_tag_delimited(completion)),
-        ToolFamily::TagDelimited | ToolFamily::Auto => {
+        ToolFamily::BracketFirst | ToolFamily::TagDelimited | ToolFamily::Auto => {
             (parse_tag_delimited(completion), parse_bare_json(completion))
         }
     };
@@ -708,5 +734,14 @@ mod tests {
             RunawayReason::MessageCountLimit.as_str(),
             "message_count_limit"
         );
+    }
+
+    #[test]
+    fn test_family_for_arch() {
+        assert_eq!(family_for_arch("LFM2.5"), ToolFamily::BracketFirst);
+        assert_eq!(family_for_arch("llama-3"), ToolFamily::TagDelimited);
+        assert_eq!(family_for_arch("qwen2.5"), ToolFamily::TagDelimited);
+        assert_eq!(family_for_arch("deepseek-v3"), ToolFamily::BareJson);
+        assert_eq!(family_for_arch("unknown_arch"), ToolFamily::Auto);
     }
 }

@@ -75,7 +75,7 @@ pub struct ConfidenceScheduler {
 /// steps. The EMA is deterministic (input-driven, no wall-clock) — Gate 4.6.3.
 /// When the EMA drops below the configured floor, `should_adapt_draft` fires,
 /// signaling TIDE's "activate only when beneficial" control.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdaptationState {
     /// EMA of the acceptance rate (`accepted / drafted`). Starts at 1.0
     /// (optimistic) so the first few steps don't trigger a spurious refresh.
@@ -83,6 +83,10 @@ pub struct AdaptationState {
     /// Number of steps observed so far. Used for the initial ramp before
     /// the EMA stabilizes.
     pub steps_observed: u64,
+    /// Cumulative count of draft tokens proposed across all observed decode steps.
+    pub total_drafted_tokens: u64,
+    /// Cumulative count of draft tokens accepted by target verification.
+    pub total_accepted_tokens: u64,
 }
 
 impl Default for AdaptationState {
@@ -90,12 +94,14 @@ impl Default for AdaptationState {
         Self {
             accept_rate_ema: 1.0,
             steps_observed: 0,
+            total_drafted_tokens: 0,
+            total_accepted_tokens: 0,
         }
     }
 }
 
 /// WI 4.4.2 — configuration for the adaptation-trigger decision.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct AdaptationConfig {
     /// EMA smoothing factor (α). `0.15` matches `SelfTuningController`'s
     /// existing EMA alpha for consistency with the codebase's other runtime
@@ -146,6 +152,8 @@ impl ConfidenceScheduler {
         if drafted == 0 {
             return;
         }
+        self.adaptation_state.total_drafted_tokens += drafted as u64;
+        self.adaptation_state.total_accepted_tokens += accepted as u64;
         let rate = (accepted as f64) / (drafted as f64);
         let alpha = self.adaptation_config.ema_alpha;
         self.adaptation_state.accept_rate_ema =
@@ -454,5 +462,16 @@ mod tests {
             "EMA must be identical for identical inputs (Gate 4.6.3)"
         );
         assert_eq!(a.should_adapt_draft(), b.should_adapt_draft());
+    }
+
+    #[test]
+    fn test_record_acceptance_tracks_totals() {
+        let mut sched =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
+        sched.record_acceptance(3, 5);
+        sched.record_acceptance(2, 4);
+        assert_eq!(sched.adaptation_state.total_drafted_tokens, 9);
+        assert_eq!(sched.adaptation_state.total_accepted_tokens, 5);
+        assert_eq!(sched.adaptation_state.steps_observed, 2);
     }
 }

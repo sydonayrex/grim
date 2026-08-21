@@ -1,0 +1,21 @@
+[package]
+name = "grim-backend-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-quant = { workspace = true }
+grim-backend-cpu = { workspace = true }
+grim-backend-rocm = { workspace = true, optional = true }
+grim-backend-cuda = { workspace = true, optional = true }
+rand = { workspace = true }
+
+[features]
+default = []
+cpu-only = []
+rocm = ["dep:grim-backend-rocm"]
+cuda = ["dep:grim-backend-cuda"]

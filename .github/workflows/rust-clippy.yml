@@ -53,3 +53,22 @@ jobs:
         with:
           sarif_file: rust-clippy-results.sarif
           wait-for-processing: true
+
+  backend-parity-cpu:
+    # WI-E9 CPU leg: quant round-trip KATs across all formats (CPU oracle only;
+    # the ROCm/CUDA legs run gated on GRIM_RUN_GPU_TESTS=1 hardware).
+    name: Backend parity (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af #@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run grim-backend-tests (CPU oracle legs)
+        run: cargo test -p grim-backend-tests --features cpu-only
