@@ -2,8 +2,8 @@
 
 use grim_backend_tests::{TEST_K_DIMS, TEST_QUANT_FORMATS};
 use grim_quant::{
-    QuantFormat, dequant_iq4nl, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
-    quant_iq4nl, quant_q4k, quant_q5k, quant_q6k, quant_q80,
+    QuantFormat, dequant_iq4nl, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, quant_iq4nl,
+    quant_q4k, quant_q5k, quant_q6k, quant_q80,
 };
 
 fn generate_deterministic_test_weights(n: usize, seed: u64) -> Vec<f32> {
@@ -160,5 +160,71 @@ fn test_gpu_rocm_dequant_parity() {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
         return;
     }
-    // Gated GPU run when environment enables it — wired in the ROCm parity leg.
+
+    #[cfg(feature = "rocm")]
+    {
+        use grim_backend_rocm::RocmDevice;
+        use grim_tensor::{BackendDevice, DType, Shape};
+
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ROCm device 0 not available: {e}");
+                return;
+            }
+        };
+
+        for &k in TEST_K_DIMS {
+            let original = generate_deterministic_test_weights(k, 0x5EED_0000_1234_5678)
+                .into_iter()
+                .map(|v| v * 0.1)
+                .collect::<Vec<f32>>();
+
+            let shape = Shape::new(vec![k]);
+            let x_storage = dev
+                .from_cpu(&original, &shape, DType::F32)
+                .expect("from_cpu failed");
+
+            // Test Q8_0 GPU quantize -> dequantize roundtrip vs CPU
+            let (q8_storage, h1) = dev
+                .quantize_on_device(x_storage.as_ref(), QuantFormat::Q8_0)
+                .expect("gpu quantize Q8_0");
+            h1.synchronize().expect("gpu sync");
+            let gpu_dequant = q8_storage.to_cpu_vec_f32().expect("gpu dequant to cpu");
+            assert_eq!(gpu_dequant.len(), k);
+
+            let cpu_quant = quant_q80(&original).expect("cpu quant_q80");
+            let cpu_dequant = dequant_q80(&cpu_quant, k).expect("cpu dequant_q80");
+
+            let max_diff = gpu_dequant
+                .iter()
+                .zip(&cpu_dequant)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-4,
+                "GPU vs CPU Q8_0 parity divergence at k={k}: max_diff={max_diff}"
+            );
+
+            // Test Q4_K GPU quantize -> dequantize roundtrip vs CPU
+            let (q4_storage, h2) = dev
+                .quantize_on_device(x_storage.as_ref(), QuantFormat::Q4K)
+                .expect("gpu quantize Q4_K");
+            h2.synchronize().expect("gpu sync");
+            let gpu_q4_dequant = q4_storage.to_cpu_vec_f32().expect("gpu q4 dequant to cpu");
+            assert_eq!(gpu_q4_dequant.len(), k);
+
+            let cpu_q4 = quant_q4k(&original).expect("cpu quant_q4k");
+            let cpu_q4_dequant = dequant_q4k(&cpu_q4, k).expect("cpu dequant_q4k");
+            let max_q4_diff = gpu_q4_dequant
+                .iter()
+                .zip(&cpu_q4_dequant)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_q4_diff < 1e-3,
+                "GPU vs CPU Q4_K parity divergence at k={k}: max_diff={max_q4_diff}"
+            );
+        }
+    }
 }

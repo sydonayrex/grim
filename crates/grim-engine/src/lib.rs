@@ -653,43 +653,44 @@ impl Engine {
         let mut total_accepted = 0usize;
         let mut decode_count = 0usize;
 
-        // Process decode steps grouped by adapter sub-batch (§4.5 multi-LoRA serving)
-        let mut processed_decode = std::collections::HashSet::new();
-        for (_adapter_id, seq_ids) in &output.adapter_batches {
-            for &id in seq_ids {
-                if !output.decode_ids.contains(&id) || self.scheduler.is_paused(id) {
-                    continue;
+        // Process active decode steps across all scheduled requests via step_batch (WI-X1)
+        let mut decode_items = Vec::new();
+        for &id in &output.decode_ids {
+            if !self.scheduler.is_paused(id) {
+                if let Some((model_id, _)) = self.model_for_request(id) {
+                    let start_pos = self.sessions.get(&id).map(|s| s.current_pos()).unwrap_or(0);
+                    let next_token = self
+                        .request_last_token
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(start_pos as u32);
+                    let ids = grim_backend_cpu::cpu_tensor(
+                        vec![next_token as f32],
+                        grim_tensor::Shape::new(vec![1]),
+                    );
+                    let positions = grim_backend_cpu::cpu_tensor(
+                        vec![start_pos as f32],
+                        grim_tensor::Shape::new(vec![1]),
+                    );
+                    decode_items.push((id, model_id.to_string(), ids, positions));
                 }
-                processed_decode.insert(id);
-                decode_count += 1;
-                let dec_start = Instant::now();
-                let outcome = self.drive_decode_with_outcome(id)?;
-                // Record the decode outcome so `last_outcome(id)` reflects
-                // THIS step's logits. Without this insert the server kept
-                // sampling from the stale step-0 prefill logits and emitted
-                // the same token forever.
-                if let Some(o) = outcome.clone() {
-                    total_accepted += o.accepted_tokens;
-                }
-                if let Some(o) = outcome {
-                    self.last_outcomes.insert(id, o);
-                }
-                decode_elapsed += dec_start.elapsed();
             }
         }
-        for &id in &output.decode_ids {
-            if !processed_decode.contains(&id) && !self.scheduler.is_paused(id) {
-                decode_count += 1;
-                let dec_start = Instant::now();
-                let outcome = self.drive_decode_with_outcome(id)?;
-                if let Some(o) = outcome.clone() {
-                    total_accepted += o.accepted_tokens;
-                }
-                if let Some(o) = outcome {
-                    self.last_outcomes.insert(id, o);
-                }
-                decode_elapsed += dec_start.elapsed();
+
+        if !decode_items.is_empty() {
+            let dec_start = Instant::now();
+            let batch_refs: Vec<(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)> =
+                decode_items
+                    .iter()
+                    .map(|(id, m, ids, pos)| (*id, m.as_str(), ids, pos))
+                    .collect();
+            let batch_results = self.step_batch(&batch_refs)?;
+            decode_count = batch_results.len();
+            for (id, outcome) in batch_results {
+                total_accepted += outcome.accepted_tokens;
+                self.last_outcomes.insert(id, outcome);
             }
+            decode_elapsed = dec_start.elapsed();
         }
 
         // MIN-4: Record actual forward-pass wall time, not schedule time.

@@ -22,6 +22,40 @@ pub struct KernelKey {
     pub k: usize,
 }
 
+impl KernelKey {
+    /// Construct a KernelKey for standard QKV attention (WI-X5).
+    pub fn qkv_attention(
+        gpu_arch: &'static str,
+        num_heads: usize,
+        head_dim: usize,
+        kv_seq_len: usize,
+    ) -> Self {
+        Self {
+            kernel: "grim_qkv_attention",
+            gpu_arch,
+            m: num_heads,
+            n: head_dim,
+            k: kv_seq_len,
+        }
+    }
+
+    /// Construct a KernelKey for paged QKV attention (WI-X5).
+    pub fn paged_attention(
+        gpu_arch: &'static str,
+        num_heads: usize,
+        head_dim: usize,
+        kv_seq_len: usize,
+    ) -> Self {
+        Self {
+            kernel: "grim_qkv_attention_paged",
+            gpu_arch,
+            m: num_heads,
+            n: head_dim,
+            k: kv_seq_len,
+        }
+    }
+}
+
 /// Coarse key hierarchy for kernel compilation (excludes fast-changing dimensions like batch/seq_len).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompileKey {
@@ -112,10 +146,7 @@ impl FeatureSet {
             || arch.starts_with("gfx90a");
 
         if self.requires_fp8_mfma {
-            return is_gfx12
-                || is_gfx13
-                || arch.starts_with("gfx94")
-                || arch.starts_with("gfx95");
+            return is_gfx12 || is_gfx13 || arch.starts_with("gfx94") || arch.starts_with("gfx95");
         }
         if self.requires_wmma {
             return is_gfx11 || is_gfx12 || is_gfx13 || is_cdna_mfma;

@@ -89,7 +89,7 @@ pub use injection::{
     InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
     loftq_initialize, oft_initialize, pissa_initialize,
 };
-pub use loss::cross_entropy_loss;
+pub use loss::{cross_entropy_loss, fused_linear_ce, fused_linear_cross_entropy_loss};
 pub use lr_schedule::CosineWarmupSchedule;
 pub use omnigrad::{OmniGradConfig, OmniGradRouter};
 pub use ops::{

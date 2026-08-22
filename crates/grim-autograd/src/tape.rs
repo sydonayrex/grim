@@ -10,7 +10,7 @@
 use crate::param::ParamId;
 use grim_tensor::Tensor;
 use grim_tensor::error::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Identifier for a tensor in the tape's registry. Id-only (no reference)
 /// because the tape owns the tensor data and the graph rewrites itself
@@ -180,6 +180,18 @@ impl Tape {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Free non-boundary intermediate activations to reduce VRAM during gradient checkpointing (WI-X13).
+    /// Retains boundary inputs and parameter tensors required for backward recomputation.
+    pub fn free_intermediate_activations(&mut self) {
+        if !self.is_checkpointing_enabled() {
+            return;
+        }
+        let boundary_set: HashSet<TensorId> = self.checkpoint_boundaries.values().copied().collect();
+        let param_set: HashSet<TensorId> = self.param_tensors.values().copied().collect();
+
+        self.tensors.retain(|id, _| boundary_set.contains(id) || param_set.contains(id));
     }
 
     /// Clear the tape (call between training steps).

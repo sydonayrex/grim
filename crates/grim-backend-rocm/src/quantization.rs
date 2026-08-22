@@ -72,7 +72,9 @@ pub fn gcn_arch(name: &str) -> GcnArch {
             {
                 GcnArch::CDNA3
             }
-            r if r.starts_with("08") || r.starts_with("0a") || r.starts_with("0A") => GcnArch::CDNA2,
+            r if r.starts_with("08") || r.starts_with("0a") || r.starts_with("0A") => {
+                GcnArch::CDNA2
+            }
             r if r.starts_with("06") => GcnArch::CDNA1,
             _ => GcnArch::Other,
         };
@@ -360,7 +362,12 @@ mod self_tests {
 
     #[test]
     fn fp8_capable_buckets_match_spec() {
-        for arch in [GcnArch::RDNA4, GcnArch::CDNA3, GcnArch::CDNA4, GcnArch::UDNA] {
+        for arch in [
+            GcnArch::RDNA4,
+            GcnArch::CDNA3,
+            GcnArch::CDNA4,
+            GcnArch::UDNA,
+        ] {
             let c = arch_capability(arch);
             assert!(
                 c.supports(QuantMode::Fp8Native),

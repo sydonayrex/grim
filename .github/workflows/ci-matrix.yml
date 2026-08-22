@@ -1,0 +1,108 @@
+# WI-X10 — CI matrix: (a) ubuntu workspace CPU tests, (b) self-hosted gfx1036
+# GPU gate + eval smoke, (c) clippy -D warnings on changed crates.
+# The self-hosted job requires a runner labelled `gfx1036` with GRIM_RUN_GPU_TESTS
+# capable hardware and a golden eval baseline in docs/eval/.
+
+name: CI Matrix & Parity
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace-test-cpu:
+    name: Workspace Tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run workspace tests (excluding vulkan)
+        run: cargo test --workspace --exclude grim-backend-vulkan --lib
+
+      - name: Run backend parity tests
+        run: cargo test -p grim-backend-tests
+
+  gpu-gate-gfx1036:
+    # Self-hosted ROCm runner. Skips cleanly when no such runner is registered.
+    name: GPU Gate (gfx1036, self-hosted)
+    runs-on: [self-hosted, gfx1036]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: ROCm backend GPU test suite
+        env:
+          GRIM_RUN_GPU_TESTS: "1"
+        run: cargo test -p grim-backend-rocm --tests
+
+      - name: Eval smoke (ppl delta < 2% vs golden)
+        run: |
+          cargo build -p grim-cli --bin grim-cli
+          ./target/debug/grim-cli eval \
+            --model LFM2.5-350M-Q8_0 --task ppl \
+            --output /tmp/eval-smoke.json
+          python3 scripts/check_eval_regression.py \
+            docs/eval/baseline-lfm25-350m-q8_0.json /tmp/eval-smoke.json --tolerance 0.02
+
+  clippy-changed:
+    name: Clippy (-D warnings, changed crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Determine changed crates
+        id: changed
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          CRATES=$(git diff --name-only "$BASE"...HEAD -- 'crates/*/Cargo.toml' 'Cargo.toml' \
+            | xargs -r -n1 dirname | sed 's|^crates/||' | sort -u | tr '\n' ' ')
+          if git diff --name-only "$BASE"...HEAD -- 'crates/*' | grep -q . && [ -z "$CRATES" ]; then
+            # source changes without Cargo.toml diffs: map via member list
+            CRATES=$(git diff --name-only "$BASE"...HEAD -- 'crates/*/src' \
+              | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          fi
+          echo "crates=$CRATES" >> "$GITHUB_OUTPUT"
+
+      - name: Run clippy on changed crates
+        run: |
+          ARGS=""
+          for c in ${{ steps.changed.outputs.crates }}; do ARGS="$ARGS -p $c"; done
+          if [ -z "$ARGS" ]; then echo "no changed crates"; exit 0; fi
+          cargo clippy $ARGS --all-targets -- -D warnings
+
+  backend-parity-cpu:
+    # WI-E9 CPU leg: quant round-trip KATs across all formats (CPU oracle only;
+    # the ROCm/CUDA legs run gated on GRIM_RUN_GPU_TESTS=1 hardware).
+    name: Backend parity (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run grim-backend-tests (CPU oracle legs)
+        run: cargo test -p grim-backend-tests --features cpu-only

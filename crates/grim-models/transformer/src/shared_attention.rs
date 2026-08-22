@@ -96,6 +96,74 @@ pub fn fused_or_scalar_attention(
     }
 }
 
+/// Paged attention entry point (WI-X2): operates on device-resident KV pages via block tables,
+/// avoiding full-history CPU-to-GPU re-uploading on decode steps.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_paged(
+    q: &[f32],
+    block_tables: &dyn grim_tensor::BackendStorage,
+    k_pages: &dyn grim_tensor::BackendStorage,
+    v_pages: &dyn grim_tensor::BackendStorage,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_blocks: usize,
+    page_size: usize,
+    kv_seq_len: usize,
+    cache_offset: u32,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![1, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &out_shape, DType::F32)?;
+
+    match dev.qkv_attention_paged(
+        q_st.as_ref(),
+        block_tables,
+        k_pages,
+        v_pages,
+        num_kv_heads,
+        max_blocks,
+        page_size,
+        kv_seq_len,
+        cache_offset,
+        window,
+        &out_shape,
+    ) {
+        Ok((storage, _handle)) => {
+            let flat_shape = Shape::new(vec![1, num_heads * head_dim]);
+            Ok(Tensor::new(
+                Arc::from(storage),
+                flat_shape,
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                device.clone(),
+            ))
+        }
+        Err(_) => {
+            // Fallback to scalar attention if paged device kernel is unavailable
+            let k_flat = k_pages.to_cpu_vec_f32().unwrap_or_default();
+            let v_flat = v_pages.to_cpu_vec_f32().unwrap_or_default();
+            scalar_attention(
+                q,
+                &k_flat,
+                &v_flat,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                kv_seq_len,
+                cache_offset as usize,
+                window,
+                1.0 / (head_dim as f32).sqrt(),
+                &dev,
+                device,
+            )
+        }
+    }
+}
+
 /// Like [`fused_or_scalar_attention`] but with an explicit softmax scale
 /// override (e.g. `qk_scale_factor / sqrt(head_dim)`). Used by models whose
 /// config carries a non-unit `qk_scale_factor` (muse_glimmer-class); the

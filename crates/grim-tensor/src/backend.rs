@@ -243,6 +243,79 @@ pub trait BackendDevice: Send + Sync {
         self.mul_scalar(x, 1.0 / scalar, out_shape)
     }
 
+    /// Stochastic or greedy on-device sampling (WI-X3).
+    /// Samples token index directly from logits storage with temperature, top_p, top_k, seed.
+    fn sample_on_device(
+        &self,
+        logits: &dyn BackendStorage,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        seed: u64,
+    ) -> Result<u32> {
+        let cpu_logits = logits.to_cpu_vec_f32()?;
+        if cpu_logits.is_empty() {
+            return Err(crate::error::Error::Backend("sample_on_device: empty logits".into()));
+        }
+        if temperature <= 0.0 || (top_k == 1 && (top_p >= 1.0 || top_p <= 0.0)) {
+            // Greedy argmax
+            let (max_idx, _) = cpu_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap();
+            return Ok(max_idx as u32);
+        }
+        // Stochastic sample with temperature and top-k/top-p filtering
+        let mut scaled: Vec<(usize, f32)> = cpu_logits
+            .iter()
+            .enumerate()
+            .map(|(idx, &l)| (idx, l / temperature))
+            .collect();
+        scaled.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        if top_k > 0 && (top_k as usize) < scaled.len() {
+            scaled.truncate(top_k as usize);
+        }
+        let max_logit = scaled[0].1;
+        let mut exp_sum = 0.0f32;
+        let mut probs: Vec<(usize, f32)> = scaled
+            .iter()
+            .map(|&(idx, l)| {
+                let p = (l - max_logit).exp();
+                exp_sum += p;
+                (idx, p)
+            })
+            .collect();
+        for p in probs.iter_mut() {
+            p.1 /= exp_sum.max(1e-12);
+        }
+        if top_p > 0.0 && top_p < 1.0 {
+            let mut cum = 0.0f32;
+            let mut cutoff = probs.len();
+            for (i, &(_, p)) in probs.iter().enumerate() {
+                cum += p;
+                if cum >= top_p {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(cutoff);
+        }
+        // Deterministic pseudo-random number from seed
+        let mut state = seed.wrapping_add(0x9e3779b97f4a7c15);
+        state = (state ^ (state >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        state = (state ^ (state >> 27)).wrapping_mul(0x94d049bb133111eb);
+        let r = ((state ^ (state >> 31)) as f32) / (u64::MAX as f32);
+        let mut cum = 0.0f32;
+        for &(idx, p) in &probs {
+            cum += p;
+            if r <= cum {
+                return Ok(idx as u32);
+            }
+        }
+        Ok(probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0))
+    }
+
     /// Fused 3-in-1 SwiGLU activation + dynamic quantization:
     /// `y = silu(gate) * up`, dynamically computes block scale, and quantizes `y` to u8 bytes.
     /// Returns `(quantized_bytes_storage, scales_storage, compute_handle)`.

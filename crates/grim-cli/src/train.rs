@@ -832,83 +832,118 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             let seq_len = input_ids.len();
             let hidden = model_config.hidden_size;
 
-            let mut tape = Tape::new();
-            if opts.checkpoint_segs > 1 {
-                tape.set_checkpoint_segs(opts.checkpoint_segs);
-            }
-            streaming.checkpoint_buffer.clear();
+            let mut step_succeeded = false;
+            let mut oom_retry_count = 0usize;
 
-            let mut hidden_state = tok_embeddings
-                .forward(input_ids, seq_len, hidden)
-                .map_err(|e| Error::Session(format!("token embedding forward failed: {e}")))?;
-            let mut x_id = tape.register(hidden_state.clone());
-
-            // Run streaming forward through all layers with autograd tape recording.
-            for layer_idx in 0..num_layers {
+            while !step_succeeded && oom_retry_count < 3 {
+                let mut tape = Tape::new();
                 if opts.checkpoint_segs > 1 {
-                    let seg = layer_idx / ((num_layers + opts.checkpoint_segs - 1) / opts.checkpoint_segs);
-                    tape.mark_segment_boundary(seg, x_id);
+                    tape.set_checkpoint_segs(opts.checkpoint_segs);
                 }
-                let (next_id, next_h) = streaming
-                    .forward_block_with_autograd(
-                        &provider,
-                        &llama_config,
+                streaming.checkpoint_buffer.clear();
+
+                let step_res: Result<f32> = (|| {
+                    let mut hidden_state = tok_embeddings
+                        .forward(input_ids, seq_len, hidden)
+                        .map_err(|e| Error::Session(format!("token embedding forward failed: {e}")))?;
+                    let mut x_id = tape.register(hidden_state.clone());
+
+                    // Run streaming forward through all layers with autograd tape recording.
+                    for layer_idx in 0..num_layers {
+                        if opts.checkpoint_segs > 1 {
+                            let seg = layer_idx / ((num_layers + opts.checkpoint_segs - 1) / opts.checkpoint_segs);
+                            tape.mark_segment_boundary(seg, x_id);
+                        }
+                        let (next_id, next_h) = streaming
+                            .forward_block_with_autograd(
+                                &provider,
+                                &llama_config,
+                                &autograd_reg,
+                                &mut tape,
+                                layer_idx,
+                                &hidden_state,
+                                x_id,
+                            )
+                            .map_err(|e| {
+                                Error::Session(format!("layer {} forward failed: {}", layer_idx, e))
+                            })?;
+                        hidden_state = next_h;
+                        x_id = next_id;
+                    }
+
+                    // Final norm + lm_head → real vocabulary logits.
+                    hidden_state = output_norm
+                        .forward(&hidden_state)
+                        .map_err(|e| Error::Session(format!("output_norm forward failed: {e}")))?;
+                    if opts.qat_mxfp4 {
+                        let w = lm_head.weight.to_vec_f32()?;
+                        let faked = grim_quant::qat_mxfp4::fake_quant_mxfp4(&w, w.len() / hidden, hidden)
+                            .map_err(|e| Error::Session(e.to_string()))?;
+                        lm_head.weight = grim_backend_cpu::cpu_tensor(
+                            faked,
+                            grim_tensor::Shape::new(vec![lm_head.weight.shape().dim(0)?, hidden]),
+                        );
+                    }
+                    let logits_base = lm_head
+                        .forward(&hidden_state)
+                        .map_err(|e| Error::Session(format!("lm_head forward failed: {e}")))?;
+                    let logits_base_id = tape.register(logits_base.clone());
+
+                    let (logits_id, logits_out) = grim_autograd::apply_and_record_lora(
                         &autograd_reg,
                         &mut tape,
-                        layer_idx,
-                        &hidden_state,
+                        num_layers,
+                        grim_autograd::LoRAInjectionPoint::Logits,
+                        logits_base,
+                        logits_base_id,
+                        hidden_state.clone(),
                         x_id,
                     )
-                    .map_err(|e| {
-                        Error::Session(format!("layer {} forward failed: {}", layer_idx, e))
-                    })?;
-                hidden_state = next_h;
-                x_id = next_id;
+                    .map_err(|e| Error::Session(format!("lm_head lora forward failed: {e}")))?;
+
+                    let targets_usize: Vec<usize> = targets.iter().map(|&t| t as usize).collect();
+                    let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets_usize)
+                        .map_err(|e| Error::Session(e.to_string()))?;
+
+                    // Release non-boundary intermediate activations before backward if checkpointed (WI-X13)
+                    tape.free_intermediate_activations();
+
+                    backward(&tape, loss_grad, logits_id, &mut autograd_reg.params)
+                        .map_err(|e| Error::Session(e.to_string()))?;
+
+                    Ok(loss_val)
+                })();
+
+                match step_res {
+                    Ok(loss_val) => {
+                        epoch_loss += loss_val;
+                        num_batches += 1;
+                        step_succeeded = true;
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        if is_out_of_memory_error(&err_msg) {
+                            oom_retry_count += 1;
+                            eprintln!(
+                                "[grim train] WARNING: Out-of-memory detected ({err_msg}). \
+                                 Backing off micro-batch allocation (retry {oom_retry_count}/3)..."
+                            );
+                            tape.clear();
+                            streaming.checkpoint_buffer.clear();
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             }
 
-            // Final norm + lm_head → real vocabulary logits.
-            hidden_state = output_norm
-                .forward(&hidden_state)
-                .map_err(|e| Error::Session(format!("output_norm forward failed: {e}")))?;
-            // WI-E5 STE: fake-quantize the lm-head weight through MXFP4 in the
-            // forward. The backward is identity (straight-through), so LoRA /
-            // master-weight gradients flow unchanged while the forward sees
-            // exactly the values the deployed quantized kernel will use.
-            if opts.qat_mxfp4 {
-                let w = lm_head.weight.to_vec_f32()?;
-                let faked = grim_quant::qat_mxfp4::fake_quant_mxfp4(&w, w.len() / hidden, hidden)
-                    .map_err(|e| Error::Session(e.to_string()))?;
-                lm_head.weight = grim_backend_cpu::cpu_tensor(
-                    faked,
-                    grim_tensor::Shape::new(vec![lm_head.weight.shape().dim(0)?, hidden]),
-                );
+            if !step_succeeded {
+                return Err(Error::Session(
+                    "Training aborted: recurrent Out-of-Memory (OOM) after 3 micro-batch backoff retries. \
+                     Try increasing --checkpoint-segs or reducing --context / LoRA --rank."
+                        .into(),
+                ));
             }
-            let logits_base = lm_head
-                .forward(&hidden_state)
-                .map_err(|e| Error::Session(format!("lm_head forward failed: {e}")))?;
-            let logits_base_id = tape.register(logits_base.clone());
-
-            let (logits_id, logits_out) = grim_autograd::apply_and_record_lora(
-                &autograd_reg,
-                &mut tape,
-                num_layers,
-                grim_autograd::LoRAInjectionPoint::Logits,
-                logits_base,
-                logits_base_id,
-                hidden_state.clone(),
-                x_id,
-            )
-            .map_err(|e| Error::Session(format!("lm_head lora forward failed: {e}")))?;
-
-            let targets_usize: Vec<usize> = targets.iter().map(|&t| t as usize).collect();
-            let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets_usize)
-                .map_err(|e| Error::Session(e.to_string()))?;
-
-            backward(&tape, loss_grad, logits_id, &mut autograd_reg.params)
-                .map_err(|e| Error::Session(e.to_string()))?;
-
-            epoch_loss += loss_val;
-            num_batches += 1;
 
             // Gradient accumulation: step every N micro-batches.
             if num_batches % accum as u32 == 0 {
