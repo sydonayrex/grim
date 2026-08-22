@@ -3915,6 +3915,7 @@ pub fn load_eagle3_from_path(
     let cfg = grim_models_transformer::Eagle3Config {
         vocab_size: 128256,
         hidden_size: 2048,
+        target_hidden_size: 4096,
         num_heads: 16,
         num_kv_heads: 8,
         head_dim: 128,
@@ -3923,6 +3924,7 @@ pub fn load_eagle3_from_path(
         rms_norm_eps: 1e-5,
         rope_theta: 500000.0,
         max_seq_len: 8192,
+        num_target_fusion_layers: 3,
     };
     let model = grim_models_transformer::Eagle3::load(device, &ws, cfg)?;
     Ok(std::sync::Arc::new(model))

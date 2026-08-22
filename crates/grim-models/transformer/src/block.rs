@@ -1534,10 +1534,7 @@ mod tests {
             let kvh = 0;
             let t = 1;
             let s0 = (0..cfg.head_dim)
-                .map(|d| {
-                    qd[t * num_head_dims + h * cfg.head_dim + d]
-                        * kd[kvh * cfg.head_dim + d]
-                })
+                .map(|d| qd[t * num_head_dims + h * cfg.head_dim + d] * kd[kvh * cfg.head_dim + d])
                 .sum::<f32>()
                 * scale;
             let s1 = (0..cfg.head_dim)

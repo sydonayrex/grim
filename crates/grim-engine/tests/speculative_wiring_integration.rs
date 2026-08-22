@@ -48,6 +48,7 @@ fn test_engine_speculative_eagle3_registration() {
     let eagle3_cfg = Eagle3Config {
         vocab_size: 100,
         hidden_size: 64,
+        target_hidden_size: 64,
         num_heads: 4,
         num_kv_heads: 2,
         head_dim: 16,
@@ -56,32 +57,10 @@ fn test_engine_speculative_eagle3_registration() {
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
         max_seq_len: 256,
+        num_target_fusion_layers: 3,
     };
 
-    let eagle3 = Eagle3 {
-        cfg: eagle3_cfg,
-        device: Device::Cpu,
-        inner: Llama {
-            cfg: base_cfg,
-            device: Device::Cpu,
-            tok_embeddings: Embedding {
-                weight: grim_backend_cpu::cpu_tensor(
-                    vec![0.01; 100 * 64],
-                    Shape::new(vec![100, 64]),
-                ),
-            },
-            layers: Vec::new(),
-            moe_blocks: Vec::new(),
-            norm: RmsNorm::new(
-                grim_backend_cpu::cpu_tensor(vec![1.0; 64], Shape::new(vec![64])),
-                1e-5,
-            ),
-            output: Linear::from_tensor(
-                grim_backend_cpu::cpu_tensor(vec![0.01; 100 * 64], Shape::new(vec![100, 64])),
-                None,
-            ),
-        },
-    };
+    let eagle3 = Eagle3::random(Device::Cpu, eagle3_cfg);
 
     // 3. Register EAGLE3 model with Engine
     engine.register_eagle3_model("test-model", Box::new(base_lm), Arc::new(eagle3));

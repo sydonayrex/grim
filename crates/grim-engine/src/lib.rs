@@ -383,10 +383,6 @@ impl Engine {
         self.kv_receiver.as_ref()
     }
 
-    /// Register a `CausalLm` auto-wrapped in `SpeculativeCausalLm::auto`.
-    /// §5.3: speculative decoding is the standard decode path, not opt-in.
-    /// Plain autoregressive is the unconfigured fallback.
-
     /// Returns the exponential moving average of generated tokens per second.
     /// Returns None if no model is loaded or no tokens have been generated yet.
     pub fn tokens_per_sec(&self) -> Option<f32> {
@@ -2219,6 +2215,7 @@ mod tests {
         let eagle3_cfg = grim_models_transformer::Eagle3Config {
             vocab_size: 256,
             hidden_size: 32,
+            target_hidden_size: 32,
             num_heads: 2,
             num_kv_heads: 1,
             head_dim: 16,
@@ -2227,29 +2224,12 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 64,
+            num_target_fusion_layers: 3,
         };
-        let inner_llama = Llama::random(
+        let eagle3 = Arc::new(grim_models_transformer::Eagle3::random(
             Device::Cpu,
-            LlamaConfig {
-                vocab_size: 256,
-                hidden_size: 32,
-                num_heads: 2,
-                num_kv_heads: 1,
-                head_dim: 16,
-                num_layers: 1,
-                intermediate_size: 64,
-                rms_norm_eps: 1e-5,
-                rope_theta: 10000.0,
-                max_seq_len: 64,
-                partial_rotary_factor: 1.0,
-                yarn: None,
-            },
-        );
-        let eagle3 = Arc::new(grim_models_transformer::Eagle3 {
-            cfg: eagle3_cfg,
-            device: Device::Cpu,
-            inner: inner_llama,
-        });
+            eagle3_cfg,
+        ));
         engine.register_eagle3_model("llama-eagle3", small_llama(), eagle3);
         assert!(engine.models.contains_key("llama-eagle3"));
     }
