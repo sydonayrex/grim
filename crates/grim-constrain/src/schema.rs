@@ -621,8 +621,8 @@ fn scan_string_constraints(schema: &Value) -> bool {
         _ => false,
     }
 }
+#[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]

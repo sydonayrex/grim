@@ -991,7 +991,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let mut epoch_loss = 0.0f32;
         let mut num_batches = 0u32;
 
-        for (batch_idx, (tokens, labels)) in dataset.iter().enumerate() {
+        for (_batch_idx, (tokens, labels)) in dataset.iter().enumerate() {
             // F8 note: single-replica process — dropping batches here would
             // train on 1/N of the data for zero benefit, so every batch runs.
             // Per-GPU replicas remain garage-side until in-process fanout lands.

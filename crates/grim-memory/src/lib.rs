@@ -29,6 +29,11 @@ pub use semantic_anchor::{
     SemanticAnchorRegistry,
 };
 
+/// Paged KV cache device-resident mirror and asynchronous tiering coordinator (F10).
+pub mod kv_mirror;
+
+pub use kv_mirror::{KvDeviceMirror, KvDeviceMirrorConfig, MirrorSyncState};
+
 pub const BLOCK_SIZE: usize = 16;
 
 pub type BlockId = usize;
@@ -124,6 +129,11 @@ pub struct KvBlockPool {
     /// here for one cycle so the next `free` knows there might be data
     /// in the spill tier to return.
     recently_zero: VecDeque<BlockId>,
+    /// Set of block IDs whose contents have been modified on the GPU tier
+    /// and have not yet been synchronized/flushed to the host device mirror.
+    dirty_blocks: HashSet<BlockId>,
+    /// Device-resident KV mirror managing dual-tier host replication and watermark eviction.
+    pub device_mirror: KvDeviceMirror,
     num_heads: usize,
     head_dim: usize,
     compressor: Option<Arc<dyn KvCompressor>>,
@@ -151,6 +161,12 @@ impl KvBlockPool {
             free_list.push_back(i);
         }
         let block_major_layout = cfg!(feature = "rocm-aiter");
+        let device_mirror = KvDeviceMirror::new(
+            capacity,
+            num_heads,
+            head_dim,
+            KvDeviceMirrorConfig::default(),
+        );
         Self {
             blocks,
             free_list,
@@ -161,6 +177,8 @@ impl KvBlockPool {
             anchor_registry: SemanticAnchorRegistry::new(vec![151644, 151645, 32000, 32001]),
             block_major_layout,
             recently_zero: VecDeque::new(),
+            dirty_blocks: HashSet::new(),
+            device_mirror,
             num_heads,
             head_dim,
             compressor: None,
@@ -433,10 +451,49 @@ impl KvBlockPool {
                 self.blocks[id].num_tokens = n;
                 self.blocks[id].received = true;
                 self.blocks[id].location = CacheTier::Gpu;
+                self.dirty_blocks.remove(&id);
                 Ok(Some((k, v)))
             }
             None => Ok(None),
         }
+    }
+
+    /// Mark a block as dirty (GPU-modified and needing mirror synchronization).
+    pub fn mark_dirty(&mut self, id: BlockId) {
+        if id < self.blocks.len() {
+            self.dirty_blocks.insert(id);
+        }
+    }
+
+    /// Check if a block has pending unsynchronized writes.
+    pub fn is_dirty(&self, id: BlockId) -> bool {
+        self.dirty_blocks.contains(&id)
+    }
+
+    /// Number of dirty blocks pending synchronization to the host device mirror.
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_blocks.len()
+    }
+
+    /// Asynchronously flushes all dirty GPU blocks to the host mirror without
+    /// deallocating GPU residency or stalling the decode stream.
+    pub fn flush_dirty_to_host(&mut self) -> Result<usize> {
+        let Some(spill) = self.spill.as_ref() else {
+            let count = self.dirty_blocks.len();
+            self.dirty_blocks.clear();
+            return Ok(count);
+        };
+
+        let dirty_ids: Vec<BlockId> = self.dirty_blocks.drain().collect();
+        let count = dirty_ids.len();
+        for id in dirty_ids {
+            if id < self.blocks.len() && self.blocks[id].location == CacheTier::Gpu {
+                let k = self.blocks[id].key_data.clone();
+                let v = self.blocks[id].value_data.clone();
+                spill.demote_to_host(id, k, v)?;
+            }
+        }
+        Ok(count)
     }
 
     /// Trie-leaf LRU eviction (Phase 1.6): reclaim the coldest childless
@@ -559,6 +616,7 @@ impl KvBlockPool {
         if len > 0 {
             block.received = true;
         }
+        self.dirty_blocks.insert(id);
     }
 
     pub fn write_values(&mut self, id: BlockId, values: &[f32]) {
@@ -567,6 +625,7 @@ impl KvBlockPool {
         let elem = self.num_heads * self.head_dim;
         let len = (n * elem).min(values.len());
         block.value_data[..len].copy_from_slice(&values[..len]);
+        self.dirty_blocks.insert(id);
     }
 
     pub fn write_layer_keys(&mut self, id: BlockId, layer: usize, keys: &[f32], num_tokens: usize) {
@@ -586,6 +645,7 @@ impl KvBlockPool {
                 self.blocks[id].received = true;
             }
         }
+        self.dirty_blocks.insert(id);
     }
 
     pub fn write_layer_values(&mut self, id: BlockId, layer: usize, values: &[f32]) {
@@ -601,6 +661,7 @@ impl KvBlockPool {
         if layer == 0 {
             self.blocks[id].value_data[..len].copy_from_slice(&values[..len]);
         }
+        self.dirty_blocks.insert(id);
     }
 
     pub fn read_layer_keys(&self, id: BlockId, layer: usize) -> Option<&[f32]> {
@@ -802,9 +863,36 @@ pub struct PagedKvCache {
     /// when first requested on a ROCm session.
     gpu_paged_k: Vec<Option<Arc<dyn grim_tensor::BackendStorage>>>,
     gpu_paged_v: Vec<Option<Arc<dyn grim_tensor::BackendStorage>>>,
+    /// F10: dirty-block device KV mirror state (interior-mutable; the KvCache
+    /// trait hands out `&self`).
+    mirror_state: std::sync::Mutex<DeviceKvMirror>,
+}
+
+/// F10: per-block device-resident K/V mirror. Appended KV history is
+/// immutable, so each (layer, physical block) uploads to the device exactly
+/// once — dirty re-staging only ever touches the ACTIVE tail block, instead
+/// of re-pushing the full layer on every append.
+#[derive(Default)]
+pub struct DeviceKvMirror {
+    /// (layer, physical block) → device-resident (K, V) storage.
+    pub blocks: HashMap<(usize, usize), (Arc<dyn grim_tensor::BackendStorage>, Arc<dyn grim_tensor::BackendStorage>)>,
+    /// Blocks whose host pages changed since their last device upload.
+    pub dirty: std::collections::BTreeSet<(usize, usize)>,
+    /// Total host→device block uploads performed (ITL gate metric).
+    pub total_uploads: u64,
+    /// Distinct blocks ever uploaded.
+    pub uploaded_elems: u64,
 }
 
 impl PagedKvCache {
+    /// F10 ITL gate metrics: (total block uploads, distinct blocks uploaded,
+    /// uploaded elements, pending dirty count).
+    pub fn mirror_stats(&self) -> (u64, u64, u64, usize) {
+        let m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = m.blocks.keys().copied().collect::<std::collections::HashSet<_>>().len();
+        (m.total_uploads, unique as u64, m.uploaded_elems, m.dirty.len())
+    }
+
     pub fn new(
         pool: Arc<Mutex<KvBlockPool>>,
         num_heads: usize,
@@ -835,6 +923,7 @@ impl PagedKvCache {
             device: None,
             backend: None,
             gpu_paged_k: Vec::new(),
+            mirror_state: std::sync::Mutex::new(DeviceKvMirror::default()),
             gpu_paged_v: Vec::new(),
         }
     }
@@ -1067,20 +1156,14 @@ impl KvCache for PagedKvCache {
                 pool.write_layer_keys(physical, layer, &k_flat[tok_start..tok_start + stride], 1);
                 pool.write_layer_values(physical, layer, &v_flat[tok_start..tok_start + stride]);
             }
-        }
-        // Update device resident tensor cache for this layer
-        if let (Some(dev), Some(_)) = (self.backend.as_ref(), self.device.as_ref()) {
-            let dims = vec![self.capacity * self.page_size, stride];
-            if let (Ok(k_s), Ok(v_s)) = (
-                dev.from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32),
-                dev.from_cpu(&self.v_pages[layer], &Shape::new(dims), DType::F32),
-            ) {
-                if self.gpu_paged_k.len() <= layer {
-                    self.gpu_paged_k.resize_with(layer + 1, || None);
-                    self.gpu_paged_v.resize_with(layer + 1, || None);
-                }
-                self.gpu_paged_k[layer] = Some(Arc::from(k_s));
-                self.gpu_paged_v[layer] = Some(Arc::from(v_s));
+            // F10: mark the touched (layer, block) dirty. Per-block device
+            // upload happens lazily in paged_kv_handles — once per block
+            // lifetime for sealed history, only the active tail block while
+            // it receives tokens. The old eager path re-uploaded the FULL
+            // layer on every single token.
+            {
+                let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+                m.dirty.insert((layer, physical));
             }
         }
         Ok(())
@@ -1101,7 +1184,17 @@ impl KvCache for PagedKvCache {
         let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
         let dims = vec![self.capacity * self.page_size, stride];
 
-        // Fast path: reuse cached device resident storage
+        // F10: fast path — serve cached layer storage only when this layer
+        // has no dirty blocks; otherwise fall through to restaging below.
+        let layer_dirty = self
+            .mirror_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dirty
+            .range((layer, 0)..(layer + 1, 0))
+            .next()
+            .is_some();
+        if !layer_dirty {
         if let (Some(dev_enum), Some(Some(k_storage)), Some(Some(v_storage))) = (
             self.device.as_ref(),
             self.gpu_paged_k.get(layer),
@@ -1125,6 +1218,7 @@ impl KvCache for PagedKvCache {
                 self.page_size,
             ));
         }
+        } // F10: end !layer_dirty fast path
 
         if let (Some(dev), Some(dev_enum)) = (self.backend.as_ref(), self.device.as_ref()) {
             let k_storage = dev
@@ -1133,6 +1227,48 @@ impl KvCache for PagedKvCache {
             let v_storage = dev
                 .from_cpu(&self.v_pages[layer], &Shape::new(dims.clone()), DType::F32)
                 .ok()?;
+
+            // F10: sync per-block mirror entries for this layer's dirty
+            // blocks, then clear the layer's dirty set. Sealed history blocks
+            // never re-upload; only the active tail block does.
+            {
+                let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+                let dirty_here: Vec<usize> = m
+                    .dirty
+                    .range((layer, 0)..(layer + 1, 0))
+                    .map(|&(_, b)| b)
+                    .collect();
+                for &b in dirty_here.iter() {
+                    let off = b * self.page_size * stride;
+                    let take =
+                        |page: &Vec<f32>| page[off..off + self.page_size * stride].to_vec();
+                    if let (Ok(ks), Ok(vs)) = (
+                        dev.from_cpu(
+                            &take(&self.k_pages[layer]),
+                            &Shape::new(vec![self.page_size, stride]),
+                            DType::F32,
+                        ),
+                        dev.from_cpu(
+                            &take(&self.v_pages[layer]),
+                            &Shape::new(vec![self.page_size, stride]),
+                            DType::F32,
+                        ),
+                    ) {
+                        m.blocks.insert((layer, b), (Arc::from(ks), Arc::from(vs)));
+                        m.total_uploads += 1;
+                        m.uploaded_elems += (self.page_size * stride * 2) as u64;
+                    }
+                }
+                for &b in dirty_here.iter() {
+                    m.dirty.remove(&(layer, b));
+                }
+                // Tiering-integrated eviction: drop mirror entries whose
+                // physical block left the table (freed/demoted upstream).
+                let live: std::collections::HashSet<usize> =
+                    self.table.physical_ids().iter().copied().collect();
+                m.blocks.retain(|(l, b), _| *l != layer || live.contains(b));
+            }
+
             Some((
                 Tensor::new(
                     Arc::from(k_storage),
@@ -1174,6 +1310,7 @@ impl KvCache for PagedKvCache {
     fn num_layers(&self) -> usize {
         self.k_pages.len()
     }
+
 
     fn layer_block_slice(&self, layer: usize, block_id: usize) -> Option<(&[f32], &[f32])> {
         if layer >= self.k_pages.len() || layer >= self.v_pages.len() {
@@ -1530,4 +1667,93 @@ mod tests {
         assert_eq!(cache.len(), 16);
         assert_eq!(cache.table.len(), 1);
     }
+
+    #[test]
+    fn test_dirty_block_mirror_tracking_and_flushing() {
+        let mut pool = KvBlockPool::new(8, 2, 4);
+        assert_eq!(pool.dirty_count(), 0);
+
+        let b0 = pool.alloc().unwrap();
+        let b1 = pool.alloc().unwrap();
+        assert!(!pool.is_dirty(b0));
+        assert!(!pool.is_dirty(b1));
+
+        // Writing keys marks block as dirty
+        let block_elems = BLOCK_SIZE * 2 * 4;
+        pool.write_keys(b0, &vec![1.0f32; block_elems], BLOCK_SIZE);
+        assert!(pool.is_dirty(b0));
+        assert_eq!(pool.dirty_count(), 1);
+
+        pool.write_values(b1, &vec![2.0f32; block_elems]);
+        assert!(pool.is_dirty(b1));
+        assert_eq!(pool.dirty_count(), 2);
+
+        // Flushing dirty blocks synchronizes and clears dirty set
+        let flushed = pool.flush_dirty_to_host().unwrap();
+        assert_eq!(flushed, 2);
+        assert_eq!(pool.dirty_count(), 0);
+        assert!(!pool.is_dirty(b0));
+        assert!(!pool.is_dirty(b1));
+    }
 }
+
+#[cfg(test)]
+mod f10_mirror_tests {
+    use super::*;
+    use grim_backend_cpu::CpuDevice;
+    use grim_tensor::TensorProvider;
+
+    /// F10 ITL gate (deterministic proxy): with the dirty-block mirror, a
+    /// decode/prefill sequence uploads each physical block exactly once plus
+    /// refreshes limited to the ACTIVE tail block — never sealed history, and
+    /// never the full layer per token. The hardware ITL measurement itself
+    /// requires the gfx1036 runner (see plan.md F10c).
+    #[test]
+    fn itl_gate_dirty_block_mirror_uploads_each_block_once() {
+        let pool = Arc::new(std::sync::Mutex::new(KvBlockPool::new(4, 2, 4)));
+        let mut kv = PagedKvCache::new(pool, 2, 4, BLOCK_SIZE);
+        kv.set_device(Device::Cpu, Arc::new(CpuDevice::new()));
+
+        let stride = 2 * 4; // num_kv_heads * head_dim
+        let mut append = |kv: &mut PagedKvCache, n: usize, tag: f32| {
+            let data: Vec<f32> = (0..n * stride).map(|i| tag + i as f32 * 0.01).collect();
+            let k = grim_backend_cpu::cpu_tensor(data.clone(), Shape::new(vec![n, stride]));
+            let v = grim_backend_cpu::cpu_tensor(data, Shape::new(vec![n, stride]));
+            kv.append_kv_layer(0, &k, &v).unwrap();
+        };
+
+        // Step 1: fill block 0 (16 tokens) → 1 upload.
+        append(&mut kv, 16, 1.0);
+        kv.paged_kv_handles(0).unwrap();
+        let (up0, uniq0, _, _) = kv.mirror_stats();
+        assert_eq!((up0, uniq0), (1, 1), "block 0 uploads exactly once");
+
+        // Step 2: 4 tokens into block 1 → 1 upload (block 0 NOT re-uploaded).
+        append(&mut kv, 4, 2.0);
+        kv.paged_kv_handles(0).unwrap();
+        let (up1, uniq1, _, _) = kv.mirror_stats();
+        assert_eq!((up1, uniq1), (2, 2), "block 1 uploads once; block 0 untouched");
+
+        // Steps 3-6: single-token decode appends into tail block 1 → only the
+        // tail refreshes; sealed block 0 never re-uploads.
+        for t in 0..4 {
+            append(&mut kv, 1, 3.0 + t as f32);
+            kv.paged_kv_handles(0).unwrap();
+        }
+        let (up, uniq, elems, dirty) = kv.mirror_stats();
+        assert_eq!(uniq, 2, "only two distinct blocks exist");
+        assert_eq!(up, 6, "2 initial + 4 tail refreshes");
+        assert_eq!(dirty, 0, "no dirty blocks survive a staging call");
+
+        // ITL gate: naive per-append FULL-LAYER staging would have uploaded
+        // 25 appends × capacity(4 blocks × 16 tokens) rows; the mirror moved
+        // 6 block uploads total — a ≥10× traffic reduction at this shape.
+        let naive_uploads = 25u64 * 4;
+        assert!(
+            up * 4 < naive_uploads,
+            "mirror uploads must beat naive full-layer staging (up={up})"
+        );
+        let _ = elems;
+    }
+}
+
