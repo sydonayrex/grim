@@ -566,6 +566,17 @@ impl Engine {
         );
     }
 
+    /// Register an EAGLE3 speculative drafter model coupled with a base model.
+    pub fn register_eagle3_model(
+        &mut self,
+        id: &str,
+        base_model: Box<dyn CausalLm>,
+        eagle3_model: Arc<grim_models_transformer::Eagle3>,
+    ) {
+        let drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3_model));
+        self.register_speculative(id, base_model, Some(drafter), None, None);
+    }
+
     /// Register a multi-LoRA adapter against a base model. The adapter is
     /// keyed by its [`AdapterHandle::id`] and dispatched into the forward
     /// pass when callers pass `&[AdapterHandle]` that references it.
@@ -2025,5 +2036,67 @@ mod tests {
 
         assert_eq!(matched_tokens, 16);
         assert_eq!(matched_blocks, block_ids1);
+    }
+
+    #[test]
+    fn test_engine_speculative_mtp_and_eagle3_registration() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let llama = Llama::random(
+            Device::Cpu,
+            LlamaConfig {
+                vocab_size: 256,
+                hidden_size: 32,
+                num_heads: 2,
+                num_kv_heads: 1,
+                head_dim: 16,
+                num_layers: 1,
+                intermediate_size: 64,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 64,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        );
+        let mtp = Arc::new(grim_models_transformer::LlamaMtp::new_random(llama, 2));
+        engine.register_native_mtp_model("llama-mtp", mtp);
+        assert!(engine.models.contains_key("llama-mtp"));
+
+        let eagle3_cfg = grim_models_transformer::Eagle3Config {
+            vocab_size: 256,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 16,
+            num_layers: 1,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 64,
+        };
+        let inner_llama = Llama::random(
+            Device::Cpu,
+            LlamaConfig {
+                vocab_size: 256,
+                hidden_size: 32,
+                num_heads: 2,
+                num_kv_heads: 1,
+                head_dim: 16,
+                num_layers: 1,
+                intermediate_size: 64,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 64,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        );
+        let eagle3 = Arc::new(grim_models_transformer::Eagle3 {
+            cfg: eagle3_cfg,
+            device: Device::Cpu,
+            inner: inner_llama,
+        });
+        engine.register_eagle3_model("llama-eagle3", small_llama(), eagle3);
+        assert!(engine.models.contains_key("llama-eagle3"));
     }
 }
