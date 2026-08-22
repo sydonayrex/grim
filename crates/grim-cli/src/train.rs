@@ -750,10 +750,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         opts.olora_lambda,
         opts.use_spectral_qlora || is_soul_eater,
     );
+    let scope = if is_full_param {
+        AutogradScope::FullParameter
+    } else {
+        AutogradScope::default()
+    };
+
     let mut autograd_reg = AutogradRegistry::with_seed_and_dtype(
         model_config.clone(),
         injection_reg,
-        AutogradScope::default(),
+        scope,
         opts.seed,
         opts.train_dtype.to_dtype(),
     )
