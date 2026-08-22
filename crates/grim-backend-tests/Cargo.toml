@@ -15,7 +15,12 @@ grim-backend-cuda = { workspace = true, optional = true }
 rand = { workspace = true }
 
 [features]
-default = []
+default = ["rocm"]
 cpu-only = []
 rocm = ["dep:grim-backend-rocm"]
 cuda = ["dep:grim-backend-cuda"]
+
+[[bench]]
+name = "op_timing"
+harness = false
+

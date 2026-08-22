@@ -681,7 +681,10 @@ impl RocmDevice {
     pub fn set_decode_gemm_enabled(&self, enabled: bool) {
         // Write the AtomicBool shadow first (lock-free hot-path reads this).
         self.decode_gemm_enabled.store(enabled, Ordering::Relaxed);
-        let mut cfg = self.decode_gemm_config.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = self
+            .decode_gemm_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
@@ -689,7 +692,10 @@ impl RocmDevice {
     pub fn set_fused_dequant_gemm_enabled(&self, enabled: bool) {
         self.fused_dequant_gemm_enabled
             .store(enabled, Ordering::Relaxed);
-        let mut cfg = self.fused_dequant_gemm_config.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = self
+            .fused_dequant_gemm_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
@@ -703,14 +709,20 @@ impl RocmDevice {
 
     /// Set whether SplitK GEMM is enabled (WI-D).
     pub fn set_split_k_enabled(&self, enabled: bool) {
-        let mut cfg = self.split_k_config.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = self
+            .split_k_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
     /// Set whether the JIT compiled WMMA GEMM kernel is enabled (WI-G). [see: `grim_wmma_gemm`]
     pub fn set_wmma_gemm_enabled(&self, enabled: bool) {
         self.wmma_gemm_enabled.store(enabled, Ordering::Relaxed);
-        let mut cfg = self.wmma_gemm_config.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = self
+            .wmma_gemm_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
@@ -824,7 +836,10 @@ impl RocmDevice {
     /// If a graph-capture session is active, returns the dedicated capture stream. [see: `None`]
     fn active_capture_stream(&self) -> Option<*mut c_void> {
         if self.capture_active.load(Ordering::SeqCst) {
-            *self.capture_stream.read().unwrap_or_else(|e| e.into_inner())
+            *self
+                .capture_stream
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
         } else {
             None
         }
@@ -884,7 +899,10 @@ impl RocmDevice {
             ));
         }
         // Lazily create the capture stream; it lives for the device lifetime so rocblas
-        let mut cs = self.capture_stream.write().unwrap_or_else(|e| e.into_inner());
+        let mut cs = self
+            .capture_stream
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if cs.is_none() {
             let mut stream: *mut c_void = std::ptr::null_mut();
             let res = unsafe { hipStreamCreate(&mut stream) };
@@ -966,7 +984,10 @@ impl RocmDevice {
                 res
             )));
         }
-        let mut cache = self.captured_graphs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .captured_graphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(old) = cache.insert(key.to_string(), CapturedGraph { graph, exec }) {
             unsafe {
                 let _ = hipGraphExecDestroy(old.exec);
@@ -991,10 +1012,16 @@ impl RocmDevice {
         }
         // Replay on the same capture stream the graph was recorded on, so the rocblas
         let stream = {
-            let cs = self.capture_stream.read().unwrap_or_else(|e| e.into_inner());
+            let cs = self
+                .capture_stream
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             cs.unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()))
         };
-        let cache = self.captured_graphs.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = self
+            .captured_graphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match cache.get(key) {
             Some(g) => {
                 // Bind rocblas to the replay stream so its captured GEMM node executes there.
@@ -1022,7 +1049,10 @@ impl RocmDevice {
 
     /// True if a graph is cached under `key` (useful for callers deciding whether to
     pub fn has_captured_graph(&self, key: &str) -> bool {
-        self.captured_graphs.lock().unwrap_or_else(|e| e.into_inner()).contains_key(key)
+        self.captured_graphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 
     // =============================================================================
@@ -1031,7 +1061,10 @@ impl RocmDevice {
 
     /// Lazily-initialized GraphCaptureManager for decode-step graph capture.
     fn ensure_graph_capture_mgr(&self) {
-        let mut mgr = self.graph_capture_mgr.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mgr = self
+            .graph_capture_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if mgr.is_none() {
             *mgr = Some(crate::graph_capture::GraphCaptureManager::for_device(self));
         }
@@ -1054,7 +1087,10 @@ impl RocmDevice {
         k: usize,
     ) -> Result<bool> {
         self.ensure_graph_capture_mgr();
-        let mgr = self.graph_capture_mgr.lock().unwrap_or_else(|e| e.into_inner());
+        let mgr = self
+            .graph_capture_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mgr = mgr.as_ref().ok_or_else(|| {
             Error::Backend(
                 "decode_graph_capture_and_replay: graph capture manager not initialized".into(),
@@ -1633,7 +1669,12 @@ impl Drop for RocmDevice {
             }
         }
         // Destroy the capture stream (owned for the device lifetime). By now the
-        if let Some(stream) = self.capture_stream.write().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(stream) = self
+            .capture_stream
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             unsafe {
                 let _ = hipStreamDestroy(stream);
             }
@@ -4030,28 +4071,43 @@ impl BackendDevice for RocmDevice {
         let q_abs = q_absorbed
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_absorbed is not RocmStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: q_absorbed is not RocmStorage".into())
+            })?;
         let q_r = q_rope
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_rope is not RocmStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: q_rope is not RocmStorage".into())
+            })?;
         let kv = kv_cache
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: kv_cache is not RocmStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: kv_cache is not RocmStorage".into())
+            })?;
         let o = out
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("mla_absorbed_decode: out is not RocmStorage".into()))?;
         let w = w_uv
             .map(|s| {
-                s.as_any()
-                    .downcast_ref::<RocmStorage>()
-                    .ok_or_else(|| Error::Backend("mla_absorbed_decode: w_uv is not RocmStorage".into()))
+                s.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("mla_absorbed_decode: w_uv is not RocmStorage".into())
+                })
             })
             .transpose()?;
         self.launch_mla_absorbed_decode(
-            q_abs, q_r, kv, w, o, num_heads, kv_lora_rank, qk_rope_dim, v_head_dim, seq_len,
+            q_abs,
+            q_r,
+            kv,
+            w,
+            o,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
         )?;
         Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
             self.active_stream(),
@@ -4340,8 +4396,7 @@ impl BackendDevice for RocmDevice {
 
         let window_lo_i: i32 = match window {
             None => 0,
-            Some(w) => (cache_offset as usize)
-                .saturating_sub(w.saturating_sub(1)) as i32,
+            Some(w) => (cache_offset as usize).saturating_sub(w.saturating_sub(1)) as i32,
         };
         let config = QkvAttentionFusionConfig {
             enabled: true,
@@ -9914,7 +9969,15 @@ impl RocmDevice {
             let mut best_ms = f64::INFINITY;
             for iter in 0..4 {
                 if let Err(e) = self.launch_flash_decode(
-                    q_s, k_s, v_s, out, num_heads, num_kv_heads, head_dim, kv_seq_len, splits,
+                    q_s,
+                    k_s,
+                    v_s,
+                    out,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    kv_seq_len,
+                    splits,
                 ) {
                     // A failing candidate (e.g. LDS overflow at high split
                     // counts) is simply not viable; skip it.
@@ -9927,7 +9990,15 @@ impl RocmDevice {
                 }
                 let t = std::time::Instant::now();
                 if let Err(e) = self.launch_flash_decode(
-                    q_s, k_s, v_s, out, num_heads, num_kv_heads, head_dim, kv_seq_len, splits,
+                    q_s,
+                    k_s,
+                    v_s,
+                    out,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    kv_seq_len,
+                    splits,
                 ) {
                     let _ = e;
                     best_ms = f64::INFINITY;
@@ -10862,7 +10933,11 @@ impl RocmDevice {
         let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
         // WI 2.4.3 — split_k clamp gate.
         let split_k_effective: u32 = {
-            let split_k_enabled = self.split_k_config.lock().unwrap_or_else(|e| e.into_inner()).enabled;
+            let split_k_enabled = self
+                .split_k_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .enabled;
             if split_k_enabled
                 && tile_config.split_k > 1
                 && (k % tile_config.split_k as usize == 0)

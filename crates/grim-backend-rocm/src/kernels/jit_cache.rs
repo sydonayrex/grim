@@ -115,10 +115,13 @@ impl HsacoKernelCache {
         if cache_path.exists() {
             let metadata = fs::metadata(&cache_path)?;
             let modified = metadata.modified()?;
-            self.entries.write().unwrap_or_else(|e| e.into_inner()).insert(
-                key.to_string(),
-                (cache_path.clone(), modified, lowered_name.to_string()),
-            );
+            self.entries
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    key.to_string(),
+                    (cache_path.clone(), modified, lowered_name.to_string()),
+                );
             return Ok(cache_path);
         }
 
@@ -138,16 +141,24 @@ impl HsacoKernelCache {
 
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
-        self.entries.write().unwrap_or_else(|e| e.into_inner()).insert(
-            key.to_string(),
-            (cache_path.clone(), modified, lowered_name.to_string()),
-        );
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.to_string(),
+                (cache_path.clone(), modified, lowered_name.to_string()),
+            );
 
         Ok(cache_path)
     }
 
     pub fn invalidate(&self, key: &str) {
-        if let Some((path, _, _)) = self.entries.write().unwrap_or_else(|e| e.into_inner()).remove(key) {
+        if let Some((path, _, _)) = self
+            .entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key)
+        {
             let _ = fs::remove_file(path);
         }
     }

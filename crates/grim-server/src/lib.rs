@@ -3688,7 +3688,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let (kv_used_bytes, kv_total_bytes, kv_blocks_used, kv_blocks_total) =
         engine.kv_cache_telemetry();
     let ctx_limit = engine.context_limit();
-    let total_tokens = engine.total_tokens_generated();
+    let _total_tokens = engine.total_tokens_generated();
 
     // Get tokens per second from engine
     let tps = engine.tokens_per_sec().unwrap_or(0.0) as f64;

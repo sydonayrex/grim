@@ -208,7 +208,9 @@ mod self_tests {
     // F8 — CK valid on RDNA (WMMA) + CDNA (MFMA) + UDNA.
     #[test]
     fn f8_ck_on_rdna_and_cdna() {
-        for arch in ["gfx1036", "gfx1100", "gfx1200", "gfx1300", "gfx908", "gfx942", "gfx950"] {
+        for arch in [
+            "gfx1036", "gfx1100", "gfx1200", "gfx1300", "gfx908", "gfx942", "gfx950",
+        ] {
             assert!(ck_dispatch(arch).is_ok(), "CK must be allowed on {arch}");
         }
     }
@@ -216,7 +218,9 @@ mod self_tests {
     // F9 — MIOpen on RDNA + CDNA + UDNA.
     #[test]
     fn f9_miopen_on_rdna_and_cdna() {
-        for arch in ["gfx1036", "gfx1100", "gfx1200", "gfx1300", "gfx908", "gfx942", "gfx950"] {
+        for arch in [
+            "gfx1036", "gfx1100", "gfx1200", "gfx1300", "gfx908", "gfx942", "gfx950",
+        ] {
             assert!(
                 miopen_supported(gcn_arch(arch)),
                 "MIOpen policy must cover {arch}"

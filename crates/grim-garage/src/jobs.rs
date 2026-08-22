@@ -1093,6 +1093,18 @@ fn run_rank_sft_forward(
         curr_x_id,
     )
     .map_err(|e| format!("logits lora apply: {e}"))?;
+    // Check if fused linear cross-entropy optimization is active (e.g. GRIM_FUSED_CE or config)
+    let use_fused_ce = std::env::var("GRIM_FUSED_CE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+
+    if use_fused_ce {
+        if let Ok((loss, grad_h)) = grim_autograd::fused_linear_ce(&curr_x, &lm_head.weight, targets, 4096) {
+            let dummy_out_id = tape.register(curr_x.clone());
+            return Ok((loss, grad_h, dummy_out_id));
+        }
+    }
+
     let (loss, grad) = grim_autograd::cross_entropy_loss(&logits_out, targets)
         .map_err(|e| format!("cross entropy: {e}"))?;
     Ok((loss, grad, logits_id))

@@ -17,6 +17,8 @@ use std::sync::Arc;
 ///
 /// Multiplies hidden states `hidden` [batch_size, hidden_dim] by LM head `lm_head` [vocab_size, hidden_dim]
 /// in chunks of `chunk_size` tokens, computing online cross entropy loss and gradient w.r.t `hidden`.
+pub use fused_linear_cross_entropy_loss as fused_linear_ce;
+
 pub fn fused_linear_cross_entropy_loss(
     hidden: &Tensor,
     lm_head: &Tensor,
