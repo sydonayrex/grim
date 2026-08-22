@@ -1,0 +1,35 @@
+# WI-E6: LoRA fine-tune recipe for LFM2.5 (garage / grim-cli train).
+#
+# A recipe is a declarative YAML snapshot of TrainOptions + dataset registry
+# reference. Load with `grim-cli train --recipe <path>` (see
+# crates/grim-cli/src/recipe.rs).
+
+recipe_version: 1
+name: lora-lfm25-consumer
+description: >-
+  Consumer-grade LoRA fine-tune for LFM2.5-class models on a single 24 GB
+  AMD GPU (gfx1036) or CPU fallback.
+
+model: LFM2.5-350M-Q8_0
+
+dataset:
+  # Reference into data/dataset_info.json — resolved and sha256-verified
+  # before training starts.
+  registry_id: wikitext2-sample
+
+training:
+  mode: lora
+  epochs: 3
+  lr: 2.0e-4
+  rank: 16
+  alpha: 32
+  batch_size: 4096          # max tokens per packed batch
+  gradient_accumulation_steps: 4
+  warmup_steps: 20
+  logging_steps: 10
+  max_grad_norm: 1.0
+  optimizer: adamw
+  scheduler: cosine
+  early_stopping_patience: 2
+
+adapter_output: ./adapters/lora-lfm25-consumer.grim

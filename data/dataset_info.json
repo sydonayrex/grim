@@ -1,0 +1,8 @@
+{
+  "wikitext2-sample": {
+    "file": "docs/eval/wikitext2.sample.txt",
+    "sha256": null,
+    "description": "Deterministic wikitext-style sample used for eval ppl and distill jobs",
+    "format": "text"
+  }
+}

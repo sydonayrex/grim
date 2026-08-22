@@ -3,6 +3,7 @@
 use grim_tensor::error::{Error, Result};
 
 pub mod accuracy_gate;
+pub mod qat_mxfp4;
 pub mod soul_eater;
 pub mod spqr;
 

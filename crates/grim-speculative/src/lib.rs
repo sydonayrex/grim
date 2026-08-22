@@ -30,7 +30,7 @@ pub mod uniform_markov_head;
 
 pub use confidence_head::ConfidenceHead;
 pub use confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, ThroughputProfile};
-pub use distill::train_speculative_draft;
+pub use distill::{compress_distill_report, train_speculative_draft};
 pub use draft_backbone::{DraftBackbone, DraftBlock};
 pub use entropy_confidence_head::EntropyConfidenceHead;
 pub use llama_mtp_adapter::LlamaMtpAdapter;

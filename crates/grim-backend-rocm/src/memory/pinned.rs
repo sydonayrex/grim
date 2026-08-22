@@ -118,7 +118,7 @@ impl PinnedStagingPool {
 
     /// Acquire a pinned host buffer of at least `min_bytes` capacity.
     pub fn acquire(&self, min_bytes: usize) -> Result<RocmPinnedBuffer<u8>> {
-        let mut lock = self.free_buffers.lock().unwrap();
+        let mut lock = self.free_buffers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pos) = lock.iter().position(|b| b.len() >= min_bytes) {
             Ok(lock.swap_remove(pos))
         } else {
@@ -129,7 +129,7 @@ impl PinnedStagingPool {
 
     /// Release a buffer back into the pool for reuse.
     pub fn release(&self, buffer: RocmPinnedBuffer<u8>) {
-        let mut lock = self.free_buffers.lock().unwrap();
+        let mut lock = self.free_buffers.lock().unwrap_or_else(|e| e.into_inner());
         if lock.len() < 8 {
             lock.push(buffer);
         }

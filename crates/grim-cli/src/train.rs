@@ -90,6 +90,11 @@ pub struct TrainOptions {
     pub olora_lambda: f32,
     /// SPECTRAL-QLORA: semi-orthogonal A/B init + Muon optimizer.
     pub use_spectral_qlora: bool,
+    /// WI-E5: MXFP4 quantization-aware training. When set, Linear weights are
+    /// fake-quantized through `grim_quant::qat_mxfp4::fake_quant_mxfp4` in the
+    /// training forward (STE identity backward), and saved adapters run real
+    /// `quant_mxfp4_matrix` packing at export.
+    pub qat_mxfp4: bool,
     /// Stop training if loss does not improve for this many epochs. 0 disables early stopping.
     pub early_stopping_patience: usize,
     /// Number of GPUs to use for data-parallel training. 1 = single-GPU,
@@ -732,7 +737,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         llama_config.rms_norm_eps,
     )
     .map_err(|e| Error::Session(format!("failed to load output_norm: {e}")))?;
-    let lm_head = match Linear::load(
+    let mut lm_head = match Linear::load(
         &ws.pp("output"),
         model_config.hidden_size,
         model_config.vocab_size,
@@ -846,6 +851,19 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             hidden_state = output_norm
                 .forward(&hidden_state)
                 .map_err(|e| Error::Session(format!("output_norm forward failed: {e}")))?;
+            // WI-E5 STE: fake-quantize the lm-head weight through MXFP4 in the
+            // forward. The backward is identity (straight-through), so LoRA /
+            // master-weight gradients flow unchanged while the forward sees
+            // exactly the values the deployed quantized kernel will use.
+            if opts.qat_mxfp4 {
+                let w = lm_head.weight.to_vec_f32()?;
+                let faked = grim_quant::qat_mxfp4::fake_quant_mxfp4(&w, w.len() / hidden, hidden)
+                    .map_err(|e| Error::Session(e.to_string()))?;
+                lm_head.weight = grim_backend_cpu::cpu_tensor(
+                    faked,
+                    grim_tensor::Shape::new(vec![lm_head.weight.shape().dim(0)?, hidden]),
+                );
+            }
             let logits_base = lm_head
                 .forward(&hidden_state)
                 .map_err(|e| Error::Session(format!("lm_head forward failed: {e}")))?;
@@ -1093,6 +1111,7 @@ mod tests {
             use_olora: false,
             olora_lambda: 0.0,
             use_spectral_qlora: false,
+            qat_mxfp4: false,
             early_stopping_patience: 3,
             num_gpus: 1,
             echo_mode: false,
