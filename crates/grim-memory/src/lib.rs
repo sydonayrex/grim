@@ -973,6 +973,21 @@ impl KvCache for PagedKvCache {
                 pool.write_layer_values(physical, layer, &v_flat[tok_start..tok_start + stride]);
             }
         }
+        // Update device resident tensor cache for this layer
+        if let (Some(dev), Some(_)) = (self.backend.as_ref(), self.device.as_ref()) {
+            let dims = vec![self.capacity * self.page_size, stride];
+            if let (Ok(k_s), Ok(v_s)) = (
+                dev.from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32),
+                dev.from_cpu(&self.v_pages[layer], &Shape::new(dims), DType::F32),
+            ) {
+                if self.gpu_paged_k.len() <= layer {
+                    self.gpu_paged_k.resize_with(layer + 1, || None);
+                    self.gpu_paged_v.resize_with(layer + 1, || None);
+                }
+                self.gpu_paged_k[layer] = Some(Arc::from(k_s));
+                self.gpu_paged_v[layer] = Some(Arc::from(v_s));
+            }
+        }
         Ok(())
     }
 
@@ -990,6 +1005,32 @@ impl KvCache for PagedKvCache {
         }
         let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
         let dims = vec![self.capacity * self.page_size, stride];
+
+        // Fast path: reuse cached device resident storage
+        if let (Some(dev_enum), Some(Some(k_storage)), Some(Some(v_storage))) = (
+            self.device.as_ref(),
+            self.gpu_paged_k.get(layer),
+            self.gpu_paged_v.get(layer),
+        ) {
+            return Some((
+                Tensor::new(
+                    k_storage.clone(),
+                    Shape::new(dims.clone()),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    dev_enum.clone(),
+                ),
+                Tensor::new(
+                    v_storage.clone(),
+                    Shape::new(dims),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    dev_enum.clone(),
+                ),
+                self.page_size,
+            ));
+        }
+
         if let (Some(dev), Some(dev_enum)) = (self.backend.as_ref(), self.device.as_ref()) {
             let k_storage = dev
                 .from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32)
