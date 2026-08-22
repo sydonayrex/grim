@@ -120,34 +120,27 @@ impl SpeculativeCausalLm {
         }
     }
 
-    /// Construct from a target + optional bundle. Selects strategy automatically.
+    /// Construct from a target + optional bundle or native MTP. Selects strategy automatically.
     /// Selection priority: DSpark (if bundle attached) > native MTP (if model
     /// implements `NativeMtp`) > plain.
-    ///
-    /// Speculative decoding constraint under weight-streaming:
-    /// When weight-streaming is active, the draft bundle must fit entirely in VRAM.
-    /// If DSpark is selected but the draft model fails to fit in available VRAM,
-    /// it falls back to plain autoregressive decoding.
-    pub fn auto(
+    pub fn auto_with_native_mtp(
         target: Box<dyn CausalLm>,
         draft: Option<Arc<dyn DraftBackbone>>,
         markov: Option<Arc<dyn MarkovHead>>,
         confidence: Option<Arc<dyn ConfidenceHead>>,
+        native_mtp: Option<Arc<dyn NativeMtp>>,
         is_weight_streaming_active: bool,
         available_vram_bytes: Option<usize>,
     ) -> Self {
         if draft.is_some() && markov.is_some() && confidence.is_some() {
-            // Check if weight-streaming is active and if a VRAM restriction applies
             if is_weight_streaming_active {
                 if let Some(available_vram) = available_vram_bytes {
                     let draft_ref = draft.as_ref().unwrap();
-                    // Estimate draft model size in bytes (weight size)
-                    // We query the estimated footprint from DraftBackbone if available.
-                    // Fallback to checking the VRAM threshold.
                     let estimated_size = draft_ref.estimated_footprint_bytes();
                     if estimated_size > available_vram {
-                        // Draft model too large to fit in VRAM along with target streaming buffers;
-                        // fall back to plain autoregressive execution to avoid serialization crash.
+                        if let Some(mtp) = native_mtp {
+                            return Self::with_native_mtp(target, mtp);
+                        }
                         return Self::plain(target);
                     }
                 }
@@ -162,9 +155,31 @@ impl SpeculativeCausalLm {
                     SpeculationConfig::default(),
                 ),
             )
+        } else if let Some(mtp) = native_mtp {
+            Self::with_native_mtp(target, mtp)
         } else {
             Self::plain(target)
         }
+    }
+
+    /// Construct from a target + optional bundle. Selects strategy automatically.
+    pub fn auto(
+        target: Box<dyn CausalLm>,
+        draft: Option<Arc<dyn DraftBackbone>>,
+        markov: Option<Arc<dyn MarkovHead>>,
+        confidence: Option<Arc<dyn ConfidenceHead>>,
+        is_weight_streaming_active: bool,
+        available_vram_bytes: Option<usize>,
+    ) -> Self {
+        Self::auto_with_native_mtp(
+            target,
+            draft,
+            markov,
+            confidence,
+            None,
+            is_weight_streaming_active,
+            available_vram_bytes,
+        )
     }
 
     pub fn strategy(&self) -> Strategy {

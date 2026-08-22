@@ -48,26 +48,27 @@ impl JsonSchemaConstraint {
 /// than silently ignored.
 ///
 /// Supported subset: `type`, `properties`, `required`, `enum`, `items`,
-/// nested `object`/`array`. `$ref`, `oneOf`/`anyOf`/`allOf`, `format`,
-/// `pattern`, `additionalProperties` are **not** supported and cause a
-/// rejection — callers get a clear error instead of malformed output.
+/// `$ref` (internal pointers `#/...`), `oneOf`/`anyOf`/`allOf`, nested `object`/`array`.
+/// `format`, `pattern`, `additionalProperties` are rejected if unrecognized.
 pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSchemaCompilerError> {
     let obj = schema.as_object().ok_or_else(|| JsonSchemaCompilerError {
         message: "json_schema must be a JSON object".to_string(),
     })?;
-    // Reject unsupported composition keywords up front — better a 400 than
-    // silently under-constrained output.
-    for unsupported in &["$ref", "oneOf", "anyOf", "allOf", "format", "pattern"] {
+
+    for unsupported in &["format", "pattern"] {
         if obj.contains_key(*unsupported) {
             return Err(JsonSchemaCompilerError {
                 message: format!(
                     "unsupported json_schema keyword '{unsupported}'; supported subset: \
-                     type, properties, required, enum, items, nested object/array"
+                     type, properties, required, enum, items, $ref, oneOf, anyOf, allOf, nested object/array"
                 ),
             });
         }
     }
-    if let Some(t) = obj.get("type") {
+
+    let resolved_schema = resolve_refs(&schema, &schema, 0)?;
+
+    if let Some(t) = resolved_schema.get("type") {
         let ty = t.as_str().ok_or_else(|| JsonSchemaCompilerError {
             message: "json_schema.type must be a string".to_string(),
         })?;
@@ -80,28 +81,75 @@ pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSc
             }
         }
     }
+
     Ok(JsonSchemaConstraint {
-        schema,
+        schema: resolved_schema,
         cache: Arc::new(Mutex::new(HashMap::new())),
     })
+}
+
+fn resolve_refs(schema: &Value, root: &Value, depth: usize) -> Result<Value, JsonSchemaCompilerError> {
+    if depth > 32 {
+        return Err(JsonSchemaCompilerError {
+            message: "circular $ref detected".to_string(),
+        });
+    }
+    match schema {
+        Value::Object(map) => {
+            if let Some(r) = map.get("$ref").and_then(|v| v.as_str()) {
+                let target = resolve_pointer(r, root)?;
+                return resolve_refs(&target, root, depth + 1);
+            }
+            let mut resolved = serde_json::Map::new();
+            for (k, v) in map {
+                resolved.insert(k.clone(), resolve_refs(v, root, depth + 1)?);
+            }
+            Ok(Value::Object(resolved))
+        }
+        Value::Array(arr) => {
+            let mut resolved = Vec::with_capacity(arr.len());
+            for v in arr {
+                resolved.push(resolve_refs(v, root, depth + 1)?);
+            }
+            Ok(Value::Array(resolved))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn resolve_pointer(pointer: &str, root: &Value) -> Result<Value, JsonSchemaCompilerError> {
+    if !pointer.starts_with("#/") {
+        return Err(JsonSchemaCompilerError {
+            message: format!("unsupported URI pointer '{pointer}', only '#/...' supported"),
+        });
+    }
+    let parts = pointer[2..].split('/');
+    let mut current = root;
+    for part in parts {
+        match current {
+            Value::Object(map) => {
+                current = map.get(part).ok_or_else(|| JsonSchemaCompilerError {
+                    message: format!("unresolved $ref path '{part}' in '{pointer}'"),
+                })?;
+            }
+            _ => {
+                return Err(JsonSchemaCompilerError {
+                    message: format!("cannot index into non-object path '{part}'"),
+                });
+            }
+        }
+    }
+    Ok(current.clone())
 }
 
 impl JsonSchemaConstraint {
     /// WI-3b: validate that `partial_json` is a prefix of some value that
     /// conforms to the schema. Conservative: returns `true` when it cannot
     /// prove a violation (so we never mask a token that could still be valid).
-    ///
-    /// The check is: parse `partial_json`; if it parses, validate it fully
-    /// against the schema; if it doesn't parse (incomplete), accept it as
-    /// long as the parse failure is a trailing-incomplete error rather than
-    /// a genuine type violation.
     pub fn is_consistent(&self, partial_json: &str) -> bool {
         let value: Value = match serde_json::from_str(partial_json) {
             Ok(v) => v,
             Err(e) => {
-                // Incomplete input (trailing comma, unclosed brace, etc.)
-                // is acceptable — the generation isn't done yet. A real
-                // syntax error (e.g. `12abc`) is not.
                 if is_truncated_error(&e) {
                     return true;
                 }
@@ -176,6 +224,25 @@ fn validate(value: &Value, schema: &Value) -> bool {
             return false;
         }
     }
+    // oneOf
+    if let Some(variants) = schema.get("oneOf").and_then(|v| v.as_array()) {
+        let matches = variants.iter().filter(|s| validate(value, s)).count();
+        if matches != 1 {
+            return false;
+        }
+    }
+    // anyOf
+    if let Some(variants) = schema.get("anyOf").and_then(|v| v.as_array()) {
+        if !variants.iter().any(|s| validate(value, s)) {
+            return false;
+        }
+    }
+    // allOf
+    if let Some(variants) = schema.get("allOf").and_then(|v| v.as_array()) {
+        if !variants.iter().all(|s| validate(value, s)) {
+            return false;
+        }
+    }
     // object: properties + required
     if let Some(obj) = value.as_object() {
         if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
@@ -214,15 +281,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rejects_unsupported_keyword() {
-        let err = compile_json_schema(serde_json::json!({"type": "object", "$ref": "#/x"}));
-        assert!(err.is_err(), "$ref must be rejected");
+    fn test_resolves_defs_ref() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "User": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "user": { "$ref": "#/$defs/User" }
+            }
+        });
+        let c = compile_json_schema(schema).unwrap();
+        assert!(c.is_consistent("{\"user\": {\"name\": \"Alice\"}}"));
+        assert!(!c.is_consistent("{\"user\": {\"name\": 123}}"));
     }
 
     #[test]
-    fn test_rejects_oneof() {
-        let err = compile_json_schema(serde_json::json!({"oneOf": [{"type": "string"}]}));
-        assert!(err.is_err(), "oneOf must be rejected");
+    fn test_accepts_oneof() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                { "type": "string" },
+                { "type": "number" }
+            ]
+        });
+        let c = compile_json_schema(schema).unwrap();
+        assert!(c.is_consistent("\"hello\""));
+        assert!(c.is_consistent("42"));
+        assert!(!c.is_consistent("true"));
     }
 
     #[test]

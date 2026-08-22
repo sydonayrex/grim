@@ -154,6 +154,31 @@ fn test_cpu_oracle_mxfp4_roundtrip() {
     }
 }
 
+/// FP8 E4M3 round-trip verification on CPU oracle.
+#[test]
+fn test_cpu_oracle_fp8_roundtrip() {
+    for &k in TEST_K_DIMS {
+        let original = generate_deterministic_test_weights(k, 0x1337_C0DE_F00D_BA5E)
+            .into_iter()
+            .map(|v| v * 0.1)
+            .collect::<Vec<f32>>();
+
+        let quantized = grim_quant::quant_fp8(&original).expect("quant_fp8 failed");
+        let dequantized = grim_quant::dequant_fp8(&quantized, k).expect("dequant_fp8 failed");
+        assert_eq!(dequantized.len(), k);
+
+        let max_abs_diff = original
+            .iter()
+            .zip(&dequantized)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 0.1,
+            "FP8 k={k} max_abs_diff={max_abs_diff} exceeds 0.1"
+        );
+    }
+}
+
 #[test]
 fn test_gpu_rocm_dequant_parity() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
@@ -246,6 +271,29 @@ fn test_gpu_rocm_dequant_parity() {
             assert!(
                 max_iq4_diff < 5e-2,
                 "GPU vs CPU IQ4_NL parity divergence at k={k}: max_diff={max_iq4_diff}"
+            );
+
+            // MXFP4 leg: length-prefixed framing and GPU dequant parity vs CPU oracle.
+            let (codes, exps) = grim_quant::quant_mxfp4_matrix(&original, 1, k);
+            let mut framed = Vec::with_capacity(16 + codes.len() + exps.len());
+            framed.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+            framed.extend_from_slice(&codes);
+            framed.extend_from_slice(&(exps.len() as u64).to_le_bytes());
+            framed.extend_from_slice(&exps);
+
+            let gpu_mxfp4_dequant = dev
+                .dequantize_mxfp4_host(&framed, k)
+                .expect("gpu dequant mxfp4 host");
+            let cpu_mxfp4_dequant =
+                grim_quant::dequant_mxfp4(&framed, k).expect("cpu dequant mxfp4");
+            let max_mxfp4_diff = gpu_mxfp4_dequant
+                .iter()
+                .zip(&cpu_mxfp4_dequant)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_mxfp4_diff < 1e-4,
+                "GPU vs CPU MXFP4 parity divergence at k={k}: max_diff={max_mxfp4_diff}"
             );
         }
     }

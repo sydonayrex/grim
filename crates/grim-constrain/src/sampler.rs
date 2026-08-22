@@ -187,18 +187,13 @@ impl ConstrainedSampler {
                     // 1. Fast O(1) state-cached PDA mask eliminates structurally invalid tokens
                     let base_mask = cache.mask_for(fsm.clone(), vocab);
                     let output = self.output.lock().unwrap();
-                    let mut mask = base_mask.to_vec();
+                    
+                    // 2. Query memoized schema validity mask
+                    let schema_mask = comp.mask_for(vocab, &output);
+                    let mut mask = Vec::with_capacity(vocab_size);
 
-                    // 2. Only evaluate JSON schema consistency on the small subset of structurally valid candidates
-                    for (i, &is_structurally_valid) in base_mask.iter().enumerate() {
-                        if !is_structurally_valid {
-                            continue;
-                        }
-                        if let Some(t) = vocab.get(i) {
-                            if !comp.is_consistent(&format!("{output}{t}")) {
-                                mask[i] = false;
-                            }
-                        }
+                    for (&struct_ok, &schema_ok) in base_mask.iter().zip(schema_mask.iter()) {
+                        mask.push(struct_ok && schema_ok);
                     }
                     if mask.len() != vocab_size {
                         mask.resize(vocab_size, true);
@@ -207,6 +202,18 @@ impl ConstrainedSampler {
                 }
                 vec![true; vocab_size]
             }
+        }
+    }
+
+    /// Return deterministic lookahead string if the current FSM state only permits a single literal path.
+    pub fn lookahead_literal(&self) -> Option<&'static str> {
+        let fsm = self.fsm.lock().unwrap();
+        match fsm.mode {
+            crate::json_fsm::Mode::ExpectColon => Some(": "),
+            crate::json_fsm::Mode::LitTrue(1) => Some("rue"),
+            crate::json_fsm::Mode::LitFalse(1) => Some("alse"),
+            crate::json_fsm::Mode::LitNull(1) => Some("ull"),
+            _ => None,
         }
     }
 }
@@ -230,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_constraint_json_schema_rejects_unsupported() {
-        let err = Constraint::json_schema(serde_json::json!({"$ref": "#/x"})).unwrap_err();
+        let err = Constraint::json_schema(serde_json::json!({"format": "email"})).unwrap_err();
         assert!(err.to_string().contains("unsupported"), "got: {}", err);
     }
 

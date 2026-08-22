@@ -300,29 +300,26 @@ impl Engine {
         // into the engine's block_pool, enabling cross-node KV handoff.
         let kv_receiver = if let Some(ref dc) = config.disagg_config {
             let role = dc.role;
-            if role == grim_disagg::PoolRole::Decode || role == grim_disagg::PoolRole::Colocated {
-                let listen_addr = if role == grim_disagg::PoolRole::Decode {
-                    &dc.decode_addr
-                } else {
-                    &dc.prefill_addr
-                };
-                match grim_disagg::KvReceiverServer::new(listen_addr, block_pool.clone()) {
-                    Ok(srv) => {
-                        eprintln!(
-                            "[grim-engine] disagg: KV receiver server started on {}",
-                            srv.listen_addr()
-                        );
-                        Some(srv)
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[grim-engine] disagg: failed to start KV receiver on {listen_addr}: {e}"
-                        );
-                        None
-                    }
-                }
+            let listen_addr = if role == grim_disagg::PoolRole::Decode {
+                &dc.decode_addr
             } else {
-                None
+                &dc.prefill_addr
+            };
+            match grim_disagg::KvReceiverServer::new(listen_addr, block_pool.clone()) {
+                Ok(srv) => {
+                    eprintln!(
+                        "[grim-engine] disagg: KV receiver server started on {} (role={:?})",
+                        srv.listen_addr(),
+                        role
+                    );
+                    Some(srv)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[grim-engine] disagg: failed to start KV receiver on {listen_addr}: {e}"
+                    );
+                    None
+                }
             }
         } else {
             None
@@ -366,8 +363,8 @@ impl Engine {
             tp_config,
             kv_receiver,
             radix_enabled: std::env::var("GRIM_RADIX")
-                .map(|v| v == "on" || v == "1" || v == "true")
-                .unwrap_or(false),
+                .map(|v| v != "0" && v != "false" && v != "off")
+                .unwrap_or(true),
         }
     }
 
@@ -524,6 +521,35 @@ impl Engine {
             confidence,
             is_weight_streaming_active,
             available_vram,
+        );
+        let config: Box<dyn ModelConfig> = Box::new(grim_core::config::GenericModelConfig {
+            name: id.to_string(),
+            modality,
+        });
+        self.models.insert(
+            id.to_string(),
+            LoadedModel {
+                model: Box::new(wrapped),
+                config,
+                device: dev,
+                tp_config: self.tp_config(),
+            },
+        );
+    }
+
+    /// Register a native multi-token prediction model wrapped in `LlamaMtpAdapter`.
+    pub fn register_native_mtp_model(
+        &mut self,
+        id: &str,
+        model: Arc<grim_models_transformer::LlamaMtp>,
+    ) {
+        let dev = grim_core::Model::device(model.as_ref()).clone();
+        let modality = grim_core::Model::config(model.as_ref()).modality();
+        let adapter = grim_speculative::LlamaMtpAdapter::new(model.clone());
+        let mtp_arc: Arc<dyn grim_speculative::NativeMtp> = Arc::new(adapter);
+        let wrapped = SpeculativeCausalLm::with_native_mtp(
+            Box::new(grim_speculative::LlamaMtpAdapter::new(model)),
+            mtp_arc,
         );
         let config: Box<dyn ModelConfig> = Box::new(grim_core::config::GenericModelConfig {
             name: id.to_string(),
@@ -875,15 +901,15 @@ impl Engine {
                     .map(|kv| kv.num_layers())
                     .unwrap_or(1)
                     .max(1);
-                for layer in 0..num_layers {
-                    for block_id in 0..num_blocks {
-                        let already_received = {
-                            let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                            pool.block_is_received(block_id) && layer == 0
-                        };
-                        if already_received {
-                            continue;
-                        }
+                for block_id in 0..num_blocks {
+                    let already_received = {
+                        let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                        pool.block_is_received(block_id)
+                    };
+                    if already_received {
+                        continue;
+                    }
+                    for layer in 0..num_layers {
                         match router.fetch_kv_block(block_id, layer as u32, block_elems) {
                             Ok((k_data, v_data)) => {
                                 let num_tokens = block_elems / elem_per_token;
