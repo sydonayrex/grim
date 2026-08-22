@@ -272,7 +272,7 @@ fn relabel_3d(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
 /// `Err(Unimplemented)` on backends that lack these primitives so callers
 /// can degrade to the host-mirror cache.
 #[allow(clippy::too_many_arguments)]
-fn cache_append_kv<'a>(
+pub(crate) fn cache_append_kv<'a>(
     dev: &dyn grim_tensor::BackendDevice,
     k_device: &'a mut Option<Box<dyn grim_tensor::BackendStorage>>,
     v_device: &'a mut Option<Box<dyn grim_tensor::BackendStorage>>,

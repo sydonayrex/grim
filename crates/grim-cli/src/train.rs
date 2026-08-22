@@ -834,8 +834,17 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
             let mut step_succeeded = false;
             let mut oom_retry_count = 0usize;
+            let mut last_good_len = 0usize;
 
             while !step_succeeded && oom_retry_count < 3 {
+                // WI-X14: on each OOM retry, halve the effective micro-batch by
+                // truncating the packed sequence to a prefix, so the retry
+                // genuinely allocates less activation memory instead of
+                // repeating an identical failing step.
+                let eff_len = (seq_len >> oom_retry_count).clamp(2, seq_len);
+                let step_input_ids = &input_ids[..eff_len];
+                let step_targets = &targets[..eff_len];
+
                 let mut tape = Tape::new();
                 if opts.checkpoint_segs > 1 {
                     tape.set_checkpoint_segs(opts.checkpoint_segs);
@@ -844,7 +853,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
                 let step_res: Result<f32> = (|| {
                     let mut hidden_state = tok_embeddings
-                        .forward(input_ids, seq_len, hidden)
+                        .forward(step_input_ids, eff_len, hidden)
                         .map_err(|e| Error::Session(format!("token embedding forward failed: {e}")))?;
                     let mut x_id = tape.register(hidden_state.clone());
 
@@ -901,7 +910,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                     )
                     .map_err(|e| Error::Session(format!("lm_head lora forward failed: {e}")))?;
 
-                    let targets_usize: Vec<usize> = targets.iter().map(|&t| t as usize).collect();
+                    let targets_usize: Vec<usize> =
+                        step_targets.iter().map(|&t| t as usize).collect();
                     let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets_usize)
                         .map_err(|e| Error::Session(e.to_string()))?;
 
@@ -919,6 +929,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                         epoch_loss += loss_val;
                         num_batches += 1;
                         step_succeeded = true;
+                        last_good_len = eff_len;
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
@@ -938,11 +949,12 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             }
 
             if !step_succeeded {
-                return Err(Error::Session(
-                    "Training aborted: recurrent Out-of-Memory (OOM) after 3 micro-batch backoff retries. \
-                     Try increasing --checkpoint-segs or reducing --context / LoRA --rank."
-                        .into(),
-                ));
+                return Err(Error::Session(format!(
+                    "Training aborted: recurrent Out-of-Memory (OOM) after 3 micro-batch backoff \
+                     retries (largest successful micro-batch this session: {last_good_len} tokens; \
+                     failing sequence: {seq_len} tokens). Try increasing --checkpoint-segs or \
+                     reducing --context / LoRA --rank."
+                )));
             }
 
             // Gradient accumulation: step every N micro-batches.

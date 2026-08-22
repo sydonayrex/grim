@@ -31,6 +31,9 @@ pub mod comm_fuse;
 pub mod compute_kernels;
 pub mod cross_attention;
 pub mod decode_gemm;
+/// WI-X3: device-side stochastic sampler (`grim_sample_logits_stochastic`) —
+/// temperature/top-k/top-p + Gumbel-max multinomial draw, 4-byte token readback.
+pub mod device_sampler;
 pub mod extend_attention;
 pub mod flash_decode;
 pub mod fp8_gemm_rdna4;

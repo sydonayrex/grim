@@ -2,13 +2,20 @@
 //!
 //! Iterates over the tape entries in reverse order, executing backward functions
 //! for each recorded operation and accumulating gradients into `TrainableParams`.
+//!
+//! WI-X13: when gradient checkpointing dropped a segment's intermediates
+//! (`Tape::free_intermediate_activations`), the affected segment is replayed
+//! on demand into a per-pass overlay (see [`crate::replay`]). Every tensor
+//! lookup consults the overlay before the tape, so checkpointed and
+//! non-checkpointed runs take identical code paths.
 
 use crate::ops::{
     AddArgs, MatMulArgs, ScaleArgs, add_backward, lora_backward, matmul_backward, scale_backward,
     silu_mul_backward,
 };
 use crate::param::TrainableParams;
-use crate::tape::{Tape, TapeMetadata, TensorId};
+use crate::replay::replay_segment;
+use crate::tape::{Tape, TapeEntry, TapeMetadata, TensorId};
 use grim_tensor::{
     Tensor,
     error::{Error, Result},
@@ -37,6 +44,42 @@ impl<'a> BackwardContext<'a> {
     }
 }
 
+/// Look a tensor up in the checkpoint-replay overlay first, then in the tape.
+fn get_any<'a>(
+    tape: &'a Tape,
+    overlay: &'a HashMap<TensorId, Tensor>,
+    id: TensorId,
+) -> Option<&'a Tensor> {
+    overlay.get(&id).or_else(|| tape.get(id))
+}
+
+/// WI-X13: if any tensor this entry needs was freed by checkpointing, replay
+/// its whole segment once into `overlay`. Cheap no-op while every activation
+/// is still resident (`checkpoint_segs <= 1`, or already replayed).
+fn ensure_entry_resolved(
+    tape: &Tape,
+    entry: &TapeEntry,
+    overlay: &mut HashMap<TensorId, Tensor>,
+) -> Result<()> {
+    let missing = entry
+        .inputs
+        .iter()
+        .chain(std::iter::once(&entry.output))
+        .any(|id| !overlay.contains_key(id) && tape.get(*id).is_none());
+    if missing {
+        replay_segment(tape, entry.segment_idx, overlay)?;
+    }
+    Ok(())
+}
+
+/// Drop a finished segment's replayed activations from the overlay to bound
+/// peak memory. Live (retained) tensors stay untouched in the tape.
+fn evict_segment_overlay(tape: &Tape, seg: usize, overlay: &mut HashMap<TensorId, Tensor>) {
+    for e in tape.entries().iter().filter(|e| e.segment_idx == seg) {
+        overlay.remove(&e.output);
+    }
+}
+
 /// Execute reverse-mode autograd pass over `tape`, starting from `loss_grad` at `loss_tensor_id`.
 ///
 /// Accumulates parameter gradients into `trainable_params`. Returns the complete map of intermediate tensor gradients.
@@ -47,27 +90,33 @@ pub fn backward(
     trainable_params: &mut TrainableParams,
 ) -> Result<HashMap<TensorId, Tensor>> {
     let mut ctx = BackwardContext::new(tape, loss_grad, loss_tensor_id);
+    // Checkpoint-replay overlay (WI-X13): recomputed activations live here.
+    let mut overlay: HashMap<TensorId, Tensor> = HashMap::new();
+    let mut active_segment: Option<usize> = None;
 
     for entry in tape.iter_rev() {
         if !ctx.grads.contains_key(&entry.output) {
             continue;
         }
 
+        // Leaving segment S downward: release its replayed outputs.
+        if active_segment.is_some_and(|s| s != entry.segment_idx) {
+            evict_segment_overlay(tape, active_segment.unwrap(), &mut overlay);
+        }
+        ensure_entry_resolved(tape, entry, &mut overlay)?;
+        active_segment = Some(entry.segment_idx);
+
         let out_grad = ctx.get_grad(entry.output)?.clone();
 
         match &entry.metadata {
             TapeMetadata::LoRAApply { alpha, rank, a, b } => {
-                let _base = tape
-                    .get(entry.inputs[0])
+                let _base = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing base tensor".into()))?;
-                let x = tape
-                    .get(entry.inputs[1])
+                let x = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing x tensor".into()))?;
-                let a_t = tape
-                    .get(entry.inputs[2])
+                let a_t = get_any(tape, &overlay, entry.inputs[2])
                     .ok_or_else(|| Error::Backend("missing a tensor".into()))?;
-                let b_t = tape
-                    .get(entry.inputs[3])
+                let b_t = get_any(tape, &overlay, entry.inputs[3])
                     .ok_or_else(|| Error::Backend("missing b tensor".into()))?;
 
                 let scale = alpha / (*rank as f32);
@@ -90,11 +139,9 @@ pub fn backward(
                 transpose_b,
                 ..
             } => {
-                let a = tape
-                    .get(entry.inputs[0])
+                let a = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing matmul input a".into()))?;
-                let b = tape
-                    .get(entry.inputs[1])
+                let b = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing matmul input b".into()))?;
 
                 let args = MatMulArgs {
@@ -132,22 +179,18 @@ pub fn backward(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g)?;
             }
             TapeMetadata::SiluMul => {
-                let gate = tape
-                    .get(entry.inputs[0])
+                let gate = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing silu_mul gate".into()))?;
-                let up = tape
-                    .get(entry.inputs[1])
+                let up = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing silu_mul up".into()))?;
                 let (d_gate, d_up) = silu_mul_backward(gate, up, &out_grad)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], d_gate)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], d_up)?;
             }
             TapeMetadata::RmsNorm { eps, weight_param } => {
-                let x = tape
-                    .get(entry.inputs[0])
+                let x = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing rmsnorm input x".into()))?;
-                let weight = tape
-                    .get(entry.inputs[1])
+                let weight = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing rmsnorm input weight".into()))?;
 
                 let (dx, dw) = crate::ops::rmsnorm_backward(x, weight, &out_grad, *eps)?;
@@ -162,19 +205,16 @@ pub fn backward(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], dw)?;
             }
             TapeMetadata::Rope => {
-                let cos = tape
-                    .get(entry.inputs[1])
+                let cos = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing rope cos".into()))?;
-                let sin = tape
-                    .get(entry.inputs[2])
+                let sin = get_any(tape, &overlay, entry.inputs[2])
                     .ok_or_else(|| Error::Backend("missing rope sin".into()))?;
 
                 let dx = crate::ops::rope_backward(&out_grad, cos, sin)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
             }
             TapeMetadata::Softmax => {
-                let s = tape
-                    .get(entry.output)
+                let s = get_any(tape, &overlay, entry.output)
                     .ok_or_else(|| Error::Backend("missing softmax output".into()))?;
                 let dx = crate::ops::softmax_backward(&out_grad, s)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
@@ -214,27 +254,33 @@ pub fn backward_step(
     optimizer: &mut crate::adamw::Optimizer,
 ) -> Result<HashMap<TensorId, Tensor>> {
     let mut ctx = BackwardContext::new(tape, loss_grad, loss_tensor_id);
+    // Checkpoint-replay overlay (WI-X13): recomputed activations live here.
+    let mut overlay: HashMap<TensorId, Tensor> = HashMap::new();
+    let mut active_segment: Option<usize> = None;
 
     for entry in tape.iter_rev() {
         if !ctx.grads.contains_key(&entry.output) {
             continue;
         }
 
+        // Leaving segment S downward: release its replayed outputs.
+        if active_segment.is_some_and(|s| s != entry.segment_idx) {
+            evict_segment_overlay(tape, active_segment.unwrap(), &mut overlay);
+        }
+        ensure_entry_resolved(tape, entry, &mut overlay)?;
+        active_segment = Some(entry.segment_idx);
+
         let out_grad = ctx.get_grad(entry.output)?.clone();
 
         match &entry.metadata {
             TapeMetadata::LoRAApply { alpha, rank, a, b } => {
-                let _base = tape
-                    .get(entry.inputs[0])
+                let _base = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing base tensor".into()))?;
-                let x = tape
-                    .get(entry.inputs[1])
+                let x = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing x tensor".into()))?;
-                let a_t = tape
-                    .get(entry.inputs[2])
+                let a_t = get_any(tape, &overlay, entry.inputs[2])
                     .ok_or_else(|| Error::Backend("missing a tensor".into()))?;
-                let b_t = tape
-                    .get(entry.inputs[3])
+                let b_t = get_any(tape, &overlay, entry.inputs[3])
                     .ok_or_else(|| Error::Backend("missing b tensor".into()))?;
 
                 let scale = alpha / (*rank as f32);
@@ -260,11 +306,9 @@ pub fn backward_step(
                 transpose_b,
                 ..
             } => {
-                let a = tape
-                    .get(entry.inputs[0])
+                let a = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing matmul input a".into()))?;
-                let b = tape
-                    .get(entry.inputs[1])
+                let b = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing matmul input b".into()))?;
 
                 let args = MatMulArgs {
@@ -304,22 +348,18 @@ pub fn backward_step(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g)?;
             }
             TapeMetadata::SiluMul => {
-                let gate = tape
-                    .get(entry.inputs[0])
+                let gate = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing silu_mul gate".into()))?;
-                let up = tape
-                    .get(entry.inputs[1])
+                let up = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing silu_mul up".into()))?;
                 let (d_gate, d_up) = silu_mul_backward(gate, up, &out_grad)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], d_gate)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], d_up)?;
             }
             TapeMetadata::RmsNorm { eps, weight_param } => {
-                let x = tape
-                    .get(entry.inputs[0])
+                let x = get_any(tape, &overlay, entry.inputs[0])
                     .ok_or_else(|| Error::Backend("missing rmsnorm input x".into()))?;
-                let weight = tape
-                    .get(entry.inputs[1])
+                let weight = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing rmsnorm input weight".into()))?;
 
                 let (dx, dw) = crate::ops::rmsnorm_backward(x, weight, &out_grad, *eps)?;
@@ -336,19 +376,16 @@ pub fn backward_step(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], dw)?;
             }
             TapeMetadata::Rope => {
-                let cos = tape
-                    .get(entry.inputs[1])
+                let cos = get_any(tape, &overlay, entry.inputs[1])
                     .ok_or_else(|| Error::Backend("missing rope cos".into()))?;
-                let sin = tape
-                    .get(entry.inputs[2])
+                let sin = get_any(tape, &overlay, entry.inputs[2])
                     .ok_or_else(|| Error::Backend("missing rope sin".into()))?;
 
                 let dx = crate::ops::rope_backward(&out_grad, cos, sin)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;
             }
             TapeMetadata::Softmax => {
-                let s = tape
-                    .get(entry.output)
+                let s = get_any(tape, &overlay, entry.output)
                     .ok_or_else(|| Error::Backend("missing softmax output".into()))?;
                 let dx = crate::ops::softmax_backward(&out_grad, s)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], dx)?;

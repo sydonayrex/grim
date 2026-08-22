@@ -1119,6 +1119,10 @@ pub fn launch_paged_attention(
     kv_seq_len: u32,
     cache_offset: u32,
     window_lo: i32, // sliding-window lower bound; 0 = full causal
+    // WI-X5: autotuner block-dim override. `None` keeps the wavefront-aware
+    // default of 4 waves per block. Overrides must be whole-wavefront
+    // multiples within the kernel's 8-wave LDS budget or they are ignored.
+    block_dim_override: Option<u32>,
 ) -> Result<(), crate::Error> {
     // The kernel bakes in a hard cap at head_dim > 256 (writes NaN + returns).
     // Reject unsupported head_dim at the wrapper so callers get a clear error
@@ -1168,14 +1172,21 @@ pub fn launch_paged_attention(
 
     let wf = dev.wavefront_size() as u32;
     let grid_dim = crate::HipDim3::new(batch, num_heads, 1);
-    let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
-    // Wavefront-aware: W32→128 threads (4×Wave32), W64→256 threads (4×Wave64).
-    // The kernel's LDS sizing assumes exactly 4 wavefronts; assert the invariant.
+    // WI-X5: honor the autotuner override when it respects the kernel's
+    // wavefront-multiple / 8-wave LDS invariants; otherwise keep the default
+    // 4-waves-per-block launch (W32→128 threads, W64→256 threads).
+    let block_x = match block_dim_override {
+        Some(d) if d % wf == 0 && d / wf <= 8 => d,
+        _ => wf * 4,
+    };
+    let block_dim = crate::HipDim3::new(block_x, 1, 1);
+    // The kernel derives num_waves = blockDim.x / wavefront at runtime and its
+    // LDS accumulators are sized for up to 8 waves; assert the invariant.
     debug_assert!(
-        block_dim.x == wf * 4,
-        "qkv_attention: block_dim.x ({}) != wf*4 ({}) — LDS sizing assumes 4 waves",
+        block_dim.x % wf == 0 && block_dim.x / wf <= 8,
+        "qkv_attention_paged: block_dim.x ({}) violates wavefront/LDS invariant (wf={}, max 8 waves)",
         block_dim.x,
-        wf * 4
+        wf
     );
 
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();

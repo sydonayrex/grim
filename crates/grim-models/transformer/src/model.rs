@@ -345,6 +345,7 @@ impl Llama {
                     base: cfg.rope_theta,
                     rotary_dim: cfg.rotary_dim(),
                     yarn: cfg.yarn,
+                    interleaved: true,
                 }),
                 tp_config: tp,
                 ffn_disabled: false,

@@ -216,6 +216,7 @@ impl Laguna {
                     base: theta,
                     rotary_dim,
                     yarn,
+                    interleaved: true,
                 };
 
                 let sliding_window = if is_sliding {
@@ -337,6 +338,7 @@ mod tests {
                     base: theta,
                     rotary_dim,
                     yarn,
+                    interleaved: true,
                 };
 
                 let sliding_window = if is_sliding {

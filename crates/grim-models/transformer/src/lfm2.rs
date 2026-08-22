@@ -65,6 +65,7 @@ pub enum Lfm2LayerCache {
     },
 }
 
+
 pub struct Lfm2Block {
     pub attn_norm: RmsNorm,
     pub wq: Option<Linear>,
@@ -411,8 +412,10 @@ impl Lfm2Block {
             // Produce `q_rot_vec` (rotated, QK-normalized Q) and extend the
             // K/V history. Both the fused MXFP4 path and the F32 reference
             // produce identical layouts so the attention loop is shared.
-            let q_rot_vec: Vec<f32> = if use_fused {
-                self.fused_qkv(&norm_x, cache, steps, hidden)?
+            // `arena_total` is Some when the new K/V rows were mirrored into
+            // the device arenas (WI-X2), enabling arena-resident attention.
+            let (q_rot_vec, arena_total): (Vec<f32>, Option<usize>) = if use_fused {
+                (self.fused_qkv(&norm_x, cache, steps, hidden)?, None)
             } else {
                 let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
                 let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
@@ -431,6 +434,7 @@ impl Lfm2Block {
                     norm_x.device(),
                 )?;
                 let k_norm = self.attn_k_norm.as_ref().unwrap().forward(&k_2d)?;
+
 
                 let dev = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
                 let q_shape = Shape::new(vec![1, steps * self.num_heads, self.head_dim]);
@@ -468,6 +472,7 @@ impl Lfm2Block {
                 let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
                 let v_vec = v.to_vec_f32()?;
 
+
                 if cache.is_none() {
                     *cache = Some(Lfm2LayerCache::Attention {
                         k: vec![],
@@ -477,19 +482,61 @@ impl Lfm2Block {
                     });
                 }
 
-                let (k_hist, v_hist) = match cache.as_mut().unwrap() {
-                    Lfm2LayerCache::Attention { k, v, .. } => (k, v),
+                let mut arena_total: Option<usize> = None;
+                let v_storage = v.storage();
+                match cache.as_mut().unwrap() {
+                    Lfm2LayerCache::Attention { k, v, k_dev, v_dev } => {
+                        let past = k.len() / kv_stride;
+                        k.extend_from_slice(&k_rot_vec);
+                        v.extend_from_slice(&v_vec);
+                        // WI-X2: mirror ONLY the new rows into preallocated
+                        // device arenas so attention runs without re-uploading
+                        // the whole history each decode step. Falls back to the
+                        // host-history path when the backend lacks the copies.
+                        if k_dev.is_none() {
+                            let shape =
+                                Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                            *k_dev = Some(Tensor::new(
+                                Arc::from(dev.zeros(&shape, DType::F32)?),
+                                shape.clone(),
+                                DType::F32,
+                                QuantProvenance::GrimNative.into(),
+                                norm_x.device().clone(),
+                            ));
+                            *v_dev = Some(Tensor::new(
+                                Arc::from(dev.zeros(&shape, DType::F32)?),
+                                shape,
+                                DType::F32,
+                                QuantProvenance::GrimNative.into(),
+                                norm_x.device().clone(),
+                            ));
+                        }
+                        let off_elems = past * kv_stride;
+                        let cnt_elems = steps * kv_stride;
+                        let k_ok = dev.copy_slice_into(
+                            k_dev.as_ref().unwrap().storage().as_ref(),
+                            k_rot_storage.as_ref(),
+                            off_elems,
+                            cnt_elems,
+                        );
+                        let v_ok = dev.copy_slice_into(
+                            v_dev.as_ref().unwrap().storage().as_ref(),
+                            v_storage.as_ref(),
+                            off_elems,
+                            cnt_elems,
+                        );
+                        if k_ok.is_ok() && v_ok.is_ok() && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
+                        {
+                            arena_total = Some(past + steps);
+                        }
+                    }
                     _ => {
                         return Err(grim_core::error::Error::Session(
                             "Mismatched Attention layer cache".into(),
                         ));
                     }
-                };
-
-                k_hist.extend_from_slice(&k_rot_vec);
-                v_hist.extend_from_slice(&v_vec);
-
-                q_rot_vec
+                }
+                (q_rot_vec, arena_total)
             };
 
             if cache.is_none() {
@@ -501,30 +548,55 @@ impl Lfm2Block {
                 });
             }
 
-            let (k_hist, v_hist) = match cache.as_ref().unwrap() {
-                Lfm2LayerCache::Attention { k, v, .. } => (k.as_slice(), v.as_slice()),
-                _ => {
-                    return Err(grim_core::error::Error::Session(
-                        "Mismatched Attention layer cache".into(),
-                    ));
-                }
+            // WI-X2: prefer arena-resident attention (history never re-uploads);
+            // fall back to the host-history path when the D2D mirror failed.
+            let attn_tensor = if let Some(total) = arena_total {
+                let (kd, vd) = match cache.as_ref().unwrap() {
+                    Lfm2LayerCache::Attention { k_dev, v_dev, .. } => (k_dev, v_dev),
+                    _ => {
+                        return Err(grim_core::error::Error::Session(
+                            "Mismatched Attention layer cache".into(),
+                        ));
+                    }
+                };
+                crate::shared_attention::fused_or_scalar_attention_arena(
+                    &q_rot_vec,
+                    kd.as_ref().unwrap().storage().as_ref(),
+                    vd.as_ref().unwrap().storage().as_ref(),
+                    total,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    steps,
+                    None,
+                    norm_x.device(),
+                )?
+            } else {
+                let (k_hist, v_hist) = match cache.as_ref().unwrap() {
+                    Lfm2LayerCache::Attention { k, v, .. } => (k.as_slice(), v.as_slice()),
+                    _ => {
+                        return Err(grim_core::error::Error::Session(
+                            "Mismatched Attention layer cache".into(),
+                        ));
+                    }
+                };
+                crate::shared_attention::fused_or_scalar_attention(
+                    &q_rot_vec,
+                    k_hist,
+                    v_hist,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    steps,
+                    None,
+                    norm_x.device(),
+                )?
             };
-
-            let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-                &q_rot_vec,
-                k_hist,
-                v_hist,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                steps,
-                None,
-                norm_x.device(),
-            )?;
             self.wo.as_ref().unwrap().forward(&attn_tensor)?
         };
 
         let x_added = add_tensors(x, &block_out).map_err(grim_core::Error::Tensor)?;
+
 
         let norm_x_ffn = self.ffn_norm.forward(&x_added)?;
         let ffn_out = if self.is_moe {

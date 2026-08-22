@@ -1394,6 +1394,17 @@ impl BackendDevice for CpuDevice {
             ));
         }
 
+        // WI-E7 fast path: Q4_K GEMM directly on the packed bytes, same shape
+        // guard pattern as Q8_0 above. A q4_K super-block covers 256 weights,
+        // so whole-block GEMM requires k % 256 == 0.
+        if matches!(format, grim_tensor::QuantFormat::Q4K) && k % 256 == 0 {
+            let c = grim_quant::gemm_q4k_packed(a_data, &b_bytes, m, n, k)?;
+            return Ok((
+                Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
+                Box::new(ReadyHandle),
+            ));
+        }
+
         let b_dequant_transposed: Vec<f32> =
             match &b_packed.dtype().storage {
                 grim_tensor::dtype::Storage::ResidualPacked(cfg) => {

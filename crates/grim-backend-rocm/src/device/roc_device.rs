@@ -4308,11 +4308,80 @@ impl BackendDevice for RocmDevice {
             n: config.head_dim,
             k: kv_seq_len.clamp(1, 1 << 16),
         };
+        let mut tuned_block_dim: Option<u32> = None;
         if let Ok(tuner) = self.autotuner.lock() {
             if let Some(cfg) = tuner.lookup(key) {
                 if cfg.block_dim > 0 {
                     launch_block_dim.x = cfg.block_dim;
+                    tuned_block_dim = Some(cfg.block_dim);
                 }
+            }
+        }
+        if tuned_block_dim.is_none() {
+            // WI-X5: record side — on a cache miss (and under the
+            // GRIM_ATTENTION_AUTOTUNE gates inside the helper), sweep candidate
+            // block dims with real launches and record the winner. The sweep
+            // writes the same attention output into `storage`; the real launch
+            // below then runs with the winning block dim, so results are
+            // unaffected by the benchmark launches.
+            let sweep_winner = self.autotune_attention_block_dim(
+                key,
+                launch.block_dim.x,
+                kv_seq_len,
+                512,
+                |block_x| {
+                    // Fresh arg copies per launch; the outer locals stay
+                    // untouched for the real launch below.
+                    let mut qptr = q_ptr;
+                    let mut kptr = k_ptr;
+                    let mut vptr = v_ptr;
+                    let mut optr = out_ptr;
+                    let mut max_ptr = max_ptr;
+                    let mut sum_ptr = sum_ptr;
+                    let mut nh = num_heads_i;
+                    let mut nkv = num_kv_heads_i;
+                    let mut hd = head_dim_i;
+                    let mut sl = seq_len_i;
+                    let mut ksl = kv_seq_len_i;
+                    let mut co = cache_offset_i;
+                    let mut isd = inv_sqrt_d;
+                    let mut wlo = window_lo_i;
+                    let mut oproj_ptr: u64 = 0;
+                    let mut odim: i32 = 0;
+                    let mut fuseo: i32 = 0;
+                    let mut alibi_ptr: u64 = 0;
+                    let mut has_alibi: i32 = 0;
+                    self.launch_compute_kernel(
+                        "grim_qkv_attention",
+                        launch.grid_dim,
+                        HipDim3::new(block_x, 1, 1),
+                        &mut [
+                            arg(&mut qptr),
+                            arg(&mut kptr),
+                            arg(&mut vptr),
+                            arg(&mut optr),
+                            arg(&mut max_ptr),
+                            arg(&mut sum_ptr),
+                            arg(&mut nh),
+                            arg(&mut nkv),
+                            arg(&mut hd),
+                            arg(&mut sl),
+                            arg(&mut ksl),
+                            arg(&mut co),
+                            arg(&mut isd),
+                            arg(&mut wlo),
+                            arg(&mut oproj_ptr),
+                            arg(&mut odim),
+                            arg(&mut fuseo),
+                            arg(&mut alibi_ptr),
+                            arg(&mut has_alibi),
+                        ],
+                    )
+                    .map(|_| ())
+                },
+            );
+            if let Some(winner) = sweep_winner {
+                launch_block_dim.x = winner;
             }
         }
 
@@ -4514,6 +4583,7 @@ impl BackendDevice for RocmDevice {
         let mut d_i = d;
         let mut half_i = half;
         let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
 
         let total = (b * s * half) as usize;
         let (grid, block) = linear_launch(total);
@@ -4531,6 +4601,7 @@ impl BackendDevice for RocmDevice {
                 arg(&mut d_i),
                 arg(&mut half_i),
                 arg(&mut base_f),
+                arg(&mut inter_i),
             ],
         )?;
 
@@ -5191,6 +5262,53 @@ impl BackendDevice for RocmDevice {
         let mut storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
 
+        // WI-X5: autotuner lookup + record side for the paged launch. Hot path
+        // unchanged on a cache hit; the sweep below only runs under the
+        // GRIM_ATTENTION_AUTOTUNE gates in `autotune_attention_block_dim`.
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let paged_key = crate::autotune::KernelKey::paged_attention(
+            arch_leak,
+            num_heads,
+            head_dim,
+            kv_seq_len.clamp(1, 1 << 16),
+        );
+        let mut block_override: Option<u32> = None;
+        if let Ok(tuner) = self.autotuner.lock() {
+            if let Some(cfg) = tuner.lookup(paged_key) {
+                if cfg.block_dim > 0 {
+                    block_override = Some(cfg.block_dim);
+                }
+            }
+        }
+        if block_override.is_none() {
+            block_override = self.autotune_attention_block_dim(
+                paged_key,
+                self.wavefront_size() as u32 * 4,
+                kv_seq_len,
+                512,
+                |block_x| {
+                    crate::launch_paged_attention(
+                        self,
+                        q_s,
+                        bt_s,
+                        k_s,
+                        v_s,
+                        &mut storage,
+                        batch as u32,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        max_blocks as u32,
+                        page_size as u32,
+                        kv_seq_len as u32,
+                        cache_offset,
+                        window_lo_i,
+                        Some(block_x),
+                    )
+                },
+            );
+        }
+
         crate::launch_paged_attention(
             self,
             q_s,
@@ -5207,6 +5325,7 @@ impl BackendDevice for RocmDevice {
             kv_seq_len as u32,
             cache_offset,
             window_lo_i,
+            block_override,
         )?;
 
         Ok((
@@ -5355,6 +5474,7 @@ impl RocmDevice {
         let mut d_i = d as i32;
         let mut rh_i = rotary_half as i32;
         let mut ms_f = mscale;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
 
         // Launch grid covers max(b*s*rotary_half, b*s*copy_len) threads to
         // handle both the rotate pass and the verbatim-copy pass in one kernel launch.
@@ -5380,6 +5500,7 @@ impl RocmDevice {
                 arg(&mut d_i),
                 arg(&mut rh_i),
                 arg(&mut ms_f),
+                arg(&mut inter_i),
             ],
         );
 
@@ -10037,6 +10158,128 @@ impl RocmDevice {
         }
     }
 
+    /// WI-X5: RECORD side of the attention block-dim autotuner, shared by the
+    /// dense `grim_qkv_attention` lookup (`qkv_attention`) and the paged
+    /// `grim_qkv_attention_paged` launch sites. Callers consult
+    /// `tuner.lookup(key)` FIRST; this helper runs only on a cache miss so the
+    /// hot path is untouched whenever a cached entry exists.
+    ///
+    /// Gating (mirrors `flash_decode_split_count`):
+    /// * `GRIM_ATTENTION_AUTOTUNE=1` must be set,
+    /// * no active graph-capture session,
+    /// * `kv_seq_len >= min_kv_len` caps total sweep cost on short contexts,
+    /// * at most one sweep per `KernelKey` per process (in-process attempt
+    ///   set; cross-process persistence comes from the `.autotune_cache` JSON).
+    ///
+    /// Candidates are 64/128/256 threads restricted to whole-wavefront
+    /// multiples that fit the qkv kernels' LDS budget (`num_waves =
+    /// blockDim.x / wavefront`, shared accumulators sized for up to 8 waves).
+    /// The current default (`fallback_block_dim`) is benched alongside them, so
+    /// a recorded winner is never slower than the static heuristic.
+    ///
+    /// Timing uses real launches of the live argument buffer with wall-clock
+    /// launch+sync measurement (1 warmup + 2 timed reps per candidate, minimum
+    /// wins) — same methodology as `flash_decode_split_count`.
+    /// `time_kernel_ms` cannot be used here: it launches tile-picker GEMM
+    /// shapes with dummy arguments rather than the live qkv pointers/scalars.
+    fn autotune_attention_block_dim(
+        &self,
+        key: crate::autotune::KernelKey,
+        fallback_block_dim: u32,
+        kv_seq_len: usize,
+        min_kv_len: usize,
+        mut launch_one: impl FnMut(u32) -> Result<()>,
+    ) -> Option<u32> {
+        let tune_enabled = std::env::var("GRIM_ATTENTION_AUTOTUNE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !tune_enabled || self.active_capture_stream().is_some() || kv_seq_len < min_kv_len {
+            return None;
+        }
+        // Double-check under the tuner lock: another thread may have recorded
+        // this key between the caller's lookup miss and this sweep.
+        if let Ok(tuner) = self.autotuner.lock() {
+            if tuner.lookup(key).is_some() {
+                return None;
+            }
+        }
+        // At most one sweep attempt per key per process. A failed sweep also
+        // lands here — retrying every call would stall the decode loop.
+        static SWEPT_KEYS: std::sync::OnceLock<Mutex<std::collections::HashSet<u64>>> =
+            std::sync::OnceLock::new();
+        let swept = SWEPT_KEYS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let key_hash = seahash::hash(
+            format!(
+                "{}|{}|{}|{}|{}",
+                key.kernel, key.gpu_arch, key.m, key.n, key.k
+            )
+            .as_bytes(),
+        );
+        match swept.lock() {
+            Ok(mut set) => {
+                if !set.insert(key_hash) {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+
+        let wf = self.wavefront_size() as u32;
+        let candidates: Vec<u32> = [64u32, 128, 256]
+            .into_iter()
+            .filter(|&d| d % wf == 0 && d / wf <= 8 && d != fallback_block_dim)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut best = (fallback_block_dim, f64::INFINITY);
+        for cand in std::iter::once(fallback_block_dim).chain(candidates) {
+            let mut best_ms = f64::INFINITY;
+            for rep in 0..3 {
+                if launch_one(cand).is_err() {
+                    // Non-viable candidate (launch/arg error): disqualify.
+                    best_ms = f64::INFINITY;
+                    break;
+                }
+                if rep == 0 {
+                    // Warmup: drain it so timed reps measure only themselves.
+                    let _ = unsafe { hipStreamSynchronize(self.active_stream()) };
+                    continue;
+                }
+                let t0 = std::time::Instant::now();
+                if unsafe { hipStreamSynchronize(self.active_stream()) } != hipSuccess {
+                    best_ms = f64::INFINITY;
+                    break;
+                }
+                best_ms = best_ms.min(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            if best_ms < best.1 {
+                best = (cand, best_ms);
+            }
+        }
+        if !best.1.is_finite() {
+            return None;
+        }
+        let cfg = crate::autotune::AutotuneConfig {
+            block_dim: best.0,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: (best.1 * 1e6) as u64,
+            spec_gamma: 4,
+            spec_acceptance_threshold: 0.6,
+            spec_alpha: 0.0,
+        };
+        if let Ok(mut tuner) = self.autotuner.lock() {
+            let _ = tuner.record(key, cfg);
+        }
+        let _ = self.save_autotune_cache(std::path::Path::new(&format!(
+            ".autotune_cache/{}.json",
+            self.gpu_target
+        )));
+        Some(best.0)
+    }
+
     /// Launch Marlin-style Interleaved W4A16 GEMM.
     pub fn launch_marlin_gemm_w4a16(
         &self,
@@ -10540,6 +10783,52 @@ impl RocmDevice {
                 arg(&mut alptr),
                 arg(&mut bs),
                 arg(&mut ndt),
+                arg(&mut vs),
+            ],
+        )
+    }
+
+    /// Launch GPU stochastic sampler (WI-X3): temperature + top-k + Gumbel-max
+    /// on device; only the chosen token id crosses back to host.
+    pub fn launch_sample_stochastic(
+        &self,
+        logits_storage: &RocmStorage,
+        out_tokens_storage: &RocmStorage,
+        temperature: f32,
+        top_k: u32,
+        seed: u64,
+        batch_size: usize,
+        vocab_size: usize,
+    ) -> Result<*mut c_void> {
+        let lg_ptr = logits_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("sample_stochastic: logits has no device ptr".into()))?;
+        let ot_ptr = out_tokens_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("sample_stochastic: out_tokens has no device ptr".into())
+        })?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new(batch_size as u32, 1, 1);
+
+        let mut lgptr = lg_ptr;
+        let mut otptr = ot_ptr;
+        let mut temp = temperature;
+        let mut tk = top_k as i32;
+        let mut sd = seed;
+        let mut bs = batch_size as i32;
+        let mut vs = vocab_size as i32;
+
+        self.launch_compute_kernel(
+            "grim_sample_stochastic",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut lgptr),
+                arg(&mut otptr),
+                arg(&mut temp),
+                arg(&mut tk),
+                arg(&mut sd),
+                arg(&mut bs),
                 arg(&mut vs),
             ],
         )
@@ -12641,6 +12930,52 @@ impl RocmDevice {
         let mut storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
 
+        // WI-X5: autotuner lookup + record side (same treatment as the trait
+        // paged path above).
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let paged_key = crate::autotune::KernelKey::paged_attention(
+            arch_leak,
+            num_heads,
+            head_dim,
+            kv_seq_len.clamp(1, 1 << 16),
+        );
+        let mut block_override: Option<u32> = None;
+        if let Ok(tuner) = self.autotuner.lock() {
+            if let Some(cfg) = tuner.lookup(paged_key) {
+                if cfg.block_dim > 0 {
+                    block_override = Some(cfg.block_dim);
+                }
+            }
+        }
+        if block_override.is_none() {
+            block_override = self.autotune_attention_block_dim(
+                paged_key,
+                self.wavefront_size() as u32 * 4,
+                kv_seq_len,
+                512,
+                |block_x| {
+                    crate::launch_paged_attention(
+                        self,
+                        q_s,
+                        bt_s,
+                        k_s,
+                        v_s,
+                        &mut storage,
+                        batch as u32,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        max_blocks as u32,
+                        page_size as u32,
+                        kv_seq_len as u32,
+                        cache_offset,
+                        0,
+                        Some(block_x),
+                    )
+                },
+            );
+        }
+
         crate::launch_paged_attention(
             self,
             q_s,
@@ -12657,6 +12992,7 @@ impl RocmDevice {
             kv_seq_len as u32,
             cache_offset,
             0,
+            block_override,
         )?;
 
         Ok((

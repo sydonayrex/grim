@@ -101,6 +101,17 @@ pub struct RopeConfig {
     pub base: f32,
     pub rotary_dim: usize,
     pub yarn: Option<YaRNParams>,
+    /// Pairing convention for rotated pairs. `true` (default) = interleaved
+    /// GPT-J style (x[2i], x[2i+1]) — matches the CPU reference implementation
+    /// and the LFM2 family. `false` = half-split NeoX style (x[i], x[i+half]).
+    /// Backends MUST honor this; hardcoding one convention corrupts whichever
+    /// model family uses the other (bisected: LFM2.5 ROCm generation garbage).
+    #[serde(default = "default_true")]
+    pub interleaved: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl RopeConfig {
@@ -110,6 +121,7 @@ impl RopeConfig {
             base,
             rotary_dim: dim,
             yarn: None,
+            interleaved: true,
         }
     }
 
@@ -255,7 +267,9 @@ pub trait BackendDevice: Send + Sync {
     ) -> Result<u32> {
         let cpu_logits = logits.to_cpu_vec_f32()?;
         if cpu_logits.is_empty() {
-            return Err(crate::error::Error::Backend("sample_on_device: empty logits".into()));
+            return Err(crate::error::Error::Backend(
+                "sample_on_device: empty logits".into(),
+            ));
         }
         if temperature <= 0.0 || (top_k == 1 && (top_p >= 1.0 || top_p <= 0.0)) {
             // Greedy argmax

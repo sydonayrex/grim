@@ -152,10 +152,12 @@ extern "C" __global__ void grim_transpose_2d_f32(const float* __restrict__ in,
 
 extern "C" __global__ void grim_rope(const float* x, const unsigned int* positions,
                                      float* out,
-                                     int b, int s, int d, int half, float base) {
-    // One thread per (batch, step, dim-half-pair) element. Matches CPU
-    // `Rope::forward` semantics: 3-D input [B, S, D] with positions[si]
-    // per step, applying rotation to pairs (x[i], x[half+i]).
+                                     int b, int s, int d, int half, float base,
+                                     int interleaved) {
+    // One thread per (batch, step, dim-half-pair) element. Pairing follows
+    // RopeConfig.interleaved: GPT-J style (x[2i], x[2i+1]) when set — the CPU
+    // reference convention, used by LFM2 — else NeoX half-split (x[i],
+    // x[i+half]).
     // CONTRACT: plain full-rotary only (rotary_dim == d). Use grim_rope_yarn
     // for partial rotary or YaRN-modified frequencies.
     int total = b * s * half;
@@ -171,8 +173,8 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     float sin_val = sinf(val);
     float cos_val = cosf(val);
     int base_idx = (bi * s + si) * d;
-    int a_idx = base_idx + i;
-    int b_idx = base_idx + half + i;
+    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
     float x1 = x[a_idx];
     float x2 = x[b_idx];
     out[a_idx] = x1 * cos_val - x2 * sin_val;
@@ -199,7 +201,7 @@ extern "C" __global__ void grim_rope_yarn(
     const unsigned int* __restrict__ positions,
     const float* __restrict__ inv_freq,
     float* __restrict__ out,
-    int b, int s, int d, int rotary_half, float mscale
+    int b, int s, int d, int rotary_half, float mscale, int interleaved
 ) {
     // Pass 1: rotate the [0, rotary_half) pairs.
     int total = b * s * rotary_half;
@@ -214,11 +216,10 @@ extern "C" __global__ void grim_rope_yarn(
         float sin_val = sinf(val) * mscale;
         float cos_val = cosf(val) * mscale;
         int base_idx = (bi * s + si) * d;
-        // Rotate-half pairing — (x[i], x[rotary_half + i]) — matching the plain
-        // `grim_rope` kernel and CPU `Rope::forward`. The previous interleaved
-        // pairing (x[2i], x[2i+1]) scrambled Q/K rotations for every YaRN model.
-        int a_idx = base_idx + i;
-        int b_idx = base_idx + rotary_half + i;
+        // Pairing follows RopeConfig.interleaved (see grim_rope). CPU
+        // `Rope::forward` — the oracle — is interleaved (x[2i], x[2i+1]).
+        int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+        int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + rotary_half + i);
         float x1 = x[a_idx];
         float x2 = x[b_idx];
         out[a_idx] = x1 * cos_val - x2 * sin_val;

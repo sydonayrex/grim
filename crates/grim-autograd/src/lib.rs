@@ -68,6 +68,7 @@ pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
 pub mod omnilo_prune;
 pub mod registry;
 pub mod relora;
+pub mod replay;
 pub mod scythe1;
 pub mod soul_eater;
 pub mod tape;
@@ -103,6 +104,7 @@ pub use preference_loss::{
     olora_orthogonality_penalty, orpo_odds_ratio_loss, orpo_odds_ratio_loss_autograd, simpo_loss,
 };
 pub use registry::AutogradRegistry;
+pub use replay::{REPLAY_COUNT, replay_count, replay_segment, reset_replay_count};
 pub use tape::{Tape, TapeEntry, TapeKind, TensorId};
 pub use tops_prune::{TopsConfig, TopsPruner, compute_entropy};
 

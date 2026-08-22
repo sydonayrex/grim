@@ -291,6 +291,49 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Te
 mod tests {
     use super::*;
 
+    /// WI-E6: fused linear-CE loss must match the materialized-logits fallback
+    /// (cross_entropy_loss on logits = hidden @ lm_head^T) to ≤1e-5 on CPU.
+    #[test]
+    fn test_fused_ce_loss_matches_fallback_path_cpu() {
+        let hidden = cpu_tensor(
+            vec![0.5f32, 0.2, -0.1, 0.8, 1.2, -0.4, 0.3, 0.7],
+            Shape::new(vec![4, 2]),
+        );
+        let lm_head = cpu_tensor(
+            vec![1.0f32, 0.5, -0.3, 0.9, 0.4, -0.8],
+            Shape::new(vec![3, 2]),
+        );
+        let targets = vec![0usize, 2, 1, 0];
+
+        let (fused_loss, fused_grad) =
+            fused_linear_cross_entropy_loss(&hidden, &lm_head, &targets, 2).unwrap();
+
+        // Fallback: materialize logits = hidden @ lm_head^T then cross_entropy_loss.
+        let h = hidden.to_vec_f32().unwrap();
+        let w = lm_head.to_vec_f32().unwrap();
+        let mut logits_vec = vec![0.0f32; 4 * 3];
+        for b in 0..4 {
+            for v in 0..3 {
+                logits_vec[b * 3 + v] = h[b * 2] * w[v * 2] + h[b * 2 + 1] * w[v * 2 + 1];
+            }
+        }
+        let logits = cpu_tensor(logits_vec, Shape::new(vec![4, 3]));
+        let (fallback_loss, _fallback_grad) = cross_entropy_loss(&logits, &targets).unwrap();
+
+        assert!(
+            (fused_loss - fallback_loss).abs() <= 1e-5,
+            "fused CE loss {} != fallback {}",
+            fused_loss,
+            fallback_loss
+        );
+
+        // Gradient sanity: shape matches hidden, finite values.
+        assert_eq!(fused_grad.shape().dims(), &[4, 2]);
+        for g in fused_grad.to_vec_f32().unwrap() {
+            assert!(g.is_finite());
+        }
+    }
+
     #[test]
     fn test_fused_linear_cross_entropy_loss_matches_unfused() {
         let hidden = cpu_tensor(vec![0.5f32, 0.2, -0.1, 0.8], Shape::new(vec![2, 2]));

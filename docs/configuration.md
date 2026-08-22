@@ -7,9 +7,37 @@ This document provides a consolidated reference for all environment variables, c
 When configuration values are supplied across multiple sources, settings resolve in the following order:
 
 1. **Explicit CLI Flags** (e.g. `--port 8080`, `--device rocm`, `--seed 42`)
-2. **Environment Variables** (e.g. `GRIM_PORT`, `GRIM_BACKEND`, `HIP_VISIBLE_DEVICES`)
-3. **Configuration File** (`grim.toml` in `./`, `~/.grim/`, or `/etc/grim/`)
+2. **Environment Variables** (e.g. `GRIM_PORT`, `GRIM_BACKEND`) — override the file
+3. **Configuration File** (`grim.toml`) — see [RuntimeEnv & grim.toml](#runtimeenv--grimtoml-wi-x16)
 4. **Hardcoded Internal Defaults**
+
+> WI-X16 note: `grim-core::env_config::RuntimeEnv` reads `grim.toml` **first**
+> and lets `GRIM_*` environment variables override per key. Unknown keys in
+> `grim.toml` produce a one-time warning; they are never silently dropped.
+> `grim doctor` prints the effective value and its source (`file` / `env` /
+> `default`) for every core key.
+
+### RuntimeEnv & grim.toml (WI-X16)
+
+Core runtime knobs are centralized in `grim-core::env_config::RuntimeEnv`.
+Lookup order per key: `GRIM_CONFIG` path → `./grim.toml` → `~/.grim/grim.toml`;
+a template ships as `grim.toml.example`. Keys:
+
+| Key | Type | Default | Env override |
+|---|---|---|---|
+| `host` | String | `127.0.0.1` | `GRIM_HOST` |
+| `port` | u16 | `11434` | `GRIM_PORT` |
+| `context` | usize | auto (model metadata) | `GRIM_CONTEXT` |
+| `backend` | String | `auto` | `GRIM_BACKEND` |
+| `gpus` | list | all visible | `GRIM_GPUS` |
+| `tp_size` | usize | `0` (off) | `GRIM_TP_SIZE` |
+| `parallel` | bool | model-dependent | `GRIM_PARALLEL` |
+| `mem_budget_mib` | usize | unlimited | `GRIM_MEM_BUDGET_MIB` |
+| `kernel_timeout` | u64 | `300` s | `GRIM_KERNEL_TIMEOUT` |
+
+Behavior-specific escapes that remain environment-only (debug/test gates such
+as `GRIM_RUN_GPU_TESTS`, `GRIM_ATTENTION_AUTOTUNE`, backend feature probes)
+are intentionally not part of the file contract.
 
 ---
 

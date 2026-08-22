@@ -169,6 +169,30 @@ pub use kernels::qkv_attention::{
 };
 pub use kernels::tile_picker::run_install_tune;
 
+/// WI-X3: GPU-native stochastic sampling (`grim_sample_logits_stochastic`,
+/// defined in `kernels::device_sampler`). Single-block JIT kernel applying
+/// temperature scaling, top-k and top-p filtering entirely on device, then
+/// drawing a token with the Gumbel-max trick (multinomial without a cumsum
+/// scan). Only the 4-byte token id crosses PCIe.
+///
+/// **Call-site hook**: the greedy counterpart `grim_sample_logits_argmax`
+/// (`kernels/speculative_sampler.rs`) currently has no Rust-side wrapper
+/// caller, and production sampling still reads the full logits row to the host
+/// before CPU sampling in `grim-server/src/lib.rs::sample_next_token`
+/// (~lines 465-489: `outcome.logits.to_vec_f32()` followed by
+/// `sampler.sample(...)` on a CPU tensor). Callers that want device-side
+/// sampling should invoke [`sample_logits_on_device`] / 
+/// [`sample_logits_on_device_at`] there — with the ROCm storage backing
+/// `outcome.logits`, the model `vocab`, and the request's sampling params —
+/// BEFORE that readback, and fall back to the existing CPU sampler whenever
+/// this returns `Ok(None)` (unsupported shape/vocab) or `Err` (any HIP
+/// failure). Stochastic requests (`temperature > 0 || top_k > 0 || top_p <
+/// 1.0`) route here; pure-greedy requests may keep the CPU argmax path.
+pub use crate::kernels::device_sampler::{
+    DEVICE_SAMPLER_KERNEL_SOURCE, MAX_DEVICE_SAMPLER_VOCAB, sample_logits_on_device,
+    sample_logits_on_device_at,
+};
+
 pub use quantization::QuantMode;
 
 /// WI-2: arch-gate helpers re-exported so callers outside

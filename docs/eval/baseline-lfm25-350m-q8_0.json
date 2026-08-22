@@ -1,0 +1,13 @@
+{
+  "date": "2026-08-22T11:31:11Z",
+  "metrics": {
+    "ppl": {
+      "corpus_sha256": "e440db59c2d4ad5992ab2e270d9aa460f62300bafb32f7b6d105218f6598fc8e",
+      "max_windows": "20",
+      "value": 1733723.125,
+      "windows": 20
+    }
+  },
+  "model": "LFM2.5-350M-Q8_0",
+  "task": "ppl"
+}

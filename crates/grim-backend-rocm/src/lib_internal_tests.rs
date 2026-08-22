@@ -2563,11 +2563,14 @@ mod tests {
         let pos = 5.0_f32;
         let cos_p = [(pos * inv_freq[0]).cos(), (pos * inv_freq[1]).cos()];
         let sin_p = [(pos * inv_freq[0]).sin(), (pos * inv_freq[1]).sin()];
+        // Interleaved pairing (x[2i], x[2i+1]) — matches the CPU
+        // `Rope::forward` oracle. The previous half-split expectation here
+        // enshrined the kernel bug that corrupted LFM2.5 ROCm generation.
         let want = [
-            input[0] * cos_p[0] - input[2] * sin_p[0],
-            input[1] * cos_p[1] - input[3] * sin_p[1],
-            input[2] * cos_p[0] + input[0] * sin_p[0],
-            input[3] * cos_p[1] + input[1] * sin_p[1],
+            input[0] * cos_p[0] - input[1] * sin_p[0],
+            input[1] * cos_p[0] + input[0] * sin_p[0],
+            input[2] * cos_p[1] - input[3] * sin_p[1],
+            input[3] * cos_p[1] + input[2] * sin_p[1],
         ];
 
         assert_eq!(got.len(), 4);

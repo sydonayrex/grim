@@ -385,6 +385,81 @@ static REQUEST_HISTORIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Historical CPU sampling path (WI-X3 fallback): D2H the full logits row,
+/// slice to vocab, run the trait-object sampler on a CPU tensor.
+fn cpu_sample_fallback(
+    t: &grim_tensor::Tensor,
+    sampler: &dyn grim_core::sampler::Sampler,
+    vocab_size: usize,
+    history: &[u32],
+) -> std::result::Result<u32, String> {
+    let full_logits = t
+        .to_vec_f32()
+        .map_err(|e| format!("logits to_vec_f32 failed: {e}"))?;
+    let last_start = full_logits.len().saturating_sub(vocab_size);
+    let last_logits = &full_logits[last_start..];
+    let sampled = sampler
+        .sample(
+            &grim_backend_cpu::cpu_tensor(
+                last_logits.to_vec(),
+                grim_tensor::Shape::new(vec![last_logits.len()]),
+            ),
+            history,
+        )
+        .unwrap_or(0);
+    Ok(sampled.min((vocab_size as u32).saturating_sub(1)))
+}
+
+/// WI-X3 device-side stochastic sampling: launch the Gumbel-max kernel on the
+/// resident ROCm logits (temperature/top-k/top-p on device) and copy back only
+/// the 4-byte token id. Sampling params come from the request-scoped env
+/// overrides `GRIM_SAMPLE_TEMPERATURE` (default 0.7) and `GRIM_SAMPLE_TOP_K`
+/// (0 = off) until the full param plumbing lands; `GRIM_CPU_SAMPLER=1` at the
+/// call site disables this path entirely.
+fn sample_on_device(
+    t: &grim_tensor::Tensor,
+    vocab_size: usize,
+    step: u64,
+) -> std::result::Result<Option<u32>, String> {
+    use grim_backend_rocm::{RocmDevice, as_rocm, sample_logits_on_device_at};
+
+    let ordinal = t
+        .device()
+        .ordinal()
+        .ok_or_else(|| "sample_on_device: no device ordinal".to_string())?;
+    let storage = as_rocm(&**t.storage())
+        .map_err(|e| format!("sample_on_device: not a ROCm storage: {e}"))?;
+
+    let dev = RocmDevice::try_new(ordinal)
+        .map_err(|e| format!("sample_on_device: RocmDevice::try_new: {e}"))?;
+    let temperature: f32 = std::env::var("GRIM_SAMPLE_TEMPERATURE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.7);
+    let top_k: i32 = std::env::var("GRIM_SAMPLE_TOP_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // Per-step reproducible stream: low bits = base seed, high bits = step.
+    let base_seed: u64 = std::env::var("GRIM_SAMPLE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seed = ((step as u64) << 32) | (base_seed & 0xffff_ffff);
+
+    sample_logits_on_device_at(
+        &dev,
+        storage,
+        vocab_size,
+        temperature,
+        top_k,
+        1.0,
+        seed,
+        step as u32,
+    )
+    .map_err(|e| format!("sample_on_device: kernel: {e}"))
+}
+
 /// WI-1 (defense-in-depth): returns `Err(message)` instead of panicking when
 /// the engine cannot advance. A network request must never be able to unwind
 /// this task while the engine mutex is held — that poisons the mutex and takes
@@ -469,25 +544,26 @@ fn sample_next_token(
     // defense-in-depth after sampling.
     let token = match logits {
         Some(t) => {
-            // WI-1: propagate host-transfer failure instead of silently
-            // degrading to an empty logits slice (which sampled token 0
-            // every step — the non-streaming "silent garbage" symptom).
-            let full_logits = t
-                .to_vec_f32()
-                .map_err(|e| format!("logits to_vec_f32 failed: {e}"))?;
-            let last_start = full_logits.len().saturating_sub(vocab_size);
-            let last_logits = &full_logits[last_start..];
-            let sampled = sampler
-                .sample(
-                    &grim_backend_cpu::cpu_tensor(
-                        last_logits.to_vec(),
-                        grim_tensor::Shape::new(vec![last_logits.len()]),
-                    ),
-                    &history,
-                )
-                .unwrap_or(0);
-            let max = (vocab_size as u32).saturating_sub(1);
-            sampled.min(max)
+            // WI-X3: when logits live on a ROCm device, run temperature/top-k
+            // sampling on-device (Gumbel-max) and D2H only the chosen token id.
+            // Any failure falls back to the historical CPU path.
+            let cpu_sampler_forced = std::env::var("GRIM_CPU_SAMPLER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let device_token = if t.device().is_rocm() && !cpu_sampler_forced {
+                match sample_on_device(&t, vocab_size, step) {
+                    Ok(Some(tok)) => Some(tok.min((vocab_size as u32).saturating_sub(1))),
+                    // Ok(None): unsupported shape/vocab -> CPU fallback contract.
+                    Ok(None) => None,
+                    Err(_e) => None,
+                }
+            } else {
+                None
+            };
+            match device_token {
+                Some(tok) => tok,
+                None => cpu_sample_fallback(&t, sampler, vocab_size, &history)?,
+            }
         }
         None => 0,
     };
@@ -665,10 +741,8 @@ fn build_choice_payload(
     prior_messages: &[grim_format::ChatMessage],
 ) -> serde_json::Value {
     let (message, finish_reason) = if tools_active {
-        let family = tool_parse::resolve_effective_tool_family(
-            template_family.unwrap_or(""),
-            model_arch,
-        );
+        let family =
+            tool_parse::resolve_effective_tool_family(template_family.unwrap_or(""), model_arch);
         match tool_parse::parse_tool_calls(content, family) {
             tool_parse::ParseOutcome {
                 calls: Some(calls), ..
@@ -1594,7 +1668,11 @@ async fn chat_completions(
                 let parse_ctx = (
                     tools_active_clone,
                     template_family_clone.clone(),
-                    state.model_arch.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    state
+                        .model_arch
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
                 );
                 let prior_messages = messages.clone();
                 let req_model = requested_model.clone();
@@ -2590,7 +2668,15 @@ async fn metrics_endpoint(
     // Keep metrics and status on one contract so probes and dashboards cannot
     // disagree about backend, model, or KV state. Legacy counters remain.
     let mut snapshot = get_status(State(state.clone())).await.0;
-    let (active_sessions, block_pool_usage, preemption_count, scheduler_snapshot, last_ttft, last_itl, spec_tele) = {
+    let (
+        active_sessions,
+        block_pool_usage,
+        preemption_count,
+        scheduler_snapshot,
+        last_ttft,
+        last_itl,
+        spec_tele,
+    ) = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let active = engine.adapter_count();
         let sched = engine.scheduler_snapshot();
@@ -2603,7 +2689,15 @@ async fn metrics_endpoint(
         let ttft = engine.last_ttft_ms();
         let itl = engine.last_itl_ms();
         let spec = engine.speculative_telemetry(None);
-        (active, pool_usage, sched.paused_requests, sched, ttft, itl, spec)
+        (
+            active,
+            pool_usage,
+            sched.paused_requests,
+            sched,
+            ttft,
+            itl,
+            spec,
+        )
     };
 
     if let Some(object) = snapshot.as_object_mut() {
@@ -2619,10 +2713,22 @@ async fn metrics_endpoint(
         object.insert("ttft_ms".into(), serde_json::json!(last_ttft));
         object.insert("itl_ms".into(), serde_json::json!(last_itl));
         if let Some(ref st) = spec_tele {
-            object.insert("speculative_accept_rate_ema".into(), serde_json::json!(st.accept_rate_ema));
-            object.insert("speculative_strategy".into(), serde_json::json!(st.strategy));
-            object.insert("speculative_drafted_tokens".into(), serde_json::json!(st.total_drafted_tokens));
-            object.insert("speculative_accepted_tokens".into(), serde_json::json!(st.total_accepted_tokens));
+            object.insert(
+                "speculative_accept_rate_ema".into(),
+                serde_json::json!(st.accept_rate_ema),
+            );
+            object.insert(
+                "speculative_strategy".into(),
+                serde_json::json!(st.strategy),
+            );
+            object.insert(
+                "speculative_drafted_tokens".into(),
+                serde_json::json!(st.total_drafted_tokens),
+            );
+            object.insert(
+                "speculative_accepted_tokens".into(),
+                serde_json::json!(st.total_accepted_tokens),
+            );
         }
     }
 
@@ -7219,7 +7325,7 @@ mod tests {
                     engine: Mutex::new(engine),
                     tokenizer: Mutex::new(None),
                     model_path: None,
-            model_arch: std::sync::Mutex::new(None),
+                    model_arch: std::sync::Mutex::new(None),
                     plugin_registry: None,
                 }),
                 42,
@@ -7703,6 +7809,12 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "tokens_per_sec": tps_json,
         "ttft_ms": ttft_json,
         "itl_ms": itl_json,
+        // WI-E2 contract block: acceptance rate + throughput in the shape the
+        // plan specifies; `speculative` above carries the richer telemetry.
+        "speculation": {
+            "accepted_rate": engine.acceptance_rate(),
+            "tokens_per_sec": tps_json,
+        },
         "speculative": spec_json,
         "kv_cache": {
             "used": kv_used,
