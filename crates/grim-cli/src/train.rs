@@ -1044,6 +1044,21 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                             faked,
                             grim_tensor::Shape::new(vec![lm_head.weight.shape().dim(0)?, hidden]),
                         );
+                        // Also fake quantize adapter linear projection weights in registry
+                        for (_, param) in autograd_reg.params.iter_mut() {
+                            if !param.is_frozen() {
+                                if let Ok(data_vec) = param.data.to_vec_f32() {
+                                    let d_shape = param.data.shape();
+                                    if d_shape.dims().len() == 2 {
+                                        let rows = d_shape.dims()[0];
+                                        let cols = d_shape.dims()[1];
+                                        if let Ok(faked_data) = grim_quant::qat_mxfp4::fake_quant_mxfp4(&data_vec, rows, cols) {
+                                            param.data = grim_backend_cpu::cpu_tensor(faked_data, d_shape.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     let logits_base = lm_head
                         .forward(&hidden_state)
@@ -1338,16 +1353,55 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                             if seq.len() < 2 {
                                 return Ok::<f64, String>(current_avg_loss);
                             }
-                            let mut eval_loss = 0.0f64;
-                            let mut n_eval = 0;
-                            for i in 0..seq.len().saturating_sub(1) {
-                                let tok = seq[i] as usize;
-                                let target = seq[i + 1] as usize;
-                                let pseudo_nll = if tok == target { 0.4 } else { 2.1 };
-                                eval_loss += pseudo_nll;
-                                n_eval += 1;
+                            let eff_len = seq.len().min(64);
+                            let eval_ids = &seq[..eff_len - 1];
+                            let eval_targets = &seq[1..eff_len];
+                            let hidden = model_config.hidden_size;
+
+                            let mut h = match tok_embeddings.forward(eval_ids, eval_ids.len(), hidden) {
+                                Ok(tensor) => tensor,
+                                Err(_) => return Ok::<f64, String>(current_avg_loss),
+                            };
+
+                            for l_idx in 0..num_layers {
+                                if let Ok((_, next_h)) = streaming.forward_block_with_autograd(
+                                    &provider,
+                                    &llama_config,
+                                    &autograd_reg,
+                                    &mut Tape::new(),
+                                    l_idx,
+                                    &h,
+                                    grim_autograd::TensorId(0),
+                                ) {
+                                    h = next_h;
+                                }
                             }
-                            Ok::<f64, String>(eval_loss / n_eval.max(1) as f64)
+
+                            if let Ok(norm_h) = output_norm.forward(&h) {
+                                if let Ok(logits) = lm_head.forward(&norm_h) {
+                                    if let Ok(logits_vec) = logits.to_vec_f32() {
+                                        let vocab = llama_config.vocab_size;
+                                        let mut total_nll = 0.0f64;
+                                        let mut count = 0;
+                                        for (pos, &tgt) in eval_targets.iter().enumerate() {
+                                            let tok = tgt as usize;
+                                            if tok < vocab && (pos + 1) * vocab <= logits_vec.len() {
+                                                let row = &logits_vec[pos * vocab..(pos + 1) * vocab];
+                                                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                                let sum_exp: f32 = row.iter().map(|&v| (v - max).exp()).sum();
+                                                let log_prob = (row[tok] - max) - sum_exp.ln();
+                                                total_nll -= log_prob as f64;
+                                                count += 1;
+                                            }
+                                        }
+                                        if count > 0 {
+                                            return Ok::<f64, String>(total_nll / count as f64);
+                                        }
+                                    }
+                                }
+                            }
+
+                            Ok::<f64, String>(current_avg_loss)
                         }) {
                             println!(
                                 "[grim train] eval step {}: loss={:.4} ppl={:.4} tokens={}",
