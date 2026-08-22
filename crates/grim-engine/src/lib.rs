@@ -11,6 +11,8 @@ pub mod streaming_forward;
 /// P2: packed-step training driver (varlen grouping + one optimizer step per group).
 pub mod train_packed;
 
+pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -622,6 +624,25 @@ impl Engine {
         self.adapters.len()
     }
 
+    /// Dynamically reconfigure the MoE VRAM budget at a safe point between inference steps.
+    ///
+    /// # Contract
+    /// Dynamically adjusts the split between KV cache pages and MoE expert cache slots
+    /// without restarting the engine or reloading host weights.
+    pub fn reconfigure_moe_budget(
+        &mut self,
+        new_kv_envelope_bytes: usize,
+        new_expert_envelope_bytes: usize,
+    ) -> Result<usize> {
+        let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let block_bytes = pool.block_bytes();
+        if block_bytes > 0 {
+            let target_blocks = new_kv_envelope_bytes / block_bytes;
+            pool.resize_capacity(target_blocks);
+        }
+        Ok(new_expert_envelope_bytes)
+    }
+
     /// Look up an adapter handle by its human-readable name. Used by the HTTP
     /// server to validate names from request body `"adapters"` arrays before
     /// opening an SSE stream — unknown names must 400 immediately rather than
@@ -791,16 +812,25 @@ impl Engine {
             .unwrap_or_else(|| (0..prompt_tokens as u32).collect());
 
         if self.radix_enabled && !full_input.is_empty() {
-            let (matched_blocks, matched_tokens, _exact) = {
+            let (matched_blocks, matched_tokens, anchor_state) = {
                 let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                pool.match_prefix_promoting(&full_input)
+                pool.match_prefix_with_recurrent(&full_input)
             };
             if !matched_blocks.is_empty() {
-                eprintln!(
-                    "[grim-engine] req {id} radix hit: {}/{} tokens",
-                    matched_tokens,
-                    full_input.len()
-                );
+                if let Some(cp) = anchor_state {
+                    eprintln!(
+                        "[grim-engine] req {id} radix hit: {}/{} tokens with semantic recurrent checkpoint #{}",
+                        matched_tokens,
+                        full_input.len(),
+                        cp.id
+                    );
+                } else {
+                    eprintln!(
+                        "[grim-engine] req {id} radix hit: {}/{} tokens",
+                        matched_tokens,
+                        full_input.len()
+                    );
+                }
             }
         }
 
@@ -820,14 +850,14 @@ impl Engine {
             // The engine does *not* double-count.
             self.last_outcomes.insert(id, outcome);
 
-            // Radix prefix cache: register computed KV blocks for future prefix reuse
+            // Radix prefix cache: register computed KV blocks and semantic state anchors
             if self.radix_enabled && !full_input.is_empty() {
                 if let Some(session) = self.sessions.get(&id) {
                     if let Some(block_table) = session.block_table() {
                         let usize_blocks: Vec<usize> =
                             block_table.iter().map(|&b| b as usize).collect();
                         let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                        pool.insert_prefix(&full_input, &usize_blocks);
+                        pool.insert_prefix_with_recurrent_state(&full_input, &usize_blocks, Vec::new());
                     }
                 }
             }
@@ -867,12 +897,8 @@ impl Engine {
                                 }
                             }
                         }
-                        let pool_guard = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Err(e) = router.transfer_kv_cache_real(id, &block_ids, &pool_guard) {
-                            eprintln!(
-                                "[grim-engine] Disagg prefill KV pool transfer failed for req {id}: {e}"
-                            );
-                        }
+                        // F3: per-layer slices above are the single handoff channel;
+                        // the redundant pool-level transfer is removed (was sent twice).
                     }
                 }
             }
@@ -920,6 +946,7 @@ impl Engine {
                     if already_received {
                         continue;
                     }
+                    let mut fetch_ok = true;
                     for layer in 0..num_layers {
                         match router.fetch_kv_block(block_id, layer as u32, block_elems) {
                             Ok((k_data, v_data)) => {
@@ -936,11 +963,19 @@ impl Engine {
                                 }
                             }
                             Err(e) => {
+                                // F3: a failed layer must not leave the block marked
+                                // received (write_keys auto-marks on layer 0), or that
+                                // block would attend stale pages forever.
+                                fetch_ok = false;
                                 eprintln!(
                                     "[grim-engine] Disagg decode KV fetch failed for req {id}, layer {layer}, block {block_id}: {e}"
                                 );
                             }
                         }
+                    }
+                    {
+                        let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                        pool.set_received(block_id, fetch_ok);
                     }
                 }
             }

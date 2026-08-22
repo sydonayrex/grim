@@ -12,12 +12,22 @@ use grim_tensor::{DType, Device, Shape, Tensor};
 /// MoE resident-set HBM budget (`rocm_kernel_plan.md` WI-C).
 pub mod moe_budget;
 
-pub use moe_budget::{MoeResidentBudget, ResidentTier};
+pub use moe_budget::{
+    ElasticMoEAllocation, LruResidencyTracker, MoeResidentBudget, ResidentTier,
+};
 
 /// Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
 pub mod radix;
 
 pub use radix::RadixTree;
+
+/// Semantic-aware state caching for recurrent/hybrid-attention models.
+pub mod semantic_anchor;
+
+pub use semantic_anchor::{
+    CheckpointId, RecurrentCheckpointPool, RecurrentLayerState, RecurrentStateCheckpoint,
+    SemanticAnchorRegistry,
+};
 
 pub const BLOCK_SIZE: usize = 16;
 
@@ -104,6 +114,10 @@ pub struct KvBlockPool {
     prefix_tree: RadixTree,
     /// SsmStatePool containing fixed-size state tensors for Mamba/SSM architectures (§5.1)
     ssm_states: HashMap<u32, Vec<f32>>,
+    /// Checkpoint pool for recurrent/hybrid-attention models anchored at semantic boundaries.
+    pub recurrent_checkpoints: RecurrentCheckpointPool,
+    /// Registry of semantic boundary token IDs (e.g. <think>, </tool_call>).
+    pub anchor_registry: SemanticAnchorRegistry,
     /// Layout configuration: block-major switch tied to the rocm-aiter feature flag
     block_major_layout: bool,
     /// Block ids that recently had their refcount drop to zero — kept
@@ -143,6 +157,8 @@ impl KvBlockPool {
             ref_counts: HashMap::new(),
             prefix_tree: RadixTree::new(BLOCK_SIZE),
             ssm_states: HashMap::new(),
+            recurrent_checkpoints: RecurrentCheckpointPool::new(64),
+            anchor_registry: SemanticAnchorRegistry::new(vec![151644, 151645, 32000, 32001]),
             block_major_layout,
             recently_zero: VecDeque::new(),
             num_heads,
@@ -197,12 +213,48 @@ impl KvBlockPool {
         self.prefix_tree.match_prefix(tokens)
     }
 
+    /// Match prefix and return the deepest valid recurrent checkpoint snapshot for hybrid models.
+    pub fn match_prefix_with_recurrent(
+        &mut self,
+        tokens: &[u32],
+    ) -> (Vec<BlockId>, usize, Option<Arc<RecurrentStateCheckpoint>>) {
+        let (matched, count, state_id) = self.prefix_tree.match_prefix_with_anchor(tokens);
+        let checkpoint = state_id.and_then(|id| self.recurrent_checkpoints.get_by_node(id));
+        (matched, count, checkpoint)
+    }
+
     /// Register newly computed `blocks` for `tokens` after a prefill
     /// completes. Shared prefix nodes are reused; diverging blocks become
     /// new tree nodes.
     pub fn insert_prefix(&mut self, tokens: &[u32], blocks: &[BlockId]) {
         self.prefix_tree.insert(tokens, blocks);
         self.prefix_tree.touch(tokens);
+    }
+
+    /// Register computed blocks and attach recurrent state snapshots at detected semantic anchors.
+    pub fn insert_prefix_with_recurrent_state(
+        &mut self,
+        tokens: &[u32],
+        blocks: &[BlockId],
+        layer_states: Vec<RecurrentLayerState>,
+    ) {
+        self.insert_prefix(tokens, blocks);
+
+        // Find semantic anchors in the prompt
+        let anchors = self.anchor_registry.find_anchors(tokens);
+        if let Some(&last_anchor_offset) = anchors.last() {
+            // Find which block index covers this anchor
+            let block_idx = (last_anchor_offset / BLOCK_SIZE).min(blocks.len().saturating_sub(1));
+            if block_idx < blocks.len() {
+                let target_block_id = blocks[block_idx];
+                let _cp = self.recurrent_checkpoints.store_checkpoint(
+                    target_block_id,
+                    last_anchor_offset,
+                    layer_states,
+                );
+                self.prefix_tree.attach_recurrent_state(target_block_id, target_block_id);
+            }
+        }
     }
 
     /// Drop one sequence's reference to `blocks`, pruning unshared tree
@@ -462,6 +514,37 @@ impl KvBlockPool {
         self.block_bytes
     }
 
+    /// Dynamically resize the block pool capacity at a scheduler safe point.
+    pub fn resize_capacity(&mut self, new_capacity: usize) {
+        let cur_cap = self.blocks.len();
+        if new_capacity > cur_cap {
+            let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
+            for i in cur_cap..new_capacity {
+                self.blocks.push(KvBlock {
+                    _id: i,
+                    key_data: vec![0.0; block_elem],
+                    value_data: vec![0.0; block_elem],
+                    layer_keys: Vec::new(),
+                    layer_values: Vec::new(),
+                    num_tokens: 0,
+                    received: false,
+                    location: CacheTier::Gpu,
+                });
+                self.free_list.push_back(i);
+            }
+        } else if new_capacity < cur_cap {
+            // Reclaim unreferenced blocks from the free list
+            while self.blocks.len() > new_capacity {
+                if let Some(pos) = self.free_list.iter().position(|&id| id == self.blocks.len() - 1) {
+                    self.free_list.remove(pos);
+                    self.blocks.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn add_ref(&mut self, id: BlockId) {
         *self.ref_counts.entry(id).or_insert(1) += 1;
     }
@@ -568,6 +651,18 @@ impl KvBlockPool {
     /// data, not "not yet arrived."
     pub fn block_is_received(&self, id: BlockId) -> bool {
         id < self.blocks.len() && self.blocks[id].received
+    }
+
+    /// F3: explicitly set whether block `id` holds complete KV data. The disagg
+    /// pull path clears this when *any* layer of a fetch fails, so a partial
+    /// transfer is retried next tick instead of attending stale pages.
+    pub fn set_received(&mut self, id: BlockId, received: bool) {
+        if let Some(b) = self.blocks.get_mut(id) {
+            if !received {
+                b.num_tokens = 0;
+            }
+            b.received = received;
+        }
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -1156,6 +1251,23 @@ mod tests {
         pool.free(id);
         // Without a spill manager, the block returns to the free list.
         assert_eq!(pool.free_list.len(), 4);
+    }
+
+    /// F3 regression: a partial (failed-layer) disagg fetch must clear the
+    /// received bit so the block is re-fetched instead of attended stale.
+    #[test]
+    fn set_received_clears_partial_fetch_mark() {
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        let id = pool.alloc().unwrap();
+        // write_keys auto-marks received (layer-0 arrival).
+        pool.write_keys(id, &vec![1.0f32; BLOCK_SIZE * 2 * 4], BLOCK_SIZE);
+        assert!(pool.block_is_received(id));
+        // A later layer failed: pull path clears the mark and token count.
+        pool.set_received(id, false);
+        assert!(!pool.block_is_received(id));
+        // Recovery after a complete retry.
+        pool.set_received(id, true);
+        assert!(pool.block_is_received(id));
     }
 
     #[test]

@@ -8,6 +8,7 @@ description = "ROCm (hip/rocBLAS) backend for Grim — primary GPU target per ar
 
 [dependencies]
 grim-tensor = { workspace = true }
+grim-backend-cpu = { workspace = true }
 grim-format = { workspace = true }
 grim-quant = { workspace = true }
 thiserror = { workspace = true }

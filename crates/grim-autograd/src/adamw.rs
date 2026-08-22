@@ -303,7 +303,11 @@ impl Optimizer {
                 lr,
                 ..AdafactorConfig::default()
             }))),
-            OptimizerKind::GaloreAdamW => {
+            OptimizerKind::GaloreAdamW => Err(Error::Unimplemented(
+                "bf16 GaLore projector not implemented; use qgalore-8bit".into(),
+            )),
+            OptimizerKind::GaloreAdamW8Bit => {
+                eprintln!("grim: galore-8bit is an alias for qgalore-8bit");
                 Ok(Optimizer::QGaLoreAdamW8Bit(QGaLoreAdamW8Bit::new(
                     QGaLoreAdamW8BitConfig {
                         lr,
@@ -311,7 +315,7 @@ impl Optimizer {
                     },
                 )))
             }
-            OptimizerKind::QGaLoreAdamW8Bit | OptimizerKind::GaloreAdamW8Bit => {
+            OptimizerKind::QGaLoreAdamW8Bit => {
                 Ok(Optimizer::QGaLoreAdamW8Bit(QGaLoreAdamW8Bit::new(
                     QGaLoreAdamW8BitConfig {
                         lr,
@@ -3443,6 +3447,7 @@ mod tests {
     fn test_unimplemented_optimizers_rejected_honestly() {
         for kind in [
             OptimizerKind::AdamWBnb,
+            OptimizerKind::GaloreAdamW,
             OptimizerKind::LOMO,
             OptimizerKind::Adalomo,
             OptimizerKind::CAME,

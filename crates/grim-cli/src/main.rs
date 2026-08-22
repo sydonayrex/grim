@@ -416,7 +416,7 @@ enum Commands {
         /// bf16/fp16 halve VRAM vs f32 on consumer RDNA (salamander.md P1).
         train_dtype: train::TrainDtype,
         /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
-        /// lion-8bit, adafactor, qgalore, galore, galore-8bit, muon, madam, lion-vote).
+        /// lion-8bit, adafactor, qgalore-8bit, galore-8bit, muon, madam, lion-vote).
         #[arg(long, default_value = "adamw")]
         optimizer: grim_autograd::OptimizerKind,
         /// LR scheduler (cosine-warmup, linear, polynomial, constant,

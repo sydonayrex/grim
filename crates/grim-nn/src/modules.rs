@@ -403,6 +403,14 @@ impl Linear {
         Self::load(ws, shape[0], shape[1], false)
     }
 
+    /// F2 (full-parameter write-back): swap in freshly trained weights,
+    /// recomputing the pre-transposed `w_t` that forward actually consumes.
+    pub fn replace_weight(&mut self, weight: Tensor) -> Result<()> {
+        self.w_t = transpose_last_two(&weight)?;
+        self.weight = weight;
+        Ok(())
+    }
+
     /// Load a column-parallel shard (dim==0): each rank gets `out_dim / world_size`
     /// rows of the weight matrix. Bias is loaded unsharded (same on all ranks).
     pub fn load_column_parallel(
@@ -1080,6 +1088,28 @@ impl Rope {
 
 #[cfg(test)]
 mod tests {
+
+    /// F2: replace_weight must rebuild `w_t` (forward's actual operand), not
+    /// just swap the stored GGUF-order weight.
+    #[test]
+    fn replace_weight_recomputes_transpose() {
+        let w0 = cpu_tensor(vec![1.0, 0.0, 0.0, 1.0], Shape::new(vec![2, 2]));
+        let mut lin = Linear::from_tensor(w0, None);
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
+        let y1 = lin.forward(&x).unwrap().to_vec_f32().unwrap();
+
+        lin.replace_weight(cpu_tensor(vec![0.0, 1.0, 1.0, 0.0], Shape::new(vec![2, 2])))
+            .unwrap();
+        assert_eq!(lin.weight.to_vec_f32().unwrap(), vec![0.0, 1.0, 1.0, 0.0]);
+        // Transposed view must match the new weight, not the old one.
+        assert_eq!(lin.w_t.to_vec_f32().unwrap(), vec![0.0, 1.0, 1.0, 0.0]);
+        let y2 = lin.forward(&x).unwrap().to_vec_f32().unwrap();
+        assert_ne!(
+            y1, y2,
+            "forward must observe replaced weights via rebuilt w_t"
+        );
+    }
+
     use super::*;
     use grim_backend_cpu::cpu_tensor;
 

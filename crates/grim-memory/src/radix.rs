@@ -32,6 +32,8 @@ pub struct RadixNode {
     pub ref_count: u32,
     /// Last time this node (or a descendant) was matched/inserted.
     pub last_access: Instant,
+    /// Checkpoint ID of attached recurrent/hybrid layer state at this block boundary (if any).
+    pub recurrent_state_id: Option<usize>,
 }
 
 /// Block-granular radix tree over request token sequences.
@@ -54,6 +56,7 @@ impl RadixTree {
             parent: None,
             ref_count: 0,
             last_access: Instant::now(),
+            recurrent_state_id: None,
         };
         Self {
             nodes: vec![root],
@@ -78,21 +81,40 @@ impl RadixTree {
     /// matches the leading tokens of `tokens`, plus the number of matched
     /// tokens. Shared prefixes stop at the first non-matching block.
     pub fn match_prefix(&self, tokens: &[u32]) -> (Vec<usize>, usize) {
+        let (matched, offset, _) = self.match_prefix_with_anchor(tokens);
+        (matched, offset)
+    }
+
+    /// Walk from the root, returning the matched physical blocks, token count,
+    /// and the deepest valid `recurrent_state_id` anchored along the matched path.
+    pub fn match_prefix_with_anchor(&self, tokens: &[u32]) -> (Vec<usize>, usize, Option<usize>) {
         let mut matched = Vec::new();
         let mut node = self.root;
         let mut offset = 0;
+        let mut deepest_state_id = None;
+
         while offset + self.block_size <= tokens.len() {
             let key = Self::block_key(tokens, offset, self.block_size);
             match self.nodes[node].children.get(&key) {
                 Some(&child) => {
                     matched.push(self.nodes[child].block_id);
+                    if let Some(st_id) = self.nodes[child].recurrent_state_id {
+                        deepest_state_id = Some(st_id);
+                    }
                     offset += self.block_size;
                     node = child;
                 }
                 None => break,
             }
         }
-        (matched, offset)
+        (matched, offset, deepest_state_id)
+    }
+
+    /// Attach a recurrent-state checkpoint ID to the node corresponding to `block_id`.
+    pub fn attach_recurrent_state(&mut self, block_id: usize, state_id: usize) {
+        if let Some(&node_idx) = self.block_to_node.get(&block_id) {
+            self.nodes[node_idx].recurrent_state_id = Some(state_id);
+        }
     }
 
     /// Touch `last_access` along the matched path so eviction prefers
@@ -135,6 +157,7 @@ impl RadixTree {
                 parent: Some(node),
                 ref_count: 1,
                 last_access: Instant::now(),
+                recurrent_state_id: None,
             });
             self.nodes[node].children.insert(key, child_idx);
             self.block_to_node.insert(bid, child_idx);

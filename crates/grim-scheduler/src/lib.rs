@@ -9,6 +9,9 @@ use grim_core::DeterminismMode;
 pub mod self_tuning;
 pub use self_tuning::{SelfTuningController, TunableKnob};
 
+pub mod bandwidth_policy;
+pub use bandwidth_policy::BandwidthProfile;
+
 /// A request in the scheduler system.
 #[derive(Debug, Clone)]
 pub struct Request {

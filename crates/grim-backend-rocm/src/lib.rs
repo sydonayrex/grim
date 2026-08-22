@@ -65,6 +65,9 @@ pub mod trace;
 pub use device::capability_profiler::{
     CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch, vram_info,
 };
+pub use device::moe_hybrid_exec::{
+    MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor,
+};
 
 // ----- Crate-root re-exports ------------------------------------
 // Existing callers (lib_internal_tests.rs + external crates) see
