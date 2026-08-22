@@ -992,9 +992,9 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let mut num_batches = 0u32;
 
         for (batch_idx, (tokens, labels)) in dataset.iter().enumerate() {
-            if opts.num_gpus > 1 && batch_idx % opts.num_gpus != 0 {
-                continue;
-            }
+            // F8 note: single-replica process — dropping batches here would
+            // train on 1/N of the data for zero benefit, so every batch runs.
+            // Per-GPU replicas remain garage-side until in-process fanout lands.
             if tokens.len() < 2 {
                 continue;
             }

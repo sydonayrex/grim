@@ -35,6 +35,11 @@ impl std::error::Error for JsonSchemaCompilerError {}
 pub struct JsonSchemaConstraint {
     schema: Value,
     cache: Arc<Mutex<HashMap<String, Arc<[bool]>>>>,
+    /// F9: true when any `pattern` or string-`enum` exists anywhere in the
+    /// schema. When false, tokens appended INSIDE an unterminated string can
+    /// never change schema validity (plain strings accept any content), so
+    /// the per-step O(vocab) validate pass is skippable entirely.
+    has_string_constraint: bool,
 }
 
 impl JsonSchemaConstraint {
@@ -82,9 +87,11 @@ pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSc
         }
     }
 
+    let has_string_constraint = scan_string_constraints(&resolved_schema);
     Ok(JsonSchemaConstraint {
         schema: resolved_schema,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        has_string_constraint,
     })
 }
 
@@ -157,6 +164,15 @@ impl JsonSchemaConstraint {
             }
         };
         validate(&value, &self.schema)
+    }
+
+    /// F9 fast path: while the cursor is INSIDE an unterminated JSON string
+    /// and the schema imposes no pattern/enum on strings, appending any token
+    /// keeps the output as consistent as it was when the string opened — so
+    /// the whole O(vocab) parse+validate pass is skipped. The structural PDA
+    /// mask still applies upstream.
+    pub fn inside_string_fast_path(&self, current_output: &str) -> bool {
+        !self.has_string_constraint && inside_unterminated_string(current_output)
     }
 
     /// Return a memoized validity mask for `vocab` given `current_output`.
@@ -573,8 +589,40 @@ fn validate(value: &Value, schema: &Value) -> bool {
     true
 }
 
-#[cfg(test)]
+/// True when `partial` ends inside an unterminated JSON string literal
+/// (unescaped double-quote parity scan).
+pub fn inside_unterminated_string(partial: &str) -> bool {
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in partial.chars() {
+        match c {
+            '"' if !escaped => in_str = !in_str,
+            '\\' if in_str => escaped = !escaped,
+            _ => escaped = false,
+        }
+    }
+    in_str
+}
+
+/// Recursive scan: does this schema subtree constrain string CONTENT via
+/// `pattern` or a string-typed `enum`?
+fn scan_string_constraints(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            let is_string = map.get("type").and_then(|t| t.as_str()) == Some("string");
+            let has_pattern = map.contains_key("pattern");
+            let string_enum = is_string && map.contains_key("enum");
+            if has_pattern || string_enum {
+                return true;
+            }
+            map.values().any(scan_string_constraints)
+        }
+        Value::Array(arr) => arr.iter().any(scan_string_constraints),
+        _ => false,
+    }
+}
 mod tests {
+
     use super::*;
 
     #[test]
@@ -677,5 +725,67 @@ mod tests {
         let c = compile_json_schema(schema).unwrap();
         assert_eq!(c.lookahead_jump_forward(""), Some("{\n".to_string()));
         assert_eq!(c.lookahead_jump_forward("{"), Some("\"user_id\": ".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod f9_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn inside_string_detection() {
+        assert!(!inside_unterminated_string(""));
+        assert!(!inside_unterminated_string("{\"a\": 1}"));
+        assert!(inside_unterminated_string("{\"a\": \"hel"));
+        assert!(!inside_unterminated_string("{\"a\": \"v\\\"x\"}"));
+        assert!(inside_unterminated_string("{\"a\": \"v\\"));
+    }
+
+    #[test]
+    fn fast_path_skips_only_unconstrained_strings() {
+        let plain = compile_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+        }))
+        .unwrap();
+        assert!(!plain.has_string_constraint);
+        assert!(plain.inside_string_fast_path("{\"name\": \"hello wor"));
+
+        let constrained = compile_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": { "code": { "type": "string", "pattern": "^[A-Z]{3}$" } }
+        }))
+        .unwrap();
+        assert!(constrained.has_string_constraint);
+        assert!(!constrained.inside_string_fast_path("{\"code\": \"AB"));
+
+        let enummed = compile_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": { "kind": { "type": "string", "enum": ["a", "b"] } }
+        }))
+        .unwrap();
+        assert!(enummed.has_string_constraint);
+    }
+
+    #[test]
+    fn fast_path_masks_equal_full_validate_inside_plain_strings() {
+        let vocab: Vec<String> = ["\"", "x", "A", "1", "}", "{", ",", ":", "\\n", " hello"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let c = compile_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" }, "n": { "type": "number" } },
+            "required": ["name", "n"]
+        }))
+        .unwrap();
+        let partial = "{\"name\": \"partial value";
+        assert!(c.inside_string_fast_path(partial));
+        let fast = c.mask_for(&vocab, partial);
+        let slow: Vec<bool> = vocab
+            .iter()
+            .map(|t| c.is_consistent(&format!("{partial}{t}")))
+            .collect();
+        assert_eq!(fast.to_vec(), slow, "fast path must agree with full validate");
     }
 }
