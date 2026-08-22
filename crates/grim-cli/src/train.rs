@@ -1289,6 +1289,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                 optimizer
                     .step(&mut autograd_reg.params)
                     .map_err(|e| Error::Session(e.to_string()))?;
+
+                // F2: full-parameter write-back — without this, stepped base
+                // weights stay in the registry and every later forward reads
+                // the original provider weights from the block cache.
+                if scope == AutogradScope::FullParameter {
+                    streaming
+                        .overwrite_base_weights(&autograd_reg)
+                        .map_err(|e| Error::Session(e.to_string()))?;
+                }
+
                 autograd_reg
                     .zero_grads()
                     .map_err(|e| Error::Session(e.to_string()))?;
@@ -1663,6 +1673,8 @@ mod tests {
         norm_bytes: Vec<u8>,           // length = hidden * 4
         lmhead_bytes: Option<Vec<u8>>, // length = vocab * hidden * 4 if Some
         embed_shape: Vec<usize>,
+        /// F2 test hook: optional layer-0 block tensors keyed by full path.
+        block: Option<std::collections::HashMap<String, (Vec<usize>, Vec<u8>)>>,
     }
 
     impl HeadProvider {
@@ -1687,7 +1699,32 @@ mod tests {
                 norm_bytes,
                 lmhead_bytes: None,
                 embed_shape: vec![vocab, hidden],
+                block: None,
             }
+        }
+        /// F2 test hook: serve the nine layer-0 tensors LlamaBlock::load needs.
+        fn with_block(mut self, hidden: usize, inter: usize) -> Self {
+            let mut m = std::collections::HashMap::new();
+            let mut put = |k: &str, shape: Vec<usize>, fill: f32| {
+                let n: usize = shape.iter().product();
+                let mut bytes = vec![0u8; n * 4];
+                for (i, b) in bytes.chunks_mut(4).enumerate() {
+                    let v = fill + (i % 7) as f32 * 0.01;
+                    b.copy_from_slice(&v.to_le_bytes());
+                }
+                m.insert(k.to_string(), (shape, bytes));
+            };
+            put("layers.0.attn_norm.weight", vec![hidden], 1.0);
+            put("layers.0.attn.wq.weight", vec![hidden, hidden], 0.05);
+            put("layers.0.attn.wk.weight", vec![hidden, hidden], 0.05);
+            put("layers.0.attn.wv.weight", vec![hidden, hidden], 0.05);
+            put("layers.0.attn.wo.weight", vec![hidden, hidden], 0.05);
+            put("layers.0.ffn_norm.weight", vec![hidden], 1.0);
+            put("layers.0.ffn.w_gate.weight", vec![inter, hidden], 0.05);
+            put("layers.0.ffn.w_up.weight", vec![inter, hidden], 0.05);
+            put("layers.0.ffn.w_down.weight", vec![hidden, inter], 0.05);
+            self.block = Some(m);
+            self
         }
         fn with_lm_head(mut self) -> Self {
             let mut lmhead_bytes = vec![0u8; self.vocab * self.hidden * 4];
@@ -1703,6 +1740,16 @@ mod tests {
 
     impl TensorProvider for HeadProvider {
         fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+            if let Some(map) = &self.block {
+                if let Some((shape, bytes)) = map.get(name) {
+                    return Ok(RawTensor {
+                        bytes: bytes.clone(),
+                        shape: shape.clone(),
+                        dtype: DType::F32,
+                        provenance: QuantProvenance::GrimNative,
+                    });
+                }
+            }
             match name {
                 "token_embd.weight" => Ok(RawTensor {
                     bytes: self.embed_bytes.clone(),
@@ -1896,6 +1943,117 @@ mod tests {
             final_loss < initial_loss,
             "final loss ({final_loss}) must be strictly lower than initial loss ({initial_loss}) after training steps"
         );
+    }
+
+    /// F2 regression: full-parameter write-back must push stepped registry
+    /// weights into the streaming block cache, so forwards after a step read
+    /// updated weights instead of the original provider tensors.
+    #[test]
+    fn full_parameter_write_back_updates_cached_block() {
+        use grim_autograd::{
+            AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape,
+        };
+        use grim_backend_cpu::cpu_tensor;
+        use grim_engine::streaming_forward::StreamingBlockForward;
+        use grim_models_transformer::LlamaConfig;
+        use grim_nn::modules::Embedding;
+        use grim_nn::WeightSource;
+        use grim_tensor::Shape;
+
+        let vocab = 16usize;
+        let hidden = 8usize;
+        let provider = HeadProvider::new(vocab, hidden).with_block(hidden, 16);
+        let ws = WeightSource::root(&provider, grim_tensor::Device::Cpu);
+        let cfg = LlamaConfig {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            num_layers: 1,
+            intermediate_size: 16,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 64,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+
+        let inj_cfg = InjectionConfig {
+            hidden_size: hidden,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 16,
+            vocab_size: vocab,
+        };
+        let mut reg = AutogradRegistry::with_scope(
+            inj_cfg,
+            LoRAInjectionRegistry::new(),
+            AutogradScope::FullParameter,
+        )
+        .unwrap();
+
+        let emb = Embedding::load(&ws.pp("token_embd"), vocab, hidden).unwrap();
+        let ids = [0u32, 1];
+        let h = emb.forward(&ids, ids.len(), hidden).unwrap();
+
+        let mut sfb = StreamingBlockForward::new(1, hidden);
+        fn run(
+            sfb: &mut StreamingBlockForward,
+            provider: &HeadProvider,
+            cfg: &LlamaConfig,
+            reg: &AutogradRegistry,
+            h: &grim_tensor::Tensor,
+        ) -> Option<Vec<f32>> {
+            let mut tape = Tape::new();
+            let x_id = tape.register(h.clone());
+            let (_, out) = sfb
+                .forward_block_with_autograd(provider, cfg, reg, &mut tape, 0, h, x_id)
+                .ok()?;
+            out.to_vec_f32().ok()
+        }
+
+        // Materialize the cache. The standalone block forward stops at
+        // attention (no session KV context here) — that's fine: the block is
+        // inserted into the cache before any math, which is all this test needs.
+        let _ = run(&mut sfb, &provider, &cfg, &reg, &h);
+        let before = sfb
+            .cached_qproj_weight(0, &grim_tensor::Device::Cpu)
+            .expect("block must be cached after first forward");
+        let before = before.to_vec_f32().unwrap();
+        assert!(!before.is_empty());
+
+        // Simulate an optimizer step: change the QProj base weight in the
+        // registry only (exactly what backward+step produce).
+        let new_w = vec![0.5f32; hidden * hidden];
+        reg.params
+            .get_mut(grim_autograd::ParamId::base(
+                0,
+                grim_autograd::LoRAInjectionPoint::QProj,
+            ))
+            .unwrap()
+            .data = cpu_tensor(new_w.clone(), Shape::new(vec![hidden, hidden]));
+
+        // Pre-fix behavior: forward still reads stale cache. Post-fix: differs.
+        sfb.overwrite_base_weights(&reg).unwrap();
+        let after = sfb
+            .cached_qproj_weight(0, &grim_tensor::Device::Cpu)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        assert_ne!(
+            before, after,
+            "overwrite_base_weights must replace the cached weight"
+        );
+
+        // And the cached weight now equals the stepped param bit-for-bit.
+        let wq = sfb
+            .cached_qproj_weight(0, &grim_tensor::Device::Cpu)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        assert_eq!(wq, new_w);
     }
 
     #[test]

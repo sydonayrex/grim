@@ -20,7 +20,7 @@ pub use deterministic_rng::DeterministicRng;
 pub use device::{CpuDevice, add_tensors, cpu_tensor};
 pub use graph_capture::{CpuCapturedGraph, CpuGraphRegistry};
 pub use hardware_spec::CpuHardwareSpec;
-pub use moe_dispatch::moe_fused_dispatch;
+pub use moe_dispatch::{PersistentMoeWorkerPool, moe_cpu_partial_dispatch, moe_fused_dispatch};
 pub use simd_gemm::{gemm_f32_lora_fused, gemm_f32_simd};
 pub use storage::CpuStorage;
 pub use topology::CpuNumaTopology;

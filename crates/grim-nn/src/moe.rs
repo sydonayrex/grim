@@ -870,6 +870,90 @@ impl MoeFfn {
         Ok(cpu_tensor(out_vec, Shape::new(vec![batch, hidden])))
     }
 
+    /// MoE-aware bandwidth-adaptive hybrid decode forward pass.
+    ///
+    /// # Contract
+    /// Partitions active routed experts into GPU resident/fills ($\mathcal{H} \cup \mathcal{F}$)
+    /// and CPU host-RAM misses ($\mathcal{C}$) using the empirical $q^*$ policy.
+    /// Evaluates both branches and merges partial sums: $y = y_{\text{GPU}} + y_{\text{CPU}}$.
+    pub fn forward_moe_aware_hybrid(
+        &self,
+        x: &Tensor,
+        executor: &grim_backend_rocm::MoeHybridExecutor,
+        is_resident: impl Fn(usize) -> bool,
+    ) -> Result<Tensor, grim_tensor::error::Error> {
+        let (indices, weights) = self.router.route(x)?;
+        let batch = indices.len();
+        let hidden = self
+            .experts
+            .down
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+
+        let mut gpu_partial = vec![0.0f32; batch * hidden];
+        let mut cpu_partial = vec![0.0f32; batch * hidden];
+
+        for t in 0..batch {
+            let experts = &indices[t];
+            let w = &weights[t];
+            let xt = slice_row(x, t)?;
+
+            // Build hybrid plan for this token's active experts
+            let plan = executor.plan_step(0, experts, &is_resident);
+            let gpu_set: std::collections::HashSet<usize> = plan
+                .gpu_resident_experts
+                .iter()
+                .chain(plan.gpu_fill_experts.iter())
+                .copied()
+                .collect();
+            let cpu_set: std::collections::HashSet<usize> =
+                plan.cpu_compute_experts.iter().copied().collect();
+
+            // GPU path (resident + fills)
+            for (rank, &e) in experts.iter().enumerate() {
+                if gpu_set.contains(&e) {
+                    let y = self.experts.expert_forward(e, &xt)?;
+                    let yv = y.to_vec_f32()?;
+                    for (i, v) in yv.iter().enumerate() {
+                        gpu_partial[t * hidden + i] += w[rank] * v;
+                    }
+                }
+            }
+
+            // CPU path (residual misses in host RAM)
+            for (rank, &e) in experts.iter().enumerate() {
+                if cpu_set.contains(&e) {
+                    let y = self.experts.expert_forward(e, &xt)?;
+                    let yv = y.to_vec_f32()?;
+                    for (i, v) in yv.iter().enumerate() {
+                        cpu_partial[t * hidden + i] += w[rank] * v;
+                    }
+                }
+            }
+        }
+
+        // Exact merge y = y_GPU + y_CPU
+        grim_backend_rocm::MoeHybridExecutor::merge_outputs(&mut gpu_partial, &cpu_partial)?;
+
+        let mut out_vec = vec![0.0f32; batch * hidden];
+        for t in 0..batch {
+            for i in 0..hidden {
+                out_vec[t * hidden + i] = self.routed_scaling_factor * gpu_partial[t * hidden + i];
+            }
+            if let Some(sh) = &self.shared_expert {
+                let xt = slice_row(x, t)?;
+                let s = sh.forward(&xt)?;
+                let sv = s.to_vec_f32()?;
+                for (i, v) in sv.iter().enumerate() {
+                    out_vec[t * hidden + i] += v;
+                }
+            }
+        }
+
+        Ok(cpu_tensor(out_vec, Shape::new(vec![batch, hidden])))
+    }
+
     /// Vulkan dispatch of the fused grouped MoE kernel (WI-M5).
     ///
     /// Flattens each expert's gate/up/down weights into the single contiguous
@@ -2550,5 +2634,58 @@ mod tests {
     #[should_panic(expected = "caps must be non-empty")]
     fn ep1_build_panics_on_empty_caps() {
         let _ = ExpertPlacementMap::build(4, &[], CapacityMetric::VramBytes);
+    }
+
+    #[test]
+    fn test_moe_aware_hybrid_matches_monolithic_forward() {
+        let hidden = 4;
+        let inter = 8;
+        let num_experts = 4;
+        let top_k = 2;
+
+        let gate_weight = cpu_tensor(vec![0.1; hidden * num_experts], Shape::new(vec![num_experts, hidden]));
+        let gate_linear = Linear::from_tensor(gate_weight, None);
+        let router = MoeRouter::new(gate_linear, RouterKind::SoftmaxTopK, top_k, num_experts, None);
+
+        let mut gate_layers = Vec::new();
+        let mut up_layers = Vec::new();
+        let mut down_layers = Vec::new();
+
+        for e in 0..num_experts {
+            let val = (e + 1) as f32 * 0.05;
+            gate_layers.push(Linear::from_tensor(cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])), None));
+            up_layers.push(Linear::from_tensor(cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])), None));
+            down_layers.push(Linear::from_tensor(cpu_tensor(vec![val; hidden * inter], Shape::new(vec![hidden, inter])), None));
+        }
+
+        let experts = ExpertBank {
+            gate: gate_layers,
+            up: up_layers,
+            down: down_layers,
+        };
+
+        let moe = MoeFfn::new(router, experts, None, 1.0);
+        let input = cpu_tensor(vec![1.0, 0.5, -0.5, 2.0], Shape::new(vec![1, hidden]));
+
+        // Standard forward
+        let std_out = moe.forward(&input).unwrap().to_vec_f32().unwrap();
+
+        // MoE-aware hybrid forward (simulating expert 0 is resident on GPU, others miss to CPU)
+        let executor = grim_backend_rocm::MoeHybridExecutor::new(25_000.0, 60_000.0);
+        let hybrid_out = moe
+            .forward_moe_aware_hybrid(&input, &executor, |e| e == 0)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(std_out.len(), hybrid_out.len());
+        for i in 0..std_out.len() {
+            assert!(
+                (std_out[i] - hybrid_out[i]).abs() < 1e-5,
+                "Mismatch at {i}: std {}, hybrid {}",
+                std_out[i],
+                hybrid_out[i]
+            );
+        }
     }
 }

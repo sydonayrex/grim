@@ -2517,229 +2517,58 @@ async fn audio_speech(
     }
 }
 
-/// Helper: encode raw bytes to standard Base64 string.
-fn server_base64_encode(data: &[u8]) -> String {
-    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    let mut chunks = data.chunks_exact(3);
-    for chunk in &mut chunks {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk[1] as u32;
-        let b2 = chunk[2] as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(CHARSET[((triple >> 6) & 0x3F) as usize] as char);
-        out.push(CHARSET[(triple & 0x3F) as usize] as char);
-    }
-    let rem = chunks.remainder();
-    if rem.len() == 1 {
-        let triple = (rem[0] as u32) << 16;
-        out.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem.len() == 2 {
-        let triple = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
-        out.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(CHARSET[((triple >> 6) & 0x3F) as usize] as char);
-        out.push('=');
-    }
-    out
-}
-
 /// OpenAI-compatible audio transcriptions endpoint.
+///
+/// F5 stage-1 honesty: the endpoint does not yet accept uploaded audio (no
+/// multipart/raw-body decode, no mel front-end), so it fails loudly instead
+/// of returning synthetic text derived from an all-zero mel.
 async fn audio_transcriptions() -> (StatusCode, Json<serde_json::Value>) {
-    let audio_guard = AUDIO_MODELS.lock().unwrap_or_else(|e| e.into_inner());
-    let whisper_model = audio_guard
-        .values()
-        .find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
-
-    if let Some(whisper) = whisper_model {
-        // Run Whisper ASR decoding pipeline end-to-end
-        let mel = grim_backend_cpu::cpu_tensor(
-            vec![0.0f32; whisper.cfg.n_mels * 8],
-            grim_tensor::Shape::new(vec![whisper.cfg.n_mels, 8]),
-        );
-        let enc = whisper.encode(&mel);
-        let ids_vec: Vec<f32> = vec![
-            1.0f32 % (whisper.cfg.vocab_size as f32),
-            2.0f32 % (whisper.cfg.vocab_size as f32),
-            3.0f32 % (whisper.cfg.vocab_size as f32),
-        ];
-        let ids = grim_backend_cpu::cpu_tensor(ids_vec, grim_tensor::Shape::new(vec![3]));
-        let mut decoded_tokens: Vec<usize> = Vec::new();
-        if let Ok(enc_out) = enc {
-            if let Ok(logits) = whisper.decode_step(&enc_out, &ids) {
-                if let Ok(v) = logits.to_vec_f32() {
-                    let best = v
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    decoded_tokens.push(best);
-                }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "text": "",
+            "error": {
+                "type": "not_implemented",
+                "capability": "audio_transcription",
+                "message": "the transcription pipeline does not accept uploaded audio in this build; real ASR requires request-body decoding and a mel front-end"
             }
-        }
-        let transcribed_text = if !decoded_tokens.is_empty() {
-            format!("audio sequence decoded ({} token steps)", decoded_tokens.len())
-        } else {
-            "transcription complete".to_string()
-        };
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "text": transcribed_text
-            })),
-        )
-    } else {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "text": "",
-                "error": {
-                    "type": "not_implemented",
-                    "capability": "audio_transcription",
-                    "message": "no ASR model is loaded; transcription requires a Whisper-family GGUF — load one via POST /v1/models/load"
-                }
-            })),
-        )
-    }
+        })),
+    )
 }
 
 /// OpenAI-compatible audio translations endpoint.
 async fn audio_translations() -> (StatusCode, Json<serde_json::Value>) {
-    let audio_guard = AUDIO_MODELS.lock().unwrap_or_else(|e| e.into_inner());
-    let whisper_model = audio_guard
-        .values()
-        .find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
-
-    if let Some(whisper) = whisper_model {
-        let mel = grim_backend_cpu::cpu_tensor(
-            vec![0.0f32; whisper.cfg.n_mels * 8],
-            grim_tensor::Shape::new(vec![whisper.cfg.n_mels, 8]),
-        );
-        let enc = whisper.encode(&mel);
-        let ids_vec: Vec<f32> = vec![
-            1.0f32 % (whisper.cfg.vocab_size as f32),
-            2.0f32 % (whisper.cfg.vocab_size as f32),
-            3.0f32 % (whisper.cfg.vocab_size as f32),
-        ];
-        let ids = grim_backend_cpu::cpu_tensor(ids_vec, grim_tensor::Shape::new(vec![3]));
-        let mut decoded_tokens: Vec<usize> = Vec::new();
-        if let Ok(enc_out) = enc {
-            if let Ok(logits) = whisper.decode_step(&enc_out, &ids) {
-                if let Ok(v) = logits.to_vec_f32() {
-                    let best = v
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    decoded_tokens.push(best);
-                }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "text": "",
+            "error": {
+                "type": "not_implemented",
+                "capability": "audio_translation",
+                "message": "the translation pipeline does not accept uploaded audio in this build; real translation requires request-body decoding and a mel front-end"
             }
-        }
-        let translated_text = if !decoded_tokens.is_empty() {
-            format!("audio translated ({} token steps)", decoded_tokens.len())
-        } else {
-            "translation complete".to_string()
-        };
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "text": translated_text
-            })),
-        )
-    } else {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "text": "",
-                "error": {
-                    "type": "not_implemented",
-                    "capability": "audio_translation",
-                    "message": "no translation model is loaded; translation requires a Whisper-family GGUF — load one via POST /v1/models/load"
-                }
-            })),
-        )
-    }
+        })),
+    )
 }
 
 /// OpenAI-compatible image generation endpoint.
 async fn images_generations() -> (StatusCode, Json<serde_json::Value>) {
-    let diff_guard = DIFFUSION_MODELS.lock().unwrap_or_else(|e| e.into_inner());
-    let diffusion_model = diff_guard.values().find_map(|m| {
-        m.as_any()
-            .downcast_ref::<grim_models_diffusion::Flux2Transformer2D>()
-    });
-
-    if let Some(flux) = diffusion_model {
-        // Run Flux 2 diffusion step
-        let latents = grim_backend_cpu::cpu_tensor(
-            vec![0.1f32; 16 * 128],
-            grim_tensor::Shape::new(vec![16, 128]),
-        );
-        let prompt_ctx = grim_backend_cpu::cpu_tensor(
-            vec![0.0f32; 8 * flux.config.joint_attention_dim],
-            grim_tensor::Shape::new(vec![8, flux.config.joint_attention_dim]),
-        );
-        let v_pred = flux.forward(&latents, &prompt_ctx, 500.0);
-        let vae = grim_models_diffusion::Flux2VAE::random(
-            grim_tensor::Device::Cpu,
-            grim_models_diffusion::Flux2VaeConfig::default(),
-        );
-        let decoded = if let Ok(v) = v_pred {
-            let unpacked = vae.unpack_latents(&v, 4, 4);
-            if let Ok(u) = unpacked {
-                vae.decode(&u).ok()
-            } else {
-                None
+    // F5 stage-1 honesty: a loaded Flux2 transformer alone cannot generate —
+    // the pipeline needs prompt text-encoder conditioning and a trained VAE.
+    // Returning unconditioned pixels decoded through a random VAE would
+    // fabricate output, so fail loudly instead (same contract as embeddings).
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "created": 0,
+            "data": [],
+            "error": {
+                "type": "not_implemented",
+                "capability": "image_generation",
+                "message": "text-conditioned generation is not wired in this build; requires a text encoder and a trained Flux 2 / UNet checkpoint with VAE"
             }
-        } else {
-            None
-        };
-
-        let raw_pixels: Vec<u8> = decoded
-            .as_ref()
-            .and_then(|d| d.to_vec_f32().ok())
-            .map(|floats| {
-                floats
-                    .iter()
-                    .map(|&f| ((f.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8)
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![128u8; 64]);
-
-        let b64_pixels = server_base64_encode(&raw_pixels);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "created": 1724240000,
-                "data": [
-                    {
-                        "b64_json": b64_pixels,
-                        "revised_prompt": "Flux 2 photorealistic synthesis"
-                    }
-                ]
-            })),
-        )
-    } else {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "created": 0,
-                "data": [],
-                "error": {
-                    "type": "not_implemented",
-                    "capability": "image_generation",
-                    "message": "no diffusion model is loaded; generation requires a Flux 2 / UNet checkpoint — load one via POST /v1/models/load"
-                }
-            })),
-        )
-    }
+        })),
+    )
 }
 
 /// gRPC service endpoint handler (§8).
@@ -4587,8 +4416,18 @@ async fn grim_pull(
 }
 
 /// Build a new HTTP router with the given engine state.
+/// Paths reachable without a bearer key even when auth is enabled.
+const AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/healthz", "/readyz", "/metrics"];
+
+/// Open server (loopback posture unchanged). See [`build_router_with_auth`].
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    build_router_with_auth(state, Vec::new())
+}
+
+/// Same route table, but requires `Authorization: Bearer <key>` on every
+/// path except [`AUTH_EXEMPT_PATHS`] when `api_keys` is non-empty.
+pub fn build_router_with_auth(state: Arc<AppState>, api_keys: Vec<String>) -> Router {
+    let router = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -4640,9 +4479,47 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // origin as the server itself — the CLI `grim scheduler` subcommand
         // and dashboards poll this instead of guessing ports.
         .route("/scheduler", get(get_status))
-        .route("/api/scheduler", get(get_status))
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
-        .with_state(state)
+        .route("/api/scheduler", get(get_status));
+        let router = if api_keys.is_empty() {
+            router
+        } else {
+            let keys: std::sync::Arc<[String]> = api_keys.into();
+            router.layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let keys = keys.clone();
+                    async move {
+                        let path = req.uri().path();
+                        if !AUTH_EXEMPT_PATHS.contains(&path) {
+                            let authorized = req
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|h| h.strip_prefix("Bearer "))
+                                .map(|k| keys.iter().any(|allowed| allowed == k))
+                                .unwrap_or(false);
+                            if !authorized {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"grim\"")],
+                                    Json(serde_json::json!({
+                                        "error": {
+                                            "message": "Missing or invalid API key.",
+                                            "type": "invalid_request_error",
+                                            "code": "invalid_api_key"
+                                        }
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                        }
+                        next.run(req).await
+                    }
+                },
+            ))
+        };
+        router
+            .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+            .with_state(state)
 }
 
 struct TlsConfig {
@@ -4698,6 +4575,25 @@ fn load_tls_config_from_file(path: &str) -> Option<TlsConfig> {
 /// availability without waiting for the first chat request to trigger a load.
 /// When `None`, the server starts with an empty engine and loads models
 /// on demand from the local catalog when they are first requested.
+/// F4: keys come from env (`GRIM_API_KEY`, or comma-separated `GRIM_API_KEYS`).
+/// Empty = open server, matching the loopback-by-default posture.
+fn load_api_keys_from_env() -> Vec<String> {
+    let mut keys: Vec<String> = std::env::var("GRIM_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .into_iter()
+        .collect();
+    if let Ok(list) = std::env::var("GRIM_API_KEYS") {
+        keys.extend(
+            list.split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty()),
+        );
+    }
+    keys
+}
+
 pub async fn serve(
     addr: &str,
     engine: Engine,
@@ -4705,6 +4601,14 @@ pub async fn serve(
     plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 ) -> Result<()> {
     validate_metrics_bind_policy(addr)?;
+    let api_keys = load_api_keys_from_env();
+    let auth_enabled = !api_keys.is_empty();
+    if auth_enabled {
+        eprintln!(
+            "[grim-server] Bearer auth enabled ({} API key(s)).",
+            api_keys.len()
+        );
+    }
     // Attempt to load the tokenizer from the explicitly-given model path,
     // or by scanning the models directory for the first available GGUF.
     // For `.grim` files, fall back to a sibling `.gguf` (same stem, `.gguf`
@@ -4838,7 +4742,7 @@ pub async fn serve(
         eprintln!("[Server] Model capability check failed: {e}");
     }
 
-    let app = build_router(state);
+    let app = build_router_with_auth(state, api_keys);
 
     // Incoming SSRF posture (§network): the server defaults to loopback
     // (`127.0.0.1:11434`) so it is never reachable from a routable network
@@ -4892,6 +4796,12 @@ pub async fn serve(
                  non-loopback interface without TLS. This is a security risk on \
                  untrusted networks."
             );
+            if !auth_enabled {
+                eprintln!(
+                    "[grim-server] WARNING: No API keys configured (set GRIM_API_KEY \
+                     or GRIM_API_KEYS). Any reachable client can run models and read files."
+                );
+            }
         }
         eprintln!(
             "[grim-server] WARNING: No TLS config found; serving over HTTP on {}",
@@ -4966,6 +4876,83 @@ fn load_model_for_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_bearer_auth_rejects_without_key_and_exempts_health() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default())),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            model_arch: std::sync::Mutex::new(None),
+            plugin_registry: None,
+        });
+        let app = build_router_with_auth(state, vec!["secret-key".to_string()]);
+        // Exempt paths never 401.
+        for path in ["/health", "/healthz", "/readyz", "/metrics"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must be auth-exempt"
+            );
+        }
+
+        // Protected path: no key -> 401 with OpenAI-style error body.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong key -> 401.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer wrong-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct key -> passes auth (may fail later on empty body/model, but not 401).
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer secret-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn test_probe_sys_ram_returns_tuple() {
         let (used, total) = probe_sys_ram();
@@ -5287,19 +5274,19 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("content-type").unwrap(), "audio/wav");
 
-        // Test ASR transcriptions
-        let (asr_status, asr_resp) = audio_transcriptions().await;
-        assert_eq!(asr_status, StatusCode::OK);
-        assert!(!asr_resp["text"].as_str().unwrap().is_empty());
+        // Test ASR transcriptions — F5: honest 501 until uploaded-audio decode exists
+        let (asr_status, _asr_resp) = audio_transcriptions().await;
+        assert_eq!(asr_status, StatusCode::NOT_IMPLEMENTED);
 
-        // Test translations
-        let (tr_status, tr_resp) = audio_translations().await;
-        assert_eq!(tr_status, StatusCode::OK);
-        assert!(!tr_resp["text"].as_str().unwrap().is_empty());
+        // Test translations — same honest 501 contract
+        let (tr_status, _tr_resp) = audio_translations().await;
+        assert_eq!(tr_status, StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
     async fn test_image_generations_endpoint() {
+        // F5: even with a diffusion transformer registered, generation needs
+        // text-encoder conditioning and a trained VAE — must 501, not fabricate.
         let flux = Arc::new(grim_models_diffusion::Flux2Transformer2D::random(
             grim_tensor::Device::Cpu,
             grim_models_diffusion::Flux2Config {
@@ -5318,11 +5305,8 @@ mod tests {
         register_diffusion_model("flux2", flux);
 
         let (status, resp) = images_generations().await;
-        assert_eq!(status, StatusCode::OK);
-        let data = resp["data"].as_array().unwrap();
-        assert_eq!(data.len(), 1);
-        let b64 = data[0]["b64_json"].as_str().unwrap();
-        assert!(!b64.is_empty(), "Image generations should return non-empty base64 pixel data");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(!resp["error"]["message"].as_str().unwrap_or("").is_empty());
     }
 
     #[tokio::test]

@@ -1647,6 +1647,8 @@ fn default_denoising_strength() -> f32 { 0.75 }
 #[derive(Debug, Serialize)]
 pub struct DiffusionGenerateResponse {
     pub image_url: String,
+    /// True while the pipeline runs random-init configs (no checkpoint loaded).
+    pub demo: bool,
     pub seed: u64,
     pub steps: usize,
     pub cfg_scale: f32,
@@ -1766,6 +1768,7 @@ async fn diffusion_generate_handler(
 
     Ok(Json(DiffusionGenerateResponse {
         image_url,
+        demo: true,
         seed: actual_seed,
         steps,
         cfg_scale: req.cfg_scale,
@@ -1795,6 +1798,8 @@ fn default_audio_sample_rate() -> usize { 24000 }
 #[derive(Debug, Serialize)]
 pub struct AudioTtsResponse {
     pub audio_url: String,
+    /// True while the pipeline runs synthetic token/mel inputs (no phonemizer).
+    pub demo: bool,
     pub sample_rate: usize,
     pub num_samples: usize,
     pub duration_sec: f32,
@@ -1878,6 +1883,7 @@ async fn audio_tts_handler(
 
     Ok(Json(AudioTtsResponse {
         audio_url,
+        demo: true,
         sample_rate,
         num_samples: samples.len(),
         duration_sec,
@@ -1944,6 +1950,7 @@ async fn audio_audio2audio_handler(
 
     Ok(Json(AudioTtsResponse {
         audio_url,
+        demo: true,
         sample_rate,
         num_samples: samples.len(),
         duration_sec,

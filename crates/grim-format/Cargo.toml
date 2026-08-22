@@ -17,6 +17,7 @@ zstd = { version = "0.13", default-features = false }
 rayon = "1.8"
 minijinja = "2"
 memmap2 = "0.9"
+libc = "0.2"
 
 [features]
 default = []

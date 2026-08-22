@@ -155,6 +155,172 @@ impl MoeResidentBudget {
     }
 }
 
+/// Dynamic GPU memory allocator managing runtime repartitioning between KV cache and MoE expert slots.
+///
+/// On edge/consumer devices, total VRAM fluctuates and KV cache grows over multi-turn agent sessions.
+/// This structure dynamically adjusts the envelope at scheduler step boundaries (safe points)
+/// without restarting the engine.
+#[derive(Debug, Clone)]
+pub struct ElasticMoEAllocation {
+    /// Total VRAM envelope in bytes dedicated to serving.
+    pub total_vram_bytes: usize,
+    /// Bytes allocated to KV cache pages.
+    pub kv_budget_bytes: usize,
+    /// Bytes allocated to the GPU MoE expert cache.
+    pub expert_budget_bytes: usize,
+    /// Size in bytes of one complete cached expert slot.
+    pub slot_size_bytes: usize,
+    /// Current number of active GPU expert slots.
+    pub max_expert_slots: usize,
+}
+
+impl ElasticMoEAllocation {
+    /// Create a new elastic allocation given total VRAM and initial KV/expert split.
+    ///
+    /// # Contract
+    /// `slot_size_bytes` must be > 0. Total of `kv_budget_bytes + expert_budget_bytes`
+    /// must not exceed `total_vram_bytes`.
+    pub fn new(
+        total_vram_bytes: usize,
+        kv_budget_bytes: usize,
+        expert_budget_bytes: usize,
+        slot_size_bytes: usize,
+    ) -> Result<Self> {
+        if kv_budget_bytes + expert_budget_bytes > total_vram_bytes {
+            return Err(Error::Config(format!(
+                "ElasticMoEAllocation: KV ({kv_budget_bytes}) + Expert ({expert_budget_bytes}) exceeds total VRAM ({total_vram_bytes})"
+            )));
+        }
+        assert!(slot_size_bytes > 0, "slot_size_bytes must be > 0");
+        let max_expert_slots = expert_budget_bytes / slot_size_bytes;
+        Ok(Self {
+            total_vram_bytes,
+            kv_budget_bytes,
+            expert_budget_bytes,
+            slot_size_bytes,
+            max_expert_slots,
+        })
+    }
+
+    /// Rebalance the split between KV cache and expert cache at a scheduler safe point.
+    ///
+    /// # Contract
+    /// Dynamically shifts capacity. Returns the new number of available expert slots.
+    pub fn rebalance(
+        &mut self,
+        new_kv_budget_bytes: usize,
+        new_expert_budget_bytes: usize,
+    ) -> Result<usize> {
+        if new_kv_budget_bytes + new_expert_budget_bytes > self.total_vram_bytes {
+            return Err(Error::Config(format!(
+                "ElasticMoEAllocation::rebalance: request exceeds total VRAM ({})",
+                self.total_vram_bytes
+            )));
+        }
+        self.kv_budget_bytes = new_kv_budget_bytes;
+        self.expert_budget_bytes = new_expert_budget_bytes;
+        self.max_expert_slots = self.expert_budget_bytes / self.slot_size_bytes;
+        Ok(self.max_expert_slots)
+    }
+}
+
+/// GPU-resident LRU expert slot residency tracker.
+///
+/// Tracks the mapping of logical `(layer_idx, expert_idx)` to physical GPU cache slot indices.
+#[derive(Debug, Clone)]
+pub struct LruResidencyTracker {
+    /// Number of physical slots available in the GPU expert cache.
+    capacity: usize,
+    /// Physical slot index -> optional `(layer_idx, expert_idx, access_timestamp)`.
+    slots: Vec<Option<(usize, usize, u64)>>,
+    /// Reverse lookup: `(layer_idx, expert_idx)` -> physical slot index.
+    key_to_slot: std::collections::HashMap<(usize, usize), usize>,
+    /// Monotonic logical clock for access recency.
+    clock: u64,
+}
+
+impl LruResidencyTracker {
+    /// Create a new tracker with `capacity` physical slots.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            slots: vec![None; capacity],
+            key_to_slot: std::collections::HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    /// Check if `(layer_idx, expert_idx)` is currently resident in the GPU cache.
+    /// If hit, refreshes recency clock and returns slot index.
+    pub fn lookup(&mut self, layer: usize, expert: usize) -> Option<usize> {
+        let &slot = self.key_to_slot.get(&(layer, expert))?;
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = &mut self.slots[slot] {
+            entry.2 = self.clock;
+        }
+        Some(slot)
+    }
+
+    /// Allocate or evict an LRU slot to admit `(layer_idx, expert_idx)`.
+    ///
+    /// # Contract
+    /// If free slot exists, uses it. Otherwise evicts the least recently used slot.
+    /// Returns `(allocated_slot_idx, evicted_expert_if_any)`.
+    pub fn admit(&mut self, layer: usize, expert: usize) -> (usize, Option<(usize, usize)>) {
+        if let Some(slot) = self.lookup(layer, expert) {
+            return (slot, None);
+        }
+
+        self.clock = self.clock.wrapping_add(1);
+
+        // Find empty slot if available
+        for slot in 0..self.capacity {
+            if self.slots[slot].is_none() {
+                self.slots[slot] = Some((layer, expert, self.clock));
+                self.key_to_slot.insert((layer, expert), slot);
+                return (slot, None);
+            }
+        }
+
+        // Evict LRU victim
+        let mut oldest_slot = 0;
+        let mut oldest_time = u64::MAX;
+        for (slot, entry) in self.slots.iter().enumerate() {
+            if let Some((_, _, time)) = entry {
+                if *time < oldest_time {
+                    oldest_time = *time;
+                    oldest_slot = slot;
+                }
+            }
+        }
+
+        let evicted = self.slots[oldest_slot].take().map(|(l, e, _)| (l, e));
+        if let Some((old_l, old_e)) = evicted {
+            self.key_to_slot.remove(&(old_l, old_e));
+        }
+
+        self.slots[oldest_slot] = Some((layer, expert, self.clock));
+        self.key_to_slot.insert((layer, expert), oldest_slot);
+
+        (oldest_slot, evicted)
+    }
+
+    /// Resize slot capacity dynamically during runtime rebalancing.
+    pub fn resize(&mut self, new_capacity: usize) {
+        if new_capacity < self.capacity {
+            // Reclaim slots starting from cold end
+            while self.slots.len() > new_capacity {
+                if let Some(Some((l, e, _))) = self.slots.pop() {
+                    self.key_to_slot.remove(&(l, e));
+                }
+            }
+        } else if new_capacity > self.capacity {
+            self.slots.resize(new_capacity, None);
+        }
+        self.capacity = new_capacity;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +387,45 @@ mod tests {
         let mut b = MoeResidentBudget::new(4, 1000, 400, 4000);
         assert!(b.promote(99, ResidentTier::Fp16).is_err());
         assert!(!b.can_promote(99, ResidentTier::Fp16));
+    }
+
+    #[test]
+    fn test_elastic_moe_allocation_rebalance() {
+        let mut alloc = ElasticMoEAllocation::new(16_000, 6_000, 10_000, 1_000).unwrap();
+        assert_eq!(alloc.max_expert_slots, 10);
+
+        // Rebalance to give more to KV
+        let new_slots = alloc.rebalance(10_000, 6_000).unwrap();
+        assert_eq!(new_slots, 6);
+        assert_eq!(alloc.max_expert_slots, 6);
+
+        // Exceeding total VRAM errors
+        assert!(alloc.rebalance(12_000, 6_000).is_err());
+    }
+
+    #[test]
+    fn test_lru_residency_tracker() {
+        let mut tracker = LruResidencyTracker::new(2);
+        // Fill slots
+        let (s0, ev0) = tracker.admit(0, 5);
+        assert_eq!(s0, 0);
+        assert_eq!(ev0, None);
+
+        let (s1, ev1) = tracker.admit(0, 12);
+        assert_eq!(s1, 1);
+        assert_eq!(ev1, None);
+
+        // Hit (0, 5) -> refreshes recency
+        assert_eq!(tracker.lookup(0, 5), Some(0));
+
+        // Admit 3rd item -> evicts (0, 12) from slot 1
+        let (s2, ev2) = tracker.admit(1, 3);
+        assert_eq!(s2, 1);
+        assert_eq!(ev2, Some((0, 12)));
+
+        // Verify residency
+        assert_eq!(tracker.lookup(0, 5), Some(0));
+        assert_eq!(tracker.lookup(0, 12), None);
+        assert_eq!(tracker.lookup(1, 3), Some(1));
     }
 }

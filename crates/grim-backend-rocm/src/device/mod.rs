@@ -13,6 +13,7 @@ pub mod hardware_spec;
 pub mod helpers;
 pub mod jit_cache;
 pub mod layout;
+pub mod moe_hybrid_exec;
 pub mod probe;
 pub mod roc_device;
 pub mod rocblas;

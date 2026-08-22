@@ -167,6 +167,56 @@ impl StreamingBlockForward {
             .clear();
     }
 
+    /// F2 (full-parameter write-back): copy stepped base weights from the
+    /// autograd registry into the cached blocks, so every subsequent forward
+    /// pass (which clones from this cache) trains on the updated weights.
+    /// CPU-resident blocks only — device-resident weight mirrors land with
+    /// the dirty-block upload work.
+    pub fn overwrite_base_weights(
+        &self,
+        reg: &grim_autograd::AutogradRegistry,
+    ) -> Result<()> {
+        use grim_autograd::{LoRAInjectionPoint, ParamId};
+        let mut cache = self.block_cache.lock().unwrap_or_else(|e| e.into_inner());
+        for ((layer_idx, dev), block) in cache.iter_mut() {
+            if *dev != Device::Cpu {
+                continue;
+            }
+            let layer = *layer_idx;
+            let mut apply = |point: LoRAInjectionPoint,
+                             linear: &mut grim_nn::modules::Linear|
+             -> Result<()> {
+                if let Some(p) = reg.params.get(ParamId::base(layer, point)) {
+                    linear.replace_weight(p.data.clone())?;
+                }
+                Ok(())
+            };
+            apply(LoRAInjectionPoint::QProj, &mut block.wq.inner)?;
+            apply(LoRAInjectionPoint::KProj, &mut block.wk.inner)?;
+            apply(LoRAInjectionPoint::VProj, &mut block.wv.inner)?;
+            apply(LoRAInjectionPoint::OProj, &mut block.wo.inner)?;
+            if let Some(g) = block.w_gate.as_mut() {
+                apply(LoRAInjectionPoint::GateProj, &mut g.inner)?;
+            }
+            if let Some(u) = block.w_up.as_mut() {
+                apply(LoRAInjectionPoint::UpProj, &mut u.inner)?;
+            }
+            if let Some(d) = block.w_down.as_mut() {
+                apply(LoRAInjectionPoint::DownProj, &mut d.inner)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// F2 test hook: clone of a cached block's QProj weight (`None` if the
+    /// layer is not materialized on `device`).
+    pub fn cached_qproj_weight(&self, layer_idx: usize, device: &Device) -> Option<Tensor> {
+        let cache = self.block_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get(&(layer_idx, device.clone()))
+            .map(|b| b.wq.inner.weight.clone())
+    }
+
     /// Load (or return the cached) `LlamaBlock` for `layer_idx` on `device`.
     fn block(
         &self,

@@ -11,6 +11,7 @@ grim-tensor = { workspace = true }
 grim-format = { workspace = true }
 grim-quant = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }
 # OxiBLAS — pure-Rust SIMD-accelerated SGEMM/DGEMM (no Fortran, no LAPACK).
 # Used by scirs2-linalg as its BLAS substrate. Architecture §4.1 mandates this
 # over scalar loops so the CPU backend reaches competitive single-threaded throughput
