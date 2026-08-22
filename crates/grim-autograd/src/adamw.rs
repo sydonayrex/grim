@@ -315,13 +315,15 @@ pub enum Optimizer {
     Muon(Muon),
     MAdam(MAdam),
     LionVote(LionVote),
+    Lomo(crate::lomo::Lomo),
+    AdaLomo(crate::lomo::AdaLomo),
+    Came(crate::came::Came),
+    Sophia(crate::sophia::Sophia),
+    GaloreAdamW(crate::galore::GaLoreOptimizer),
 }
 
 impl Optimizer {
     /// Build an optimizer from kind and learning rate.
-    ///
-    /// Returns `Error::Unimplemented` for kinds whose implementation has not
-    /// landed yet (see `OptimizerKind` docs).
     pub fn new(kind: OptimizerKind, lr: f32) -> Result<Self> {
         match kind {
             OptimizerKind::AdamW => Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
@@ -353,9 +355,14 @@ impl Optimizer {
                 lr,
                 ..AdafactorConfig::default()
             }))),
-            OptimizerKind::GaloreAdamW => Err(Error::Unimplemented(
-                "bf16 GaLore projector not implemented; use qgalore-8bit".into(),
-            )),
+            OptimizerKind::GaloreAdamW => {
+                Ok(Optimizer::GaloreAdamW(crate::galore::GaLoreOptimizer::new(
+                    crate::galore::GaLoreConfig {
+                        lr,
+                        ..Default::default()
+                    },
+                )))
+            }
             OptimizerKind::GaloreAdamW8Bit => {
                 eprintln!("grim: galore-8bit is an alias for qgalore-8bit");
                 Ok(Optimizer::QGaLoreAdamW8Bit(QGaLoreAdamW8Bit::new(
@@ -396,18 +403,30 @@ impl Optimizer {
             OptimizerKind::AdamWBnb => Err(Error::Unimplemented(
                 "optimizer 'adamw-bnb' is not yet implemented (no bitsandbytes dependency); use adamw-8bit".into(),
             )),
-            OptimizerKind::LOMO => Err(Error::Unimplemented(
-                "optimizer 'lomo' is not yet implemented; use adamw or qgalore-8bit".into(),
-            )),
-            OptimizerKind::Adalomo => Err(Error::Unimplemented(
-                "optimizer 'adalomo' is not yet implemented; use adamw or adafactor".into(),
-            )),
-            OptimizerKind::CAME => Err(Error::Unimplemented(
-                "optimizer 'came' is not yet implemented; use adamw or adafactor".into(),
-            )),
-            OptimizerKind::Sophia => Err(Error::Unimplemented(
-                "optimizer 'sophia' is not yet implemented; use adamw or muon".into(),
-            )),
+            OptimizerKind::LOMO => Ok(Optimizer::Lomo(crate::lomo::Lomo::new(
+                crate::lomo::LomoConfig {
+                    lr,
+                    ..Default::default()
+                },
+            ))),
+            OptimizerKind::Adalomo => Ok(Optimizer::AdaLomo(crate::lomo::AdaLomo::new(
+                crate::lomo::AdaLomoConfig {
+                    lr,
+                    ..Default::default()
+                },
+            ))),
+            OptimizerKind::CAME => Ok(Optimizer::Came(crate::came::Came::new(
+                crate::came::CameConfig {
+                    lr,
+                    ..Default::default()
+                },
+            ))),
+            OptimizerKind::Sophia => Ok(Optimizer::Sophia(crate::sophia::Sophia::new(
+                crate::sophia::SophiaConfig {
+                    lr,
+                    ..Default::default()
+                },
+            ))),
         }
     }
 
@@ -424,6 +443,11 @@ impl Optimizer {
             Optimizer::Muon(_) => OptimizerKind::Muon,
             Optimizer::MAdam(_) => OptimizerKind::MAdam,
             Optimizer::LionVote(_) => OptimizerKind::LionVote,
+            Optimizer::Lomo(_) => OptimizerKind::LOMO,
+            Optimizer::AdaLomo(_) => OptimizerKind::Adalomo,
+            Optimizer::Came(_) => OptimizerKind::CAME,
+            Optimizer::Sophia(_) => OptimizerKind::Sophia,
+            Optimizer::GaloreAdamW(_) => OptimizerKind::GaloreAdamW,
         }
     }
 
@@ -440,6 +464,11 @@ impl Optimizer {
             Optimizer::Muon(m) => m.config.lr,
             Optimizer::MAdam(m) => m.config.lr,
             Optimizer::LionVote(l) => l.config.lr,
+            Optimizer::Lomo(o) => o.config.lr,
+            Optimizer::AdaLomo(o) => o.config.lr,
+            Optimizer::Came(o) => o.config.lr,
+            Optimizer::Sophia(o) => o.config.lr,
+            Optimizer::GaloreAdamW(o) => o.config.lr,
         }
     }
 
@@ -477,6 +506,11 @@ impl Optimizer {
             Optimizer::Muon(o) => o.step(params),
             Optimizer::MAdam(o) => o.step(params),
             Optimizer::LionVote(o) => o.step(params),
+            Optimizer::Lomo(o) => o.step(params),
+            Optimizer::AdaLomo(o) => o.step(params),
+            Optimizer::Came(o) => o.step(params),
+            Optimizer::Sophia(o) => o.step(params),
+            Optimizer::GaloreAdamW(o) => o.step(params),
         }
     }
 
@@ -491,6 +525,11 @@ impl Optimizer {
             Optimizer::Lion(o) => o.step_param(id, param),
             Optimizer::MAdam(o) => o.step_param(id, param),
             Optimizer::LionVote(o) => o.step_param(id, param),
+            Optimizer::Lomo(o) => o.step_param(id, param),
+            Optimizer::AdaLomo(o) => o.step_param(id, param),
+            Optimizer::Came(o) => o.step_param(id, param),
+            Optimizer::Sophia(o) => o.step_param(id, param),
+            Optimizer::GaloreAdamW(o) => o.step_param(id, param),
             _ => {
                 let mut temp_params = TrainableParams::new();
                 let param_clone = param.clone();
@@ -517,6 +556,11 @@ impl Optimizer {
             Optimizer::Muon(m) => m.config.lr = lr,
             Optimizer::MAdam(m) => m.config.lr = lr,
             Optimizer::LionVote(l) => l.config.lr = lr,
+            Optimizer::Lomo(o) => o.config.lr = lr,
+            Optimizer::AdaLomo(o) => o.config.lr = lr,
+            Optimizer::Came(o) => o.config.lr = lr,
+            Optimizer::Sophia(o) => o.config.lr = lr,
+            Optimizer::GaloreAdamW(o) => o.config.lr = lr,
         }
     }
 
@@ -532,6 +576,11 @@ impl Optimizer {
             Optimizer::Muon(o) => o.save_to_train_state(params),
             Optimizer::MAdam(o) => o.save_to_train_state(params),
             Optimizer::LionVote(o) => o.save_to_train_state(params),
+            Optimizer::Lomo(o) => o.save_to_train_state(params),
+            Optimizer::AdaLomo(o) => o.save_to_train_state(params),
+            Optimizer::Came(o) => o.save_to_train_state(params),
+            Optimizer::Sophia(o) => o.save_to_train_state(params),
+            Optimizer::GaloreAdamW(o) => o.save_to_train_state(params),
         }
     }
 
@@ -551,6 +600,11 @@ impl Optimizer {
             Optimizer::Muon(o) => o.load_from_train_state(params, state),
             Optimizer::MAdam(o) => o.load_from_train_state(params, state),
             Optimizer::LionVote(o) => o.load_from_train_state(params, state),
+            Optimizer::Lomo(o) => o.load_from_train_state(params, state),
+            Optimizer::AdaLomo(o) => o.load_from_train_state(params, state),
+            Optimizer::Came(o) => o.load_from_train_state(params, state),
+            Optimizer::Sophia(o) => o.load_from_train_state(params, state),
+            Optimizer::GaloreAdamW(o) => o.load_from_train_state(params, state),
         }
     }
 }
@@ -852,7 +906,7 @@ fn decode_blob_f32s(bytes: &[u8], fmt: TrainFpFormat) -> Result<Vec<f32>> {
 /// Used by optimizer variants whose moment buffers are not yet serialized to
 /// `.grim.train` (Lion, Lion8Bit, Adafactor, PagedAdamW moments are pending;
 /// AdamW persists m/v via its own richer implementation).
-fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainState {
+pub(crate) fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainState {
     let mut state = TrainState {
         step: step_count as u64,
         fp_format: TrainFpFormat::Fp32,
@@ -871,7 +925,7 @@ fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainSta
 }
 
 /// Restore parameter data (and step count) from a `.grim.train` `TrainState`.
-fn load_param_data_only(params: &mut TrainableParams, state: &TrainState) -> Result<()> {
+pub(crate) fn load_param_data_only(params: &mut TrainableParams, state: &TrainState) -> Result<()> {
     for (id, param) in params.iter_mut() {
         let param_key = weight_slot(id);
         if let Some(blob) = blob_slot(state, &param_key, legacy_weight_slot(id)) {
@@ -3446,19 +3500,57 @@ mod tests {
 
     #[test]
     fn test_unimplemented_optimizers_rejected_honestly() {
-        for kind in [
-            OptimizerKind::AdamWBnb,
-            OptimizerKind::GaloreAdamW,
-            OptimizerKind::LOMO,
-            OptimizerKind::Adalomo,
-            OptimizerKind::CAME,
-            OptimizerKind::Sophia,
-        ] {
+        for kind in [OptimizerKind::AdamWBnb] {
             let res = Optimizer::new(kind, 1e-3);
             assert!(
                 matches!(res, Err(Error::Unimplemented(_))),
                 "Optimizer {:?} must be explicitly rejected with Error::Unimplemented instead of silently aliasing",
                 kind
+            );
+        }
+    }
+
+    /// The memory-efficient family must construct and step cleanly — no
+    /// silent aliasing to AdamW, no Unimplemented rejection.
+    #[test]
+    fn test_memory_efficient_optimizers_construct_and_step() {
+        use crate::param::{TrainableParam, TrainableParams};
+        let kinds = [
+            OptimizerKind::LOMO,
+            OptimizerKind::Adalomo,
+            OptimizerKind::CAME,
+            OptimizerKind::Sophia,
+            OptimizerKind::GaloreAdamW,
+            OptimizerKind::GaloreAdamW8Bit,
+        ];
+        for kind in kinds {
+            let mut opt = Optimizer::new(kind, 1e-2).expect("must construct");
+            let mut params = TrainableParams::new();
+            let w0 = vec![1.0f32, -2.0, 0.5, 3.0];
+            let t = grim_backend_cpu::cpu_tensor(
+                w0.clone(),
+                grim_tensor::Shape::new(vec![2, 2]),
+            );
+            params.insert(
+                TrainableParam::new(
+                    ParamId::base(0, crate::injection::LoRAInjectionPoint::QProj),
+                    t,
+                )
+                .expect("param alloc"),
+            );
+            // Seed a gradient (simulates backward).
+            for (_, p) in params.iter_mut() {
+                let g = vec![0.1f32, -0.2, 0.4, -0.1];
+                let gt = grim_backend_cpu::cpu_tensor(g, Shape::new(vec![2, 2]));
+                p.accumulate_grad(&gt);
+            }
+            for _ in 0..3 {
+                opt.step(&mut params).expect("step must succeed");
+            }
+            let (_, p) = params.iter().next().unwrap();
+            assert!(
+                p.data.to_vec_f32().unwrap()[0] != w0[0],
+                "{kind:?} must update weights"
             );
         }
     }

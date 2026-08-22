@@ -3,8 +3,8 @@
 //! Uses a diagonal Hessian estimate with elementwise clipping:
 //! theta_{t+1} = theta_t - eta * clip(m_t / max(h_t, gamma), rho) - eta * lambda * theta_t.
 
-use crate::param::{ParamId, TrainableParams};
-use grim_format::train::{TrainFpFormat, TrainState};
+use crate::param::{ParamId, TrainableParam, TrainableParams};
+use grim_format::train::TrainState;
 use grim_tensor::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -120,36 +120,66 @@ impl Sophia {
         Ok(())
     }
 
+    /// Single param step.
+    pub fn step_param(&mut self, id: ParamId, param: &mut TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let mut data = param.data.to_vec_f32()?;
+        let grad = param.grad().to_vec_f32()?;
+        if let Some(state) = self.states.get_mut(&id) {
+            if state.hessian.iter().all(|&x| x == 0.0) {
+                for (h, &gv) in state.hessian.iter_mut().zip(grad.iter()) {
+                    *h = gv.abs();
+                }
+            }
+        }
+        self.update_param(id, &mut data, &grad)?;
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
+        param.data = grim_tensor::Tensor::new(
+            std::sync::Arc::from(updated),
+            shape,
+            param.data.dtype(),
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        param.zero_grad()?;
+        Ok(())
+    }
+
     /// Step over TrainableParams with gradients.
-    pub fn step(
-        &mut self,
-        params: &mut TrainableParams,
-        grads: &HashMap<ParamId, Vec<f32>>,
-    ) -> Result<()> {
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
         self.step_count += 1;
 
-        for (id, g) in grads {
-            if let Some(param) = params.get_mut(*id) {
-                let mut data = param.data.to_vec_f32()?;
-                if let Some(state) = self.states.get_mut(id) {
-                    if state.hessian.iter().all(|&x| x == 0.0) {
-                        for (h, &gv) in state.hessian.iter_mut().zip(g.iter()) {
-                            *h = gv.abs();
-                        }
+        for (id, param) in params.iter_mut() {
+            if param.is_frozen() {
+                param.zero_grad()?;
+                continue;
+            }
+            let mut data = param.data.to_vec_f32()?;
+            let grad = param.grad().to_vec_f32()?;
+            if let Some(state) = self.states.get_mut(id) {
+                if state.hessian.iter().all(|&x| x == 0.0) {
+                    for (h, &gv) in state.hessian.iter_mut().zip(grad.iter()) {
+                        *h = gv.abs();
                     }
                 }
-                self.update_param(*id, &mut data, g)?;
-                let dev = crate::pick_device_for_tensor(&param.data);
-                let shape = param.data.shape().clone();
-                let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
-                param.data = grim_tensor::Tensor::new(
-                    std::sync::Arc::from(updated),
-                    shape,
-                    param.data.dtype(),
-                    param.data.provenance().clone(),
-                    param.data.device().clone(),
-                );
             }
+            self.update_param(*id, &mut data, &grad)?;
+            let dev = crate::pick_device_for_tensor(&param.data);
+            let shape = param.data.shape().clone();
+            let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
+            param.data = grim_tensor::Tensor::new(
+                std::sync::Arc::from(updated),
+                shape,
+                param.data.dtype(),
+                param.data.provenance().clone(),
+                param.data.device().clone(),
+            );
+            param.zero_grad()?;
         }
 
         Ok(())
@@ -157,35 +187,17 @@ impl Sophia {
 
     /// Export to TrainState.
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
-        let mut state = TrainState {
-            step: self.step_count as u64,
-            fp_format: TrainFpFormat::Fp32,
-            dtypes: HashMap::new(),
-            blobs: HashMap::new(),
-        };
-        for (id, s) in &self.states {
-            let prefix = format!(
-                "sophia.{}.{}",
-                id.layer_idx,
-                if id.is_a { "a" } else { "b" }
-            );
-            let m_bytes: Vec<u8> = s.exp_avg.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let h_bytes: Vec<u8> = s.hessian.iter().flat_map(|v| v.to_le_bytes()).collect();
-            state.add_blob(format!("{prefix}.m"), vec![s.exp_avg.len()], m_bytes);
-            state.add_blob(format!("{prefix}.h"), vec![s.hessian.len()], h_bytes);
-        }
-        for (id, param) in params.iter() {
-            if let Ok(data) = param.data.to_vec_f32() {
-                let name = format!(
-                    "weight.{}.{}",
-                    id.layer_idx,
-                    if id.is_a { "a" } else { "b" }
-                );
-                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                state.add_blob(name, param.data.shape().dims().to_vec(), bytes);
-            }
-        }
-        state
+        crate::adamw::save_param_data_only(params, self.step_count)
+    }
+
+    /// Restore from TrainState.
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        crate::adamw::load_param_data_only(params, state)
     }
 }
 

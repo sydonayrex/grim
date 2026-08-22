@@ -93,6 +93,12 @@ pub struct StartTrainingRequest {
     /// or "auto"). Drives the grim-garage backend selection chain.
     #[serde(default)]
     pub preferred_backend: Option<String>,
+    /// Which optimizer to use for this training job (e.g. AdamW, GaLore, LOMO, AdaLomo, CAME, Sophia, Muon, etc.).
+    #[serde(default)]
+    pub optimizer: grim_autograd::OptimizerKind,
+    /// Which LR schedule to use.
+    #[serde(default)]
+    pub scheduler: grim_autograd::LRScheduler,
     /// Gradient accumulation steps. Optimizer step fires every N micro-steps;
     /// loss is reported as the average over the accumulation window.
     #[serde(default = "default_accumulation_steps")]
@@ -473,8 +479,8 @@ async fn start_training(
         weight_format: req.weight_format,
         preferred_backend: req.preferred_backend.clone(),
         accumulation_steps: req.accumulation_steps,
-        optimizer: grim_autograd::OptimizerKind::AdamW,
-        scheduler: grim_autograd::LRScheduler::Cosine,
+        optimizer: req.optimizer,
+        scheduler: req.scheduler,
         min_lr: (req.learning_rate * 1e-2).max(1e-10),
         num_gpus: req.num_gpus,
         use_pissa: req.use_pissa,

@@ -338,6 +338,8 @@ document.addEventListener('DOMContentLoaded', () => {
       lora_rank: parseInt(document.getElementById('input-lora-rank').value) || 16,
       learning_rate: parseFloat(document.getElementById('input-lr').value) || 2e-5,
       epochs: parseInt(document.getElementById('input-epochs').value) || 1,
+      optimizer: document.getElementById('input-optimizer')?.value || 'AdamW',
+      scheduler: document.getElementById('input-scheduler')?.value || 'Cosine',
       rocm_fusion_rmsnorm_matmul: document.getElementById('check-fusion-rmsnorm').checked,
       rocm_fusion_qkv_attention: document.getElementById('check-fusion-attn').checked,
     };
