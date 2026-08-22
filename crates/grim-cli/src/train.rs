@@ -968,11 +968,13 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         autograd_reg
             .zero_grads()
             .map_err(|e| Error::Session(e.to_string()))?;
-
         let mut epoch_loss = 0.0f32;
         let mut num_batches = 0u32;
 
-        for (tokens, labels) in dataset.iter() {
+        for (batch_idx, (tokens, labels)) in dataset.iter().enumerate() {
+            if opts.num_gpus > 1 && batch_idx % opts.num_gpus != 0 {
+                continue;
+            }
             if tokens.len() < 2 {
                 continue;
             }
