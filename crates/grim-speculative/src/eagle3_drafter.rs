@@ -48,14 +48,38 @@ impl DraftBackbone for Eagle3Drafter {
 
         for r in start_row..rows {
             let row_slice = &logits_vec[r * vocab_size..(r + 1) * vocab_size];
-            let best_tok = row_slice
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
-            drafted_tokens.push(best_tok);
-            confidences.push(0.85); // High-confidence default from draft forward
+            let max_val = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut top1 = f32::NEG_INFINITY;
+            let mut top1_idx = 0u32;
+            let mut top2 = f32::NEG_INFINITY;
+            let mut sum_exp = 0.0f32;
+
+            for (i, &l) in row_slice.iter().enumerate() {
+                let exp = (l - max_val).exp();
+                sum_exp += exp;
+                if l > top1 {
+                    top2 = top1;
+                    top1 = l;
+                    top1_idx = i as u32;
+                } else if l > top2 {
+                    top2 = l;
+                }
+            }
+
+            let top1_prob = if sum_exp > 0.0 {
+                (top1 - max_val).exp() / sum_exp
+            } else {
+                0.5
+            };
+            let top2_prob = if sum_exp > 0.0 && top2 > f32::NEG_INFINITY {
+                (top2 - max_val).exp() / sum_exp
+            } else {
+                0.0
+            };
+            let margin_conf = (top1_prob - top2_prob).clamp(0.05, 0.99);
+
+            drafted_tokens.push(top1_idx);
+            confidences.push(margin_conf);
         }
 
         Ok(DraftBlock {
@@ -75,7 +99,6 @@ impl DraftBackbone for Eagle3Drafter {
         _draft_tokens: &[u32],
         _accepted_mask: &[bool],
     ) -> Result<()> {
-        // Online adaptation feedback
         Ok(())
     }
 }

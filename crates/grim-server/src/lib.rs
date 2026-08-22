@@ -2385,7 +2385,7 @@ pub struct EmbeddingRequest {
 
 /// OpenAI-compatible embeddings endpoint.
 async fn embeddings(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(payload): Json<EmbeddingRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let inputs: Vec<String> = match &payload.input {
@@ -2410,57 +2410,16 @@ async fn embeddings(
         );
     }
 
-    let model_name = payload.model.clone().unwrap_or_else(|| {
-        state
-            .model_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "grim".to_string())
-    });
-
-    let (embeddings_data, total_tokens) = {
-        let _engine_guard = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let mut results = Vec::new();
-        let mut token_count = 0usize;
-
-        for (idx, text) in inputs.iter().enumerate() {
-            let tokens: Vec<u32> = text.bytes().map(|b| b as u32).collect();
-            token_count += tokens.len().max(1);
-
-            // Compute deterministic normalized embedding projection (dim=128 by default or requested)
-            let dim = payload.dimensions.unwrap_or(128).clamp(16, 4096);
-            let mut emb = vec![0.0f32; dim];
-            let mut seed = 0x5EED_C0DE_1234_5678u64;
-            for &tok in &tokens {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(tok as u64 + 1);
-                let idx_target = (tok as usize) % dim;
-                let val = ((seed >> 33) as i32) as f32 / (i32::MAX as f32);
-                emb[idx_target] += val;
-            }
-            // L2 normalize
-            let norm: f32 = emb.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
-            for v in emb.iter_mut() {
-                *v /= norm;
-            }
-
-            results.push(serde_json::json!({
-                "object": "embedding",
-                "index": idx,
-                "embedding": emb
-            }));
-        }
-        (results, token_count)
-    };
-
     (
-        StatusCode::OK,
+        StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({
             "object": "list",
-            "data": embeddings_data,
-            "model": model_name,
-            "usage": {
-                "prompt_tokens": total_tokens,
-                "total_tokens": total_tokens
+            "data": [],
+            "model": "grim",
+            "error": {
+                "type": "not_implemented",
+                "capability": "embeddings",
+                "message": "no embedding model is loaded; text embeddings require an encoder or BERT/Nomic-family model — load one via POST /v1/models/load"
             }
         })),
     )

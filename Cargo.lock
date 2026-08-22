@@ -2233,7 +2233,9 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-backend-cuda",
+ "grim-backend-metal",
  "grim-backend-rocm",
+ "grim-backend-vulkan",
  "grim-quant",
  "grim-tensor",
  "rand",

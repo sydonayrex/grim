@@ -414,11 +414,9 @@ enum Commands {
         seed: u64,
         /// Master-parameter compute precision: f32, bf16, or fp16.
         /// bf16/fp16 halve VRAM vs f32 on consumer RDNA (salamander.md P1).
-        #[arg(long, default_value = "f32")]
         train_dtype: train::TrainDtype,
         /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
-        /// lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit,
-        /// lomo, adalomo, came, sophia).
+        /// lion-8bit, adafactor, qgalore, galore, galore-8bit, muon, madam, lion-vote).
         #[arg(long, default_value = "adamw")]
         optimizer: grim_autograd::OptimizerKind,
         /// LR scheduler (cosine-warmup, linear, polynomial, constant,

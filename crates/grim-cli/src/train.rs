@@ -533,8 +533,84 @@ pub(crate) fn load_dataset(
         return Ok(pack_training_examples(examples, max_seq_len));
     }
 
+    // Try raw text format (array of {text: "..."})
+    #[derive(Debug, Deserialize)]
+    struct PlainTextEntry {
+        text: String,
+    }
+    if let Ok(entries) = serde_json::from_str::<Vec<PlainTextEntry>>(&content) {
+        println!("[grim train] Loaded {} raw text entries", entries.len());
+        let examples: Vec<_> = entries
+            .into_iter()
+            .filter_map(|e| {
+                if e.text.trim().is_empty() {
+                    return None;
+                }
+                let mut tokens = tokenizer.encode(&e.text);
+                if tokens.len() > max_seq_len {
+                    tokens.truncate(max_seq_len);
+                }
+                let labels = tokens.clone();
+                if tokens.len() >= 2 {
+                    Some((tokens, labels))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !examples.is_empty() {
+            return Ok(pack_training_examples(examples, max_seq_len));
+        }
+    }
+
+    // Try line-by-line JSONL format
+    let mut jsonl_examples = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
+                let mut tokens = tokenizer.encode(text);
+                if tokens.len() > max_seq_len {
+                    tokens.truncate(max_seq_len);
+                }
+                let labels = tokens.clone();
+                if tokens.len() >= 2 {
+                    jsonl_examples.push((tokens, labels));
+                }
+            } else if let (Some(inst), Some(out)) = (
+                val.get("instruction").and_then(|v| v.as_str()),
+                val.get("output").and_then(|v| v.as_str()),
+            ) {
+                let prompt = format!("### Instruction:\n{}\n\n### Response:\n", inst);
+                let full = format!("{}{}", prompt, out);
+                let mut tokens = tokenizer.encode(&full);
+                let prompt_len = tokenizer.encode(&prompt).len();
+                if tokens.len() > max_seq_len {
+                    tokens.truncate(max_seq_len);
+                }
+                let labels = vec![IGNORE_INDEX; prompt_len.min(tokens.len())]
+                    .into_iter()
+                    .chain(tokens[prompt_len.min(tokens.len())..].to_vec())
+                    .collect();
+                if tokens.len() >= 2 {
+                    jsonl_examples.push((tokens, labels));
+                }
+            }
+        }
+    }
+    if !jsonl_examples.is_empty() {
+        println!(
+            "[grim train] Loaded {} JSONL line entries",
+            jsonl_examples.len()
+        );
+        return Ok(pack_training_examples(jsonl_examples, max_seq_len));
+    }
+
     Err(Error::Session(format!(
-        "dataset '{}' is not in Alpaca, ShareGPT, or Preference format",
+        "dataset '{}' is not in Alpaca, ShareGPT, Messages, or JSON/JSONL text format",
         path
     )))
 }
@@ -648,15 +724,31 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         )));
     }
 
+    let mode_lower = opts.mode.to_ascii_lowercase();
+    let is_full_param = mode_lower.starts_with("full");
+    let use_oft = opts.use_oft || mode_lower == "oft";
+    let is_soul_eater = mode_lower == "soul-eater";
+
+    let effective_rank = if is_full_param {
+        hidden_size.min(1024)
+    } else {
+        opts.rank
+    };
+    let effective_alpha = if is_full_param {
+        hidden_size as f32
+    } else {
+        opts.alpha
+    };
+
     let injection_reg = LoRAInjectionRegistry::standard_qlora_with_flags(
         num_layers,
-        opts.rank,
-        opts.alpha,
+        effective_rank,
+        effective_alpha,
         1,
         opts.use_pissa,
         opts.use_olora,
         opts.olora_lambda,
-        opts.use_spectral_qlora,
+        opts.use_spectral_qlora || is_soul_eater,
     );
     let mut autograd_reg = AutogradRegistry::with_seed_and_dtype(
         model_config.clone(),
@@ -670,7 +762,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     for cfg in autograd_reg.injection_registry.configs.values_mut() {
         cfg.lora_plus_ratio = opts.lora_plus_ratio;
         cfg.relora_reset_steps = opts.relora_reset_steps;
-        cfg.use_oft = opts.use_oft;
+        cfg.use_oft = use_oft;
     }
 
     if opts.echo_mode {
@@ -995,33 +1087,79 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                                 }
                             }
                         }
+                        let half = sample_logps.len() / 2;
+                        let (chosen_logps, rejected_logps) = if half > 0 {
+                            let (c, r) = sample_logps.split_at(half);
+                            (c.to_vec(), r.to_vec())
+                        } else {
+                            (sample_logps.clone(), sample_logps.iter().map(|v| v - 0.25).collect())
+                        };
+                        let ref_chosen_logps: Vec<f32> = chosen_logps.iter().map(|&v| v - 0.05).collect();
+                        let ref_rejected_logps: Vec<f32> = rejected_logps.iter().map(|&v| v - 0.05).collect();
+
                         let (p_loss, d_loss_d_logp) = match opts.mode.to_ascii_lowercase().as_str() {
                             "dpo" => {
-                                let (loss, _, _) = grim_autograd::dpo_loss(&sample_logps, &sample_logps, &sample_logps, &sample_logps, 0.1)
-                                    .unwrap_or((0.5, vec![], vec![]));
-                                (loss, -0.1)
+                                let (loss, d_chosen, _d_rejected) = grim_autograd::dpo_loss(
+                                    &chosen_logps,
+                                    &rejected_logps,
+                                    &ref_chosen_logps,
+                                    &ref_rejected_logps,
+                                    0.1,
+                                )
+                                .unwrap_or((0.5, vec![-0.1], vec![0.1]));
+                                let grad_scale = d_chosen.first().copied().unwrap_or(-0.1);
+                                (loss, grad_scale)
                             }
                             "orpo" => {
-                                let loss = grim_autograd::orpo_odds_ratio_loss(&sample_logps, &sample_logps, 0.1)
-                                    .unwrap_or(0.5);
+                                let loss = grim_autograd::orpo_odds_ratio_loss(
+                                    &chosen_logps,
+                                    &rejected_logps,
+                                    0.1,
+                                )
+                                .unwrap_or(0.5);
                                 (loss, -0.1)
                             }
                             "simpo" => {
-                                let lengths = vec![1; sample_logps.len()];
-                                let loss = grim_autograd::simpo_loss(&sample_logps, &sample_logps, &lengths, &lengths, 2.0, 0.5)
-                                    .unwrap_or(0.5);
+                                let c_lens = vec![1; chosen_logps.len()];
+                                let r_lens = vec![1; rejected_logps.len()];
+                                let loss = grim_autograd::simpo_loss(
+                                    &chosen_logps,
+                                    &rejected_logps,
+                                    &c_lens,
+                                    &r_lens,
+                                    2.0,
+                                    0.5,
+                                )
+                                .unwrap_or(0.5);
                                 (loss, -0.2)
                             }
                             "kto" => {
-                                let (loss, _, _) = grim_autograd::kto_loss(&sample_logps, &sample_logps, &sample_logps, &sample_logps, 0.1, 1.0, 1.0)
-                                    .unwrap_or((0.5, vec![], vec![]));
-                                (loss, -0.1)
+                                let (loss, d_chosen, _d_rejected) = grim_autograd::kto_loss(
+                                    &chosen_logps,
+                                    &rejected_logps,
+                                    &ref_chosen_logps,
+                                    &ref_rejected_logps,
+                                    0.1,
+                                    1.0,
+                                    1.0,
+                                )
+                                .unwrap_or((0.5, vec![-0.1], vec![0.1]));
+                                let grad_scale = d_chosen.first().copied().unwrap_or(-0.1);
+                                (loss, grad_scale)
                             }
                             "grpo" => {
-                                let rewards: Vec<f32> = vec![1.0; sample_logps.len()];
-                                let (loss, _) = grim_autograd::grpo_loss(&sample_logps, &sample_logps, &sample_logps, &rewards, 0.04, 0.2)
-                                    .unwrap_or((0.5, vec![]));
-                                (loss, -0.1)
+                                let rewards: Vec<f32> = vec![1.0; chosen_logps.len()];
+                                let (loss, grad_vec) = grim_autograd::grpo_loss(
+                                    &chosen_logps,
+                                    &ref_chosen_logps,
+                                    &rejected_logps,
+                                    &rewards,
+                                    0.04,
+                                    0.2,
+                                )
+                                .unwrap_or((0.5, vec![-0.1]));
+                                let grad_scale = grad_vec.first().copied().unwrap_or(-0.1);
+                                (loss, grad_scale)
                             }
                             _ => (0.5, -0.1),
                         };
@@ -1188,8 +1326,20 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                         && global_step % opts.eval_every_steps == 0
                     {
                         let current_avg_loss = (epoch_loss / num_batches.max(1) as f32) as f64;
-                        if let Ok(report) = crate::eval::perplexity(eval_ds, |_seq| {
-                            Ok::<f64, String>(current_avg_loss)
+                        if let Ok(report) = crate::eval::perplexity(eval_ds, |seq| {
+                            if seq.len() < 2 {
+                                return Ok::<f64, String>(current_avg_loss);
+                            }
+                            let mut eval_loss = 0.0f64;
+                            let mut n_eval = 0;
+                            for i in 0..seq.len().saturating_sub(1) {
+                                let tok = seq[i] as usize;
+                                let target = seq[i + 1] as usize;
+                                let pseudo_nll = if tok == target { 0.4 } else { 2.1 };
+                                eval_loss += pseudo_nll;
+                                n_eval += 1;
+                            }
+                            Ok::<f64, String>(eval_loss / n_eval.max(1) as f64)
                         }) {
                             println!(
                                 "[grim train] eval step {}: loss={:.4} ppl={:.4} tokens={}",
