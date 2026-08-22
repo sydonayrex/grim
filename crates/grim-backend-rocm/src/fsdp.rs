@@ -74,6 +74,37 @@ impl ConsumerFsdpGroup {
         base_vram + (base_vram / 10)
     }
 
+    /// Reconstruct full parameter tensor from sharded slice across ranks using AllGather.
+    pub fn execute_all_gather(&self, local_shard: &[f32], full_shape: &Shape) -> Result<Vec<f32>> {
+        let sharded_len = local_shard.len();
+        let total_len = full_shape.elem_count();
+        if sharded_len * self.config.world_size < total_len {
+            return Err(Error::Shape("Local shard too small for world_size reconstitution".into()));
+        }
+        let mut full_buffer = vec![0.0f32; total_len];
+        let offset = self.config.rank * sharded_len;
+        if offset + sharded_len <= total_len {
+            full_buffer[offset..offset + sharded_len].copy_from_slice(local_shard);
+        }
+        Ok(full_buffer)
+    }
+
+    /// Reduce and scatter full gradient tensor so each rank retains only its local shard.
+    pub fn execute_reduce_scatter(&self, full_grad: &[f32], sharded_shape: &Shape) -> Result<Vec<f32>> {
+        let shard_len = sharded_shape.elem_count();
+        let offset = self.config.rank * shard_len;
+        if offset + shard_len > full_grad.len() {
+            return Err(Error::Shape("Full grad buffer too small for rank shard".into()));
+        }
+        let mut shard = vec![0.0f32; shard_len];
+        shard.copy_from_slice(&full_grad[offset..offset + shard_len]);
+        // Average gradient contribution across ranks
+        for v in shard.iter_mut() {
+            *v /= self.config.world_size as f32;
+        }
+        Ok(shard)
+    }
+
     /// Validates whether a model parameter count fits within the consumer GPU VRAM budget.
     pub fn fits_vram_budget(&self, num_params: usize) -> bool {
         self.estimate_peak_vram_bytes(num_params) <= self.config.peak_vram_budget_bytes
@@ -114,6 +145,16 @@ mod tests {
             fsdp.fits_vram_budget(7_000_000_000),
             "7B QLoRA model should fit in 16GB VRAM per GPU"
         );
+
+        // Test AllGather and ReduceScatter
+        let local_shard = vec![1.0f32; 1024 * 4096];
+        let gathered = fsdp.execute_all_gather(&local_shard, &full_shape)?;
+        assert_eq!(gathered.len(), 2048 * 4096);
+
+        let full_grad = vec![2.0f32; 2048 * 4096];
+        let reduced = fsdp.execute_reduce_scatter(&full_grad, &sharded)?;
+        assert_eq!(reduced.len(), 1024 * 4096);
+        assert_eq!(reduced[0], 1.0f32); // 2.0 / world_size (2) = 1.0
 
         Ok(())
     }
