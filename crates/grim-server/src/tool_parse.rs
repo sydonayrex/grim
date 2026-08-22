@@ -137,7 +137,10 @@ pub fn parse_tool_calls(completion: &str, family: ToolFamily) -> ParseOutcome {
     }
     ParseOutcome {
         calls: None,
-        diagnostic: first.diagnostic.or(second.diagnostic).or(bracket.diagnostic),
+        diagnostic: first
+            .diagnostic
+            .or(second.diagnostic)
+            .or(bracket.diagnostic),
     }
 }
 

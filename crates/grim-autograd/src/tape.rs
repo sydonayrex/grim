@@ -183,15 +183,56 @@ impl Tape {
     }
 
     /// Free non-boundary intermediate activations to reduce VRAM during gradient checkpointing (WI-X13).
-    /// Retains boundary inputs and parameter tensors required for backward recomputation.
+    ///
+    /// Retention policy — a tensor survives if any of the following hold:
+    ///
+    /// 1. It is a segment-boundary input (`checkpoint_boundaries`), i.e. the
+    ///    replay anchor for the segment that starts there.
+    /// 2. It is a parameter tensor (`param_tensors`) — LoRA A/B (and
+    ///    FullParameter base weights) are needed by backward *and* by LoRA
+    ///    replay.
+    /// 3. It is a cross-segment input: some entry consumes it while its
+    ///    producing entry lives in an EARLIER segment, so that later
+    ///    segments' backward/replay can always resolve it.
+    /// 4. It has no producing entry at all but is consumed by the tape —
+    ///    externally computed values (cos/sin tables, embedding outputs,
+    ///    norm outputs, base projection outputs registered with `register`
+    ///    rather than produced by a recorded op). Replay cannot recompute
+    ///    these because the tape never recorded how they were made.
+    ///
+    /// Everything else (produced and consumed entirely within one segment)
+    /// is freed; [`crate::replay::replay_segment`] reconstructs those on
+    /// demand when backward first touches their segment.
     pub fn free_intermediate_activations(&mut self) {
         if !self.is_checkpointing_enabled() {
             return;
         }
-        let boundary_set: HashSet<TensorId> = self.checkpoint_boundaries.values().copied().collect();
-        let param_set: HashSet<TensorId> = self.param_tensors.values().copied().collect();
+        let mut retain: HashSet<TensorId> = self.checkpoint_boundaries.values().copied().collect();
+        retain.extend(self.param_tensors.values().copied());
 
-        self.tensors.retain(|id, _| boundary_set.contains(id) || param_set.contains(id));
+        // Producer map: output tensor id -> segment index of its producer.
+        let mut producer_segment: HashMap<TensorId, usize> = HashMap::new();
+        for e in &self.entries {
+            producer_segment.insert(e.output, e.segment_idx);
+        }
+
+        for e in &self.entries {
+            for &inp in &e.inputs {
+                match producer_segment.get(&inp) {
+                    // Produced in an earlier segment: keep for later segments.
+                    Some(&seg) if seg < e.segment_idx => {
+                        retain.insert(inp);
+                    }
+                    // No producer entry: externally computed, unrecomputable.
+                    None => {
+                        retain.insert(inp);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.tensors.retain(|id, _| retain.contains(id));
     }
 
     /// Clear the tape (call between training steps).
@@ -570,14 +611,114 @@ mod tests {
         tape.mark_segment_boundary(0, x);
 
         let w1 = tape.register(cpu_tensor(vec![0.5, 0.5, 0.5, 0.5], Shape::new(vec![2, 2])));
-        let h1 = tape.record_matmul(x, w1, cpu_tensor(vec![1.5, 1.5], Shape::new(vec![1, 2])), false, false, 1, 2, 2, None);
+        let h1 = tape.record_matmul(
+            x,
+            w1,
+            cpu_tensor(vec![1.5, 1.5], Shape::new(vec![1, 2])),
+            false,
+            false,
+            1,
+            2,
+            2,
+            None,
+        );
         assert_eq!(tape.entries()[0].segment_idx, 0);
 
         tape.mark_segment_boundary(1, h1);
         let w2 = tape.register(cpu_tensor(vec![0.2, 0.2, 0.2, 0.2], Shape::new(vec![2, 2])));
-        let _h2 = tape.record_matmul(h1, w2, cpu_tensor(vec![0.6, 0.6], Shape::new(vec![1, 2])), false, false, 1, 2, 2, None);
+        let _h2 = tape.record_matmul(
+            h1,
+            w2,
+            cpu_tensor(vec![0.6, 0.6], Shape::new(vec![1, 2])),
+            false,
+            false,
+            1,
+            2,
+            2,
+            None,
+        );
         assert_eq!(tape.entries()[1].segment_idx, 1);
         assert_eq!(tape.checkpoint_boundaries.len(), 2);
+    }
+
+    // WI-X13: build the same two-segment graph on a fresh tape. Segment 0:
+    // y = x @ w1. Segment 1 (boundary input y): z = 2*y; out = z + s, where s
+    // is a registered cross-segment constant.
+    fn build_two_segment_tape(tape: &mut Tape) -> (TensorId, TensorId, TensorId) {
+        let x = tape.register(t(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        let w1 = tape.register(t(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]));
+        tape.mark_segment_boundary(0, x);
+        // y = x @ I = x
+        let y_id = tape.record_matmul(
+            x,
+            w1,
+            t(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]),
+            false,
+            false,
+            2,
+            2,
+            2,
+            None,
+        );
+        tape.mark_segment_boundary(1, y_id);
+        // z = 2 * y
+        let z_id = tape.record_scale(y_id, t(vec![2.0, 4.0, 6.0, 8.0], vec![2, 2]), 2.0, None);
+        let s = tape.register(t(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
+        let out_id =
+            tape.record_add(z_id, s, t(vec![3.0, 5.0, 7.0, 9.0], vec![2, 2]), None);
+        (y_id, z_id, out_id)
+    }
+
+    #[test]
+    fn checkpointed_gradients_match_uncheckpointed() {
+        use crate::backward::backward;
+        use crate::param::TrainableParams;
+
+        // Run 1: full residency.
+        let mut tape_a = Tape::new();
+        let (_, _, out_a) = build_two_segment_tape(&mut tape_a);
+        let mut params_a = TrainableParams::new();
+        let grads_a = backward(&tape_a, t(vec![1.0; 4], vec![2, 2]), out_a, &mut params_a)
+            .expect("plain backward");
+
+        // Run 2: checkpointed — activations freed before backward, so the
+        // backward pass must replay segment 1 to rebuild `z`.
+        crate::replay::reset_replay_count();
+        let mut tape_b = Tape::new();
+        let (y_b, z_b, out_b) = build_two_segment_tape(&mut tape_b);
+        tape_b.set_checkpoint_segs(4);
+        tape_b.free_intermediate_activations();
+        // The scale output is internal to segment 1 → freed; the boundary
+        // input y and the unproduced constant s stay resident.
+        assert!(
+            tape_b.get(z_b).is_none(),
+            "internal activation should be freed under checkpointing"
+        );
+        assert!(tape_b.get(y_b).is_some(), "boundary input must be retained");
+
+        let mut params_b = TrainableParams::new();
+        let grads_b = backward(&tape_b, t(vec![1.0; 4], vec![2, 2]), out_b, &mut params_b)
+            .expect("checkpointed backward with replay");
+        assert!(
+            crate::replay::replay_count() > 0,
+            "backward should have replayed at least one freed segment"
+        );
+
+        assert_eq!(grads_a.len(), grads_b.len());
+        for (id, ga) in &grads_a {
+            let gb = grads_b
+                .get(id)
+                .unwrap_or_else(|| panic!("grad missing in checkpointed run: {id:?}"));
+            let va = ga.to_vec_f32().unwrap();
+            let vb = gb.to_vec_f32().unwrap();
+            assert_eq!(va.len(), vb.len());
+            for (i, (&a, &b)) in va.iter().zip(vb.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "grad divergence at tensor {id:?}[{i}]: {a} vs {b}"
+                );
+            }
+        }
     }
 
     // Helper for the test above

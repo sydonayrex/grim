@@ -13,13 +13,39 @@ use grim_tensor::Device;
 /// PPL sliding-window size in tokens.
 const PPL_WINDOW: usize = 2048;
 
+/// Resolve the eval device from `GRIM_BACKEND` / `GRIM_FORCE_DEVICE`
+/// (`rocm[:ord]`, `cuda[:ord]`); anything else stays CPU. Kept local to the
+/// lib crate — `run.rs`'s probe lives in the binary target.
+fn resolve_device() -> Device {
+    let requested = std::env::var("GRIM_BACKEND")
+        .or_else(|_| std::env::var("GRIM_FORCE_DEVICE"))
+        .unwrap_or_default();
+    let s = requested.trim().to_ascii_lowercase();
+    let ord = |default: usize| -> usize {
+        s.split(':')
+            .nth(1)
+            .and_then(|x| x.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    if s.starts_with("rocm") {
+        Device::Rocm(ord(0))
+    } else if s.starts_with("cuda") {
+        Device::Cuda(ord(0))
+    } else {
+        Device::Cpu
+    }
+}
+
 /// Load a model by catalog name or path, mirroring `bench.rs`.
 fn load_model(model: &str) -> Result<(Box<dyn CausalLm>, String)> {
     let resolved = grim_core::catalog::resolve_model_path(model).ok_or_else(|| {
         Error::Config(format!("model '{model}' not found in local cache or on disk"))
     })?;
     let path_str = resolved.to_string_lossy().to_lowercase();
-    let device = Device::Cpu;
+    // WI-E1: honor GRIM_BACKEND like the rest of the CLI — never silently pin
+    // eval to CPU when a GPU backend is requested.
+    let device = resolve_device();
+    eprintln!("[eval] using device: {device:?}");
     let boxed: Box<dyn CausalLm> = if path_str.ends_with(".gguf") {
         grim_engine::model_loader::load_model_from_gguf(
             resolved.to_string_lossy().as_ref(),
@@ -58,7 +84,18 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
     let mut sum_nll = 0.0f64;
     let mut n_windows = 0usize;
     let mut start = 0usize;
+    // GRIM_EVAL_MAX_WINDOWS: deterministic prefix cap. Baselines produced
+    // with a cap record it in their metrics JSON — same corpus + cap + model
+    // always yields the same ppl.
+    let max_windows: Option<usize> = std::env::var("GRIM_EVAL_MAX_WINDOWS")
+        .ok()
+        .and_then(|v| v.parse().ok());
     while start + PPL_WINDOW < tokens.len() {
+        if let Some(cap) = max_windows {
+            if n_windows >= cap {
+                break;
+            }
+        }
         let ctx = &tokens[start..start + PPL_WINDOW];
         let target = tokens[start + PPL_WINDOW];
 
@@ -316,9 +353,20 @@ pub async fn cmd_eval(
                 eprintln!("[eval] ppl: {} tokens", tokens.len());
                 let (ppl, windows) = compute_ppl(loaded.as_ref(), &tokens)?;
                 println!("ppl={ppl:.4} windows={windows}");
+                let corpus_sha = {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(text.as_bytes());
+                    format!("{:x}", h.finalize())
+                };
                 metrics.insert(
                     "ppl".into(),
-                    serde_json::json!({ "value": ppl, "windows": windows }),
+                    serde_json::json!({
+                        "value": ppl,
+                        "windows": windows,
+                        "max_windows": std::env::var("GRIM_EVAL_MAX_WINDOWS").ok(),
+                        "corpus_sha256": corpus_sha,
+                    }),
                 );
             }
             "gsm8k" => {

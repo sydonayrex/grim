@@ -3,6 +3,7 @@
 use grim_tensor::error::{Error, Result};
 
 pub mod accuracy_gate;
+mod packed_gemm;
 pub mod qat_mxfp4;
 pub mod soul_eater;
 pub mod spqr;
@@ -5764,6 +5765,10 @@ mod tests {
 
 /// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed Q8_0 weights.
 /// A has shape [m, k], B has shape [n, k] (in packed Q8_0 bytes).
+///
+/// Dispatches once per call to an AVX2 kernel on x86-64 (runtime-detected) or
+/// a NEON kernel on aarch64; the scalar loop below is the always-available
+/// fallback and the mathematical reference for the SIMD kernels.
 pub fn gemm_q8_0_packed(
     a: &[f32],
     b_q80_bytes: &[u8],
@@ -5793,6 +5798,34 @@ pub fn gemm_q8_0_packed(
         )));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if packed_gemm::avx2_detected() {
+        // SAFETY: AVX2 presence was just verified at runtime, and all shape /
+        // buffer-length validation above has passed.
+        return Ok(unsafe { packed_gemm::x86::gemm_q8_0_packed_avx2(a, b_q80_bytes, m, n, k) });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: shape / buffer-length validation above has passed. NEON is
+    // baseline on aarch64, so no runtime feature check is needed.
+    return Ok(unsafe { packed_gemm::neon::gemm_q8_0_packed_neon(a, b_q80_bytes, m, n, k) });
+
+    #[cfg(not(target_arch = "aarch64"))]
+    Ok(gemm_q8_0_packed_scalar(a, b_q80_bytes, m, n, k))
+}
+
+/// Scalar reference implementation of [`gemm_q8_0_packed`] (inputs already validated).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn gemm_q8_0_packed_scalar(
+    a: &[f32],
+    b_q80_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let blocks_per_row = k / 32;
+    let stride_b = blocks_per_row * 34;
+
     let mut c = vec![0.0f32; m * n];
 
     for row_m in 0..m {
@@ -5817,11 +5850,15 @@ pub fn gemm_q8_0_packed(
         }
     }
 
-    Ok(c)
+    c
 }
 
 /// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed Q4_K weights.
 /// A has shape [m, k], B has shape [n, k] (in packed Q4_K bytes: 144 bytes per 256 weights).
+///
+/// Dispatches once per call to an AVX2 kernel on x86-64 (runtime-detected);
+/// the scalar loop below is the always-available fallback and the mathematical
+/// reference for the SIMD kernel. (Q4_K stays scalar on aarch64.)
 pub fn gemm_q4k_packed(
     a: &[f32],
     b_q4k_bytes: &[u8],
@@ -5850,6 +5887,27 @@ pub fn gemm_q4k_packed(
             a.len()
         )));
     }
+
+    #[cfg(target_arch = "x86_64")]
+    if packed_gemm::avx2_detected() {
+        // SAFETY: AVX2 presence was just verified at runtime, and all shape /
+        // buffer-length validation above has passed.
+        return Ok(unsafe { packed_gemm::x86::gemm_q4k_packed_avx2(a, b_q4k_bytes, m, n, k) });
+    }
+
+    Ok(gemm_q4k_packed_scalar(a, b_q4k_bytes, m, n, k))
+}
+
+/// Scalar reference implementation of [`gemm_q4k_packed`] (inputs already validated).
+fn gemm_q4k_packed_scalar(
+    a: &[f32],
+    b_q4k_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let blocks_per_row = k / 256;
+    let stride_b = blocks_per_row * 144;
 
     let mut c = vec![0.0f32; m * n];
 
@@ -5902,5 +5960,5 @@ pub fn gemm_q4k_packed(
         }
     }
 
-    Ok(c)
+    c
 }

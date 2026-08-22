@@ -343,11 +343,11 @@ enum Commands {
         /// Quick preset: sets low-rank LoRA defaults for rapid experimentation.
         #[arg(long)]
         quick: bool,
-        /// Base model path or catalog name.
-        #[arg(short, long)]
+        /// Base model path or catalog name (empty allowed with --recipe).
+        #[arg(short, long, default_value = "")]
         model: String,
-        /// Dataset path.
-        #[arg(short, long)]
+        /// Dataset path (empty allowed with --recipe).
+        #[arg(short, long, default_value = "")]
         dataset: String,
         /// Output .grim.train sidecar path.
         #[arg(short, long, default_value = "adapter.grim.train")]
@@ -459,6 +459,10 @@ enum Commands {
         /// Deduplicate identical token sequences across mixed datasets.
         #[arg(long)]
         dedup: bool,
+        /// Training recipe YAML (docs/recipes/*.yaml, WI-E6). Values apply to
+        /// arguments left at their defaults; explicit flags win.
+        #[arg(long)]
+        recipe: Option<String>,
         /// Number of gradient checkpointing segments across layers (0 = disabled).
         #[arg(long, default_value_t = 0)]
         checkpoint_segs: usize,
@@ -1366,10 +1370,128 @@ async fn main() -> Result<()> {
             dataset_paths,
             mix_weights,
             dedup,
+            recipe,
             checkpoint_segs,
         } => {
             // Load grim.toml defaults if available
             let cfg_toml = grim_cli::config::GrimToml::from_path("grim.toml").unwrap_or_default();
+
+            // WI-E6: load the training recipe and resolve its dataset registry
+            // entry (sha256-verified when pinned). Recipe values apply only to
+            // arguments still at their defaults; explicit flags win.
+            let loaded_recipe = match recipe.as_deref() {
+                Some(path) => match grim_cli::recipe::load_recipe(std::path::Path::new(path)) {
+                    Ok(r) => {
+                        println!(
+                            "[grim train] Loaded recipe '{}' (v{})",
+                            r.name, r.recipe_version
+                        );
+                        Some(r)
+                    }
+                    Err(e) => {
+                        eprintln!("[grim train] Failed to load recipe {path}: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            if let Some(r) = &loaded_recipe {
+                match grim_cli::recipe::resolve_dataset(&r.dataset.registry_id) {
+                    Ok(p) => println!(
+                        "[grim train] Recipe dataset '{}' resolved to {}",
+                        r.dataset.registry_id,
+                        p.display()
+                    ),
+                    Err(e) => {
+                        eprintln!("[grim train] Dataset resolution failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let rt = loaded_recipe.as_ref().map(|r| &r.training);
+            let recipe_model = loaded_recipe.as_ref().map(|r| r.model.clone());
+            let recipe_dataset = loaded_recipe
+                .as_ref()
+                .map(|r| grim_cli::recipe::resolve_dataset(&r.dataset.registry_id))
+                .map(|p| p.map(|p| p.to_string_lossy().into_owned()));
+
+            let effective_model = match (model.is_empty(), recipe_model) {
+                (true, Some(m)) => m,
+                _ => model,
+            };
+            let effective_dataset = match (dataset.is_empty(), recipe_dataset) {
+                (true, Some(Ok(d))) => d,
+                _ => dataset,
+            };
+            let effective_epochs = if epochs == 3 {
+                rt.map(|t| t.epochs).unwrap_or(epochs)
+            } else {
+                epochs
+            };
+            let effective_lr = if (lr - 2e-4).abs() < f32::EPSILON {
+                rt.map(|t| t.lr).unwrap_or(lr)
+            } else {
+                lr
+            };
+            let effective_rank = if rank == 16 {
+                rt.map(|t| t.rank).unwrap_or(rank)
+            } else {
+                rank
+            };
+            let effective_alpha = if (alpha - 32.0).abs() < f32::EPSILON {
+                rt.map(|t| t.alpha).unwrap_or(alpha)
+            } else {
+                alpha
+            };
+            let effective_batch_size = if batch_size == 2048 {
+                rt.map(|t| t.batch_size).unwrap_or(batch_size)
+            } else {
+                batch_size
+            };
+            let effective_grad_accum = if gradient_accumulation_steps == 1 {
+                rt.map(|t| t.gradient_accumulation_steps)
+                    .unwrap_or(gradient_accumulation_steps)
+            } else {
+                gradient_accumulation_steps
+            };
+            let effective_warmup = if warmup_steps == 0 {
+                rt.map(|t| t.warmup_steps).unwrap_or(warmup_steps)
+            } else {
+                warmup_steps
+            };
+            let effective_logging = if logging_steps == 0 {
+                rt.map(|t| t.logging_steps).unwrap_or(logging_steps)
+            } else {
+                logging_steps
+            };
+            let effective_max_grad_norm = if (max_grad_norm - 1.0).abs() < f32::EPSILON {
+                rt.map(|t| t.max_grad_norm).unwrap_or(max_grad_norm)
+            } else {
+                max_grad_norm
+            };
+            let effective_patience = if early_stopping_patience == 0 {
+                rt.map(|t| t.early_stopping_patience)
+                    .unwrap_or(early_stopping_patience)
+            } else {
+                early_stopping_patience
+            };
+            let effective_mode = if mode == "qlora" {
+                rt.map(|t| t.mode.clone()).unwrap_or(mode)
+            } else {
+                mode
+            };
+            let effective_optimizer = match rt.map(|t| t.optimizer.as_str()) {
+                Some(name) if optimizer == grim_autograd::OptimizerKind::AdamW => name
+                    .parse()
+                    .unwrap_or(grim_autograd::OptimizerKind::AdamW),
+                _ => optimizer,
+            };
+            let effective_scheduler = match rt.map(|t| t.scheduler.as_str()) {
+                Some(name) if scheduler == grim_autograd::LRScheduler::Cosine => name
+                    .parse()
+                    .unwrap_or(grim_autograd::LRScheduler::Cosine),
+                _ => scheduler,
+            };
             let effective_lora_plus = if (lora_plus_ratio - 1.0).abs() > 1e-5 {
                 lora_plus_ratio
             } else {
@@ -1417,28 +1539,34 @@ async fn main() -> Result<()> {
                 );
                 (1, 8, 16.0, "cpu".to_string(), "lora".to_string())
             } else {
-                (epochs, rank, alpha, device, mode)
+                (
+                    effective_epochs,
+                    effective_rank,
+                    effective_alpha,
+                    device,
+                    effective_mode,
+                )
             };
 
             let opts = train::TrainOptions {
-                model_path: model,
-                dataset_path: dataset,
+                model_path: effective_model,
+                dataset_path: effective_dataset,
                 output_sidecar: output,
                 epochs: final_epochs,
-                lr,
+                lr: effective_lr,
                 rank: final_rank,
                 alpha: final_alpha,
-                batch_size,
-                gradient_accumulation_steps,
-                warmup_steps,
-                logging_steps,
-                max_grad_norm,
-                early_stopping_patience,
+                batch_size: effective_batch_size,
+                gradient_accumulation_steps: effective_grad_accum,
+                warmup_steps: effective_warmup,
+                logging_steps: effective_logging,
+                max_grad_norm: effective_max_grad_norm,
+                early_stopping_patience: effective_patience,
                 num_gpus,
                 device: final_device,
                 mode: final_mode,
-                optimizer,
-                scheduler,
+                optimizer: effective_optimizer,
+                scheduler: effective_scheduler,
                 use_pissa,
                 use_olora,
                 olora_lambda,

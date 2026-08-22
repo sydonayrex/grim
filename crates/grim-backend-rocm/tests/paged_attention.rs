@@ -87,6 +87,7 @@ fn test_paged_attention_gpu_matches_reference() {
         kv_seq_len,
         cache_offset,
         0i32,
+        None, // WI-X5 block_dim_override: keep the wavefront-aware default
     );
 
     assert!(

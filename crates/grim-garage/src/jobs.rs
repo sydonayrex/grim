@@ -1089,18 +1089,24 @@ fn run_rank_sft_forward(
         grim_autograd::LoRAInjectionPoint::Logits,
         logits_base,
         logits_base_id,
-        curr_x,
+        curr_x.clone(),
         curr_x_id,
     )
     .map_err(|e| format!("logits lora apply: {e}"))?;
-    // Check if fused linear cross-entropy optimization is active (e.g. GRIM_FUSED_CE or config)
-    let use_fused_ce = std::env::var("GRIM_FUSED_CE")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false);
+    // WI-E6: route through the fused linear-CE on ROCm (avoids materializing
+    // [B, V] logits); CPU keeps the materialized-logits fallback. Default-on
+    // for Rocm devices; GRIM_FUSED_CE=0 forces the fallback everywhere.
+    let use_fused_ce = match std::env::var("GRIM_FUSED_CE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => logits_out.device().is_rocm(),
+    };
 
     if use_fused_ce {
-        if let Ok((loss, grad_h)) = grim_autograd::fused_linear_ce(&curr_x, &lm_head.weight, targets, 4096) {
-            let dummy_out_id = tape.register(curr_x.clone());
+        let fused_hidden = curr_x.clone();
+        if let Ok((loss, grad_h)) =
+            grim_autograd::fused_linear_ce(&fused_hidden, &lm_head.weight, targets, 4096)
+        {
+            let dummy_out_id = tape.register(fused_hidden);
             return Ok((loss, grad_h, dummy_out_id));
         }
     }
@@ -1882,6 +1888,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             | TrainingMode::TurboFinetune
             | TrainingMode::ContrastOmni
             | TrainingMode::SpectralQLoRA
+            // WI-E4: CompressDistill flows through the scaled-loss SFT
+            // cross-entropy arm, which needs the teacher (base model) forward.
+            | TrainingMode::CompressDistill
     );
     let mut sft_base: Option<RankModel> = None;
     if needs_model {
@@ -1976,6 +1985,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 | TrainingMode::OmniloPrune
                 | TrainingMode::ContrastOmni
                 | TrainingMode::SpectralQLoRA
+                // WI-E4: distillation loss is the SFT cross-entropy path.
+                | TrainingMode::CompressDistill
         );
         let rccl = match rccl_handle.as_ref() {
             Some(handle) => handle,

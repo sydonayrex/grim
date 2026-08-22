@@ -32,6 +32,10 @@ impl Device {
     pub fn same_kind(&self, other: &Device) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
+    /// True when this target is a ROCm device.
+    pub fn is_rocm(&self) -> bool {
+        matches!(self, Device::Rocm(_))
+    }
 }
 
 impl fmt::Display for Device {

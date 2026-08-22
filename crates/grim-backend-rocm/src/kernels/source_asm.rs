@@ -19,6 +19,9 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);
+    // grim_dequant_q4k must ride in the same aggregate unit — without this
+    // append, hipModuleGetFunction fails with error 500 on first use.
+    s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
     #[cfg(feature = "q4k")]
     s.push_str(crate::kernels::q4k_gemm::KERNEL_SOURCE);
     #[cfg(feature = "q5k")]
@@ -34,6 +37,12 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
     s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);
+    // MXFP4/MXFP8 standalone dequant kernels (grim_dequant_mxfp4 et al.) —
+    // same aggregate-unit requirement as the q4k/iq families above.
+    s.push_str(crate::kernels::mxfp_standalone::KERNEL_SOURCE);
+    // IQ-family standalone dequant kernels (grim_dequant_iq4nl et al.) —
+    // same aggregate-unit requirement as grim_dequant_q4k above.
+    s.push_str(crate::kernels::iq_dequant::KERNEL_SOURCE);
     s.push_str(crate::kernels::silu_mul_quant::SILU_MUL_QUANT_KERNEL_SOURCE);
     s.push_str(crate::kernels::sage_attention::SAGE_ATTENTION_KERNEL_SOURCE);
     s.push_str(crate::kernels::scythe_persistent::KERNEL_SOURCE);
@@ -45,6 +54,9 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::preshuffled_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::mrope::KERNEL_SOURCE);
     s.push_str(crate::kernels::speculative_sampler::KERNEL_SOURCE);
+    // WI-X3: GPU stochastic sampler (grim_sample_logits_stochastic) rides in
+    // the same aggregate translation unit so `launch_compute_kernel` resolves it.
+    s.push_str(crate::kernels::device_sampler::DEVICE_SAMPLER_KERNEL_SOURCE);
     s.push_str(crate::kernels::mxfp4_gemm::KERNEL_SOURCE);
     s
 }

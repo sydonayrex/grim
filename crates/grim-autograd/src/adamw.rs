@@ -331,13 +331,11 @@ impl Optimizer {
                     ..PagedAdamWConfig::default()
                 })))
             }
-            OptimizerKind::AdamWBnb => {
-                Ok(Optimizer::AdamW8Bit(AdamW8Bit::new(AdamW8BitConfig {
-                    lr,
-                    use_8bit_moments: true,
-                    ..AdamW8BitConfig::default()
-                })))
-            }
+            OptimizerKind::AdamWBnb => Ok(Optimizer::AdamW8Bit(AdamW8Bit::new(AdamW8BitConfig {
+                lr,
+                use_8bit_moments: true,
+                ..AdamW8BitConfig::default()
+            }))),
             OptimizerKind::LOMO | OptimizerKind::Adalomo => {
                 Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
                     lr,
@@ -1154,11 +1152,21 @@ impl AdamW8Bit {
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
         let mut state = save_param_data_only(params, self.step_count);
         for (id, m_bytes) in &self.m_q80 {
-            let key = format!("opt_8bit_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            let key = format!(
+                "opt_8bit_m_{}_{}_{}",
+                id.layer_idx,
+                id.adapter_id,
+                if id.is_a { "a" } else { "b" }
+            );
             state.add_blob(key, vec![m_bytes.len()], m_bytes.clone());
         }
         for (id, v_bytes) in &self.v_q80 {
-            let key = format!("opt_8bit_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            let key = format!(
+                "opt_8bit_v_{}_{}_{}",
+                id.layer_idx,
+                id.adapter_id,
+                if id.is_a { "a" } else { "b" }
+            );
             state.add_blob(key, vec![v_bytes.len()], v_bytes.clone());
         }
         state
@@ -1173,8 +1181,18 @@ impl AdamW8Bit {
         self.step_count = state.step as usize;
         load_param_data_only(params, state)?;
         for (id, _) in params.iter() {
-            let m_key = format!("opt_8bit_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
-            let v_key = format!("opt_8bit_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            let m_key = format!(
+                "opt_8bit_m_{}_{}_{}",
+                id.layer_idx,
+                id.adapter_id,
+                if id.is_a { "a" } else { "b" }
+            );
+            let v_key = format!(
+                "opt_8bit_v_{}_{}_{}",
+                id.layer_idx,
+                id.adapter_id,
+                if id.is_a { "a" } else { "b" }
+            );
             if let Some(blob) = state.blobs.get(&m_key) {
                 self.m_q80.insert(*id, blob.data.clone());
             }
@@ -1274,12 +1292,14 @@ impl PagedAdamW {
     /// Page in the requested moment page on touch.
     fn touch_page(&mut self, id: ParamId, page_idx: usize, page_len: usize) -> &mut MomentPage {
         self.dirty_set.insert((id, page_idx));
-        self.pages.entry((id, page_idx)).or_insert_with(|| MomentPage {
-            m: vec![0.0f32; page_len],
-            v: vec![0.0f32; page_len],
-            dirty: false,
-            in_gpu: !self.config.cpu_offload,
-        })
+        self.pages
+            .entry((id, page_idx))
+            .or_insert_with(|| MomentPage {
+                m: vec![0.0f32; page_len],
+                v: vec![0.0f32; page_len],
+                dirty: false,
+                in_gpu: !self.config.cpu_offload,
+            })
     }
 
     pub fn step_param(
@@ -1362,8 +1382,20 @@ impl PagedAdamW {
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
         let mut state = save_param_data_only(params, self.step_count);
         for ((id, page_idx), page) in &self.pages {
-            let m_key = format!("paged_m_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, page_idx);
-            let v_key = format!("paged_v_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, page_idx);
+            let m_key = format!(
+                "paged_m_{}_{}_{}_p{}",
+                id.layer_idx,
+                id.adapter_id,
+                if id.is_a { "a" } else { "b" },
+                page_idx
+            );
+            let v_key = format!(
+                "paged_v_{}_{}_{}_p{}",
+                id.layer_idx,
+                id.adapter_id,
+                if id.is_a { "a" } else { "b" },
+                page_idx
+            );
             let m_bytes: Vec<u8> = page.m.iter().flat_map(|v| v.to_le_bytes()).collect();
             let v_bytes: Vec<u8> = page.v.iter().flat_map(|v| v.to_le_bytes()).collect();
             state.add_blob(m_key, vec![page.m.len()], m_bytes);
@@ -1385,8 +1417,20 @@ impl PagedAdamW {
             let page_size = self.config.page_size.max(1);
             let num_pages = (elem_count + page_size - 1) / page_size;
             for p in 0..num_pages {
-                let m_key = format!("paged_m_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, p);
-                let v_key = format!("paged_v_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, p);
+                let m_key = format!(
+                    "paged_m_{}_{}_{}_p{}",
+                    id.layer_idx,
+                    id.adapter_id,
+                    if id.is_a { "a" } else { "b" },
+                    p
+                );
+                let v_key = format!(
+                    "paged_v_{}_{}_{}_p{}",
+                    id.layer_idx,
+                    id.adapter_id,
+                    if id.is_a { "a" } else { "b" },
+                    p
+                );
                 if let Some(blob) = state.blobs.get(&m_key) {
                     if let Ok(m_vals) = bytes_to_f32_vec(&blob.data) {
                         let entry = self.pages.entry((*id, p)).or_insert_with(|| MomentPage {
@@ -3372,8 +3416,16 @@ mod tests {
 
         paged_opt.step(&mut params).unwrap();
 
-        assert_eq!(paged_opt.pages.len(), 4, "Must allocate 4 pages for 100 elements at page_size=32");
-        assert_eq!(paged_opt.dirty_set.len(), 4, "All 4 pages must be marked dirty during step");
+        assert_eq!(
+            paged_opt.pages.len(),
+            4,
+            "Must allocate 4 pages for 100 elements at page_size=32"
+        );
+        assert_eq!(
+            paged_opt.dirty_set.len(),
+            4,
+            "All 4 pages must be marked dirty during step"
+        );
 
         let updated = params.get(pid).unwrap().data.to_vec_f32().unwrap();
         for &w in &updated {

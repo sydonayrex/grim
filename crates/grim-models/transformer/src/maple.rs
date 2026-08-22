@@ -195,6 +195,7 @@ impl Maple {
                     base: theta,
                     rotary_dim,
                     yarn,
+                    interleaved: true,
                 };
 
                 let sliding_window = if is_sliding {

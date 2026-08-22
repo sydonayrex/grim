@@ -44,10 +44,37 @@ pub fn fused_or_scalar_attention(
     debug_assert_eq!(v_history.len(), kv_len * kv_stride);
     let cache_offset = kv_len.saturating_sub(steps);
 
-    let out_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    // GRIM_QKV_FUSED=0 forces the scalar reference path on GPU backends.
+    // Correctness escape hatch while the fused-route generation corruption
+    // (bisected to d95f21f, kernel itself verified correct standalone) is
+    // being root-caused.
+    if std::env::var("GRIM_QKV_FUSED").as_deref() == Ok("0") {
+        return scalar_attention(
+            q,
+            k_history,
+            v_history,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            steps,
+            kv_len,
+            cache_offset,
+            window,
+            1.0 / (head_dim as f32).sqrt(),
+            &pick_device_for_storage_device(device),
+            device,
+        );
+    }
+
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    // Allocate the kernel output directly with the FLAT [steps, heads*dim]
+    // shape consumers expect. Relabeling a [steps, heads, dim] storage under a
+    // flat shape corrupts downstream matmuls that consult the storage dims
+    // (bisected: LFM2 `wo` projections on ROCm).
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
     let dev = pick_device_for_storage_device(device);
 
-    let q_st = dev.from_cpu(q, &out_shape, DType::F32)?;
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
     let kv_shape = Shape::new(vec![kv_len, num_kv_heads, head_dim]);
     let k_st = dev.from_cpu(k_history, &kv_shape, DType::F32)?;
     let v_st = dev.from_cpu(v_history, &kv_shape, DType::F32)?;
@@ -65,14 +92,11 @@ pub fn fused_or_scalar_attention(
         None,
     ) {
         Ok((storage, _handle)) => {
-            // The fused kernel writes [steps, heads, head_dim]; every consumer
-            // (Linear::forward → device matmul) requires the flat
-            // [steps, heads*head_dim] layout the scalar path produces. Relabel
-            // without copying — the storage layout is identical row-major.
-            let flat_shape = Shape::new(vec![steps, num_heads * head_dim]);
+            // Output storage was allocated with the flat consumer shape —
+            // no relabeling, storage dims and tensor dims agree.
             Ok(Tensor::new(
                 Arc::from(storage),
-                flat_shape,
+                out_shape.clone(),
                 DType::F32,
                 grim_tensor::QuantProvenance::default(),
                 device.clone(),
@@ -94,6 +118,70 @@ pub fn fused_or_scalar_attention(
             device,
         ),
     }
+}
+
+/// WI-X2: attention over a caller-maintained device KV arena (see
+/// `block.rs::cache_append_kv`). Only the per-step K/V rows cross H2D; the
+/// history stays resident, so decode cost is O(new tokens), not O(context).
+/// Falls back to the host-history path when the device kernel rejects the
+/// call or the backend lacks the fused kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_arena(
+    q: &[f32],
+    k_arena: &dyn grim_tensor::BackendStorage,
+    v_arena: &dyn grim_tensor::BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    // Flat output allocation — see fused_or_scalar_attention for why the
+    // storage shape must already match the consumer-facing logical shape.
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    let cache_offset = kv_len.saturating_sub(steps);
+    if let Ok((storage, _handle)) = dev.qkv_attention(
+        q_st.as_ref(),
+        k_arena,
+        v_arena,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+        None,
+        None,
+    ) {
+        return Ok(Tensor::new(
+            Arc::from(storage),
+            out_shape.clone(),
+            DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            device.clone(),
+        ));
+    }
+    // Fallback: materialize exactly `kv_len` rows (the arena may be larger
+    // than the live history — capacity grows geometrically) and take the
+    // host-history path.
+    let kv_stride = num_kv_heads * head_dim;
+    let k_hist = k_arena.to_cpu_vec_f32()?;
+    let v_hist = v_arena.to_cpu_vec_f32()?;
+    fused_or_scalar_attention(
+        q,
+        &k_hist[..kv_len * kv_stride],
+        &v_hist[..kv_len * kv_stride],
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
 }
 
 /// Paged attention entry point (WI-X2): operates on device-resident KV pages via block tables,
@@ -358,6 +446,73 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// WI-X2: the arena entry must produce byte-identical results to the
+    /// host-history entry when the device has no fused kernel (CPU) — the
+    /// arena path degrades to a materialize-and-fallback, never to wrong math.
+    #[test]
+    fn arena_attention_matches_host_history_path() {
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let kv_len = 24usize;
+        let steps = 3usize;
+        let window = Some(10usize);
+        let kv_stride = num_kv_heads * head_dim;
+
+        let mut seed = 0xfeed_beefu64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let q: Vec<f32> = (0..steps * num_heads * head_dim).map(|_| rand()).collect();
+        let k: Vec<f32> = (0..kv_len * kv_stride).map(|_| rand()).collect();
+        let v: Vec<f32> = (0..kv_len * kv_stride).map(|_| rand()).collect();
+
+        let device = Device::Cpu;
+        let host = fused_or_scalar_attention(
+            &q,
+            &k,
+            &v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            steps,
+            window,
+            &device,
+        )
+        .expect("host-history attention");
+
+        // Arena holding exactly kv_len rows, laid out [kv_len, kv_stride].
+        let shape = Shape::new(vec![kv_len, kv_stride]);
+        let cpu_dev = grim_nn::modules::pick_device_for_storage_device(&device);
+        let k_arena = cpu_dev.from_cpu(&k, &shape, DType::F32).expect("k arena");
+        let v_arena = cpu_dev.from_cpu(&v, &shape, DType::F32).expect("v arena");
+
+        let arena = fused_or_scalar_attention_arena(
+            &q,
+            k_arena.as_ref(),
+            v_arena.as_ref(),
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            steps,
+            window,
+            &device,
+        )
+        .expect("arena attention");
+
+        let a = host.to_vec_f32().expect("host vec");
+        let b = arena.to_vec_f32().expect("arena vec");
+        assert_eq!(a.len(), b.len());
+        for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-6,
+                "arena/host divergence at [{i}]: {x} vs {y}"
+            );
         }
     }
 }
