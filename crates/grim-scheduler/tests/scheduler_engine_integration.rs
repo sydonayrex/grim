@@ -6,12 +6,12 @@
 //! - Request pause, resume, preemption, and completion lifecycle
 //! - Self-tuning controller dynamic knob updates based on latency observations
 
-use std::time::Duration;
 use grim_scheduler::self_tuning::KnobKind;
 use grim_scheduler::{
     AdmissionController, AdmissionDecision, BatchTokenBacklog, Request, Scheduler,
     SelfTuningController,
 };
+use std::time::Duration;
 
 #[test]
 fn test_scheduler_chunked_prefill_and_decode_interleaving() {

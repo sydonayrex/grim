@@ -48,10 +48,7 @@ pub(crate) mod x86 {
         ($v:expr) => {{
             let v = $v;
             // s = [L0+L4, L1+L5, L2+L6, L3+L7]
-            let s = _mm_add_ps(
-                _mm256_castps256_ps128(v),
-                _mm256_extractf128_ps::<1>(v),
-            );
+            let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
             // unpacklo(a,a) = [a0,a0,a1,a1], unpackhi(a,a) = [a2,a2,a3,a3]
             let lo = _mm_unpacklo_ps(s, s);
             let hi = _mm_unpackhi_ps(s, s);
@@ -123,10 +120,7 @@ pub(crate) mod x86 {
                         // sign extension: i8 -> i16 -> i32 -> f32) and
                         // multiply-accumulate against the matching A lanes.
                         let q = _mm256_loadu_si256(b_row.as_ptr().add(b_pos + 2) as *const __m256i);
-                        let halves = [
-                            _mm256_castsi256_si128(q),
-                            _mm256_extracti128_si256::<1>(q),
-                        ];
+                        let halves = [_mm256_castsi256_si128(q), _mm256_extracti128_si256::<1>(q)];
                         let mut acc = _mm256_setzero_ps();
                         for (half, q_half) in halves.iter().enumerate() {
                             let w16 = _mm256_cvtepi8_epi16(*q_half);
@@ -135,9 +129,11 @@ pub(crate) mod x86 {
                                 _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(w16)),
                             ];
                             for (quarter, wq) in quarters.iter().enumerate() {
-                                let av =
-                                    _mm256_loadu_ps(a.as_ptr().add(a_pos + half * 16 + quarter * 8));
-                                acc = _mm256_add_ps(acc, _mm256_mul_ps(av, _mm256_cvtepi32_ps(*wq)));
+                                let av = _mm256_loadu_ps(
+                                    a.as_ptr().add(a_pos + half * 16 + quarter * 8),
+                                );
+                                acc =
+                                    _mm256_add_ps(acc, _mm256_mul_ps(av, _mm256_cvtepi32_ps(*wq)));
                             }
                         }
 
@@ -198,25 +194,12 @@ pub(crate) mod x86 {
                             let raw =
                                 _mm256_loadu_si256(qs.as_ptr().add(group * 32) as *const __m256i);
                             let lo_bytes = _mm256_and_si256(raw, mask_0f);
-                            let hi_bytes =
-                                _mm256_and_si256(_mm256_srli_epi16::<4>(raw), mask_0f);
+                            let hi_bytes = _mm256_and_si256(_mm256_srli_epi16::<4>(raw), mask_0f);
 
                             let (sc, mi) = crate::get_scale_min_k4(is, scales);
-                            dot += sub_block_contrib!(
-                                a,
-                                a_base,
-                                lo_bytes,
-                                d * sc,
-                                min * mi
-                            );
+                            dot += sub_block_contrib!(a, a_base, lo_bytes, d * sc, min * mi);
                             let (sc, mi) = crate::get_scale_min_k4(is + 1, scales);
-                            dot += sub_block_contrib!(
-                                a,
-                                a_base + 32,
-                                hi_bytes,
-                                d * sc,
-                                min * mi
-                            );
+                            dot += sub_block_contrib!(a, a_base + 32, hi_bytes, d * sc, min * mi);
 
                             a_base += 64;
                             is += 2;
@@ -270,10 +253,7 @@ pub(crate) mod neon {
                         let scale = crate::f16_to_f32(b_row[b_pos], b_row[b_pos + 1]);
 
                         let qs8 = vreinterpretq_s8_u8(vld1q_u8(b_row.as_ptr().add(b_pos + 2)));
-                        let halves = [
-                            vmovl_s8(vget_low_s8(qs8)),
-                            vmovl_s8(vget_high_s8(qs8)),
-                        ];
+                        let halves = [vmovl_s8(vget_low_s8(qs8)), vmovl_s8(vget_high_s8(qs8))];
                         let mut acc = vdupq_n_f32(0.0);
                         for (half, q16) in halves.iter().enumerate() {
                             let quarters = [
@@ -281,8 +261,7 @@ pub(crate) mod neon {
                                 vmovl_s16(vget_high_s16(*q16)),
                             ];
                             for (quarter, q32) in quarters.iter().enumerate() {
-                                let av =
-                                    vld1q_f32(a.as_ptr().add(a_pos + half * 16 + quarter * 4));
+                                let av = vld1q_f32(a.as_ptr().add(a_pos + half * 16 + quarter * 4));
                                 acc = vmlaq_f32(acc, av, vcvtq_f32_s32(*q32));
                             }
                         }

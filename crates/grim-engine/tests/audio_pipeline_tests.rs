@@ -14,5 +14,8 @@ fn test_audio_pipeline_full_synthesis() {
     let tokens = vec![1, 15, 23, 42, 88];
     let audio_samples = pipe.generate(&tokens, None).unwrap();
 
-    assert!(!audio_samples.is_empty(), "synthesized audio waveform must contain samples");
+    assert!(
+        !audio_samples.is_empty(),
+        "synthesized audio waveform must contain samples"
+    );
 }

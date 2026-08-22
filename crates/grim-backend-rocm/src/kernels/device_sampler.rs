@@ -267,8 +267,8 @@ use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::{ArithType, Error, Shape};
 
 use crate::{
-    HipDim3, HipMemcpyKind, RocmDevice, RocmStorage, arg, check_hip, dev_ptr,
-    hipMemcpyAsync, hipStreamSynchronize,
+    HipDim3, HipMemcpyKind, RocmDevice, RocmStorage, arg, check_hip, dev_ptr, hipMemcpyAsync,
+    hipStreamSynchronize,
 };
 use grim_tensor::error::Result;
 
@@ -356,12 +356,7 @@ fn sample_impl(
 
 /// Validate shape/vocab and return the device pointer, or `None` when the
 /// caller must fall back to CPU sampling (`Ok(None)` contract).
-fn validate_input(
-    logits: &RocmStorage,
-    vocab: usize,
-    temperature: f32,
-    top_p: f32,
-) -> Option<u64> {
+fn validate_input(logits: &RocmStorage, vocab: usize, temperature: f32, top_p: f32) -> Option<u64> {
     if vocab == 0 || vocab > MAX_DEVICE_SAMPLER_VOCAB {
         return None;
     }

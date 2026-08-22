@@ -358,7 +358,7 @@ fn qkv_attention_reference_chunked_prefill() {
     );
     // Row 0 (the latest pre-bound row) must be unchanged by K[5].
     for d in 0..head_dim {
-        let i = (0_usize * num_heads + head) * head_dim + d;
+        let i = head * head_dim + d;
         assert!(
             (got[i] - got2[i]).abs() < 1e-5,
             "row 0 must not depend on K[5] when cache_offset=4 (causal bound j<=4); got delta={}",

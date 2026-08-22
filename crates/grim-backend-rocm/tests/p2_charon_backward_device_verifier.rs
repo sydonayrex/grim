@@ -94,8 +94,8 @@ fn flat_expert_weights() -> FlatWeights {
 fn well_separated_router_gate() -> Vec<f32> {
     let mut gw = vec![0.0f32; NUM_EXPERTS * HIDDEN];
     for i in 0..HIDDEN {
-        gw[0 * HIDDEN + i] = 2.0 + 0.1 * i as f32;
-        gw[1 * HIDDEN + i] = -2.0 - 0.1 * i as f32;
+        gw[i] = 2.0 + 0.1 * i as f32;
+        gw[HIDDEN + i] = -2.0 - 0.1 * i as f32;
     }
     gw
 }

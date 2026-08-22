@@ -3,7 +3,6 @@
 //! Orchestrates draft token generation, target model verification, and device-side
 //! rejection sampling with minimal host-GPU synchronization.
 
-
 /// Configuration for the Speculative Decoding Engine.
 #[derive(Debug, Clone)]
 pub struct SpeculativeLoopConfig {

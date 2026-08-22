@@ -9,7 +9,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, DType, QuantProvenance, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -264,8 +264,7 @@ impl DeepSeek2Mla {
         let mut latent_new = vec![0.0f32; seq_len * (rank + rope_d)];
         for s in 0..seq_len {
             let dst = s * (rank + rope_d);
-            latent_new[dst..dst + rank]
-                .copy_from_slice(&kv_a_normed_v[s * rank..(s + 1) * rank]);
+            latent_new[dst..dst + rank].copy_from_slice(&kv_a_normed_v[s * rank..(s + 1) * rank]);
             latent_new[dst + rank..dst + rank + rope_d]
                 .copy_from_slice(&k_rope_v[s * rope_d..(s + 1) * rope_d]);
         }
@@ -283,7 +282,10 @@ impl DeepSeek2Mla {
         };
         let total_kv_len = latent_all_v.len() / (rank + rope_d);
         *kv_cache = Some((
-            cpu_tensor(latent_all_v.clone(), Shape::new(vec![total_kv_len, rank + rope_d])),
+            cpu_tensor(
+                latent_all_v.clone(),
+                Shape::new(vec![total_kv_len, rank + rope_d]),
+            ),
             cpu_tensor(Vec::new(), Shape::new(vec![0, 0])),
         ));
 
@@ -353,8 +355,11 @@ impl DeepSeek2Mla {
 
                 for d in 0..vd {
                     let wrow = &self.w_vc[(h * vd + d) * rank..(h * vd + d + 1) * rank];
-                    attn_out[(s * nh + h) * vd + d] =
-                        attn_latent.iter().zip(wrow.iter()).map(|(a, b)| a * b).sum();
+                    attn_out[(s * nh + h) * vd + d] = attn_latent
+                        .iter()
+                        .zip(wrow.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
                 }
             }
         }
@@ -866,10 +871,7 @@ mod tests {
 
                 let mut attn_latent = vec![0.0f32; rank];
                 for t in 0..=causal_limit {
-                    for (o, l) in attn_latent
-                        .iter_mut()
-                        .zip(&c_kv[t * rank..(t + 1) * rank])
-                    {
+                    for (o, l) in attn_latent.iter_mut().zip(&c_kv[t * rank..(t + 1) * rank]) {
                         *o += weights[t] * l;
                     }
                 }
@@ -903,8 +905,10 @@ mod tests {
                 }
                 let mx_old = scores_old.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum_old: f32 = scores_old.iter().map(|v| (v - mx_old).exp()).sum();
-                let weights_old: Vec<f32> =
-                    scores_old.iter().map(|v| (v - mx_old).exp() / sum_old).collect();
+                let weights_old: Vec<f32> = scores_old
+                    .iter()
+                    .map(|v| (v - mx_old).exp() / sum_old)
+                    .collect();
 
                 for d in 0..vd {
                     let mut acc = 0.0f32;

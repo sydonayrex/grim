@@ -86,7 +86,9 @@ impl ConsumerFsdpGroup {
         let sharded_len = local_shard.len();
         let total_len = full_shape.elem_count();
         if sharded_len * self.config.world_size < total_len {
-            return Err(Error::Shape("Local shard too small for world_size reconstitution".into()));
+            return Err(Error::Shape(
+                "Local shard too small for world_size reconstitution".into(),
+            ));
         }
         let mut full_buffer = vec![0.0f32; total_len];
         let offset = self.config.rank * sharded_len;
@@ -97,11 +99,17 @@ impl ConsumerFsdpGroup {
     }
 
     /// Reduce and scatter full gradient tensor so each rank retains only its local shard.
-    pub fn execute_reduce_scatter(&self, full_grad: &[f32], sharded_shape: &Shape) -> Result<Vec<f32>> {
+    pub fn execute_reduce_scatter(
+        &self,
+        full_grad: &[f32],
+        sharded_shape: &Shape,
+    ) -> Result<Vec<f32>> {
         let shard_len = sharded_shape.elem_count();
         let offset = self.config.rank * shard_len;
         if offset + shard_len > full_grad.len() {
-            return Err(Error::Shape("Full grad buffer too small for rank shard".into()));
+            return Err(Error::Shape(
+                "Full grad buffer too small for rank shard".into(),
+            ));
         }
         let mut shard = vec![0.0f32; shard_len];
         shard.copy_from_slice(&full_grad[offset..offset + shard_len]);

@@ -2283,7 +2283,7 @@ mod tests {
         // V: position 0 carries a dominant value; all others near-zero. If the
         // window excludes position 0, it must not appear in the output.
         let mut v_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
-        v_data[0 * head_dim + 0] = 1000.0;
+        v_data[0] = 1000.0;
         let v = dev
             .from_cpu(
                 &v_data,

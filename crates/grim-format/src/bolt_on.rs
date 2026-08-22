@@ -757,14 +757,20 @@ pub fn overwrite_tensor_f32(grim_path: &Path, tensor_name: &str, values: &[f32])
         .ok_or_else(|| Error::Backend(format!("tensor {} not found in .grim file", tensor_name)))?;
     let entry = &src.tensors[idx];
     let src_ext = src.metadata.get_tensor_ext(tensor_name).ok_or_else(|| {
-        Error::Backend(format!("tensor {} has no GrimTensorExt metadata", tensor_name))
+        Error::Backend(format!(
+            "tensor {} has no GrimTensorExt metadata",
+            tensor_name
+        ))
     })?;
 
     let row_count = src_ext.row_count.max(1) as usize;
     let row_stride = src_ext.row_stride as usize;
     let default_bpw = src_ext.default_bpw.clamp(2, 8);
     if row_stride == 0 {
-        return Err(Error::Backend(format!("tensor {} row_stride is zero", tensor_name)));
+        return Err(Error::Backend(format!(
+            "tensor {} row_stride is zero",
+            tensor_name
+        )));
     }
     if values.len() != row_count * row_stride {
         return Err(Error::Backend(format!(
@@ -810,7 +816,11 @@ pub fn overwrite_tensor_f32(grim_path: &Path, tensor_name: &str, values: &[f32])
     let new_payload_size = (new_codes.len() + new_scales.len()) as u64;
 
     let mut new_meta = src.metadata.clone();
-    if let Some(ext) = new_meta.ext_entries.iter_mut().find(|e| e.tensor_name == tensor_name) {
+    if let Some(ext) = new_meta
+        .ext_entries
+        .iter_mut()
+        .find(|e| e.tensor_name == tensor_name)
+    {
         ext.gptq_ordered = 0;
         ext.backup1 = BackupLayer::default();
         ext.backup2 = BackupLayer::default();
@@ -890,4 +900,3 @@ pub fn overwrite_tensor_f32(grim_path: &Path, tensor_name: &str, values: &[f32])
     }
     result
 }
-

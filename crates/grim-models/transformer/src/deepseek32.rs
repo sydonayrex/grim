@@ -9,7 +9,7 @@ use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, DType, QuantProvenance, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -308,8 +308,7 @@ impl DeepSeek32Mla {
         let mut latent_new = vec![0.0f32; seq_len * (rank + rope_d)];
         for s in 0..seq_len {
             let dst = s * (rank + rope_d);
-            latent_new[dst..dst + rank]
-                .copy_from_slice(&kv_a_normed_v[s * rank..(s + 1) * rank]);
+            latent_new[dst..dst + rank].copy_from_slice(&kv_a_normed_v[s * rank..(s + 1) * rank]);
             latent_new[dst + rank..dst + rank + rope_d]
                 .copy_from_slice(&k_rope_v[s * rope_d..(s + 1) * rope_d]);
         }
@@ -327,7 +326,10 @@ impl DeepSeek32Mla {
         };
         let total_kv_len = latent_all_v.len() / (rank + rope_d);
         *kv_cache = Some((
-            cpu_tensor(latent_all_v.clone(), Shape::new(vec![total_kv_len, rank + rope_d])),
+            cpu_tensor(
+                latent_all_v.clone(),
+                Shape::new(vec![total_kv_len, rank + rope_d]),
+            ),
             cpu_tensor(Vec::new(), Shape::new(vec![0, 0])),
         ));
 
@@ -397,8 +399,11 @@ impl DeepSeek32Mla {
 
                 for d in 0..vd {
                     let wrow = &self.w_vc[(h * vd + d) * rank..(h * vd + d + 1) * rank];
-                    attn_out[(s * nh + h) * vd + d] =
-                        attn_latent.iter().zip(wrow.iter()).map(|(a, b)| a * b).sum();
+                    attn_out[(s * nh + h) * vd + d] = attn_latent
+                        .iter()
+                        .zip(wrow.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
                 }
             }
         }

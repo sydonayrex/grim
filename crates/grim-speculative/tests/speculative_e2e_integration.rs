@@ -7,13 +7,12 @@
 //! - Mamba state checkpointing and rollback upon speculative candidate rejection
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::session::Inner;
 use grim_core::CausalLm;
+use grim_core::session::Inner;
 use grim_models_transformer::{Llama, LlamaConfig};
 use grim_speculative::{
-    ConfidenceScheduler, DraftBackbone, MambaSpeculativeEngine, MarkovHead,
-    SpeculationConfig, SpeculativeCausalLm, Strategy, ThroughputProfile,
-    TinyDraftBackbone, UniformMarkovHead,
+    ConfidenceScheduler, DraftBackbone, MambaSpeculativeEngine, MarkovHead, SpeculationConfig,
+    SpeculativeCausalLm, Strategy, ThroughputProfile, TinyDraftBackbone, UniformMarkovHead,
 };
 use grim_tensor::{Device, Shape};
 
@@ -44,7 +43,9 @@ fn test_speculative_causal_lm_plain_forward_and_telemetry() {
     let mut session = Inner::new(Device::Cpu);
     let input = cpu_tensor(vec![10.0f32, 20.0f32], Shape::new(vec![1, 2]));
     let positions = cpu_tensor(vec![0.0f32, 1.0f32], Shape::new(vec![1, 2]));
-    let logits = spec_model.forward(&mut session, &input, &positions, &[]).unwrap();
+    let logits = spec_model
+        .forward(&mut session, &input, &positions, &[])
+        .unwrap();
     assert_eq!(logits.shape().dims(), &[2, 1000]);
 }
 
@@ -73,13 +74,19 @@ fn test_confidence_scheduler_dynamic_block_length_and_adaptation() {
 
     // 2. Fully saturated GPU (1.0) under extreme load -> minimal verify length
     let verify_busy = scheduler.choose_verify_len(&draft_block, 1.0, 1000);
-    assert_eq!(verify_busy, 1, "Saturated GPU should clamp to minimum verify len");
+    assert_eq!(
+        verify_busy, 1,
+        "Saturated GPU should clamp to minimum verify len"
+    );
 
     // 3. Record acceptance telemetry and verify adaptation trigger
     for _ in 0..15 {
         scheduler.record_acceptance(1, 5); // 20% acceptance rate < 30% threshold
     }
-    assert!(scheduler.should_adapt_draft(), "Drift below acceptance floor should trigger adaptation");
+    assert!(
+        scheduler.should_adapt_draft(),
+        "Drift below acceptance floor should trigger adaptation"
+    );
 }
 
 #[test]

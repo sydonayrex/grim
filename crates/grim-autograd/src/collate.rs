@@ -342,9 +342,9 @@ mod tests {
 
         let mask = packed.attention_mask.to_vec_f32().unwrap();
         // Token 0 can attend to 0 (seq 0)
-        assert_eq!(mask[0 * 5 + 0], 1.0);
+        assert_eq!(mask[0], 1.0);
         // Token 3 (start of seq 1) CANNOT attend to token 0, 1, 2 (seq 0)
-        assert_eq!(mask[3 * 5 + 0], 0.0);
+        assert_eq!(mask[3 * 5], 0.0);
         assert_eq!(mask[3 * 5 + 1], 0.0);
         assert_eq!(mask[3 * 5 + 2], 0.0);
         // Token 3 can attend to token 3

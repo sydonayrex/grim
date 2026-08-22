@@ -106,10 +106,7 @@ fn parse_flat_yaml(text: &str) -> HashMap<String, String> {
             folding = true;
             map.insert(full_key.clone(), String::new());
         } else {
-            let v = value
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string();
+            let v = value.trim_matches('"').trim_matches('\'').to_string();
             map.insert(full_key, v);
         }
     }
@@ -160,10 +157,7 @@ pub fn load_recipe(path: &std::path::Path) -> Result<Recipe> {
             logging_steps: get_or(&m, "training.logging_steps", default_logging_steps()),
             max_grad_norm: get_or(&m, "training.max_grad_norm", default_max_grad_norm()),
             optimizer: get(&m, "training.optimizer")?.to_string(),
-            scheduler: m
-                .get("training.scheduler")
-                .cloned()
-                .unwrap_or_default(),
+            scheduler: m.get("training.scheduler").cloned().unwrap_or_default(),
             early_stopping_patience: get_or(&m, "training.early_stopping_patience", 0),
         },
         adapter_output: get(&m, "adapter_output")?.to_string(),
@@ -182,12 +176,8 @@ pub fn load_recipe(path: &std::path::Path) -> Result<Recipe> {
 /// when the entry pins one, return the file path.
 pub fn resolve_dataset(registry_id: &str) -> Result<std::path::PathBuf> {
     let registry_path = workspace_root().join("data/dataset_info.json");
-    let text = std::fs::read_to_string(&registry_path).map_err(|e| {
-        Error::Config(format!(
-            "dataset registry {}: {e}",
-            registry_path.display()
-        ))
-    })?;
+    let text = std::fs::read_to_string(&registry_path)
+        .map_err(|e| Error::Config(format!("dataset registry {}: {e}", registry_path.display())))?;
     let reg: std::collections::HashMap<String, DatasetEntry> =
         serde_json::from_str(&text).map_err(|e| Error::Config(format!("registry json: {e}")))?;
     let entry = reg
@@ -236,7 +226,8 @@ fn workspace_root() -> std::path::PathBuf {
 /// SHA-256 of a file as lowercase hex. Uses a small pure-Rust implementation
 /// to avoid adding a crypto dependency for this one hash.
 fn sha256_hex_file(path: &std::path::Path) -> Result<String> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
     Ok(sha256_hex(&bytes))
 }
 

@@ -1406,7 +1406,7 @@ mod tests {
     fn outlier_encode_decode_round_trip() {
         let o = GrimOutlier {
             index: 12345,
-            value: 3.14,
+            value: std::f32::consts::PI,
         };
         let encoded = o.encode();
         assert_eq!(encoded.len(), OUTLIER_RECORD_BYTES);

@@ -1282,7 +1282,11 @@ fn load_model_from_config(
                 n_embd_out: 0,
                 // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (escape hatch: GRIM_LFM2_MXFP4_QKV=0/false/off)
                 mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
-                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+                    .map(|v| {
+                        v != "0"
+                            && !v.eq_ignore_ascii_case("false")
+                            && !v.eq_ignore_ascii_case("off")
+                    })
                     .unwrap_or(true),
             };
 
@@ -2822,7 +2826,11 @@ fn load_model_with_providers(
                 n_embd_out: 0,
                 // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (escape hatch: GRIM_LFM2_MXFP4_QKV=0/false/off)
                 mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
-                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+                    .map(|v| {
+                        v != "0"
+                            && !v.eq_ignore_ascii_case("false")
+                            && !v.eq_ignore_ascii_case("off")
+                    })
                     .unwrap_or(true),
             };
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
@@ -2915,14 +2923,10 @@ fn load_model_with_providers(
                 .or_else(|| lookup.get_f32("alibi.bias_max"))
                 .is_some()
             {
-                eprintln!(
-                    "[grim] enabling ALiBi on {} blocks",
-                    m.layers.len()
-                );
+                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
                 for layer in m.layers.iter_mut() {
                     *layer = std::mem::replace(layer, layer.clone()).with_alibi();
                 }
-
             }
             Ok(Box::new(m))
         }
@@ -3590,14 +3594,10 @@ fn load_model_with_providers(
                 .or_else(|| lookup.get_f32("alibi.bias_max"))
                 .is_some()
             {
-                eprintln!(
-                    "[grim] enabling ALiBi on {} blocks",
-                    m.layers.len()
-                );
+                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
                 for layer in m.layers.iter_mut() {
                     *layer = std::mem::replace(layer, layer.clone()).with_alibi();
                 }
-
             }
             Ok(Box::new(m))
         }
@@ -3905,7 +3905,10 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
 }
 
 /// Load an EAGLE3 speculative drafter model from a safetensors checkpoint.
-pub fn load_eagle3_from_path(path: &str, device: Device) -> Result<std::sync::Arc<grim_models_transformer::Eagle3>> {
+pub fn load_eagle3_from_path(
+    path: &str,
+    device: Device,
+) -> Result<std::sync::Arc<grim_models_transformer::Eagle3>> {
     let tp = resolve_tp_config()?;
     let tprov = SafetensorsProvider::open(path)?;
     let ws = WeightSource::root(&tprov, device.clone()).with_tp_config(tp);

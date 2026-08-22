@@ -12,9 +12,7 @@ use grim_tensor::{DType, Device, Shape, Tensor};
 /// MoE resident-set HBM budget (`rocm_kernel_plan.md` WI-C).
 pub mod moe_budget;
 
-pub use moe_budget::{
-    ElasticMoEAllocation, LruResidencyTracker, MoeResidentBudget, ResidentTier,
-};
+pub use moe_budget::{ElasticMoEAllocation, LruResidencyTracker, MoeResidentBudget, ResidentTier};
 
 /// Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
 pub mod radix;
@@ -270,7 +268,8 @@ impl KvBlockPool {
                     last_anchor_offset,
                     layer_states,
                 );
-                self.prefix_tree.attach_recurrent_state(target_block_id, target_block_id);
+                self.prefix_tree
+                    .attach_recurrent_state(target_block_id, target_block_id);
             }
         }
     }
@@ -592,7 +591,11 @@ impl KvBlockPool {
         } else if new_capacity < cur_cap {
             // Reclaim unreferenced blocks from the free list
             while self.blocks.len() > new_capacity {
-                if let Some(pos) = self.free_list.iter().position(|&id| id == self.blocks.len() - 1) {
+                if let Some(pos) = self
+                    .free_list
+                    .iter()
+                    .position(|&id| id == self.blocks.len() - 1)
+                {
                     self.free_list.remove(pos);
                     self.blocks.pop();
                 } else {
@@ -634,7 +637,9 @@ impl KvBlockPool {
         }
         let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
         if self.blocks[id].layer_keys.len() <= layer {
-            self.blocks[id].layer_keys.resize_with(layer + 1, || vec![0.0; block_elem]);
+            self.blocks[id]
+                .layer_keys
+                .resize_with(layer + 1, || vec![0.0; block_elem]);
         }
         let len = keys.len().min(block_elem);
         self.blocks[id].layer_keys[layer][..len].copy_from_slice(&keys[..len]);
@@ -654,7 +659,9 @@ impl KvBlockPool {
         }
         let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
         if self.blocks[id].layer_values.len() <= layer {
-            self.blocks[id].layer_values.resize_with(layer + 1, || vec![0.0; block_elem]);
+            self.blocks[id]
+                .layer_values
+                .resize_with(layer + 1, || vec![0.0; block_elem]);
         }
         let len = values.len().min(block_elem);
         self.blocks[id].layer_values[layer][..len].copy_from_slice(&values[..len]);
@@ -875,7 +882,13 @@ pub struct PagedKvCache {
 #[derive(Default)]
 pub struct DeviceKvMirror {
     /// (layer, physical block) → device-resident (K, V) storage.
-    pub blocks: HashMap<(usize, usize), (Arc<dyn grim_tensor::BackendStorage>, Arc<dyn grim_tensor::BackendStorage>)>,
+    pub blocks: HashMap<
+        (usize, usize),
+        (
+            Arc<dyn grim_tensor::BackendStorage>,
+            Arc<dyn grim_tensor::BackendStorage>,
+        ),
+    >,
     /// Blocks whose host pages changed since their last device upload.
     pub dirty: std::collections::BTreeSet<(usize, usize)>,
     /// Total host→device block uploads performed (ITL gate metric).
@@ -889,8 +902,18 @@ impl PagedKvCache {
     /// uploaded elements, pending dirty count).
     pub fn mirror_stats(&self) -> (u64, u64, u64, usize) {
         let m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
-        let unique = m.blocks.keys().copied().collect::<std::collections::HashSet<_>>().len();
-        (m.total_uploads, unique as u64, m.uploaded_elems, m.dirty.len())
+        let unique = m
+            .blocks
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        (
+            m.total_uploads,
+            unique as u64,
+            m.uploaded_elems,
+            m.dirty.len(),
+        )
     }
 
     pub fn new(
@@ -970,7 +993,10 @@ impl PagedKvCache {
         let start = block_id * block_elems;
         let end = start + block_elems;
         if end <= self.k_pages[layer].len() && end <= self.v_pages[layer].len() {
-            Some((&self.k_pages[layer][start..end], &self.v_pages[layer][start..end]))
+            Some((
+                &self.k_pages[layer][start..end],
+                &self.v_pages[layer][start..end],
+            ))
         } else {
             None
         }
@@ -1195,29 +1221,29 @@ impl KvCache for PagedKvCache {
             .next()
             .is_some();
         if !layer_dirty {
-        if let (Some(dev_enum), Some(Some(k_storage)), Some(Some(v_storage))) = (
-            self.device.as_ref(),
-            self.gpu_paged_k.get(layer),
-            self.gpu_paged_v.get(layer),
-        ) {
-            return Some((
-                Tensor::new(
-                    k_storage.clone(),
-                    Shape::new(dims.clone()),
-                    DType::F32,
-                    grim_tensor::QuantProvenance::default(),
-                    dev_enum.clone(),
-                ),
-                Tensor::new(
-                    v_storage.clone(),
-                    Shape::new(dims),
-                    DType::F32,
-                    grim_tensor::QuantProvenance::default(),
-                    dev_enum.clone(),
-                ),
-                self.page_size,
-            ));
-        }
+            if let (Some(dev_enum), Some(Some(k_storage)), Some(Some(v_storage))) = (
+                self.device.as_ref(),
+                self.gpu_paged_k.get(layer),
+                self.gpu_paged_v.get(layer),
+            ) {
+                return Some((
+                    Tensor::new(
+                        k_storage.clone(),
+                        Shape::new(dims.clone()),
+                        DType::F32,
+                        grim_tensor::QuantProvenance::default(),
+                        dev_enum.clone(),
+                    ),
+                    Tensor::new(
+                        v_storage.clone(),
+                        Shape::new(dims),
+                        DType::F32,
+                        grim_tensor::QuantProvenance::default(),
+                        dev_enum.clone(),
+                    ),
+                    self.page_size,
+                ));
+            }
         } // F10: end !layer_dirty fast path
 
         if let (Some(dev), Some(dev_enum)) = (self.backend.as_ref(), self.device.as_ref()) {
@@ -1240,8 +1266,7 @@ impl KvCache for PagedKvCache {
                     .collect();
                 for &b in dirty_here.iter() {
                     let off = b * self.page_size * stride;
-                    let take =
-                        |page: &Vec<f32>| page[off..off + self.page_size * stride].to_vec();
+                    let take = |page: &Vec<f32>| page[off..off + self.page_size * stride].to_vec();
                     if let (Ok(ks), Ok(vs)) = (
                         dev.from_cpu(
                             &take(&self.k_pages[layer]),
@@ -1311,7 +1336,6 @@ impl KvCache for PagedKvCache {
         self.k_pages.len()
     }
 
-
     fn layer_block_slice(&self, layer: usize, block_id: usize) -> Option<(&[f32], &[f32])> {
         if layer >= self.k_pages.len() || layer >= self.v_pages.len() {
             return None;
@@ -1321,13 +1345,22 @@ impl KvCache for PagedKvCache {
         let start = block_id * block_elems;
         let end = start + block_elems;
         if end <= self.k_pages[layer].len() && end <= self.v_pages[layer].len() {
-            Some((&self.k_pages[layer][start..end], &self.v_pages[layer][start..end]))
+            Some((
+                &self.k_pages[layer][start..end],
+                &self.v_pages[layer][start..end],
+            ))
         } else {
             None
         }
     }
 
-    fn write_layer_block(&mut self, layer: usize, block_id: usize, k: &[f32], v: &[f32]) -> Result<()> {
+    fn write_layer_block(
+        &mut self,
+        layer: usize,
+        block_id: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<()> {
         let stride = if layer < self.k_pages.len() && !self.k_pages[layer].is_empty() {
             self.k_pages[layer].len() / (self.capacity * self.page_size)
         } else {
@@ -1732,7 +1765,11 @@ mod f10_mirror_tests {
         append(&mut kv, 4, 2.0);
         kv.paged_kv_handles(0).unwrap();
         let (up1, uniq1, _, _) = kv.mirror_stats();
-        assert_eq!((up1, uniq1), (2, 2), "block 1 uploads once; block 0 untouched");
+        assert_eq!(
+            (up1, uniq1),
+            (2, 2),
+            "block 1 uploads once; block 0 untouched"
+        );
 
         // Steps 3-6: single-token decode appends into tail block 1 → only the
         // tail refreshes; sealed block 0 never re-uploads.
@@ -1756,4 +1793,3 @@ mod f10_mirror_tests {
         let _ = elems;
     }
 }
-

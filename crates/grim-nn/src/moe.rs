@@ -2062,10 +2062,10 @@ mod tests {
         //   expert0 -> high, expert2 -> high, expert1 low, expert3 lowest.
         // softmax([3,0.1,2,-1]) top-2 = {0, 2}.
         let mut gate_w = vec![0.0f32; n * hidden];
-        gate_w[0 * hidden + 0] = 3.0; // expert 0 gate logit
-        gate_w[1 * hidden + 0] = 0.1; // expert 1
-        gate_w[2 * hidden + 0] = 2.0; // expert 2
-        gate_w[3 * hidden + 0] = -1.0; // expert 3
+        gate_w[0] = 3.0; // expert 0 gate logit
+        gate_w[hidden] = 0.1; // expert 1
+        gate_w[2 * hidden] = 2.0; // expert 2
+        gate_w[3 * hidden] = -1.0; // expert 3
         let gate = Linear::from_tensor(cpu_tensor(gate_w, Shape::new(vec![n, hidden])), None);
 
         let mut eg = Vec::new();
@@ -2643,9 +2643,18 @@ mod tests {
         let num_experts = 4;
         let top_k = 2;
 
-        let gate_weight = cpu_tensor(vec![0.1; hidden * num_experts], Shape::new(vec![num_experts, hidden]));
+        let gate_weight = cpu_tensor(
+            vec![0.1; hidden * num_experts],
+            Shape::new(vec![num_experts, hidden]),
+        );
         let gate_linear = Linear::from_tensor(gate_weight, None);
-        let router = MoeRouter::new(gate_linear, RouterKind::SoftmaxTopK, top_k, num_experts, None);
+        let router = MoeRouter::new(
+            gate_linear,
+            RouterKind::SoftmaxTopK,
+            top_k,
+            num_experts,
+            None,
+        );
 
         let mut gate_layers = Vec::new();
         let mut up_layers = Vec::new();
@@ -2653,9 +2662,18 @@ mod tests {
 
         for e in 0..num_experts {
             let val = (e + 1) as f32 * 0.05;
-            gate_layers.push(Linear::from_tensor(cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])), None));
-            up_layers.push(Linear::from_tensor(cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])), None));
-            down_layers.push(Linear::from_tensor(cpu_tensor(vec![val; hidden * inter], Shape::new(vec![hidden, inter])), None));
+            gate_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])),
+                None,
+            ));
+            up_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])),
+                None,
+            ));
+            down_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; hidden * inter], Shape::new(vec![hidden, inter])),
+                None,
+            ));
         }
 
         let experts = ExpertBank {

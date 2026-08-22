@@ -105,7 +105,13 @@ pub trait KvCache: Send {
     }
 
     /// Write raw key and value slices directly into a physical block for a layer (e.g. for disagg network ingestion).
-    fn write_layer_block(&mut self, _layer: usize, _block_id: usize, _k: &[f32], _v: &[f32]) -> Result<()> {
+    fn write_layer_block(
+        &mut self,
+        _layer: usize,
+        _block_id: usize,
+        _k: &[f32],
+        _v: &[f32],
+    ) -> Result<()> {
         Ok(())
     }
 }

@@ -118,7 +118,10 @@ struct PerLayerScythe<'a> {
 /// `routes: vec![route_link]`); the all-reduce is a step-level collective,
 /// not a layer operation, so we take the modal link across layers and expand
 /// it to the full K×K matrix shape used by the no-controller fallback.
-fn step_routes_from_layers(placements: &[grim_tensor::backend::ScythePlacement], k: usize) -> Vec<ScytheLink> {
+fn step_routes_from_layers(
+    placements: &[grim_tensor::backend::ScythePlacement],
+    k: usize,
+) -> Vec<ScytheLink> {
     let mut peer = 0usize;
     let mut pcie = 0usize;
     let mut host = 0usize;
@@ -1127,7 +1130,9 @@ fn run_rank_sft_forward(
     for layer_idx in 0..hparams.num_layers {
         if let Some(ctx) = scythe.as_mut() {
             let shape: Vec<usize> = curr_x.shape().dims().to_vec();
-            let placement = ctx.ctrl.decide(layer_idx as u32, &shape, ctx.caps, ctx.links, 0);
+            let placement = ctx
+                .ctrl
+                .decide(layer_idx as u32, &shape, ctx.caps, ctx.links, 0);
             layer_placements.push(placement);
         }
         let (next_id, next_h) = streaming

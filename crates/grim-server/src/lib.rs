@@ -551,16 +551,17 @@ fn sample_next_token(
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             let has_active_constraint = sampler.name() == "constrained";
-            let device_token = if t.device().is_rocm() && !cpu_sampler_forced && !has_active_constraint {
-                match sample_on_device(&t, vocab_size, step) {
-                    Ok(Some(tok)) => Some(tok.min((vocab_size as u32).saturating_sub(1))),
-                    // Ok(None): unsupported shape/vocab -> CPU fallback contract.
-                    Ok(None) => None,
-                    Err(_e) => None,
-                }
-            } else {
-                None
-            };
+            let device_token =
+                if t.device().is_rocm() && !cpu_sampler_forced && !has_active_constraint {
+                    match sample_on_device(&t, vocab_size, step) {
+                        Ok(Some(tok)) => Some(tok.min((vocab_size as u32).saturating_sub(1))),
+                        // Ok(None): unsupported shape/vocab -> CPU fallback contract.
+                        Ok(None) => None,
+                        Err(_e) => None,
+                    }
+                } else {
+                    None
+                };
             match device_token {
                 Some(tok) => tok,
                 None => cpu_sample_fallback(&t, sampler, vocab_size, &history)?,
@@ -2537,7 +2538,9 @@ async fn audio_transcriptions(
     body: axum::body::Bytes,
 ) -> Response {
     let audio_guard = AUDIO_MODELS.lock().unwrap_or_else(|e| e.into_inner());
-    let whisper_model = audio_guard.values().find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
+    let whisper_model = audio_guard
+        .values()
+        .find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
 
     if let Some(whisper) = whisper_model {
         let pcm_samples = if !body.is_empty() {
@@ -2607,7 +2610,9 @@ async fn audio_translations(
     body: axum::body::Bytes,
 ) -> Response {
     let audio_guard = AUDIO_MODELS.lock().unwrap_or_else(|e| e.into_inner());
-    let whisper_model = audio_guard.values().find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
+    let whisper_model = audio_guard
+        .values()
+        .find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
 
     if let Some(whisper) = whisper_model {
         let pcm_samples = if !body.is_empty() {
@@ -4600,46 +4605,49 @@ pub fn build_router_with_auth(state: Arc<AppState>, api_keys: Vec<String>) -> Ro
         // and dashboards poll this instead of guessing ports.
         .route("/scheduler", get(get_status))
         .route("/api/scheduler", get(get_status));
-        let router = if api_keys.is_empty() {
-            router
-        } else {
-            let keys: std::sync::Arc<[String]> = api_keys.into();
-            router.layer(axum::middleware::from_fn(
-                move |req: axum::extract::Request, next: axum::middleware::Next| {
-                    let keys = keys.clone();
-                    async move {
-                        let path = req.uri().path();
-                        if !AUTH_EXEMPT_PATHS.contains(&path) {
-                            let authorized = req
-                                .headers()
-                                .get(axum::http::header::AUTHORIZATION)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|h| h.strip_prefix("Bearer "))
-                                .map(|k| keys.iter().any(|allowed| allowed == k))
-                                .unwrap_or(false);
-                            if !authorized {
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"grim\"")],
-                                    Json(serde_json::json!({
-                                        "error": {
-                                            "message": "Missing or invalid API key.",
-                                            "type": "invalid_request_error",
-                                            "code": "invalid_api_key"
-                                        }
-                                    })),
-                                )
-                                    .into_response();
-                            }
-                        }
-                        next.run(req).await
-                    }
-                },
-            ))
-        };
+    let router = if api_keys.is_empty() {
         router
-            .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
-            .with_state(state)
+    } else {
+        let keys: std::sync::Arc<[String]> = api_keys.into();
+        router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let keys = keys.clone();
+                async move {
+                    let path = req.uri().path();
+                    if !AUTH_EXEMPT_PATHS.contains(&path) {
+                        let authorized = req
+                            .headers()
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|h| h.strip_prefix("Bearer "))
+                            .map(|k| keys.iter().any(|allowed| allowed == k))
+                            .unwrap_or(false);
+                        if !authorized {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                [(
+                                    axum::http::header::WWW_AUTHENTICATE,
+                                    "Bearer realm=\"grim\"",
+                                )],
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "message": "Missing or invalid API key.",
+                                        "type": "invalid_request_error",
+                                        "code": "invalid_api_key"
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
+    };
+    router
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .with_state(state)
 }
 
 struct TlsConfig {
@@ -5000,7 +5008,9 @@ mod tests {
     #[tokio::test]
     async fn test_bearer_auth_rejects_without_key_and_exempts_health() {
         let state = Arc::new(AppState {
-            engine: Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default())),
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
             tokenizer: Mutex::new(None),
             model_path: None,
             model_arch: std::sync::Mutex::new(None),
@@ -5011,12 +5021,7 @@ mod tests {
         for path in ["/health", "/healthz", "/readyz", "/metrics"] {
             let res = app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_ne!(

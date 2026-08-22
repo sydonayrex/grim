@@ -92,7 +92,9 @@ pub struct MoeHybridExecutionPlan {
 impl MoeHybridExecutionPlan {
     /// Returns total number of active experts evaluated across GPU and CPU.
     pub fn total_active_experts(&self) -> usize {
-        self.gpu_resident_experts.len() + self.gpu_fill_experts.len() + self.cpu_compute_experts.len()
+        self.gpu_resident_experts.len()
+            + self.gpu_fill_experts.len()
+            + self.cpu_compute_experts.len()
     }
 
     /// Returns `true` if CPU co-execution is required for this step.

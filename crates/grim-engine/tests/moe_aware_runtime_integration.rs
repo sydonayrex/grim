@@ -11,10 +11,7 @@
 use grim_backend_cpu::PersistentMoeWorkerPool;
 use grim_backend_rocm::{MoeGraphSyncFlag, MoeHybridExecutor};
 use grim_format::{FtwDirectLoader, FtwHeader, FtwQuantFormat};
-use grim_memory::{
-    ElasticMoEAllocation, KvBlockPool, RecurrentLayerState,
-    SemanticAnchorRegistry,
-};
+use grim_memory::{ElasticMoEAllocation, KvBlockPool, RecurrentLayerState, SemanticAnchorRegistry};
 use grim_scheduler::BandwidthProfile;
 
 #[test]
@@ -50,7 +47,10 @@ fn test_moe_aware_semantic_anchor_and_prefix_caching_integration() {
     let (matched, count, checkpoint) = pool.match_prefix_with_recurrent(&prompt);
     assert_eq!(matched, vec![1, 2]);
     assert_eq!(count, 32);
-    assert!(checkpoint.is_some(), "Anchored checkpoint must be retrieved");
+    assert!(
+        checkpoint.is_some(),
+        "Anchored checkpoint must be retrieved"
+    );
     let cp = checkpoint.unwrap();
     assert_eq!(cp.token_offset, 17);
     assert_eq!(cp.layer_states.len(), 2);
@@ -73,7 +73,10 @@ fn test_moe_aware_bandwidth_policy_to_hybrid_execution_integration() {
     let plan = executor.plan_step(0, &routed, |e| e == 0);
 
     assert_eq!(plan.gpu_resident_experts, vec![0]);
-    assert_eq!(plan.gpu_fill_experts.len() + plan.cpu_compute_experts.len(), 3);
+    assert_eq!(
+        plan.gpu_fill_experts.len() + plan.cpu_compute_experts.len(),
+        3
+    );
     // m = 3 * 0.5 = 1.5 -> round to 2 GPU fills, 1 CPU compute
     assert_eq!(plan.gpu_fill_experts, vec![1, 2]);
     assert_eq!(plan.cpu_compute_experts, vec![3]);
@@ -144,13 +147,8 @@ fn test_moe_aware_elastic_safe_point_rebalance_integration() {
 
     let total_vram = 100 * block_bytes + 10 * 1024 * 1024;
     let slot_bytes = 1024 * 1024;
-    let mut elastic = ElasticMoEAllocation::new(
-        total_vram,
-        100 * block_bytes,
-        0,
-        slot_bytes,
-    )
-    .unwrap();
+    let mut elastic =
+        ElasticMoEAllocation::new(total_vram, 100 * block_bytes, 0, slot_bytes).unwrap();
     assert_eq!(elastic.max_expert_slots, 0);
 
     // Dynamic shift at scheduler safe point: allocate 10 expert slots (10MB) by reducing KV
@@ -176,7 +174,8 @@ fn test_moe_aware_ftw_direct_io_and_prefill_pipeline_integration() {
     let _pinned = loader.pin_all_banks();
 
     // 2. Prefill pipelining
-    let mut prefill_pipe = grim_engine::pipelines::MoePrefillPipeline::new(4, 8, 1024 * 1024, 4 * 1024 * 1024);
+    let mut prefill_pipe =
+        grim_engine::pipelines::MoePrefillPipeline::new(4, 8, 1024 * 1024, 4 * 1024 * 1024);
     assert!(prefill_pipe.double_buffering_enabled);
 
     let mut compute_layers = Vec::new();

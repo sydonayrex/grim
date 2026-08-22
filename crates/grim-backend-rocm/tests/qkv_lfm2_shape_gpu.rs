@@ -41,8 +41,8 @@ fn reference_attention(
             for d in 0..head_dim {
                 let mut acc = 0.0;
                 for (t2, &s) in scores.iter().enumerate() {
-                    acc += (s - mx).exp() / sum
-                        * v[t2 * num_kv_heads * head_dim + kvh * head_dim + d];
+                    acc +=
+                        (s - mx).exp() / sum * v[t2 * num_kv_heads * head_dim + kvh * head_dim + d];
                 }
                 out[t * num_heads * head_dim + h * head_dim + d] = acc;
             }
@@ -73,8 +73,12 @@ fn run_case(dev: &RocmDevice, label: &str, steps: usize, history: usize, offset:
     let q_shape = Shape::new(vec![1, steps * heads, dim]);
     let kv_shape = Shape::new(vec![1, history * kv_heads, dim]);
     let q_st = dev.from_cpu(&q, &q_shape, DType::F32).expect("q upload");
-    let k_st = dev.from_cpu(&k_full, &kv_shape, DType::F32).expect("k upload");
-    let v_st = dev.from_cpu(&v_full, &kv_shape, DType::F32).expect("v upload");
+    let k_st = dev
+        .from_cpu(&k_full, &kv_shape, DType::F32)
+        .expect("k upload");
+    let v_st = dev
+        .from_cpu(&v_full, &kv_shape, DType::F32)
+        .expect("v upload");
 
     let out_shape = Shape::new(vec![steps, heads, dim]);
     let res = dev.qkv_attention(
@@ -96,7 +100,9 @@ fn run_case(dev: &RocmDevice, label: &str, steps: usize, history: usize, offset:
             return false;
         }
     };
-    let want = reference_attention(&q, &k_full, &v_full, steps, history, heads, kv_heads, dim, offset);
+    let want = reference_attention(
+        &q, &k_full, &v_full, steps, history, heads, kv_heads, dim, offset,
+    );
     let max_diff = got
         .iter()
         .zip(&want)
@@ -132,30 +138,33 @@ fn qkv_attention_matches_reference_at_lfm2_shapes() {
     assert!(all_ok, "grim_qkv_attention diverges from scalar reference");
 }
 
-    // Sequential stress: 16 layers x mixed prefill/decode calls in one process,
-    // mirroring generation's call cadence. Detects cross-call state pollution.
-    #[test]
-    fn qkv_attention_survives_generation_cadence() {
-        if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
-            eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+// Sequential stress: 16 layers x mixed prefill/decode calls in one process,
+// mirroring generation's call cadence. Detects cross-call state pollution.
+#[test]
+fn qkv_attention_survives_generation_cadence() {
+    if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
+        eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+        return;
+    }
+    let dev = match RocmDevice::try_new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no device: {e}");
             return;
         }
-        let dev = match RocmDevice::try_new(0) {
-            Ok(d) => d,
-            Err(e) => { eprintln!("no device: {e}"); return; }
-        };
-        let mut all_ok = true;
-        for layer in 0..16 {
-            all_ok &= run_case(&dev, &format!("L{layer}-prefill"), 24, 24, 0);
-            for step in 1..4 {
-                all_ok &= run_case(
-                    &dev,
-                    &format!("L{layer}-decode{step}"),
-                    1,
-                    24 + step,
-                    24 + step - 1,
-                );
-            }
+    };
+    let mut all_ok = true;
+    for layer in 0..16 {
+        all_ok &= run_case(&dev, &format!("L{layer}-prefill"), 24, 24, 0);
+        for step in 1..4 {
+            all_ok &= run_case(
+                &dev,
+                &format!("L{layer}-decode{step}"),
+                1,
+                24 + step,
+                24 + step - 1,
+            );
         }
-        assert!(all_ok, "sequential cadence corrupted results");
     }
+    assert!(all_ok, "sequential cadence corrupted results");
+}

@@ -31,7 +31,9 @@ pub mod tiny_draft_backbone;
 pub mod uniform_markov_head;
 
 pub use confidence_head::ConfidenceHead;
-pub use confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, SpeculationDepthConfig, ThroughputProfile};
+pub use confidence_scheduler::{
+    ConfidenceScheduler, SpeculationConfig, SpeculationDepthConfig, ThroughputProfile,
+};
 pub use depth_tuner::{SpeculativeDepthPidConfig, SpeculativeDepthPidController};
 pub use distill::{compress_distill_report, train_speculative_draft};
 pub use draft_backbone::{DraftBackbone, DraftBlock};

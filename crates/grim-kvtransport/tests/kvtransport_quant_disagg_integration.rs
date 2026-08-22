@@ -6,12 +6,12 @@
 //! - NetworkKvClient & start_kv_receiver_server TCP socket streaming with multi-layer KV blocks
 //! - NvmeWeightStreamer sequential page streaming and memory-mapped reader integrity
 
+use grim_kvtransport::{
+    BlockId, CacheTier, KvBlockHeader, KvBlockStore, NetworkKvClient, NvmeWeightStreamer,
+    SharedSpillManager, start_kv_receiver_server,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use grim_kvtransport::{
-    BlockId, CacheTier, KvBlockHeader, KvBlockStore, NetworkKvClient,
-    NvmeWeightStreamer, SharedSpillManager, start_kv_receiver_server,
-};
 
 /// Mock in-memory KvBlockStore for testing network ingestion.
 struct MockBlockStore {
@@ -97,7 +97,9 @@ fn test_tiered_spill_manager_gpu_host_nvme_roundtrip() {
     let v_data = vec![4.56f32; 64];
 
     // 1. Demote to Host RAM
-    shared.demote_to_host(10, k_data.clone(), v_data.clone()).unwrap();
+    shared
+        .demote_to_host(10, k_data.clone(), v_data.clone())
+        .unwrap();
     assert_eq!(shared.get_tier(10), Some(CacheTier::HostRam));
 
     // 2. Demote Host RAM to NVMe
@@ -136,14 +138,20 @@ fn test_network_kv_transport_tcp_loopback_streaming() {
     let v_payload = vec![0.84f32; 4 * 16];
 
     let send_res = client.send_block_remote(2, 0, &k_payload, &v_payload, &addr.to_string());
-    assert!(send_res.is_ok(), "Client should successfully send KV block to loopback receiver");
+    assert!(
+        send_res.is_ok(),
+        "Client should successfully send KV block to loopback receiver"
+    );
 
     // Give server a moment to ingest payload into block store
     std::thread::sleep(Duration::from_millis(50));
 
     {
         let store = pool.lock().unwrap();
-        assert!(store.block_is_received(2), "Block 2 should be marked received");
+        assert!(
+            store.block_is_received(2),
+            "Block 2 should be marked received"
+        );
         assert_eq!(store.keys[2], k_payload);
         assert_eq!(store.values[2], v_payload);
     }

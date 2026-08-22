@@ -139,10 +139,7 @@ pub fn refresh_draft(
 /// Returns `(teacher_ppl, student_ppl_pre, student_ppl_post)`. Teacher ppl is
 /// computed from the same target distribution (entropy bound); student ppl
 /// from the cross-entropy of the draft distribution against it.
-pub fn compress_distill_report(
-    epochs: usize,
-    vocab_size: usize,
-) -> Result<(f32, f32, f32)> {
+pub fn compress_distill_report(epochs: usize, vocab_size: usize) -> Result<(f32, f32, f32)> {
     if epochs == 0 || vocab_size == 0 {
         return Err(grim_core::error::Error::Config(
             "compress_distill_report: epochs and vocab_size must be > 0".into(),
@@ -384,7 +381,10 @@ mod wi_e4_tests {
     fn compress_distill_report_improves_student_ppl() {
         let (teacher, pre, post) = compress_distill_report(50, 1024).expect("report");
         // Teacher is the entropy floor; the uniform student starts far above it.
-        assert!(teacher < pre, "teacher ppl {teacher} must beat uniform {pre}");
+        assert!(
+            teacher < pre,
+            "teacher ppl {teacher} must beat uniform {pre}"
+        );
         // Training must move the student toward the teacher.
         assert!(
             post < pre,

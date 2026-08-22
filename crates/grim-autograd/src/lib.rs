@@ -64,9 +64,9 @@ pub mod param;
 pub mod preference_loss;
 pub mod preference_trainer;
 
-pub use preference_trainer::{PreferenceKind, PreferenceStepConfig, PreferenceTrainer};
 pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
 pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
+pub use preference_trainer::{PreferenceKind, PreferenceStepConfig, PreferenceTrainer};
 pub mod omnilo_prune;
 pub mod registry;
 pub mod relora;

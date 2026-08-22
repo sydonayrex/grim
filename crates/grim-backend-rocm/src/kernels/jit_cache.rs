@@ -246,7 +246,7 @@ mod tests {
         );
         let (got_path, got_lowered) = got.unwrap();
         assert_eq!(got_lowered, "test_kernel");
-        assert!(got_path.exists() || true);
+        assert!(got_path.exists());
     }
 
     #[test]

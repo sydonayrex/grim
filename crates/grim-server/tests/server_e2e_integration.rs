@@ -8,16 +8,16 @@
 //! - Tokenize and detokenize endpoints with active tokenizer
 //! - Request pause, resume, and cancellation lifecycle
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
-use tower::ServiceExt;
 use grim_engine::{Engine, EngineConfig};
 use grim_format::{GgufTokenizer, GgufValue};
 use grim_models_transformer::{Llama, LlamaConfig};
 use grim_server::{AppState, build_router};
 use grim_tensor::Device;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tower::ServiceExt;
 
 fn create_test_state() -> Arc<AppState> {
     let mut engine = Engine::new(EngineConfig::default());
@@ -47,8 +47,8 @@ fn create_test_state() -> Arc<AppState> {
         GgufValue::String("llama".to_string()),
     );
     let tokens_arr: Vec<GgufValue> = [
-        "<unk>", "<s>", "</s>", "hello", "world", "grim", "test", "{", "}", ":", "\"", "a",
-        "b", "c",
+        "<unk>", "<s>", "</s>", "hello", "world", "grim", "test", "{", "}", ":", "\"", "a", "b",
+        "c",
     ]
     .iter()
     .map(|s| GgufValue::String(s.to_string()))
@@ -152,7 +152,9 @@ async fn test_server_chat_completions_non_streaming() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(val.get("choices").is_some());
     assert!(val["choices"][0]["message"]["content"].is_string());
@@ -186,14 +188,24 @@ async fn test_server_chat_completions_streaming() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
         "text/event-stream"
     );
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("data:"), "SSE response should contain data lines");
-    assert!(text.contains("[DONE]"), "SSE stream should terminate with [DONE]");
+    assert!(
+        text.contains("data:"),
+        "SSE response should contain data lines"
+    );
+    assert!(
+        text.contains("[DONE]"),
+        "SSE stream should terminate with [DONE]"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +255,9 @@ async fn test_server_tokenize_and_detokenize() {
                 .method("POST")
                 .uri("/v1/tokenize")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&tok_body).unwrap()))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&tok_body).unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -260,7 +274,9 @@ async fn test_server_tokenize_and_detokenize() {
                 .method("POST")
                 .uri("/v1/detokenize")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&detok_body).unwrap()))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&detok_body).unwrap(),
+                ))
                 .unwrap(),
         )
         .await

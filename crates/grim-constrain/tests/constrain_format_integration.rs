@@ -6,7 +6,6 @@
 //! - ConstrainedSampler end-to-end token sampling with vocabulary FSM masking
 //! - TokenMaskCache memoization across identical parser states
 
-use std::sync::Arc;
 use grim_backend_cpu::cpu_tensor;
 use grim_constrain::{
     ConstrainedSampler, Constraint, JsonState, TokenMaskCache, apply_mask, compile_json_schema,
@@ -14,6 +13,7 @@ use grim_constrain::{
 use grim_core::sampler::{GreedySampler, Sampler};
 use grim_tensor::Shape;
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn test_compile_json_schema_valid_and_invalid() {
@@ -28,14 +28,20 @@ fn test_compile_json_schema_valid_and_invalid() {
         "required": ["name", "age"]
     });
     let constraint_res = compile_json_schema(valid_schema);
-    assert!(constraint_res.is_ok(), "Valid schema must compile successfully");
+    assert!(
+        constraint_res.is_ok(),
+        "Valid schema must compile successfully"
+    );
 
     // 2. Invalid schema (unsupported type)
     let invalid_schema = json!({
         "type": "unsupported_data_type"
     });
     let invalid_res = compile_json_schema(invalid_schema);
-    assert!(invalid_res.is_err(), "Invalid schema type must fail compilation");
+    assert!(
+        invalid_res.is_err(),
+        "Invalid schema type must fail compilation"
+    );
 }
 
 #[test]
@@ -76,7 +82,9 @@ fn test_constrained_sampler_json_object_enforcement() {
         "invalid_garbage".to_string(),
     ]);
 
-    let greedy = Arc::new(GreedySampler { repeat_penalty: Some(1.0) });
+    let greedy = Arc::new(GreedySampler {
+        repeat_penalty: Some(1.0),
+    });
     let sampler = ConstrainedSampler::new(greedy, Constraint::json_object()).with_vocab(vocab);
 
     // Initial state: tokens 0, 1, 3 are valid value starts; token 5 is invalid garbage with highest raw logit (10.0)

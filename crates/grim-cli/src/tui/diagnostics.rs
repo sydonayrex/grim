@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1), "1 B");
         assert_eq!(format_ms(None), "n/a");
-        assert_eq!(format_ms(Some(3.14)), "3.1 ms");
+        assert_eq!(format_ms(Some(3.5)), "3.5 ms");
         assert_eq!(format_tps(Some(41.23)), "41.2 tok/s");
         assert_eq!(acceptance_rate(0, 0), None);
         assert_eq!(acceptance_rate(7, 3), Some(7.0 / 3.0));

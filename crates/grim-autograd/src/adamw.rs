@@ -273,10 +273,20 @@ pub(crate) fn legacy_weight_slot(id: &ParamId) -> String {
     weight_slot(id)
 }
 pub(crate) fn m_slot(id: &ParamId) -> String {
-    format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, point_suffix(id.point))
+    format!(
+        "opt_m_{}_{}_{}",
+        id.layer_idx,
+        id.adapter_id,
+        point_suffix(id.point)
+    )
 }
 pub(crate) fn v_slot(id: &ParamId) -> String {
-    format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, point_suffix(id.point))
+    format!(
+        "opt_v_{}_{}_{}",
+        id.layer_idx,
+        id.adapter_id,
+        point_suffix(id.point)
+    )
 }
 pub(crate) fn legacy_m_slot(id: &ParamId) -> String {
     m_slot(id)
