@@ -115,6 +115,114 @@ impl SoulEaterAdapter {
 
         Ok(cpu_tensor(out, Shape::new(vec![b, d_out])))
     }
+
+    /// Compute backward gradients for 3-factor SoulEater adapter:
+    /// Returns (g_x, g_u, g_v, g_sigma).
+    pub fn backward(
+        &self,
+        out_grad: &Tensor,
+        x: &Tensor,
+    ) -> Result<(Tensor, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let x_shape = x.shape().dims();
+        let b = x_shape[0];
+        let d_in = x_shape[1];
+        let d_out = self.u.shape().dims()[0];
+        let r = self.rank;
+
+        let g_vec = out_grad.to_vec_f32()?;
+        let x_vec = x.to_vec_f32()?;
+        let u_vec = self.u.to_vec_f32()?;
+        let v_vec = self.v.to_vec_f32()?;
+        let sig_vec = self.sigma.to_vec_f32()?;
+
+        // 1. Forward activations needed:
+        // X_V = X * V [B, r]
+        let mut x_v = vec![0.0f32; b * r];
+        for i in 0..b {
+            for j in 0..r {
+                let mut sum = 0.0f32;
+                for k in 0..d_in {
+                    sum += x_vec[i * d_in + k] * v_vec[k * r + j];
+                }
+                x_v[i * r + j] = sum;
+            }
+        }
+        // X_V_Sig = X_V * Σ [B, r]
+        let mut x_v_sig = vec![0.0f32; b * r];
+        for i in 0..b {
+            for j in 0..r {
+                x_v_sig[i * r + j] = x_v[i * r + j] * sig_vec[j];
+            }
+        }
+
+        // 2. Compute g_U [d_out, r] = (G^T * X_V_Sig) * scale
+        let mut g_u = vec![0.0f32; d_out * r];
+        for j in 0..d_out {
+            for k in 0..r {
+                let mut sum = 0.0f32;
+                for i in 0..b {
+                    sum += g_vec[i * d_out + j] * x_v_sig[i * r + k];
+                }
+                g_u[j * r + k] = sum * self.scale;
+            }
+        }
+
+        // 3. Backprop through U^T: G_X_V_Sig = (G * U) * scale [B, r]
+        let mut g_x_v_sig = vec![0.0f32; b * r];
+        for i in 0..b {
+            for k in 0..r {
+                let mut sum = 0.0f32;
+                for j in 0..d_out {
+                    sum += g_vec[i * d_out + j] * u_vec[j * r + k];
+                }
+                g_x_v_sig[i * r + k] = sum * self.scale;
+            }
+        }
+
+        // 4. Compute g_sigma [r] = sum_i (G_X_V_Sig[i, k] * X_V[i, k])
+        let mut g_sigma = vec![0.0f32; r];
+        for k in 0..r {
+            let mut sum = 0.0f32;
+            for i in 0..b {
+                sum += g_x_v_sig[i * r + k] * x_v[i * r + k];
+            }
+            g_sigma[k] = sum;
+        }
+
+        // 5. Backprop through Σ: G_X_V = G_X_V_Sig * Σ [B, r]
+        let mut g_x_v = vec![0.0f32; b * r];
+        for i in 0..b {
+            for k in 0..r {
+                g_x_v[i * r + k] = g_x_v_sig[i * r + k] * sig_vec[k];
+            }
+        }
+
+        // 6. Compute g_V [d_in, r] = X^T * G_X_V
+        let mut g_v = vec![0.0f32; d_in * r];
+        for k in 0..d_in {
+            for j in 0..r {
+                let mut sum = 0.0f32;
+                for i in 0..b {
+                    sum += x_vec[i * d_in + k] * g_x_v[i * r + j];
+                }
+                g_v[k * r + j] = sum;
+            }
+        }
+
+        // 7. Compute g_X [B, d_in] = G_X_V * V^T
+        let mut g_x = vec![0.0f32; b * d_in];
+        for i in 0..b {
+            for k in 0..d_in {
+                let mut sum = 0.0f32;
+                for j in 0..r {
+                    sum += g_x_v[i * r + j] * v_vec[k * r + j];
+                }
+                g_x[i * d_in + k] = sum;
+            }
+        }
+
+        Ok((cpu_tensor(g_x, Shape::new(vec![b, d_in])), g_u, g_v, g_sigma))
+    }
 }
 
 /// SOUL EATER Optimizer (SCYTHE1 variant): Momentum + Newton-Schulz for U, V;
@@ -650,6 +758,21 @@ mod tests {
             changed,
             "Sigma should change under non-zero gradient with FIM preconditioning"
         );
+    }
+
+    #[test]
+    fn test_soul_eater_adapter_backward_parity() {
+        let adapter = SoulEaterAdapter::new(8, 16, 4, 8.0).unwrap();
+        let x = cpu_tensor(vec![0.5f32; 2 * 16], Shape::new(vec![2, 16]));
+        let out = adapter.forward(&x).unwrap();
+        assert_eq!(out.shape().dims(), &[2, 8]);
+
+        let grad_out = cpu_tensor(vec![1.0f32; 2 * 8], Shape::new(vec![2, 8]));
+        let (g_x, g_u, g_v, g_sigma) = adapter.backward(&grad_out, &x).unwrap();
+        assert_eq!(g_x.shape().dims(), &[2, 16]);
+        assert_eq!(g_u.len(), 8 * 4);
+        assert_eq!(g_v.len(), 16 * 4);
+        assert_eq!(g_sigma.len(), 4);
     }
 
     #[test]
