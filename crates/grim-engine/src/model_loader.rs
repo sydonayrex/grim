@@ -3904,6 +3904,27 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     }
 }
 
+/// Load an EAGLE3 speculative drafter model from a safetensors checkpoint.
+pub fn load_eagle3_from_path(path: &str, device: Device) -> Result<std::sync::Arc<grim_models_transformer::Eagle3>> {
+    let tp = resolve_tp_config()?;
+    let tprov = SafetensorsProvider::open(path)?;
+    let ws = WeightSource::root(&tprov, device.clone()).with_tp_config(tp);
+    let cfg = grim_models_transformer::Eagle3Config {
+        vocab_size: 128256,
+        hidden_size: 2048,
+        num_heads: 16,
+        num_kv_heads: 8,
+        head_dim: 128,
+        num_layers: 4,
+        intermediate_size: 8192,
+        rms_norm_eps: 1e-5,
+        rope_theta: 500000.0,
+        max_seq_len: 8192,
+    };
+    let model = grim_models_transformer::Eagle3::load(device, &ws, cfg)?;
+    Ok(std::sync::Arc::new(model))
+}
+
 /// Load an audio model (Whisper ASR, Kokoro TTS, MeanVC2 Voice Conversion, Vocos Vocoder) with auto device detection.
 pub fn load_audio_model(path: &str) -> Result<std::sync::Arc<dyn grim_core::Model>> {
     let dev = if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {

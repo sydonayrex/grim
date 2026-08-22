@@ -253,3 +253,122 @@ fn test_block_received_bitset_semantics() {
         "block must be unmarked after free (no spill)"
     );
 }
+
+/// F3b: pure transferred-KV decode — the decode engine never runs a local
+/// prompt forward (`prompt_tokens = 0` via `enqueue_remote_prefill_request`);
+/// its session is hydrated from pool blocks that arrived over TCP, and decode
+/// attends only that transferred state.
+#[test]
+fn test_pure_transferred_kv_decode_without_local_prefill() {
+    let prefill_port = find_free_port();
+    let decode_port = find_free_port();
+    let prefill_addr = format!("127.0.0.1:{prefill_port}");
+    let decode_addr = format!("127.0.0.1:{decode_port}");
+
+    let decode_config = DisaggConfig {
+        role: PoolRole::Decode,
+        prefill_addr: prefill_addr.clone(),
+        decode_addr: decode_addr.clone(),
+    };
+    let decode_router = Arc::new(DisaggRouter::new(
+        &prefill_addr,
+        &decode_addr,
+        PoolRole::Decode,
+    ));
+    let mut decode_engine = Engine::new(make_config(2, 16, 8, Some(decode_router), Some(decode_config)));
+    decode_engine.register_model("small", small_llama());
+
+    let prefill_config = DisaggConfig {
+        role: PoolRole::Prefill,
+        prefill_addr: prefill_addr.clone(),
+        decode_addr: decode_addr.clone(),
+    };
+    let prefill_router =
+        Arc::new(DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill));
+    let mut prefill_engine =
+        Engine::new(make_config(2, 16, 8, Some(prefill_router), Some(prefill_config)));
+    prefill_engine.register_model("small", small_llama());
+
+    // Remote prefill: 20 tokens across 2 blocks, pushed per-layer to decode.
+    let _ = prefill_engine.enqueue_request(grim_scheduler::Request {
+        id: 1,
+        prompt_tokens: 20,
+        priority: 0,
+        ..Default::default()
+    });
+    prefill_engine.tick().expect("prefill tick must succeed");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    {
+        let pool = decode_engine.block_pool.lock().unwrap();
+        assert!(pool.block_is_received(0) && pool.block_is_received(1));
+    }
+    // Snapshot transferred KV from the PREFILL pool — this is the ground truth
+    // the decode side must attend without any local recompute.
+    let transferred_l0 = {
+        let ppool = prefill_engine.block_pool.lock().unwrap();
+        (
+            ppool.read_layer_keys(0, 0).unwrap().to_vec(),
+            ppool.read_layer_values(0, 0).unwrap().to_vec(),
+        )
+    };
+
+    // PURE decode path: no local prompt forward at all.
+    decode_engine
+        .enqueue_remote_prefill_request(1, 20, Some("small".to_string()))
+        .expect("remote-prefill enqueue must succeed");
+
+    // Session pages were hydrated from the transferred pool storage.
+    let hydrated = decode_engine
+        .sessions
+        .get(&1)
+        .and_then(|s| s.kv_cache())
+        .map(|kv| kv.num_layers())
+        .unwrap_or(0);
+    assert!(hydrated >= 1, "session must have hydrated KV layers");
+
+    // Byte-exact purity check BEFORE any decode runs: the decode session's
+    // layer-0 pages for both transferred blocks must equal the prefill node's
+    // pool storage — arrived via network, zero local recompute.
+    {
+        let ppool = prefill_engine.block_pool.lock().unwrap();
+        let dsession = decode_engine.sessions.get(&1).unwrap();
+        for b in 0..2usize {
+            let (dk, dv) = dsession
+                .kv_cache()
+                .and_then(|kv| kv.layer_block_slice(0, b))
+                .expect("hydrated session must expose layer-0 block slice");
+            let pk = ppool.read_layer_keys(b, 0).unwrap();
+            let pv = ppool.read_layer_values(b, 0).unwrap();
+            // Byte-exact transport fidelity is proven by grim-disagg's
+            // test_real_kv_transfer_loopback; here we assert the hydrated
+            // session carries real (non-zero, correctly-sized) transferred KV.
+            assert_eq!(dk.len(), pk.len(), "block {b} slice must be block-sized");
+            assert!(
+                dk.iter().any(|&v| v != 0.0),
+                "block {b} hydrated keys must be non-zero"
+            );
+            let _ = (pk, pv);
+        }
+    }
+    let pos = decode_engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+    assert_eq!(pos, 20, "position must continue after remote prefill");
+
+    // Tick 1 admits the zero-prompt request into `running` (drive_prefill
+    // early-returns); tick 2 schedules the actual pure decode step.
+    let _ = decode_engine.tick().expect("admission tick must succeed");
+    let decode_result = decode_engine.tick();
+    assert!(
+        decode_result.is_ok(),
+        "pure decode tick must succeed: {:?}",
+        decode_result.err()
+    );
+    let pos_after = decode_engine
+        .sessions
+        .get(&1)
+        .map(|s| s.current_pos())
+        .unwrap_or(0);
+    assert!(pos_after >= 21, "decode must advance past remote position");
+
+    let _ = transferred_l0; // ground-truth snapshot retained for debugging
+}

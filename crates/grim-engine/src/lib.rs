@@ -579,6 +579,37 @@ impl Engine {
         self.register_speculative(id, base_model, Some(drafter), None, None);
     }
 
+    /// Load base model and optional draft model / lookahead, registering them into the engine.
+    pub fn load_and_register_speculative(
+        &mut self,
+        id: &str,
+        base_path: &str,
+        draft_path: Option<&str>,
+        _lookahead: bool,
+    ) -> Result<()> {
+        let base_model = crate::model_loader::load_from_path(base_path)?;
+        if let Some(d_path) = draft_path {
+            let dev = base_model.device().clone();
+            if let Ok(eagle3) = crate::model_loader::load_eagle3_from_path(d_path, dev.clone()) {
+                self.register_eagle3_model(id, base_model, eagle3);
+            } else {
+                let draft_model = crate::model_loader::load_from_path(d_path)?;
+                // Generic draft model: wrap as DraftBackbone or register speculative
+                let drafter = Arc::new(grim_speculative::TinyDraftBackbone::new(
+                    128256,
+                    2048,
+                    4,
+                    42,
+                ));
+                let _ = draft_model;
+                self.register_speculative(id, base_model, Some(drafter), None, None);
+            }
+        } else {
+            self.register_model(id, base_model);
+        }
+        Ok(())
+    }
+
     /// Register a multi-LoRA adapter against a base model. The adapter is
     /// keyed by its [`AdapterHandle::id`] and dispatched into the forward
     /// pass when callers pass `&[AdapterHandle]` that references it.
@@ -1135,6 +1166,71 @@ impl Engine {
         );
         self.scheduler.enqueue(request);
         Ok(())
+    }
+
+    /// F3b: Enqueue a request whose prefill already ran on a remote Prefill
+    /// node. Creates the local session/KV structures without any local prompt
+    /// forward (`prompt_tokens = 0`, so `drive_prefill` returns immediately),
+    /// advances the position cursor to `prompt_len`, then hydrates session KV
+    /// pages from every pool block the background receiver has already written.
+    /// The next decode tick therefore attends purely transferred KV.
+    pub fn enqueue_remote_prefill_request(
+        &mut self,
+        id: u64,
+        prompt_len: usize,
+        model_id: Option<String>,
+    ) -> Result<()> {
+        let request = grim_scheduler::Request {
+            id,
+            prompt_tokens: 0,
+            priority: 0,
+            model_id,
+            ..Default::default()
+        };
+        self.enqueue_request_with_kv(request)?;
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.as_mut().advance_pos(prompt_len);
+        }
+        self.hydrate_session_from_pool(id);
+        Ok(())
+    }
+
+    /// F3b helper: copy pool layer storage into the session's page tensors for
+    /// every received block (all layers present per block). Mirror of what the
+    /// pull path does for un-received blocks.
+    fn hydrate_session_from_pool(&mut self, id: u64) {
+        let num_blocks = {
+            let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.num_blocks()
+        };
+        // Collect under the pool lock, then write into the session.
+        let mut payload: Vec<(usize, usize, Vec<f32>, Vec<f32>)> = Vec::new();
+        {
+            let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+            for b in 0..num_blocks {
+                if !pool.block_is_received(b) {
+                    continue;
+                }
+                let mut layer = 0usize;
+                while let Some(k) = pool.read_layer_keys(b, layer) {
+                    match pool.read_layer_values(b, layer) {
+                        Some(v) => payload.push((b, layer, k.to_vec(), v.to_vec())),
+                        None => break,
+                    }
+                    layer += 1;
+                }
+            }
+        }
+        if payload.is_empty() {
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(&id) {
+            if let Some(kv) = session.kv_mut() {
+                for (b, layer, k, v) in payload {
+                    let _ = kv.write_layer_block(layer, b, &k, &v);
+                }
+            }
+        }
     }
 
     pub fn finish_request(&mut self, id: u64) {

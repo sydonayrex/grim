@@ -12,10 +12,15 @@
 
 pub mod autotune;
 pub mod caps;
+pub mod graph_capture;
 pub mod kernels;
 
 pub use autotune::{CudaAutotuner, CudaTileConfig, GemmOp, ShapeClass};
 pub use caps::CudaCaps;
+pub use graph_capture::{
+    CudaGraphExecutor, DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey,
+    GraphCaptureManager,
+};
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -109,6 +114,23 @@ unsafe extern "C" {
         kernelParams: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> i32;
+
+    pub fn cudaStreamCreate(stream: *mut CUstream) -> i32;
+    pub fn cudaStreamDestroy(stream: CUstream) -> i32;
+    pub fn cudaStreamSynchronize(stream: CUstream) -> i32;
+    pub fn cudaStreamBeginCapture(stream: CUstream, mode: i32) -> i32;
+    pub fn cudaStreamEndCapture(stream: CUstream, graph: *mut *mut c_void) -> i32;
+    pub fn cudaGraphCreate(graph: *mut *mut c_void, flags: u32) -> i32;
+    pub fn cudaGraphInstantiate(
+        graphExec: *mut *mut c_void,
+        graph: *mut c_void,
+        pErrorNode: *mut *mut c_void,
+        pLogBuffer: *mut i8,
+        bufferSize: usize,
+    ) -> i32;
+    pub fn cudaGraphLaunch(graphExec: *mut c_void, stream: CUstream) -> i32;
+    pub fn cudaGraphDestroy(graph: *mut c_void) -> i32;
+    pub fn cudaGraphExecDestroy(graphExec: *mut c_void) -> i32;
 }
 
 #[derive(Debug, Clone, Copy)]

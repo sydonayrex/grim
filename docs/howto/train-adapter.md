@@ -48,15 +48,33 @@ Train or fine-tune LoRA adapters (SFT QLoRA) on a base model using a custom data
    ```
 
 4. **Choosing a Training Mode**
-   Grim supports several fine-tuning modes via `--mode`:
-   - `qlora` (default): Quantized LoRA with frozen 4-bit base weights and trainable adapter matrices.
-   - `lora`: Standard LoRA on full-precision / half-precision base weights.
-   - `full-bf16` / `full-fp16`: Full parameter fine-tuning in BF16 or FP16.
-   - `soul-eater`: High-throughput adapter training with FP4/FP8 subspace caching.
-   - `oft`: Orthogonal Fine-Tuning preserving Frobenius norms.
+   Grim supports several fine-tuning and alignment modes via `--mode`:
+   - **SFT & Adapter Modes**:
+     - `qlora` (default): Quantized LoRA with frozen 4-bit base weights and trainable adapter matrices (lowest VRAM).
+     - `lora`: Standard LoRA on full-precision / half-precision base weights.
+     - `full-bf16` / `full-fp16`: Full parameter fine-tuning in BF16 or FP16.
+     - `soul-eater`: Orthogonal weight matrix evolution with FP4/FP8 subspace caching.
+     - `oft`: Orthogonal Fine-Tuning preserving representation norms.
+   - **Preference Alignment Modes**:
+     - `dpo`: Direct Preference Optimization using paired chosen and rejected target sequences with analytical VJP gradients.
+     - `kto`: Kahneman-Tversky Optimization applying prospect theory to unpaired or paired preferences.
+     - `simpo`: Simple reference-free preference optimization with target margin and length normalization.
+     - `orpo`: Odds Ratio Preference Optimization penalizing rejected sequence probability odds.
+     - `grpo`: Group Relative Policy Optimization with clipped surrogate loss and reward advantage normalization.
 
-5. **Bake the Adapter (Optional)**
-   You can permanently merge the trained adapter sidecar into a base model using the `merge` command.
+5. **Multi-GPU Data-Parallel (DP) Training**
+   Scale training across multiple AMD GPUs using RCCL all-reduce:
+   ```bash
+   grim train \
+     --model llama3 \
+     --dataset ./data/train.jsonl \
+     --num-gpus 2 \
+     --mode dpo \
+     --batch-size 2048
+   ```
+
+6. **Bake the Adapter (Optional)**
+   You can permanently merge the trained adapter sidecar into a base model using the `merge` command:
 
    ```bash
    grim merge --model llama3 --adapter my-adapter.grim.train --output merged_model.grim
@@ -74,4 +92,4 @@ During training, Grim will stream loss metrics and progress per epoch:
 ## What Can Go Wrong
 
 - **Loss divergence (NaN)**: The learning rate might be too high or the batch size too large. **Recovery**: Reduce `--lr` (e.g., to `1e-5`) or increase `--gradient-accumulation-steps`.
-- **Out of memory (OOM)**: Training requires more memory than inference. **Recovery**: Reduce `--batch-size` or use `--device cpu` to offload processing to system memory, though this will be slower.
+- **Out of memory (OOM)**: Training requires more memory than inference. **Recovery**: Reduce `--batch-size`, enable `--qat-mxfp4`, or scale across GPUs with `--num-gpus`.

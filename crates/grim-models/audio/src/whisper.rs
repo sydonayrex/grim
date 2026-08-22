@@ -142,23 +142,24 @@ struct WhisperEncoderBlock {
 impl WhisperEncoderBlock {
     fn new(d_model: usize, num_heads: usize, ffn: usize, eps: f32, rng: &mut SimpleRng) -> Self {
         let head_dim = d_model / num_heads;
+        let scale = 1.0 / (d_model as f32).sqrt();
         let wq = (0..num_heads * head_dim * d_model)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale)
             .collect();
         let wk = (0..num_heads * head_dim * d_model)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale)
             .collect();
         let wv = (0..num_heads * head_dim * d_model)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale)
             .collect();
         let wo = (0..d_model * num_heads * head_dim)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale)
             .collect();
         let fc1_w = (0..ffn * d_model)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale)
             .collect();
         let fc2_w = (0..d_model * ffn)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * (1.0 / (ffn as f32).sqrt()))
             .collect();
         Self {
             norm1: RmsNorm {
@@ -504,19 +505,20 @@ impl WhisperDecoderBlock {
     ) -> Self {
         let head_dim = d_model / num_heads;
         let n = d_model;
-        let self_q = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let self_k = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let self_v = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let self_o = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let cross_q = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let cross_k = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let cross_v = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let cross_o = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let scale = 1.0 / (d_model as f32).sqrt();
+        let self_q = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let self_k = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let self_v = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let self_o = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let cross_q = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let cross_k = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let cross_v = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
+        let cross_o = (0..n * n).map(|_| (rng.next_f32() - 0.5) * scale).collect();
         let fc1_w = (0..ffn * d_model)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale)
             .collect();
         let fc2_w = (0..d_model * ffn)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * (1.0 / (ffn as f32).sqrt()))
             .collect();
         Self {
             self_norm: RmsNorm {
@@ -868,8 +870,9 @@ impl Whisper {
         let tok_emb = Embedding {
             weight: cpu_tensor(tok_emb_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
         };
+        let scale_in = 1.0 / (cfg.n_mels as f32).sqrt();
         let enc_in_proj_w = (0..cfg.d_model * cfg.n_mels)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale_in)
             .collect();
         let enc_in_proj = Linear::from_tensor(
             cpu_tensor(enc_in_proj_w, Shape::new(vec![cfg.d_model, cfg.n_mels])),
@@ -909,8 +912,9 @@ impl Whisper {
             weight: cpu_tensor(vec![1.0; cfg.d_model], Shape::new(vec![cfg.d_model])),
             eps: cfg.rms_norm_eps,
         };
+        let scale_out = 1.0 / (cfg.d_model as f32).sqrt();
         let output_w = (0..cfg.vocab_size * cfg.d_model)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .map(|_| (rng.next_f32() - 0.5) * scale_out)
             .collect();
         let output = Linear::from_tensor(
             cpu_tensor(output_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
@@ -1070,6 +1074,49 @@ impl Whisper {
         let normed = self.dec_norm.forward(&cur)?;
         let logits = self.output.forward(&normed)?;
         Ok(logits)
+    }
+
+    /// Transcribe mel-spectrogram features into a sequence of token IDs via autoregressive greedy decoding.
+    pub fn transcribe_tokens(&self, mel: &Tensor, max_tokens: usize) -> Result<Vec<u32>> {
+        let enc_out = self.encode(mel)?;
+        let mut tokens: Vec<u32> = if self.cfg.vocab_size >= 50360 {
+            vec![50258, 50259, 50359] // <|startoftranscript|>, <|en|>, <|transcribe|>
+        } else {
+            vec![1.min((self.cfg.vocab_size.saturating_sub(1)) as u32)]
+        };
+        let limit = max_tokens.min(self.cfg.max_text_len);
+
+        for _ in 0..limit {
+            let ids_tensor = cpu_tensor(
+                tokens.iter().map(|&t| t as f32).collect(),
+                Shape::new(vec![tokens.len()]),
+            );
+            let logits = self.decode_step(&enc_out, &ids_tensor)?;
+            let logits_data = logits.to_vec_f32()?;
+            let vocab_size = self.cfg.vocab_size;
+            let last_row_start = (tokens.len() - 1) * vocab_size;
+            if last_row_start + vocab_size > logits_data.len() {
+                break;
+            }
+            let last_row = &logits_data[last_row_start..last_row_start + vocab_size];
+
+            let mut best_tok = 0u32;
+            let mut best_logit = f32::NEG_INFINITY;
+            for (idx, &l) in last_row.iter().enumerate() {
+                if l > best_logit {
+                    best_logit = l;
+                    best_tok = idx as u32;
+                }
+            }
+
+            if best_tok == 50257 {
+                // <|endoftranscript|>
+                break;
+            }
+            tokens.push(best_tok);
+        }
+
+        Ok(tokens)
     }
 }
 

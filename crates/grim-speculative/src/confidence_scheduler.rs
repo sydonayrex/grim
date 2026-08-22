@@ -125,6 +125,30 @@ impl Default for AdaptationConfig {
     }
 }
 
+/// Dynamic speculative rollout depth PID configuration.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct SpeculationDepthConfig {
+    pub target_accept_rate: f64,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+    pub min_k: usize,
+    pub max_k: usize,
+}
+
+impl Default for SpeculationDepthConfig {
+    fn default() -> Self {
+        Self {
+            target_accept_rate: 0.6,
+            kp: 0.8,
+            ki: 0.05,
+            kd: 0.1,
+            min_k: 1,
+            max_k: 5,
+        }
+    }
+}
+
 impl ConfidenceScheduler {
     pub fn new(throughput_profile: ThroughputProfile, config: SpeculationConfig) -> Self {
         Self {
@@ -133,6 +157,16 @@ impl ConfidenceScheduler {
             adaptation_state: AdaptationState::default(),
             adaptation_config: AdaptationConfig::default(),
         }
+    }
+
+    /// Set the target acceptance rate for online speculation depth tuning.
+    pub fn set_target_accept_rate(&mut self, target: f64) {
+        self.adaptation_config.min_accept_rate = target;
+    }
+
+    /// Return the current target acceptance rate.
+    pub fn target_accept_rate(&self) -> f64 {
+        self.adaptation_config.min_accept_rate
     }
 
     /// WI 4.4.2 — Record the acceptance result from a decode step and update

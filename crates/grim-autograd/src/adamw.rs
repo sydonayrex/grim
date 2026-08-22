@@ -6,7 +6,7 @@
 //! Also includes learning rate schedules and additional optimizer variants.
 
 use crate::param::{ParamId, TrainableParams};
-use grim_format::train::{TrainFpFormat, TrainState};
+use grim_format::train::{TrainBlob, TrainFpFormat, TrainState};
 use grim_tensor::{
     BackendStorage, DType, Tensor,
     error::{Error, Result},
@@ -254,6 +254,46 @@ impl std::fmt::Display for OptimizerKind {
 
 /// Boxed optimizer wrapper used by the garage worker to dispatch
 /// optimizer construction and stepping uniformly via the `Optimizer` enum.
+
+/// F2b: sidecar slot names now embed the injection point so base-weight
+/// entries (`adapter_id == 0`) for different points stop colliding.
+pub(crate) fn point_suffix(p: crate::injection::LoRAInjectionPoint) -> &'static str {
+    p.suffix()
+}
+pub(crate) fn weight_slot(id: &ParamId) -> String {
+    format!(
+        "param_{}_{}_{}_{}",
+        id.layer_idx,
+        id.adapter_id,
+        point_suffix(id.point),
+        if id.is_a { "a" } else { "b" }
+    )
+}
+pub(crate) fn legacy_weight_slot(id: &ParamId) -> String {
+    weight_slot(id)
+}
+pub(crate) fn m_slot(id: &ParamId) -> String {
+    format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, point_suffix(id.point))
+}
+pub(crate) fn v_slot(id: &ParamId) -> String {
+    format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, point_suffix(id.point))
+}
+pub(crate) fn legacy_m_slot(id: &ParamId) -> String {
+    m_slot(id)
+}
+pub(crate) fn legacy_v_slot(id: &ParamId) -> String {
+    v_slot(id)
+}
+/// Read helper: prefer the point-suffixed slot, fall back to pre-F2b names
+/// so older sidecars still resume.
+pub(crate) fn blob_slot<'a>(
+    state: &'a TrainState,
+    new: &str,
+    legacy: String,
+) -> Option<&'a TrainBlob> {
+    state.blobs.get(new).or_else(|| state.blobs.get(&legacy))
+}
+
 pub enum Optimizer {
     AdamW(AdamW),
     AdamW8Bit(AdamW8Bit),
@@ -700,12 +740,7 @@ impl AdamW {
         for (id, param) in params.iter() {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
-                let blob_name = format!(
-                    "param_{}_{}_{}",
-                    id.layer_idx,
-                    id.adapter_id,
-                    if id.is_a { "a" } else { "b" }
-                );
+                let blob_name = weight_slot(id);
                 let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
                 let bytes = grim_format::train::encode_f32s_as(&data, fmt);
                 state.dtypes.insert(blob_name.clone(), fmt);
@@ -718,12 +753,7 @@ impl AdamW {
             if let Some(m_st) = self.m.get(id) {
                 if let Ok(m_vec) = m_st.to_cpu_vec_f32() {
                     let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let blob_name = format!(
-                        "opt_m_{}_{}_{}",
-                        id.layer_idx,
-                        id.adapter_id,
-                        if id.is_a { "a" } else { "b" }
-                    );
+                    let blob_name = m_slot(id);
                     state.add_blob(blob_name, shape.clone(), bytes);
                 }
             }
@@ -731,12 +761,7 @@ impl AdamW {
             if let Some(v_st) = self.v.get(id) {
                 if let Ok(v_vec) = v_st.to_cpu_vec_f32() {
                     let bytes: Vec<u8> = v_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let blob_name = format!(
-                        "opt_v_{}_{}_{}",
-                        id.layer_idx,
-                        id.adapter_id,
-                        if id.is_a { "a" } else { "b" }
-                    );
+                    let blob_name = v_slot(id);
                     state.add_blob(blob_name, shape, bytes);
                 }
             }
@@ -753,12 +778,11 @@ impl AdamW {
     ) -> Result<()> {
         self.step_count = state.step as usize;
         for (id, param) in params.iter_mut() {
-            let suffix = if id.is_a { "a" } else { "b" };
-            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
-            let m_key = format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
-            let v_key = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let param_key = weight_slot(id);
+            let m_key = m_slot(id);
+            let v_key = v_slot(id);
 
-            if let Some(blob) = state.blobs.get(&param_key) {
+            if let Some(blob) = blob_slot(state, &param_key, legacy_weight_slot(id)) {
                 let fmt = state
                     .dtypes
                     .get(&param_key)
@@ -777,14 +801,14 @@ impl AdamW {
                 );
             }
 
-            if let Some(blob) = state.blobs.get(&m_key) {
+            if let Some(blob) = blob_slot(state, &m_key, legacy_m_slot(id)) {
                 let f32_vals = bytes_to_f32_vec(&blob.data)?;
                 let dev = crate::pick_device_for_tensor(&param.data);
                 let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
                 self.m.insert(*id, st);
             }
 
-            if let Some(blob) = state.blobs.get(&v_key) {
+            if let Some(blob) = blob_slot(state, &v_key, legacy_v_slot(id)) {
                 let f32_vals = bytes_to_f32_vec(&blob.data)?;
                 let dev = crate::pick_device_for_tensor(&param.data);
                 let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
@@ -829,12 +853,7 @@ fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainSta
         let shape = param.data.shape().dims().to_vec();
         if let Ok(data) = param.data.to_vec_f32() {
             let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let blob_name = format!(
-                "param_{}_{}_{}",
-                id.layer_idx,
-                id.adapter_id,
-                if id.is_a { "a" } else { "b" }
-            );
+            let blob_name = weight_slot(id);
             state.add_blob(blob_name, shape, bytes);
         }
     }
@@ -844,9 +863,8 @@ fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainSta
 /// Restore parameter data (and step count) from a `.grim.train` `TrainState`.
 fn load_param_data_only(params: &mut TrainableParams, state: &TrainState) -> Result<()> {
     for (id, param) in params.iter_mut() {
-        let suffix = if id.is_a { "a" } else { "b" };
-        let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
-        if let Some(blob) = state.blobs.get(&param_key) {
+        let param_key = weight_slot(id);
+        if let Some(blob) = blob_slot(state, &param_key, legacy_weight_slot(id)) {
             let fmt = state
                 .dtypes
                 .get(&param_key)
@@ -1203,10 +1221,10 @@ impl AdamW8Bit {
                 id.adapter_id,
                 if id.is_a { "a" } else { "b" }
             );
-            if let Some(blob) = state.blobs.get(&m_key) {
+            if let Some(blob) = blob_slot(state, &m_key, legacy_m_slot(id)) {
                 self.m_q80.insert(*id, blob.data.clone());
             }
-            if let Some(blob) = state.blobs.get(&v_key) {
+            if let Some(blob) = blob_slot(state, &v_key, legacy_v_slot(id)) {
                 self.v_q80.insert(*id, blob.data.clone());
             }
         }
@@ -1441,7 +1459,7 @@ impl PagedAdamW {
                     if id.is_a { "a" } else { "b" },
                     p
                 );
-                if let Some(blob) = state.blobs.get(&m_key) {
+                if let Some(blob) = blob_slot(state, &m_key, legacy_m_slot(id)) {
                     if let Ok(m_vals) = bytes_to_f32_vec(&blob.data) {
                         let entry = self.pages.entry((*id, p)).or_insert_with(|| MomentPage {
                             m: vec![0.0; m_vals.len()],
@@ -1452,7 +1470,7 @@ impl PagedAdamW {
                         entry.m = m_vals;
                     }
                 }
-                if let Some(blob) = state.blobs.get(&v_key) {
+                if let Some(blob) = blob_slot(state, &v_key, legacy_v_slot(id)) {
                     if let Ok(v_vals) = bytes_to_f32_vec(&blob.data) {
                         let entry = self.pages.entry((*id, p)).or_insert_with(|| MomentPage {
                             m: vec![0.0; v_vals.len()],
@@ -2380,12 +2398,7 @@ impl Muon {
         for (id, param) in params.iter() {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
-                let blob_name = format!(
-                    "param_{}_{}_{}",
-                    id.layer_idx,
-                    id.adapter_id,
-                    if id.is_a { "a" } else { "b" }
-                );
+                let blob_name = weight_slot(id);
                 let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
                 let bytes = grim_format::train::encode_f32s_as(&data, fmt);
                 state.dtypes.insert(blob_name.clone(), fmt);
@@ -2418,11 +2431,10 @@ impl Muon {
     ) -> Result<()> {
         self.step_count = state.step as usize;
         for (id, param) in params.iter_mut() {
-            let suffix = if id.is_a { "a" } else { "b" };
-            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let param_key = weight_slot(id);
             let m_key = format!("opt_m_{}_{}_b", id.layer_idx, id.adapter_id);
 
-            if let Some(blob) = state.blobs.get(&param_key) {
+            if let Some(blob) = blob_slot(state, &param_key, legacy_weight_slot(id)) {
                 let fmt = state
                     .dtypes
                     .get(&param_key)
@@ -2442,7 +2454,7 @@ impl Muon {
             }
 
             if !id.is_a {
-                if let Some(blob) = state.blobs.get(&m_key) {
+                if let Some(blob) = blob_slot(state, &m_key, legacy_m_slot(id)) {
                     let f32_vals = bytes_to_f32_vec(&blob.data)?;
                     let dev = crate::pick_device_for_tensor(&param.data);
                     let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
@@ -2630,12 +2642,7 @@ impl MAdam {
         for (id, param) in params.iter() {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
-                let blob_name = format!(
-                    "param_{}_{}_{}",
-                    id.layer_idx,
-                    id.adapter_id,
-                    if id.is_a { "a" } else { "b" }
-                );
+                let blob_name = weight_slot(id);
                 let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
                 let bytes = grim_format::train::encode_f32s_as(&data, fmt);
                 state.dtypes.insert(blob_name.clone(), fmt);
@@ -2648,12 +2655,7 @@ impl MAdam {
             if let Some(m_st) = self.m.get(id) {
                 if let Ok(m_vec) = m_st.to_cpu_vec_f32() {
                     let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let blob_name = format!(
-                        "opt_m_{}_{}_{}",
-                        id.layer_idx,
-                        id.adapter_id,
-                        if id.is_a { "a" } else { "b" }
-                    );
+                    let blob_name = m_slot(id);
                     state.add_blob(blob_name, shape.clone(), bytes);
                 }
             }
@@ -2661,12 +2663,7 @@ impl MAdam {
             if let Some(v_st) = self.v.get(id) {
                 if let Ok(v_vec) = v_st.to_cpu_vec_f32() {
                     let bytes: Vec<u8> = v_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let blob_name = format!(
-                        "opt_v_{}_{}_{}",
-                        id.layer_idx,
-                        id.adapter_id,
-                        if id.is_a { "a" } else { "b" }
-                    );
+                    let blob_name = v_slot(id);
                     state.add_blob(blob_name, shape, bytes);
                 }
             }
@@ -2682,12 +2679,11 @@ impl MAdam {
     ) -> Result<()> {
         self.step_count = state.step as usize;
         for (id, param) in params.iter_mut() {
-            let suffix = if id.is_a { "a" } else { "b" };
-            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
-            let m_key = format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
-            let v_key = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let param_key = weight_slot(id);
+            let m_key = m_slot(id);
+            let v_key = v_slot(id);
 
-            if let Some(blob) = state.blobs.get(&param_key) {
+            if let Some(blob) = blob_slot(state, &param_key, legacy_weight_slot(id)) {
                 let fmt = state
                     .dtypes
                     .get(&param_key)
@@ -2706,14 +2702,14 @@ impl MAdam {
                 );
             }
 
-            if let Some(blob) = state.blobs.get(&m_key) {
+            if let Some(blob) = blob_slot(state, &m_key, legacy_m_slot(id)) {
                 let f32_vals = bytes_to_f32_vec(&blob.data)?;
                 let dev = crate::pick_device_for_tensor(&param.data);
                 let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
                 self.m.insert(*id, st);
             }
 
-            if let Some(blob) = state.blobs.get(&v_key) {
+            if let Some(blob) = blob_slot(state, &v_key, legacy_v_slot(id)) {
                 let f32_vals = bytes_to_f32_vec(&blob.data)?;
                 let dev = crate::pick_device_for_tensor(&param.data);
                 let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
@@ -2868,12 +2864,7 @@ impl LionVote {
         for (id, param) in params.iter() {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
-                let blob_name = format!(
-                    "param_{}_{}_{}",
-                    id.layer_idx,
-                    id.adapter_id,
-                    if id.is_a { "a" } else { "b" }
-                );
+                let blob_name = weight_slot(id);
                 let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
                 let bytes = grim_format::train::encode_f32s_as(&data, fmt);
                 state.dtypes.insert(blob_name.clone(), fmt);
@@ -2908,10 +2899,10 @@ impl LionVote {
         self.step_count = state.step as usize;
         for (id, param) in params.iter_mut() {
             let suffix = if id.is_a { "a" } else { "b" };
-            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let param_key = weight_slot(id);
             let exp_key = format!("opt_exp_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
 
-            if let Some(blob) = state.blobs.get(&param_key) {
+            if let Some(blob) = blob_slot(state, &param_key, legacy_weight_slot(id)) {
                 let fmt = state
                     .dtypes
                     .get(&param_key)

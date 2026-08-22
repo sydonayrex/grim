@@ -764,3 +764,79 @@ impl Drop for RcclAllReduce {
         }
     }
 }
+
+/// Multi-node RCCL communicator group using TCP rendezvous.
+#[derive(Debug)]
+pub struct RocmMultiNodeGroup {
+    pub world_size: usize,
+    pub rank: usize,
+    pub comm: Option<NcclComm>,
+}
+
+impl RocmMultiNodeGroup {
+    /// Create and rendezvous a multi-node group across nodes using TCP socket exchange.
+    pub fn new(world_size: usize, rank: usize, master_addr: &str, master_port: u16) -> Result<Self> {
+        if world_size <= 1 {
+            return Ok(Self {
+                world_size: 1,
+                rank: 0,
+                comm: None,
+            });
+        }
+
+        #[cfg(feature = "rccl")]
+        {
+            let mut unique_id = NcclUniqueId { internal: [0; 128] };
+            if rank == 0 {
+                unsafe {
+                    let res = ncclGetUniqueId(&mut unique_id);
+                    if res != NCCL_SUCCESS {
+                        return Err(Error::Backend(format!("ncclGetUniqueId failed with code {res}")));
+                    }
+                }
+                let listener = std::net::TcpListener::bind(format!("{master_addr}:{master_port}"))
+                    .map_err(|e| Error::Backend(format!("Failed to bind master rendezvous socket: {e}")))?;
+                for _ in 1..world_size {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        use std::io::Write;
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(&unique_id as *const _ as *const u8, std::mem::size_of::<NcclUniqueId>())
+                        };
+                        let _ = stream.write_all(slice);
+                    }
+                }
+            } else {
+                let mut stream = std::net::TcpStream::connect(format!("{master_addr}:{master_port}"))
+                    .map_err(|e| Error::Backend(format!("Worker failed to connect to master rendezvous: {e}")))?;
+                use std::io::Read;
+                let slice = unsafe {
+                    std::slice::from_raw_parts_mut(&mut unique_id as *mut _ as *mut u8, std::mem::size_of::<NcclUniqueId>())
+                };
+                stream.read_exact(slice)
+                    .map_err(|e| Error::Backend(format!("Worker failed to read unique_id from master: {e}")))?;
+            }
+
+            let mut comm = NcclComm(std::ptr::null_mut());
+            unsafe {
+                let res = ncclCommInitRank(&mut comm, world_size as i32, unique_id, rank as i32);
+                if res != NCCL_SUCCESS {
+                    return Err(Error::Backend(format!("ncclCommInitRank failed with code {res}")));
+                }
+            }
+            Ok(Self {
+                world_size,
+                rank,
+                comm: Some(comm),
+            })
+        }
+        #[cfg(not(feature = "rccl"))]
+        {
+            let _ = (master_addr, master_port);
+            Ok(Self {
+                world_size,
+                rank,
+                comm: None,
+            })
+        }
+    }
+}

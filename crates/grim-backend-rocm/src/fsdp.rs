@@ -24,10 +24,17 @@ impl Default for ConsumerFsdpConfig {
     }
 }
 
-/// Fully Sharded Data Parallel group managing parameter partitions for consumer AMD GPUs.
+/// Fully Sharded Data Parallel / Data Parallel group managing parameter partitions for consumer AMD GPUs.
 pub struct ConsumerFsdpGroup {
     config: ConsumerFsdpConfig,
 }
+
+/// Type alias for Consumer Data Parallel group.
+pub type ConsumerDpGroup = ConsumerFsdpGroup;
+/// Type alias for Consumer Data Parallel configuration.
+pub type ConsumerDpConfig = ConsumerFsdpConfig;
+/// Type alias for Consumer ZeRO parameter planner.
+pub type ConsumerZeroPlanner = ConsumerFsdpGroup;
 
 impl ConsumerFsdpGroup {
     /// Constructs a new `ConsumerFsdpGroup` with the specified configuration. [see: `config.world_size`, `config.rank`]

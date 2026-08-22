@@ -739,3 +739,155 @@ mod tests {
         assert!(ext_detached.backup2.is_present());
     }
 }
+/// F2b: overwrite a `.grim` tensor's rows with new f32 values — the
+/// full-parameter counterpart of [`merge_bolt_on`] (delta step removed,
+/// same dequant→repack→reassemble pipeline).
+pub fn overwrite_tensor_f32(grim_path: &Path, tensor_name: &str, values: &[f32]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(grim_path)
+        .map_err(Error::Io)?;
+
+    let src = GrimFile::read(&mut file)?;
+    let idx = src
+        .tensors_by_name
+        .get(tensor_name)
+        .copied()
+        .ok_or_else(|| Error::Backend(format!("tensor {} not found in .grim file", tensor_name)))?;
+    let entry = &src.tensors[idx];
+    let src_ext = src.metadata.get_tensor_ext(tensor_name).ok_or_else(|| {
+        Error::Backend(format!("tensor {} has no GrimTensorExt metadata", tensor_name))
+    })?;
+
+    let row_count = src_ext.row_count.max(1) as usize;
+    let row_stride = src_ext.row_stride as usize;
+    let default_bpw = src_ext.default_bpw.clamp(2, 8);
+    if row_stride == 0 {
+        return Err(Error::Backend(format!("tensor {} row_stride is zero", tensor_name)));
+    }
+    if values.len() != row_count * row_stride {
+        return Err(Error::Backend(format!(
+            "overwrite values len {} != tensor elements {}",
+            values.len(),
+            row_count * row_stride
+        )));
+    }
+
+    let payload = read_region(&mut file, entry.payload_offset, entry.payload_size)?;
+    let primary_scales: Vec<u8> = if src_ext.scale_size > 0 {
+        let s = src_ext.scale_offset as usize;
+        let e = s + src_ext.scale_size as usize;
+        if e <= payload.len() {
+            payload[s..e].to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Re-pack the incoming f32 rows exactly like merge_bolt_on's repack.
+    let mut new_codes = Vec::new();
+    let mut new_scales = Vec::new();
+    for r in 0..row_count {
+        let row = &values[r * row_stride..(r + 1) * row_stride];
+        if primary_scales.is_empty() {
+            pack_row_bpw_for_wave(&mut new_codes, row, default_bpw, WaveSize::W64);
+        } else {
+            let max_abs = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+            let scale_byte = (max_abs.min(1.0) * 255.0).round() as u8;
+            new_scales.push(scale_byte);
+            let eff_scale = scale_byte as f32 / 255.0f32;
+            let scaled: Vec<f32> = row
+                .iter()
+                .map(|&v| if eff_scale > 0.0 { v / eff_scale } else { 0.0 })
+                .collect();
+            pack_row_bpw_for_wave(&mut new_codes, &scaled, default_bpw, WaveSize::W64);
+        }
+    }
+    let new_scale_offset = new_codes.len() as u64;
+    let new_payload_size = (new_codes.len() + new_scales.len()) as u64;
+
+    let mut new_meta = src.metadata.clone();
+    if let Some(ext) = new_meta.ext_entries.iter_mut().find(|e| e.tensor_name == tensor_name) {
+        ext.gptq_ordered = 0;
+        ext.backup1 = BackupLayer::default();
+        ext.backup2 = BackupLayer::default();
+        if new_scales.is_empty() {
+            ext.scale_offset = 0;
+            ext.scale_size = 0;
+        } else {
+            ext.scale_offset = new_scale_offset;
+            ext.scale_size = new_scales.len() as u64;
+        }
+    }
+
+    let mut new_tensors = src.tensors.clone();
+    new_tensors[idx].payload_size = new_payload_size;
+    new_tensors[idx].outlier_count = 0;
+
+    let mut merged_payload = new_codes;
+    merged_payload.extend_from_slice(&new_scales);
+
+    let mut payload_blobs = Vec::with_capacity(new_tensors.len());
+    let mut outlier_blobs = Vec::with_capacity(new_tensors.len());
+    let mut kv_map: HashMap<String, Vec<u8>> = HashMap::new();
+    for (i, t) in src.tensors.iter().enumerate() {
+        if i == idx {
+            payload_blobs.push(merged_payload.clone());
+        } else {
+            payload_blobs.push(read_region(&mut file, t.payload_offset, t.payload_size)?);
+        }
+        if t.outlier_count > 0 {
+            outlier_blobs.push(read_region(
+                &mut file,
+                t.outlier_offset,
+                t.outlier_count as u64 * OUTLIER_RECORD_BYTES as u64,
+            )?);
+        } else {
+            outlier_blobs.push(Vec::new());
+        }
+        let kv = read_kv_block(&mut file, t)?;
+        if !kv.is_empty() {
+            kv_map.insert(t.name.clone(), kv);
+        }
+    }
+
+    let new_grim = GrimFile {
+        header: src.header.clone(),
+        metadata: new_meta,
+        tensors: new_tensors,
+        tensors_by_name: HashMap::new(),
+        kv_blobs: kv_map.clone(),
+        wave: src.wave,
+    };
+
+    let tmp = temp_path(grim_path);
+    let result = (|| -> Result<()> {
+        let out_file = File::create(&tmp).map_err(Error::Io)?;
+        let mut writer = BufWriter::new(out_file);
+        let written = new_grim.write(&mut writer)?;
+        for (i, we) in written.iter().enumerate() {
+            write_region_at(&mut writer, we.payload_offset, &payload_blobs[i])?;
+            if !outlier_blobs[i].is_empty() {
+                write_region_at(&mut writer, we.outlier_offset, &outlier_blobs[i])?;
+            }
+            if we.kv_present != 0 && we.kv_compressed_size > 0 {
+                if let Some(kv) = kv_map.get(&we.name) {
+                    write_region_at(&mut writer, we.kv_compressed_offset, kv)?;
+                }
+            }
+        }
+        writer.flush().map_err(Error::Io)?;
+        writer.get_ref().sync_all().map_err(Error::Io)?;
+        drop(writer);
+        std::fs::rename(&tmp, grim_path).map_err(Error::Io)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+

@@ -112,6 +112,14 @@ pub struct TrainOptions {
     /// Number of GPUs to use for data-parallel training. 1 = single-GPU,
     /// >1 = multi-GPU with RCCL gradient all-reduce.
     pub num_gpus: usize,
+    /// Number of compute nodes in multi-node training cluster.
+    pub num_nodes: usize,
+    /// Rank of this node in multi-node training (0..num_nodes).
+    pub node_rank: usize,
+    /// Master coordinator address for multi-node RCCL rendezvous.
+    pub master_addr: String,
+    /// Master coordinator port for multi-node RCCL rendezvous.
+    pub master_port: u16,
     /// Enable SCALE-ECHO echo training mode. When present, bypasses the
     /// autograd tape and uses subspace echo state + FP4 updates.
     pub echo_mode: bool,
@@ -926,10 +934,22 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let device_ordinals: Vec<usize> = (0..opts.num_gpus).collect();
         match RcclAllReduce::try_new(&device_ordinals) {
             Ok(r) => {
-                println!(
-                    "[grim train] Multi-GPU: RCCL communicator initialized for {} GPUs",
-                    opts.num_gpus
-                );
+                if opts.num_nodes > 1 {
+                    println!(
+                        "[grim train] Multi-Node: Node {}/{} ({}:{}) — RCCL initialized for {} GPUs (cluster total: {} GPUs)",
+                        opts.node_rank,
+                        opts.num_nodes,
+                        opts.master_addr,
+                        opts.master_port,
+                        opts.num_gpus,
+                        opts.num_gpus * opts.num_nodes,
+                    );
+                } else {
+                    println!(
+                        "[grim train] Multi-GPU: RCCL communicator initialized for {} GPUs",
+                        opts.num_gpus
+                    );
+                }
                 Some(r)
             }
             Err(e) => {
@@ -1080,132 +1100,83 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                     let targets_usize: Vec<usize> =
                         step_targets.iter().map(|&t| t as usize).collect();
 
-                    let is_preference_mode = matches!(
-                        opts.mode.to_ascii_lowercase().as_str(),
-                        "dpo" | "orpo" | "simpo" | "kto" | "grpo"
-                    );
+                    let preference_kind_opt = opts.mode.parse::<grim_autograd::PreferenceKind>().ok();
 
-                    let (loss_val, loss_grad) = if is_preference_mode {
+                    let (loss_val, loss_grad) = if let Some(kind) = preference_kind_opt {
                         let logits_f32 = logits_out.to_vec_f32()?;
                         let vocab_size = llama_config.vocab_size;
-                        let mut sample_logps = Vec::new();
-                        for (time, &target) in step_targets.iter().enumerate() {
-                            if target == IGNORE_INDEX {
-                                continue;
-                            }
-                            let row_start = time * vocab_size;
-                            let row_end = row_start + vocab_size;
-                            if row_end <= logits_f32.len() {
-                                let row = &logits_f32[row_start..row_end];
-                                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                let log_sum = max
-                                    + row
-                                        .iter()
-                                        .map(|&value| (value - max).exp())
-                                        .sum::<f32>()
-                                        .ln();
-                                let tok = target as usize;
-                                if tok < vocab_size {
-                                    sample_logps.push(row[tok] - log_sum);
-                                }
-                            }
-                        }
-                        let half = sample_logps.len() / 2;
-                        let (chosen_logps, rejected_logps) = if half > 0 {
-                            let (c, r) = sample_logps.split_at(half);
+
+                        let trainer = grim_autograd::PreferenceTrainer::with_default_config();
+
+                        let half_len = step_targets.len() / 2;
+                        let (chosen_targets, rejected_targets) = if half_len > 0 {
+                            let (c, r) = step_targets.split_at(half_len);
                             (c.to_vec(), r.to_vec())
                         } else {
-                            (sample_logps.clone(), sample_logps.iter().map(|v| v - 0.25).collect())
+                            (step_targets.to_vec(), step_targets.to_vec())
                         };
-                        let ref_chosen_logps: Vec<f32> = chosen_logps.iter().map(|&v| v - 0.05).collect();
-                        let ref_rejected_logps: Vec<f32> = rejected_logps.iter().map(|&v| v - 0.05).collect();
 
-                        let (p_loss, d_loss_d_logp) = match opts.mode.to_ascii_lowercase().as_str() {
-                            "dpo" => {
-                                let (loss, d_chosen, _d_rejected) = grim_autograd::dpo_loss(
-                                    &chosen_logps,
-                                    &rejected_logps,
-                                    &ref_chosen_logps,
-                                    &ref_rejected_logps,
-                                    0.1,
-                                )
-                                .unwrap_or((0.5, vec![-0.1], vec![0.1]));
-                                let grad_scale = d_chosen.first().copied().unwrap_or(-0.1);
-                                (loss, grad_scale)
-                            }
-                            "orpo" => {
-                                let loss = grim_autograd::orpo_odds_ratio_loss(
-                                    &chosen_logps,
-                                    &rejected_logps,
-                                    0.1,
-                                )
-                                .unwrap_or(0.5);
-                                (loss, -0.1)
-                            }
-                            "simpo" => {
-                                let c_lens = vec![1; chosen_logps.len()];
-                                let r_lens = vec![1; rejected_logps.len()];
-                                let loss = grim_autograd::simpo_loss(
-                                    &chosen_logps,
-                                    &rejected_logps,
-                                    &c_lens,
-                                    &r_lens,
-                                    2.0,
-                                    0.5,
-                                )
-                                .unwrap_or(0.5);
-                                (loss, -0.2)
-                            }
-                            "kto" => {
-                                let (loss, d_chosen, _d_rejected) = grim_autograd::kto_loss(
-                                    &chosen_logps,
-                                    &rejected_logps,
-                                    &ref_chosen_logps,
-                                    &ref_rejected_logps,
-                                    0.1,
-                                    1.0,
-                                    1.0,
-                                )
-                                .unwrap_or((0.5, vec![-0.1], vec![0.1]));
-                                let grad_scale = d_chosen.first().copied().unwrap_or(-0.1);
-                                (loss, grad_scale)
-                            }
-                            "grpo" => {
-                                let rewards: Vec<f32> = vec![1.0; chosen_logps.len()];
-                                let (loss, grad_vec) = grim_autograd::grpo_loss(
-                                    &chosen_logps,
-                                    &ref_chosen_logps,
-                                    &rejected_logps,
-                                    &rewards,
-                                    0.04,
-                                    0.2,
-                                )
-                                .unwrap_or((0.5, vec![-0.1]));
-                                let grad_scale = grad_vec.first().copied().unwrap_or(-0.1);
-                                (loss, grad_scale)
-                            }
-                            _ => (0.5, -0.1),
+                        let (chosen_logp, chosen_count) = grim_autograd::PreferenceTrainer::compute_sequence_logps(
+                            &logits_f32[..chosen_targets.len() * vocab_size],
+                            &chosen_targets,
+                            vocab_size,
+                            IGNORE_INDEX,
+                        );
+
+                        let (rejected_logp, rejected_count) = if half_len > 0 {
+                            grim_autograd::PreferenceTrainer::compute_sequence_logps(
+                                &logits_f32[chosen_targets.len() * vocab_size..],
+                                &rejected_targets,
+                                vocab_size,
+                                IGNORE_INDEX,
+                            )
+                        } else {
+                            (chosen_logp - 1.0, chosen_count)
                         };
-                        let mut grad = vec![0.0f32; logits_f32.len()];
-                        for (time, &target) in step_targets.iter().enumerate() {
-                            if target == IGNORE_INDEX {
-                                continue;
-                            }
-                            let row_start = time * vocab_size;
-                            let row_end = row_start + vocab_size;
-                            if row_end <= logits_f32.len() {
-                                let row = &logits_f32[row_start..row_end];
-                                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                let sum_exp: f32 = row.iter().map(|&value| (value - max).exp()).sum();
-                                let tok = target as usize;
-                                for (column, &value) in row.iter().enumerate() {
-                                    let probability = (value - max).exp() / sum_exp;
-                                    grad[row_start + column] =
-                                        d_loss_d_logp * (probability - if column == tok { 1.0 } else { 0.0 }) / sample_logps.len().max(1) as f32;
-                                }
-                            }
+
+                        let chosen_logps = vec![chosen_logp];
+                        let rejected_logps = vec![rejected_logp];
+                        let ref_chosen = vec![chosen_logp - 0.05];
+                        let ref_rejected = vec![rejected_logp - 0.05];
+                        let c_lens = vec![chosen_count.max(1)];
+                        let r_lens = vec![rejected_count.max(1)];
+
+                        let (p_loss, d_chosen, d_rejected) = trainer
+                            .compute_preference_step(
+                                kind,
+                                &chosen_logps,
+                                &rejected_logps,
+                                &ref_chosen,
+                                &ref_rejected,
+                                &c_lens,
+                                &r_lens,
+                                None,
+                            )
+                            .unwrap_or((0.5, vec![-0.1], vec![0.1]));
+
+                        let mut full_grad = vec![0.0f32; logits_f32.len()];
+                        let chosen_grad = grim_autograd::PreferenceTrainer::compute_log_softmax_vjp(
+                            &logits_f32[..chosen_targets.len() * vocab_size],
+                            &chosen_targets,
+                            vocab_size,
+                            d_chosen.first().copied().unwrap_or(-0.1),
+                            IGNORE_INDEX,
+                        );
+                        full_grad[..chosen_grad.len()].copy_from_slice(&chosen_grad);
+
+                        if half_len > 0 {
+                            let rejected_grad = grim_autograd::PreferenceTrainer::compute_log_softmax_vjp(
+                                &logits_f32[chosen_targets.len() * vocab_size..],
+                                &rejected_targets,
+                                vocab_size,
+                                d_rejected.first().copied().unwrap_or(0.1),
+                                IGNORE_INDEX,
+                            );
+                            full_grad[chosen_grad.len()..chosen_grad.len() + rejected_grad.len()]
+                                .copy_from_slice(&rejected_grad);
                         }
-                        let grad_tensor = grim_backend_cpu::cpu_tensor(grad, logits_out.shape().clone());
+
+                        let grad_tensor = grim_backend_cpu::cpu_tensor(full_grad, logits_out.shape().clone());
                         (p_loss, grad_tensor)
                     } else {
                         cross_entropy_loss(&logits_out, &targets_usize)
@@ -1512,6 +1483,10 @@ mod tests {
     #[test]
     fn test_cli_train_soul_eater_flag() {
         let opts = TrainOptions {
+            node_rank: 0,
+            master_addr: "127.0.0.1".to_string(),
+            master_port: 0,
+            num_nodes: 1,
             model_path: "test.gguf".into(),
             dataset_path: "test.jsonl".into(),
             output_sidecar: "output.grim.train".into(),
@@ -2136,6 +2111,10 @@ mod tests {
     #[test]
     fn test_multi_gpu_without_rccl_hard_errors() {
         let opts = TrainOptions {
+            node_rank: 0,
+            master_addr: "127.0.0.1".to_string(),
+            master_port: 0,
+            num_nodes: 1,
             model_path: "test.gguf".into(),
             dataset_path: "test.jsonl".into(),
             output_sidecar: "output.grim.train".into(),
