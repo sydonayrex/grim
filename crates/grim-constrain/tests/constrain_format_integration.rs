@@ -89,3 +89,56 @@ fn test_constrained_sampler_json_object_enforcement() {
     // ConstrainedSampler must mask invalid token 5 (-inf) so token 0 ("{", logit 5.0) is selected
     assert_eq!(sampled, 0, "Sampler must force valid opening brace");
 }
+
+/// F9 regression: the bounded-backtracking regex subset must accept/reject
+/// exactly the language of the pattern, including character classes, ranges,
+/// and `{m,n}` quantifiers — not the old substring heuristic.
+#[test]
+fn test_f9_regex_subset_engine() {
+    use grim_constrain::schema::validate_pattern;
+
+    // Anchored repetition
+    assert!(validate_pattern("^[A-Z]{3}$", "ABC"));
+    assert!(!validate_pattern("^[A-Z]{3}$", "AB"));
+    assert!(!validate_pattern("^[A-Z]{3}$", "ABCD"));
+
+    // Character classes and ranges
+    assert!(validate_pattern(r"^\d{4}-\d{2}$", "2026-08"));
+    assert!(!validate_pattern(r"^\d{4}-\d{2}$", "2026-8"));
+    assert!(validate_pattern(r"^[^0-9]+$", "abc"));
+    assert!(!validate_pattern(r"^[^0-9]+$", "a1c"));
+
+    // Unanchored substring match still works
+    assert!(validate_pattern("foo", "foobar"));
+    assert!(!validate_pattern("foo", "bar"));
+}
+
+/// F9 regression: schema-driven lookahead jump-forward must deterministically
+/// emit the forced continuation when the schema admits exactly one path
+/// (single required key, single enum value).
+#[test]
+fn test_f9_schema_lookahead_jump_forward() {
+    use grim_constrain::schema::compile_json_schema;
+
+    // Single required key → after `{`, the only valid continuation is the key.
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "name": {"type": "string"} },
+        "required": ["name"]
+    });
+    let comp = compile_json_schema(schema).unwrap();
+    assert_eq!(
+        comp.lookahead_jump_forward("{").as_deref(),
+        Some("\"name\": "),
+        "forced key name must be jump-forwarded"
+    );
+
+    // Single enum value → the whole value is forced.
+    let schema = serde_json::json!({"type": "string", "enum": ["x"]});
+    let comp = compile_json_schema(schema).unwrap();
+    assert_eq!(
+        comp.lookahead_jump_forward("").as_deref(),
+        Some("\"x\""),
+        "single-enum value must be jump-forwarded"
+    );
+}
