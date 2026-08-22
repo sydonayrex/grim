@@ -1,0 +1,20 @@
+Explain the difference between TCP and UDP in three sentences.
+Write a Python function to check if a string is a palindrome.
+Summarize the theory of general relativity for a high school student.
+What are the primary colors in additive and subtractive color models?
+Write a SQL query to find the second highest salary in an employees table.
+Explain how public-key cryptography works using an analogy.
+What is the difference between a process and a thread?
+Write a rust function to binary search an integer array.
+Explain what happens when you type a URL into a web browser and press enter.
+What are the four main principles of object-oriented programming?
+Explain the difference between depth-first search and breadth-first search.
+How does gradient descent optimize neural network weights?
+Write a bash one-liner to find all .log files modified in the last 24 hours.
+What is Amdahl's Law and what are its implications for parallel computing?
+Explain the difference between synchronous and asynchronous I/O.
+What is the purpose of an index in a relational database?
+Explain the concept of memory alignment and why it matters for CPU/GPU performance.
+How does the attention mechanism in transformers work?
+Write a brief overview of the Byzantine Generals Problem and its solutions.
+What is the difference between static and dynamic linking?

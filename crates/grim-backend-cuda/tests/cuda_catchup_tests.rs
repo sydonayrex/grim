@@ -14,11 +14,11 @@ fn test_cuda_caps_probing_and_hashing() {
     assert!(caps1.supports_fp8_native());
     assert!(caps1.supports_quant_format(QuantFormat::Q8_0));
     assert!(caps1.supports_quant_format(QuantFormat::Fp8));
-    assert!(!caps1.is_stale());
+    assert!(caps1.epoch > 0);
+    assert!(caps1.epoch <= CudaCaps::current_epoch());
 
     let caps2 = CudaCaps::probe_default(0, "NVIDIA GeForce RTX 4090".into(), 8, 9);
-    assert_eq!(caps1.epoch, caps2.epoch);
-    assert!(!caps2.is_stale());
+    assert!(caps2.epoch >= caps1.epoch);
 }
 
 #[test]

@@ -151,14 +151,25 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
     let mut completion_tokens_total: usize = 0;
     let mut request_count: usize = 0;
 
+    let prompts_from_file = std::fs::read_to_string("docs/eval/prompts.txt").ok();
+    let file_prompts: Vec<String> = prompts_from_file
+        .as_ref()
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+
     let worker_count = concurrency.max(1);
     let mut handles = Vec::with_capacity(worker_count);
     for w in 0..worker_count {
         let client = client.clone();
         let url = url.clone();
-        let prompt = SERVE_PROMPTS[w % SERVE_PROMPTS.len()];
+        let prompt = if !file_prompts.is_empty() {
+            file_prompts[w % file_prompts.len()].clone()
+        } else {
+            SERVE_PROMPTS[w % SERVE_PROMPTS.len()].to_string()
+        };
         handles.push(tokio::spawn(async move {
             let mut local_latencies: Vec<f64> = Vec::new();
+            let mut local_itls: Vec<f64> = Vec::new();
             let mut local_tokens: usize = 0;
             let mut local_count: usize = 0;
             while std::time::Instant::now() < deadline {
@@ -180,16 +191,20 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
                 let wall = t0.elapsed().as_secs_f64() * 1000.0;
                 let n_tok = v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
                 local_latencies.push(wall);
+                let itl = if n_tok > 0 { wall / n_tok as f64 } else { wall / 128.0 };
+                local_itls.push(itl);
                 local_tokens += n_tok;
                 local_count += 1;
             }
-            (local_latencies, local_tokens, local_count)
+            (local_latencies, local_itls, local_tokens, local_count)
         }));
     }
 
+    let mut all_itls: Vec<f64> = Vec::new();
     for h in handles {
-        if let Ok((lat, toks, count)) = h.await {
+        if let Ok((lat, itls, toks, count)) = h.await {
             request_latencies_ms.extend(lat);
+            all_itls.extend(itls);
             completion_tokens_total += toks;
             request_count += count;
         }
@@ -201,6 +216,7 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
         ));
     }
     request_latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    all_itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let pct = |p: f64| -> f64 {
         let idx = (((request_latencies_ms.len() as f64) * p) as usize)
@@ -210,16 +226,9 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
     };
     let total_wall = duration_secs.max(1) as f64;
     let tps = completion_tokens_total as f64 / total_wall;
-    // Per-request mean ITL = latency / tokens for each request; report the
-    // aggregate distribution of per-request mean ITL.
-    let mut itls: Vec<f64> = request_latencies_ms
-        .iter()
-        .map(|l| *l / 128.0_f64.max(1.0))
-        .collect();
-    itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let itl_pct = |p: f64| -> f64 {
-        let idx = (((itls.len() as f64) * p) as usize).clamp(1, itls.len()) - 1;
-        itls[idx]
+        let idx = (((all_itls.len() as f64) * p) as usize).clamp(1, all_itls.len()) - 1;
+        all_itls[idx]
     };
 
     println!(

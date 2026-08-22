@@ -206,7 +206,7 @@ async fn run_gsm8k(
                 )}
             ],
             "temperature": 0,
-            "max_tokens": 512
+            "max_tokens": 256
         });
         let resp = client.post(&url).json(&body).send().await.map_err(map_req_err)?;
         let v: serde_json::Value = resp.json().await.map_err(map_req_err)?;
@@ -343,6 +343,7 @@ pub async fn cmd_eval(
     if let Some(out_path) = output {
         let doc = serde_json::json!({
             "model": model,
+            "task": tasks,
             "metrics": metrics,
             "date": chrono_now_iso(),
         });
@@ -363,6 +364,7 @@ fn chrono_now_iso() -> String {
     let days = secs / 86400;
     let rem = secs % 86400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Formula for civil date from days since 1970-01-01
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -411,5 +413,27 @@ mod tests {
         assert_eq!(normalize_number("$42"), "42");
         assert_eq!(normalize_number("3.50"), "3.5");
         assert_eq!(normalize_number("42.000000001"), "42.000000001");
+    }
+
+    #[test]
+    fn test_ppl_math_synthetic_logits_known_answer() {
+        // Test cross-entropy and perplexity calculation with uniform logits.
+        // For uniform distribution over V classes:
+        // P(target) = 1/V, -ln(1/V) = ln(V), exp(ln(V)) = V.
+        let vocab_size = 100usize;
+        let uniform_logits = vec![1.0f32; vocab_size];
+        
+        let max_l = 1.0f32;
+        let sum_exp: f32 = uniform_logits.iter().map(|&x| (x - max_l).exp()).sum();
+        let log_sum_exp = max_l + sum_exp.ln();
+        
+        let target_idx = 42usize;
+        let target_logit = uniform_logits[target_idx];
+        let nll = (log_sum_exp - target_logit) as f64;
+        let expected_nll = (vocab_size as f64).ln();
+        assert!((nll - expected_nll).abs() < 1e-5);
+        
+        let ppl = nll.exp() as f32;
+        assert!((ppl - vocab_size as f32).abs() < 1e-3);
     }
 }

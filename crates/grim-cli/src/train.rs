@@ -56,6 +56,16 @@ impl TrainDtype {
     }
 }
 
+/// Helper to classify if an error is an out-of-memory error (HIP / CUDA / backend).
+pub fn is_out_of_memory_error(err_str: &str) -> bool {
+    let lower = err_str.to_ascii_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("hiperroroutofmemory")
+        || lower.contains("hiperrormemoryallocation")
+        || lower.contains("cudaerrormemoryallocation")
+        || lower.contains("failed: 2")
+}
+
 /// Training arguments for CLI execution.
 #[derive(Debug, Clone)]
 pub struct TrainOptions {
@@ -95,6 +105,8 @@ pub struct TrainOptions {
     /// training forward (STE identity backward), and saved adapters run real
     /// `quant_mxfp4_matrix` packing at export.
     pub qat_mxfp4: bool,
+    /// Number of gradient checkpointing segments across layers (0 = disabled).
+    pub checkpoint_segs: usize,
     /// Stop training if loss does not improve for this many epochs. 0 disables early stopping.
     pub early_stopping_patience: usize,
     /// Number of GPUs to use for data-parallel training. 1 = single-GPU,
@@ -771,11 +783,11 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                 Some(r)
             }
             Err(e) => {
-                eprintln!(
-                    "[grim train] WARNING: RCCL init failed ({}). Falling back to single-GPU.",
-                    e
-                );
-                None
+                return Err(Error::Session(format!(
+                    "Multi-GPU training requested (num_gpus={}) but RCCL initialization failed: {e}. \
+                     Aborting to prevent divergent gradients across GPUs.",
+                    opts.num_gpus
+                )));
             }
         }
     } else {
@@ -821,6 +833,9 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             let hidden = model_config.hidden_size;
 
             let mut tape = Tape::new();
+            if opts.checkpoint_segs > 1 {
+                tape.set_checkpoint_segs(opts.checkpoint_segs);
+            }
             streaming.checkpoint_buffer.clear();
 
             let mut hidden_state = tok_embeddings
@@ -830,6 +845,10 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
             // Run streaming forward through all layers with autograd tape recording.
             for layer_idx in 0..num_layers {
+                if opts.checkpoint_segs > 1 {
+                    let seg = layer_idx / ((num_layers + opts.checkpoint_segs - 1) / opts.checkpoint_segs);
+                    tape.mark_segment_boundary(seg, x_id);
+                }
                 let (next_id, next_h) = streaming
                     .forward_block_with_autograd(
                         &provider,
@@ -894,19 +913,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             // Gradient accumulation: step every N micro-batches.
             if num_batches % accum as u32 == 0 {
                 // Multi-GPU gradient all-reduce via RCCL (in-place device pointer sum + 1/N averaging).
-                // Falls back to the CPU round-trip BackendDevice::all_reduce if no RCCL handle.
                 if let (Some(rccl_ref), Some(placement)) = (&rccl, &dp_placement) {
                     autograd_reg
                         .params
                         .all_reduce_grads(&*dev, placement, Some(rccl_ref))
                         .map_err(|e| Error::Session(format!("all_reduce_grads failed: {e}")))?;
                 } else if opts.num_gpus > 1 {
-                    // Fallback: use BackendDevice::all_reduce (still CPU round-trip,
-                    // but at least exercises the trait method path).
-                    eprintln!(
-                        "[grim train] WARNING: no RCCL handle; gradient sync is not performed. \
-                         Multi-GPU results may be incorrect."
-                    );
+                    return Err(Error::Session(format!(
+                        "Multi-GPU training requested (num_gpus={}) but no active RCCL handle is available.",
+                        opts.num_gpus
+                    )));
                 }
 
                 // Global gradient clipping (scale grad by 1/accum, then clip).
@@ -1112,6 +1128,7 @@ mod tests {
             olora_lambda: 0.0,
             use_spectral_qlora: false,
             qat_mxfp4: false,
+            checkpoint_segs: 0,
             early_stopping_patience: 3,
             num_gpus: 1,
             echo_mode: false,
@@ -1552,5 +1569,63 @@ mod tests {
         }
         assert!(tok.chat_template.is_some());
         assert!(tok.chat_template.unwrap().contains("<|im_start|>"));
+    }
+
+    #[test]
+    fn test_is_out_of_memory_error_classification() {
+        assert!(is_out_of_memory_error("hipErrorOutOfMemory (code 2)"));
+        assert!(is_out_of_memory_error("hipMalloc failed: 2"));
+        assert!(is_out_of_memory_error("Out of memory while allocating device buffer"));
+        assert!(is_out_of_memory_error("cudaErrorMemoryAllocation"));
+        assert!(!is_out_of_memory_error("File not found: model.gguf"));
+    }
+
+    #[test]
+    fn test_multi_gpu_without_rccl_hard_errors() {
+        let opts = TrainOptions {
+            model_path: "test.gguf".into(),
+            dataset_path: "test.jsonl".into(),
+            output_sidecar: "output.grim.train".into(),
+            epochs: 1,
+            lr: 1e-4,
+            rank: 8,
+            alpha: 16.0,
+            batch_size: 2048,
+            gradient_accumulation_steps: 4,
+            warmup_steps: 10,
+            logging_steps: 1,
+            max_grad_norm: 1.0,
+            device: "cpu".into(),
+            mode: "qlora".into(),
+            optimizer: grim_autograd::OptimizerKind::AdamW,
+            scheduler: grim_autograd::LRScheduler::Cosine,
+            use_pissa: false,
+            use_olora: false,
+            olora_lambda: 0.0,
+            use_spectral_qlora: false,
+            qat_mxfp4: false,
+            checkpoint_segs: 2,
+            early_stopping_patience: 3,
+            num_gpus: 4, // Multi-GPU
+            echo_mode: false,
+            seed: 0,
+            train_dtype: TrainDtype::F32,
+            lora_plus_ratio: 1.0,
+            relora_reset_steps: 0,
+            use_oft: false,
+            oft_rank: 8,
+            eval_dataset: None,
+            eval_every_steps: 0,
+            eval_warmup_steps: 0,
+            dataset_paths: vec![],
+            mix_weights: vec![],
+            dedup: false,
+            quick: false,
+        };
+        let res = cmd_train(opts);
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap().to_string();
+        // Must either fail on model missing or multi-GPU RCCL init
+        assert!(err_msg.contains("Multi-GPU") || err_msg.contains("failed") || err_msg.contains("No such file"));
     }
 }

@@ -3725,11 +3725,12 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             )
         })
         .unwrap_or(false);
+    let accepted_tokens = engine.accepted_tokens_total();
     let acceptance_rate = engine.acceptance_rate();
     let speculation_info = serde_json::json!({
         "enabled": !spec_disabled,
         "strategy": if spec_disabled { "disabled" } else { "auto" },
-        "accepted_tokens": total_tokens,
+        "accepted_tokens": accepted_tokens,
         "accepted_rate": acceptance_rate
     });
     Json(serde_json::json!({
@@ -7666,13 +7667,35 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
         Some(tele) => serde_json::json!({
             "strategy": tele.strategy,
             "accept_rate_ema": tele.accept_rate_ema,
+            "accepted_rate": engine.acceptance_rate(),
             "steps_observed": tele.steps_observed,
             "total_drafted_tokens": tele.total_drafted_tokens,
             "total_accepted_tokens": tele.total_accepted_tokens,
+            "accepted_tokens": tele.total_accepted_tokens,
             "min_accept_rate": tele.min_accept_rate,
             "should_adapt": tele.should_adapt,
+            "enabled": true,
         }),
-        None => serde_json::Value::Null,
+        None => {
+            let spec_disabled = std::env::var("GRIM_SPEC")
+                .map(|v| {
+                    matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "off" | "0" | "false" | "disable" | "disabled"
+                    )
+                })
+                .unwrap_or(false);
+            if !spec_disabled && engine.total_tokens_generated() > 0 {
+                serde_json::json!({
+                    "enabled": true,
+                    "strategy": "auto",
+                    "accepted_tokens": engine.accepted_tokens_total(),
+                    "accepted_rate": engine.acceptance_rate(),
+                })
+            } else {
+                serde_json::Value::Null
+            }
+        }
     };
 
     serde_json::json!({

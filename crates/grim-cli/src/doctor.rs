@@ -36,6 +36,7 @@ pub fn run_doctor(
     check_gpu_backend(&mut report);
     check_toolchain(&mut report);
     check_plugin_grants(&mut report);
+    check_configuration(&mut report);
 
     // WI-2: optional pre-flight model/hardware compatibility check.
     // Runs *after* the existing system checks so the full suite still
@@ -425,6 +426,20 @@ fn check_plugin_grants(report: &mut DoctorReport) {
     println!(
         "[INFO] Native dylib plugins (.so/.dll) run in-process as trusted modules (see §6.1)."
     );
+}
+
+/// WI-X16: verify effective configuration source per key (file vs env vs default).
+fn check_configuration(_report: &mut DoctorReport) {
+    println!("\n=== Effective Configuration (WI-X16) ===");
+    if let Some(p) = grim_core::env_config::RuntimeEnv::locate_config_file() {
+        println!("  Config File: {} (found)", p.display());
+    } else {
+        println!("  Config File: None (using environment / defaults)");
+    }
+    let env = grim_core::env_config::RuntimeEnv::from_env();
+    for (key, val, src) in env.effective_config_summary() {
+        println!("  - {:<18} = {:<20} [source: {}]", key, val, src);
+    }
 }
 
 /// WI-2: pre-flight model/hardware compatibility check.

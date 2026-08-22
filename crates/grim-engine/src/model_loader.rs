@@ -1280,9 +1280,10 @@ fn load_model_from_config(
                 n_swa: 0,
                 swa_type: 0,
                 n_embd_out: 0,
+                // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (escape hatch: GRIM_LFM2_MXFP4_QKV=0/false/off)
                 mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+                    .unwrap_or(true),
             };
 
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
@@ -2819,9 +2820,10 @@ fn load_model_with_providers(
                 n_swa: 0,
                 swa_type: 0,
                 n_embd_out: 0,
+                // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (escape hatch: GRIM_LFM2_MXFP4_QKV=0/false/off)
                 mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+                    .unwrap_or(true),
             };
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -4259,8 +4261,11 @@ mod tests {
     /// if the branch is correctly wired (which we're verifying), and the real
     /// work is making sure the CLI install step puts files in the right place
     /// for this branch to find them.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_arch_compat_spec_finds_grimplugin_in_plugins_dir() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
 
         // Write a .grimplugin JSON into the temp dir.
@@ -4324,6 +4329,7 @@ mod tests {
     /// over the plugins-dir scan when both are available.
     #[test]
     fn resolve_arch_compat_spec_prefers_inline_config_over_plugins_dir() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
 
         // Write a .grimplugin into the plugins dir with one set of values.
