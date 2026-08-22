@@ -303,14 +303,18 @@ impl Optimizer {
                 lr,
                 ..AdafactorConfig::default()
             }))),
-            OptimizerKind::QGaLoreAdamW8Bit
-            | OptimizerKind::GaloreAdamW
-            | OptimizerKind::GaloreAdamW8Bit => Ok(Optimizer::QGaLoreAdamW8Bit(
-                QGaLoreAdamW8Bit::new(QGaLoreAdamW8BitConfig {
-                    lr,
-                    ..QGaLoreAdamW8BitConfig::default()
-                }),
-            )),
+            OptimizerKind::GaloreAdamW => Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
+                lr,
+                ..AdamWConfig::default()
+            }))),
+            OptimizerKind::QGaLoreAdamW8Bit | OptimizerKind::GaloreAdamW8Bit => {
+                Ok(Optimizer::QGaLoreAdamW8Bit(QGaLoreAdamW8Bit::new(
+                    QGaLoreAdamW8BitConfig {
+                        lr,
+                        ..QGaLoreAdamW8BitConfig::default()
+                    },
+                )))
+            }
             OptimizerKind::Muon => Ok(Optimizer::Muon(Muon::new(MuonConfig {
                 lr,
                 ..MuonConfig::default()

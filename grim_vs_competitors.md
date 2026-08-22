@@ -266,3 +266,49 @@ This is the single largest previously-unexamined subsystem found in this pass. T
 ### 7.6 What this section changes about the rest of the document
 
 Two corrections stand out as more important than the subsystem writeups themselves: the `roofline_cost` bug and the `scythe_persistent` test-quality gap, both cited in prior internal notes as confirmed open issues, do not reproduce against the current source and each has direct evidence (a passing named regression test; a hardware-verified integration test) suggesting they were already fixed. Anyone planning work against those two items should re-verify against current source before prioritizing them, rather than trusting the older notes.
+
+---
+
+# Re-verification @ 77b4bc0e (2026-08-22) — deltas against everything above
+
+Full re-audit of grim at HEAD plus fresh source audits of all six competitor snapshots. Sections below supersede conflicting statements above.
+
+## D1. Disagg KV-transfer bug (§3.4): FIXED at the data-path level; handoff semantics still rough
+
+`PagedKvCache::append_kv_layer` (`grim-memory/src/lib.rs:918-977`) now mirrors every token's post-RoPE K/V into the shared pool via `pool.write_layer_keys/write_layer_values` (lines 971-974), so `transfer_kv_cache_real` reads live data. Prefill sends per-layer block slices then the pool-level transfer (`grim-engine/src/lib.rs:798-841`); decode pulls un-received blocks and writes them into both pool and page tensors (`engine lib.rs:856-910`). Content-sniffing replaced by an explicit received bit; byte-exact loopback tests exist (`grim-disagg lib.rs:616-669`, `grim-engine/tests/disagg_engine_loopback.rs:85-219`, real TCP between two engines). Residual gaps: layers >0 are re-fetched over TCP every decode step (no per-layer arrival tracking, `engine lib.rs:880-884`); prefill nodes start no receiver so the pull path logs connection errors (push is the reliable channel); the loopback test also runs a local 4-token prefill on the decode side, so it proves transport, not pure transferred-KV decode.
+
+## D2. Optimizer aliasing (§4.2): PARTIALLY FIXED
+
+`Optimizer::new` (`grim-autograd/src/adamw.rs:275-349`) now returns `Error::Unimplemented` with suggested alternatives for `lomo`, `adalomo`, `came`, `sophia`, `adamw-bnb` — silent AdamW aliasing is gone. Still aliased: `GaloreAdamW` and `GaloreAdamW8Bit` both construct `QGaLoreAdamW8Bit` with default config (lines 306-313). New real implementations since §4.2 was written: Muon, MAdam, LionVote. Note: the CLI help for `--optimizer` still advertises lomo/adalomo/came/sophia as accepted values that now hard-error at training start.
+
+## D3. Preference-loss wiring (§4.1/§4.2): split verdict — garage real, CLI degenerate
+
+The prior "implemented but unreachable" status is outdated in BOTH directions:
+
+- **Reachable and correct via grim-garage**: `TrainingMode::{Orpo,Dpo,Kto,SimPo,Grpo}` (`grim-garage/src/jobs.rs:186-208`) load chosen/rejected pairs from JSONL (`dataloader.rs:98-160`), run four forwards (chosen/rejected × policy/frozen-reference), apply `preference_loss_and_grads` with distinct gradients per input, and train via web API `POST /api/train/start`. Multi-rank RCCL variant exists. Integration test executes the real worker on a tiny GGUF ("PASSED 2026-08-20 on gfx1036").
+- **Reachable but WRONG via grim-cli**: `grim train --mode dpo|orpo|simpo|kto|grpo` passes the SAME logp vector as chosen=rejected=ref_chosen=ref_rejected (`grim-cli/src/train.rs:1000,1011,1016,1022`) making the loss constant −log σ(0) ≈ 0.693, hardcodes GRPO rewards to 1.0 (zero advantage), and backprops a hand-picked scalar (−0.1/−0.2) times a softmax CE gradient (train.rs:1028-1046) instead of the loss derivative. This is scaled-down SFT wearing a preference label.
+
+## D4. Correction to §4.2: `--mode` does NOT select a training path
+
+`opts.mode` is consumed only for printing and preference-mode detection (`train.rs:592,968,998`). `lora | full-bf16 | full-fp16 | soul-eater | oft` all execute the identical QLoRA-style adapter injection (`standard_qlora_with_flags`, train.rs:651-660). There is **no full-parameter fine-tuning** in grim today, contrary to §4.2's list of Train capabilities and the CLI help/docs. Soul Eater/Scythe1 math remains implemented-and-tested but has zero production callers (garage labels for those modes fall through to generic SFT, jobs.rs:1949-1969).
+
+## D5. New serving findings (not in earlier sections)
+
+- **Speculative decoding is default-ON**: `Engine::register_model` wraps every registered model in `SpeculativeCausalLm::auto` (strategies Plain/DSpark/NativeMtp, VRAM-aware fallback, acceptance-rate telemetry). EAGLE3 exists as a model file (`grim-models/transformer/src/eagle3.rs`) but nothing implements it as a drafter.
+- **Radix prefix-cache reuse defaults OFF** behind `GRIM_RADIX` env (`grim-engine/src/lib.rs:368-371`) — §3.1 described the mechanism but not the gate.
+- **Hot-path perf debt**: `paged_kv_handles` re-uploads K/V pages host→device every call/every layer/every step despite cache fields existing (`grim-memory lib.rs:987-1023`).
+- **Endpoint honesty**: `/v1/embeddings` returns hardcoded 501; `/v1/images/generations` runs a Flux2 forward but puts the literal string `format!("flux2_generated_pixels_{n}")` in `b64_json`; `/v1/audio/transcriptions` feeds an all-zero mel and returns canned `"Transcribed audio content"` even when Whisper is loaded (`grim-server/src/lib.rs:2382-2396,2632,2497-2518`). Zero auth anywhere (bind-defaults + optional TLS only).
+- **Multimodal Studio (grim-garage)**: Diffusion/Audio Studio tabs wired end-to-end at the transport level (UI→HTTP→pipeline→base64 BMP/WAV), but demo-grade: random-init default configs, synthetic prompt embeddings, `char % 256` tokenization for TTS, sine-synth mel for audio2audio; no checkpoint loading (`grim-garage/src/routes.rs:1674-1958`).
+- **Eval**: two tasks only (wikitext2 windowed PPL, GSM8K exact-match vs a running server). In-training held-out eval is a stub returning exp(training loss) (`grim-cli/src/train.rs:1185-1199`).
+- **SCYTHE-2 improvement**: the `micro_step % num_layers` placeholder is gone; `C2plrController.decide` runs per layer with real indices/shapes inside the rank-SFT forward and feeds step-level gradient-sync routing with measured-latency updates (`jobs.rs:1125-1136, 2628-2659`). Still training-only.
+- **Checkpoint-replay** (commit 647f3e87): segment replay during backward proven gradient-parity-equal to uncheckpointed backward; wired into CLI train when `--checkpoint-segs > 1`.
+- **QAT reality**: `--qat-mxfp4` fake-quantizes ONLY `lm_head.weight`; the field doc claiming all Linear weights are fake-quantized is currently false (`train.rs:939-947` vs `train.rs:103-107`).
+
+## D6. Competitor snapshot corrections (materially different from common descriptions)
+
+- **Ollama no longer vendors a ggml fork** (supersedes §1 table): the vendored tree is empty; upstream llama.cpp (`LLAMA_CPP_VERSION=b10091`) is fetched at build time via FetchContent and built as a `llama-server` binary; the Go daemon spawns one subprocess per loaded model and proxies HTTP (`llm/llama_server.go`), with a 105-line compat hook patch. First-party stacks: a Go MLX runner (own prefix-cache trie, MTP drafting) and an experimental Flux-architecture image generator. Anthropic Messages API served locally alongside OpenAI compat. Vulkan default-enabled.
+- **vLLM now contains a first-party Rust workspace** (`rust/`: server, tokenizer, parser, chat; 306 `.rs` files bridged via PyO3) — the "Python+CUDA" description is already outdated for this snapshot. Original PagedAttention CUDA kernel no longer exists; the design doc is self-flagged historical. RDNA presence: ~138 mentions/16 files incl. purpose-built rdna3 W4A16 WMMA kernels + tests; CDNA ~524 mentions/101 files. No training loops; RL-ready weight-update/pause-resume plumbing instead.
+- **SGLang: zero consumer-RDNA code** (0 files for any RDNA gfx target; 73 files gfx90a/942/950/1250) — stronger version of §2's ratio claim. Eight builtin speculative algorithms + plugin registry; PD-disaggregation with 4 connectors; ~188 registered architecture classes; no training loops.
+- **Unsloth (2026.8.15)**: ROCm support is now substantial (radeon.com-pinned wheel matrix incl. Windows ROCm, HIP branches throughout); multi-GPU *training* raises a hard RuntimeError while README advertises multi-GPU (that refers to Studio inference). Hard runtime dependency on unsloth_zoo; DPO/KTO patching moved to the zoo leaving `models/dpo.py` an empty stub.
+- **LlamaFactory (0.9.6.dev0)**: stages stop at pt/sft/rm/ppo/dpo/kto — **no GRPO stage** (spun out to sibling EasyR1); `llamafactory-cli eval` raises `NotImplementedError` (benchmark evaluation deprecated, evaluator orphaned); ~634 registered checkpoints/131 model groups, ~124 chat templates, 24 multimodal plugins incl. audio; export writes Ollama Modelfiles but has no GGUF path; Ascend NPU support is real (torch-npu pins, fused NPU MoE/RMSNorm kernels); ROCm footprint is one Dockerfile.
+- **Axolotl (0.18.0)**: RL coverage DPO/IPO/SimPO/ORPO/KTO/GRPO/GDPO/EBFT + async GRPO with vLLM weight sync; ReLoRA in-tree; N-D parallelism (FSDP×TP×CP×EP via DeviceMesh); `src/axolotl/integrations/` carries a separate restrictive community license inside the Apache-2.0 repo; no first-party general-purpose inference server (vLLM serve is aimed at GRPO rollouts).

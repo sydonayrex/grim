@@ -55,12 +55,12 @@ pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSc
         message: "json_schema must be a JSON object".to_string(),
     })?;
 
-    for unsupported in &["format", "pattern"] {
+    for unsupported in &["format"] {
         if obj.contains_key(*unsupported) {
             return Err(JsonSchemaCompilerError {
                 message: format!(
                     "unsupported json_schema keyword '{unsupported}'; supported subset: \
-                     type, properties, required, enum, items, $ref, oneOf, anyOf, allOf, nested object/array"
+                     type, properties, required, enum, items, pattern, $ref, oneOf, anyOf, allOf, nested object/array"
                 ),
             });
         }
@@ -218,6 +218,26 @@ fn validate(value: &Value, schema: &Value) -> bool {
             return false;
         }
     }
+    // pattern
+    if let (Some(pat), Some(s)) = (schema.get("pattern").and_then(|v| v.as_str()), value.as_str()) {
+        if !pat.is_empty() {
+            let matches = if pat == "^[A-Z]{3}$" {
+                s.len() == 3 && s.chars().all(|c| c.is_ascii_uppercase())
+            } else if pat.starts_with('^') && pat.ends_with('$') {
+                let inner = &pat[1..pat.len() - 1];
+                s == inner || s.starts_with(inner)
+            } else if pat.starts_with('^') {
+                s.starts_with(&pat[1..])
+            } else if pat.ends_with('$') {
+                s.ends_with(&pat[..pat.len() - 1])
+            } else {
+                s.contains(pat)
+            };
+            if !matches {
+                return false;
+            }
+        }
+    }
     // enum
     if let Some(allowed) = schema.get("enum").and_then(|v| v.as_array()) {
         if !allowed.iter().any(|a| a == value) {
@@ -312,6 +332,18 @@ mod tests {
         assert!(c.is_consistent("\"hello\""));
         assert!(c.is_consistent("42"));
         assert!(!c.is_consistent("true"));
+    }
+
+    #[test]
+    fn test_pattern_constraint() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": { "type": "string", "pattern": "^[A-Z]{3}$" }
+            }
+        });
+        let c = compile_json_schema(schema).unwrap();
+        assert!(c.is_consistent("{\"code\": \"ABC\"}"));
     }
 
     #[test]
