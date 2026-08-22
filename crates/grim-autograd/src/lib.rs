@@ -52,9 +52,12 @@ impl Default for AutogradScope {
 
 pub mod adamw;
 pub mod backward;
+pub mod came;
 pub mod collate;
 pub mod contrast_omni;
+pub mod galore;
 pub mod injection;
+pub mod lomo;
 pub mod loss;
 pub mod lr_schedule;
 pub mod mm_grpo;
@@ -63,6 +66,12 @@ pub mod ops;
 pub mod param;
 pub mod preference_loss;
 pub mod preference_trainer;
+pub mod sophia;
+
+pub use came::{Came, CameConfig, CameMatrixState, CameVectorState};
+pub use galore::{GaLoreConfig, GaLoreMatrixState, GaLoreOptimizer};
+pub use lomo::{AdaLomo, AdaLomoConfig, Lomo, LomoConfig};
+pub use sophia::{Sophia, SophiaConfig, SophiaState};
 
 pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
 pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
