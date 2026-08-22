@@ -1,6 +1,6 @@
 //! Paged KV cache memory pool, logical block tables, prefix sharing, and multi-tier spilling.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use grim_core::error::{Error, Result};

@@ -53,7 +53,7 @@ Train or fine-tune LoRA adapters (SFT QLoRA) on a base model using a custom data
      - `qlora` (default): Quantized LoRA with frozen 4-bit base weights and trainable adapter matrices (lowest VRAM).
      - `lora`: Standard LoRA on full-precision / half-precision base weights.
      - `full-bf16` / `full-fp16`: Full parameter fine-tuning in BF16 or FP16.
-     - `soul-eater`: Orthogonal weight matrix evolution with FP4/FP8 subspace caching.
+     - `soul-eater`: spectral QLoRA initialization (the dedicated SoulEater adapter/optimizer is not yet wired to this mode).
      - `oft`: Orthogonal Fine-Tuning preserving representation norms.
    - **Preference Alignment Modes**:
      - `dpo`: Direct Preference Optimization using paired chosen and rejected target sequences with analytical VJP gradients.
@@ -63,7 +63,10 @@ Train or fine-tune LoRA adapters (SFT QLoRA) on a base model using a custom data
      - `grpo`: Group Relative Policy Optimization with clipped surrogate loss and reward advantage normalization.
 
 5. **Multi-GPU Data-Parallel (DP) Training**
-   Scale training across multiple AMD GPUs using RCCL all-reduce:
+   Scale training across multiple AMD GPUs using RCCL all-reduce
+   (single-process multi-device gradient sync; per-GPU model replicas are on
+   the roadmap — today each batch is computed once and gradients sync across
+   devices):
    ```bash
    grim train \
      --model llama3 \

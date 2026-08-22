@@ -188,8 +188,16 @@ impl ConstrainedSampler {
                     let base_mask = cache.mask_for(fsm.clone(), vocab);
                     let output = self.output.lock().unwrap();
                     
-                    // 2. Query memoized schema validity mask
-                    let schema_mask = comp.mask_for(vocab, &output);
+                    // 2. Query schema validity mask. F9 fast path: inside an
+                    // unterminated string with no pattern/enum constraints,
+                    // schema validity is invariant per token — reuse the
+                    // structural mask and skip the O(vocab) validate pass.
+                    let all_valid: Arc<[bool]> = vec![true; vocab_size].into();
+                    let schema_mask = if comp.inside_string_fast_path(&output) {
+                        &all_valid
+                    } else {
+                        &comp.mask_for(vocab, &output)
+                    };
                     let mut mask = Vec::with_capacity(vocab_size);
 
                     for (&struct_ok, &schema_ok) in base_mask.iter().zip(schema_mask.iter()) {
