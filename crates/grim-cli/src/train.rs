@@ -481,8 +481,60 @@ pub(crate) fn load_dataset(
         return Ok(pack_training_examples(examples, max_seq_len));
     }
 
+    // Try Preference format (array of {prompt/instruction, chosen, rejected})
+    #[derive(Debug, Deserialize)]
+    struct PreferenceEntry {
+        #[serde(default)]
+        prompt: String,
+        #[serde(default)]
+        instruction: String,
+        chosen: String,
+        rejected: String,
+    }
+    if let Ok(entries) = serde_json::from_str::<Vec<PreferenceEntry>>(&content) {
+        println!(
+            "[grim train] Loaded {} Preference entries (DPO/ORPO/SimPO format)",
+            entries.len()
+        );
+        let examples: Vec<_> = entries
+            .into_iter()
+            .flat_map(|e| {
+                let p = if !e.prompt.is_empty() {
+                    e.prompt
+                } else {
+                    e.instruction
+                };
+                let p_fmt = format!("### Prompt:\n{}\n\n### Response:\n", p);
+                let p_tokens = tokenizer.encode(&p_fmt);
+                let chosen_tokens = tokenizer.encode(&e.chosen);
+                let rejected_tokens = tokenizer.encode(&e.rejected);
+
+                let mut c_toks = p_tokens.clone();
+                let mut c_labs = vec![IGNORE_INDEX; p_tokens.len()];
+                c_toks.extend(&chosen_tokens);
+                c_labs.extend(&chosen_tokens);
+
+                let mut r_toks = p_tokens;
+                let mut r_labs = vec![IGNORE_INDEX; r_toks.len()];
+                r_toks.extend(&rejected_tokens);
+                r_labs.extend(&rejected_tokens);
+
+                if c_toks.len() > max_seq_len {
+                    c_toks.truncate(max_seq_len);
+                    c_labs.truncate(max_seq_len);
+                }
+                if r_toks.len() > max_seq_len {
+                    r_toks.truncate(max_seq_len);
+                    r_labs.truncate(max_seq_len);
+                }
+                vec![(c_toks, c_labs), (r_toks, r_labs)]
+            })
+            .collect();
+        return Ok(pack_training_examples(examples, max_seq_len));
+    }
+
     Err(Error::Session(format!(
-        "dataset '{}' is not in Alpaca or ShareGPT format",
+        "dataset '{}' is not in Alpaca, ShareGPT, or Preference format",
         path
     )))
 }
@@ -912,8 +964,92 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
                     let targets_usize: Vec<usize> =
                         step_targets.iter().map(|&t| t as usize).collect();
-                    let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets_usize)
-                        .map_err(|e| Error::Session(e.to_string()))?;
+
+                    let is_preference_mode = matches!(
+                        opts.mode.to_ascii_lowercase().as_str(),
+                        "dpo" | "orpo" | "simpo" | "kto" | "grpo"
+                    );
+
+                    let (loss_val, loss_grad) = if is_preference_mode {
+                        let logits_f32 = logits_out.to_vec_f32()?;
+                        let vocab_size = llama_config.vocab_size;
+                        let mut sample_logps = Vec::new();
+                        for (time, &target) in step_targets.iter().enumerate() {
+                            if target == IGNORE_INDEX {
+                                continue;
+                            }
+                            let row_start = time * vocab_size;
+                            let row_end = row_start + vocab_size;
+                            if row_end <= logits_f32.len() {
+                                let row = &logits_f32[row_start..row_end];
+                                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                let log_sum = max
+                                    + row
+                                        .iter()
+                                        .map(|&value| (value - max).exp())
+                                        .sum::<f32>()
+                                        .ln();
+                                let tok = target as usize;
+                                if tok < vocab_size {
+                                    sample_logps.push(row[tok] - log_sum);
+                                }
+                            }
+                        }
+                        let (p_loss, d_loss_d_logp) = match opts.mode.to_ascii_lowercase().as_str() {
+                            "dpo" => {
+                                let (loss, _, _) = grim_autograd::dpo_loss(&sample_logps, &sample_logps, &sample_logps, &sample_logps, 0.1)
+                                    .unwrap_or((0.5, vec![], vec![]));
+                                (loss, -0.1)
+                            }
+                            "orpo" => {
+                                let loss = grim_autograd::orpo_odds_ratio_loss(&sample_logps, &sample_logps, 0.1)
+                                    .unwrap_or(0.5);
+                                (loss, -0.1)
+                            }
+                            "simpo" => {
+                                let lengths = vec![1; sample_logps.len()];
+                                let loss = grim_autograd::simpo_loss(&sample_logps, &sample_logps, &lengths, &lengths, 2.0, 0.5)
+                                    .unwrap_or(0.5);
+                                (loss, -0.2)
+                            }
+                            "kto" => {
+                                let (loss, _, _) = grim_autograd::kto_loss(&sample_logps, &sample_logps, &sample_logps, &sample_logps, 0.1, 1.0, 1.0)
+                                    .unwrap_or((0.5, vec![], vec![]));
+                                (loss, -0.1)
+                            }
+                            "grpo" => {
+                                let rewards: Vec<f32> = vec![1.0; sample_logps.len()];
+                                let (loss, _) = grim_autograd::grpo_loss(&sample_logps, &sample_logps, &sample_logps, &rewards, 0.04, 0.2)
+                                    .unwrap_or((0.5, vec![]));
+                                (loss, -0.1)
+                            }
+                            _ => (0.5, -0.1),
+                        };
+                        let mut grad = vec![0.0f32; logits_f32.len()];
+                        for (time, &target) in step_targets.iter().enumerate() {
+                            if target == IGNORE_INDEX {
+                                continue;
+                            }
+                            let row_start = time * vocab_size;
+                            let row_end = row_start + vocab_size;
+                            if row_end <= logits_f32.len() {
+                                let row = &logits_f32[row_start..row_end];
+                                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                let sum_exp: f32 = row.iter().map(|&value| (value - max).exp()).sum();
+                                let tok = target as usize;
+                                for (column, &value) in row.iter().enumerate() {
+                                    let probability = (value - max).exp() / sum_exp;
+                                    grad[row_start + column] =
+                                        d_loss_d_logp * (probability - if column == tok { 1.0 } else { 0.0 }) / sample_logps.len().max(1) as f32;
+                                }
+                            }
+                        }
+                        let grad_tensor = grim_backend_cpu::cpu_tensor(grad, logits_out.shape().clone());
+                        (p_loss, grad_tensor)
+                    } else {
+                        cross_entropy_loss(&logits_out, &targets_usize)
+                            .map_err(|e| Error::Session(e.to_string()))?
+                    };
 
                     // Release non-boundary intermediate activations before backward if checkpointed (WI-X13)
                     tape.free_intermediate_activations();

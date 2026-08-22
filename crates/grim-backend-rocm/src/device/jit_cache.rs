@@ -313,17 +313,4 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
         unsafe { std::env::remove_var("GRIM_JIT_CACHE_DIR") };
     }
-
-    #[cfg(unix)]
-    fn filetime_backdate(path: &std::path::Path) -> std::io::Result<()> {
-        // Touch mtime into the past via std only: rewrite then set with
-        // set_file_times equivalent using utimensat is out of scope; instead
-        // rely on max_age=0 making any mtime qualify as stale.
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn filetime_backdate(_path: &std::path::Path) -> std::io::Result<()> {
-        Ok(())
-    }
 }

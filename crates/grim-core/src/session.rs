@@ -29,6 +29,9 @@ pub trait SessionT: Send {
     fn append_kv_layer(&mut self, _layer: usize, _k: &Tensor, _v: &Tensor) -> Result<()> {
         Ok(())
     }
+    fn kv_cache(&self) -> Option<&(dyn KvCache + 'static)> {
+        None
+    }
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         None
     }
@@ -175,6 +178,9 @@ impl SessionT for Inner {
             kv.append_kv_layer(layer, k, v)?;
         }
         Ok(())
+    }
+    fn kv_cache(&self) -> Option<&(dyn KvCache + 'static)> {
+        self.kv.as_deref()
     }
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         self.kv.as_deref_mut()

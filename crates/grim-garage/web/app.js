@@ -695,4 +695,335 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   }
+
+  // -------------------------------------------------------------
+  // DIFFUSION STUDIO (Automatic1111 Format)
+  // -------------------------------------------------------------
+  const btnTabTxt2Img = document.getElementById('btn-tab-txt2img');
+  const btnTabImg2Img = document.getElementById('btn-tab-img2img');
+  const img2imgDock = document.getElementById('diff-img2img-dock');
+  const denoisingRow = document.getElementById('diff-denoising-row');
+  const initImageInput = document.getElementById('diff-init-image-input');
+  const initPreview = document.getElementById('diff-init-preview');
+  const initPreviewImg = document.getElementById('diff-init-preview-img');
+
+  let activeDiffusionMode = 'txt2img';
+  let loadedInitImageBase64 = null;
+
+  if (btnTabTxt2Img && btnTabImg2Img) {
+    btnTabTxt2Img.addEventListener('click', () => {
+      activeDiffusionMode = 'txt2img';
+      btnTabTxt2Img.classList.add('active', 'btn-primary');
+      btnTabTxt2Img.classList.remove('btn-secondary');
+      btnTabImg2Img.classList.remove('active', 'btn-primary');
+      btnTabImg2Img.classList.add('btn-secondary');
+      if (img2imgDock) img2imgDock.style.display = 'none';
+      if (denoisingRow) denoisingRow.style.display = 'none';
+    });
+
+    btnTabImg2Img.addEventListener('click', () => {
+      activeDiffusionMode = 'img2img';
+      btnTabImg2Img.classList.add('active', 'btn-primary');
+      btnTabImg2Img.classList.remove('btn-secondary');
+      btnTabTxt2Img.classList.remove('active', 'btn-primary');
+      btnTabTxt2Img.classList.add('btn-secondary');
+      if (img2imgDock) img2imgDock.style.display = 'block';
+      if (denoisingRow) denoisingRow.style.display = 'block';
+    });
+  }
+
+  if (initImageInput) {
+    initImageInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          loadedInitImageBase64 = ev.target.result;
+          if (initPreviewImg) initPreviewImg.src = loadedInitImageBase64;
+          if (initPreview) initPreview.style.display = 'block';
+        };
+        reader.readAsDataURL(file);
+      }
+    });
+  }
+
+  // Sliders dynamic value display
+  const sliderSteps = document.getElementById('diff-steps');
+  const sliderWidth = document.getElementById('diff-width');
+  const sliderHeight = document.getElementById('diff-height');
+  const sliderCfg = document.getElementById('diff-cfg');
+  const sliderDenoising = document.getElementById('diff-denoising');
+
+  if (sliderSteps) sliderSteps.addEventListener('input', () => {
+    document.getElementById('val-diff-steps').textContent = sliderSteps.value;
+  });
+  if (sliderWidth) sliderWidth.addEventListener('input', () => {
+    document.getElementById('val-diff-width').textContent = sliderWidth.value;
+  });
+  if (sliderHeight) sliderHeight.addEventListener('input', () => {
+    document.getElementById('val-diff-height').textContent = sliderHeight.value;
+  });
+  if (sliderCfg) sliderCfg.addEventListener('input', () => {
+    document.getElementById('val-diff-cfg').textContent = sliderCfg.value;
+  });
+  if (sliderDenoising) sliderDenoising.addEventListener('input', () => {
+    document.getElementById('val-diff-denoising').textContent = sliderDenoising.value;
+  });
+
+  const btnDiffGenerate = document.getElementById('btn-diff-generate');
+  const diffPlaceholder = document.getElementById('diff-placeholder');
+  const diffResultImg = document.getElementById('diff-result-img');
+  const diffSpinner = document.getElementById('diff-spinner');
+  const diffMetaBar = document.getElementById('diff-meta-bar');
+  const diffMetaText = document.getElementById('diff-meta-text');
+  const btnDiffDownload = document.getElementById('btn-diff-download');
+
+  if (btnDiffGenerate) {
+    btnDiffGenerate.addEventListener('click', async () => {
+      const prompt = document.getElementById('diff-prompt').value.trim();
+      const negPrompt = document.getElementById('diff-neg-prompt').value.trim();
+      const sampler = document.getElementById('diff-sampler').value;
+      const steps = parseInt(sliderSteps ? sliderSteps.value : '28', 10);
+      const width = parseInt(sliderWidth ? sliderWidth.value : '512', 10);
+      const height = parseInt(sliderHeight ? sliderHeight.value : '512', 10);
+      const cfg_scale = parseFloat(sliderCfg ? sliderCfg.value : '3.5');
+      const seedVal = parseInt(document.getElementById('diff-seed').value || '-1', 10);
+      const denoising = parseFloat(sliderDenoising ? sliderDenoising.value : '0.75');
+
+      if (!prompt) {
+        alert('Please enter a positive prompt for diffusion generation.');
+        return;
+      }
+
+      if (diffPlaceholder) diffPlaceholder.style.display = 'none';
+      if (diffResultImg) diffResultImg.style.display = 'none';
+      if (diffSpinner) diffSpinner.style.display = 'block';
+      if (diffMetaBar) diffMetaBar.style.display = 'none';
+      btnDiffGenerate.disabled = true;
+
+      try {
+        const payload = {
+          prompt,
+          negative_prompt: negPrompt || undefined,
+          sampler,
+          steps,
+          width,
+          height,
+          cfg_scale,
+          seed: seedVal >= 0 ? seedVal : undefined,
+          init_image: activeDiffusionMode === 'img2img' ? loadedInitImageBase64 : undefined,
+          denoising_strength: denoising
+        };
+
+        const res = await fetch('/api/diffusion/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (res.ok && data.image_url) {
+          if (diffResultImg) {
+            diffResultImg.src = data.image_url;
+            diffResultImg.style.display = 'block';
+          }
+          if (diffMetaBar) {
+            diffMetaBar.style.display = 'flex';
+            diffMetaText.textContent = `Seed: ${data.seed} | Sampler: ${data.sampler} | Steps: ${data.steps} | CFG: ${data.cfg_scale} | ${data.width}x${data.height} | Latency: ${data.latency_ms}ms`;
+            if (btnDiffDownload) {
+              btnDiffDownload.href = data.image_url;
+              btnDiffDownload.download = `flux2_${data.seed}.bmp`;
+            }
+          }
+        } else {
+          alert('Diffusion generation error: ' + (data.error || 'Unknown error'));
+          if (diffPlaceholder) diffPlaceholder.style.display = 'block';
+        }
+      } catch (err) {
+        console.error('Diffusion network error:', err);
+        alert('Failed to connect to diffusion generation endpoint: ' + err.message);
+        if (diffPlaceholder) diffPlaceholder.style.display = 'block';
+      } finally {
+        if (diffSpinner) diffSpinner.style.display = 'none';
+        btnDiffGenerate.disabled = false;
+      }
+    });
+  }
+
+  // -------------------------------------------------------------
+  // AUDIO STUDIO (TTS & Vocos Vocoder)
+  // -------------------------------------------------------------
+  const sliderTtsSpeed = document.getElementById('tts-speed');
+  if (sliderTtsSpeed) {
+    sliderTtsSpeed.addEventListener('input', () => {
+      document.getElementById('val-tts-speed').textContent = sliderTtsSpeed.value;
+    });
+  }
+
+  const btnTtsSynthesize = document.getElementById('btn-tts-synthesize');
+  const ttsPlayerContainer = document.getElementById('tts-player-container');
+  const ttsAudioPlayer = document.getElementById('tts-audio-player');
+  const ttsTelemetry = document.getElementById('tts-telemetry');
+
+  if (btnTtsSynthesize) {
+    btnTtsSynthesize.addEventListener('click', async () => {
+      const text = document.getElementById('tts-text-input').value.trim();
+      const voice = document.getElementById('tts-voice-select').value;
+      const speed = parseFloat(sliderTtsSpeed ? sliderTtsSpeed.value : '1.0');
+
+      if (!text) {
+        alert('Please enter text to synthesize speech.');
+        return;
+      }
+
+      btnTtsSynthesize.disabled = true;
+      btnTtsSynthesize.textContent = '⏳ Synthesizing Audio...';
+
+      try {
+        const res = await fetch('/api/audio/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, voice, speed, sample_rate: 24000 })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.audio_url) {
+          if (ttsAudioPlayer) ttsAudioPlayer.src = data.audio_url;
+          if (ttsPlayerContainer) ttsPlayerContainer.style.display = 'flex';
+          if (ttsTelemetry) {
+            ttsTelemetry.textContent = `Duration: ${data.duration_sec.toFixed(2)}s | Samples: ${data.num_samples} | Sample Rate: ${data.sample_rate}Hz | Latency: ${data.latency_ms}ms`;
+          }
+          if (ttsAudioPlayer) ttsAudioPlayer.play();
+        } else {
+          alert('TTS error: ' + (data.error || 'Synthesis failed'));
+        }
+      } catch (err) {
+        console.error('TTS network error:', err);
+        alert('Failed to connect to TTS synthesis endpoint: ' + err.message);
+      } finally {
+        btnTtsSynthesize.disabled = false;
+        btnTtsSynthesize.textContent = '🎙️ Synthesize Speech';
+      }
+    });
+  }
+
+  const sliderVocosPitch = document.getElementById('vocos-pitch');
+  if (sliderVocosPitch) {
+    sliderVocosPitch.addEventListener('input', () => {
+      document.getElementById('val-vocos-pitch').textContent = sliderVocosPitch.value;
+    });
+  }
+
+  const btnVocosRun = document.getElementById('btn-vocos-run');
+  const vocosPlayerContainer = document.getElementById('vocos-player-container');
+  const vocosAudioPlayer = document.getElementById('vocos-audio-player');
+  const vocosTelemetry = document.getElementById('vocos-telemetry');
+
+  if (btnVocosRun) {
+    btnVocosRun.addEventListener('click', async () => {
+      const pitch_shift = parseFloat(sliderVocosPitch ? sliderVocosPitch.value : '1.0');
+      const sample_rate = parseInt(document.getElementById('vocos-sample-rate').value || '24000', 10);
+
+      btnVocosRun.disabled = true;
+      btnVocosRun.textContent = '⏳ Running Vocoder...';
+
+      try {
+        const res = await fetch('/api/audio/audio2audio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pitch_shift, speed: 1.0, sample_rate })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.audio_url) {
+          if (vocosAudioPlayer) vocosAudioPlayer.src = data.audio_url;
+          if (vocosPlayerContainer) vocosPlayerContainer.style.display = 'flex';
+          if (vocosTelemetry) {
+            vocosTelemetry.textContent = `Duration: ${data.duration_sec.toFixed(2)}s | Samples: ${data.num_samples} | Rate: ${data.sample_rate}Hz | Latency: ${data.latency_ms}ms`;
+          }
+          if (vocosAudioPlayer) vocosAudioPlayer.play();
+        } else {
+          alert('Vocos vocoder error: ' + (data.error || 'Reconstruction failed'));
+        }
+      } catch (err) {
+        console.error('Vocoder network error:', err);
+        alert('Failed to connect to audio vocoder endpoint: ' + err.message);
+      } finally {
+        btnVocosRun.disabled = false;
+        btnVocosRun.textContent = '🌊 Run Mel Vocoder Reconstruction';
+      }
+    });
+  }
+
+  // -------------------------------------------------------------
+  // DIAGNOSTICS DASHBOARD
+  // -------------------------------------------------------------
+  async function fetchDiagnostics() {
+    const diagList = document.getElementById('diag-checks-list');
+    if (!diagList) return;
+
+    diagList.innerHTML = '<div style="padding: 16px; color: var(--text-muted);">Running diagnostic audit...</div>';
+
+    try {
+      const res = await fetch('/api/diagnostics');
+      const data = await res.json();
+
+      if (res.ok) {
+        let html = `
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 14px;">
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 14px;">
+              <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">ROCm Hardware</div>
+              <div style="font-size: 16px; font-weight: 700; color: ${data.rocm.available ? '#22c55e' : '#eab308'}; margin-top: 4px;">
+                ${data.rocm.available ? `${data.rocm.device_count} Device(s) Active` : 'CPU Fallback'}
+              </div>
+            </div>
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 14px;">
+              <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Host Processor</div>
+              <div style="font-size: 16px; font-weight: 700; color: var(--text-main); margin-top: 4px;">
+                ${data.cpu.logical_cores} Cores (${data.cpu.arch})
+              </div>
+            </div>
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 14px;">
+              <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">KV Memory Pool</div>
+              <div style="font-size: 16px; font-weight: 700; color: #3b82f6; margin-top: 4px;">
+                ${data.engine.kv_block_pool_capacity} Blocks
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+        `;
+
+        for (const check of data.diagnostics || []) {
+          html += `
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(15,23,42,0.3); border: 1px solid var(--border-card); border-radius: 6px;">
+              <div>
+                <div style="font-weight: 600; font-size: 13px; color: var(--text-main);">${check.name}</div>
+                <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${check.message}</div>
+              </div>
+              <span class="badge ${check.passed ? 'badge-success' : 'badge-danger'}" style="padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; background: ${check.passed ? 'rgba(34,197,94,0.2); color: #22c55e;' : 'rgba(239,68,68,0.2); color: #ef4444;'}">
+                ${check.passed ? '✓ PASSED' : '✗ FAILED'}
+              </span>
+            </div>
+          `;
+        }
+
+        html += '</div>';
+        diagList.innerHTML = html;
+      } else {
+        diagList.innerHTML = `<div style="color: var(--danger-color); padding: 12px;">Failed to fetch diagnostics: ${data.error || 'Unknown error'}</div>`;
+      }
+    } catch (err) {
+      console.error('Diagnostics fetch error:', err);
+      diagList.innerHTML = `<div style="color: var(--danger-color); padding: 12px;">Error connecting to diagnostics API: ${err.message}</div>`;
+    }
+  }
+
+  const btnRunDiag = document.getElementById('btn-run-diagnostics');
+  if (btnRunDiag) {
+    btnRunDiag.addEventListener('click', fetchDiagnostics);
+  }
+  const navDiag = document.getElementById('nav-diagnostics');
+  if (navDiag) {
+    navDiag.addEventListener('click', fetchDiagnostics);
+  }
 });

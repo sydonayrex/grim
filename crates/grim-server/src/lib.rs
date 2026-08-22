@@ -546,11 +546,11 @@ fn sample_next_token(
         Some(t) => {
             // WI-X3: when logits live on a ROCm device, run temperature/top-k
             // sampling on-device (Gumbel-max) and D2H only the chosen token id.
-            // Any failure falls back to the historical CPU path.
             let cpu_sampler_forced = std::env::var("GRIM_CPU_SAMPLER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let device_token = if t.device().is_rocm() && !cpu_sampler_forced {
+            let has_active_constraint = sampler.name() == "constrained";
+            let device_token = if t.device().is_rocm() && !cpu_sampler_forced && !has_active_constraint {
                 match sample_on_device(&t, vocab_size, step) {
                     Ok(Some(tok)) => Some(tok.min((vocab_size as u32).saturating_sub(1))),
                     // Ok(None): unsupported shape/vocab -> CPU fallback contract.

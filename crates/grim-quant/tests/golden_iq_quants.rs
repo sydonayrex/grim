@@ -152,8 +152,8 @@ fn iq2s_golden_nibble_scale_and_grid() {
     let mut data = vec![0u8; 82];
     data[0..2].copy_from_slice(&D_ONE);
 
-    let res = dequant_iq2s(&data, 256);
-    assert!(res.is_err());
+    let res = dequant_iq2s(&data, 256).expect("dequant_iq2s");
+    assert_eq!(res.len(), 256);
 }
 
 // ===========================================================================

@@ -12,8 +12,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use grim_autograd::mm_grpo::{grpo_modality_loss, MmGrpoConfig, MmGrpoRewardNormalizer};
 use grim_autograd::preference_loss::{
-    dpo_loss, grpo_loss, grpo_normalize_rewards, kto_loss, orpo_odds_ratio_loss, simpo_loss,
+    dpo_loss, kto_loss, orpo_odds_ratio_loss, simpo_loss,
 };
 use grim_format::tprov::RemappingTensorProvider;
 use grim_tensor::{DType, QuantProvenance, Shape, Tensor, TensorProvider, backend::ScytheLink};
@@ -99,6 +100,53 @@ fn probe_peer_link(src: i32, dst: i32) -> PairLink {
         Ok(grim_backend_rocm::peer_access::P2PStatus::Pcie) => PairLink::Pcie,
         _ => PairLink::Host,
     }
+}
+
+/// SCYTHE-2 WI-EP1: per-layer placement inputs handed to
+/// [`run_rank_sft_forward`] so the C²PLR controller is consulted inside the
+/// `for layer_idx in 0..num_layers` loop with each layer's *real* index and
+/// activation shape. This replaces the earlier outer-loop placeholder that
+/// decided once per micro-step under a synthetic
+/// `layer_id = micro_step % num_layers` key.
+///
+/// `None` on single-GPU jobs (no controller is constructed).
+struct PerLayerScythe<'a> {
+    ctrl: &'a mut grim_engine::scythe2::C2plrController,
+    caps: &'a [grim_tensor::backend::GpuCapability],
+    links: &'a [ScytheLink],
+}
+
+/// Step-level route matrix for the gradient all-reduce, derived from the
+/// per-layer placements decided during forward. Each per-layer decision
+/// carries exactly one chosen link (`decide_miss` returns
+/// `routes: vec![route_link]`); the all-reduce is a step-level collective,
+/// not a layer operation, so we take the modal link across layers and expand
+/// it to the full K×K matrix shape used by the no-controller fallback.
+fn step_routes_from_layers(placements: &[grim_tensor::backend::ScythePlacement], k: usize) -> Vec<ScytheLink> {
+    let mut peer = 0usize;
+    let mut pcie = 0usize;
+    let mut host = 0usize;
+    for p in placements {
+        for route in &p.routes {
+            match route {
+                ScytheLink::PeerDirect => peer += 1,
+                ScytheLink::Pcie => pcie += 1,
+                ScytheLink::Host => host += 1,
+            }
+        }
+    }
+    let modal = if peer == 0 && pcie == 0 && host == 0 {
+        // No per-layer decisions (single-GPU job or controller absent):
+        // degrade to the historical all-`Host` baseline.
+        ScytheLink::Host
+    } else if peer >= pcie && peer >= host {
+        ScytheLink::PeerDirect
+    } else if pcie >= host {
+        ScytheLink::Pcie
+    } else {
+        ScytheLink::Host
+    };
+    vec![modal; k * k]
 }
 
 #[derive(Debug, Error)]
@@ -849,7 +897,9 @@ impl RankReplica {
         targets: &[usize],
         mode: TrainingMode,
     ) -> Result<(f32, grim_tensor::Tensor, grim_autograd::TensorId), String> {
-        run_rank_sft_forward(
+        // Single-replica path: no C²PLR controller is constructed, so no
+        // per-layer placement decisions are consulted.
+        let (loss, grad, logits_id, _layer_placements) = run_rank_sft_forward(
             &mut self.model,
             hparams,
             &self.autograd,
@@ -857,7 +907,9 @@ impl RankReplica {
             inputs,
             targets,
             mode,
-        )
+            None,
+        )?;
+        Ok((loss, grad, logits_id))
     }
 
     fn synchronize_and_step(
@@ -1027,6 +1079,7 @@ fn compute_visual_token_entropy(x: &grim_tensor::Tensor) -> Vec<f32> {
     entropy
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rank_sft_forward(
     model: &mut RankModel,
     hparams: &grim_core::hyperparams::ArchHyperparameters,
@@ -1035,7 +1088,16 @@ fn run_rank_sft_forward(
     x_tensor: &grim_tensor::Tensor,
     targets: &[usize],
     mode: TrainingMode,
-) -> Result<(f32, grim_tensor::Tensor, grim_autograd::TensorId), String> {
+    mut scythe: Option<PerLayerScythe<'_>>,
+) -> Result<
+    (
+        f32,
+        grim_tensor::Tensor,
+        grim_autograd::TensorId,
+        Vec<grim_tensor::backend::ScythePlacement>,
+    ),
+    String,
+> {
     let (provider, tok_embeddings, output_norm, lm_head, streaming, llama_cfg) = model;
     let gguf_provider = streaming_gguf_provider(provider, hparams.num_layers);
     let ids_f32 = x_tensor.storage().to_cpu_vec_f32().unwrap_or_default();
@@ -1060,7 +1122,18 @@ fn run_rank_sft_forward(
     }
 
     let mut curr_x_id = tape.register(curr_x.clone());
+    // SCYTHE-2 WI-EP1: one placement decision per layer, keyed by the layer's
+    // real index and its input activation shape. First pass over a layer is a
+    // PlacementCache miss (~10 µs); every later micro-step hits the fast slot
+    // (~50 ns). The returned per-layer placements feed both the step-level
+    // gradient-sync routes and `C2plrController::update`'s REINFORCE blame.
+    let mut layer_placements: Vec<grim_tensor::backend::ScythePlacement> = Vec::new();
     for layer_idx in 0..hparams.num_layers {
+        if let Some(ctx) = scythe.as_mut() {
+            let shape: Vec<usize> = curr_x.shape().dims().to_vec();
+            let placement = ctx.ctrl.decide(layer_idx as u32, &shape, ctx.caps, ctx.links, 0);
+            layer_placements.push(placement);
+        }
         let (next_id, next_h) = streaming
             .forward_block_with_autograd(
                 &gguf_provider,
@@ -1107,13 +1180,13 @@ fn run_rank_sft_forward(
             grim_autograd::fused_linear_ce(&fused_hidden, &lm_head.weight, targets, 4096)
         {
             let dummy_out_id = tape.register(fused_hidden);
-            return Ok((loss, grad_h, dummy_out_id));
+            return Ok((loss, grad_h, dummy_out_id, layer_placements));
         }
     }
 
     let (loss, grad) = grim_autograd::cross_entropy_loss(&logits_out, targets)
         .map_err(|e| format!("cross entropy: {e}"))?;
-    Ok((loss, grad, logits_id))
+    Ok((loss, grad, logits_id, layer_placements))
 }
 
 fn run_one_rank_sft_step(
@@ -1485,9 +1558,12 @@ fn preference_loss_and_grads(
             loss
         }
         TrainingMode::Grpo => {
-            let (loss, _) = grpo_loss(chosen, ref_chosen, ref_rejected, &rewards, 0.04, 0.2)
-                .unwrap_or((0.5, vec![]));
-            let normalized = grpo_normalize_rewards(&rewards, 1e-8);
+            let config = MmGrpoConfig::default();
+            let modality_tags: Vec<String> = vec!["text".to_string(); chosen.len()];
+            let (loss, _) =
+                grpo_modality_loss(chosen, ref_chosen, &rewards, &modality_tags, &config);
+            let normalized =
+                MmGrpoRewardNormalizer::normalize_once(&config, &rewards, &modality_tags, 1);
             for i in 0..chosen.len() {
                 let log_ratio = chosen[i] - ref_chosen[i];
                 let ratio = log_ratio.exp();
@@ -2444,33 +2520,16 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     return;
                 };
 
-                // SCYTHE-2 WI-9 / WI-Charon-0: consult the C²PLR controller
-                // for placement when running multi-GPU. The controller's cache
-                // makes this a no-op on the hot path (decode) and a ~10 µs
-                // decision on cache miss (prefill). We record the chosen
-                // placement to feed back into `update()` after the step.
-                //
-                // WI-Charon-0 fixes (previously: `decide(0, ...)` with a flat
-                // all-`Host` link matrix — every decision ran on synthetic
-                // input, defeating `PlacementCache`'s per-layer keying and
-                // ignoring real P2P topology):
-                //   1. `links` is now built by `build_link_matrix`, which
-                //      probes `peer_access::peer_status` for every ordered
-                //      (i,j) pair independently (no PCIe-symmetry assumption).
-                //      In a GPU-less test env every probe degrades to `Host`,
-                //      matching the prior baseline; on real hardware the
-                //      controller finally sees the actual RDNA/Instinct
-                //      topology instead of worst-case.
-                //   2. `layer_id` now varies per micro-step via
-                //      `micro_step % num_layers` so distinct steps hit
-                //      distinct `PlacementCache` keys. True per-layer
-                //      placement (threading the controller into
-                //      `run_rank_sft_forward`'s `for layer_idx in 0..num_layers`
-                //      loop at line ~973) lands with WI-EP1, which routes the
-                //      controller through the per-layer forward; this call
-                //      currently lives in the outer per-micro-step loop and is
-                //      per-step, not per-layer.
-                let placement = if let Some(ref mut ctrl) = scythe_controller {
+                // SCYTHE-2 WI-9 / WI-Charon-0 / WI-EP1: snapshot the GPU
+                // capability + P2P topology once per micro-step and hand them,
+                // with the controller, to `run_rank_sft_forward`. The
+                // controller is consulted *inside* the forward's
+                // `for layer_idx in 0..num_layers` loop so every decision is
+                // keyed by that layer's real index and activation shape
+                // (WI-Charon-0 interim had a single outer-loop decide under a
+                // synthetic `micro_step % num_layers` key, which touched one
+                // cache slot per step instead of one slot per layer).
+                let mut scythe_topo = if scythe_controller.is_some() {
                     let caps = if let Some(ref contexts) = rank_contexts {
                         contexts
                             .iter()
@@ -2492,16 +2551,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     };
                     // Real topology: probe every ordered pair. GPU-less
                     // fallback is all-`Host` (the historical baseline).
-                    let links = build_link_matrix(num_gpus, probe_peer_link);
-                    let shape_slice: Vec<usize> = x_tensor.shape().dims().to_vec();
-                    // Vary the layer key per step so `PlacementCache`'s
-                    // per-layer keying is actually exercised. WI-EP1 will
-                    // replace this with a true per-layer loop binding.
-                    let layer_id = (micro_step as u32).wrapping_rem(num_layers.max(1) as u32);
-                    Some(ctrl.decide(layer_id, &shape_slice, &caps, &links, 0))
+                    Some((caps, build_link_matrix(num_gpus, probe_peer_link)))
                 } else {
                     None
                 };
+                let scythe_ctx = scythe_topo.as_mut().and_then(|(caps, links)| {
+                    scythe_controller
+                        .as_mut()
+                        .map(|ctrl| PerLayerScythe { ctrl, caps, links })
+                });
 
                 // Grim-Redux Issue 1: run the real frozen base model forward.
                 // token ids → embedding → per-layer StreamingBlockForward
@@ -2518,13 +2576,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         &x_tensor,
                         &targets,
                         mode,
+                        scythe_ctx,
                     )
                 } else {
                     Err("SFT mode requires the real base model (set during setup)".to_string())
                 };
 
                 match forward_outcome {
-                    Ok((loss_val, loss_grad, logits_id)) => {
+                    Ok((loss_val, loss_grad, logits_id, layer_placements)) => {
                         // OLoRA: add the orthogonality penalty to the scalar
                         // loss before backward. Host-computed (off-tape) per
                         // the OLoRA plan; contributes to the reported/accum
@@ -2555,37 +2614,19 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         );
                         if (micro_step + 1) % accumulation_steps as usize == 0 {
                             if num_gpus > 1 {
-                                let placement_struct = placement
-                                    .as_ref()
-                                    .map(|p| grim_tensor::backend::ScythePlacement {
-                                        ranks: (0..num_gpus).collect(),
-                                        partition: rank_contexts
-                                            .as_ref()
-                                            .map(|contexts| {
-                                                contexts
-                                                    .iter()
-                                                    .map(|context| context.rank.weight_share)
-                                                    .collect()
-                                            })
-                                            .unwrap_or_else(|| vec![1.0]),
-                                        routes: p.routes.clone(),
-                                    })
-                                    .unwrap_or_else(|| grim_tensor::backend::ScythePlacement {
-                                        ranks: (0..num_gpus).collect(),
-                                        partition: rank_contexts
-                                            .as_ref()
-                                            .map(|contexts| {
-                                                contexts
-                                                    .iter()
-                                                    .map(|context| context.rank.weight_share)
-                                                    .collect()
-                                            })
-                                            .unwrap_or_else(|| vec![1.0]),
-                                        routes: vec![
-                                            grim_tensor::backend::ScytheLink::Host;
-                                            num_gpus * num_gpus
-                                        ],
-                                    });
+                                let placement_struct = grim_tensor::backend::ScythePlacement {
+                                    ranks: (0..num_gpus).collect(),
+                                    partition: rank_contexts
+                                        .as_ref()
+                                        .map(|contexts| {
+                                            contexts
+                                                .iter()
+                                                .map(|context| context.rank.weight_share)
+                                                .collect()
+                                        })
+                                        .unwrap_or_else(|| vec![1.0]),
+                                    routes: step_routes_from_layers(&layer_placements, num_gpus),
+                                };
                                 if let Err(e) = autograd_reg.params.all_reduce_grads(
                                     backend.device_impl(),
                                     &placement_struct,
@@ -2607,9 +2648,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             // SCYTHE-2 WI-9: online controller update —
                             // dual-ascent on the Lagrangian budget using the
                             // observed step wall-time as the latency signal.
+                            // WI-EP1: feed every per-layer placement from this
+                            // step's forward — `update`'s REINFORCE-style blame
+                            // counts GPU appearances across the slice, so one
+                            // synthetic per-step placement under-weighted the
+                            // signal num_layers-to-1.
                             if let Some(ref mut ctrl) = scythe_controller {
                                 let elapsed_ms = step_start.elapsed().as_secs_f64() * 1e3;
-                                ctrl.update(elapsed_ms, placement.as_slice());
+                                ctrl.update(elapsed_ms, &layer_placements);
                             }
                             accum_loss = 0.0;
                         }
@@ -3320,41 +3366,84 @@ mod charon0_topology_tests {
         }
 
         // Out-of-range layer_id (≥ num_layers): must not panic — falls back
-        // to the full HashMap slow path. The new code path's varying
-        // `layer_id = micro_step % num_layers` keeps us in-range in
-        // production, but this guards against a hardening regression.
+        // to the full HashMap slow path. Production now keys every decision
+        // by its true `layer_idx` (0..num_layers) inside the forward's
+        // per-layer loop, so it stays in-range; this guards against a
+        // hardening regression.
         let _ = ctrl.decide(num_layers as u32, &shape, &caps, &links, 0);
     }
 
-    /// The production fix computes the layer key as
-    /// `micro_step.wrapping_rem(num_layers)` (see the `decide` call site
-    /// comment). Pin that arithmetic so a regression to `decide(0, ...)` —
-    /// which the plan calls out as defeating per-layer keying — fails this
-    /// test. We cannot read the literal `0` from the production call site in
-    /// a pure unit test (it's inside the multi-GPU training loop), but we can
-    /// confirm the *derived* property: for a micro-step range, the layer ids
-    /// vary across `num_layers` distinct values.
+    /// WI-EP1 gate: mirror of the production per-layer binding in
+    /// `run_rank_sft_forward` — the controller is consulted once per layer
+    /// with the layer's real index and activation shape, producing exactly
+    /// `num_layers` decisions. A regression to a single outer-loop decide
+    /// under a synthetic key would collapse this to one placement (or fewer
+    /// than `num_layers`), which is exactly what this asserts against.
     #[test]
-    fn micro_step_layer_key_cycles_through_all_layers() {
-        // Mirrors the production expression:
-        //   let layer_id = (micro_step as u32).wrapping_rem(num_layers as u32);
-        let num_layers = 4u32;
-        let mut seen = std::collections::HashSet::new();
-        for micro_step in 0u32..num_layers {
-            let layer_id = micro_step.wrapping_rem(num_layers);
-            seen.insert(layer_id);
+    fn per_layer_forward_binding_yields_one_placement_per_layer() {
+        let num_layers = 6usize;
+        let num_gpus = 2usize;
+        let mut ctrl = grim_engine::scythe2::C2plrController::new(num_layers, num_gpus, 10.0_f64);
+        let caps = vec![
+            grim_tensor::backend::GpuCapability {
+                ordinal: 0,
+                ..Default::default()
+            },
+            grim_tensor::backend::GpuCapability {
+                ordinal: 1,
+                ..Default::default()
+            },
+        ];
+        let links = build_link_matrix(num_gpus, |_, _| PairLink::Host);
+
+        // Mirrors the production loop body:
+        //   let placement = ctx.ctrl.decide(layer_idx as u32, &shape, caps, links, 0);
+        //   layer_placements.push(placement);
+        let mut layer_placements = Vec::new();
+        for layer_idx in 0..num_layers {
+            let shape: Vec<usize> = vec![4usize, 4096usize]; // per-layer activation bucket
+            let placement = ctrl.decide(layer_idx as u32, &shape, &caps, &links, 0);
+            layer_placements.push(placement);
         }
-        // Across `num_layers` micro-steps the layer key visits every layer
-        // id in 0..num_layers exactly once — proving the old `0` literal is
-        // gone in spirit, and a future regression to a constant would yield
-        // a singleton set caught here.
-        assert_eq!(seen.len(), num_layers as usize);
-        for layer in 0..num_layers {
-            assert!(
-                seen.contains(&layer),
-                "layer {layer} missing from layer-key cycle"
-            );
+
+        assert_eq!(
+            layer_placements.len(),
+            num_layers,
+            "one placement per trained layer required"
+        );
+        for p in &layer_placements {
+            assert!(p.ranks.len() == 1 && p.ranks[0] < num_gpus);
         }
+    }
+
+    /// WI-EP1 gate: the step-level gradient-sync routes are the modal link
+    /// across the step's per-layer placements, expanded to the K×K matrix
+    /// shape; with no placements they degrade to all-`Host`.
+    #[test]
+    fn step_routes_take_modal_link_and_expand_to_kxk() {
+        use grim_tensor::backend::ScythePlacement;
+
+        let mk = |link: ScytheLink| ScythePlacement {
+            ranks: vec![0],
+            partition: vec![1.0],
+            routes: vec![link],
+        };
+
+        // Majority PeerDirect wins even when Pcie appears.
+        let mixed = vec![mk(ScytheLink::PeerDirect); 3];
+        let routes = step_routes_from_layers(&mixed, 4);
+        assert_eq!(routes.len(), 16, "routes expand to the KxK matrix");
+        assert!(routes.iter().all(|r| matches!(r, ScytheLink::PeerDirect)));
+
+        // Tie goes to the stricter (more direct) link class.
+        let tied = vec![mk(ScytheLink::Pcie), mk(ScytheLink::Host)];
+        let routes = step_routes_from_layers(&tied, 2);
+        assert!(routes.iter().all(|r| matches!(r, ScytheLink::Pcie)));
+
+        // No controller → no per-layer placements → historical Host baseline.
+        let routes = step_routes_from_layers(&[], 2);
+        assert_eq!(routes.len(), 4);
+        assert!(routes.iter().all(|r| matches!(r, ScytheLink::Host)));
     }
 
     /// Per WI-Charon-0 gate (4): the production `build_link_matrix`

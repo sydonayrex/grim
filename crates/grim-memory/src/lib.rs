@@ -42,15 +42,25 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
     fn block_is_received(&self, id: BlockId) -> bool {
         self.block_is_received(id)
     }
+    fn write_layer_keys(&mut self, id: BlockId, layer_idx: u32, keys: &[f32], num_tokens: usize) {
+        self.write_layer_keys(id, layer_idx as usize, keys, num_tokens);
+    }
+    fn write_layer_values(&mut self, id: BlockId, layer_idx: u32, values: &[f32]) {
+        self.write_layer_values(id, layer_idx as usize, values);
+    }
 }
 
 /// One physical KV block in the pool.
 struct KvBlock {
     _id: BlockId,
-    /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for keys.
+    /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for keys (layer 0).
     key_data: Vec<f32>,
-    /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for values.
+    /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for values (layer 0).
     value_data: Vec<f32>,
+    /// Per-layer key storage for multi-layer handoffs.
+    layer_keys: Vec<Vec<f32>>,
+    /// Per-layer value storage for multi-layer handoffs.
+    layer_values: Vec<Vec<f32>>,
     num_tokens: usize,
     /// Whether this block has received real KV data (via `store_kv`,
     /// network ingestion, or explicit `write_keys`). Replaces the
@@ -118,6 +128,8 @@ impl KvBlockPool {
                 _id: i,
                 key_data: vec![0.0; block_elem],
                 value_data: vec![0.0; block_elem],
+                layer_keys: Vec::new(),
+                layer_values: Vec::new(),
                 num_tokens: 0,
                 received: false,
                 location: CacheTier::Gpu,
@@ -474,6 +486,74 @@ impl KvBlockPool {
         block.value_data[..len].copy_from_slice(&values[..len]);
     }
 
+    pub fn write_layer_keys(&mut self, id: BlockId, layer: usize, keys: &[f32], num_tokens: usize) {
+        if id >= self.blocks.len() {
+            return;
+        }
+        let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
+        if self.blocks[id].layer_keys.len() <= layer {
+            self.blocks[id].layer_keys.resize_with(layer + 1, || vec![0.0; block_elem]);
+        }
+        let len = keys.len().min(block_elem);
+        self.blocks[id].layer_keys[layer][..len].copy_from_slice(&keys[..len]);
+        if layer == 0 {
+            self.blocks[id].key_data[..len].copy_from_slice(&keys[..len]);
+            self.blocks[id].num_tokens = num_tokens.min(BLOCK_SIZE);
+            if len > 0 {
+                self.blocks[id].received = true;
+            }
+        }
+    }
+
+    pub fn write_layer_values(&mut self, id: BlockId, layer: usize, values: &[f32]) {
+        if id >= self.blocks.len() {
+            return;
+        }
+        let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
+        if self.blocks[id].layer_values.len() <= layer {
+            self.blocks[id].layer_values.resize_with(layer + 1, || vec![0.0; block_elem]);
+        }
+        let len = values.len().min(block_elem);
+        self.blocks[id].layer_values[layer][..len].copy_from_slice(&values[..len]);
+        if layer == 0 {
+            self.blocks[id].value_data[..len].copy_from_slice(&values[..len]);
+        }
+    }
+
+    pub fn read_layer_keys(&self, id: BlockId, layer: usize) -> Option<&[f32]> {
+        if id >= self.blocks.len() {
+            return None;
+        }
+        if layer < self.blocks[id].layer_keys.len() {
+            Some(&self.blocks[id].layer_keys[layer])
+        } else if layer == 0 {
+            Some(&self.blocks[id].key_data)
+        } else {
+            None
+        }
+    }
+
+    pub fn read_layer_values(&self, id: BlockId, layer: usize) -> Option<&[f32]> {
+        if id >= self.blocks.len() {
+            return None;
+        }
+        if layer < self.blocks[id].layer_values.len() {
+            Some(&self.blocks[id].layer_values[layer])
+        } else if layer == 0 {
+            Some(&self.blocks[id].value_data)
+        } else {
+            None
+        }
+    }
+
+    pub fn num_layers(&self, id: BlockId) -> usize {
+        if id >= self.blocks.len() {
+            0
+        } else {
+            self.blocks[id].layer_keys.len().max(1)
+        }
+    }
+
     pub fn read_keys(&self, id: BlockId) -> &[f32] {
         &self.blocks[id].key_data
     }
@@ -690,6 +770,27 @@ impl PagedKvCache {
         let v_storage = dev.from_cpu(&self.v_pages[layer], &Shape::new(dims), DType::F32)?;
         Ok((Arc::from(k_storage), Arc::from(v_storage)))
     }
+
+    /// Return the number of active layers in this cache.
+    pub fn num_layers(&self) -> usize {
+        self.k_pages.len()
+    }
+
+    /// Extract key and value slices for a given layer and physical block ID.
+    pub fn layer_block_slice(&self, layer: usize, block_id: usize) -> Option<(&[f32], &[f32])> {
+        if layer >= self.k_pages.len() || layer >= self.v_pages.len() {
+            return None;
+        }
+        let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
+        let block_elems = self.page_size * stride;
+        let start = block_id * block_elems;
+        let end = start + block_elems;
+        if end <= self.k_pages[layer].len() && end <= self.v_pages[layer].len() {
+            Some((&self.k_pages[layer][start..end], &self.v_pages[layer][start..end]))
+        } else {
+            None
+        }
+    }
 }
 
 impl KvCache for PagedKvCache {
@@ -866,6 +967,11 @@ impl KvCache for PagedKvCache {
             self.v_pages[layer][offset..offset + stride]
                 .copy_from_slice(&v_flat[tok_start..tok_start + stride]);
             self.layer_committed_tokens[layer] += 1;
+
+            if let Ok(mut pool) = self.pool.lock() {
+                pool.write_layer_keys(physical, layer, &k_flat[tok_start..tok_start + stride], 1);
+                pool.write_layer_values(physical, layer, &v_flat[tok_start..tok_start + stride]);
+            }
         }
         Ok(())
     }
@@ -927,6 +1033,52 @@ impl KvCache for PagedKvCache {
 
     fn prefix_physical_ids(&self) -> Vec<usize> {
         self.table.physical_ids().to_vec()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.k_pages.len()
+    }
+
+    fn layer_block_slice(&self, layer: usize, block_id: usize) -> Option<(&[f32], &[f32])> {
+        if layer >= self.k_pages.len() || layer >= self.v_pages.len() {
+            return None;
+        }
+        let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
+        let block_elems = self.page_size * stride;
+        let start = block_id * block_elems;
+        let end = start + block_elems;
+        if end <= self.k_pages[layer].len() && end <= self.v_pages[layer].len() {
+            Some((&self.k_pages[layer][start..end], &self.v_pages[layer][start..end]))
+        } else {
+            None
+        }
+    }
+
+    fn write_layer_block(&mut self, layer: usize, block_id: usize, k: &[f32], v: &[f32]) -> Result<()> {
+        let stride = if layer < self.k_pages.len() && !self.k_pages[layer].is_empty() {
+            self.k_pages[layer].len() / (self.capacity * self.page_size)
+        } else {
+            self.num_heads * self.head_dim
+        };
+        let page_elems = self.capacity * self.page_size * stride;
+        if self.k_pages.len() <= layer {
+            for _ in self.k_pages.len()..=layer {
+                self.k_pages.push(vec![0.0f32; page_elems]);
+                self.v_pages.push(vec![0.0f32; page_elems]);
+                self.layer_committed_tokens.push(0);
+            }
+        }
+        let block_elems = self.page_size * stride;
+        let start = block_id * block_elems;
+        let k_len = k.len().min(block_elems);
+        let v_len = v.len().min(block_elems);
+        if start + k_len <= self.k_pages[layer].len() {
+            self.k_pages[layer][start..start + k_len].copy_from_slice(&k[..k_len]);
+        }
+        if start + v_len <= self.v_pages[layer].len() {
+            self.v_pages[layer][start..start + v_len].copy_from_slice(&v[..v_len]);
+        }
+        Ok(())
     }
 }
 

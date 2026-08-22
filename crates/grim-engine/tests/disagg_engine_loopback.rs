@@ -39,7 +39,7 @@ fn small_llama() -> Box<dyn CausalLm> {
             num_heads: 2,
             num_kv_heads: 1,
             head_dim: 16,
-            num_layers: 1,
+            num_layers: 2,
             intermediate_size: 64,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
@@ -152,13 +152,8 @@ fn test_disagg_prefill_to_decode_loopback() {
         prefill_addr: prefill_addr.clone(),
         decode_addr: decode_addr.clone(),
     };
-    // The prefill router's pool points at the *decode* engine's pool so that
-    // transfer_kv_cache_real reads real KV data from the prefill engine's pool.
-    // In the real deployment these are separate processes; here we share the
-    // decode pool as a stand-in for the prefill pool's content.
     let prefill_router = Arc::new(
-        DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill)
-            .with_pool(decode_engine.block_pool.clone()),
+        DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill),
     );
     let prefill_engine_config = make_config(2, 16, 8, Some(prefill_router), Some(prefill_config));
     let mut prefill_engine = Engine::new(prefill_engine_config);
@@ -183,6 +178,14 @@ fn test_disagg_prefill_to_decode_loopback() {
         assert!(
             pool.block_is_received(0),
             "decode pool block 0 must be marked received after transfer"
+        );
+        assert!(
+            pool.read_layer_keys(0, 0).is_some(),
+            "decode pool block 0 layer 0 keys must be present"
+        );
+        assert!(
+            pool.read_layer_keys(0, 1).is_some(),
+            "decode pool block 0 layer 1 keys must be present"
         );
     }
 

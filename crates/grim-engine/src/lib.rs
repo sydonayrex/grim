@@ -809,10 +809,31 @@ impl Engine {
                         .map(|t| t.iter().map(|&b| b as usize).collect())
                         .unwrap_or_default();
                     if !block_ids.is_empty() {
+                        if let Some(session) = self.sessions.get(&id) {
+                            if let Some(kv) = session.kv_cache() {
+                                let num_layers = kv.num_layers();
+                                for layer in 0..num_layers {
+                                    for &b_id in &block_ids {
+                                        if let Some((k_slice, v_slice)) = kv.layer_block_slice(layer, b_id) {
+                                            if let Err(e) = router.send_layer_block_remote(
+                                                b_id,
+                                                layer as u32,
+                                                k_slice,
+                                                v_slice,
+                                            ) {
+                                                eprintln!(
+                                                    "[grim-engine] Disagg prefill KV transfer failed for req {id}, layer {layer}, block {b_id}: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let pool_guard = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                         if let Err(e) = router.transfer_kv_cache_real(id, &block_ids, &pool_guard) {
                             eprintln!(
-                                "[grim-engine] Disagg prefill KV transfer failed for req {id}: {e}"
+                                "[grim-engine] Disagg prefill KV pool transfer failed for req {id}: {e}"
                             );
                         }
                     }
@@ -838,30 +859,50 @@ impl Engine {
         // over the network.  The background KvReceiverServer (started in
         // Engine::new) writes incoming blocks into self.block_pool.  Here we
         // poll for / fetch any blocks that haven't arrived yet so the decode
-        // session has a complete KV context.
+        // session has a complete KV context across all layers.
         if let Some(ref router) = self.config.disagg_router {
             if router.pool_role == grim_disagg::PoolRole::Decode {
                 let elem_per_token = self.config.num_kv_heads * self.config.head_dim;
                 let block_elems = elem_per_token * BLOCK_SIZE;
-                let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                for block_id in 0..pool.num_blocks() {
-                    // Skip if the block already has data.  Uses the explicit
-                    // `received` bitset rather than a non-zero-content sniff —
-                    // a genuinely all-zero KV block (valid data) must not be
-                    // treated as "not yet arrived" and re-fetched.
-                    if pool.block_is_received(block_id) {
-                        continue;
-                    }
-                    match router.fetch_kv_block(block_id, 0, block_elems) {
-                        Ok((k_data, v_data)) => {
-                            let num_tokens = block_elems / elem_per_token;
-                            pool.write_keys(block_id, &k_data, num_tokens);
-                            pool.write_values(block_id, &v_data);
+                let num_blocks = {
+                    let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                    pool.num_blocks()
+                };
+                let num_layers = self
+                    .sessions
+                    .get(&id)
+                    .and_then(|s| s.kv_cache())
+                    .map(|kv| kv.num_layers())
+                    .unwrap_or(1)
+                    .max(1);
+                for layer in 0..num_layers {
+                    for block_id in 0..num_blocks {
+                        let already_received = {
+                            let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                            pool.block_is_received(block_id) && layer == 0
+                        };
+                        if already_received {
+                            continue;
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[grim-engine] Disagg decode KV fetch failed for req {id}, block {block_id}: {e}"
-                            );
+                        match router.fetch_kv_block(block_id, layer as u32, block_elems) {
+                            Ok((k_data, v_data)) => {
+                                let num_tokens = block_elems / elem_per_token;
+                                if layer == 0 {
+                                    let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                                    pool.write_keys(block_id, &k_data, num_tokens);
+                                    pool.write_values(block_id, &v_data);
+                                }
+                                if let Some(session) = self.sessions.get_mut(&id) {
+                                    if let Some(kv) = session.kv_mut() {
+                                        let _ = kv.write_layer_block(layer, block_id, &k_data, &v_data);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[grim-engine] Disagg decode KV fetch failed for req {id}, layer {layer}, block {block_id}: {e}"
+                                );
+                            }
                         }
                     }
                 }

@@ -93,4 +93,19 @@ pub trait KvCache: Send {
     fn prefix_physical_ids(&self) -> Vec<usize> {
         Vec::new()
     }
+
+    /// Return the number of active layers in the paged store.
+    fn num_layers(&self) -> usize {
+        0
+    }
+
+    /// Extract key and value slices for a given layer and physical block ID.
+    fn layer_block_slice(&self, _layer: usize, _block_id: usize) -> Option<(&[f32], &[f32])> {
+        None
+    }
+
+    /// Write raw key and value slices directly into a physical block for a layer (e.g. for disagg network ingestion).
+    fn write_layer_block(&mut self, _layer: usize, _block_id: usize, _k: &[f32], _v: &[f32]) -> Result<()> {
+        Ok(())
+    }
 }
