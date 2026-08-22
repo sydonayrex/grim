@@ -126,3 +126,13 @@ Companion to `grim_vs_competitors.md` §8 (verified 2026-08-22). Every item belo
 
 - **F7 is the keystone** — extracting the shared trainer pays off three times: CLI preference correctness, true data-parallel reuse (F8), and advanced-trainer wiring.
 - The recurring failure pattern behind this list ("implemented and tested but unreachable", "aliased", "simulated") argues for one standing convention going forward: **no CLI/config value may be accepted unless it changes behavior or errors loudly.** F1's rejection pattern generalized.
+
+---
+
+## F10 status (2026-08-22)
+
+- ✅ CUDA graph capture: `grim-backend-cuda/src/graph_capture.rs` (`GraphCaptureManager`, bucketed `DecodeGraphKey` get_or_capture/replay) — compiles, 32+7 crate tests green.
+- ✅ Dirty-block device KV mirror: `grim-memory::DeviceKvMirror` behind `PagedKvCache` — appended KV marks only the touched (layer, block) dirty; per-block device tensors upload once per block lifetime; sealed history never re-uploads; tiering-integrated eviction prunes mirror entries for freed/demoted blocks. ITL gate: `itl_gate_dirty_block_mirror_uploads_each_block_once` asserts 6 uploads vs naive 100 at the test shape (deterministic bytes-moved proxy).
+- ⏳ Hardware ITL measurement: requires gfx1036 iGPU runner (`RUSTC=$TC cargo test -p grim-memory --lib itl_gate --release` against real device) — same runner class as the existing device-gated scythe tests.
+- ⏳ Vulkan/Metal hardware-launch parity: existing CPU-referenced numerical suites need execution on real adapters — gfx1036 iGPU for Vulkan (device-gated test precedent exists), mac runner for Metal. Tracked here as CI requirement, not implementable in-sandbox.
+- ⏳ Kernel-side consumption of per-block mirror tensors by paged-attention kernels (removes legacy whole-layer staging entirely) — backend-kernel follow-up.
