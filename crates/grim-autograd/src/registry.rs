@@ -285,21 +285,35 @@ impl AutogradRegistry {
             params.insert(param_b);
         }
 
-        // WI-T8: when scope is FullParameter, register all base weights as
-        // frozen TrainableParams so gradients flow through them during backward
-        // but the optimizer skips them (base weights stay frozen in WI-T8/QLoRA).
+        // When scope is FullParameter, register base weights across all layers
+        // as unfrozen TrainableParams so optimizer updates the dense weights directly.
         if scope == AutogradScope::FullParameter {
-            for point in LoRAInjectionPoint::all_points() {
-                let (rows, cols) = point.base_weight_shape(&model_config);
-                let base_id = ParamId::base(0, *point);
-                let base_tensor =
-                    cpu_tensor(vec![0.0f32; rows * cols], Shape::new(vec![rows, cols]));
-                let base_param = TrainableParam::register_base_weight(
-                    base_id,
-                    base_tensor,
-                    true, // frozen — optimizer skips base weights
-                )?;
-                params.insert(base_param);
+            let num_layers = injection_registry
+                .configs
+                .keys()
+                .map(|(l, _)| *l)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1);
+            for layer_idx in 0..num_layers {
+                for point in LoRAInjectionPoint::all_points() {
+                    let (rows, cols) = point.base_weight_shape(&model_config);
+                    let base_id = ParamId::base(layer_idx, *point);
+                    let weight_data = if let Some(map) = base_weights {
+                        map.get(&(layer_idx, *point))
+                            .cloned()
+                            .unwrap_or_else(|| vec![0.0f32; rows * cols])
+                    } else {
+                        vec![0.0f32; rows * cols]
+                    };
+                    let base_tensor = cpu_tensor(weight_data, Shape::new(vec![rows, cols]));
+                    let base_param = TrainableParam::register_base_weight(
+                        base_id,
+                        base_tensor,
+                        false, // unfrozen: optimizer updates base weights directly
+                    )?;
+                    params.insert(base_param);
+                }
             }
         }
 
