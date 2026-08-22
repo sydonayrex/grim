@@ -1224,6 +1224,10 @@ pub fn apply_and_record_lora(
     x: Tensor,
     x_id: crate::tape::TensorId,
 ) -> Result<(crate::tape::TensorId, Tensor)> {
+    if autograd_reg.scope == crate::AutogradScope::FullParameter {
+        return Ok((base_id, base));
+    }
+
     if let Some(cfg) = autograd_reg.injection_registry.get(layer_idx, point) {
         if cfg.enabled {
             let param_a = autograd_reg.params.get(cfg.param_id_a()).ok_or_else(|| {
