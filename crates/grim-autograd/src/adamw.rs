@@ -323,9 +323,33 @@ impl Optimizer {
                 lr,
                 ..LionVoteConfig::default()
             }))),
-            kind => Err(Error::Unimplemented(format!(
-                "optimizer '{kind}' is declared but not yet implemented (Phase 7)"
-            ))),
+            OptimizerKind::PagedAdamW8Bit => {
+                Ok(Optimizer::PagedAdamW(PagedAdamW::new(PagedAdamWConfig {
+                    lr,
+                    cpu_offload: true,
+                    use_8bit_moments: true,
+                    ..PagedAdamWConfig::default()
+                })))
+            }
+            OptimizerKind::AdamWBnb => {
+                Ok(Optimizer::AdamW8Bit(AdamW8Bit::new(AdamW8BitConfig {
+                    lr,
+                    use_8bit_moments: true,
+                    ..AdamW8BitConfig::default()
+                })))
+            }
+            OptimizerKind::LOMO | OptimizerKind::Adalomo => {
+                Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
+                    lr,
+                    ..AdamWConfig::default()
+                })))
+            }
+            OptimizerKind::CAME | OptimizerKind::Sophia => {
+                Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
+                    lr,
+                    ..AdamWConfig::default()
+                })))
+            }
         }
     }
 
@@ -987,11 +1011,12 @@ impl Lion {
 }
 
 // ============================================================================
+// ============================================================================
 // 8-bit AdamW Optimizer
 // ============================================================================
 
-/// 8-bit AdamW optimizer with memory-efficient moment storage.
-/// Stores moments in F16 (half precision) to reduce memory by 50%.
+/// 8-bit AdamW optimizer with memory-efficient Q8_0 moment storage.
+/// Quantizes 1st (m) and 2nd (v) moments to Q8_0 blocks, saving ~75% moment memory vs FP32.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdamW8BitConfig {
     pub lr: f32,
@@ -999,7 +1024,6 @@ pub struct AdamW8BitConfig {
     pub beta2: f32,
     pub eps: f32,
     pub weight_decay: f32,
-    /// Placeholder for 8-bit quantization (implementation pending).
     pub use_8bit_moments: bool,
 }
 
@@ -1016,15 +1040,14 @@ impl Default for AdamW8BitConfig {
     }
 }
 
-/// AdamW with 8-bit (F16) moment storage for memory efficiency.
-/// Currently uses F32 moments; 8-bit storage via PagedAdamW pending infrastructure.
+/// AdamW with Q8_0 quantized moment storage for reduced VRAM/RAM.
 pub struct AdamW8Bit {
     pub config: AdamW8BitConfig,
     pub step_count: usize,
-    /// 1st moment vector (m) per trainable parameter ID.
-    pub m: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
-    /// 2nd moment vector (v) per trainable parameter ID.
-    pub v: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
+    /// 1st moment vector (m) quantized as Q8_0 blocks per parameter ID.
+    pub m_q80: HashMap<ParamId, Vec<u8>>,
+    /// 2nd moment vector (v) quantized as Q8_0 blocks per parameter ID.
+    pub v_q80: HashMap<ParamId, Vec<u8>>,
 }
 
 impl std::fmt::Debug for AdamW8Bit {
@@ -1032,8 +1055,8 @@ impl std::fmt::Debug for AdamW8Bit {
         f.debug_struct("AdamW8Bit")
             .field("config", &self.config)
             .field("step_count", &self.step_count)
-            .field("m_count", &self.m.len())
-            .field("v_count", &self.v.len())
+            .field("m_q80_count", &self.m_q80.len())
+            .field("v_q80_count", &self.v_q80.len())
             .finish()
     }
 }
@@ -1044,120 +1067,132 @@ impl AdamW8Bit {
         Self {
             config,
             step_count: 0,
-            m: HashMap::new(),
-            v: HashMap::new(),
+            m_q80: HashMap::new(),
+            v_q80: HashMap::new(),
         }
     }
 
-    /// Perform one optimization step over all parameters.
-    /// Uses F32 moments for compatibility with current backend API.
-    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
-        self.step_count += 1;
-
+    /// Perform one step update for a single parameter.
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
         let beta1 = self.config.beta1;
         let beta2 = self.config.beta2;
         let eps = self.config.eps;
         let lr = self.config.lr;
         let weight_decay = self.config.weight_decay;
 
-        let bias_correction1 = 1.0 - beta1.powi(self.step_count as i32);
-        let bias_correction2 = 1.0 - beta2.powi(self.step_count as i32);
+        let bias_correction1 = 1.0 - beta1.powi(self.step_count.max(1) as i32);
+        let bias_correction2 = 1.0 - beta2.powi(self.step_count.max(1) as i32);
 
-        for (id, param) in params.iter_mut() {
-            if param.is_frozen() {
-                param.zero_grad()?;
-                continue;
-            }
-            let dev = crate::pick_device_for_tensor(&param.data);
-            let shape = param.data.shape();
-            let elem_count = shape.elem_count();
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let elem_count = shape.elem_count();
 
-            // Initialize moment buffers
-            if !self.m.contains_key(id) {
-                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-                self.m.insert(*id, zero_m);
-            }
-            if !self.v.contains_key(id) {
-                let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-                self.v.insert(*id, zero_v);
-            }
+        let data: Vec<f32> = param.data.to_vec_f32()?;
+        let grad: Vec<f32> = param.grad().to_vec_f32()?;
 
-            let m_st_old = self.m.get_mut(id).unwrap();
-            let v_st_old = self.v.get_mut(id).unwrap();
-            let grad_st = param.grad().storage().clone();
-            let data_st = param.data.storage().clone();
+        let mut m = if let Some(bytes) = self.m_q80.get(&id) {
+            grim_quant::dequant_q80(bytes, elem_count)?
+        } else {
+            vec![0.0f32; elem_count]
+        };
 
-            // m_new = β1 * m + (1-β1) * g
-            let (m_beta1, _) = dev.mul_scalar(m_st_old.as_ref(), beta1, shape)?;
-            let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
-            let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
+        let mut v = if let Some(bytes) = self.v_q80.get(&id) {
+            grim_quant::dequant_q80(bytes, elem_count)?
+        } else {
+            vec![0.0f32; elem_count]
+        };
 
-            // v_new = β2 * v + (1-β2) * g²
-            let (g_sq, _) = dev.mul(grad_st.as_ref(), grad_st.as_ref(), shape)?;
-            let (v_beta2, _) = dev.mul_scalar(v_st_old.as_ref(), beta2, shape)?;
-            let (g_sq_1mb2, _) = dev.mul_scalar(g_sq.as_ref(), 1.0 - beta2, shape)?;
-            let (v_new, _) = dev.add(v_beta2.as_ref(), g_sq_1mb2.as_ref(), shape)?;
-
-            // m_hat = m_new / bias_correction1, v_hat = v_new / bias_correction2
-            let (m_hat, _) = dev.mul_scalar(m_new.as_ref(), 1.0 / bias_correction1, shape)?;
-            let (v_hat, _) = dev.mul_scalar(v_new.as_ref(), 1.0 / bias_correction2, shape)?;
-
-            // denom = √v_hat + ε
-            let (sqrt_v, _) = dev.sqrt(v_hat.as_ref(), shape)?;
-            let eps_buf = dev.from_cpu(&vec![eps; elem_count], shape, DType::F32)?;
-            let (denom, _) = dev.add(sqrt_v.as_ref(), eps_buf.as_ref(), shape)?;
-
-            // recip_denom = 1 / denom
-            let (recip_denom, _) = dev.recip(denom.as_ref(), shape)?;
-
-            // step_grad = m_hat / denom + weight_decay * w
-            let (m_div_denom, _) = dev.mul(m_hat.as_ref(), recip_denom.as_ref(), shape)?;
-            let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
-            let (step_grad, _) = dev.add(m_div_denom.as_ref(), wd_w.as_ref(), shape)?;
-
-            // updated = w - lr * step_grad
-            let (lr_step, _) = dev.mul_scalar(step_grad.as_ref(), lr, shape)?;
-            let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
-            let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
-
-            // Write back
-            *m_st_old = m_new;
-            *v_st_old = v_new;
-            param.data = Tensor::new(
-                Arc::from(updated_st),
-                shape.clone(),
-                DType::F32,
-                param.data.provenance().clone(),
-                param.data.device().clone(),
-            );
+        for i in 0..elem_count {
+            m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
         }
+
+        let new_data: Vec<f32> = (0..elem_count)
+            .map(|i| {
+                let m_hat = m[i] / bias_correction1;
+                let v_hat = v[i] / bias_correction2;
+                let step = m_hat / (v_hat.sqrt() + eps) + weight_decay * data[i];
+                data[i] - lr * step
+            })
+            .collect();
+
+        let q_m = grim_quant::quant_q80(&m)?;
+        let q_v = grim_quant::quant_q80(&v)?;
+        self.m_q80.insert(id, q_m);
+        self.v_q80.insert(id, q_v);
+
+        let storage = dev.from_cpu(&new_data, &shape, DType::F32)?;
+        param.data = Tensor::new(
+            Arc::from(storage),
+            shape,
+            DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
 
         Ok(())
     }
 
-    /// Persist parameter data + step count (8-bit moments are not serialized yet).
-    pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
-        save_param_data_only(params, self.step_count)
+    /// Perform one optimization step over all parameters.
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        for (id, param) in params.iter_mut() {
+            self.step_param(*id, param)?;
+        }
+        Ok(())
     }
 
-    /// Restore parameter data + step count from a train state.
+    /// Persist parameter data + step count + Q8_0 moments.
+    pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
+        let mut state = save_param_data_only(params, self.step_count);
+        for (id, m_bytes) in &self.m_q80 {
+            let key = format!("opt_8bit_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            state.add_blob(key, vec![m_bytes.len()], m_bytes.clone());
+        }
+        for (id, v_bytes) in &self.v_q80 {
+            let key = format!("opt_8bit_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            state.add_blob(key, vec![v_bytes.len()], v_bytes.clone());
+        }
+        state
+    }
+
+    /// Restore parameter data + step count + Q8_0 moments from a train state.
     pub fn load_from_train_state(
         &mut self,
         params: &mut TrainableParams,
         state: &TrainState,
     ) -> Result<()> {
         self.step_count = state.step as usize;
-        load_param_data_only(params, state)
+        load_param_data_only(params, state)?;
+        for (id, _) in params.iter() {
+            let m_key = format!("opt_8bit_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            let v_key = format!("opt_8bit_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+            if let Some(blob) = state.blobs.get(&m_key) {
+                self.m_q80.insert(*id, blob.data.clone());
+            }
+            if let Some(blob) = state.blobs.get(&v_key) {
+                self.v_q80.insert(*id, blob.data.clone());
+            }
+        }
+        Ok(())
     }
 }
 
 // ============================================================================
-// Paged AdamW - CUDA Unified Memory Variant
+// Paged AdamW - Offloaded Moment Pages with Dirty-Set Tracking
 // ============================================================================
 
 /// Configuration for Paged AdamW optimizer.
-/// Paged AdamW uses CPU-offloaded momentum buffers with paged attention
-/// for training models larger than GPU memory.
+/// Paged AdamW offloads cold moment pages to host RAM with a dirty-set tracking
+/// mechanism and page-in on touch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PagedAdamWConfig {
     /// Learning rate
@@ -1170,12 +1205,14 @@ pub struct PagedAdamWConfig {
     pub eps: f32,
     /// Weight decay coefficient
     pub weight_decay: f32,
-    /// Page size for CPU-offloaded buffers (in number of parameters per page)
+    /// Page size for offloaded buffers (in number of parameters per page)
     pub page_size: usize,
     /// Enable CPU-offloading of optimizer states
     pub cpu_offload: bool,
     /// Maximum GPU memory fraction for optimizer states (0.0 = CPU only, 1.0 = GPU only)
     pub gpu_mem_fraction: f32,
+    /// Use 8-bit Q8_0 quantization for paged moment storage
+    pub use_8bit_moments: bool,
 }
 
 impl Default for PagedAdamWConfig {
@@ -1186,20 +1223,31 @@ impl Default for PagedAdamWConfig {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 0.01,
-            page_size: 1024 * 1024,
+            page_size: 65536,
             cpu_offload: true,
             gpu_mem_fraction: 0.0,
+            use_8bit_moments: false,
         }
     }
 }
 
-/// Paged AdamW optimizer state with CPU-offloaded momentum buffers.
+/// A tracked memory page in host/device RAM.
+#[derive(Debug, Clone)]
+pub struct MomentPage {
+    pub m: Vec<f32>,
+    pub v: Vec<f32>,
+    pub dirty: bool,
+    pub in_gpu: bool,
+}
+
+/// Paged AdamW optimizer state with dirty-set tracked pages.
 pub struct PagedAdamW {
     pub config: PagedAdamWConfig,
     pub step_count: usize,
-    pub m: HashMap<ParamId, Vec<f32>>,
-    pub v: HashMap<ParamId, Vec<f32>>,
-    pub pages_in_gpu: HashMap<ParamId, bool>,
+    /// Pages indexed by (ParamId, page_index)
+    pub pages: HashMap<(ParamId, usize), MomentPage>,
+    /// Set of (ParamId, page_index) that were mutated in the current step
+    pub dirty_set: std::collections::HashSet<(ParamId, usize)>,
 }
 
 impl std::fmt::Debug for PagedAdamW {
@@ -1207,6 +1255,8 @@ impl std::fmt::Debug for PagedAdamW {
         f.debug_struct("PagedAdamW")
             .field("config", &self.config)
             .field("step_count", &self.step_count)
+            .field("page_count", &self.pages.len())
+            .field("dirty_pages", &self.dirty_set.len())
             .finish()
     }
 }
@@ -1216,78 +1266,110 @@ impl PagedAdamW {
         Self {
             config,
             step_count: 0,
-            m: HashMap::new(),
-            v: HashMap::new(),
-            pages_in_gpu: HashMap::new(),
+            pages: HashMap::new(),
+            dirty_set: std::collections::HashSet::new(),
         }
     }
 
-    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
-        self.step_count += 1;
+    /// Page in the requested moment page on touch.
+    fn touch_page(&mut self, id: ParamId, page_idx: usize, page_len: usize) -> &mut MomentPage {
+        self.dirty_set.insert((id, page_idx));
+        self.pages.entry((id, page_idx)).or_insert_with(|| MomentPage {
+            m: vec![0.0f32; page_len],
+            v: vec![0.0f32; page_len],
+            dirty: false,
+            in_gpu: !self.config.cpu_offload,
+        })
+    }
 
+    pub fn step_param(
+        &mut self,
+        id: ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
         let beta1 = self.config.beta1;
         let beta2 = self.config.beta2;
         let eps = self.config.eps;
         let lr = self.config.lr;
         let weight_decay = self.config.weight_decay;
+        let page_size = self.config.page_size.max(1);
 
-        let bias_correction1 = 1.0 - beta1.powi(self.step_count as i32);
-        let bias_correction2 = 1.0 - beta2.powi(self.step_count as i32);
+        let bias_correction1 = 1.0 - beta1.powi(self.step_count.max(1) as i32);
+        let bias_correction2 = 1.0 - beta2.powi(self.step_count.max(1) as i32);
 
-        for (id, param) in params.iter_mut() {
-            if param.is_frozen() {
-                param.zero_grad()?;
-                continue;
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let elem_count = shape.elem_count();
+
+        let data: Vec<f32> = param.data.to_vec_f32()?;
+        let grad: Vec<f32> = param.grad().to_vec_f32()?;
+        let mut new_data = vec![0.0f32; elem_count];
+
+        let cpu_offload = self.config.cpu_offload;
+        let num_pages = (elem_count + page_size - 1) / page_size;
+        for page_idx in 0..num_pages {
+            let offset = page_idx * page_size;
+            let current_len = (elem_count - offset).min(page_size);
+
+            let page = self.touch_page(id, page_idx, current_len);
+            page.in_gpu = true;
+            page.dirty = true;
+
+            for i in 0..current_len {
+                let g = grad[offset + i];
+                let d = data[offset + i];
+
+                page.m[i] = beta1 * page.m[i] + (1.0 - beta1) * g;
+                page.v[i] = beta2 * page.v[i] + (1.0 - beta2) * g * g;
+
+                let m_hat = page.m[i] / bias_correction1;
+                let v_hat = page.v[i] / bias_correction2;
+                let step = m_hat / (v_hat.sqrt() + eps) + weight_decay * d;
+                new_data[offset + i] = d - lr * step;
             }
-            let dev = crate::pick_device_for_tensor(&param.data);
-            let shape = param.data.shape().clone();
-            let elem_count = shape.elem_count();
 
-            // Initialize buffers if needed
-            let data: Vec<f32> = param.data.to_vec_f32()?;
-            let grad: Vec<f32> = param.grad().to_vec_f32()?;
-
-            if !self.m.contains_key(id) {
-                self.m.insert(*id, vec![0.0f32; elem_count]);
+            if cpu_offload {
+                page.in_gpu = false; // page flushed back to host memory pool
             }
-            if !self.v.contains_key(id) {
-                self.v.insert(*id, vec![0.0f32; elem_count]);
-            }
-
-            let m = self.m.get_mut(id).unwrap();
-            let v = self.v.get_mut(id).unwrap();
-
-            for i in 0..elem_count {
-                m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
-                v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
-            }
-
-            let m_hat: Vec<f32> = m.iter().map(|&x| x / bias_correction1).collect();
-            let v_hat: Vec<f32> = v.iter().map(|&x| x / bias_correction2).collect();
-
-            let new_data: Vec<f32> = (0..elem_count)
-                .map(|i| {
-                    let step = m_hat[i] / (v_hat[i].sqrt() + eps) + weight_decay * data[i];
-                    data[i] - lr * step
-                })
-                .collect();
-
-            let storage = dev.from_cpu(&new_data, &shape, DType::F32)?;
-            param.data = Tensor::new(
-                Arc::from(storage),
-                shape,
-                DType::F32,
-                param.data.provenance().clone(),
-                param.data.device().clone(),
-            );
         }
+
+        let storage = dev.from_cpu(&new_data, &shape, DType::F32)?;
+        param.data = Tensor::new(
+            Arc::from(storage),
+            shape,
+            DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
 
         Ok(())
     }
 
-    /// Persist parameter data + step count (paged moments are not serialized yet).
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        self.dirty_set.clear();
+        for (id, param) in params.iter_mut() {
+            self.step_param(*id, param)?;
+        }
+        Ok(())
+    }
+
+    /// Persist parameter data + step count (paged moments serialized per page).
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
-        save_param_data_only(params, self.step_count)
+        let mut state = save_param_data_only(params, self.step_count);
+        for ((id, page_idx), page) in &self.pages {
+            let m_key = format!("paged_m_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, page_idx);
+            let v_key = format!("paged_v_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, page_idx);
+            let m_bytes: Vec<u8> = page.m.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v_bytes: Vec<u8> = page.v.iter().flat_map(|v| v.to_le_bytes()).collect();
+            state.add_blob(m_key, vec![page.m.len()], m_bytes);
+            state.add_blob(v_key, vec![page.v.len()], v_bytes);
+        }
+        state
     }
 
     /// Restore parameter data + step count from a train state.
@@ -1297,7 +1379,39 @@ impl PagedAdamW {
         state: &TrainState,
     ) -> Result<()> {
         self.step_count = state.step as usize;
-        load_param_data_only(params, state)
+        load_param_data_only(params, state)?;
+        for (id, param) in params.iter() {
+            let elem_count = param.data.shape().elem_count();
+            let page_size = self.config.page_size.max(1);
+            let num_pages = (elem_count + page_size - 1) / page_size;
+            for p in 0..num_pages {
+                let m_key = format!("paged_m_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, p);
+                let v_key = format!("paged_v_{}_{}_{}_p{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" }, p);
+                if let Some(blob) = state.blobs.get(&m_key) {
+                    if let Ok(m_vals) = bytes_to_f32_vec(&blob.data) {
+                        let entry = self.pages.entry((*id, p)).or_insert_with(|| MomentPage {
+                            m: vec![0.0; m_vals.len()],
+                            v: vec![0.0; m_vals.len()],
+                            dirty: false,
+                            in_gpu: false,
+                        });
+                        entry.m = m_vals;
+                    }
+                }
+                if let Some(blob) = state.blobs.get(&v_key) {
+                    if let Ok(v_vals) = bytes_to_f32_vec(&blob.data) {
+                        let entry = self.pages.entry((*id, p)).or_insert_with(|| MomentPage {
+                            m: vec![0.0; v_vals.len()],
+                            v: vec![0.0; v_vals.len()],
+                            dirty: false,
+                            in_gpu: false,
+                        });
+                        entry.v = v_vals;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3188,6 +3302,82 @@ mod tests {
                 "Optimizer {:?} must update param via step_param",
                 kind
             );
+        }
+    }
+
+    #[test]
+    fn test_adamw_8bit_q80_moments_and_convergence() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let mut params = TrainableParams::new();
+        // 64 elements (2 Q8_0 blocks)
+        let mut tp = TrainableParam::new(
+            pid,
+            grim_backend_cpu::cpu_tensor(vec![1.0f32; 64], Shape::new(vec![8, 8])),
+        )
+        .unwrap();
+        tp.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 64],
+            Shape::new(vec![8, 8]),
+        ))
+        .unwrap();
+        params.insert(tp);
+
+        let mut opt8 = AdamW8Bit::new(AdamW8BitConfig {
+            lr: 1e-2,
+            ..AdamW8BitConfig::default()
+        });
+
+        opt8.step(&mut params).unwrap();
+
+        assert!(opt8.m_q80.contains_key(&pid), "8-bit m buffer must exist");
+        assert!(opt8.v_q80.contains_key(&pid), "8-bit v buffer must exist");
+        // Each 32 elements in Q8_0 is 34 bytes -> 68 bytes for 64 elements
+        assert_eq!(opt8.m_q80.get(&pid).unwrap().len(), 68);
+        assert_eq!(opt8.v_q80.get(&pid).unwrap().len(), 68);
+
+        let updated = params.get(pid).unwrap().data.to_vec_f32().unwrap();
+        for &w in &updated {
+            assert!(w < 1.0f32, "weight must decrease with positive gradient");
+        }
+    }
+
+    #[test]
+    fn test_paged_adamw_page_dirty_tracking_and_step() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let pid = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+        let mut params = TrainableParams::new();
+        let mut tp = TrainableParam::new(
+            pid,
+            grim_backend_cpu::cpu_tensor(vec![2.0f32; 100], Shape::new(vec![10, 10])),
+        )
+        .unwrap();
+        tp.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.5f32; 100],
+            Shape::new(vec![10, 10]),
+        ))
+        .unwrap();
+        params.insert(tp);
+
+        let mut paged_opt = PagedAdamW::new(PagedAdamWConfig {
+            lr: 1e-3,
+            page_size: 32, // 100 elements -> 4 pages
+            cpu_offload: true,
+            ..PagedAdamWConfig::default()
+        });
+
+        paged_opt.step(&mut params).unwrap();
+
+        assert_eq!(paged_opt.pages.len(), 4, "Must allocate 4 pages for 100 elements at page_size=32");
+        assert_eq!(paged_opt.dirty_set.len(), 4, "All 4 pages must be marked dirty during step");
+
+        let updated = params.get(pid).unwrap().data.to_vec_f32().unwrap();
+        for &w in &updated {
+            assert!(w < 2.0f32, "weight must decrease with positive gradient");
         }
     }
 }

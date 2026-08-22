@@ -459,6 +459,9 @@ enum Commands {
         /// Deduplicate identical token sequences across mixed datasets.
         #[arg(long)]
         dedup: bool,
+        /// Number of gradient checkpointing segments across layers (0 = disabled).
+        #[arg(long, default_value_t = 0)]
+        checkpoint_segs: usize,
     },
     /// Manage and inspect chat templates.
     Templates {
@@ -1363,6 +1366,7 @@ async fn main() -> Result<()> {
             dataset_paths,
             mix_weights,
             dedup,
+            checkpoint_segs,
         } => {
             // Load grim.toml defaults if available
             let cfg_toml = grim_cli::config::GrimToml::from_path("grim.toml").unwrap_or_default();
@@ -1443,6 +1447,7 @@ async fn main() -> Result<()> {
                 train_dtype,
                 use_spectral_qlora: false,
                 qat_mxfp4: qat_mxfp4,
+                checkpoint_segs,
                 lora_plus_ratio: effective_lora_plus,
                 relora_reset_steps: effective_relora_steps,
                 use_oft: effective_use_oft,

@@ -4243,10 +4243,27 @@ impl BackendDevice for RocmDevice {
             return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
         }
 
+        let mut launch_block_dim = launch.block_dim;
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let key = crate::autotune::KernelKey {
+            kernel: "grim_qkv_attention",
+            gpu_arch: arch_leak,
+            m: config.num_heads,
+            n: config.head_dim,
+            k: kv_seq_len.clamp(1, 1 << 16),
+        };
+        if let Ok(tuner) = self.autotuner.lock() {
+            if let Some(cfg) = tuner.lookup(key) {
+                if cfg.block_dim > 0 {
+                    launch_block_dim.x = cfg.block_dim;
+                }
+            }
+        }
+
         let stream = self.launch_compute_kernel(
             "grim_qkv_attention",
             launch.grid_dim,
-            launch.block_dim,
+            launch_block_dim,
             &mut [
                 arg(&mut qptr),
                 arg(&mut kptr),

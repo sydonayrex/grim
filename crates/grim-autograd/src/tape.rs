@@ -58,6 +58,10 @@ pub struct TapeEntry {
     pub param_id: Option<ParamId>,
     /// Operation-specific context.
     pub metadata: TapeMetadata,
+    /// Checkpoint segment index (0 = default).
+    pub segment_idx: usize,
+    /// Whether this entry serves as a segment checkpoint boundary.
+    pub is_checkpoint: bool,
 }
 
 /// Operation-specific context. Mirrors the existing forward op semantics so
@@ -109,11 +113,33 @@ pub struct Tape {
     tensors: HashMap<TensorId, Tensor>,
     param_tensors: HashMap<ParamId, TensorId>,
     next_id: u32,
+    /// Configured checkpoint segments count (0 or 1 = disabled).
+    pub checkpoint_segs: usize,
+    /// Current segment index during forward recording.
+    pub current_segment: usize,
+    /// Segment boundary markers: segment_idx -> boundary TensorId.
+    pub checkpoint_boundaries: HashMap<usize, TensorId>,
 }
 
 impl Tape {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure segment-wise gradient checkpointing.
+    pub fn set_checkpoint_segs(&mut self, segs: usize) {
+        self.checkpoint_segs = segs;
+    }
+
+    /// Mark a segment boundary for gradient checkpointing.
+    pub fn mark_segment_boundary(&mut self, segment_idx: usize, input_id: TensorId) {
+        self.current_segment = segment_idx;
+        self.checkpoint_boundaries.insert(segment_idx, input_id);
+    }
+
+    /// True if gradient checkpointing is active.
+    pub fn is_checkpointing_enabled(&self) -> bool {
+        self.checkpoint_segs > 1
     }
 
     /// Register a tensor and return its `TensorId`.
@@ -161,6 +187,7 @@ impl Tape {
         self.entries.clear();
         self.tensors.clear();
         self.param_tensors.clear();
+        self.checkpoint_boundaries.clear();
         self.next_id = 0;
     }
 
@@ -193,6 +220,8 @@ impl Tape {
                 k,
                 n,
             },
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -211,6 +240,8 @@ impl Tape {
             output: out_id,
             param_id,
             metadata: TapeMetadata::Add,
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -229,6 +260,8 @@ impl Tape {
             output: out_id,
             param_id,
             metadata: TapeMetadata::Scale { factor },
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -260,6 +293,8 @@ impl Tape {
                 a: a_param,
                 b: b_param,
             },
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -273,6 +308,8 @@ impl Tape {
             output: out_id,
             param_id: None,
             metadata: TapeMetadata::SiluMul,
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -293,6 +330,8 @@ impl Tape {
             output: out_id,
             param_id: weight_param,
             metadata: TapeMetadata::RmsNorm { eps, weight_param },
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -312,6 +351,8 @@ impl Tape {
             output: out_id,
             param_id: None,
             metadata: TapeMetadata::Rope,
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -325,6 +366,8 @@ impl Tape {
             output: out_id,
             param_id: None,
             metadata: TapeMetadata::Softmax,
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -351,6 +394,8 @@ impl Tape {
                 hidden_dim,
                 weight_param,
             },
+            segment_idx: self.current_segment,
+            is_checkpoint: false,
         });
         out_id
     }
@@ -501,6 +546,26 @@ mod tests {
         assert!(tape.is_empty());
         let stepped_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
         assert_ne!(initial_a, stepped_a);
+    }
+
+    #[test]
+    fn test_gradient_checkpointing_segments_and_parity() {
+        let mut tape = Tape::new();
+        tape.set_checkpoint_segs(4);
+        assert!(tape.is_checkpointing_enabled());
+
+        let x = tape.register(cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2])));
+        tape.mark_segment_boundary(0, x);
+
+        let w1 = tape.register(cpu_tensor(vec![0.5, 0.5, 0.5, 0.5], Shape::new(vec![2, 2])));
+        let h1 = tape.record_matmul(x, w1, cpu_tensor(vec![1.5, 1.5], Shape::new(vec![1, 2])), false, false, 1, 2, 2, None);
+        assert_eq!(tape.entries()[0].segment_idx, 0);
+
+        tape.mark_segment_boundary(1, h1);
+        let w2 = tape.register(cpu_tensor(vec![0.2, 0.2, 0.2, 0.2], Shape::new(vec![2, 2])));
+        let _h2 = tape.record_matmul(h1, w2, cpu_tensor(vec![0.6, 0.6], Shape::new(vec![1, 2])), false, false, 1, 2, 2, None);
+        assert_eq!(tape.entries()[1].segment_idx, 1);
+        assert_eq!(tape.checkpoint_boundaries.len(), 2);
     }
 
     // Helper for the test above

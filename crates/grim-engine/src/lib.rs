@@ -453,6 +453,11 @@ impl Engine {
         self.total_tokens_generated
     }
 
+    /// Total count of speculative draft tokens accepted since engine startup.
+    pub fn accepted_tokens_total(&self) -> u64 {
+        self.accepted_tokens_total
+    }
+
     /// WI-E2: speculative-decoding acceptance rate — accepted / generated.
     /// Returns None when no tokens have been generated yet.
     pub fn acceptance_rate(&self) -> Option<f64> {

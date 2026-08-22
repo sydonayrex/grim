@@ -1625,4 +1625,41 @@ mod wi_e3_tests {
             assert_eq!(covered, text.len());
         }
     }
+
+    #[test]
+    fn test_parallel_encode_10_varied_samples_parity() {
+        let tok = GgufTokenizer::default();
+        let samples: Vec<String> = vec![
+            // 1. English prose
+            "The quick brown fox jumps over the lazy dog. A journey of a thousand miles begins with a single step.\n".repeat(200),
+            // 2. German prose
+            "Zusammenfassung der wichtigsten Ergebnisse der Untersuchung über künstliche Intelligenz und maschinelles Lernen.\n".repeat(200),
+            // 3. Japanese CJK
+            "自然言語処理におけるトークナイザーの並列化と性能最適化に関する研究報告書。\n".repeat(200),
+            // 4. Source code
+            "fn compute_kernel(a: &[f32], b: &[f32], c: &mut [f32]) { for i in 0..a.len() { c[i] = a[i] * b[i] + 1.0; } }\n".repeat(200),
+            // 5. Numerical tables
+            "Row 0: 1.2345, 6.7890, 0.0012, -4.5678, 9.8765\nRow 1: 3.1415, 2.7182, 1.4142, -0.5772, 0.6931\n".repeat(200),
+            // 6. Math symbols & unicode punctuation
+            "Theorem 1: ∀x ∈ ℝ, ∃y: x² + y² ≥ 0 ⇒ lim_{n→∞} (1 + 1/n)^n = e ≈ 2.71828.\n".repeat(200),
+            // 7. JSON structural
+            "{\"id\": 42, \"model\": \"grim-v1\", \"status\": \"active\", \"metrics\": {\"tps\": 128.5, \"p99\": 12.4}}\n".repeat(200),
+            // 8. Repetitive tokens
+            "word word word word word word word word word word word word word word word word\n".repeat(200),
+            // 9. Whitespace & indentation
+            "    indented line 1\n        nested line 2\n            deep line 3\n".repeat(200),
+            // 10. Markdown document
+            "# Section Title\n\nHere is a paragraph explaining tokenizer benchmarks.\n\n- item 1\n- item 2\n".repeat(200),
+        ];
+
+        for (idx, sample) in samples.iter().enumerate() {
+            assert!(sample.len() >= 8192, "sample {idx} must cross 8192 byte parallel threshold");
+            let parallel = tok.encode(sample);
+            let mut serial = Vec::new();
+            for line_group in split_lines_for_test(sample, 4096) {
+                serial.extend(tok.encode(line_group));
+            }
+            assert_eq!(parallel, serial, "sample {idx} parallel encode diverged from serial");
+        }
+    }
 }

@@ -1,0 +1,29 @@
+# grim configuration template
+# Values set here provide defaults, overridden by GRIM_* environment variables.
+
+# Server bind host (default: "127.0.0.1")
+host = "127.0.0.1"
+
+# Server bind port (default: 11434)
+port = 11434
+
+# Context window limit in tokens (default: auto from GGUF metadata)
+# context = 4096
+
+# Preferred backend: "rocm", "cuda", "vulkan", "metal", "cpu", "auto" (default: "auto")
+backend = "auto"
+
+# Visible GPU ordinals (default: all available)
+# gpus = [0, 1]
+
+# Tensor parallel world size (default: 0 = disabled)
+tp_size = 0
+
+# Multi-GPU parallelism hint
+# parallel = true
+
+# GPU memory budget cap per device in MiB (default: unlimited)
+# mem_budget_mib = 16384
+
+# Kernel launch timeout in seconds (default: 300)
+kernel_timeout = 300

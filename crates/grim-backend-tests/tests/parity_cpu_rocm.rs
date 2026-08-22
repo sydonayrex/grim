@@ -2,7 +2,7 @@
 
 use grim_backend_tests::{TEST_K_DIMS, TEST_QUANT_FORMATS};
 use grim_quant::{
-    QuantFormat, dequant_iq4nl, dequant_mxfp4, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
+    QuantFormat, dequant_iq4nl, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
     quant_iq4nl, quant_q4k, quant_q5k, quant_q6k, quant_q80,
 };
 
