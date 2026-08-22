@@ -60,6 +60,8 @@ pub struct UiTrainingConfig {
     pub rocm_fusion_qkv_attention: bool,
     pub auto_wavefront: bool,
     pub xnack_enabled: bool,
+    /// Selected optimizer.
+    pub optimizer: String,
     /// PiSSA: initialize adapter A/B via truncated SVD of the base weight.
     pub use_pissa: bool,
     /// OLoRA: add `olora_lambda * olora_orthogonality_penalty(A, B)` to the loss.
@@ -82,6 +84,7 @@ impl Default for UiTrainingConfig {
             rocm_fusion_qkv_attention: false,
             auto_wavefront: true,
             xnack_enabled: false,
+            optimizer: "AdamW".into(),
             use_pissa: false,
             use_olora: false,
             olora_lambda: 0.0,

@@ -132,6 +132,9 @@ pub struct HyperparamFormV1 {
     pub auto_wavefront: bool,
     pub xnack_enabled: bool,
 
+    /// Which optimizer is selected: AdamW, GaLore, LOMO, AdaLomo, CAME, Sophia, Muon, etc.
+    pub optimizer: String,
+
     /// PiSSA: initialize adapter A/B via truncated SVD of the base weight.
     pub use_pissa: bool,
     /// OLoRA: add `olora_lambda * olora_orthogonality_penalty(A, B)` to the loss.
@@ -153,6 +156,7 @@ impl Default for HyperparamFormV1 {
             rocm_fusion_qkv_attention: false,
             auto_wavefront: true,
             xnack_enabled: false,
+            optimizer: "AdamW".into(),
             use_pissa: false,
             use_olora: false,
             olora_lambda: 0.0,
@@ -174,6 +178,7 @@ impl HyperparamFormV1 {
             rocm_fusion_qkv_attention: c.rocm_fusion_qkv_attention,
             auto_wavefront: c.auto_wavefront,
             xnack_enabled: c.xnack_enabled,
+            optimizer: c.optimizer,
             use_pissa: c.use_pissa,
             use_olora: c.use_olora,
             olora_lambda: c.olora_lambda,

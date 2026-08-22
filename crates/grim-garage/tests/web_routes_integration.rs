@@ -175,3 +175,39 @@ async fn cannot_exceed_max_concurrent_jobs() {
 
     assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
 }
+
+#[tokio::test]
+async fn test_start_training_accepts_advanced_optimizers() {
+    let optimizers = ["LOMO", "Adalomo", "CAME", "Sophia", "GaloreAdamW"];
+    for opt in optimizers {
+        let state = new_app_state();
+        let app = build_router(state);
+
+        let payload = serde_json::json!({
+            "model_path": "models/model.grim",
+            "dataset_path": "datasets/data.jsonl",
+            "training_mode": "Lora",
+            "optimizer": opt
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/train/start")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&payload).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "failed starting job with optimizer {opt}"
+        );
+    }
+}

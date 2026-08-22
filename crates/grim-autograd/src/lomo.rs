@@ -4,8 +4,8 @@
 //! gradient memory overhead during LLM pretraining and full-parameter finetuning.
 //! AdaLomo adds adaptive learning rate scaling with minimal second-moment state.
 
-use crate::param::{ParamId, TrainableParams};
-use grim_format::train::{TrainFpFormat, TrainState};
+use crate::param::{ParamId, TrainableParam, TrainableParams};
+use grim_format::train::TrainState;
 use grim_tensor::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -95,51 +95,52 @@ impl Lomo {
         Ok(())
     }
 
+    /// Single-param step (fused streaming update).
+    pub fn step_param(&mut self, id: ParamId, param: &mut TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let mut data = param.data.to_vec_f32()?;
+        let grad = param.grad().to_vec_f32()?;
+        self.update_param(id, &mut data, &grad)?;
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
+        param.data = grim_tensor::Tensor::new(
+            std::sync::Arc::from(updated),
+            shape,
+            param.data.dtype(),
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        param.zero_grad()?;
+        Ok(())
+    }
+
     /// Perform a full step on all parameters in `TrainableParams`.
-    pub fn step(
-        &mut self,
-        params: &mut TrainableParams,
-        grads: &HashMap<ParamId, Vec<f32>>,
-    ) -> Result<()> {
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
         self.step_count += 1;
 
-        let scale = if let Some(max_norm) = self.config.clip_grad_norm {
-            let mut sum_sq = 0.0f64;
-            for g in grads.values() {
-                for &val in g {
-                    sum_sq += (val as f64) * (val as f64);
-                }
+        for (id, param) in params.iter_mut() {
+            if param.is_frozen() {
+                param.zero_grad()?;
+                continue;
             }
-            let total_norm = sum_sq.sqrt() as f32;
-            if total_norm > max_norm && total_norm > 1e-12 {
-                max_norm / total_norm
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        };
-
-        for (id, g) in grads {
-            if let Some(param) = params.get_mut(*id) {
-                let mut data = param.data.to_vec_f32()?;
-                let scaled_g: Vec<f32> = if (scale - 1.0).abs() > 1e-7 {
-                    g.iter().map(|&x| x * scale).collect()
-                } else {
-                    g.clone()
-                };
-                self.update_param(*id, &mut data, &scaled_g)?;
-                let dev = crate::pick_device_for_tensor(&param.data);
-                let shape = param.data.shape().clone();
-                let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
-                param.data = grim_tensor::Tensor::new(
-                    std::sync::Arc::from(updated),
-                    shape,
-                    param.data.dtype(),
-                    param.data.provenance().clone(),
-                    param.data.device().clone(),
-                );
-            }
+            let mut data = param.data.to_vec_f32()?;
+            let grad = param.grad().to_vec_f32()?;
+            self.update_param(*id, &mut data, &grad)?;
+            let dev = crate::pick_device_for_tensor(&param.data);
+            let shape = param.data.shape().clone();
+            let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
+            param.data = grim_tensor::Tensor::new(
+                std::sync::Arc::from(updated),
+                shape,
+                param.data.dtype(),
+                param.data.provenance().clone(),
+                param.data.device().clone(),
+            );
+            param.zero_grad()?;
         }
 
         Ok(())
@@ -147,33 +148,17 @@ impl Lomo {
 
     /// Export optimizer state to `TrainState`.
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
-        let mut state = TrainState {
-            step: self.step_count as u64,
-            fp_format: TrainFpFormat::Fp32,
-            dtypes: HashMap::new(),
-            blobs: HashMap::new(),
-        };
-        for (id, buf) in &self.momentum_buffers {
-            let name = format!(
-                "lomo.momentum.{}.{}",
-                id.layer_idx,
-                if id.is_a { "a" } else { "b" }
-            );
-            let bytes: Vec<u8> = buf.iter().flat_map(|v| v.to_le_bytes()).collect();
-            state.add_blob(name, vec![buf.len()], bytes);
-        }
-        for (id, param) in params.iter() {
-            if let Ok(data) = param.data.to_vec_f32() {
-                let name = format!(
-                    "weight.{}.{}",
-                    id.layer_idx,
-                    if id.is_a { "a" } else { "b" }
-                );
-                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                state.add_blob(name, param.data.shape().dims().to_vec(), bytes);
-            }
-        }
-        state
+        crate::adamw::save_param_data_only(params, self.step_count)
+    }
+
+    /// Restore optimizer state from `TrainState`.
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        crate::adamw::load_param_data_only(params, state)
     }
 }
 
@@ -265,29 +250,52 @@ impl AdaLomo {
         Ok(())
     }
 
+    /// Single-param step (fused streaming update).
+    pub fn step_param(&mut self, id: ParamId, param: &mut TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let mut data = param.data.to_vec_f32()?;
+        let grad = param.grad().to_vec_f32()?;
+        self.update_param(id, &mut data, &grad)?;
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
+        param.data = grim_tensor::Tensor::new(
+            std::sync::Arc::from(updated),
+            shape,
+            param.data.dtype(),
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        param.zero_grad()?;
+        Ok(())
+    }
+
     /// Perform a full step on all parameters in `TrainableParams`.
-    pub fn step(
-        &mut self,
-        params: &mut TrainableParams,
-        grads: &HashMap<ParamId, Vec<f32>>,
-    ) -> Result<()> {
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
         self.step_count += 1;
 
-        for (id, g) in grads {
-            if let Some(param) = params.get_mut(*id) {
-                let mut data = param.data.to_vec_f32()?;
-                self.update_param(*id, &mut data, g)?;
-                let dev = crate::pick_device_for_tensor(&param.data);
-                let shape = param.data.shape().clone();
-                let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
-                param.data = grim_tensor::Tensor::new(
-                    std::sync::Arc::from(updated),
-                    shape,
-                    param.data.dtype(),
-                    param.data.provenance().clone(),
-                    param.data.device().clone(),
-                );
+        for (id, param) in params.iter_mut() {
+            if param.is_frozen() {
+                param.zero_grad()?;
+                continue;
             }
+            let mut data = param.data.to_vec_f32()?;
+            let grad = param.grad().to_vec_f32()?;
+            self.update_param(*id, &mut data, &grad)?;
+            let dev = crate::pick_device_for_tensor(&param.data);
+            let shape = param.data.shape().clone();
+            let updated = dev.from_cpu(&data, &shape, param.data.dtype())?;
+            param.data = grim_tensor::Tensor::new(
+                std::sync::Arc::from(updated),
+                shape,
+                param.data.dtype(),
+                param.data.provenance().clone(),
+                param.data.device().clone(),
+            );
+            param.zero_grad()?;
         }
 
         Ok(())
@@ -295,33 +303,17 @@ impl AdaLomo {
 
     /// Export state to `TrainState`.
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
-        let mut state = TrainState {
-            step: self.step_count as u64,
-            fp_format: TrainFpFormat::Fp32,
-            dtypes: HashMap::new(),
-            blobs: HashMap::new(),
-        };
-        for (id, buf) in &self.exp_avg_sq {
-            let name = format!(
-                "adalomo.exp_avg_sq.{}.{}",
-                id.layer_idx,
-                if id.is_a { "a" } else { "b" }
-            );
-            let bytes: Vec<u8> = buf.iter().flat_map(|v| v.to_le_bytes()).collect();
-            state.add_blob(name, vec![buf.len()], bytes);
-        }
-        for (id, param) in params.iter() {
-            if let Ok(data) = param.data.to_vec_f32() {
-                let name = format!(
-                    "weight.{}.{}",
-                    id.layer_idx,
-                    if id.is_a { "a" } else { "b" }
-                );
-                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                state.add_blob(name, param.data.shape().dims().to_vec(), bytes);
-            }
-        }
-        state
+        crate::adamw::save_param_data_only(params, self.step_count)
+    }
+
+    /// Restore state from `TrainState`.
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        crate::adamw::load_param_data_only(params, state)
     }
 }
 
@@ -364,7 +356,6 @@ mod tests {
         let mut param = vec![10.0f32];
         let id = ParamId::new(0, 0, LoRAInjectionPoint::QProj, true);
 
-        // Optimize quadratic loss L = 0.5 * param^2 -> grad = param
         for _ in 0..50 {
             let grad = vec![param[0]];
             adalomo.step_count += 1;

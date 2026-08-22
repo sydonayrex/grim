@@ -163,6 +163,38 @@
                 </div>
               </div>
 
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="input-optimizer">Optimizer</label>
+                  <select id="input-optimizer" class="form-control">
+                    <option value="AdamW" selected>AdamW (Standard FP32)</option>
+                    <option value="AdamW8Bit">AdamW 8-bit</option>
+                    <option value="PagedAdamW">Paged AdamW (RAM Offload)</option>
+                    <option value="Lion">Lion (Sign Momentum)</option>
+                    <option value="Lion8Bit">Lion 8-bit</option>
+                    <option value="Adafactor">Adafactor (Factored 2nd Moment)</option>
+                    <option value="GaloreAdamW">GaLore (SVD Low-Rank Projection)</option>
+                    <option value="QGaLoreAdamW8Bit">QGaLore (Quantized Low-Rank)</option>
+                    <option value="LOMO">LOMO (Zero-Grad Fused SGD)</option>
+                    <option value="Adalomo">AdaLomo (Adaptive LOMO)</option>
+                    <option value="CAME">CAME (Confidence-Guided Adaptive)</option>
+                    <option value="Sophia">Sophia (2nd-Order Diagonal Hessian)</option>
+                    <option value="Muon">Muon (Newton-Schulz Orthogonal)</option>
+                    <option value="MAdam">M-Adam (FP4/FP8 Add-Mult)</option>
+                    <option value="LionVote">LionVote (Adaptive Sign-Vote)</option>
+                  </select>
+                </div>
+                <div class="form-group half">
+                  <label for="input-scheduler">LR Schedule</label>
+                  <select id="input-scheduler" class="form-control">
+                    <option value="Cosine" selected>Cosine Annealing</option>
+                    <option value="Linear">Linear Decay</option>
+                    <option value="Constant">Constant</option>
+                    <option value="InverseSqrt">Inverse Sqrt</option>
+                  </select>
+                </div>
+              </div>
+
               <div class="form-row checkboxes">
                 <label class="checkbox-label">
                   <input type="checkbox" id="check-fusion-rmsnorm" checked> ROCm Fused RMSNorm+Matmul

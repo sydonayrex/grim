@@ -6,7 +6,6 @@ use grim_autograd::{
 };
 use grim_backend_cpu::cpu_tensor;
 use grim_tensor::Shape;
-use std::collections::HashMap;
 
 #[test]
 fn test_lomo_and_adalomo_numerical_accuracy() {
@@ -20,9 +19,11 @@ fn test_lomo_and_adalomo_numerical_accuracy() {
     params.insert(TrainableParam::new(id0, t0).unwrap());
     params.insert(TrainableParam::new(id1, t1).unwrap());
 
-    let mut grads = HashMap::new();
-    grads.insert(id0, vec![0.1, -0.2, 0.3]);
-    grads.insert(id1, vec![0.5, 0.5, 0.5]);
+    let g0 = cpu_tensor(vec![0.1, -0.2, 0.3], Shape::new(vec![3]));
+    let g1 = cpu_tensor(vec![0.5, 0.5, 0.5], Shape::new(vec![3]));
+
+    params.get_mut(id0).unwrap().accumulate_grad(&g0).unwrap();
+    params.get_mut(id1).unwrap().accumulate_grad(&g1).unwrap();
 
     // 1. LOMO Step
     let mut lomo = Lomo::new(LomoConfig {
@@ -32,7 +33,7 @@ fn test_lomo_and_adalomo_numerical_accuracy() {
         clip_grad_norm: None,
     });
 
-    lomo.step(&mut params, &grads).unwrap();
+    lomo.step(&mut params).unwrap();
 
     let p0 = params.get(id0).unwrap().data.to_vec_f32().unwrap();
     // delta = 0.1 * [0.1, -0.2, 0.3] -> p0 = [2.0 - 0.01, -3.0 + 0.02, 4.0 - 0.03]
@@ -50,7 +51,10 @@ fn test_lomo_and_adalomo_numerical_accuracy() {
         clip_grad_norm: None,
     });
 
-    adalomo.step(&mut params, &grads).unwrap();
+    params.get_mut(id0).unwrap().accumulate_grad(&g0).unwrap();
+    params.get_mut(id1).unwrap().accumulate_grad(&g1).unwrap();
+
+    adalomo.step(&mut params).unwrap();
     let p0_post = params.get(id0).unwrap().data.to_vec_f32().unwrap();
     assert!(
         p0_post[0] < p0[0],
