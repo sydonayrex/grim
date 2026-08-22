@@ -12,10 +12,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grim_autograd::mm_grpo::{grpo_modality_loss, MmGrpoConfig, MmGrpoRewardNormalizer};
-use grim_autograd::preference_loss::{
-    dpo_loss, kto_loss, orpo_odds_ratio_loss, simpo_loss,
-};
 use grim_format::tprov::RemappingTensorProvider;
 use grim_tensor::{DType, QuantProvenance, Shape, Tensor, TensorProvider, backend::ScytheLink};
 use serde::{Deserialize, Serialize};
@@ -1457,24 +1453,13 @@ fn preference_log_softmax_vjp(
     vocab_size: usize,
     d_loss_d_logp: f32,
 ) -> Vec<f32> {
-    let mut grad = vec![0.0f32; logits_vec.len()];
-    for (time, &token_id) in input_ids.iter().enumerate() {
-        let row_start = time * vocab_size;
-        let row_end = row_start.saturating_add(vocab_size);
-        if row_end > logits_vec.len() {
-            break;
-        }
-        let row = &logits_vec[row_start..row_end];
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum_exp: f32 = row.iter().map(|&value| (value - max).exp()).sum();
-        let token_id = token_id as usize;
-        for (column, &value) in row.iter().enumerate() {
-            let probability = (value - max).exp() / sum_exp;
-            grad[row_start + column] =
-                d_loss_d_logp * (probability - if column == token_id { 1.0 } else { 0.0 });
-        }
-    }
-    grad
+    grim_autograd::PreferenceTrainer::compute_log_softmax_vjp(
+        logits_vec,
+        input_ids,
+        vocab_size,
+        d_loss_d_logp,
+        u32::MAX, // no ignore index
+    )
 }
 
 fn preference_loss_and_grads(
@@ -1484,100 +1469,31 @@ fn preference_loss_and_grads(
     ref_chosen: &[f32],
     ref_rejected: &[f32],
 ) -> (f32, Vec<f32>, Vec<f32>) {
-    let n = chosen.len().max(1) as f32;
-    let mut grad_chosen = vec![0.0; chosen.len()];
-    let mut grad_rejected = vec![0.0; rejected.len()];
-    let rewards: Vec<f32> = chosen
-        .iter()
-        .zip(rejected.iter())
-        .map(|(&positive, &negative)| positive - negative)
-        .collect();
-    let softplus_grad = |value: f32| 1.0 / (1.0 + (-value).exp().min(1e10));
-    let loss = match mode {
-        TrainingMode::Dpo => {
-            let (loss, _, _) = dpo_loss(chosen, rejected, ref_chosen, ref_rejected, 0.1)
-                .unwrap_or((0.5, vec![], vec![]));
-            for i in 0..chosen.len().min(rejected.len()) {
-                let margin = 0.1 * ((chosen[i] - ref_chosen[i]) - (rejected[i] - ref_rejected[i]));
-                let sigmoid_negative = 1.0 / (1.0 + margin.exp().min(1e10));
-                grad_chosen[i] = -0.1 * sigmoid_negative / n;
-                grad_rejected[i] = 0.1 * sigmoid_negative / n;
-            }
-            loss
-        }
-        TrainingMode::Orpo => {
-            let loss = orpo_odds_ratio_loss(chosen, rejected, 0.1).unwrap_or(0.5);
-            for i in 0..chosen.len().min(rejected.len()) {
-                let p_chosen = chosen[i].exp().clamp(1e-7, 1.0 - 1e-7);
-                let p_rejected = rejected[i].exp().clamp(1e-7, 1.0 - 1e-7);
-                let log_odds =
-                    (p_chosen / (1.0 - p_chosen) / (p_rejected / (1.0 - p_rejected))).ln();
-                let sigmoid_negative = 1.0 / (1.0 + log_odds.exp().min(1e10));
-                grad_chosen[i] = 0.1 * sigmoid_negative / ((1.0 - p_chosen).max(1e-7) * n);
-                grad_rejected[i] = -0.1 * sigmoid_negative / ((1.0 - p_rejected).max(1e-7) * n);
-            }
-            loss
-        }
-        TrainingMode::Kto => {
-            let (loss, _, _) = kto_loss(chosen, rejected, ref_chosen, ref_rejected, 0.1, 1.0, 1.0)
-                .unwrap_or((0.5, vec![], vec![]));
-            let chosen_mean = chosen
-                .iter()
-                .zip(ref_chosen.iter())
-                .map(|(&value, &reference)| value - reference)
-                .sum::<f32>()
-                / n;
-            for i in 0..chosen.len() {
-                grad_chosen[i] =
-                    -0.1 * softplus_grad(-0.1 * ((chosen[i] - ref_chosen[i]) - chosen_mean)) / n;
-            }
-            let rejected_n = rejected.len().max(1) as f32;
-            for i in 0..rejected.len() {
-                grad_rejected[i] = 0.1
-                    * softplus_grad(-0.1 * (chosen_mean - (rejected[i] - ref_rejected[i])))
-                    / rejected_n;
-            }
-            loss
-        }
-        TrainingMode::SimPo => {
-            let loss = simpo_loss(
-                chosen,
-                rejected,
-                &vec![1; chosen.len()],
-                &vec![1; rejected.len()],
-                2.0,
-                0.5,
-            )
-            .unwrap_or(0.5);
-            for i in 0..chosen.len().min(rejected.len()) {
-                let margin = 2.0 * (chosen[i] - rejected[i]) - 0.5;
-                let gradient = softplus_grad(-margin);
-                grad_chosen[i] = 2.0 * gradient / n;
-                grad_rejected[i] = -2.0 * gradient / n;
-            }
-            loss
-        }
-        TrainingMode::Grpo => {
-            let config = MmGrpoConfig::default();
-            let modality_tags: Vec<String> = vec!["text".to_string(); chosen.len()];
-            let (loss, _) =
-                grpo_modality_loss(chosen, ref_chosen, &rewards, &modality_tags, &config);
-            let normalized =
-                MmGrpoRewardNormalizer::normalize_once(&config, &rewards, &modality_tags, 1);
-            for i in 0..chosen.len() {
-                let log_ratio = chosen[i] - ref_chosen[i];
-                let ratio = log_ratio.exp();
-                let advantage = normalized.get(i).copied().unwrap_or(0.0);
-                let clipped = ratio.clamp(0.8, 1.2) * advantage;
-                let objective = (ratio * advantage).min(clipped);
-                let kl = (ref_chosen[i] - chosen[i]).exp() - (ref_chosen[i] - chosen[i]) - 1.0;
-                grad_chosen[i] = (-objective + 0.04 * kl) / n;
-            }
-            loss
-        }
-        _ => 0.5,
+    let trainer = grim_autograd::PreferenceTrainer::with_default_config();
+    let kind = match mode {
+        TrainingMode::Dpo => grim_autograd::PreferenceKind::Dpo,
+        TrainingMode::Orpo => grim_autograd::PreferenceKind::Orpo,
+        TrainingMode::SimPo => grim_autograd::PreferenceKind::Simpo,
+        TrainingMode::Kto => grim_autograd::PreferenceKind::Kto,
+        TrainingMode::Grpo => grim_autograd::PreferenceKind::Grpo,
+        _ => grim_autograd::PreferenceKind::Dpo,
     };
-    (loss, grad_chosen, grad_rejected)
+
+    let c_lens = vec![chosen.len()];
+    let r_lens = vec![rejected.len()];
+
+    trainer
+        .compute_preference_step(
+            kind,
+            chosen,
+            rejected,
+            ref_chosen,
+            ref_rejected,
+            &c_lens,
+            &r_lens,
+            None,
+        )
+        .unwrap_or((0.5, vec![-0.1], vec![0.1]))
 }
 
 fn run_multi_rank_sft(

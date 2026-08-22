@@ -183,8 +183,8 @@ impl StreamingBlockForward {
                 continue;
             }
             let layer = *layer_idx;
-            let mut apply = |point: LoRAInjectionPoint,
-                             linear: &mut grim_nn::modules::Linear|
+            let apply = |point: LoRAInjectionPoint,
+                         linear: &mut grim_nn::modules::Linear|
              -> Result<()> {
                 if let Some(p) = reg.params.get(ParamId::base(layer, point)) {
                     linear.replace_weight(p.data.clone())?;

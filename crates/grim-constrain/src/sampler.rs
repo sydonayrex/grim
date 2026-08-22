@@ -205,16 +205,30 @@ impl ConstrainedSampler {
         }
     }
 
-    /// Return deterministic lookahead string if the current FSM state only permits a single literal path.
-    pub fn lookahead_literal(&self) -> Option<&'static str> {
-        let fsm = self.fsm.lock().unwrap();
-        match fsm.mode {
-            crate::json_fsm::Mode::ExpectColon => Some(": "),
-            crate::json_fsm::Mode::LitTrue(1) => Some("rue"),
-            crate::json_fsm::Mode::LitFalse(1) => Some("alse"),
-            crate::json_fsm::Mode::LitNull(1) => Some("ull"),
-            _ => None,
+    /// Return deterministic lookahead string if the current FSM/schema state
+    /// only permits a single literal continuation. Consumed by the server's
+    /// jump-forward-lite (F6): when the constrained mask admits the literal,
+    /// the sampler splices it and skips ahead instead of sampling token by
+    /// token.
+    pub fn lookahead_literal(&self) -> Option<String> {
+        // FSM-level singletons (JSON-object mode): forced colon, literal tails.
+        {
+            let fsm = self.fsm.lock().unwrap();
+            match fsm.mode {
+                crate::json_fsm::Mode::ExpectColon => return Some(": ".to_string()),
+                crate::json_fsm::Mode::LitTrue(1) => return Some("rue".to_string()),
+                crate::json_fsm::Mode::LitFalse(1) => return Some("alse".to_string()),
+                crate::json_fsm::Mode::LitNull(1) => return Some("ull".to_string()),
+                _ => {}
+            }
         }
+        // Schema-level singletons: forced key names, single-enum values.
+        if let Constraint::JsonSchema(comp) = &self.constraint {
+            if let Ok(out) = self.output.lock() {
+                return comp.lookahead_jump_forward(&out);
+            }
+        }
+        None
     }
 }
 

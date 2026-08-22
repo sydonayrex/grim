@@ -256,6 +256,116 @@ impl GraphCaptureManager {
     }
 }
 
+/// Supported fixed decode batch buckets for HIP Graph capture.
+/// Reduces kernel launch overhead by compiling static graphs for common batch cardinalities.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DecodeBatchBucket {
+    /// Batch 1 (single-sequence decode).
+    B1 = 1,
+    /// Batch 2.
+    B2 = 2,
+    /// Batch 4.
+    B4 = 4,
+    /// Batch 8.
+    B8 = 8,
+    /// Batch 16.
+    B16 = 16,
+    /// Batch 32.
+    B32 = 32,
+}
+
+impl DecodeBatchBucket {
+    /// Return the raw integer batch size for this bucket.
+    pub const fn batch_size(self) -> usize {
+        self as usize
+    }
+
+    /// Map a runtime batch size to the smallest enclosing bucket $B \in \{1, 2, 4, 8, 16, 32\}$.
+    /// Returns `None` if `batch == 0` or exceeds the maximum supported bucket (32).
+    pub fn from_batch_size(batch: usize) -> Option<Self> {
+        match batch {
+            0 => None,
+            1 => Some(Self::B1),
+            2 => Some(Self::B2),
+            3..=4 => Some(Self::B4),
+            5..=8 => Some(Self::B8),
+            9..=16 => Some(Self::B16),
+            17..=32 => Some(Self::B32),
+            _ => None,
+        }
+    }
+
+    /// Return all supported fixed batch buckets in ascending order.
+    pub const fn all_buckets() -> &'static [DecodeBatchBucket] {
+        &[
+            DecodeBatchBucket::B1,
+            DecodeBatchBucket::B2,
+            DecodeBatchBucket::B4,
+            DecodeBatchBucket::B8,
+            DecodeBatchBucket::B16,
+            DecodeBatchBucket::B32,
+        ]
+    }
+}
+
+/// Bucket-specialized graph manager for fixed-size autoregressive decode execution.
+#[derive(Debug, Default)]
+pub struct DecodeBucketGraphPool {
+    buckets: HashMap<DecodeBatchBucket, Arc<DecodeGraph>>,
+}
+
+impl DecodeBucketGraphPool {
+    /// Create a new empty decode bucket graph pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if a graph executable is captured and instantiated for a bucket.
+    pub fn contains_bucket(&self, bucket: DecodeBatchBucket) -> bool {
+        self.buckets.contains_key(&bucket)
+    }
+
+    /// Retrieve or capture a graph for the specified bucket.
+    pub fn get_or_capture<F>(
+        &mut self,
+        bucket: DecodeBatchBucket,
+        manager: &GraphCaptureManager,
+        key_template: DecodeGraphKey,
+        record_fn: F,
+    ) -> Result<Arc<DecodeGraph>>
+    where
+        F: FnOnce(*mut c_void) -> Result<()> + Send,
+    {
+        if let Some(graph) = self.buckets.get(&bucket) {
+            return Ok(graph.clone());
+        }
+
+        let mut bucket_key = key_template;
+        bucket_key.batch = bucket.batch_size() as u32;
+
+        let graph = manager.get_or_capture(bucket_key, record_fn)?;
+        self.buckets.insert(bucket, graph.clone());
+        Ok(graph)
+    }
+
+    /// Launch a bucket graph on a specified HIP stream with zero kernel launch host overhead.
+    pub fn launch(&self, bucket: DecodeBatchBucket, stream: *mut c_void) -> Result<()> {
+        let graph = self
+            .buckets
+            .get(&bucket)
+            .ok_or_else(|| Error::Backend(format!("No captured HIP graph for bucket {:?}", bucket)))?;
+
+        let res = unsafe { hipGraphLaunch(graph.exec, stream) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipGraphLaunch failed on bucket {:?}: {}",
+                bucket, res
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Drop for GraphCaptureManager {
     fn drop(&mut self) {
         // Tear down the capture stream if any was created.
@@ -407,5 +517,45 @@ impl Drop for HipGraphExecutor {
                 let _ = hipGraphDestroy(self.graph);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_batch_bucket_mapping() {
+        assert_eq!(DecodeBatchBucket::from_batch_size(0), None);
+        assert_eq!(DecodeBatchBucket::from_batch_size(1), Some(DecodeBatchBucket::B1));
+        assert_eq!(DecodeBatchBucket::from_batch_size(2), Some(DecodeBatchBucket::B2));
+        assert_eq!(DecodeBatchBucket::from_batch_size(3), Some(DecodeBatchBucket::B4));
+        assert_eq!(DecodeBatchBucket::from_batch_size(4), Some(DecodeBatchBucket::B4));
+        assert_eq!(DecodeBatchBucket::from_batch_size(5), Some(DecodeBatchBucket::B8));
+        assert_eq!(DecodeBatchBucket::from_batch_size(8), Some(DecodeBatchBucket::B8));
+        assert_eq!(DecodeBatchBucket::from_batch_size(12), Some(DecodeBatchBucket::B16));
+        assert_eq!(DecodeBatchBucket::from_batch_size(16), Some(DecodeBatchBucket::B16));
+        assert_eq!(DecodeBatchBucket::from_batch_size(24), Some(DecodeBatchBucket::B32));
+        assert_eq!(DecodeBatchBucket::from_batch_size(32), Some(DecodeBatchBucket::B32));
+        assert_eq!(DecodeBatchBucket::from_batch_size(64), None);
+
+        assert_eq!(DecodeBatchBucket::B1.batch_size(), 1);
+        assert_eq!(DecodeBatchBucket::B2.batch_size(), 2);
+        assert_eq!(DecodeBatchBucket::B4.batch_size(), 4);
+        assert_eq!(DecodeBatchBucket::B8.batch_size(), 8);
+        assert_eq!(DecodeBatchBucket::B16.batch_size(), 16);
+        assert_eq!(DecodeBatchBucket::B32.batch_size(), 32);
+
+        let buckets = DecodeBatchBucket::all_buckets();
+        assert_eq!(buckets.len(), 6);
+        assert_eq!(buckets[0], DecodeBatchBucket::B1);
+        assert_eq!(buckets[5], DecodeBatchBucket::B32);
+    }
+
+    #[test]
+    fn test_decode_bucket_graph_pool_init() {
+        let pool = DecodeBucketGraphPool::new();
+        assert!(!pool.contains_bucket(DecodeBatchBucket::B1));
+        assert!(!pool.contains_bucket(DecodeBatchBucket::B8));
     }
 }

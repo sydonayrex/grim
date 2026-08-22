@@ -62,7 +62,9 @@ pub mod omnigrad;
 pub mod ops;
 pub mod param;
 pub mod preference_loss;
+pub mod preference_trainer;
 
+pub use preference_trainer::{PreferenceKind, PreferenceStepConfig, PreferenceTrainer};
 pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
 pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
 pub mod omnilo_prune;

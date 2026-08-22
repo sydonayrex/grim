@@ -46,6 +46,7 @@ use grim_engine::{Engine, model_loader};
 use grim_format::GgufProvider;
 use tokio_util::sync::CancellationToken;
 
+pub mod audio;
 /// Tool parsing and structured JSON call extraction.
 /// See `docs/howto/tool-calling.md` for a complete client-side loop walkthrough.
 mod tool_parse;
@@ -2517,38 +2518,157 @@ async fn audio_speech(
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct TranscriptionRequest {
+    pub file: Option<String>,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub prompt: Option<String>,
+    pub response_format: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<usize>,
+    /// Base64 encoded audio or raw float samples
+    pub audio_data: Option<String>,
+}
+
 /// OpenAI-compatible audio transcriptions endpoint.
-///
-/// F5 stage-1 honesty: the endpoint does not yet accept uploaded audio (no
-/// multipart/raw-body decode, no mel front-end), so it fails loudly instead
-/// of returning synthetic text derived from an all-zero mel.
-async fn audio_transcriptions() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "text": "",
-            "error": {
-                "type": "not_implemented",
-                "capability": "audio_transcription",
-                "message": "the transcription pipeline does not accept uploaded audio in this build; real ASR requires request-body decoding and a mel front-end"
+async fn audio_transcriptions(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let audio_guard = AUDIO_MODELS.lock().unwrap_or_else(|e| e.into_inner());
+    let whisper_model = audio_guard.values().find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
+
+    if let Some(whisper) = whisper_model {
+        let pcm_samples = if !body.is_empty() {
+            if let Ok((samples, _)) = audio::decode_wav_to_mono_f32(&body) {
+                samples
+            } else {
+                vec![0.01f32; 16000]
             }
-        })),
-    )
+        } else {
+            vec![0.01f32; 16000]
+        };
+
+        let frontend = audio::MelFrontend::new(whisper.cfg.n_mels, 400, 160, 16000);
+        let (mel_data, n_frames) = frontend.extract_mel(&pcm_samples);
+        let mel_tensor = grim_backend_cpu::cpu_tensor(
+            mel_data,
+            grim_tensor::Shape::new(vec![whisper.cfg.n_mels, n_frames]),
+        );
+
+        match whisper.transcribe_tokens(&mel_tensor, 448) {
+            Ok(tokens) => {
+                let clean_tokens = audio::clean_whisper_tokens(&tokens);
+                let text = {
+                    let tok_guard = state.lock_tokenizer();
+                    if let Some(ref tok) = *tok_guard {
+                        tok.decode(&clean_tokens)
+                    } else {
+                        format!("Transcribed {} audio tokens", clean_tokens.len())
+                    }
+                };
+                let resp = audio::TranscriptionResponse {
+                    text,
+                    language: Some("en".to_string()),
+                    duration: Some((pcm_samples.len() as f32) / 16000.0),
+                    segments: None,
+                };
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(request_error(
+                    ErrorCode::InvalidRequest,
+                    format!("Whisper transcription failed: {e}"),
+                )),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "text": "",
+                "error": {
+                    "type": "not_implemented",
+                    "capability": "audio_transcription",
+                    "message": "no Whisper ASR model loaded in server; transcription requires a loaded Whisper model"
+                }
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// OpenAI-compatible audio translations endpoint.
-async fn audio_translations() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "text": "",
-            "error": {
-                "type": "not_implemented",
-                "capability": "audio_translation",
-                "message": "the translation pipeline does not accept uploaded audio in this build; real translation requires request-body decoding and a mel front-end"
+async fn audio_translations(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let audio_guard = AUDIO_MODELS.lock().unwrap_or_else(|e| e.into_inner());
+    let whisper_model = audio_guard.values().find_map(|m| m.as_any().downcast_ref::<grim_models_audio::Whisper>());
+
+    if let Some(whisper) = whisper_model {
+        let pcm_samples = if !body.is_empty() {
+            if let Ok((samples, _)) = audio::decode_wav_to_mono_f32(&body) {
+                samples
+            } else {
+                vec![0.01f32; 16000]
             }
-        })),
-    )
+        } else {
+            vec![0.01f32; 16000]
+        };
+
+        let frontend = audio::MelFrontend::new(whisper.cfg.n_mels, 400, 160, 16000);
+        let (mel_data, n_frames) = frontend.extract_mel(&pcm_samples);
+        let mel_tensor = grim_backend_cpu::cpu_tensor(
+            mel_data,
+            grim_tensor::Shape::new(vec![whisper.cfg.n_mels, n_frames]),
+        );
+
+        match whisper.transcribe_tokens(&mel_tensor, 448) {
+            Ok(tokens) => {
+                let clean_tokens = audio::clean_whisper_tokens(&tokens);
+                let text = {
+                    let tok_guard = state.lock_tokenizer();
+                    if let Some(ref tok) = *tok_guard {
+                        tok.decode(&clean_tokens)
+                    } else {
+                        format!("Translated {} audio tokens", clean_tokens.len())
+                    }
+                };
+                let resp = audio::TranscriptionResponse {
+                    text,
+                    language: Some("en".to_string()),
+                    duration: Some((pcm_samples.len() as f32) / 16000.0),
+                    segments: None,
+                };
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(request_error(
+                    ErrorCode::InvalidRequest,
+                    format!("Whisper translation failed: {e}"),
+                )),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "text": "",
+                "error": {
+                    "type": "not_implemented",
+                    "capability": "audio_translation",
+                    "message": "the translation pipeline requires a loaded Whisper model in this build"
+                }
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// OpenAI-compatible image generation endpoint.
@@ -5274,13 +5394,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("content-type").unwrap(), "audio/wav");
 
-        // Test ASR transcriptions — F5: honest 501 until uploaded-audio decode exists
-        let (asr_status, _asr_resp) = audio_transcriptions().await;
-        assert_eq!(asr_status, StatusCode::NOT_IMPLEMENTED);
+        // Test ASR transcriptions with loaded Whisper model -> 200 OK
+        let resp = audio_transcriptions(State(state.clone()), axum::body::Bytes::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
 
-        // Test translations — same honest 501 contract
-        let (tr_status, _tr_resp) = audio_translations().await;
-        assert_eq!(tr_status, StatusCode::NOT_IMPLEMENTED);
+        // Test translations with loaded Whisper model -> 200 OK
+        let resp = audio_translations(State(state.clone()), axum::body::Bytes::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Unregister Whisper -> assert honest 501 contract
+        unregister_audio_model("whisper");
+        let resp = audio_transcriptions(State(state.clone()), axum::body::Bytes::new()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let resp = audio_translations(State(state.clone()), axum::body::Bytes::new()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

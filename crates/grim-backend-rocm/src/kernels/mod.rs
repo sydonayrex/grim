@@ -44,6 +44,7 @@ pub mod iq_dequant;
 pub mod iq_gemm;
 pub mod jit_cache;
 pub mod kv_dequant_attention;
+pub mod log_softmax_vjp;
 pub mod marlin_gemm;
 pub mod mla_decode;
 pub mod mrope;

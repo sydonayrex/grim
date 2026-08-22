@@ -88,6 +88,12 @@ enum Commands {
         /// Optional model name or path to preload upon server startup.
         #[arg(short, long)]
         model: Option<String>,
+        /// Optional speculative draft model (EAGLE3 or small draft checkpoint).
+        #[arg(long)]
+        draft_model: Option<String>,
+        /// Enable lookahead speculative decoding.
+        #[arg(long)]
+        lookahead: bool,
         /// Target compute device/backend (e.g. rocm, cuda, vulkan, metal, cpu).
         #[arg(short, long, alias = "device")]
         backend: Option<String>,
@@ -124,6 +130,12 @@ enum Commands {
     Run {
         /// Name or path of the model.
         model: Option<String>,
+        /// Optional speculative draft model (EAGLE3 or small draft checkpoint).
+        #[arg(long)]
+        draft_model: Option<String>,
+        /// Enable lookahead speculative decoding.
+        #[arg(long)]
+        lookahead: bool,
         /// Prompt string (runs one-shot mode instead of interactive chat).
         prompt: Option<String>,
         /// Start the HTTP server (Ollama-compatible) on the specified port.
@@ -388,6 +400,18 @@ enum Commands {
         /// Number of GPUs for data-parallel training. >1 enables RCCL all-reduce.
         #[arg(long, default_value_t = 1)]
         num_gpus: usize,
+        /// Number of compute nodes in multi-node training cluster.
+        #[arg(long, default_value_t = 1)]
+        num_nodes: usize,
+        /// Rank of this node in multi-node training (0..num_nodes).
+        #[arg(long, default_value_t = 0)]
+        node_rank: usize,
+        /// Master coordinator address for multi-node RCCL rendezvous.
+        #[arg(long, default_value = "127.0.0.1")]
+        master_addr: String,
+        /// Master coordinator port for multi-node RCCL rendezvous.
+        #[arg(long, default_value_t = 29500)]
+        master_port: u16,
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
@@ -888,6 +912,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Serve {
             model,
+            draft_model,
+            lookahead,
             backend,
             address,
             host,
@@ -952,7 +978,27 @@ async fn main() -> Result<()> {
                 engine_config.disagg_config = Some(dc);
             }
 
-            let engine = grim_engine::Engine::new(engine_config);
+            let mut engine = grim_engine::Engine::new(engine_config);
+            if let Some(ref m) = model {
+                let p = catalog::resolve_model_preferring_grim(m).or_else(|| {
+                    let dp = std::path::Path::new(m);
+                    if dp.exists() {
+                        Some(dp.to_path_buf())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ref path) = p {
+                    if let Err(e) = engine.load_and_register_speculative(
+                        m,
+                        &path.display().to_string(),
+                        draft_model.as_deref(),
+                        lookahead,
+                    ) {
+                        eprintln!("[grim] WARNING: could not preload '{m}': {e}");
+                    }
+                }
+            }
             // Load plugins into a registry that is *kept* and threaded into
             // `serve()` so request handlers can look up registered samplers by
             // name. Prior behavior loaded then dropped the registry before a
@@ -1050,6 +1096,8 @@ async fn main() -> Result<()> {
         }
         Commands::Run {
             model,
+            draft_model,
+            lookahead,
             prompt,
             serve,
             address,
@@ -1098,10 +1146,13 @@ async fn main() -> Result<()> {
                         }
                     });
                     if let Some(ref path) = p {
-                        match grim_engine::model_loader::load_from_path(&path.display().to_string())
-                        {
-                            Ok(loaded) => engine.register_model(m, loaded),
-                            Err(e) => eprintln!("[grim] WARNING: could not load '{}': {e}", m),
+                        if let Err(e) = engine.load_and_register_speculative(
+                            m,
+                            &path.display().to_string(),
+                            draft_model.as_deref(),
+                            lookahead,
+                        ) {
+                            eprintln!("[grim] WARNING: could not load '{m}': {e}");
                         }
                     } else {
                         eprintln!(
@@ -1353,6 +1404,10 @@ async fn main() -> Result<()> {
             max_grad_norm,
             early_stopping_patience,
             num_gpus,
+            num_nodes,
+            node_rank,
+            master_addr,
+            master_port,
             device,
             mode,
             optimizer,
@@ -1566,6 +1621,10 @@ async fn main() -> Result<()> {
                 max_grad_norm: effective_max_grad_norm,
                 early_stopping_patience: effective_patience,
                 num_gpus,
+                num_nodes,
+                node_rank,
+                master_addr,
+                master_port,
                 device: final_device,
                 mode: final_mode,
                 optimizer: effective_optimizer,
@@ -1684,6 +1743,48 @@ async fn main() -> Result<()> {
                         scale,
                     )?;
                     println!("[grim merge] Merged tensor: {}", tensor_name);
+                }
+            }
+
+            // F2b: full-parameter sidecars carry base-weight blobs
+            // (`param_{layer}_0_{point}_a`, no `_b` partner). Overwrite the
+            // matching GGUF tensors so the merged checkpoint IS the trained
+            // model, not just an adapter delta.
+            let base_blobs = state.base_weight_blobs();
+            if !base_blobs.is_empty() {
+                println!(
+                    "[grim merge] Full-parameter checkpoint: {} base weight(s).",
+                    base_blobs.len()
+                );
+            }
+            for (layer, point_suffix, blob) in &base_blobs {
+                let Some(fmt) = state.dtypes.get(&blob.name).copied() else {
+                    continue;
+                };
+                let Some(vals) = grim_format::train::decode_f32s_from(&blob.data, fmt) else {
+                    continue;
+                };
+                let tensor_name = match point_suffix.as_str() {
+                    "logits" => "output.weight".to_string(),
+                    "qproj" => format!("layers.{layer}.attn.wq.weight"),
+                    "kproj" => format!("layers.{layer}.attn.wk.weight"),
+                    "vproj" => format!("layers.{layer}.attn.wv.weight"),
+                    "oproj" => format!("layers.{layer}.attn.wo.weight"),
+                    "gateproj" => format!("layers.{layer}.ffn.w_gate.weight"),
+                    "upproj" => format!("layers.{layer}.ffn.w_up.weight"),
+                    "downproj" => format!("layers.{layer}.ffn.w_down.weight"),
+                    other => {
+                        eprintln!("[grim merge] Unknown point suffix '{other}', skipping");
+                        continue;
+                    }
+                };
+                match grim_format::bolt_on::overwrite_tensor_f32(
+                    std::path::Path::new(&out_path),
+                    &tensor_name,
+                    &vals,
+                ) {
+                    Ok(()) => println!("[grim merge] Overwrote base tensor: {tensor_name}"),
+                    Err(e) => eprintln!("[grim merge] Skipped {tensor_name}: {e}"),
                 }
             }
             println!("[grim] Permanently merged adapter into '{}'.", out_path);

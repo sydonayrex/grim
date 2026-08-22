@@ -308,6 +308,27 @@ impl Default for TrainState {
 }
 
 impl TrainState {
+    /// F2b: full-parameter sidecars store base weights as
+    /// `param_{layer}_0_{point}_a` with no `_b` partner. Returns
+    /// `(layer_idx, point_suffix, blob)` candidates for checkpoint merge.
+    pub fn base_weight_blobs(&self) -> Vec<(usize, String, &TrainBlob)> {
+        let mut out = Vec::new();
+        for (name, blob) in &self.blobs {
+            let parts: Vec<&str> = name.split('_').collect();
+            if parts.len() != 5 || parts[0] != "param" || parts[2] != "0" || parts[4] != "a" {
+                continue;
+            }
+            let Ok(layer) = parts[1].parse::<usize>() else { continue };
+            let b_partner = format!("param_{}_{}_{}_b", layer, parts[2], parts[3]);
+            if self.blobs.contains_key(&b_partner) {
+                continue; // real LoRA-A (adapter 0), not a base weight
+            }
+            out.push((layer, parts[3].to_string(), blob));
+        }
+        out.sort_by_key(|(l, p, _)| (*l, p.clone()));
+        out
+    }
+
     /// Insert a blob under `name`.
     pub fn add_blob(&mut self, name: impl Into<String>, shape: Vec<usize>, data: Vec<u8>) {
         let name = name.into();
@@ -467,6 +488,24 @@ impl TrainState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base_weight_blobs_excludes_lora_pairs_and_non_base() {
+        let mut st = TrainState::default();
+        let mk = |n: &str| TrainBlob { name: n.to_string(), shape: vec![2, 2], data: vec![0; 16] };
+        // Base weights: adapter 0, `_a`, no `_b` partner.
+        st.blobs.insert("param_0_0_qproj_a".into(), mk("param_0_0_qproj_a"));
+        st.blobs.insert("param_1_0_downproj_a".into(), mk("param_1_0_downproj_a"));
+        // Real LoRA-A of adapter 0 has a `_b` partner → excluded.
+        st.blobs.insert("param_0_0_logits_a".into(), mk("param_0_0_logits_a"));
+        st.blobs.insert("param_0_0_logits_b".into(), mk("param_0_0_logits_b"));
+        // Non-zero adapter → never a base weight.
+        st.blobs.insert("param_2_5_upproj_a".into(), mk("param_2_5_upproj_a"));
+
+        let got = st.base_weight_blobs();
+        let names: Vec<&str> = got.iter().map(|(_, _, b)| b.name.as_str()).collect();
+        assert_eq!(names, vec!["param_0_0_qproj_a", "param_1_0_downproj_a"]);
+    }
+
     use super::*;
 
     #[test]

@@ -199,6 +199,297 @@ fn is_truncated_error(e: &serde_json::Error) -> bool {
         || msg.contains("control character")
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum CharMatcher {
+    Any,
+    Exact(char),
+    Class { ranges: Vec<(char, char)>, chars: Vec<char>, negated: bool },
+}
+
+impl CharMatcher {
+    fn matches(&self, c: char) -> bool {
+        match self {
+            CharMatcher::Any => true,
+            CharMatcher::Exact(target) => *target == c,
+            CharMatcher::Class { ranges, chars, negated } => {
+                let hit = chars.contains(&c) || ranges.iter().any(|&(low, high)| c >= low && c <= high);
+                if *negated { !hit } else { hit }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RegexElement {
+    matcher: CharMatcher,
+    min_repeat: usize,
+    max_repeat: usize,
+}
+
+/// Bounded-backtracking regex subset compiler supporting:
+/// `^`, `$`, `[...]`, `[^...]`, `\d`, `\w`, `\s`, `.`, `{m,n}`, `*`, `+`, `?`, literals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedRegex {
+    elements: Vec<RegexElement>,
+    anchor_start: bool,
+    anchor_end: bool,
+}
+
+impl BoundedRegex {
+    pub fn parse(pattern: &str) -> Option<Self> {
+        let chars: Vec<char> = pattern.chars().collect();
+        if chars.is_empty() {
+            return Some(Self { elements: Vec::new(), anchor_start: false, anchor_end: false });
+        }
+
+        let mut i = 0;
+        let mut anchor_start = false;
+        let mut anchor_end = false;
+
+        if chars[0] == '^' {
+            anchor_start = true;
+            i += 1;
+        }
+
+        let len = chars.len();
+        let end_limit = if len > i && chars[len - 1] == '$' && (len < 2 || chars[len - 2] != '\\') {
+            anchor_end = true;
+            len - 1
+        } else {
+            len
+        };
+
+        let mut elements = Vec::new();
+
+        while i < end_limit {
+            let c = chars[i];
+            let matcher = match c {
+                '.' => {
+                    i += 1;
+                    CharMatcher::Any
+                }
+                '\\' => {
+                    if i + 1 >= end_limit {
+                        return None;
+                    }
+                    let next = chars[i + 1];
+                    i += 2;
+                    match next {
+                        'd' => CharMatcher::Class { ranges: vec![('0', '9')], chars: Vec::new(), negated: false },
+                        'D' => CharMatcher::Class { ranges: vec![('0', '9')], chars: Vec::new(), negated: true },
+                        'w' => CharMatcher::Class { ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')], chars: vec!['_'], negated: false },
+                        'W' => CharMatcher::Class { ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')], chars: vec!['_'], negated: true },
+                        's' => CharMatcher::Class { ranges: Vec::new(), chars: vec![' ', '\t', '\n', '\r'], negated: false },
+                        'S' => CharMatcher::Class { ranges: Vec::new(), chars: vec![' ', '\t', '\n', '\r'], negated: true },
+                        escaped => CharMatcher::Exact(escaped),
+                    }
+                }
+                '[' => {
+                    i += 1;
+                    let mut negated = false;
+                    if i < end_limit && chars[i] == '^' {
+                        negated = true;
+                        i += 1;
+                    }
+                    let mut ranges = Vec::new();
+                    let mut specific_chars = Vec::new();
+                    let mut closed = false;
+
+                    while i < end_limit {
+                        let ch = chars[i];
+                        if ch == ']' {
+                            closed = true;
+                            i += 1;
+                            break;
+                        }
+                        if i + 2 < end_limit && chars[i + 1] == '-' && chars[i + 2] != ']' {
+                            let low = ch;
+                            let high = chars[i + 2];
+                            ranges.push((low, high));
+                            i += 3;
+                        } else if ch == '\\' && i + 1 < end_limit {
+                            let esc = chars[i + 1];
+                            match esc {
+                                'd' => ranges.push(('0', '9')),
+                                'w' => {
+                                    ranges.push(('a', 'z'));
+                                    ranges.push(('A', 'Z'));
+                                    ranges.push(('0', '9'));
+                                    specific_chars.push('_');
+                                }
+                                's' => specific_chars.extend_from_slice(&[' ', '\t', '\n', '\r']),
+                                other => specific_chars.push(other),
+                            }
+                            i += 2;
+                        } else {
+                            specific_chars.push(ch);
+                            i += 1;
+                        }
+                    }
+
+                    if !closed {
+                        return None;
+                    }
+                    CharMatcher::Class { ranges, chars: specific_chars, negated }
+                }
+                literal => {
+                    i += 1;
+                    CharMatcher::Exact(literal)
+                }
+            };
+
+            let (min_rep, max_rep) = if i < end_limit {
+                match chars[i] {
+                    '*' => { i += 1; (0, usize::MAX) }
+                    '+' => { i += 1; (1, usize::MAX) }
+                    '?' => { i += 1; (0, 1) }
+                    '{' => {
+                        let start_q = i + 1;
+                        let mut end_q = start_q;
+                        while end_q < end_limit && chars[end_q] != '}' {
+                            end_q += 1;
+                        }
+                        if end_q >= end_limit {
+                            return None;
+                        }
+                        let q_str: String = chars[start_q..end_q].iter().collect();
+                        i = end_q + 1;
+
+                        if let Some((min_s, max_s)) = q_str.split_once(',') {
+                            let min = min_s.trim().parse::<usize>().ok()?;
+                            let max = if max_s.trim().is_empty() {
+                                usize::MAX
+                            } else {
+                                max_s.trim().parse::<usize>().ok()?
+                            };
+                            (min, max)
+                        } else {
+                            let n = q_str.trim().parse::<usize>().ok()?;
+                            (n, n)
+                        }
+                    }
+                    _ => (1, 1),
+                }
+            } else {
+                (1, 1)
+            };
+
+            elements.push(RegexElement { matcher, min_repeat: min_rep, max_repeat: max_rep });
+        }
+
+        Some(Self { elements, anchor_start, anchor_end })
+    }
+
+    pub fn matches(&self, text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        let mut steps = 0usize;
+        let max_steps = 10_000usize;
+
+        if self.anchor_start {
+            self.match_from(&chars, 0, 0, &mut steps, max_steps)
+        } else {
+            for start_idx in 0..=chars.len() {
+                if self.match_from(&chars, start_idx, 0, &mut steps, max_steps) {
+                    return true;
+                }
+                if steps >= max_steps {
+                    break;
+                }
+            }
+            false
+        }
+    }
+
+    fn match_from(&self, chars: &[char], text_pos: usize, elem_idx: usize, steps: &mut usize, max_steps: usize) -> bool {
+        *steps += 1;
+        if *steps > max_steps {
+            return false;
+        }
+
+        if elem_idx == self.elements.len() {
+            if self.anchor_end {
+                return text_pos == chars.len();
+            }
+            return true;
+        }
+
+        let elem = &self.elements[elem_idx];
+
+        let mut max_matched = 0;
+        while text_pos + max_matched < chars.len() && max_matched < elem.max_repeat {
+            if elem.matcher.matches(chars[text_pos + max_matched]) {
+                max_matched += 1;
+            } else {
+                break;
+            }
+        }
+
+        if max_matched < elem.min_repeat {
+            return false;
+        }
+
+        for k in (elem.min_repeat..=max_matched).rev() {
+            if self.match_from(chars, text_pos + k, elem_idx + 1, steps, max_steps) {
+                return true;
+            }
+            if *steps > max_steps {
+                return false;
+            }
+        }
+
+        false
+    }
+}
+
+pub fn validate_pattern(pat: &str, text: &str) -> bool {
+    if let Some(regex) = BoundedRegex::parse(pat) {
+        regex.matches(text)
+    } else {
+        if pat.starts_with('^') && pat.ends_with('$') {
+            let inner = &pat[1..pat.len() - 1];
+            text == inner || text.starts_with(inner)
+        } else if pat.starts_with('^') {
+            text.starts_with(&pat[1..])
+        } else if pat.ends_with('$') {
+            text.ends_with(&pat[..pat.len() - 1])
+        } else {
+            text.contains(pat)
+        }
+    }
+}
+
+impl JsonSchemaConstraint {
+    /// Return deterministic lookahead fast-forward string if the current schema state permits only a single literal continuation.
+    pub fn lookahead_jump_forward(&self, partial_json: &str) -> Option<String> {
+        let trimmed = partial_json.trim_start();
+        if trimmed.is_empty() {
+            if let Some(ty) = self.schema.get("type").and_then(|v| v.as_str()) {
+                if ty == "object" {
+                    return Some("{\n".to_string());
+                }
+            }
+        }
+
+        if trimmed == "{" || trimmed == "{\n" {
+            if let Some(req) = self.schema.get("required").and_then(|v| v.as_array()) {
+                if req.len() == 1 {
+                    if let Some(key_name) = req[0].as_str() {
+                        return Some(format!("\"{}\": ", key_name));
+                    }
+                }
+            }
+        }
+
+        if let Some(enum_vals) = self.schema.get("enum").and_then(|v| v.as_array()) {
+            if enum_vals.len() == 1 {
+                return Some(enum_vals[0].to_string());
+            }
+        }
+
+        None
+    }
+}
+
 /// Recursive JSON-Schema validation for the supported subset.
 fn validate(value: &Value, schema: &Value) -> bool {
     if let Some(ty) = schema.get("type").and_then(|v| v.as_str()) {
@@ -218,24 +509,10 @@ fn validate(value: &Value, schema: &Value) -> bool {
             return false;
         }
     }
-    // pattern
+    // pattern (bounded backtracking regex subset)
     if let (Some(pat), Some(s)) = (schema.get("pattern").and_then(|v| v.as_str()), value.as_str()) {
-        if !pat.is_empty() {
-            let matches = if pat == "^[A-Z]{3}$" {
-                s.len() == 3 && s.chars().all(|c| c.is_ascii_uppercase())
-            } else if pat.starts_with('^') && pat.ends_with('$') {
-                let inner = &pat[1..pat.len() - 1];
-                s == inner || s.starts_with(inner)
-            } else if pat.starts_with('^') {
-                s.starts_with(&pat[1..])
-            } else if pat.ends_with('$') {
-                s.ends_with(&pat[..pat.len() - 1])
-            } else {
-                s.contains(pat)
-            };
-            if !matches {
-                return false;
-            }
+        if !pat.is_empty() && !validate_pattern(pat, s) {
+            return false;
         }
     }
     // enum
@@ -368,5 +645,37 @@ mod tests {
             compile_json_schema(serde_json::json!({"type": "string", "enum": ["a", "b"]})).unwrap();
         assert!(c.is_consistent("\"a\""));
         assert!(!c.is_consistent("\"c\""), "enum violation detected");
+    }
+
+    #[test]
+    fn test_bounded_regex_features() {
+        let r1 = BoundedRegex::parse("^[a-z0-9_-]{3,8}$").unwrap();
+        assert!(r1.matches("abc-12"));
+        assert!(!r1.matches("ab"));
+        assert!(!r1.matches("toolongstring123"));
+        assert!(!r1.matches("ABC-12"));
+
+        let r2 = BoundedRegex::parse(r"^\d{4}-\d{2}$").unwrap();
+        assert!(r2.matches("2026-08"));
+        assert!(!r2.matches("2026-8"));
+        assert!(!r2.matches("year-08"));
+
+        let r3 = BoundedRegex::parse(r"^[^0-9]+$").unwrap();
+        assert!(r3.matches("hello_world"));
+        assert!(!r3.matches("hello123world"));
+    }
+
+    #[test]
+    fn test_schema_lookahead_jump_forward() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "user_id": { "type": "string" }
+            },
+            "required": ["user_id"]
+        });
+        let c = compile_json_schema(schema).unwrap();
+        assert_eq!(c.lookahead_jump_forward(""), Some("{\n".to_string()));
+        assert_eq!(c.lookahead_jump_forward("{"), Some("\"user_id\": ".to_string()));
     }
 }

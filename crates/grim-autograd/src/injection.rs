@@ -42,6 +42,22 @@ pub enum LoRAInjectionPoint {
 }
 
 impl LoRAInjectionPoint {
+    /// F2b: stable short suffix for sidecar blob slot names so distinct
+    /// points never collide (base weights previously all mapped to
+    /// `param_L_0_a`, silently dropping all but one per layer).
+    pub fn suffix(&self) -> &'static str {
+        match self {
+            Self::QProj => "qproj",
+            Self::KProj => "kproj",
+            Self::VProj => "vproj",
+            Self::OProj => "oproj",
+            Self::GateProj => "gateproj",
+            Self::UpProj => "upproj",
+            Self::DownProj => "downproj",
+            Self::Logits => "logits",
+        }
+    }
+
     /// All standard QLoRA injection points (7 total, matching Unsloth).
     /// `Logits` is intentionally excluded — it is not a standard QLoRA site.
     pub fn all_standard_qlora() -> &'static [Self] {
