@@ -17,4 +17,4 @@ pub mod schema;
 
 pub use json_fsm::{FsmCheck, JsonState, TokenMaskCache, apply_mask};
 pub use sampler::{ConstrainedSampler, Constraint, constrained_json_object};
-pub use schema::{JsonSchemaCompilerError, compile_json_schema};
+pub use schema::{BoundedRegex, JsonSchemaCompilerError, compile_json_schema, validate_pattern};
