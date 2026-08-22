@@ -2890,8 +2890,7 @@ impl BackendDevice for MetalDevice {
             &Shape::new(vec![seq, qk_rope_dim]),
             kv_raw.dtype(),
         )?;
-        let v_storage =
-            self.from_cpu(&v_vec, &Shape::new(vec![seq, v_dim]), kv_raw.dtype())?;
+        let v_storage = self.from_cpu(&v_vec, &Shape::new(vec![seq, v_dim]), kv_raw.dtype())?;
 
         Ok((
             q_nope_storage,
@@ -5195,7 +5194,7 @@ mod tests {
     #[test]
     fn test_metal_add_golden_exact() {
         let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
-        let a_data = vec![1.5f32, -2.5, 0.0, 3.14159];
+        let a_data = vec![1.5f32, -2.5, 0.0, std::f32::consts::PI];
         let b_data = vec![2.5f32, 3.5, -1.0, 1.0];
         let a = dev
             .from_cpu(&a_data, &Shape::new(vec![4]), DType::F32)

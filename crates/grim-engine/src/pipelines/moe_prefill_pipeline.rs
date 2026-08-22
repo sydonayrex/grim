@@ -125,11 +125,7 @@ impl MoePrefillPipeline {
     /// # Contract
     /// `compute_fn(layer_idx, buffer_idx)` runs GPU kernel on the compute stream.
     /// `dma_fn(layer_idx, buffer_idx)` initiates asynchronous DMA on the transfer stream.
-    pub fn execute_pipelined<C, D>(
-        &mut self,
-        mut compute_fn: C,
-        mut dma_fn: D,
-    ) -> Result<()>
+    pub fn execute_pipelined<C, D>(&mut self, mut compute_fn: C, mut dma_fn: D) -> Result<()>
     where
         C: FnMut(usize, usize) -> Result<()>,
         D: FnMut(usize, usize) -> Result<()>,

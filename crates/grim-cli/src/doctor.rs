@@ -685,7 +685,9 @@ fn print_report(report: &DoctorReport) {
 /// write access to the HSACO cache directory, and flags potential rustup
 /// toolchain collisions in target/.
 pub fn check_toolchain(report: &mut DoctorReport) {
-    let clang_res = std::process::Command::new("clang").arg("--version").output();
+    let clang_res = std::process::Command::new("clang")
+        .arg("--version")
+        .output();
     match clang_res {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout);
@@ -703,7 +705,9 @@ pub fn check_toolchain(report: &mut DoctorReport) {
         }
     }
 
-    let llvm_res = std::process::Command::new("llvm-config").arg("--version").output();
+    let llvm_res = std::process::Command::new("llvm-config")
+        .arg("--version")
+        .output();
     if let Ok(out) = llvm_res {
         if out.status.success() {
             let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -740,13 +744,19 @@ pub fn check_toolchain(report: &mut DoctorReport) {
             let probe_file = cache_dir.join(".doctor_write_probe");
             if std::fs::write(&probe_file, b"ok").is_ok() {
                 let _ = std::fs::remove_file(&probe_file);
-                println!("[OK]  HSACO JIT cache directory writable: {}", cache_dir.display());
+                println!(
+                    "[OK]  HSACO JIT cache directory writable: {}",
+                    cache_dir.display()
+                );
             } else {
                 report.errors.push(format!(
                     "HSACO cache directory not writable: {}",
                     cache_dir.display()
                 ));
-                eprintln!("[ERR] HSACO cache directory not writable: {}", cache_dir.display());
+                eprintln!(
+                    "[ERR] HSACO cache directory not writable: {}",
+                    cache_dir.display()
+                );
             }
         }
         Err(e) => {
@@ -767,9 +777,12 @@ fn dirs_next_cache() -> Option<std::path::PathBuf> {
         .ok()
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| std::path::PathBuf::from(h).join(".cache").join("grim").join("hsaco"))
+            std::env::var("HOME").ok().map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".cache")
+                    .join("grim")
+                    .join("hsaco")
+            })
         })
 }
 
@@ -784,7 +797,10 @@ mod tests {
         // Either clang was found, or an actionable error message naming pacman/apt was pushed.
         if !report.errors.is_empty() {
             assert!(
-                report.errors.iter().any(|e| e.contains("pacman -S clang") || e.contains("clang not found")),
+                report
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("pacman -S clang") || e.contains("clang not found")),
                 "Error messages must give actionable remedy command"
             );
         }

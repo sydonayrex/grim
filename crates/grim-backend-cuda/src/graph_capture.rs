@@ -37,6 +37,9 @@ pub struct DecodeGraph {
     exec: *mut c_void,
 }
 
+unsafe impl Send for DecodeGraph {}
+unsafe impl Sync for DecodeGraph {}
+
 impl DecodeGraph {
     pub fn exec_handle(&self) -> *mut c_void {
         self.exec
@@ -95,11 +98,9 @@ impl GraphCaptureManager {
     }
 
     fn ensure_capture_stream(&self) -> Result<CUstream> {
-        if let Some(s) = *self
-            .capture_stream
-            .lock()
-            .map_err(|_| Error::Backend("GraphCaptureManager: capture_stream mutex poisoned".into()))?
-        {
+        if let Some(s) = *self.capture_stream.lock().map_err(|_| {
+            Error::Backend("GraphCaptureManager: capture_stream mutex poisoned".into())
+        })? {
             return Ok(s);
         }
 
@@ -111,10 +112,9 @@ impl GraphCaptureManager {
             )));
         }
 
-        let mut slot = self
-            .capture_stream
-            .lock()
-            .map_err(|_| Error::Backend("GraphCaptureManager: capture_stream mutex poisoned".into()))?;
+        let mut slot = self.capture_stream.lock().map_err(|_| {
+            Error::Backend("GraphCaptureManager: capture_stream mutex poisoned".into())
+        })?;
         *slot = Some(stream);
         Ok(stream)
     }
@@ -215,17 +215,16 @@ impl GraphCaptureManager {
         Ok(graph)
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn replay(&self, key: &DecodeGraphKey, stream: CUstream) -> Result<()> {
         let graph = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| Error::Backend("GraphCaptureManager: state mutex poisoned".into()))?;
-            state
-                .cache
-                .get(key)
-                .cloned()
-                .ok_or_else(|| Error::Backend(format!("GraphCaptureManager: key {key:?} not in cache")))?
+            state.cache.get(key).cloned().ok_or_else(|| {
+                Error::Backend(format!("GraphCaptureManager: key {key:?} not in cache"))
+            })?
         };
 
         let status = unsafe { cudaGraphLaunch(graph.exec, stream) };
@@ -330,11 +329,11 @@ impl DecodeBucketGraphPool {
         Ok(graph)
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn launch(&self, bucket: DecodeBatchBucket, stream: CUstream) -> Result<()> {
-        let graph = self
-            .buckets
-            .get(&bucket)
-            .ok_or_else(|| Error::Backend(format!("No captured CUDA graph for bucket {:?}", bucket)))?;
+        let graph = self.buckets.get(&bucket).ok_or_else(|| {
+            Error::Backend(format!("No captured CUDA graph for bucket {:?}", bucket))
+        })?;
 
         let res = unsafe { cudaGraphLaunch(graph.exec, stream) };
         if res != cudaSuccess {
@@ -400,7 +399,10 @@ impl CudaGraphExecutor {
             unsafe {
                 let _ = cudaStreamDestroy(stream);
             }
-            return Err(Error::Backend(format!("cudaGraphInstantiate failed: {}", res)));
+            return Err(Error::Backend(format!(
+                "cudaGraphInstantiate failed: {}",
+                res
+            )));
         }
 
         self.stream = Some(stream);
@@ -420,7 +422,10 @@ impl CudaGraphExecutor {
         }
         let res = unsafe { cudaStreamSynchronize(stream) };
         if res != cudaSuccess {
-            return Err(Error::Backend(format!("cudaStreamSynchronize failed: {}", res)));
+            return Err(Error::Backend(format!(
+                "cudaStreamSynchronize failed: {}",
+                res
+            )));
         }
         Ok(())
     }
@@ -453,16 +458,46 @@ mod tests {
     #[test]
     fn test_cuda_decode_batch_bucket_mapping() {
         assert_eq!(DecodeBatchBucket::from_batch_size(0), None);
-        assert_eq!(DecodeBatchBucket::from_batch_size(1), Some(DecodeBatchBucket::B1));
-        assert_eq!(DecodeBatchBucket::from_batch_size(2), Some(DecodeBatchBucket::B2));
-        assert_eq!(DecodeBatchBucket::from_batch_size(3), Some(DecodeBatchBucket::B4));
-        assert_eq!(DecodeBatchBucket::from_batch_size(4), Some(DecodeBatchBucket::B4));
-        assert_eq!(DecodeBatchBucket::from_batch_size(5), Some(DecodeBatchBucket::B8));
-        assert_eq!(DecodeBatchBucket::from_batch_size(8), Some(DecodeBatchBucket::B8));
-        assert_eq!(DecodeBatchBucket::from_batch_size(12), Some(DecodeBatchBucket::B16));
-        assert_eq!(DecodeBatchBucket::from_batch_size(16), Some(DecodeBatchBucket::B16));
-        assert_eq!(DecodeBatchBucket::from_batch_size(24), Some(DecodeBatchBucket::B32));
-        assert_eq!(DecodeBatchBucket::from_batch_size(32), Some(DecodeBatchBucket::B32));
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(1),
+            Some(DecodeBatchBucket::B1)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(2),
+            Some(DecodeBatchBucket::B2)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(3),
+            Some(DecodeBatchBucket::B4)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(4),
+            Some(DecodeBatchBucket::B4)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(5),
+            Some(DecodeBatchBucket::B8)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(8),
+            Some(DecodeBatchBucket::B8)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(12),
+            Some(DecodeBatchBucket::B16)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(16),
+            Some(DecodeBatchBucket::B16)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(24),
+            Some(DecodeBatchBucket::B32)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(32),
+            Some(DecodeBatchBucket::B32)
+        );
         assert_eq!(DecodeBatchBucket::from_batch_size(64), None);
 
         assert_eq!(DecodeBatchBucket::B1.batch_size(), 1);

@@ -132,7 +132,7 @@ fn enable_peer_access_is_infallible_or_errors_loud() -> TestResult {
         return Ok(());
     }
     let granted = r?;
-    assert!(granted || !granted, "must be Ok(bool), not Err");
+    let _ = granted;
     Ok(())
 }
 

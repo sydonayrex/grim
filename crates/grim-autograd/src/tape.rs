@@ -664,8 +664,7 @@ mod tests {
         // z = 2 * y
         let z_id = tape.record_scale(y_id, t(vec![2.0, 4.0, 6.0, 8.0], vec![2, 2]), 2.0, None);
         let s = tape.register(t(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
-        let out_id =
-            tape.record_add(z_id, s, t(vec![3.0, 5.0, 7.0, 9.0], vec![2, 2]), None);
+        let out_id = tape.record_add(z_id, s, t(vec![3.0, 5.0, 7.0, 9.0], vec![2, 2]), None);
         (y_id, z_id, out_id)
     }
 

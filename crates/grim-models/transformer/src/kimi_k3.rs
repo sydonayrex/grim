@@ -269,7 +269,8 @@ impl KimiK3Mla {
             let total_seq = new_k.len() / total_k_dim;
             let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, total_k_dim]));
             let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, total_v_dim]));
-            let full_rope = cpu_tensor(new_rope, Shape::new(vec![total_seq, self.qk_rope_head_dim]));
+            let full_rope =
+                cpu_tensor(new_rope, Shape::new(vec![total_seq, self.qk_rope_head_dim]));
             *kv_cache = Some((full_k.clone(), full_v.clone(), full_rope.clone()));
             (full_k, full_v, full_rope)
         } else {
@@ -687,7 +688,8 @@ mod tests {
     fn tiny_mla() -> KimiK3Mla {
         use grim_backend_cpu::cpu_tensor;
         use grim_nn::Linear;
-        let (hidden, ql, rank, nh, nope, rope_d, vd) = (8usize, 4usize, 6usize, 2usize, 4usize, 2usize, 3usize);
+        let (hidden, ql, rank, nh, nope, rope_d, vd) =
+            (8usize, 4usize, 6usize, 2usize, 4usize, 2usize, 3usize);
         let q_dim = nh * (nope + rope_d);
         let kv_b_out = nh * (nope + vd);
         let mut seed = 0xC0FFEEu64;
@@ -742,7 +744,10 @@ mod tests {
                 cpu_tensor(v0.to_vec_f32().unwrap(), v0.shape().clone()),
                 cpu_tensor(r0.to_vec_f32().unwrap(), r0.shape().clone()),
             ));
-            mla.forward(&cpu_x(1, 8), &[3], &mut c).unwrap().to_vec_f32().unwrap()
+            mla.forward(&cpu_x(1, 8), &[3], &mut c)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap()
         };
         // Poison the cached rope rows only.
         let poisoned = vec![7.5f32; r0.to_vec_f32().unwrap().len()];
@@ -751,9 +756,16 @@ mod tests {
             cpu_tensor(v0.to_vec_f32().unwrap(), v0.shape().clone()),
             cpu_tensor(poisoned, r0.shape().clone()),
         ));
-        let perturbed = mla.forward(&cpu_x(1, 8), &[3], &mut c).unwrap().to_vec_f32().unwrap();
+        let perturbed = mla
+            .forward(&cpu_x(1, 8), &[3], &mut c)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         assert!(
-            baseline.iter().zip(&perturbed).any(|(a, b)| (a - b).abs() > 1e-4),
+            baseline
+                .iter()
+                .zip(&perturbed)
+                .any(|(a, b)| (a - b).abs() > 1e-4),
             "decode output ignored cached rope keys — rope-history bug regressed"
         );
     }

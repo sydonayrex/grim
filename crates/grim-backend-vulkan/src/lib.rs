@@ -5313,7 +5313,7 @@ mod tests {
             return;
         }
         let dev = VulkanDevice::new();
-        let a_data = vec![1.5f32, -2.5, 0.0, 3.14159];
+        let a_data = vec![1.5f32, -2.5, 0.0, std::f32::consts::PI];
         let b_data = vec![2.5f32, 3.5, -1.0, 1.0];
         let shape = Shape::new(vec![4]);
         let a = dev.from_cpu(&a_data, &shape, DType::F32).unwrap();

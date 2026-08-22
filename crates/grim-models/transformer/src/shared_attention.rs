@@ -403,8 +403,19 @@ mod tests {
         let dev: std::sync::Arc<dyn grim_tensor::backend::BackendDevice> =
             pick_device_for_storage_device(&Device::Cpu);
         let got = scalar_attention(
-            &q, &k, &v, num_heads, num_kv_heads, head_dim, steps, kv_len,
-            kv_len - steps, window, 1.0 / (head_dim as f32).sqrt(), &dev, &Device::Cpu,
+            &q,
+            &k,
+            &v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            steps,
+            kv_len,
+            kv_len - steps,
+            window,
+            1.0 / (head_dim as f32).sqrt(),
+            &dev,
+            &Device::Cpu,
         )
         .unwrap();
         let got = got.to_vec_f32().unwrap();
@@ -433,8 +444,7 @@ mod tests {
                     let mut acc = 0.0;
                     for (i, s) in scores.iter().enumerate() {
                         let t2 = window_start + i;
-                        acc += ((s - mx).exp() / sum)
-                            * v[t2 * kv_stride + kvh * head_dim + d];
+                        acc += ((s - mx).exp() / sum) * v[t2 * kv_stride + kvh * head_dim + d];
                     }
                     let expect = acc;
                     let idx = t * num_heads * head_dim + h * head_dim + d;

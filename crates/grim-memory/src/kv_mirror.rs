@@ -67,7 +67,12 @@ pub struct KvDeviceMirror {
 
 impl KvDeviceMirror {
     /// Create a new device-resident KV mirror for a pool of given capacity and geometry.
-    pub fn new(capacity: usize, num_heads: usize, head_dim: usize, config: KvDeviceMirrorConfig) -> Self {
+    pub fn new(
+        capacity: usize,
+        num_heads: usize,
+        head_dim: usize,
+        config: KvDeviceMirrorConfig,
+    ) -> Self {
         Self {
             config,
             states: vec![MirrorSyncState::Clean; capacity],
@@ -178,8 +183,8 @@ impl KvDeviceMirror {
             return Vec::new();
         }
 
-        let target_freed = ((pressure - self.config.low_watermark_ratio) * (total_blocks as f32))
-            .ceil() as usize;
+        let target_freed =
+            ((pressure - self.config.low_watermark_ratio) * (total_blocks as f32)).ceil() as usize;
 
         // Prioritize blocks that are already InSync with the host mirror (zero transfer cost to evict)
         let mut candidates = Vec::with_capacity(target_freed);
@@ -259,12 +264,17 @@ mod tests {
 
     #[test]
     fn test_watermark_candidate_selection() {
-        let mut mirror = KvDeviceMirror::new(100, 2, 4, KvDeviceMirrorConfig {
-            high_watermark_ratio: 0.80,
-            low_watermark_ratio: 0.60,
-            max_batch_flush_size: 32,
-            enable_proactive_writeback: true,
-        });
+        let mut mirror = KvDeviceMirror::new(
+            100,
+            2,
+            4,
+            KvDeviceMirrorConfig {
+                high_watermark_ratio: 0.80,
+                low_watermark_ratio: 0.60,
+                max_batch_flush_size: 32,
+                enable_proactive_writeback: true,
+            },
+        );
 
         // Under watermark: 50/100 -> 0 candidates
         let cand = mirror.evaluate_watermark_eviction_candidates(50, 100);

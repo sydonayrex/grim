@@ -811,8 +811,8 @@ mod tests {
             let w1 = ((u128_cols[out_idx] >> 32) & 0xFFFFFFFF) as u32;
             let w2 = ((u128_cols[out_idx] >> 64) & 0xFFFFFFFF) as u32;
 
-            let idx0 = 0 * out_features + out_idx;
-            let idx1 = 1 * out_features + out_idx;
+            let idx0 = out_idx;
+            let idx1 = out_features + out_idx;
             let idx2 = 2 * out_features + out_idx;
 
             qweight[idx0 * 4..idx0 * 4 + 4].copy_from_slice(&w0.to_le_bytes());

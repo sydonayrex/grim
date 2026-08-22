@@ -118,172 +118,173 @@ impl AutogradRegistry {
 
         if scope != AutogradScope::FullParameter {
             for config in injection_registry.enabled() {
-            let (a_rows, a_cols) = config
-                .injection_point
-                .lora_a_shape(&model_config, config.rank);
-            let (b_rows, b_cols) = config
-                .injection_point
-                .lora_b_shape(&model_config, config.rank);
+                let (a_rows, a_cols) = config
+                    .injection_point
+                    .lora_a_shape(&model_config, config.rank);
+                let (b_rows, b_cols) = config
+                    .injection_point
+                    .lora_b_shape(&model_config, config.rank);
 
-            let stddev = (1.0 / a_cols as f32).sqrt();
-            // When a user seed is set (salamander.md P0.2), mix it into the
-            // Kaiming pseudo-random value per flat index so init is
-            // reproducible and differs across seeds. Seed 0 preserves the
-            // legacy flat-index behavior (`i % 17`) bit-for-bit.
-            let mut seed_state = seed
-                .wrapping_mul(0x9E3779B97F4A7C15)
-                .wrapping_add((config.layer_idx as u64).wrapping_mul(0x100000001B3))
-                .wrapping_add((config.injection_point as u64).wrapping_mul(0xC2B2AE3D27D4EB4F));
-            let default_a: Vec<f32> = (0..(a_rows * a_cols))
-                .map(|i| {
-                    if seed == 0 {
-                        (((i % 17) as f32 / 17.0) - 0.5) * stddev
-                    } else {
-                        // xorshift64 step per element for a reproducible stream.
-                        seed_state ^= seed_state << 13;
-                        seed_state ^= seed_state >> 7;
-                        seed_state ^= seed_state << 17;
-                        ((seed_state >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * stddev
-                    }
-                })
-                .collect();
-            let zero_b: Vec<f32> = vec![0.0f32; b_rows * b_cols];
-
-            // SPECTRAL-QLORA override: use the well-conditioned 2D-dependent
-            // seed formula from SoulEaterAdapter instead of the flat-index
-            // default_a / zero_b, so that Newton-Schulz and Gram-Schmidt have
-            // a full-rank matrix to orthogonalize. The standard LoRA defaults
-            // are kept for non-SpectralQLoRA paths (A is Kaiming random,
-            // B is zero so the adapter starts as identity).
-            let (spectral_a, spectral_b) = if config.use_spectral_qlora {
-                let s_a: Vec<f32> = (0..(a_rows * a_cols))
-                    .map(|idx| {
-                        let row = idx / a_cols;
-                        let col = idx % a_cols;
-                        ((((row + 1) * 17 + (col + 1) * 31) % 100) as f32 / 100.0) - 0.5
-                    })
-                    .collect();
-                let s_b: Vec<f32> = (0..(b_rows * b_cols))
-                    .map(|idx| {
-                        let row = idx / b_cols;
-                        let col = idx % b_cols;
-                        ((((row + 1) * 13 + (col + 1) * 29) % 100) as f32 / 100.0) - 0.5
-                    })
-                    .collect();
-                (s_a, s_b)
-            } else {
-                (default_a.clone(), zero_b.clone())
-            };
-
-            // PiSSA: initialize A/B from the base weight's principal
-            // singular components. The base weight is [out, in] =
-            // [b_rows, a_cols]; pissa returns a = [rank, in],
-            // b = [out, rank], matching the A/B layout above.
-            let (a_data, b_data) = if config.use_pissa {
-                match base_weights.and_then(|m| m.get(&(config.layer_idx, config.injection_point)))
-                {
-                    Some(w) => {
-                        let (a, b, _quantized) =
-                            crate::injection::pissa_initialize(w, b_rows, a_cols, config.rank)?;
-                        (a, b)
-                    }
-                    // No base weight yet (pre-WI-T8 worker): fall back to
-                    // the well-conditioned spectral seed (if SpectralQLoRA) or
-                    // the default Kaiming A / zero B otherwise.
-                    None => {
-                        if config.use_spectral_qlora {
-                            (spectral_a, spectral_b)
+                let stddev = (1.0 / a_cols as f32).sqrt();
+                // When a user seed is set (salamander.md P0.2), mix it into the
+                // Kaiming pseudo-random value per flat index so init is
+                // reproducible and differs across seeds. Seed 0 preserves the
+                // legacy flat-index behavior (`i % 17`) bit-for-bit.
+                let mut seed_state = seed
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+                    .wrapping_add((config.layer_idx as u64).wrapping_mul(0x100000001B3))
+                    .wrapping_add((config.injection_point as u64).wrapping_mul(0xC2B2AE3D27D4EB4F));
+                let default_a: Vec<f32> = (0..(a_rows * a_cols))
+                    .map(|i| {
+                        if seed == 0 {
+                            (((i % 17) as f32 / 17.0) - 0.5) * stddev
                         } else {
-                            (default_a, zero_b)
+                            // xorshift64 step per element for a reproducible stream.
+                            seed_state ^= seed_state << 13;
+                            seed_state ^= seed_state >> 7;
+                            seed_state ^= seed_state << 17;
+                            ((seed_state >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * stddev
+                        }
+                    })
+                    .collect();
+                let zero_b: Vec<f32> = vec![0.0f32; b_rows * b_cols];
+
+                // SPECTRAL-QLORA override: use the well-conditioned 2D-dependent
+                // seed formula from SoulEaterAdapter instead of the flat-index
+                // default_a / zero_b, so that Newton-Schulz and Gram-Schmidt have
+                // a full-rank matrix to orthogonalize. The standard LoRA defaults
+                // are kept for non-SpectralQLoRA paths (A is Kaiming random,
+                // B is zero so the adapter starts as identity).
+                let (spectral_a, spectral_b) = if config.use_spectral_qlora {
+                    let s_a: Vec<f32> = (0..(a_rows * a_cols))
+                        .map(|idx| {
+                            let row = idx / a_cols;
+                            let col = idx % a_cols;
+                            ((((row + 1) * 17 + (col + 1) * 31) % 100) as f32 / 100.0) - 0.5
+                        })
+                        .collect();
+                    let s_b: Vec<f32> = (0..(b_rows * b_cols))
+                        .map(|idx| {
+                            let row = idx / b_cols;
+                            let col = idx % b_cols;
+                            ((((row + 1) * 13 + (col + 1) * 29) % 100) as f32 / 100.0) - 0.5
+                        })
+                        .collect();
+                    (s_a, s_b)
+                } else {
+                    (default_a.clone(), zero_b.clone())
+                };
+
+                // PiSSA: initialize A/B from the base weight's principal
+                // singular components. The base weight is [out, in] =
+                // [b_rows, a_cols]; pissa returns a = [rank, in],
+                // b = [out, rank], matching the A/B layout above.
+                let (a_data, b_data) = if config.use_pissa {
+                    match base_weights
+                        .and_then(|m| m.get(&(config.layer_idx, config.injection_point)))
+                    {
+                        Some(w) => {
+                            let (a, b, _quantized) =
+                                crate::injection::pissa_initialize(w, b_rows, a_cols, config.rank)?;
+                            (a, b)
+                        }
+                        // No base weight yet (pre-WI-T8 worker): fall back to
+                        // the well-conditioned spectral seed (if SpectralQLoRA) or
+                        // the default Kaiming A / zero B otherwise.
+                        None => {
+                            if config.use_spectral_qlora {
+                                (spectral_a, spectral_b)
+                            } else {
+                                (default_a, zero_b)
+                            }
                         }
                     }
-                }
-            } else if config.use_spectral_qlora {
-                // SpectralQLoRA: start from the well-conditioned 2D-dependent
-                // seed so Newton-Schulz has a full-rank matrix to orthogonalize.
-                (spectral_a, spectral_b)
-            } else {
-                (default_a, zero_b)
-            };
+                } else if config.use_spectral_qlora {
+                    // SpectralQLoRA: start from the well-conditioned 2D-dependent
+                    // seed so Newton-Schulz has a full-rank matrix to orthogonalize.
+                    (spectral_a, spectral_b)
+                } else {
+                    (default_a, zero_b)
+                };
 
-            // SPECTRAL-QLORA: orthogonal adapter initialization.
-            // Apply subspace Newton-Schulz orthogonalization once at adapter
-            // creation so that AB is semi-orthogonal in the dominant subspace.
-            // This reuses `grim-quant::soul_eater::subspace_newton_schulz_step`
-            // for the Gram-matrix-based orthogonality check, matching
-            // SoulEaterAdapter's init pattern. When Newton-Schulz cannot
-            // converge (ill-conditioned seed or iteration cap reached), fall
-            // back to modified Gram-Schmidt which always yields orthonormal
-            // columns.
-            let (a_data, b_data) = if config.use_spectral_qlora {
-                let mut a_data = a_data;
-                let mut b_data = b_data;
+                // SPECTRAL-QLORA: orthogonal adapter initialization.
+                // Apply subspace Newton-Schulz orthogonalization once at adapter
+                // creation so that AB is semi-orthogonal in the dominant subspace.
+                // This reuses `grim-quant::soul_eater::subspace_newton_schulz_step`
+                // for the Gram-matrix-based orthogonality check, matching
+                // SoulEaterAdapter's init pattern. When Newton-Schulz cannot
+                // converge (ill-conditioned seed or iteration cap reached), fall
+                // back to modified Gram-Schmidt which always yields orthonormal
+                // columns.
+                let (a_data, b_data) = if config.use_spectral_qlora {
+                    let mut a_data = a_data;
+                    let mut b_data = b_data;
 
-                // B [b_rows, b_cols] = [out, rank] is tall/thin → Newton-Schulz
-                // directly to make columns orthonormal (B^T * B ≈ I).
-                let ns_ok = grim_quant::soul_eater::subspace_newton_schulz_step(
-                    &mut b_data,
-                    b_rows,
-                    b_cols,
-                    10,
-                );
-                if ns_ok.map_or(true, |iters| iters >= 10) {
-                    crate::injection::orthogonalize_columns(&mut b_data, b_rows, b_cols);
-                }
-
-                // A [a_rows, a_cols] = [rank, in] is wide/thin. Transpose to
-                // [in, rank] (tall/thin), orthogonalize, then transpose back so
-                // rows of A become orthonormal: A * A^T ≈ I.
-                let mut a_t = vec![0.0f32; a_cols * a_rows];
-                for row in 0..a_cols {
-                    for col in 0..a_rows {
-                        a_t[row * a_rows + col] = a_data[col * a_cols + row];
+                    // B [b_rows, b_cols] = [out, rank] is tall/thin → Newton-Schulz
+                    // directly to make columns orthonormal (B^T * B ≈ I).
+                    let ns_ok = grim_quant::soul_eater::subspace_newton_schulz_step(
+                        &mut b_data,
+                        b_rows,
+                        b_cols,
+                        10,
+                    );
+                    if ns_ok.map_or(true, |iters| iters >= 10) {
+                        crate::injection::orthogonalize_columns(&mut b_data, b_rows, b_cols);
                     }
-                }
-                let ns_ok = grim_quant::soul_eater::subspace_newton_schulz_step(
-                    &mut a_t, a_cols, a_rows, 10,
-                );
-                if ns_ok.map_or(true, |iters| iters >= 10) {
-                    crate::injection::orthogonalize_columns(&mut a_t, a_cols, a_rows);
-                }
-                // Transpose back into a_data.
-                for row in 0..a_cols {
-                    for col in 0..a_rows {
-                        a_data[col * a_cols + row] = a_t[row * a_rows + col];
+
+                    // A [a_rows, a_cols] = [rank, in] is wide/thin. Transpose to
+                    // [in, rank] (tall/thin), orthogonalize, then transpose back so
+                    // rows of A become orthonormal: A * A^T ≈ I.
+                    let mut a_t = vec![0.0f32; a_cols * a_rows];
+                    for row in 0..a_cols {
+                        for col in 0..a_rows {
+                            a_t[row * a_rows + col] = a_data[col * a_cols + row];
+                        }
                     }
-                }
+                    let ns_ok = grim_quant::soul_eater::subspace_newton_schulz_step(
+                        &mut a_t, a_cols, a_rows, 10,
+                    );
+                    if ns_ok.map_or(true, |iters| iters >= 10) {
+                        crate::injection::orthogonalize_columns(&mut a_t, a_cols, a_rows);
+                    }
+                    // Transpose back into a_data.
+                    for row in 0..a_cols {
+                        for col in 0..a_rows {
+                            a_data[col * a_cols + row] = a_t[row * a_rows + col];
+                        }
+                    }
 
-                (a_data, b_data)
-            } else {
-                (a_data, b_data)
-            };
+                    (a_data, b_data)
+                } else {
+                    (a_data, b_data)
+                };
 
-            let dev = grim_backend_cpu::CpuDevice::new();
-            let a_storage =
-                dev.from_cpu(&a_data, &Shape::new(vec![a_rows, a_cols]), dtype.clone())?;
-            let b_storage =
-                dev.from_cpu(&b_data, &Shape::new(vec![b_rows, b_cols]), dtype.clone())?;
+                let dev = grim_backend_cpu::CpuDevice::new();
+                let a_storage =
+                    dev.from_cpu(&a_data, &Shape::new(vec![a_rows, a_cols]), dtype.clone())?;
+                let b_storage =
+                    dev.from_cpu(&b_data, &Shape::new(vec![b_rows, b_cols]), dtype.clone())?;
 
-            let a_tensor = grim_tensor::Tensor::new(
-                std::sync::Arc::from(a_storage),
-                Shape::new(vec![a_rows, a_cols]),
-                dtype.clone(),
-                Default::default(),
-                grim_tensor::Device::Cpu,
-            );
-            let b_tensor = grim_tensor::Tensor::new(
-                std::sync::Arc::from(b_storage),
-                Shape::new(vec![b_rows, b_cols]),
-                dtype.clone(),
-                Default::default(),
-                grim_tensor::Device::Cpu,
-            );
+                let a_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(a_storage),
+                    Shape::new(vec![a_rows, a_cols]),
+                    dtype.clone(),
+                    Default::default(),
+                    grim_tensor::Device::Cpu,
+                );
+                let b_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(b_storage),
+                    Shape::new(vec![b_rows, b_cols]),
+                    dtype.clone(),
+                    Default::default(),
+                    grim_tensor::Device::Cpu,
+                );
 
-            let param_a = TrainableParam::new(config.param_id_a(), a_tensor)?;
-            let param_b = TrainableParam::new(config.param_id_b(), b_tensor)?;
+                let param_a = TrainableParam::new(config.param_id_a(), a_tensor)?;
+                let param_b = TrainableParam::new(config.param_id_b(), b_tensor)?;
 
-            params.insert(param_a);
-            params.insert(param_b);
+                params.insert(param_a);
+                params.insert(param_b);
             }
         }
 

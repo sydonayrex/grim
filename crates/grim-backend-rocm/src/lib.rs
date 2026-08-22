@@ -65,9 +65,7 @@ pub mod trace;
 pub use device::capability_profiler::{
     CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch, vram_info,
 };
-pub use device::moe_hybrid_exec::{
-    MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor,
-};
+pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
 
 // ----- Crate-root re-exports ------------------------------------
 // Existing callers (lib_internal_tests.rs + external crates) see
@@ -158,8 +156,10 @@ pub use crate::device::roc_device::{
     CharonBackwardResult, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
 };
 
+pub use crate::graph_capture::{
+    DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager,
+};
 pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
-pub use crate::graph_capture::{DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager};
 
 pub use fusion::{
     DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, KvDequantAttentionConfig,
@@ -185,7 +185,7 @@ pub use kernels::tile_picker::run_install_tune;
 /// before CPU sampling in `grim-server/src/lib.rs::sample_next_token`
 /// (~lines 465-489: `outcome.logits.to_vec_f32()` followed by
 /// `sampler.sample(...)` on a CPU tensor). Callers that want device-side
-/// sampling should invoke [`sample_logits_on_device`] / 
+/// sampling should invoke [`sample_logits_on_device`] /
 /// [`sample_logits_on_device_at`] there — with the ROCm storage backing
 /// `outcome.logits`, the model `vocab`, and the request's sampling params —
 /// BEFORE that readback, and fall back to the existing CPU sampler whenever

@@ -1653,13 +1653,19 @@ mod wi_e3_tests {
         ];
 
         for (idx, sample) in samples.iter().enumerate() {
-            assert!(sample.len() >= 8192, "sample {idx} must cross 8192 byte parallel threshold");
+            assert!(
+                sample.len() >= 8192,
+                "sample {idx} must cross 8192 byte parallel threshold"
+            );
             let parallel = tok.encode(sample);
             let mut serial = Vec::new();
             for line_group in split_lines_for_test(sample, 4096) {
                 serial.extend(tok.encode(line_group));
             }
-            assert_eq!(parallel, serial, "sample {idx} parallel encode diverged from serial");
+            assert_eq!(
+                parallel, serial,
+                "sample {idx} parallel encode diverged from serial"
+            );
         }
     }
 }

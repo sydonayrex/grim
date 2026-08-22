@@ -923,13 +923,13 @@ mod tests {
     #[test]
     fn test_rocm_add_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
-        let a = [1.5f32, -2.5, 0.0, 3.14159];
+        let a = [1.5f32, -2.5, 0.0, std::f32::consts::PI];
         let b = [2.5f32, 3.5, -1.0, 1.0];
         if let Some(out) = run_binary_op(env, &a, &b, &[4], |d, x, y, s| d.add(x, y, s)) {
             close_rocm(out[0], 4.0, "rocm_add w0");
             close_rocm(out[1], 1.0, "rocm_add w1");
             close_rocm(out[2], -1.0, "rocm_add w2");
-            close_rocm(out[3], 4.14159, "rocm_add w3");
+            close_rocm(out[3], 1.0 + std::f32::consts::PI, "rocm_add w3");
         }
     }
 

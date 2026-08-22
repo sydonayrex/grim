@@ -187,7 +187,7 @@ impl ConstrainedSampler {
                     // 1. Fast O(1) state-cached PDA mask eliminates structurally invalid tokens
                     let base_mask = cache.mask_for(fsm.clone(), vocab);
                     let output = self.output.lock().unwrap();
-                    
+
                     // 2. Query schema validity mask. F9 fast path: inside an
                     // unterminated string with no pattern/enum constraints,
                     // schema validity is invariant per token — reuse the

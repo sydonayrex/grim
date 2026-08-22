@@ -50,15 +50,18 @@ pub fn decode_wav_to_mono_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
 
     while offset + 8 <= bytes.len() {
         let chunk_id = &bytes[offset..offset + 4];
-        let chunk_size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk_size =
+            u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
         offset += 8;
 
         if chunk_id == b"fmt " {
             if chunk_size >= 16 && offset + 16 <= bytes.len() {
                 audio_format = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-                num_channels = u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
+                num_channels =
+                    u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap());
                 sample_rate = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-                bits_per_sample = u16::from_le_bytes(bytes[offset + 14..offset + 16].try_into().unwrap());
+                bits_per_sample =
+                    u16::from_le_bytes(bytes[offset + 14..offset + 16].try_into().unwrap());
             }
             offset += chunk_size;
         } else if chunk_id == b"data" {
@@ -105,7 +108,12 @@ pub fn decode_wav_to_mono_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
             for ch in 0..channel_count {
                 let idx = (f * channel_count + ch) * 4;
                 if idx + 4 <= data.len() {
-                    let sample_f32 = f32::from_le_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]);
+                    let sample_f32 = f32::from_le_bytes([
+                        data[idx],
+                        data[idx + 1],
+                        data[idx + 2],
+                        data[idx + 3],
+                    ]);
                     sum += sample_f32;
                 }
             }
@@ -166,9 +174,7 @@ impl MelFrontend {
         let min_mel = Self::hz_to_mel(f_min);
         let max_mel = Self::hz_to_mel(f_max);
         let mel_centre: Vec<f32> = (0..self.n_mels as i32)
-            .map(|i| {
-                min_mel + (max_mel - min_mel) * (i as f32 + 0.5) / (self.n_mels as f32)
-            })
+            .map(|i| min_mel + (max_mel - min_mel) * (i as f32 + 0.5) / (self.n_mels as f32))
             .collect();
         let hz_centre: Vec<f32> = mel_centre.iter().map(|&m| Self::mel_to_hz(m)).collect();
 
@@ -227,7 +233,11 @@ impl MelFrontend {
             let mut re = 0.0f32;
             let mut im = 0.0f32;
             for (i, &s) in frame.iter().take(n).enumerate() {
-                let w = if i < self.window.len() { self.window[i] } else { 1.0 };
+                let w = if i < self.window.len() {
+                    self.window[i]
+                } else {
+                    1.0
+                };
                 let v = s * w;
                 let angle = omega * (i as f32);
                 re += v * angle.cos();
@@ -286,11 +296,7 @@ impl MelFrontend {
 
 /// Strip Whisper control tokens (<|startoftranscript|>, language, task, timestamp tokens >= 50257).
 pub fn clean_whisper_tokens(tokens: &[u32]) -> Vec<u32> {
-    tokens
-        .iter()
-        .copied()
-        .filter(|&t| t < 50257)
-        .collect()
+    tokens.iter().copied().filter(|&t| t < 50257).collect()
 }
 
 #[cfg(test)]
@@ -353,7 +359,10 @@ mod tests {
         let (mel_2, frames_2) = frontend.extract_mel(&tone_2500);
 
         assert_eq!(frames_1, frames_2);
-        assert_ne!(mel_1, mel_2, "Mel spectrograms for distinct tones must differ");
+        assert_ne!(
+            mel_1, mel_2,
+            "Mel spectrograms for distinct tones must differ"
+        );
 
         // Verify distinct peak energy bands between low and high tones
         let peak_band_1 = (0..80)
@@ -392,14 +401,10 @@ mod tests {
             },
         );
 
-        let mel_tensor_1 = grim_backend_cpu::cpu_tensor(
-            mel_1,
-            grim_tensor::Shape::new(vec![80, frames_1]),
-        );
-        let mel_tensor_2 = grim_backend_cpu::cpu_tensor(
-            mel_2,
-            grim_tensor::Shape::new(vec![80, frames_2]),
-        );
+        let mel_tensor_1 =
+            grim_backend_cpu::cpu_tensor(mel_1, grim_tensor::Shape::new(vec![80, frames_1]));
+        let mel_tensor_2 =
+            grim_backend_cpu::cpu_tensor(mel_2, grim_tensor::Shape::new(vec![80, frames_2]));
 
         let enc_1 = whisper.encode(&mel_tensor_1).unwrap();
         let enc_2 = whisper.encode(&mel_tensor_2).unwrap();
@@ -410,8 +415,16 @@ mod tests {
         );
 
         let prompt = grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1]));
-        let logits_1 = whisper.decode_step(&enc_1, &prompt).unwrap().to_vec_f32().unwrap();
-        let logits_2 = whisper.decode_step(&enc_2, &prompt).unwrap().to_vec_f32().unwrap();
+        let logits_1 = whisper
+            .decode_step(&enc_1, &prompt)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let logits_2 = whisper
+            .decode_step(&enc_2, &prompt)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
 
         assert_ne!(
             logits_1, logits_2,

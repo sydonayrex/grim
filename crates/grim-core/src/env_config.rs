@@ -126,13 +126,28 @@ impl RuntimeEnv {
                 if let Ok(val) = content.parse::<toml::Value>() {
                     if let Some(table) = val.as_table() {
                         let known_keys: HashSet<&str> = [
-                            "host", "port", "context", "backend", "gpus", "tp_size",
-                            "parallel", "mem_budget_mib", "kernel_timeout",
-                        ].into_iter().collect();
+                            "host",
+                            "port",
+                            "context",
+                            "backend",
+                            "gpus",
+                            "tp_size",
+                            "parallel",
+                            "mem_budget_mib",
+                            "kernel_timeout",
+                        ]
+                        .into_iter()
+                        .collect();
 
                         for k in table.keys() {
-                            if !known_keys.contains(k.as_str()) && !WARNED_UNKNOWN.swap(true, Ordering::Relaxed) {
-                                eprintln!("[grim config] Warning: unknown key '{}' in {}", k, cfg_path.display());
+                            if !known_keys.contains(k.as_str())
+                                && !WARNED_UNKNOWN.swap(true, Ordering::Relaxed)
+                            {
+                                eprintln!(
+                                    "[grim config] Warning: unknown key '{}' in {}",
+                                    k,
+                                    cfg_path.display()
+                                );
                             }
                         }
 
@@ -160,7 +175,10 @@ impl RuntimeEnv {
                             backend_src = "toml";
                         }
                         if let Some(arr) = table.get("gpus").and_then(|v| v.as_array()) {
-                            gpus = arr.iter().filter_map(|x| x.as_integer().map(|i| i as usize)).collect();
+                            gpus = arr
+                                .iter()
+                                .filter_map(|x| x.as_integer().map(|i| i as usize))
+                                .collect();
                             gpus_src = "toml";
                         }
                         if let Some(tp) = table.get("tp_size").and_then(|v| v.as_integer()) {
@@ -189,11 +207,17 @@ impl RuntimeEnv {
             host = Some(h);
             host_src = "env";
         }
-        if let Some(p) = std::env::var("GRIM_PORT").ok().and_then(|s| s.parse::<u16>().ok()) {
+        if let Some(p) = std::env::var("GRIM_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+        {
             port = Some(p);
             port_src = "env";
         }
-        if let Some(c) = std::env::var("GRIM_CONTEXT").ok().and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(c) = std::env::var("GRIM_CONTEXT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             context = Some(c);
             context_src = "env";
         }
@@ -209,10 +233,16 @@ impl RuntimeEnv {
             backend_src = "env";
         }
         if let Ok(s) = std::env::var("GRIM_GPUS") {
-            gpus = s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect();
+            gpus = s
+                .split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect();
             gpus_src = "env";
         }
-        if let Some(tp) = std::env::var("GRIM_TP_SIZE").ok().and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(tp) = std::env::var("GRIM_TP_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             tp_size = tp;
             tp_size_src = "env";
         }
@@ -229,11 +259,17 @@ impl RuntimeEnv {
                 _ => {}
             }
         }
-        if let Some(mb) = std::env::var("GRIM_MEM_BUDGET_MIB").ok().and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(mb) = std::env::var("GRIM_MEM_BUDGET_MIB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             mem_budget_mib = Some(mb);
             mem_budget_mib_src = "env";
         }
-        if let Some(kt) = std::env::var("GRIM_KERNEL_TIMEOUT").ok().and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(kt) = std::env::var("GRIM_KERNEL_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             kernel_timeout = Duration::from_secs(kt);
             kernel_timeout_src = "env";
         }
@@ -263,15 +299,51 @@ impl RuntimeEnv {
     /// Return summary of effective configuration values with their sources.
     pub fn effective_config_summary(&self) -> Vec<(String, String, &'static str)> {
         vec![
-            ("host".into(), self.host.clone().unwrap_or_else(|| "127.0.0.1".into()), self.host_src),
-            ("port".into(), self.port.map(|p| p.to_string()).unwrap_or_else(|| "11434".into()), self.port_src),
-            ("context".into(), self.context.map(|c| c.to_string()).unwrap_or_else(|| "auto".into()), self.context_src),
-            ("backend".into(), format!("{:?}", self.backend).to_lowercase(), self.backend_src),
+            (
+                "host".into(),
+                self.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                self.host_src,
+            ),
+            (
+                "port".into(),
+                self.port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "11434".into()),
+                self.port_src,
+            ),
+            (
+                "context".into(),
+                self.context
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "auto".into()),
+                self.context_src,
+            ),
+            (
+                "backend".into(),
+                format!("{:?}", self.backend).to_lowercase(),
+                self.backend_src,
+            ),
             ("gpus".into(), format!("{:?}", self.gpus), self.gpus_src),
             ("tp_size".into(), self.tp_size.to_string(), self.tp_size_src),
-            ("parallel".into(), self.parallel.map(|p| p.to_string()).unwrap_or_else(|| "none".into()), self.parallel_src),
-            ("mem_budget_mib".into(), self.mem_budget_mib.map(|m| m.to_string()).unwrap_or_else(|| "unlimited".into()), self.mem_budget_mib_src),
-            ("kernel_timeout".into(), format!("{}s", self.kernel_timeout.as_secs()), self.kernel_timeout_src),
+            (
+                "parallel".into(),
+                self.parallel
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                self.parallel_src,
+            ),
+            (
+                "mem_budget_mib".into(),
+                self.mem_budget_mib
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "unlimited".into()),
+                self.mem_budget_mib_src,
+            ),
+            (
+                "kernel_timeout".into(),
+                format!("{}s", self.kernel_timeout.as_secs()),
+                self.kernel_timeout_src,
+            ),
         ]
     }
 

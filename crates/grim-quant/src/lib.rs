@@ -5778,7 +5778,8 @@ mod tests {
                 let q = quant_q80(row).expect("quant_q80");
                 b_q80_bytes.extend_from_slice(&q);
             }
-            let packed_c_q80 = gemm_q8_0_packed(&a, &b_q80_bytes, m, n, k).expect("gemm_q8_0_packed");
+            let packed_c_q80 =
+                gemm_q8_0_packed(&a, &b_q80_bytes, m, n, k).expect("gemm_q8_0_packed");
             let dequant_b_q80 = dequant_q80(&b_q80_bytes, n * k).expect("dequant_q80");
             for row in 0..m {
                 for col in 0..n {
@@ -5956,13 +5957,7 @@ pub fn gemm_q4k_packed(
 }
 
 /// Scalar reference implementation of [`gemm_q4k_packed`] (inputs already validated).
-fn gemm_q4k_packed_scalar(
-    a: &[f32],
-    b_q4k_bytes: &[u8],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
+fn gemm_q4k_packed_scalar(a: &[f32], b_q4k_bytes: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
     let blocks_per_row = k / 256;
     let stride_b = blocks_per_row * 144;
 

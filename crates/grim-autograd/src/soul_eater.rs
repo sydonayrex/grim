@@ -221,7 +221,12 @@ impl SoulEaterAdapter {
             }
         }
 
-        Ok((cpu_tensor(g_x, Shape::new(vec![b, d_in])), g_u, g_v, g_sigma))
+        Ok((
+            cpu_tensor(g_x, Shape::new(vec![b, d_in])),
+            g_u,
+            g_v,
+            g_sigma,
+        ))
     }
 }
 

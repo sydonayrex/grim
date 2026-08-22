@@ -596,10 +596,7 @@ impl Engine {
                 let draft_model = crate::model_loader::load_from_path(d_path)?;
                 // Generic draft model: wrap as DraftBackbone or register speculative
                 let drafter = Arc::new(grim_speculative::TinyDraftBackbone::new(
-                    128256,
-                    2048,
-                    4,
-                    42,
+                    128256, 2048, 4, 42,
                 ));
                 let _ = draft_model;
                 self.register_speculative(id, base_model, Some(drafter), None, None);
@@ -888,7 +885,11 @@ impl Engine {
                         let usize_blocks: Vec<usize> =
                             block_table.iter().map(|&b| b as usize).collect();
                         let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                        pool.insert_prefix_with_recurrent_state(&full_input, &usize_blocks, Vec::new());
+                        pool.insert_prefix_with_recurrent_state(
+                            &full_input,
+                            &usize_blocks,
+                            Vec::new(),
+                        );
                     }
                 }
             }
@@ -912,7 +913,9 @@ impl Engine {
                                 let num_layers = kv.num_layers();
                                 for layer in 0..num_layers {
                                     for &b_id in &block_ids {
-                                        if let Some((k_slice, v_slice)) = kv.layer_block_slice(layer, b_id) {
+                                        if let Some((k_slice, v_slice)) =
+                                            kv.layer_block_slice(layer, b_id)
+                                        {
                                             if let Err(e) = router.send_layer_block_remote(
                                                 b_id,
                                                 layer as u32,
@@ -983,13 +986,15 @@ impl Engine {
                             Ok((k_data, v_data)) => {
                                 let num_tokens = block_elems / elem_per_token;
                                 if layer == 0 {
-                                    let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut pool =
+                                        self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                                     pool.write_keys(block_id, &k_data, num_tokens);
                                     pool.write_values(block_id, &v_data);
                                 }
                                 if let Some(session) = self.sessions.get_mut(&id) {
                                     if let Some(kv) = session.kv_mut() {
-                                        let _ = kv.write_layer_block(layer, block_id, &k_data, &v_data);
+                                        let _ =
+                                            kv.write_layer_block(layer, block_id, &k_data, &v_data);
                                     }
                                 }
                             }
@@ -1352,21 +1357,39 @@ mod tests {
     fn test_grim_kv_quant_env_attach() {
         // Baseline: default config attaches no compressor.
         let engine = Engine::new(EngineConfig::default());
-        assert!(!engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).has_compressor());
+        assert!(
+            !engine
+                .block_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_compressor()
+        );
 
         // With GRIM_KV_QUANT=int8 the pool must hold a compressor.
         unsafe {
             std::env::set_var("GRIM_KV_QUANT", "int8");
         }
         let engine = Engine::new(EngineConfig::default());
-        assert!(engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).has_compressor());
+        assert!(
+            engine
+                .block_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_compressor()
+        );
 
         // off / invalid → none.
         unsafe {
             std::env::set_var("GRIM_KV_QUANT", "off");
         }
         let engine = Engine::new(EngineConfig::default());
-        assert!(!engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).has_compressor());
+        assert!(
+            !engine
+                .block_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_compressor()
+        );
         unsafe {
             std::env::remove_var("GRIM_KV_QUANT");
         }

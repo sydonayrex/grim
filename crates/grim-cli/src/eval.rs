@@ -39,7 +39,9 @@ fn resolve_device() -> Device {
 /// Load a model by catalog name or path, mirroring `bench.rs`.
 fn load_model(model: &str) -> Result<(Box<dyn CausalLm>, String)> {
     let resolved = grim_core::catalog::resolve_model_path(model).ok_or_else(|| {
-        Error::Config(format!("model '{model}' not found in local cache or on disk"))
+        Error::Config(format!(
+            "model '{model}' not found in local cache or on disk"
+        ))
     })?;
     let path_str = resolved.to_string_lossy().to_lowercase();
     // WI-E1: honor GRIM_BACKEND like the rest of the CLI — never silently pin
@@ -52,7 +54,10 @@ fn load_model(model: &str) -> Result<(Box<dyn CausalLm>, String)> {
             device,
         )?
     } else if path_str.ends_with(".grim") {
-        grim_engine::model_loader::load_model_from_grim(resolved.to_string_lossy().as_ref(), device)?
+        grim_engine::model_loader::load_model_from_grim(
+            resolved.to_string_lossy().as_ref(),
+            device,
+        )?
     } else if path_str.ends_with(".safetensors") || path_str.ends_with(".bin") {
         grim_engine::model_loader::load_model_from_safetensors(
             resolved.to_string_lossy().as_ref(),
@@ -119,7 +124,10 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
         let last_logits = &all[last_row_start..];
 
         // log-softmax of the target token.
-        let max_l = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_l = last_logits
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         let log_sum_exp = max_l
             + last_logits
                 .iter()
@@ -245,7 +253,12 @@ async fn run_gsm8k(
             "temperature": 0,
             "max_tokens": 256
         });
-        let resp = client.post(&url).json(&body).send().await.map_err(map_req_err)?;
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_req_err)?;
         let v: serde_json::Value = resp.json().await.map_err(map_req_err)?;
         let content = v["choices"][0]["message"]["content"]
             .as_str()
@@ -260,7 +273,13 @@ async fn run_gsm8k(
         if ok {
             correct += 1;
         }
-        eprintln!("[eval] gsm8k {}/{}: {} (gold={})", i + 1, questions.len(), if ok { "PASS" } else { "FAIL" }, q.answer);
+        eprintln!(
+            "[eval] gsm8k {}/{}: {} (gold={})",
+            i + 1,
+            questions.len(),
+            if ok { "PASS" } else { "FAIL" },
+            q.answer
+        );
     }
     Ok((correct, questions.len()))
 }
@@ -370,8 +389,7 @@ pub async fn cmd_eval(
                 );
             }
             "gsm8k" => {
-                let dataset =
-                    std::path::PathBuf::from("docs/eval/gsm8k.test100.jsonl");
+                let dataset = std::path::PathBuf::from("docs/eval/gsm8k.test100.jsonl");
                 let (correct, total) = run_gsm8k(&addr, &model, &dataset, 100).await?;
                 let em = correct as f32 / total as f32;
                 println!("exact_match={em:.3} correct={correct}/{total}");
@@ -446,7 +464,10 @@ mod tests {
             Some("42")
         );
         // trailing number fallback
-        assert_eq!(extract_final_number("the answer is 17 apples.").as_deref(), Some("17"));
+        assert_eq!(
+            extract_final_number("the answer is 17 apples.").as_deref(),
+            Some("17")
+        );
         // negative
         assert_eq!(extract_final_number("#### -3.5").as_deref(), Some("-3.5"));
         // no number
@@ -470,17 +491,17 @@ mod tests {
         // P(target) = 1/V, -ln(1/V) = ln(V), exp(ln(V)) = V.
         let vocab_size = 100usize;
         let uniform_logits = vec![1.0f32; vocab_size];
-        
+
         let max_l = 1.0f32;
         let sum_exp: f32 = uniform_logits.iter().map(|&x| (x - max_l).exp()).sum();
         let log_sum_exp = max_l + sum_exp.ln();
-        
+
         let target_idx = 42usize;
         let target_logit = uniform_logits[target_idx];
         let nll = (log_sum_exp - target_logit) as f64;
         let expected_nll = (vocab_size as f64).ln();
         assert!((nll - expected_nll).abs() < 1e-5);
-        
+
         let ppl = nll.exp() as f32;
         assert!((ppl - vocab_size as f32).abs() < 1e-3);
     }

@@ -23,11 +23,17 @@ fn test_template_registry_lookup_and_rendering() {
     ]);
     let rendered_chatml = render_family("chatml", messages.clone()).unwrap();
     assert!(rendered_chatml.contains("<|im_start|>user\nHello GRIM!<|im_end|>"));
-    assert!(rendered_chatml.contains("<|im_start|>assistant\nHello! How can I assist you today?<|im_end|>"));
+    assert!(
+        rendered_chatml
+            .contains("<|im_start|>assistant\nHello! How can I assist you today?<|im_end|>")
+    );
 
     // 2. Llama 3 template rendering
     let rendered_llama3 = render_family("llama3", messages.clone()).unwrap();
-    assert!(rendered_llama3.contains("<|start_header_id|>user<|end_header_id|>\n\nHello GRIM!<|eot_id|>"));
+    assert!(
+        rendered_llama3
+            .contains("<|start_header_id|>user<|end_header_id|>\n\nHello GRIM!<|eot_id|>")
+    );
 
     // 3. Unknown template family error handling
     let unknown_res = render_family("non_existent_family", messages);

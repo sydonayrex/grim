@@ -99,7 +99,10 @@ impl FtwHeader {
             }
             FtwQuantFormat::MxFp4 | FtwQuantFormat::NvFp4 => {
                 // 4-bit packed weights: 0.5 bytes per element
-                bank_row_bytes.insert(quant_format.bank_names()[0].to_string(), inter_dim * hidden_dim);
+                bank_row_bytes.insert(
+                    quant_format.bank_names()[0].to_string(),
+                    inter_dim * hidden_dim,
+                );
                 bank_row_bytes.insert(
                     quant_format.bank_names()[1].to_string(),
                     (2 * inter_dim * hidden_dim) / 32,
@@ -153,9 +156,10 @@ impl FtwHeader {
                 self.num_layers, self.num_experts
             )));
         }
-        let row_bytes = self.bank_row_bytes.get(bank_name).ok_or_else(|| {
-            Error::Backend(format!("FtwHeader: unknown bank name '{bank_name}'"))
-        })?;
+        let row_bytes = self
+            .bank_row_bytes
+            .get(bank_name)
+            .ok_or_else(|| Error::Backend(format!("FtwHeader: unknown bank name '{bank_name}'")))?;
         let flat_idx = layer_idx * self.num_experts + expert_idx;
         Ok(flat_idx * row_bytes)
     }
@@ -235,7 +239,9 @@ impl FtwDirectLoader {
         })?;
 
         reader.read_exact(&mut bank.data).map_err(|e| {
-            Error::Backend(format!("FtwDirectLoader: failed to read bank '{name}': {e}"))
+            Error::Backend(format!(
+                "FtwDirectLoader: failed to read bank '{name}': {e}"
+            ))
         })?;
 
         Ok(bank.data.len())

@@ -610,7 +610,7 @@ mod tests {
         let hidden = num_heads * head_dim;
 
         // Decode shape (new_tokens = 1): index of last V element.
-        let last = 0 * 2 * hidden + hidden + (head_dim - 1);
+        let last = hidden + (head_dim - 1);
         assert!(last < 2 * hidden, "decode kv index OOB: {last}");
 
         // Prefill shape (new_tokens = 5): last token's last V element.

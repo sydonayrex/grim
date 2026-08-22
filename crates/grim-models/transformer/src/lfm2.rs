@@ -65,7 +65,6 @@ pub enum Lfm2LayerCache {
     },
 }
 
-
 pub struct Lfm2Block {
     pub attn_norm: RmsNorm,
     pub wq: Option<Linear>,
@@ -435,7 +434,6 @@ impl Lfm2Block {
                 )?;
                 let k_norm = self.attn_k_norm.as_ref().unwrap().forward(&k_2d)?;
 
-
                 let dev = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
                 let q_shape = Shape::new(vec![1, steps * self.num_heads, self.head_dim]);
                 let k_shape = Shape::new(vec![1, steps * self.num_kv_heads, self.head_dim]);
@@ -472,7 +470,6 @@ impl Lfm2Block {
                 let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
                 let v_vec = v.to_vec_f32()?;
 
-
                 if cache.is_none() {
                     *cache = Some(Lfm2LayerCache::Attention {
                         k: vec![],
@@ -494,8 +491,7 @@ impl Lfm2Block {
                         // the whole history each decode step. Falls back to the
                         // host-history path when the backend lacks the copies.
                         if k_dev.is_none() {
-                            let shape =
-                                Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                            let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
                             *k_dev = Some(Tensor::new(
                                 Arc::from(dev.zeros(&shape, DType::F32)?),
                                 shape.clone(),
@@ -525,7 +521,9 @@ impl Lfm2Block {
                             off_elems,
                             cnt_elems,
                         );
-                        if k_ok.is_ok() && v_ok.is_ok() && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
+                        if k_ok.is_ok()
+                            && v_ok.is_ok()
+                            && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
                         {
                             arena_total = Some(past + steps);
                         }
@@ -596,7 +594,6 @@ impl Lfm2Block {
         };
 
         let x_added = add_tensors(x, &block_out).map_err(grim_core::Error::Tensor)?;
-
 
         let norm_x_ffn = self.ffn_norm.forward(&x_added)?;
         let ffn_out = if self.is_moe {

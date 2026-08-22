@@ -86,7 +86,8 @@ mod tests {
                     let exp = exps[r * (k / 32) + j / 32];
                     let real = mxfp4_e2m1_to_f32(code, exp);
                     assert_eq!(
-                        faked[r * k + j], real,
+                        faked[r * k + j],
+                        real,
                         "k={k} [{r},{j}]: fake={} real={real}",
                         faked[r * k + j]
                     );

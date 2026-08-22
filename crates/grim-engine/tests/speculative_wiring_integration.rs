@@ -30,10 +30,7 @@ fn test_engine_speculative_eagle3_registration() {
         cfg: base_cfg.clone(),
         device: Device::Cpu,
         tok_embeddings: Embedding {
-            weight: grim_backend_cpu::cpu_tensor(
-                vec![0.01; 100 * 64],
-                Shape::new(vec![100, 64]),
-            ),
+            weight: grim_backend_cpu::cpu_tensor(vec![0.01; 100 * 64], Shape::new(vec![100, 64])),
         },
         layers: Vec::new(),
         moe_blocks: Vec::new(),

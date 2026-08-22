@@ -3,8 +3,8 @@
 pub mod bolt_on;
 pub mod convert;
 pub mod format;
-pub mod gguf;
 pub mod ftw;
+pub mod gguf;
 pub mod gptq;
 pub mod onnx;
 pub mod safetensors;

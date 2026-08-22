@@ -6,8 +6,8 @@
 //! - AttentionDispatcher multi-tier routing (Tier 1 Matrix / Tier 2 Compute / Tier 3 CPU)
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::session::Inner;
 use grim_core::CausalLm;
+use grim_core::session::Inner;
 use grim_models_transformer::attention_dispatcher::{
     AttentionDispatcher, AttentionTier, AttentionTopology,
 };
@@ -37,7 +37,9 @@ fn test_llama_forward_and_kv_evolution() {
     let input = cpu_tensor(vec![10.0f32, 20.0f32], Shape::new(vec![1, 2]));
     let positions = cpu_tensor(vec![0.0f32, 1.0f32], Shape::new(vec![1, 2]));
 
-    let logits = model.forward(&mut session, &input, &positions, &[]).unwrap();
+    let logits = model
+        .forward(&mut session, &input, &positions, &[])
+        .unwrap();
     assert_eq!(logits.shape().dims(), &[2, 500]);
 }
 
@@ -68,7 +70,9 @@ fn test_muse_glimmer_forward_pass() {
     let input = cpu_tensor(vec![5.0f32, 15.0f32], Shape::new(vec![1, 2]));
     let positions = cpu_tensor(vec![0.0f32, 1.0f32], Shape::new(vec![1, 2]));
 
-    let logits = model.forward(&mut session, &input, &positions, &[]).unwrap();
+    let logits = model
+        .forward(&mut session, &input, &positions, &[])
+        .unwrap();
     assert_eq!(logits.shape().dims(), &[2, 500]);
 }
 
@@ -96,18 +100,8 @@ fn test_attention_dispatcher_tier_selection_and_gqa() {
     let q = vec![0.5f32; 4 * 16];
     let k = vec![0.5f32; 2 * 16];
     let v = vec![0.5f32; 2 * 16];
-    let (out, tier) = AttentionDispatcher::dispatch_gqa(
-        &q,
-        &k,
-        &v,
-        4,
-        2,
-        16,
-        1,
-        None,
-        &Device::Cpu,
-    )
-    .unwrap();
+    let (out, tier) =
+        AttentionDispatcher::dispatch_gqa(&q, &k, &v, 4, 2, 16, 1, None, &Device::Cpu).unwrap();
     assert_eq!(tier, AttentionTier::Tier3CpuFallback);
     assert_eq!(out.shape().elem_count(), 4 * 16);
 }

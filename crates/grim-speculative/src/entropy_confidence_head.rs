@@ -75,10 +75,10 @@ mod tests {
         let head = EntropyConfidenceHead;
         let mut logits = vec![0.0f32; 2 * 16];
         // Position 0: peaked at id 5.
-        logits[0 * 16 + 5] = 10.0;
+        logits[5] = 10.0;
         // Position 1: flat (low confidence).
         for v in 0..16 {
-            logits[1 * 16 + v] = 0.0;
+            logits[16 + v] = 0.0;
         }
         let block = DraftBlock {
             tokens: vec![5, 0],

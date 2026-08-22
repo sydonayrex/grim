@@ -148,8 +148,8 @@ fn well_separated_router_gate() -> Vec<f32> {
     // perturbations cannot flip the ranking because the gate is frozen.
     let mut gw = vec![0.0f32; NUM_EXPERTS * HIDDEN];
     for i in 0..HIDDEN {
-        gw[0 * HIDDEN + i] = 2.0 + 0.1 * i as f32; // expert 0: large logits
-        gw[1 * HIDDEN + i] = -2.0 - 0.1 * i as f32; // expert 1: large negative
+        gw[i] = 2.0 + 0.1 * i as f32; // expert 0: large logits
+        gw[HIDDEN + i] = -2.0 - 0.1 * i as f32; // expert 1: large negative
     }
     gw
 }

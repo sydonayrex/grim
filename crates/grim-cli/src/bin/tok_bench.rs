@@ -1,7 +1,6 @@
 //! WI-E3 measure-first micro-bench: how long does `encode` take on the eval
 //! corpus? Gate: if >= 50 ms, the parallel fast path is worth building.
 
-
 fn main() {
     let path = std::env::args()
         .nth(1)

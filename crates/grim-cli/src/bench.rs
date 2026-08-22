@@ -154,7 +154,12 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
     let prompts_from_file = std::fs::read_to_string("docs/eval/prompts.txt").ok();
     let file_prompts: Vec<String> = prompts_from_file
         .as_ref()
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     let worker_count = concurrency.max(1);
@@ -191,7 +196,11 @@ async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> R
                 let wall = t0.elapsed().as_secs_f64() * 1000.0;
                 let n_tok = v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
                 local_latencies.push(wall);
-                let itl = if n_tok > 0 { wall / n_tok as f64 } else { wall / 128.0 };
+                let itl = if n_tok > 0 {
+                    wall / n_tok as f64
+                } else {
+                    wall / 128.0
+                };
                 local_itls.push(itl);
                 local_tokens += n_tok;
                 local_count += 1;

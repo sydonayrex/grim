@@ -350,10 +350,9 @@ impl DecodeBucketGraphPool {
 
     /// Launch a bucket graph on a specified HIP stream with zero kernel launch host overhead.
     pub fn launch(&self, bucket: DecodeBatchBucket, stream: *mut c_void) -> Result<()> {
-        let graph = self
-            .buckets
-            .get(&bucket)
-            .ok_or_else(|| Error::Backend(format!("No captured HIP graph for bucket {:?}", bucket)))?;
+        let graph = self.buckets.get(&bucket).ok_or_else(|| {
+            Error::Backend(format!("No captured HIP graph for bucket {:?}", bucket))
+        })?;
 
         let res = unsafe { hipGraphLaunch(graph.exec, stream) };
         if res != hipSuccess {
@@ -527,16 +526,46 @@ mod tests {
     #[test]
     fn test_decode_batch_bucket_mapping() {
         assert_eq!(DecodeBatchBucket::from_batch_size(0), None);
-        assert_eq!(DecodeBatchBucket::from_batch_size(1), Some(DecodeBatchBucket::B1));
-        assert_eq!(DecodeBatchBucket::from_batch_size(2), Some(DecodeBatchBucket::B2));
-        assert_eq!(DecodeBatchBucket::from_batch_size(3), Some(DecodeBatchBucket::B4));
-        assert_eq!(DecodeBatchBucket::from_batch_size(4), Some(DecodeBatchBucket::B4));
-        assert_eq!(DecodeBatchBucket::from_batch_size(5), Some(DecodeBatchBucket::B8));
-        assert_eq!(DecodeBatchBucket::from_batch_size(8), Some(DecodeBatchBucket::B8));
-        assert_eq!(DecodeBatchBucket::from_batch_size(12), Some(DecodeBatchBucket::B16));
-        assert_eq!(DecodeBatchBucket::from_batch_size(16), Some(DecodeBatchBucket::B16));
-        assert_eq!(DecodeBatchBucket::from_batch_size(24), Some(DecodeBatchBucket::B32));
-        assert_eq!(DecodeBatchBucket::from_batch_size(32), Some(DecodeBatchBucket::B32));
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(1),
+            Some(DecodeBatchBucket::B1)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(2),
+            Some(DecodeBatchBucket::B2)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(3),
+            Some(DecodeBatchBucket::B4)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(4),
+            Some(DecodeBatchBucket::B4)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(5),
+            Some(DecodeBatchBucket::B8)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(8),
+            Some(DecodeBatchBucket::B8)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(12),
+            Some(DecodeBatchBucket::B16)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(16),
+            Some(DecodeBatchBucket::B16)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(24),
+            Some(DecodeBatchBucket::B32)
+        );
+        assert_eq!(
+            DecodeBatchBucket::from_batch_size(32),
+            Some(DecodeBatchBucket::B32)
+        );
         assert_eq!(DecodeBatchBucket::from_batch_size(64), None);
 
         assert_eq!(DecodeBatchBucket::B1.batch_size(), 1);

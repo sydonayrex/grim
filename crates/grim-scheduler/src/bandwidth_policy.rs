@@ -14,8 +14,6 @@
 //! Experts in $\mathcal{F}$ ($|\mathcal{F}| = q^*$) are transferred over PCIe into GPU LRU slots,
 //! while experts in $\mathcal{C}$ ($|\mathcal{C}| = m - q^*$) execute concurrently on the CPU.
 
-
-
 /// Empirical bandwidth profile of the host system.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BandwidthProfile {

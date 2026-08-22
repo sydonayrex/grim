@@ -36,7 +36,9 @@ use serde_json::json;
 use crate::discovery::{DatasetEntry, ModelEntry, default_datasets_dir, default_models_dir};
 use crate::jobs::{JobId, JobRegistry, TrainingJob, TrainingMode};
 use crate::rocm::probe_rocm_devices;
-use grim_engine::pipelines::{AudioPipeline, AudioPipelineConfig, DiffusionPipeline, DiffusionPipelineConfig};
+use grim_engine::pipelines::{
+    AudioPipeline, AudioPipelineConfig, DiffusionPipeline, DiffusionPipelineConfig,
+};
 use grim_engine::{Engine, model_loader};
 use grim_format::GgufTokenizer;
 use grim_models_audio::{KokoroConfig, VocosConfig};
@@ -1532,9 +1534,21 @@ fn encode_bmp_rgb(rgb_bytes: &[u8], width: usize, height: usize) -> Vec<u8> {
     for y in 0..height {
         for x in 0..width {
             let idx = (y * width + x) * 3;
-            let r = if idx < rgb_bytes.len() { rgb_bytes[idx] } else { 0 };
-            let g = if idx + 1 < rgb_bytes.len() { rgb_bytes[idx + 1] } else { 0 };
-            let b = if idx + 2 < rgb_bytes.len() { rgb_bytes[idx + 2] } else { 0 };
+            let r = if idx < rgb_bytes.len() {
+                rgb_bytes[idx]
+            } else {
+                0
+            };
+            let g = if idx + 1 < rgb_bytes.len() {
+                rgb_bytes[idx + 1]
+            } else {
+                0
+            };
+            let b = if idx + 2 < rgb_bytes.len() {
+                rgb_bytes[idx + 2]
+            } else {
+                0
+            };
             bmp.push(b);
             bmp.push(g);
             bmp.push(r);
@@ -1581,7 +1595,9 @@ fn encode_wav_16bit(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 /// Endpoint: GET /api/diagnostics
 async fn get_diagnostics(State(state): State<AppState>) -> Json<serde_json::Value> {
     let rocm_devices = probe_rocm_devices();
-    let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let (engine_models, kv_blocks) = {
         let engine = state.engine.lock().unwrap();
         let cap = engine.block_pool.lock().unwrap().capacity();
@@ -1638,11 +1654,21 @@ pub struct DiffusionGenerateRequest {
     pub denoising_strength: f32,
 }
 
-fn default_diffusion_steps() -> usize { 28 }
-fn default_guidance_scale() -> f32 { 3.5 }
-fn default_sampler_name() -> String { "FlowMatchEuler".into() }
-fn default_diffusion_dim() -> usize { 512 }
-fn default_denoising_strength() -> f32 { 0.75 }
+fn default_diffusion_steps() -> usize {
+    28
+}
+fn default_guidance_scale() -> f32 {
+    3.5
+}
+fn default_sampler_name() -> String {
+    "FlowMatchEuler".into()
+}
+fn default_diffusion_dim() -> usize {
+    512
+}
+fn default_denoising_strength() -> f32 {
+    0.75
+}
 
 #[derive(Debug, Serialize)]
 pub struct DiffusionGenerateResponse {
@@ -1723,10 +1749,8 @@ async fn diffusion_generate_handler(
                 ((byte as f32 / 255.0) - 0.5) * 2.0 + (prompt_rng.next_f32() - 0.5) * 0.1;
         }
     }
-    let prompt_embeds = grim_backend_cpu::cpu_tensor(
-        prompt_vec,
-        grim_tensor::Shape::new(vec![prompt_len, 128]),
-    );
+    let prompt_embeds =
+        grim_backend_cpu::cpu_tensor(prompt_vec, grim_tensor::Shape::new(vec![prompt_len, 128]));
 
     let image_tensor = pipe.generate(&prompt_embeds, actual_seed).map_err(|e| {
         (
@@ -1751,8 +1775,10 @@ async fn diffusion_generate_handler(
             for x in 0..width {
                 let pix = y * width + x;
                 let r = (((tensor_data[pix] + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-                let g = (((tensor_data[plane_size + pix] + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-                let b = (((tensor_data[plane_size * 2 + pix] + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+                let g =
+                    (((tensor_data[plane_size + pix] + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+                let b = (((tensor_data[plane_size * 2 + pix] + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0)
+                    as u8;
                 let out_idx = pix * 3;
                 rgb_bytes[out_idx] = r;
                 rgb_bytes[out_idx + 1] = g;
@@ -1791,9 +1817,15 @@ pub struct AudioTtsRequest {
     pub sample_rate: usize,
 }
 
-fn default_voice_name() -> String { "af_bella".into() }
-fn default_audio_speed() -> f32 { 1.0 }
-fn default_audio_sample_rate() -> usize { 24000 }
+fn default_voice_name() -> String {
+    "af_bella".into()
+}
+fn default_audio_speed() -> f32 {
+    1.0
+}
+fn default_audio_sample_rate() -> usize {
+    24000
+}
 
 #[derive(Debug, Serialize)]
 pub struct AudioTtsResponse {
@@ -1854,18 +1886,13 @@ async fn audio_tts_handler(
         hop_length: 256,
     };
 
-    let pipe = AudioPipeline::new(
-        &kokoro_cfg,
-        &vocos_cfg,
-        pipe_cfg,
-        grim_tensor::Device::Cpu,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to initialize audio pipeline: {e}") })),
-        )
-    })?;
+    let pipe = AudioPipeline::new(&kokoro_cfg, &vocos_cfg, pipe_cfg, grim_tensor::Device::Cpu)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to initialize audio pipeline: {e}") })),
+            )
+        })?;
 
     let token_ids: Vec<u32> = req.text.chars().map(|c| (c as u32) % 256).collect();
     let samples = pipe.generate(&token_ids, None).map_err(|e| {
@@ -1910,18 +1937,13 @@ async fn audio_audio2audio_handler(
         hop_length: 256,
     };
 
-    let pipe = AudioPipeline::new(
-        &kokoro_cfg,
-        &vocos_cfg,
-        pipe_cfg,
-        grim_tensor::Device::Cpu,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to initialize audio pipeline: {e}") })),
-        )
-    })?;
+    let pipe = AudioPipeline::new(&kokoro_cfg, &vocos_cfg, pipe_cfg, grim_tensor::Device::Cpu)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to initialize audio pipeline: {e}") })),
+            )
+        })?;
 
     // Create synthetic mel-spectrogram [100, 64] to run through Vocos vocoder reconstruction
     let mut mel_vec = vec![0.0f32; 100 * 64];
@@ -1930,10 +1952,7 @@ async fn audio_audio2audio_handler(
         let time = (i / 100) as f32;
         *v = (freq * 0.1 * req.pitch_shift + time * 0.05).sin() * 0.5;
     }
-    let mel_tensor = grim_backend_cpu::cpu_tensor(
-        mel_vec,
-        grim_tensor::Shape::new(vec![64, 100]),
-    );
+    let mel_tensor = grim_backend_cpu::cpu_tensor(mel_vec, grim_tensor::Shape::new(vec![64, 100]));
 
     let samples = pipe.decode_mel(&mel_tensor).map_err(|e| {
         (
@@ -2148,7 +2167,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/audio/tts")
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&tts_body).unwrap()))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&tts_body).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2166,7 +2187,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/audio/audio2audio")
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&vocos_body).unwrap()))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&vocos_body).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await

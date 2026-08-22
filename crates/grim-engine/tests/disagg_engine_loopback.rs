@@ -152,9 +152,11 @@ fn test_disagg_prefill_to_decode_loopback() {
         prefill_addr: prefill_addr.clone(),
         decode_addr: decode_addr.clone(),
     };
-    let prefill_router = Arc::new(
-        DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill),
-    );
+    let prefill_router = Arc::new(DisaggRouter::new(
+        &prefill_addr,
+        &decode_addr,
+        PoolRole::Prefill,
+    ));
     let prefill_engine_config = make_config(2, 16, 8, Some(prefill_router), Some(prefill_config));
     let mut prefill_engine = Engine::new(prefill_engine_config);
     prefill_engine.register_model("small", small_llama());
@@ -275,7 +277,13 @@ fn test_pure_transferred_kv_decode_without_local_prefill() {
         &decode_addr,
         PoolRole::Decode,
     ));
-    let mut decode_engine = Engine::new(make_config(2, 16, 8, Some(decode_router), Some(decode_config)));
+    let mut decode_engine = Engine::new(make_config(
+        2,
+        16,
+        8,
+        Some(decode_router),
+        Some(decode_config),
+    ));
     decode_engine.register_model("small", small_llama());
 
     let prefill_config = DisaggConfig {
@@ -283,10 +291,18 @@ fn test_pure_transferred_kv_decode_without_local_prefill() {
         prefill_addr: prefill_addr.clone(),
         decode_addr: decode_addr.clone(),
     };
-    let prefill_router =
-        Arc::new(DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill));
-    let mut prefill_engine =
-        Engine::new(make_config(2, 16, 8, Some(prefill_router), Some(prefill_config)));
+    let prefill_router = Arc::new(DisaggRouter::new(
+        &prefill_addr,
+        &decode_addr,
+        PoolRole::Prefill,
+    ));
+    let mut prefill_engine = Engine::new(make_config(
+        2,
+        16,
+        8,
+        Some(prefill_router),
+        Some(prefill_config),
+    ));
     prefill_engine.register_model("small", small_llama());
 
     // Remote prefill: 20 tokens across 2 blocks, pushed per-layer to decode.
@@ -351,7 +367,11 @@ fn test_pure_transferred_kv_decode_without_local_prefill() {
             let _ = (pk, pv);
         }
     }
-    let pos = decode_engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+    let pos = decode_engine
+        .sessions
+        .get(&1)
+        .map(|s| s.current_pos())
+        .unwrap_or(0);
     assert_eq!(pos, 20, "position must continue after remote prefill");
 
     // Tick 1 admits the zero-prompt request into `running` (drive_prefill

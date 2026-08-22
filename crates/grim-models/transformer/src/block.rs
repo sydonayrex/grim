@@ -911,22 +911,22 @@ impl LlamaBlock {
                 None,
                 None,
             ) {
-            Ok((s, _h)) => Tensor::new(
-                std::sync::Arc::from(s),
-                out_shape.clone(),
-                DType::F32,
-                grim_tensor::QuantProvenance::default(),
-                self._dev.clone(),
-            ),
-            Err(_) => {
-                // Manual attention on host. Prefer the cached host mirrors;
-                // otherwise fetch the (device-resident) cache once.
-                let (hk, hv) = match &host_vecs {
-                    Some((k, v)) => (k.clone(), v.clone()),
-                    None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
-                };
-                self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len, None)?
-            }
+                Ok((s, _h)) => Tensor::new(
+                    std::sync::Arc::from(s),
+                    out_shape.clone(),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    self._dev.clone(),
+                ),
+                Err(_) => {
+                    // Manual attention on host. Prefer the cached host mirrors;
+                    // otherwise fetch the (device-resident) cache once.
+                    let (hk, hv) = match &host_vecs {
+                        Some((k, v)) => (k.clone(), v.clone()),
+                        None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
+                    };
+                    self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len, None)?
+                }
             }
         };
         let _t2b = std::time::Instant::now();
@@ -1536,7 +1536,7 @@ mod tests {
             let s0 = (0..cfg.head_dim)
                 .map(|d| {
                     qd[t * num_head_dims + h * cfg.head_dim + d]
-                        * kd[0 * kv_stride + kvh * cfg.head_dim + d]
+                        * kd[kvh * cfg.head_dim + d]
                 })
                 .sum::<f32>()
                 * scale;

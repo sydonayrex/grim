@@ -1341,15 +1341,7 @@ async fn main() -> Result<()> {
             port,
             duration,
         } => {
-            bench::cmd_bench(
-                tokens,
-                concurrency,
-                model.as_deref(),
-                &mode,
-                port,
-                duration,
-            )
-            .await?;
+            bench::cmd_bench(tokens, concurrency, model.as_deref(), &mode, port, duration).await?;
         }
         Commands::Eval {
             model,
@@ -1539,15 +1531,15 @@ async fn main() -> Result<()> {
                 mode
             };
             let effective_optimizer = match rt.map(|t| t.optimizer.as_str()) {
-                Some(name) if optimizer == grim_autograd::OptimizerKind::AdamW => name
-                    .parse()
-                    .unwrap_or(grim_autograd::OptimizerKind::AdamW),
+                Some(name) if optimizer == grim_autograd::OptimizerKind::AdamW => {
+                    name.parse().unwrap_or(grim_autograd::OptimizerKind::AdamW)
+                }
                 _ => optimizer,
             };
             let effective_scheduler = match rt.map(|t| t.scheduler.as_str()) {
-                Some(name) if scheduler == grim_autograd::LRScheduler::Cosine => name
-                    .parse()
-                    .unwrap_or(grim_autograd::LRScheduler::Cosine),
+                Some(name) if scheduler == grim_autograd::LRScheduler::Cosine => {
+                    name.parse().unwrap_or(grim_autograd::LRScheduler::Cosine)
+                }
                 _ => scheduler,
             };
             let effective_lora_plus = if (lora_plus_ratio - 1.0).abs() > 1e-5 {

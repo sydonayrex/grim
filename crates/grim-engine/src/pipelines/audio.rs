@@ -2,8 +2,8 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AudioVocoder, TextToSpeechModel};
 use grim_models_audio::{Kokoro, KokoroConfig, Vocos, VocosConfig};
-use grim_tensor::{Device, Shape};
 use grim_tensor::tensor::Tensor;
+use grim_tensor::{Device, Shape};
 
 /// Configuration for the end-to-end audio pipeline.
 #[derive(Debug, Clone)]
@@ -56,7 +56,10 @@ impl AudioPipeline {
             return Ok(Vec::new());
         }
 
-        let default_style = cpu_tensor(vec![0.0f32; self.kokoro.config.style_dim], Shape::new(vec![self.kokoro.config.style_dim]));
+        let default_style = cpu_tensor(
+            vec![0.0f32; self.kokoro.config.style_dim],
+            Shape::new(vec![self.kokoro.config.style_dim]),
+        );
         let style = style_embed.unwrap_or(&default_style);
 
         // 1. Synthesize audio waveform via Kokoro

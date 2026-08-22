@@ -1026,13 +1026,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                 let step_res: Result<f32> = (|| {
                     let mut hidden_state = tok_embeddings
                         .forward(step_input_ids, eff_len, hidden)
-                        .map_err(|e| Error::Session(format!("token embedding forward failed: {e}")))?;
+                        .map_err(|e| {
+                            Error::Session(format!("token embedding forward failed: {e}"))
+                        })?;
                     let mut x_id = tape.register(hidden_state.clone());
 
                     // Run streaming forward through all layers with autograd tape recording.
                     for layer_idx in 0..num_layers {
                         if opts.checkpoint_segs > 1 {
-                            let seg = layer_idx / ((num_layers + opts.checkpoint_segs - 1) / opts.checkpoint_segs);
+                            let seg = layer_idx
+                                / ((num_layers + opts.checkpoint_segs - 1) / opts.checkpoint_segs);
                             tape.mark_segment_boundary(seg, x_id);
                         }
                         let (next_id, next_h) = streaming
@@ -1058,8 +1061,9 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                         .map_err(|e| Error::Session(format!("output_norm forward failed: {e}")))?;
                     if opts.qat_mxfp4 {
                         let w = lm_head.weight.to_vec_f32()?;
-                        let faked = grim_quant::qat_mxfp4::fake_quant_mxfp4(&w, w.len() / hidden, hidden)
-                            .map_err(|e| Error::Session(e.to_string()))?;
+                        let faked =
+                            grim_quant::qat_mxfp4::fake_quant_mxfp4(&w, w.len() / hidden, hidden)
+                                .map_err(|e| Error::Session(e.to_string()))?;
                         lm_head.weight = grim_backend_cpu::cpu_tensor(
                             faked,
                             grim_tensor::Shape::new(vec![lm_head.weight.shape().dim(0)?, hidden]),
@@ -1072,8 +1076,15 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                                     if d_shape.dims().len() == 2 {
                                         let rows = d_shape.dims()[0];
                                         let cols = d_shape.dims()[1];
-                                        if let Ok(faked_data) = grim_quant::qat_mxfp4::fake_quant_mxfp4(&data_vec, rows, cols) {
-                                            param.data = grim_backend_cpu::cpu_tensor(faked_data, d_shape.clone());
+                                        if let Ok(faked_data) =
+                                            grim_quant::qat_mxfp4::fake_quant_mxfp4(
+                                                &data_vec, rows, cols,
+                                            )
+                                        {
+                                            param.data = grim_backend_cpu::cpu_tensor(
+                                                faked_data,
+                                                d_shape.clone(),
+                                            );
                                         }
                                     }
                                 }
@@ -1100,7 +1111,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                     let targets_usize: Vec<usize> =
                         step_targets.iter().map(|&t| t as usize).collect();
 
-                    let preference_kind_opt = opts.mode.parse::<grim_autograd::PreferenceKind>().ok();
+                    let preference_kind_opt =
+                        opts.mode.parse::<grim_autograd::PreferenceKind>().ok();
 
                     let (loss_val, loss_grad) = if let Some(kind) = preference_kind_opt {
                         let logits_f32 = logits_out.to_vec_f32()?;
@@ -1116,12 +1128,13 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                             (step_targets.to_vec(), step_targets.to_vec())
                         };
 
-                        let (chosen_logp, chosen_count) = grim_autograd::PreferenceTrainer::compute_sequence_logps(
-                            &logits_f32[..chosen_targets.len() * vocab_size],
-                            &chosen_targets,
-                            vocab_size,
-                            IGNORE_INDEX,
-                        );
+                        let (chosen_logp, chosen_count) =
+                            grim_autograd::PreferenceTrainer::compute_sequence_logps(
+                                &logits_f32[..chosen_targets.len() * vocab_size],
+                                &chosen_targets,
+                                vocab_size,
+                                IGNORE_INDEX,
+                            );
 
                         let (rejected_logp, rejected_count) = if half_len > 0 {
                             grim_autograd::PreferenceTrainer::compute_sequence_logps(
@@ -1165,18 +1178,20 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                         full_grad[..chosen_grad.len()].copy_from_slice(&chosen_grad);
 
                         if half_len > 0 {
-                            let rejected_grad = grim_autograd::PreferenceTrainer::compute_log_softmax_vjp(
-                                &logits_f32[chosen_targets.len() * vocab_size..],
-                                &rejected_targets,
-                                vocab_size,
-                                d_rejected.first().copied().unwrap_or(0.1),
-                                IGNORE_INDEX,
-                            );
+                            let rejected_grad =
+                                grim_autograd::PreferenceTrainer::compute_log_softmax_vjp(
+                                    &logits_f32[chosen_targets.len() * vocab_size..],
+                                    &rejected_targets,
+                                    vocab_size,
+                                    d_rejected.first().copied().unwrap_or(0.1),
+                                    IGNORE_INDEX,
+                                );
                             full_grad[chosen_grad.len()..chosen_grad.len() + rejected_grad.len()]
                                 .copy_from_slice(&rejected_grad);
                         }
 
-                        let grad_tensor = grim_backend_cpu::cpu_tensor(full_grad, logits_out.shape().clone());
+                        let grad_tensor =
+                            grim_backend_cpu::cpu_tensor(full_grad, logits_out.shape().clone());
                         (p_loss, grad_tensor)
                     } else {
                         cross_entropy_loss(&logits_out, &targets_usize)
@@ -1339,10 +1354,11 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                             let eval_targets = &seq[1..eff_len];
                             let hidden = model_config.hidden_size;
 
-                            let mut h = match tok_embeddings.forward(eval_ids, eval_ids.len(), hidden) {
-                                Ok(tensor) => tensor,
-                                Err(_) => return Ok::<f64, String>(current_avg_loss),
-                            };
+                            let mut h =
+                                match tok_embeddings.forward(eval_ids, eval_ids.len(), hidden) {
+                                    Ok(tensor) => tensor,
+                                    Err(_) => return Ok::<f64, String>(current_avg_loss),
+                                };
 
                             for l_idx in 0..num_layers {
                                 if let Ok((_, next_h)) = streaming.forward_block_with_autograd(
@@ -1366,10 +1382,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                                         let mut count = 0;
                                         for (pos, &tgt) in eval_targets.iter().enumerate() {
                                             let tok = tgt as usize;
-                                            if tok < vocab && (pos + 1) * vocab <= logits_vec.len() {
-                                                let row = &logits_vec[pos * vocab..(pos + 1) * vocab];
-                                                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                                let sum_exp: f32 = row.iter().map(|&v| (v - max).exp()).sum();
+                                            if tok < vocab && (pos + 1) * vocab <= logits_vec.len()
+                                            {
+                                                let row =
+                                                    &logits_vec[pos * vocab..(pos + 1) * vocab];
+                                                let max = row
+                                                    .iter()
+                                                    .copied()
+                                                    .fold(f32::NEG_INFINITY, f32::max);
+                                                let sum_exp: f32 =
+                                                    row.iter().map(|&v| (v - max).exp()).sum();
                                                 let log_prob = (row[tok] - max) - sum_exp.ln();
                                                 total_nll -= log_prob as f64;
                                                 count += 1;
@@ -1931,8 +1953,8 @@ mod tests {
         use grim_backend_cpu::cpu_tensor;
         use grim_engine::streaming_forward::StreamingBlockForward;
         use grim_models_transformer::LlamaConfig;
-        use grim_nn::modules::Embedding;
         use grim_nn::WeightSource;
+        use grim_nn::modules::Embedding;
         use grim_tensor::Shape;
 
         let vocab = 16usize;
@@ -2103,7 +2125,9 @@ mod tests {
     fn test_is_out_of_memory_error_classification() {
         assert!(is_out_of_memory_error("hipErrorOutOfMemory (code 2)"));
         assert!(is_out_of_memory_error("hipMalloc failed: 2"));
-        assert!(is_out_of_memory_error("Out of memory while allocating device buffer"));
+        assert!(is_out_of_memory_error(
+            "Out of memory while allocating device buffer"
+        ));
         assert!(is_out_of_memory_error("cudaErrorMemoryAllocation"));
         assert!(!is_out_of_memory_error("File not found: model.gguf"));
     }
@@ -2158,6 +2182,10 @@ mod tests {
         assert!(res.is_err());
         let err_msg = res.err().unwrap().to_string();
         // Must either fail on model missing or multi-GPU RCCL init
-        assert!(err_msg.contains("Multi-GPU") || err_msg.contains("failed") || err_msg.contains("No such file"));
+        assert!(
+            err_msg.contains("Multi-GPU")
+                || err_msg.contains("failed")
+                || err_msg.contains("No such file")
+        );
     }
 }

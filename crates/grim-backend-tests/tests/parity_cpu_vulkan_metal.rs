@@ -91,7 +91,11 @@ fn test_vulkan_kernel_registry_and_spirv_parity() {
 
     for kernel in vulkan_kernels {
         let spv = spirv_for(kernel);
-        assert!(!spv.is_empty(), "SPIR-V blob for {:?} must be present", kernel);
+        assert!(
+            !spv.is_empty(),
+            "SPIR-V blob for {:?} must be present",
+            kernel
+        );
         assert_eq!(spv.len() % 4, 0, "SPIR-V must be 4-byte aligned");
         assert!(
             binding_count(kernel) >= 3,
@@ -212,7 +216,11 @@ fn test_cpu_vulkan_metal_silu_swiglu_numerical_parity() {
         assert!((s - expected).abs() < 1e-6, "SiLU mismatch at index {i}");
     }
 
-    for (i, (&sw, (&s, &u))) in swiglu_ref.iter().zip(silu_ref.iter().zip(up.iter())).enumerate() {
+    for (i, (&sw, (&s, &u))) in swiglu_ref
+        .iter()
+        .zip(silu_ref.iter().zip(up.iter()))
+        .enumerate()
+    {
         assert!((sw - (s * u)).abs() < 1e-6, "SwiGLU mismatch at index {i}");
     }
 }
@@ -223,13 +231,21 @@ fn test_cpu_vulkan_metal_softmax_numerical_parity() {
     let probs = cpu_softmax_reference(&logits);
 
     let sum: f32 = probs.iter().sum();
-    assert!((sum - 1.0).abs() < 1e-6, "Softmax probabilities must sum to 1.0");
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "Softmax probabilities must sum to 1.0"
+    );
 
     for &p in &probs {
         assert!(p >= 0.0 && p <= 1.0, "Probability {p} out of bounds");
     }
     assert_eq!(
-        probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0,
+        probs
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0,
         6,
         "Max probability should match max logit index"
     );

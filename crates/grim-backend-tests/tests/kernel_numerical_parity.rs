@@ -43,12 +43,7 @@ pub fn cpu_fused_add_rmsnorm(
 /// CPU reference implementation of standard 1D RoPE (Rotary Positional Embedding).
 ///
 /// Rotates consecutive pairs or half-split components at position `pos`.
-pub fn cpu_rope_1d(
-    vec: &[f32],
-    pos: usize,
-    head_dim: usize,
-    theta_base: f32,
-) -> Vec<f32> {
+pub fn cpu_rope_1d(vec: &[f32], pos: usize, head_dim: usize, theta_base: f32) -> Vec<f32> {
     assert_eq!(vec.len() % head_dim, 0);
     assert_eq!(head_dim % 2, 0);
     let mut out = vec.to_vec();
@@ -115,7 +110,10 @@ fn test_cpu_rmsnorm_invariants() {
     let eps = 1e-5;
     let out = cpu_rmsnorm(&x, &gamma, eps);
     let mean_sq_out = out.iter().map(|&v| v * v).sum::<f32>() / (out.len() as f32);
-    assert!((mean_sq_out - 1.0).abs() < 1e-4, "Normalized variance should be ~1.0");
+    assert!(
+        (mean_sq_out - 1.0).abs() < 1e-4,
+        "Normalized variance should be ~1.0"
+    );
 }
 
 #[test]
@@ -172,7 +170,10 @@ fn test_cpu_softmax_sum_to_one() {
     let x = vec![-1000.0, -999.0, -998.0, 0.0, 1.0, 5.0];
     let probs = cpu_softmax(&x);
     let sum: f32 = probs.iter().sum();
-    assert!((sum - 1.0).abs() < 1e-5, "Softmax probabilities must sum to 1.0");
+    assert!(
+        (sum - 1.0).abs() < 1e-5,
+        "Softmax probabilities must sum to 1.0"
+    );
     for &p in &probs {
         assert!(p >= 0.0, "Probability must be non-negative");
     }
@@ -184,7 +185,10 @@ fn test_cpu_cross_entropy_perfect_prediction_approaches_zero() {
     logits[3] = 50.0; // Very high confidence for index 3
     let loss = cpu_cross_entropy_loss(&logits, 3);
     assert!(loss >= 0.0);
-    assert!(loss < 1e-4, "Loss for near-certain correct prediction should be ~0.0");
+    assert!(
+        loss < 1e-4,
+        "Loss for near-certain correct prediction should be ~0.0"
+    );
 }
 
 #[test]

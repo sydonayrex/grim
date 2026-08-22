@@ -3,10 +3,10 @@
 //! Evaluates and enforces layer-wise cosine fidelity, relative L2 error,
 //! and perplexity degradation bounds across all 18 supported quantization formats.
 
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 use grim_tensor::dtype::QuantFormat;
 use grim_tensor::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Tolerance budget specification for a given quantization format.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

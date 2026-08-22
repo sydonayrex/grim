@@ -172,10 +172,7 @@ impl StreamingBlockForward {
     /// pass (which clones from this cache) trains on the updated weights.
     /// CPU-resident blocks only — device-resident weight mirrors land with
     /// the dirty-block upload work.
-    pub fn overwrite_base_weights(
-        &self,
-        reg: &grim_autograd::AutogradRegistry,
-    ) -> Result<()> {
+    pub fn overwrite_base_weights(&self, reg: &grim_autograd::AutogradRegistry) -> Result<()> {
         use grim_autograd::{LoRAInjectionPoint, ParamId};
         let mut cache = self.block_cache.lock().unwrap_or_else(|e| e.into_inner());
         for ((layer_idx, dev), block) in cache.iter_mut() {
@@ -183,14 +180,13 @@ impl StreamingBlockForward {
                 continue;
             }
             let layer = *layer_idx;
-            let apply = |point: LoRAInjectionPoint,
-                         linear: &mut grim_nn::modules::Linear|
-             -> Result<()> {
-                if let Some(p) = reg.params.get(ParamId::base(layer, point)) {
-                    linear.replace_weight(p.data.clone())?;
-                }
-                Ok(())
-            };
+            let apply =
+                |point: LoRAInjectionPoint, linear: &mut grim_nn::modules::Linear| -> Result<()> {
+                    if let Some(p) = reg.params.get(ParamId::base(layer, point)) {
+                        linear.replace_weight(p.data.clone())?;
+                    }
+                    Ok(())
+                };
             apply(LoRAInjectionPoint::QProj, &mut block.wq.inner)?;
             apply(LoRAInjectionPoint::KProj, &mut block.wk.inner)?;
             apply(LoRAInjectionPoint::VProj, &mut block.wv.inner)?;

@@ -21,7 +21,10 @@ impl Eagle3Drafter {
     /// Create a new drafter backbone from an `Eagle3` model instance.
     pub fn new(model: Arc<Eagle3>) -> Self {
         let device = model.device.clone();
-        Self { model, _device: device }
+        Self {
+            model,
+            _device: device,
+        }
     }
 }
 

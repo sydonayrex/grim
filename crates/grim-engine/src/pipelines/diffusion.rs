@@ -65,11 +65,7 @@ impl DiffusionPipeline {
     }
 
     /// Generate an image from prompt embeddings.
-    pub fn generate(
-        &self,
-        prompt_embeds: &Tensor,
-        seed: u64,
-    ) -> Result<Tensor> {
+    pub fn generate(&self, prompt_embeds: &Tensor, seed: u64) -> Result<Tensor> {
         let lat_h = self.config.height / 8;
         let lat_w = self.config.width / 8;
         let patch_h = lat_h / 2;
@@ -89,11 +85,7 @@ impl DiffusionPipeline {
             let t = self.scheduler.timesteps[step];
 
             // Predict velocity vector field v_theta
-            let v_pred = self.transformer.forward(
-                &latents,
-                prompt_embeds,
-                t,
-            )?;
+            let v_pred = self.transformer.forward(&latents, prompt_embeds, t)?;
 
             // Euler integration step
             latents = self.scheduler.step(&v_pred, &latents, step as u32)?;

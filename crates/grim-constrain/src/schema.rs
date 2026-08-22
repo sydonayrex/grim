@@ -95,7 +95,11 @@ pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSc
     })
 }
 
-fn resolve_refs(schema: &Value, root: &Value, depth: usize) -> Result<Value, JsonSchemaCompilerError> {
+fn resolve_refs(
+    schema: &Value,
+    root: &Value,
+    depth: usize,
+) -> Result<Value, JsonSchemaCompilerError> {
     if depth > 32 {
         return Err(JsonSchemaCompilerError {
             message: "circular $ref detected".to_string(),
@@ -219,7 +223,11 @@ fn is_truncated_error(e: &serde_json::Error) -> bool {
 enum CharMatcher {
     Any,
     Exact(char),
-    Class { ranges: Vec<(char, char)>, chars: Vec<char>, negated: bool },
+    Class {
+        ranges: Vec<(char, char)>,
+        chars: Vec<char>,
+        negated: bool,
+    },
 }
 
 impl CharMatcher {
@@ -227,8 +235,13 @@ impl CharMatcher {
         match self {
             CharMatcher::Any => true,
             CharMatcher::Exact(target) => *target == c,
-            CharMatcher::Class { ranges, chars, negated } => {
-                let hit = chars.contains(&c) || ranges.iter().any(|&(low, high)| c >= low && c <= high);
+            CharMatcher::Class {
+                ranges,
+                chars,
+                negated,
+            } => {
+                let hit =
+                    chars.contains(&c) || ranges.iter().any(|&(low, high)| c >= low && c <= high);
                 if *negated { !hit } else { hit }
             }
         }
@@ -255,7 +268,11 @@ impl BoundedRegex {
     pub fn parse(pattern: &str) -> Option<Self> {
         let chars: Vec<char> = pattern.chars().collect();
         if chars.is_empty() {
-            return Some(Self { elements: Vec::new(), anchor_start: false, anchor_end: false });
+            return Some(Self {
+                elements: Vec::new(),
+                anchor_start: false,
+                anchor_end: false,
+            });
         }
 
         let mut i = 0;
@@ -291,12 +308,36 @@ impl BoundedRegex {
                     let next = chars[i + 1];
                     i += 2;
                     match next {
-                        'd' => CharMatcher::Class { ranges: vec![('0', '9')], chars: Vec::new(), negated: false },
-                        'D' => CharMatcher::Class { ranges: vec![('0', '9')], chars: Vec::new(), negated: true },
-                        'w' => CharMatcher::Class { ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')], chars: vec!['_'], negated: false },
-                        'W' => CharMatcher::Class { ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')], chars: vec!['_'], negated: true },
-                        's' => CharMatcher::Class { ranges: Vec::new(), chars: vec![' ', '\t', '\n', '\r'], negated: false },
-                        'S' => CharMatcher::Class { ranges: Vec::new(), chars: vec![' ', '\t', '\n', '\r'], negated: true },
+                        'd' => CharMatcher::Class {
+                            ranges: vec![('0', '9')],
+                            chars: Vec::new(),
+                            negated: false,
+                        },
+                        'D' => CharMatcher::Class {
+                            ranges: vec![('0', '9')],
+                            chars: Vec::new(),
+                            negated: true,
+                        },
+                        'w' => CharMatcher::Class {
+                            ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')],
+                            chars: vec!['_'],
+                            negated: false,
+                        },
+                        'W' => CharMatcher::Class {
+                            ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')],
+                            chars: vec!['_'],
+                            negated: true,
+                        },
+                        's' => CharMatcher::Class {
+                            ranges: Vec::new(),
+                            chars: vec![' ', '\t', '\n', '\r'],
+                            negated: false,
+                        },
+                        'S' => CharMatcher::Class {
+                            ranges: Vec::new(),
+                            chars: vec![' ', '\t', '\n', '\r'],
+                            negated: true,
+                        },
                         escaped => CharMatcher::Exact(escaped),
                     }
                 }
@@ -346,7 +387,11 @@ impl BoundedRegex {
                     if !closed {
                         return None;
                     }
-                    CharMatcher::Class { ranges, chars: specific_chars, negated }
+                    CharMatcher::Class {
+                        ranges,
+                        chars: specific_chars,
+                        negated,
+                    }
                 }
                 literal => {
                     i += 1;
@@ -356,9 +401,18 @@ impl BoundedRegex {
 
             let (min_rep, max_rep) = if i < end_limit {
                 match chars[i] {
-                    '*' => { i += 1; (0, usize::MAX) }
-                    '+' => { i += 1; (1, usize::MAX) }
-                    '?' => { i += 1; (0, 1) }
+                    '*' => {
+                        i += 1;
+                        (0, usize::MAX)
+                    }
+                    '+' => {
+                        i += 1;
+                        (1, usize::MAX)
+                    }
+                    '?' => {
+                        i += 1;
+                        (0, 1)
+                    }
                     '{' => {
                         let start_q = i + 1;
                         let mut end_q = start_q;
@@ -390,10 +444,18 @@ impl BoundedRegex {
                 (1, 1)
             };
 
-            elements.push(RegexElement { matcher, min_repeat: min_rep, max_repeat: max_rep });
+            elements.push(RegexElement {
+                matcher,
+                min_repeat: min_rep,
+                max_repeat: max_rep,
+            });
         }
 
-        Some(Self { elements, anchor_start, anchor_end })
+        Some(Self {
+            elements,
+            anchor_start,
+            anchor_end,
+        })
     }
 
     pub fn matches(&self, text: &str) -> bool {
@@ -416,7 +478,14 @@ impl BoundedRegex {
         }
     }
 
-    fn match_from(&self, chars: &[char], text_pos: usize, elem_idx: usize, steps: &mut usize, max_steps: usize) -> bool {
+    fn match_from(
+        &self,
+        chars: &[char],
+        text_pos: usize,
+        elem_idx: usize,
+        steps: &mut usize,
+        max_steps: usize,
+    ) -> bool {
         *steps += 1;
         if *steps > max_steps {
             return false;
@@ -526,7 +595,10 @@ fn validate(value: &Value, schema: &Value) -> bool {
         }
     }
     // pattern (bounded backtracking regex subset)
-    if let (Some(pat), Some(s)) = (schema.get("pattern").and_then(|v| v.as_str()), value.as_str()) {
+    if let (Some(pat), Some(s)) = (
+        schema.get("pattern").and_then(|v| v.as_str()),
+        value.as_str(),
+    ) {
         if !pat.is_empty() && !validate_pattern(pat, s) {
             return false;
         }
@@ -724,7 +796,10 @@ mod tests {
         });
         let c = compile_json_schema(schema).unwrap();
         assert_eq!(c.lookahead_jump_forward(""), Some("{\n".to_string()));
-        assert_eq!(c.lookahead_jump_forward("{"), Some("\"user_id\": ".to_string()));
+        assert_eq!(
+            c.lookahead_jump_forward("{"),
+            Some("\"user_id\": ".to_string())
+        );
     }
 }
 
@@ -786,6 +861,10 @@ mod f9_fast_path_tests {
             .iter()
             .map(|t| c.is_consistent(&format!("{partial}{t}")))
             .collect();
-        assert_eq!(fast.to_vec(), slow, "fast path must agree with full validate");
+        assert_eq!(
+            fast.to_vec(),
+            slow,
+            "fast path must agree with full validate"
+        );
     }
 }
