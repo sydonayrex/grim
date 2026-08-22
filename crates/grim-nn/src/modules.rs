@@ -1242,6 +1242,7 @@ mod tests {
                 beta_slow: 1.0,
                 attention_factor: 1.0,
             }),
+            interleaved: true,
         };
         let yarn = Rope::from_config(yarn_cfg);
         let input: Vec<f32> = (0..4).map(|i| (i + 1) as f32).collect();
@@ -2437,16 +2438,16 @@ impl Conv1d {
         let kernel_size = w_dims[2];
         let in_c = in_c_per_group * self.groups;
 
-        let (batch, in_seq, x_flat) = if x_dims.len() == 2 {
+        let (batch, in_seq, is_seq_first, x_flat) = if x_dims.len() == 2 {
             if x_dims[1] == in_c {
-                (1, x_dims[0], x.to_vec_f32()?)
+                (1, x_dims[0], true, x.to_vec_f32()?)
             } else if x_dims[0] == in_c {
-                (1, x_dims[1], x.to_vec_f32()?)
+                (1, x_dims[1], false, x.to_vec_f32()?)
             } else {
-                (1, x_dims[0], x.to_vec_f32()?)
+                (1, x_dims[0], true, x.to_vec_f32()?)
             }
         } else if x_dims.len() == 3 {
-            (x_dims[0], x_dims[2], x.to_vec_f32()?)
+            (x_dims[0], x_dims[2], false, x.to_vec_f32()?)
         } else {
             return Err(Error::Shape(format!(
                 "Conv1d: unsupported input rank {}",
@@ -2493,20 +2494,29 @@ impl Conv1d {
                                 let in_pos = in_center as isize + (k * self.dilation) as isize
                                     - self.padding as isize;
                                 if in_pos >= 0 && (in_pos as usize) < in_seq {
-                                    let x_val = x_flat[b_in_off + ic * in_seq + in_pos as usize];
+                                    let x_idx = if is_seq_first {
+                                        b_in_off + (in_pos as usize) * in_c + ic
+                                    } else {
+                                        b_in_off + ic * in_seq + (in_pos as usize)
+                                    };
+                                    let x_val = x_flat[x_idx];
                                     let w_val = w_vec[w_base + k];
                                     sum += x_val * w_val;
                                 }
                             }
                         }
-                        out[b_out_off + oc * out_seq + os] = sum;
+                        if is_seq_first {
+                            out[b_out_off + os * out_c + oc] = sum;
+                        } else {
+                            out[b_out_off + oc * out_seq + os] = sum;
+                        }
                     }
                 }
             }
         }
 
         let dev = pick_device_for_tensor(x);
-        let out_shape = if x_dims.len() == 2 && x_dims[1] == in_c {
+        let out_shape = if is_seq_first {
             Shape::new(vec![out_seq, out_c])
         } else if x_dims.len() == 2 {
             Shape::new(vec![out_c, out_seq])

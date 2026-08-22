@@ -39,6 +39,15 @@
         <button class="nav-item" data-tab="chat" id="nav-chat">
           <span class="icon">💬</span> Interactive Chat
         </button>
+        <button class="nav-item" data-tab="diffusion" id="nav-diffusion">
+          <span class="icon">🎨</span> Diffusion Studio
+        </button>
+        <button class="nav-item" data-tab="audio" id="nav-audio">
+          <span class="icon">🎵</span> Audio Studio
+        </button>
+        <button class="nav-item" data-tab="diagnostics" id="nav-diagnostics">
+          <span class="icon">🩺</span> Diagnostics
+        </button>
       </nav>
 
       <div class="gpu-badge" id="gpu-telemetry-badge">
@@ -418,6 +427,231 @@
             <textarea id="input-chat-prompt" class="form-control" rows="2" placeholder="Type prompt or question to verify model response..." style="flex: 1; resize: none; border-radius: 8px;"></textarea>
             <button type="submit" class="btn btn-primary" id="btn-chat-send" style="height: 46px; padding: 0 24px; font-weight: 600;">🚀 Send</button>
           </form>
+        </div>
+      </section>
+
+      <!-- TAB 7: Diffusion Studio (Automatic1111 WebUI Style) -->
+      <section class="tab-page" id="page-diffusion">
+        <div class="card card-panel" style="padding: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-card); padding-bottom: 14px; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <h2 style="margin-bottom: 4px;">🎨 Flux.2 Diffusion Studio (Automatic1111 Format)</h2>
+              <p class="subtitle" style="margin-bottom: 0;">Multi-modal image synthesis validation with FlowMatch Euler & MM-DiT transformer architectures.</p>
+            </div>
+            <!-- Sub tabs: txt2img | img2img -->
+            <div class="diffusion-subtabs" style="display: flex; gap: 6px; background: rgba(15,23,42,0.6); padding: 4px; border-radius: 8px; border: 1px solid var(--border-card);">
+              <button type="button" class="btn btn-sm btn-primary active" id="btn-tab-txt2img">txt2img</button>
+              <button type="button" class="btn btn-sm btn-secondary" id="btn-tab-img2img">img2img</button>
+            </div>
+          </div>
+
+          <div class="grid-2col" style="grid-template-columns: 1.2fr 0.8fr; gap: 20px; align-items: start;">
+            <!-- Left Column: Controls & Prompt Dock -->
+            <div style="display: flex; flex-direction: column; gap: 14px;">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="diff-prompt" style="font-weight: 600; font-size: 13px;">Positive Prompt</label>
+                <textarea id="diff-prompt" class="form-control" rows="3" placeholder="masterpiece, highly detailed cyberpunk cityscape at dusk, neon lighting, volumetric atmosphere, 8k resolution" style="border-radius: 8px; resize: vertical;"></textarea>
+              </div>
+
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="diff-neg-prompt" style="font-weight: 600; font-size: 13px; color: var(--text-muted);">Negative Prompt</label>
+                <textarea id="diff-neg-prompt" class="form-control" rows="2" placeholder="blurry, low quality, artifacts, distorted, out of frame" style="border-radius: 8px; resize: vertical;"></textarea>
+              </div>
+
+              <!-- img2img upload dock (hidden by default) -->
+              <div id="diff-img2img-dock" style="display: none; border: 2px dashed var(--border-card); border-radius: 8px; padding: 16px; text-align: center; background: rgba(15,23,42,0.3);">
+                <label style="cursor: pointer; font-size: 13px; color: var(--text-main); font-weight: 500;">
+                  📁 Drop initial image here or click to browse
+                  <input type="file" id="diff-init-image-input" accept="image/*" style="display: none;">
+                </label>
+                <div id="diff-init-preview" style="margin-top: 10px; display: none;">
+                  <img id="diff-init-preview-img" style="max-height: 140px; border-radius: 6px;" alt="Init Image Preview">
+                </div>
+              </div>
+
+              <!-- Parameter Grid -->
+              <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                  <div>
+                    <label for="diff-sampler" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Sampling Method</label>
+                    <select id="diff-sampler" class="form-control">
+                      <option value="FlowMatchEuler" selected>FlowMatch Euler (Flux.2 Native)</option>
+                      <option value="Euler">Euler</option>
+                      <option value="Euler a">Euler a</option>
+                      <option value="DDIM">DDIM</option>
+                      <option value="DPM++ 2M Karras">DPM++ 2M Karras</option>
+                      <option value="Heun">Heun</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label for="diff-steps" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Sampling Steps: <span id="val-diff-steps">28</span></label>
+                    <input type="range" id="diff-steps" min="1" max="100" step="1" value="28" style="width: 100%;">
+                  </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                  <div>
+                    <label for="diff-width" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Width: <span id="val-diff-width">512</span>px</label>
+                    <input type="range" id="diff-width" min="256" max="1024" step="64" value="512" style="width: 100%;">
+                  </div>
+
+                  <div>
+                    <label for="diff-height" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Height: <span id="val-diff-height">512</span>px</label>
+                    <input type="range" id="diff-height" min="256" max="1024" step="64" value="512" style="width: 100%;">
+                  </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                  <div>
+                    <label for="diff-cfg" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">CFG / Guidance Scale: <span id="val-diff-cfg">3.5</span></label>
+                    <input type="range" id="diff-cfg" min="1.0" max="20.0" step="0.5" value="3.5" style="width: 100%;">
+                  </div>
+
+                  <div>
+                    <label for="diff-seed" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Seed (-1 for random)</label>
+                    <input type="number" id="diff-seed" class="form-control" value="-1" style="height: 36px;">
+                  </div>
+                </div>
+
+                <div id="diff-denoising-row" style="display: none;">
+                  <label for="diff-denoising" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Denoising Strength: <span id="val-diff-denoising">0.75</span></label>
+                  <input type="range" id="diff-denoising" min="0.0" max="1.0" step="0.05" value="0.75" style="width: 100%;">
+                </div>
+              </div>
+
+              <!-- Action Bar -->
+              <button type="button" class="btn btn-primary" id="btn-diff-generate" style="height: 48px; font-size: 15px; font-weight: 700; background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);">
+                ✨ Generate Image
+              </button>
+            </div>
+
+            <!-- Right Column: Output Image Preview -->
+            <div style="display: flex; flex-direction: column; gap: 12px;">
+              <div id="diff-output-container" style="min-height: 420px; background: rgba(15,23,42,0.5); border: 1px solid var(--border-card); border-radius: 8px; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
+                <div id="diff-placeholder" style="color: var(--text-muted); font-size: 13px; text-align: center; padding: 20px;">
+                  🖼️ Generated diffusion output will appear here.<br>Enter prompt and click Generate.
+                </div>
+                <img id="diff-result-img" style="display: none; max-width: 100%; height: auto; border-radius: 6px;" alt="Generated Output">
+                <div id="diff-spinner" style="display: none; position: absolute; text-align: center; color: #f97316; font-weight: 600;">
+                  ⏳ Running FlowMatch Euler Denoising...
+                </div>
+              </div>
+
+              <!-- Output Metadata & Download Bar -->
+              <div id="diff-meta-bar" style="display: none; background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 12px; justify-content: space-between; align-items: center;">
+                <div style="font-size: 11px; color: var(--text-muted); line-height: 1.4;" id="diff-meta-text">
+                  Seed: - | Steps: 28 | Latency: 0ms
+                </div>
+                <a id="btn-diff-download" class="btn btn-secondary btn-sm" download="generated-image.bmp">⬇️ Download</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 8: Audio Studio (TTS & Audio-to-Audio) -->
+      <section class="tab-page" id="page-audio">
+        <div class="card card-panel" style="padding: 20px;">
+          <div style="border-bottom: 1px solid var(--border-card); padding-bottom: 14px; margin-bottom: 16px;">
+            <h2 style="margin-bottom: 4px;">🎵 Audio Studio (TTS & Audio-to-Audio Vocoder)</h2>
+            <p class="subtitle" style="margin-bottom: 0;">Validate Kokoro text-to-speech synthesis and Vocos neural vocoder reconstruction pipelines.</p>
+          </div>
+
+          <div class="grid-2col" style="gap: 20px; align-items: start;">
+            <!-- Panel 1: Text-to-Speech (TTS) -->
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+              <h3 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">🗣️ Text-to-Speech (Kokoro Model)</h3>
+              
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="tts-text-input" style="font-weight: 600; font-size: 12px;">Input Text / Script</label>
+                <textarea id="tts-text-input" class="form-control" rows="3" placeholder="Hello from Grim engine! This audio is synthesized natively on your device." style="border-radius: 8px; resize: vertical;"></textarea>
+              </div>
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div>
+                  <label for="tts-voice-select" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Voice Character</label>
+                  <select id="tts-voice-select" class="form-control">
+                    <option value="af_bella">Bella (American Female)</option>
+                    <option value="af_sarah">Sarah (American Female)</option>
+                    <option value="am_adam">Adam (American Male)</option>
+                    <option value="am_michael">Michael (American Male)</option>
+                    <option value="bf_emma">Emma (British Female)</option>
+                    <option value="bf_isabella">Isabella (British Female)</option>
+                    <option value="bm_george">George (British Male)</option>
+                    <option value="bm_lewis">Lewis (British Male)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label for="tts-speed" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Speed: <span id="val-tts-speed">1.0</span>x</label>
+                  <input type="range" id="tts-speed" min="0.5" max="2.0" step="0.1" value="1.0" style="width: 100%;">
+                </div>
+              </div>
+
+              <button type="button" class="btn btn-primary" id="btn-tts-synthesize" style="height: 42px; font-weight: 600;">
+                🎙️ Synthesize Speech
+              </button>
+
+              <div id="tts-player-container" style="display: none; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border-card);">
+                <audio id="tts-audio-player" controls style="width: 100%; border-radius: 6px;"></audio>
+                <div id="tts-telemetry" style="font-size: 11px; color: var(--text-muted);">Duration: 0.0s | Rate: 24kHz</div>
+              </div>
+            </div>
+
+            <!-- Panel 2: Audio-to-Audio (Vocos Vocoder) -->
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+              <h3 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">🎛️ Audio-to-Audio & Vocoder (Vocos)</h3>
+              
+              <p style="font-size: 12px; color: var(--text-muted); margin: 0;">
+                Reconstruct and synthesize mel-spectrogram features through the ultra-fast Fourier-based Vocos neural vocoder.
+              </p>
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div>
+                  <label for="vocos-pitch" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Pitch Modulation: <span id="val-vocos-pitch">1.0</span>x</label>
+                  <input type="range" id="vocos-pitch" min="0.5" max="2.0" step="0.1" value="1.0" style="width: 100%;">
+                </div>
+
+                <div>
+                  <label for="vocos-sample-rate" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Sample Rate</label>
+                  <select id="vocos-sample-rate" class="form-control">
+                    <option value="24000" selected>24,000 Hz</option>
+                    <option value="22050">22,050 Hz</option>
+                    <option value="44100">44,100 Hz</option>
+                  </select>
+                </div>
+              </div>
+
+              <button type="button" class="btn btn-secondary" id="btn-vocos-run" style="height: 42px; font-weight: 600;">
+                🌊 Run Mel Vocoder Reconstruction
+              </button>
+
+              <div id="vocos-player-container" style="display: none; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border-card);">
+                <audio id="vocos-audio-player" controls style="width: 100%; border-radius: 6px;"></audio>
+                <div id="vocos-telemetry" style="font-size: 11px; color: var(--text-muted);">Duration: 0.0s | Rate: 24kHz</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 9: Diagnostic Health Checks -->
+      <section class="tab-page" id="page-diagnostics">
+        <div class="card card-panel" style="padding: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-card); padding-bottom: 14px; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <h2 style="margin-bottom: 4px;">🩺 System & Hardware Diagnostic Checks</h2>
+              <p class="subtitle" style="margin-bottom: 0;">Comprehensive verification of ROCm/HIP drivers, memory tiers, autograd tape health, and multimodal engines.</p>
+            </div>
+            <button type="button" class="btn btn-secondary" id="btn-run-diagnostics">🔄 Run Diagnostic Audit</button>
+          </div>
+
+          <div id="diag-checks-list" style="display: flex; flex-direction: column; gap: 12px;">
+            <div style="padding: 16px; background: rgba(15,23,42,0.4); border-radius: 8px; border: 1px solid var(--border-card); color: var(--text-muted);">
+              Loading diagnostic audit data...
+            </div>
+          </div>
         </div>
       </section>
     </main>

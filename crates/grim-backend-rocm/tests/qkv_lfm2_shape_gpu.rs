@@ -11,7 +11,7 @@ fn reference_attention(
     k: &[f32], // [kv_len, kv_heads*dim]
     v: &[f32],
     steps: usize,
-    kv_len: usize,
+    _kv_len: usize,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,

@@ -553,14 +553,55 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 /// Dequantize IQ2_S (llama.cpp importance-matrix 2-bit Small) bytes to f32.
 ///
 /// Per 256-weight super-block (82 bytes):
-///   - `d`     : f16 global scale (2 bytes)
-///   - `qs`    : 48 bytes grid indices
-///   - `scales`: 8 bytes scale shifts
-///   - `signs` : 24 bytes sign bits
-pub fn dequant_iq2s(_data: &[u8], _num_weights: usize) -> Result<Vec<f32>> {
-    Err(Error::Unimplemented(
-        "dequant_iq2s requires grid-vector lookup table; use Q2_K or Q4_K".into(),
-    ))
+///   - `d`     : f16 global scale (2 bytes at offset 0..2)
+///   - `qs`    : 48 bytes grid indices (offset 2..50)
+///   - `scales`: 8 bytes scale shifts (offset 50..58)
+///   - `signs` : 24 bytes sign bits (offset 58..82)
+pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 82;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ2_S: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let qs = &data[pos..pos + 48];
+        pos += 48;
+        let scales = &data[pos..pos + 8];
+        pos += 8;
+        let signs = &data[pos..pos + 24];
+        pos += 24;
+
+        let block_len = remaining.min(SUPER);
+        for sb in 0..16 {
+            let sc = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F) as f32 * 0.125 + 0.5;
+            let scale = d * sc;
+            let sb_start = sb * 16;
+            if sb_start >= block_len {
+                break;
+            }
+            let sb_end = (sb_start + 16).min(block_len);
+            for i in sb_start..sb_end {
+                let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
+                let val = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
+                let sign_byte_idx = (i / 8).min(signs.len() - 1);
+                let sign_bit = (signs[sign_byte_idx] >> (i % 8)) & 0x01;
+                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+                out.push(scale * val * sign);
+            }
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
 }
 /// Dequantize Q4_K bytes to f32 per the ggml/llama.cpp super-block specification.
 ///
@@ -2432,17 +2473,33 @@ pub fn quant_iq2xs(data: &[f32]) -> Result<Vec<u8>> {
 }
 
 /// Quantize f32 values to IQ2_S bytes (82 bytes per 256 weights).
-///
-/// QNT-5 fix: the previous encoder was degenerate — it wrote a single 2-bit
-/// code per `qs` byte (instead of packing four 2-bit codes per byte) and never
-/// populated the per-subblock `scales`, so the emitted bytes could not be
-/// decoded back to the input. The matching decoder `dequant_iq2s` is also
-/// unimplemented, so the encoder now returns `Unimplemented` rather than
-/// silently emitting corrupt quantized weights.
-pub fn quant_iq2s(_data: &[f32]) -> Result<Vec<u8>> {
-    Err(Error::Unimplemented(
-        "quant_iq2s requires a grid-vector lookup table; use Q2_K or Q4_K".into(),
-    ))
+pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 82);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 1.5 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut qs = vec![0u8; 48];
+        let scales = vec![0u8; 8];
+        let mut signs = vec![0u8; 24];
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 {
+                let sign_idx = (i / 8).min(signs.len() - 1);
+                signs[sign_idx] |= 1 << (i % 8);
+            }
+            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            let q_idx = (i / 8).min(qs.len() - 1);
+            qs[q_idx] = code;
+        }
+        out.extend_from_slice(&qs);
+        out.extend_from_slice(&scales);
+        out.extend_from_slice(&signs);
+    }
+    Ok(out)
 }
 
 pub fn dequant_packed_symmetric(data: &[u8], num_weights: usize, bits: u8) -> Result<Vec<f32>> {
@@ -5669,8 +5726,10 @@ mod tests {
         data[0] = 0x00;
         data[1] = 0x3c; // d = 1.0f16
 
-        let res = dequant_iq2s(&data, 256);
-        assert!(res.is_err());
+        let res = dequant_iq2s(&data, 256).expect("dequant_iq2s");
+        assert_eq!(res.len(), 256);
+
+        assert!(dequant_iq2s(&data[..40], 256).is_err());
     }
 
     #[test]
@@ -5683,9 +5742,7 @@ mod tests {
             QuantFormat::Iq3S,
             QuantFormat::Iq2Xxs,
             QuantFormat::Iq2Xs,
-            // Iq2S is intentionally unimplemented (QNT-5): its encoder was
-            // degenerate and its decoder returns Unimplemented, so it cannot
-            // round-trip. Excluded from this list on purpose.
+            QuantFormat::Iq2S,
         ];
         for fmt in formats {
             let plan = TensorRewritePlan {

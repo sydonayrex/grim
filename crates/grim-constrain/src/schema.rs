@@ -8,6 +8,8 @@
 //! clear error rather than silently under-constraining.
 
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// WI-3b: error from compiling a JSON Schema into a constraint.
 #[derive(Debug, Clone)]
@@ -23,17 +25,16 @@ impl std::fmt::Display for JsonSchemaCompilerError {
 
 impl std::error::Error for JsonSchemaCompilerError {}
 
-/// A compiled JSON-Schema constraint. Currently this is a *validator*
-/// rather than a full FSM: at each step we check whether the partial JSON
-/// produced so far is consistent with the schema, and mask tokens whose
-/// continuation would violate it.
+/// A compiled JSON-Schema constraint with memoized token validity masking.
 ///
-/// `TODO(perf)`: a real FSM would precompute per-token validity; this
-/// validator re-parses the partial output each step. Correctness-gated
-/// for WI-3b; WI-3c optimizes it.
+/// At each step we check whether the partial JSON produced so far is consistent
+/// with the schema, and mask tokens whose continuation would violate it.
+/// Computed masks are cached per distinct output prefix to prevent redundant
+/// O(V) re-validations.
 #[derive(Debug, Clone)]
 pub struct JsonSchemaConstraint {
     schema: Value,
+    cache: Arc<Mutex<HashMap<String, Arc<[bool]>>>>,
 }
 
 impl JsonSchemaConstraint {
@@ -79,7 +80,10 @@ pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSc
             }
         }
     }
-    Ok(JsonSchemaConstraint { schema })
+    Ok(JsonSchemaConstraint {
+        schema,
+        cache: Arc::new(Mutex::new(HashMap::new())),
+    })
 }
 
 impl JsonSchemaConstraint {
@@ -107,13 +111,31 @@ impl JsonSchemaConstraint {
         validate(&value, &self.schema)
     }
 
+    /// Return a memoized validity mask for `vocab` given `current_output`.
+    pub fn mask_for(&self, vocab: &[String], current_output: &str) -> Arc<[bool]> {
+        if let Ok(guard) = self.cache.lock() {
+            if let Some(mask) = guard.get(current_output) {
+                return mask.clone();
+            }
+        }
+        let mask: Vec<bool> = vocab
+            .iter()
+            .map(|t| self.is_consistent(&format!("{current_output}{t}")))
+            .collect();
+        let arc: Arc<[bool]> = Arc::from(mask.into_boxed_slice());
+        if let Ok(mut guard) = self.cache.lock() {
+            if guard.len() > 1024 {
+                guard.clear();
+            }
+            guard.insert(current_output.to_string(), arc.clone());
+        }
+        arc
+    }
+
     /// WI-3b: for each token in `vocab`, check whether appending it to
     /// `current_output` keeps the partial output consistent with the schema.
     pub fn valid_tokens(&self, vocab: &[String], current_output: &str) -> Vec<bool> {
-        vocab
-            .iter()
-            .map(|t| self.is_consistent(&format!("{current_output}{t}")))
-            .collect()
+        self.mask_for(vocab, current_output).to_vec()
     }
 }
 

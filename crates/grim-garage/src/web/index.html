@@ -3,334 +3,660 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Grim's Garage — Local Training & Model Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/app.css">
+  <title>Grim's Garage — Local Training & Repack Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
-<body class="dark-theme">
-  <div id="app" class="app-layout">
-    <!-- Navigation Sidebar -->
+<body>
+  <div id="app" class="dashboard-root">
+    <!-- Sidebar Navigation -->
     <aside class="sidebar">
       <div class="brand">
         <div class="logo-wrapper">
-          <img src="/logo.png" alt="Grim's Garage Logo" class="brand-logo-img">
+          <img src="/logo.png" alt="Grim's Garage Logo" class="brand-logo-img" style="height: 38px; border-radius: 6px;">
         </div>
-        <span class="badge">v0.1</span>
+        <div class="brand-text">
+          <h1>GRIM'S GARAGE</h1>
+          <span class="brand-subtitle">v0.1.0-autotune</span>
+        </div>
       </div>
 
       <nav class="nav-menu">
-        <button class="nav-item active" data-tab="training">
-          <span class="nav-icon">🏋️</span>
-          <span>Training Panel</span>
+        <button class="nav-item active" data-tab="training" id="nav-training">
+          <span class="icon">🚀</span> Training Control Room
         </button>
-        <button class="nav-item" data-tab="models">
-          <span class="nav-icon">📦</span>
-          <span>Models & Bolt-Ons</span>
+        <button class="nav-item" data-tab="repack" id="nav-repack">
+          <span class="icon">📦</span> Quant Repack Studio
         </button>
-        <button class="nav-item" data-tab="convert">
-          <span class="nav-icon">⚙️</span>
-          <span>Convert Model</span>
+        <button class="nav-item" data-tab="boltons" id="nav-boltons">
+          <span class="icon">🧩</span> Bolt-On Manager
         </button>
-        <button class="nav-item" data-tab="jobs">
-          <span class="nav-icon">📊</span>
-          <span>Training Jobs</span>
+        <button class="nav-item" data-tab="dataset" id="nav-dataset">
+          <span class="icon">📊</span> Dataset & Tokenizer
         </button>
-        <button class="nav-item" data-tab="devices">
-          <span class="nav-icon">🎮</span>
-          <span>GPU Accelerators</span>
+        <button class="nav-item" data-tab="settings" id="nav-settings">
+          <span class="icon">⚙️</span> Expert Settings
+        </button>
+        <button class="nav-item" data-tab="chat" id="nav-chat">
+          <span class="icon">💬</span> Interactive Chat
+        </button>
+        <button class="nav-item" data-tab="diffusion" id="nav-diffusion">
+          <span class="icon">🎨</span> Diffusion Studio
+        </button>
+        <button class="nav-item" data-tab="audio" id="nav-audio">
+          <span class="icon">🎵</span> Audio Studio
+        </button>
+        <button class="nav-item" data-tab="diagnostics" id="nav-diagnostics">
+          <span class="icon">🩺</span> Diagnostics
         </button>
       </nav>
 
-      <div class="sidebar-footer">
-        <div class="system-status">
-          <span class="status-indicator online"></span>
-          <span id="backend-status">Hardware Engine Active</span>
+      <div class="gpu-badge" id="gpu-telemetry-badge">
+        <div class="badge-title">Backend Hardware Telemetry</div>
+        <div id="gpu-telemetry-list" style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+          <div class="gpu-name" id="gpu-name-display">Probing hardware...</div>
+          <div class="vram-bar-container">
+            <div class="vram-bar" id="gpu-vram-bar" style="width: 0%;"></div>
+          </div>
+          <div class="vram-text" id="gpu-vram-text">0 GB / 0 GB VRAM</div>
         </div>
       </div>
     </aside>
 
     <!-- Main Content Area -->
-    <main class="main-content">
+    <main class="content-area">
       <!-- Header Bar -->
-      <header class="top-bar">
-        <div class="page-title">
-          <h2 id="tab-title">Training Panel</h2>
-          <p id="tab-desc">SFT QLoRA fine-tuning and parameter setup</p>
+      <header class="top-header">
+        <div class="header-status">
+          <span class="status-indicator online" id="server-status-dot"></span>
+          <span class="status-text" id="server-status-text">Server Online (0.0.0.0:8741)</span>
         </div>
-        <div class="top-actions">
-          <button class="btn btn-outline" id="theme-toggle-btn" aria-label="Toggle light/dark theme">🌙 Dark</button>
-          <button class="btn btn-outline" id="refresh-btn">🔄 Refresh State</button>
+        <div class="header-actions">
+          <button class="btn btn-secondary" id="btn-refresh-hardware">🔄 Probe GPU</button>
         </div>
       </header>
 
-      <!-- View Containers -->
-      <div class="view-container">
-        <!-- Tab 1: Training Panel -->
-        <section id="tab-training" class="tab-page active">
-          <div class="grid-2col">
-            <!-- Left Column: Architecture Thesis & Documentation Hub -->
-            <div class="flex-column gap-24">
-              <div class="card">
-                <h3>Training Architecture Thesis</h3>
-                <div class="hero-banner">
-                  <img src="/hero.jpg" alt="Grim Reaper & 1967 Impala SS 396 in Garage" class="hero-img">
-                </div>
-                <div class="thesis-box">
-                  <p><strong>Unsloth-Parity Zero-Copy Memory Stream:</strong></p>
-                  <ul>
-                    <li>Base weights remain frozen and read lazily per-tensor from disk.</li>
-                    <li>Dequantization runs just-in-time inside ROCm fused kernels.</li>
-                    <li>Only trainable adapter parameters (A & B) + AdamW moments live in VRAM.</li>
-                    <li>Gradients accumulate into <code>.grim.train</code> sidecar format.</li>
-                  </ul>
-                </div>
+      <!-- TAB 1: Training Control Room -->
+      <section class="tab-page active" id="page-training">
+        <div class="grid-2col">
+          <!-- Config Panel -->
+          <div class="card card-panel">
+            <h2>New Training Run</h2>
+            <form id="form-start-training" onsubmit="return false;">
+              <div class="form-group">
+                <label for="select-model">Base Model (.grim / GGUF)</label>
+                <select id="select-model" class="form-control">
+                  <option value="">Loading models...</option>
+                </select>
               </div>
 
-              <!-- Quick Start & Beginner Documentation Hub -->
-              <div class="card card-docs">
-                <h3>📚 Beginner's Guide & Documentation Hub</h3>
-                <p class="subtitle-text">New to LLM training and GRIM? Explore our quick-start guides:</p>
-                <ul class="docs-links">
-                  <li>
-                    <a href="/docs/qlora.html" target="_blank" class="doc-link">
-                      📖 <strong>Beginner's Guide to QLoRA Fine-Tuning</strong> ↗
-                    </a>
-                  </li>
-                  <li>
-                    <a href="/docs/bolt-on.html" target="_blank" class="doc-link">
-                      ⚡ <strong>What are Bolt-On Sidecar Adapters?</strong> ↗
-                    </a>
-                  </li>
-                  <li>
-                    <a href="/docs/rocm.html" target="_blank" class="doc-link">
-                      🎮 <strong>AMD ROCm Hardware Acceleration Explained</strong> ↗
-                    </a>
-                  </li>
-                  <li>
-                    <a href="/docs/hyperparams.html" target="_blank" class="doc-link">
-                      💡 <strong>Hyperparameter Tuning 101: Rank, Alpha & Learning Rate</strong> ↗
-                    </a>
-                  </li>
-                </ul>
-              </div>
-            </div>
-
-            <!-- Right Column: Hyperparameter Setup Form -->
-            <div class="card card-glow">
-              <div class="card-header-flex">
-                <h3>Hyperparameter Setup</h3>
-                <span class="vram-badge" id="vram-estimate">VRAM estimate unavailable</span>
-              </div>
-              <p class="subtitle-text">Configure your fine-tuning run. Hover over any <span class="help-icon">ℹ️</span> icon for a beginner-friendly explanation.</p>
-              
-              <!-- Quick Presets -->
-              <div class="preset-bar">
-                <span class="preset-label">Recommended Presets:</span>
-                <button type="button" class="btn-preset" id="preset-beginner">🌟 Beginner Default</button>
-                <button type="button" class="btn-preset" id="preset-highperf">🚀 High Performance</button>
-                <button type="button" class="btn-preset" id="preset-lowvram">📉 Ultra-Low VRAM</button>
-              </div>
-
-              <form id="train-form" class="form-grid">
-                <div class="form-group">
-                  <label for="model-select">
-                    Base Model <span class="help-icon" title="Foundation model architectures (e.g. Qwen, Nemotron, GLM, Gemini, LFM2, QwenMoE) autoloaded from local .grim model files.">ℹ️</span>
-                  </label>
-                  <select id="model-select" required></select>
+              <div class="form-group">
+                <label>Dataset Source</label>
+                <div style="display: flex; gap: 14px; margin-bottom: 6px;">
+                  <label style="font-size: 12px; cursor: pointer; color: var(--text-main);"><input type="radio" name="dataset-source-type" value="local" checked id="radio-dataset-local"> Local File / Folder</label>
+                  <label style="font-size: 12px; cursor: pointer; color: var(--text-main);"><input type="radio" name="dataset-source-type" value="remote" id="radio-dataset-remote"> HuggingFace / Remote URL</label>
                 </div>
 
-                <div class="form-group">
-                  <label for="train-mode">
-                    Training Mode <span class="help-icon" title="QLoRA keeps 4-bit base weights frozen on disk and only updates small adapter layers in VRAM (saving ~85% GPU memory).">ℹ️</span>
-                  </label>
-                  <select id="train-mode">
-                    <option value="QLoRA" selected>QLoRA (Frozen 4-Bit Base + Adapters — Recommended)</option>
-                    <option value="LoRA">LoRA (Unquantized Base + Adapters)</option>
+                <div id="dataset-local-group">
+                  <select id="select-dataset" class="form-control">
+                    <option value="">Loading datasets...</option>
                   </select>
                 </div>
 
-                <div class="form-group">
-                  <label>
-                    Dataset Source <span class="help-icon" title="Choose a dataset loaded from local files (~/.grim/datasets) or pull directly from a HuggingFace repository (e.g. tatsu-lab/alpaca).">ℹ️</span>
-                  </label>
-                  <div class="dataset-source-toggle">
-                    <button type="button" class="btn-toggle active" id="ds-toggle-local">📂 Local Dataset</button>
-                    <button type="button" class="btn-toggle" id="ds-toggle-hf">🤗 HuggingFace</button>
+                <div id="dataset-remote-group" style="display: none;">
+                  <input type="text" id="input-dataset-url" class="form-control" placeholder="e.g. https://huggingface.co/datasets/tatsu-lab/alpaca or Parquet/JSONL URL">
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="select-dataset-split">Dataset Split</label>
+                  <select id="select-dataset-split" class="form-control">
+                    <option value="train">train (Default)</option>
+                    <option value="validation">validation</option>
+                    <option value="test">test</option>
+                    <option value="all">All Splits</option>
+                  </select>
+                </div>
+                <div class="form-group half">
+                  <label for="select-subsample-type">Subsample Limit</label>
+                  <div style="display: flex; gap: 6px;">
+                    <select id="select-subsample-type" class="form-control" style="width: 85px;">
+                      <option value="percent">%</option>
+                      <option value="rows">rows</option>
+                    </select>
+                    <input type="number" id="input-subsample-val" class="form-control" value="100" min="1">
                   </div>
                 </div>
-
-                <div class="form-group">
-                  <label id="dataset-input-label">
-                    Dataset <span class="help-icon" title="The dataset containing prompt-response examples for SFT fine-tuning.">ℹ️</span>
-                  </label>
-                  <div id="group-local-ds">
-                    <select id="dataset-select" style="width: 100%;"></select>
-                  </div>
-                  <div class="hidden" id="group-hf-ds">
-                    <input type="text" id="hf-dataset-input" placeholder="e.g. tatsu-lab/alpaca or HuggingFaceH4/ultrachat_200k" style="width: 100%;">
-                  </div>
-                </div>
-
-                <div class="form-group">
-                  <label for="lora-rank">
-                    LoRA Rank (r) <span class="help-icon" title="Controls adapter capacity and expressiveness. Typical beginner values: 8, 16, or 32. Higher values use slightly more memory.">ℹ️</span>
-                  </label>
-                  <input type="number" id="lora-rank" value="16" min="1" max="256">
-                </div>
-                <div class="form-group">
-                  <label for="lora-alpha">
-                    LoRA Alpha (α) <span class="help-icon" title="Scaling multiplier for adapter updates. Standard rule of thumb: set Alpha = 2 × Rank (e.g. Rank 16 → Alpha 32).">ℹ️</span>
-                  </label>
-                  <input type="number" id="lora-alpha" value="32" min="1" max="512">
-                </div>
-                <div class="form-group">
-                  <label for="lr">
-                    Learning Rate <span class="help-icon" title="Step size for weight updates. Standard recommended range for QLoRA fine-tuning is 0.0001 to 0.0003.">ℹ️</span>
-                  </label>
-                  <input type="text" id="lr" value="0.0002">
-                </div>
-                <div class="form-group">
-                  <label for="epochs">
-                    Epochs <span class="help-icon" title="Number of complete passes over the dataset. 1 to 3 epochs is usually ideal to avoid overfitting.">ℹ️</span>
-                  </label>
-                  <input type="number" id="epochs" value="3" min="1" max="100">
-                </div>
-                <div class="form-group full-width">
-                  <button type="submit" class="btn btn-primary btn-large">🚀 Start Training Job</button>
-                </div>
-              </form>
-            </div>
-          </div>
-        </section>
-
-        <!-- Tab 2: Models & Bolt-Ons -->
-        <section id="tab-models" class="tab-page">
-          <div class="card">
-            <h3>Local Models & Bolt-On Adapter Management</h3>
-            <p class="subtitle-text">Base models are stored in <code>.grim</code> or <code>.gguf</code> format. Bolt-on sidecars can be attached without duplicating base weights.</p>
-            <div id="models-list" class="models-grid"></div>
-          </div>
-
-          <div class="card margin-top">
-            <h3>⚡ Attach or 🔧 Wrench-In Adapter</h3>
-            <p class="subtitle-text"><strong>Attach:</strong> Dynamically loads adapter into the <code>backup2</code> residual slot without altering primary model weights.<br><strong>Wrench-In (Merge):</strong> Permanently bakes the adapter weights directly into the base <code>.grim</code> file and frees residual slots for minimum file size and zero overhead.</p>
-            <form id="bolton-form" class="form-inline">
-              <select id="bolton-model-select" required></select>
-              <input type="text" id="adapter-path" placeholder="Sidecar Path (e.g. adapter.grim.train)" required>
-              <button type="submit" id="btn-attach-adapter" class="btn btn-secondary">⚡ Attach Bolt-On</button>
-              <button type="button" id="btn-wrench-adapter" class="btn btn-warning">🔧 Wrench-In (Merge)</button>
-            </form>
-          </div>
-        </section>
-
-        <!-- Tab 3: Convert Model (grim-format Oxidizer) -->
-        <section id="tab-convert" class="tab-page">
-          <div class="card card-glow">
-            <h3>🔄 Convert Model — grim-format Oxidizer</h3>
-            <p class="subtitle-text">Convert local <code>.gguf</code> model files or download from a HuggingFace URL into high-performance native <code>.grim</code> format using EvoPress evolutionary compression.</p>
-            
-            <form id="convert-form" class="form-grid">
-              <div class="form-group">
-                <label for="convert-source-select">Discovered Source Models (GGUF, SafeTensors, BIN, FP16/8/4, MXFP4, NVFP4, BitsAndBytes)</label>
-                <select id="convert-source-select"></select>
               </div>
 
               <div class="form-group">
-                <label for="convert-source">Custom Local Path or HuggingFace URL</label>
-                <input type="text" id="convert-source" placeholder="e.g. /path/to/model.safetensors or https://huggingface.co/.../model.gguf">
+                <label>Target Accelerator GPU(s)</label>
+                <div id="gpu-selection-container" class="form-control" style="height: auto; min-height: 42px; display: flex; flex-direction: column; gap: 6px; padding: 10px;">
+                  <span class="text-muted" style="font-size: 12px;">Probing hardware GPUs...</span>
+                </div>
+                <div id="gpu-selection-help" style="font-size: 11px; margin-top: 4px; color: var(--text-muted);">Select single or matching architecture GPUs for FSDP parallel training.</div>
               </div>
 
-              <div class="form-group">
-                <label for="convert-output-name">Output Model Name (.grim)</label>
-                <input type="text" id="convert-output-name" placeholder="e.g. qwen2.5-7b-grim or nemotron-7b-grim" required>
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="input-mode">Training Mode</label>
+                  <select id="input-mode" class="form-control">
+                    <option value="Lora">LoRA Fine-tuning</option>
+                    <option value="Full">Full Parameter Training</option>
+                    <option value="DirectDPO">Direct DPO</option>
+                  </select>
+                </div>
+                <div class="form-group half">
+                  <label for="input-lora-rank">LoRA Rank (r)</label>
+                  <input type="number" id="input-lora-rank" class="form-control" value="16" min="1" max="512">
+                </div>
               </div>
 
-              <div class="form-group">
-                <label for="convert-arch">Target Consumer GPU Architecture</label>
-                <select id="convert-arch">
-                  <optgroup label="RDNA 3 (RX 7000 Series)">
-                    <option value="gfx1100" selected>gfx1100 (RDNA 3 — RX 7900 XTX / 7900 XT)</option>
-                    <option value="gfx1101">gfx1101 (RDNA 3 — RX 7800 XT / 7700 XT)</option>
-                    <option value="gfx1102">gfx1102 (RDNA 3 — RX 7600)</option>
-                  </optgroup>
-                  <optgroup label="RDNA 4 (RX 9000 Series)">
-                    <option value="gfx1200">gfx1200 (RDNA 4 — RX 9070 XT / 9070 / 9060 XT / 9060)</option>
-                  </optgroup>
-                  <optgroup label="RDNA 3.5 (Radeon APUs)">
-                    <option value="gfx1150">gfx1150 (RDNA 3.5 — Radeon 890M / Strix Point)</option>
-                  </optgroup>
-                  <optgroup label="RDNA 2 (RX 6000 Series)">
-                    <option value="gfx1030">gfx1030 (RDNA 2 — RX 6900 XT / 6800 XT)</option>
-                    <option value="gfx1031">gfx1031 (RDNA 2 — RX 6700 XT)</option>
-                    <option value="gfx1032">gfx1032 (RDNA 2 — RX 6600 XT)</option>
-                  </optgroup>
-                </select>
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="input-lr">Learning Rate</label>
+                  <input type="number" id="input-lr" class="form-control" value="0.00002" step="0.000001">
+                </div>
+                <div class="form-group half">
+                  <label for="input-epochs">Epochs</label>
+                  <input type="number" id="input-epochs" class="form-control" value="1" min="1" max="100">
+                </div>
               </div>
 
-              <div class="form-group">
-                <label for="convert-bpw">Target Bits-Per-Weight (BPW)</label>
-                <select id="convert-bpw">
-                  <option value="2.0">2.0 Bits (Q2_K — Extreme Compression)</option>
-                  <option value="3.0">3.0 Bits (Q3_K — High Compression)</option>
-                  <option value="4.0" selected>4.0 Bits (Q4_K — Balanced / Recommended)</option>
-                  <option value="5.0">5.0 Bits (Q5_K — High Precision)</option>
-                  <option value="6.0">6.0 Bits (Q6_K — Ultra Precision)</option>
-                  <option value="8.0">8.0 Bits (Q8_0 — Near-Native Precision)</option>
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label for="convert-generations">
-                  EvoPress Compression Generations <span class="help-icon" title="Number of evolutionary calibration iterations for the grim-format oxidizer. Recommended default: 10 generations.">ℹ️</span>
+              <div class="form-row checkboxes">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="check-fusion-rmsnorm" checked> ROCm Fused RMSNorm+Matmul
                 </label>
-                <input type="number" id="convert-generations" value="10" min="0" max="100">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="check-fusion-attn" checked> ROCm Fused FlashAttention
+                </label>
               </div>
 
-              <div class="form-group full-width">
-                <button type="submit" class="btn btn-primary btn-large" id="convert-submit-btn">⚙️ Convert & Export to .grim Format (Evo Oxidizer)</button>
+              <div class="autotune-box" id="autotune-recommendation-box">
+                <span class="autotune-title">✨ Hardware Autotune Recommendation</span>
+                <p id="autotune-text">Select a model and dataset to generate optimal consumer VRAM allocations.</p>
+                <button type="button" class="btn btn-sm btn-accent" id="btn-apply-autotune">Apply Autotune Preset</button>
+              </div>
+
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary btn-block" id="btn-start-job">🚀 Start Training Job</button>
               </div>
             </form>
           </div>
-        </section>
 
-        <!-- Tab 4: Training Jobs -->
-        <section id="tab-jobs" class="tab-page">
-          <div class="card">
-            <h3>Active & Recent Jobs</h3>
-            <p class="subtitle-text">Monitor training iterations, real-time loss metrics, and checkpointing status.</p>
-            <div id="jobs-list" class="jobs-grid"></div>
-          </div>
-        </section>
-
-        <!-- Tab 5: GPU Accelerators & Devices -->
-        <section id="tab-devices" class="tab-page">
-          <div class="card">
+          <!-- Live Telemetry Monitor -->
+          <div class="card card-panel">
+            <div class="hero-banner" style="margin-bottom: 16px; border-radius: 10px; overflow: hidden; height: 380px; border: 1px solid var(--border-card);">
+              <img src="/hero.jpg" alt="Grim Reaper & 1967 Impala SS 396 in Garage" class="hero-img" style="width: 100%; height: 100%; object-fit: cover; object-position: center;">
+            </div>
             <div class="card-header-flex">
-              <h3>GPU Accelerators & Hardware Discovery</h3>
-              <span class="status-pill status-online" id="rocm-status-pill">🟢 Hardware Engine Active</span>
+              <h2>Live Telemetry Monitor</h2>
+              <div class="job-controls" id="job-active-controls" style="display:none;">
+                <button class="btn btn-sm btn-warning" id="btn-pause-job">⏸️ Pause</button>
+                <button class="btn btn-sm btn-success" id="btn-resume-job" style="display:none;">▶️ Resume</button>
+                <button class="btn btn-sm btn-danger" id="btn-cancel-job">⏹️ Cancel</button>
+              </div>
             </div>
-            <p class="subtitle-text">GPU accelerator discovery, backend compliance (AMD ROCm vs NVIDIA CUDA), and memory telemetry.</p>
-            <div id="devices-list" class="devices-grid"></div>
+
+            <div class="metrics-summary">
+              <div class="metric-card">
+                <span class="metric-label">Training Loss</span>
+                <span class="metric-val" id="val-loss">0.0000</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Allocated VRAM</span>
+                <span class="metric-val" id="val-vram">Unavailable</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Throughput</span>
+                <span class="metric-val" id="val-tokens-sec">Unavailable</span>
+              </div>
+            </div>
+
+            <!-- SVG Loss Chart -->
+            <div class="chart-container">
+              <svg id="svg-loss-chart" viewBox="0 0 500 200" preserveAspectRatio="none">
+                <path id="chart-grid-line-1" d="M 0 50 L 500 50" stroke="#1f293d" stroke-dasharray="4"/>
+                <path id="chart-grid-line-2" d="M 0 100 L 500 100" stroke="#1f293d" stroke-dasharray="4"/>
+                <path id="chart-grid-line-3" d="M 0 150 L 500 150" stroke="#1f293d" stroke-dasharray="4"/>
+                <path id="chart-loss-path" d="M 0 200" fill="none" stroke="#3b82f6" stroke-width="3"/>
+              </svg>
+            </div>
+
+            <!-- Active Jobs Table -->
+            <h3>Job Registry</h3>
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Job ID</th>
+                    <th>Status</th>
+                    <th>Mode</th>
+                    <th>Model</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="table-jobs-body">
+                  <tr><td colspan="5" class="text-muted">No active training jobs</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: Quant Repack Studio -->
+      <section class="tab-page" id="page-repack">
+        <div class="card card-panel">
+          <h2>Raven FP8 / Crow Q4_K Model Repack Studio</h2>
+          <p class="subtitle">Convert raw GGUF checkpoints into high-throughput ROCm `.grim` model artifacts with integrated EvoPress bitwidth optimization.</p>
+          
+          <form id="form-repack-model" onsubmit="return false;" class="form-narrow">
+            <div class="form-group">
+              <label for="input-repack-source">Source Model Path or URL</label>
+              <input type="text" id="input-repack-source" class="form-control" placeholder="models/Llama-3-8B-Q4_K_M.gguf or https://huggingface.co/...">
+            </div>
+
+            <div class="form-group">
+              <label for="input-repack-name">Output Model Name (.grim)</label>
+              <input type="text" id="input-repack-name" class="form-control" placeholder="llama3-8b-raven-fp8.grim">
+            </div>
+
+            <div class="form-row">
+              <div class="form-group half">
+                <label for="select-repack-mode">Repack Format</label>
+                <select id="select-repack-mode" class="form-control">
+                  <option value="RavenFP8" id="option-raven-fp8">Raven FP8 (E4M3 Sequential - RDNA 4+)</option>
+                  <option value="CrowQ4K" id="option-crow-q4k">Crow Q4_K (Fused GPU Dequant)</option>
+                  <option value="JayMXFP4" id="option-jay-mxfp4">Jay MXFP4 (Micro-block 4-bit - RDNA 5 ONLY)</option>
+                </select>
+              </div>
+              <div class="form-group half">
+                <label for="input-target-bpw">Target Bits-per-Weight (BPW)</label>
+                <input type="number" id="input-target-bpw" class="form-control" value="8.0" step="0.1" min="2.0" max="16.0">
+              </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary btn-block" id="btn-run-repack">📦 Execute Repack Conversion</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- TAB 3: Bolt-On Manager -->
+      <section class="tab-page" id="page-boltons">
+        <div class="card card-panel">
+          <h2>Hot-Swappable Multi-Adapter Bolt-On Studio</h2>
+          <p class="subtitle">Attach, balance, or detach LoRA adapters to active base model slots in real-time.</p>
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Slot ID</th>
+                  <th>Adapter Path</th>
+                  <th>Scaling Factor (α / r)</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="table-boltons-body">
+                <tr><td colspan="5" class="text-muted">No model loaded for bolt-on attachment</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: Dataset Inspector -->
+      <section class="tab-page" id="page-dataset">
+        <div class="card card-panel">
+          <h2>Dataset & Sequence Packing Visualizer</h2>
+          <p class="subtitle">Inspect sample rows, token length distributions, and sample packing density.</p>
+          <div id="dataset-preview-container" class="preview-box">
+            <p class="text-muted">Select a dataset in the Training Control Room to view preview samples and length histograms.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: Expert Settings -->
+      <section class="tab-page" id="page-settings">
+        <div class="card card-panel">
+          <h2>⚙️ Grim's Garage — Expert Engine Settings</h2>
+          <p class="subtitle">Fine-tune low-level ROCm kernel execution, FSDP sharding, quantization fallback thresholds, and memory management knobs.</p>
+
+          <div class="grid-2col" style="margin-top: 20px;">
+            <div class="card" style="background: rgba(15, 23, 42, 0.5);">
+              <h3 style="font-size: 15px; margin-bottom: 14px;">⚡ Kernel Fusions & Parallel Execution</h3>
+              <div class="form-group">
+                <label for="set-fusion-mode">ROCm Kernel Fusion Level</label>
+                <select id="set-fusion-mode" class="form-control">
+                  <option value="Aggressive">Aggressive (RMSNorm+Matmul & FlashAttention)</option>
+                  <option value="Standard">Standard (Fused RMSNorm+Matmul)</option>
+                  <option value="Strict">Strict IEEE Parity (Unfused)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-fsdp-mode">Consumer FSDP Sharding Strategy</label>
+                <select id="set-fsdp-mode" class="form-control">
+                  <option value="FullShard">Full Shard (Zero3 - Peak VRAM Saving)</option>
+                  <option value="ShardGradOp">Shard Grad Op (Zero2 - Low Communication)</option>
+                  <option value="NoShard">No Shard (Replicated - Single GPU Speed)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-checkpoint-freq">Activation Checkpoint Frequency</label>
+                <select id="set-checkpoint-freq" class="form-control">
+                  <option value="1">Every Transformer Block (Lowest VRAM)</option>
+                  <option value="2">Every 2 Transformer Blocks (Balanced)</option>
+                  <option value="0">Disabled (Max VRAM required)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="card" style="background: rgba(15, 23, 42, 0.5);">
+              <h3 style="font-size: 15px; margin-bottom: 14px;">📦 Precision & Quantization Policy</h3>
+              <div class="form-group">
+                <label for="set-fp8-format">FP8 Execution Format</label>
+                <select id="set-fp8-format" class="form-control">
+                  <option value="E4M3">E4M3 (Higher Precision - Recommended for Training)</option>
+                  <option value="E5M2">E5M2 (Higher Dynamic Range - Recommended for Gradients)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-quant-group">Quantization Group Block Size</label>
+                <select id="set-quant-group" class="form-control">
+                  <option value="128">128 Elements / Group (Default)</option>
+                  <option value="64">64 Elements / Group (Higher Precision)</option>
+                  <option value="256">256 Elements / Group (Lower Overhead)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-vram-cap">VRAM Allocation Budget Cap (%)</label>
+                <input type="number" id="set-vram-cap" class="form-control" value="90" min="50" max="98">
+              </div>
+            </div>
           </div>
 
-          <!-- Informational Card -->
-          <div class="card margin-top">
-            <h3>ℹ️ Understanding Hardware Acceleration in GRIM</h3>
-            <div class="thesis-box">
-              <p><strong>Hardware Backend Delineation:</strong></p>
-              <ul>
-                <li><strong>AMD ROCm HIP Backend:</strong> Native fused dequantization kernels run on AMD Radeon (RDNA) and Instinct (CDNA) GPUs.</li>
-                <li><strong>NVIDIA CUDA Backend:</strong> NVIDIA GPUs execute via CUDA kernels / Vulkan backend without ROCm HIP emulation.</li>
-                <li><strong>Automatic Fallback:</strong> Systems without discrete GPUs run multi-threaded SIMD CPU kernels.</li>
-              </ul>
+          <div class="form-actions" style="margin-top: 24px;">
+            <button class="btn btn-primary" id="btn-save-settings">💾 Save Expert Engine Settings</button>
+            <span id="save-settings-msg" style="font-size: 13px; color: var(--success-color); margin-left: 12px; display: none;">✅ Settings Saved</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 6: Interactive Chat Playground -->
+      <section class="tab-page" id="page-chat">
+        <div class="card card-panel" style="display: flex; flex-direction: column; min-height: 580px; padding: 20px;">
+          <!-- Top Model & Parameter Controls Bar -->
+          <div style="display: flex; gap: 16px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-card); padding-bottom: 16px; margin-bottom: 16px; flex-wrap: wrap;">
+            <div>
+              <h2 style="margin-bottom: 4px;">💬 Interactive Model Chat Playground</h2>
+              <p class="subtitle" style="margin-bottom: 0;">Test model inference & language responses before and after fine-tuning. Accepts both .grim and .gguf checkpoints.</p>
+            </div>
+
+            <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+              <div>
+                <label for="select-chat-model" style="font-size: 11px; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 4px;">Selected Model Checkpoint</label>
+                <select id="select-chat-model" class="form-control" style="width: 260px;">
+                  <option value="">Loading models...</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="input-chat-temp" style="font-size: 11px; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 4px;">Temperature: <span id="val-chat-temp">0.7</span></label>
+                <input type="range" id="input-chat-temp" min="0.1" max="1.5" step="0.05" value="0.7" style="width: 110px;">
+              </div>
+
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-clear-chat" style="margin-top: 14px;">🗑️ Clear Chat</button>
             </div>
           </div>
-        </section>
-      </div>
+
+          <!-- Main Message Thread Box -->
+          <div id="chat-messages-container" style="flex: 1; overflow-y: auto; max-height: 420px; min-height: 320px; padding: 12px; background: rgba(15, 23, 42, 0.4); border-radius: 8px; border: 1px solid var(--border-card); margin-bottom: 16px; display: flex; flex-direction: column; gap: 12px;">
+            <!-- Welcome System Message -->
+            <div style="align-self: center; background: rgba(255,255,255,0.05); padding: 8px 16px; border-radius: 20px; font-size: 12px; color: var(--text-muted); text-align: center;">
+              Select a model checkpoint (.grim / .gguf) and type a prompt to verify language & reasoning output.
+            </div>
+          </div>
+
+          <!-- Bottom Message Input Dock -->
+          <form id="form-chat-send" onsubmit="return false;" style="display: flex; gap: 10px; align-items: flex-end;">
+            <textarea id="input-chat-prompt" class="form-control" rows="2" placeholder="Type prompt or question to verify model response..." style="flex: 1; resize: none; border-radius: 8px;"></textarea>
+            <button type="submit" class="btn btn-primary" id="btn-chat-send" style="height: 46px; padding: 0 24px; font-weight: 600;">🚀 Send</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- TAB 7: Diffusion Studio (Automatic1111 WebUI Style) -->
+      <section class="tab-page" id="page-diffusion">
+        <div class="card card-panel" style="padding: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-card); padding-bottom: 14px; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <h2 style="margin-bottom: 4px;">🎨 Flux.2 Diffusion Studio (Automatic1111 Format)</h2>
+              <p class="subtitle" style="margin-bottom: 0;">Multi-modal image synthesis validation with FlowMatch Euler & MM-DiT transformer architectures.</p>
+            </div>
+            <!-- Sub tabs: txt2img | img2img -->
+            <div class="diffusion-subtabs" style="display: flex; gap: 6px; background: rgba(15,23,42,0.6); padding: 4px; border-radius: 8px; border: 1px solid var(--border-card);">
+              <button type="button" class="btn btn-sm btn-primary active" id="btn-tab-txt2img">txt2img</button>
+              <button type="button" class="btn btn-sm btn-secondary" id="btn-tab-img2img">img2img</button>
+            </div>
+          </div>
+
+          <div class="grid-2col" style="grid-template-columns: 1.2fr 0.8fr; gap: 20px; align-items: start;">
+            <!-- Left Column: Controls & Prompt Dock -->
+            <div style="display: flex; flex-direction: column; gap: 14px;">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="diff-prompt" style="font-weight: 600; font-size: 13px;">Positive Prompt</label>
+                <textarea id="diff-prompt" class="form-control" rows="3" placeholder="masterpiece, highly detailed cyberpunk cityscape at dusk, neon lighting, volumetric atmosphere, 8k resolution" style="border-radius: 8px; resize: vertical;"></textarea>
+              </div>
+
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="diff-neg-prompt" style="font-weight: 600; font-size: 13px; color: var(--text-muted);">Negative Prompt</label>
+                <textarea id="diff-neg-prompt" class="form-control" rows="2" placeholder="blurry, low quality, artifacts, distorted, out of frame" style="border-radius: 8px; resize: vertical;"></textarea>
+              </div>
+
+              <!-- img2img upload dock (hidden by default) -->
+              <div id="diff-img2img-dock" style="display: none; border: 2px dashed var(--border-card); border-radius: 8px; padding: 16px; text-align: center; background: rgba(15,23,42,0.3);">
+                <label style="cursor: pointer; font-size: 13px; color: var(--text-main); font-weight: 500;">
+                  📁 Drop initial image here or click to browse
+                  <input type="file" id="diff-init-image-input" accept="image/*" style="display: none;">
+                </label>
+                <div id="diff-init-preview" style="margin-top: 10px; display: none;">
+                  <img id="diff-init-preview-img" style="max-height: 140px; border-radius: 6px;" alt="Init Image Preview">
+                </div>
+              </div>
+
+              <!-- Parameter Grid -->
+              <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                  <div>
+                    <label for="diff-sampler" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Sampling Method</label>
+                    <select id="diff-sampler" class="form-control">
+                      <option value="FlowMatchEuler" selected>FlowMatch Euler (Flux.2 Native)</option>
+                      <option value="Euler">Euler</option>
+                      <option value="Euler a">Euler a</option>
+                      <option value="DDIM">DDIM</option>
+                      <option value="DPM++ 2M Karras">DPM++ 2M Karras</option>
+                      <option value="Heun">Heun</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label for="diff-steps" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Sampling Steps: <span id="val-diff-steps">28</span></label>
+                    <input type="range" id="diff-steps" min="1" max="100" step="1" value="28" style="width: 100%;">
+                  </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                  <div>
+                    <label for="diff-width" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Width: <span id="val-diff-width">512</span>px</label>
+                    <input type="range" id="diff-width" min="256" max="1024" step="64" value="512" style="width: 100%;">
+                  </div>
+
+                  <div>
+                    <label for="diff-height" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Height: <span id="val-diff-height">512</span>px</label>
+                    <input type="range" id="diff-height" min="256" max="1024" step="64" value="512" style="width: 100%;">
+                  </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+                  <div>
+                    <label for="diff-cfg" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">CFG / Guidance Scale: <span id="val-diff-cfg">3.5</span></label>
+                    <input type="range" id="diff-cfg" min="1.0" max="20.0" step="0.5" value="3.5" style="width: 100%;">
+                  </div>
+
+                  <div>
+                    <label for="diff-seed" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Seed (-1 for random)</label>
+                    <input type="number" id="diff-seed" class="form-control" value="-1" style="height: 36px;">
+                  </div>
+                </div>
+
+                <div id="diff-denoising-row" style="display: none;">
+                  <label for="diff-denoising" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Denoising Strength: <span id="val-diff-denoising">0.75</span></label>
+                  <input type="range" id="diff-denoising" min="0.0" max="1.0" step="0.05" value="0.75" style="width: 100%;">
+                </div>
+              </div>
+
+              <!-- Action Bar -->
+              <button type="button" class="btn btn-primary" id="btn-diff-generate" style="height: 48px; font-size: 15px; font-weight: 700; background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);">
+                ✨ Generate Image
+              </button>
+            </div>
+
+            <!-- Right Column: Output Image Preview -->
+            <div style="display: flex; flex-direction: column; gap: 12px;">
+              <div id="diff-output-container" style="min-height: 420px; background: rgba(15,23,42,0.5); border: 1px solid var(--border-card); border-radius: 8px; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
+                <div id="diff-placeholder" style="color: var(--text-muted); font-size: 13px; text-align: center; padding: 20px;">
+                  🖼️ Generated diffusion output will appear here.<br>Enter prompt and click Generate.
+                </div>
+                <img id="diff-result-img" style="display: none; max-width: 100%; height: auto; border-radius: 6px;" alt="Generated Output">
+                <div id="diff-spinner" style="display: none; position: absolute; text-align: center; color: #f97316; font-weight: 600;">
+                  ⏳ Running FlowMatch Euler Denoising...
+                </div>
+              </div>
+
+              <!-- Output Metadata & Download Bar -->
+              <div id="diff-meta-bar" style="display: none; background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 12px; justify-content: space-between; align-items: center;">
+                <div style="font-size: 11px; color: var(--text-muted); line-height: 1.4;" id="diff-meta-text">
+                  Seed: - | Steps: 28 | Latency: 0ms
+                </div>
+                <a id="btn-diff-download" class="btn btn-secondary btn-sm" download="generated-image.bmp">⬇️ Download</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 8: Audio Studio (TTS & Audio-to-Audio) -->
+      <section class="tab-page" id="page-audio">
+        <div class="card card-panel" style="padding: 20px;">
+          <div style="border-bottom: 1px solid var(--border-card); padding-bottom: 14px; margin-bottom: 16px;">
+            <h2 style="margin-bottom: 4px;">🎵 Audio Studio (TTS & Audio-to-Audio Vocoder)</h2>
+            <p class="subtitle" style="margin-bottom: 0;">Validate Kokoro text-to-speech synthesis and Vocos neural vocoder reconstruction pipelines.</p>
+          </div>
+
+          <div class="grid-2col" style="gap: 20px; align-items: start;">
+            <!-- Panel 1: Text-to-Speech (TTS) -->
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+              <h3 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">🗣️ Text-to-Speech (Kokoro Model)</h3>
+              
+              <div class="form-group" style="margin-bottom: 0;">
+                <label for="tts-text-input" style="font-weight: 600; font-size: 12px;">Input Text / Script</label>
+                <textarea id="tts-text-input" class="form-control" rows="3" placeholder="Hello from Grim engine! This audio is synthesized natively on your device." style="border-radius: 8px; resize: vertical;"></textarea>
+              </div>
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div>
+                  <label for="tts-voice-select" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Voice Character</label>
+                  <select id="tts-voice-select" class="form-control">
+                    <option value="af_bella">Bella (American Female)</option>
+                    <option value="af_sarah">Sarah (American Female)</option>
+                    <option value="am_adam">Adam (American Male)</option>
+                    <option value="am_michael">Michael (American Male)</option>
+                    <option value="bf_emma">Emma (British Female)</option>
+                    <option value="bf_isabella">Isabella (British Female)</option>
+                    <option value="bm_george">George (British Male)</option>
+                    <option value="bm_lewis">Lewis (British Male)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label for="tts-speed" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Speed: <span id="val-tts-speed">1.0</span>x</label>
+                  <input type="range" id="tts-speed" min="0.5" max="2.0" step="0.1" value="1.0" style="width: 100%;">
+                </div>
+              </div>
+
+              <button type="button" class="btn btn-primary" id="btn-tts-synthesize" style="height: 42px; font-weight: 600;">
+                🎙️ Synthesize Speech
+              </button>
+
+              <div id="tts-player-container" style="display: none; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border-card);">
+                <audio id="tts-audio-player" controls style="width: 100%; border-radius: 6px;"></audio>
+                <div id="tts-telemetry" style="font-size: 11px; color: var(--text-muted);">Duration: 0.0s | Rate: 24kHz</div>
+              </div>
+            </div>
+
+            <!-- Panel 2: Audio-to-Audio (Vocos Vocoder) -->
+            <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+              <h3 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">🎛️ Audio-to-Audio & Vocoder (Vocos)</h3>
+              
+              <p style="font-size: 12px; color: var(--text-muted); margin: 0;">
+                Reconstruct and synthesize mel-spectrogram features through the ultra-fast Fourier-based Vocos neural vocoder.
+              </p>
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div>
+                  <label for="vocos-pitch" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Pitch Modulation: <span id="val-vocos-pitch">1.0</span>x</label>
+                  <input type="range" id="vocos-pitch" min="0.5" max="2.0" step="0.1" value="1.0" style="width: 100%;">
+                </div>
+
+                <div>
+                  <label for="vocos-sample-rate" style="font-size: 11px; font-weight: 600; display: block; margin-bottom: 4px;">Sample Rate</label>
+                  <select id="vocos-sample-rate" class="form-control">
+                    <option value="24000" selected>24,000 Hz</option>
+                    <option value="22050">22,050 Hz</option>
+                    <option value="44100">44,100 Hz</option>
+                  </select>
+                </div>
+              </div>
+
+              <button type="button" class="btn btn-secondary" id="btn-vocos-run" style="height: 42px; font-weight: 600;">
+                🌊 Run Mel Vocoder Reconstruction
+              </button>
+
+              <div id="vocos-player-container" style="display: none; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border-card);">
+                <audio id="vocos-audio-player" controls style="width: 100%; border-radius: 6px;"></audio>
+                <div id="vocos-telemetry" style="font-size: 11px; color: var(--text-muted);">Duration: 0.0s | Rate: 24kHz</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 9: Diagnostic Health Checks -->
+      <section class="tab-page" id="page-diagnostics">
+        <div class="card card-panel" style="padding: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-card); padding-bottom: 14px; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <h2 style="margin-bottom: 4px;">🩺 System & Hardware Diagnostic Checks</h2>
+              <p class="subtitle" style="margin-bottom: 0;">Comprehensive verification of ROCm/HIP drivers, memory tiers, autograd tape health, and multimodal engines.</p>
+            </div>
+            <button type="button" class="btn btn-secondary" id="btn-run-diagnostics">🔄 Run Diagnostic Audit</button>
+          </div>
+
+          <div id="diag-checks-list" style="display: flex; flex-direction: column; gap: 12px;">
+            <div style="padding: 16px; background: rgba(15,23,42,0.4); border-radius: 8px; border: 1px solid var(--border-card); color: var(--text-muted);">
+              Loading diagnostic audit data...
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

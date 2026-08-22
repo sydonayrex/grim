@@ -398,6 +398,11 @@ enum Commands {
         ///  - full-fp16: full parameter fine-tuning in float16
         ///  - soul-eater: orthogonal weight matrix evolution
         ///  - oft: orthogonal fine-tuning preserving representation norms
+        ///  - dpo: direct preference optimization with paired chosen/rejected targets
+        ///  - orpo: odds ratio preference optimization
+        ///  - simpo: simple reference-free preference optimization
+        ///  - kto: kahneman-tversky optimization
+        ///  - grpo: group relative policy optimization
         #[arg(long, default_value = "qlora")]
         mode: String,
         /// Enable SCALE-ECHO echo training mode. Bypasses the autograd tape

@@ -138,9 +138,7 @@ impl ConstrainedSampler {
             out.push_str(token_text);
         }
         if let Ok(mut fsm) = self.fsm.lock() {
-            if let Constraint::JsonObject = &self.constraint {
-                let _ = fsm.feed_token(token_text);
-            }
+            let _ = fsm.feed_token(token_text);
         }
     }
 
@@ -184,11 +182,23 @@ impl ConstrainedSampler {
             }
             Constraint::JsonSchema(comp) => {
                 if let Some(vocab) = &self.vocab {
+                    let fsm = self.fsm.lock().unwrap();
+                    let mut cache = self.cache.lock().unwrap();
+                    // 1. Fast O(1) state-cached PDA mask eliminates structurally invalid tokens
+                    let base_mask = cache.mask_for(fsm.clone(), vocab);
                     let output = self.output.lock().unwrap();
-                    let mut mask = Vec::with_capacity(vocab.len());
-                    for t in vocab.iter() {
-                        let candidate = format!("{output}{t}");
-                        mask.push(comp.is_consistent(&candidate));
+                    let mut mask = base_mask.to_vec();
+
+                    // 2. Only evaluate JSON schema consistency on the small subset of structurally valid candidates
+                    for (i, &is_structurally_valid) in base_mask.iter().enumerate() {
+                        if !is_structurally_valid {
+                            continue;
+                        }
+                        if let Some(t) = vocab.get(i) {
+                            if !comp.is_consistent(&format!("{output}{t}")) {
+                                mask[i] = false;
+                            }
+                        }
                     }
                     if mask.len() != vocab_size {
                         mask.resize(vocab_size, true);

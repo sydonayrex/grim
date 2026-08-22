@@ -186,15 +186,52 @@ impl DisaggRouter {
             ));
         }
         for &b_id in block_ids {
-            let k_data = pool.read_keys(b_id);
-            let v_data = pool.read_values(b_id);
-            self.kv_client.send_block_remote(
-                b_id,
-                0, // layer_idx — pool blocks are layer-local; 0 is the canonical value
-                k_data,
-                v_data,
-                &self.decode_node_addr,
-            )?;
+            let num_layers = pool.num_layers(b_id);
+            for layer in 0..num_layers {
+                if let (Some(k_data), Some(v_data)) = (
+                    pool.read_layer_keys(b_id, layer),
+                    pool.read_layer_values(b_id, layer),
+                ) {
+                    if !k_data.is_empty() && !v_data.is_empty() {
+                        self.kv_client.send_block_remote(
+                            b_id,
+                            layer as u32,
+                            k_data,
+                            v_data,
+                            &self.decode_node_addr,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Transfer real multi-layer KV blocks from a `PagedKvCache` across all layers.
+    pub fn transfer_paged_cache_real(
+        &self,
+        _request_id: u64,
+        block_ids: &[usize],
+        cache: &grim_memory::PagedKvCache,
+    ) -> Result<()> {
+        if block_ids.is_empty() {
+            return Err(Error::KvCache(
+                "Handoff protocol error: block list cannot be empty".into(),
+            ));
+        }
+        let num_layers = cache.num_layers();
+        for layer in 0..num_layers {
+            for &b_id in block_ids {
+                if let Some((k_slice, v_slice)) = cache.layer_block_slice(layer, b_id) {
+                    self.kv_client.send_block_remote(
+                        b_id,
+                        layer as u32,
+                        k_slice,
+                        v_slice,
+                        &self.decode_node_addr,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -285,6 +322,18 @@ impl DisaggRouter {
         self.kv_client
             .fetch_block_remote(block_id, layer_idx, &self.prefill_node_addr, block_elems)
     }
+
+    /// Dispatches a single layer's KV block key/value slice to the decode node address.
+    pub fn send_layer_block_remote(
+        &self,
+        block_id: usize,
+        layer_idx: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<()> {
+        self.kv_client
+            .send_block_remote(block_id, layer_idx, k, v, &self.decode_node_addr)
+    }
 }
 
 impl DisaggRouterT for DisaggRouter {
@@ -308,13 +357,7 @@ impl DisaggRouterT for DisaggRouter {
         let guard = pool
             .lock()
             .map_err(|e| Error::KvCache(format!("transfer_kv_cache: pool mutex poisoned: {e}")))?;
-        for &b_id in block_ids {
-            let k_data = guard.read_keys(b_id);
-            let v_data = guard.read_values(b_id);
-            self.kv_client
-                .send_block_remote(b_id, 0, k_data, v_data, &self.decode_node_addr)?;
-        }
-        Ok(())
+        self.transfer_kv_cache_real(_request_id, block_ids, &guard)
     }
 
     /// Dispatch a step-decode task to a dedicated decode engine.

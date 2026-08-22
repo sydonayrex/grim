@@ -2402,6 +2402,8 @@ dependencies = [
  "grim-core",
  "grim-engine",
  "grim-format",
+ "grim-models-audio",
+ "grim-models-diffusion",
  "grim-models-transformer",
  "grim-nn",
  "grim-tensor",

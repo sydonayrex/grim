@@ -342,6 +342,20 @@ pub trait KvBlockStore: Send + Sync {
     /// content sniff: a genuinely all-zero KV block is valid data, not
     /// "not yet arrived."
     fn block_is_received(&self, id: BlockId) -> bool;
+
+    /// Write key data into `id`'s block for a specific layer.
+    fn write_layer_keys(&mut self, id: BlockId, layer_idx: u32, keys: &[f32], num_tokens: usize) {
+        if layer_idx == 0 {
+            self.write_keys(id, keys, num_tokens);
+        }
+    }
+
+    /// Write value data into `id`'s block for a specific layer.
+    fn write_layer_values(&mut self, id: BlockId, layer_idx: u32, values: &[f32]) {
+        if layer_idx == 0 {
+            self.write_values(id, values);
+        }
+    }
 }
 
 /// Network transport layer for network-based (RDMA/TCP) KV handoffs.
@@ -649,8 +663,8 @@ where
                         } else {
                             num_elems
                         };
-                        guard.write_keys(block_id, &k_data, num_tokens);
-                        guard.write_values(block_id, &v_data);
+                        guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
+                        guard.write_layer_values(block_id, header.layer_idx, &v_data);
                     } else {
                         eprintln!(
                             "[grim-kvtransport] KV receiver: block_id {} out of range",

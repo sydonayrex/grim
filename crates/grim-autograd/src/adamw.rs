@@ -331,23 +331,21 @@ impl Optimizer {
                     ..PagedAdamWConfig::default()
                 })))
             }
-            OptimizerKind::AdamWBnb => Ok(Optimizer::AdamW8Bit(AdamW8Bit::new(AdamW8BitConfig {
-                lr,
-                use_8bit_moments: true,
-                ..AdamW8BitConfig::default()
-            }))),
-            OptimizerKind::LOMO | OptimizerKind::Adalomo => {
-                Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
-                    lr,
-                    ..AdamWConfig::default()
-                })))
-            }
-            OptimizerKind::CAME | OptimizerKind::Sophia => {
-                Ok(Optimizer::AdamW(AdamW::new(AdamWConfig {
-                    lr,
-                    ..AdamWConfig::default()
-                })))
-            }
+            OptimizerKind::AdamWBnb => Err(Error::Unimplemented(
+                "optimizer 'adamw-bnb' is not yet implemented (no bitsandbytes dependency); use adamw-8bit".into(),
+            )),
+            OptimizerKind::LOMO => Err(Error::Unimplemented(
+                "optimizer 'lomo' is not yet implemented; use adamw or qgalore-8bit".into(),
+            )),
+            OptimizerKind::Adalomo => Err(Error::Unimplemented(
+                "optimizer 'adalomo' is not yet implemented; use adamw or adafactor".into(),
+            )),
+            OptimizerKind::CAME => Err(Error::Unimplemented(
+                "optimizer 'came' is not yet implemented; use adamw or adafactor".into(),
+            )),
+            OptimizerKind::Sophia => Err(Error::Unimplemented(
+                "optimizer 'sophia' is not yet implemented; use adamw or muon".into(),
+            )),
         }
     }
 
@@ -3430,6 +3428,24 @@ mod tests {
         let updated = params.get(pid).unwrap().data.to_vec_f32().unwrap();
         for &w in &updated {
             assert!(w < 2.0f32, "weight must decrease with positive gradient");
+        }
+    }
+
+    #[test]
+    fn test_unimplemented_optimizers_rejected_honestly() {
+        for kind in [
+            OptimizerKind::AdamWBnb,
+            OptimizerKind::LOMO,
+            OptimizerKind::Adalomo,
+            OptimizerKind::CAME,
+            OptimizerKind::Sophia,
+        ] {
+            let res = Optimizer::new(kind, 1e-3);
+            assert!(
+                matches!(res, Err(Error::Unimplemented(_))),
+                "Optimizer {:?} must be explicitly rejected with Error::Unimplemented instead of silently aliasing",
+                kind
+            );
         }
     }
 }
