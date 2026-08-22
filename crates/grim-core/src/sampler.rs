@@ -185,7 +185,7 @@ impl TopPSampler {
     }
 
     fn next_u32(&self) -> u32 {
-        let mut state = self.rng_state.lock().unwrap();
+        let mut state = self.rng_state.lock().unwrap_or_else(|e| e.into_inner());
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;

@@ -92,7 +92,7 @@ impl HsacoKernelCache {
     }
 
     pub fn get_cached_kernel(&self, key: &str) -> Option<(PathBuf, String)> {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
         if let Some((path, _, lowered)) = entries.get(key) {
             if path.exists() {
                 return Some((path.clone(), lowered.clone()));
@@ -115,7 +115,7 @@ impl HsacoKernelCache {
         if cache_path.exists() {
             let metadata = fs::metadata(&cache_path)?;
             let modified = metadata.modified()?;
-            self.entries.write().unwrap().insert(
+            self.entries.write().unwrap_or_else(|e| e.into_inner()).insert(
                 key.to_string(),
                 (cache_path.clone(), modified, lowered_name.to_string()),
             );
@@ -123,11 +123,22 @@ impl HsacoKernelCache {
         }
 
         let _ = fs::create_dir_all(&self.cache_dir);
-        fs::write(&cache_path, compiled)?;
+        let tmp_path = self.cache_dir.join(format!(
+            ".tmp_{}_{:016x}_{}_{:x}",
+            key,
+            hash,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::write(&tmp_path, compiled)?;
+        let _ = fs::rename(&tmp_path, &cache_path);
 
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
-        self.entries.write().unwrap().insert(
+        self.entries.write().unwrap_or_else(|e| e.into_inner()).insert(
             key.to_string(),
             (cache_path.clone(), modified, lowered_name.to_string()),
         );
@@ -136,7 +147,7 @@ impl HsacoKernelCache {
     }
 
     pub fn invalidate(&self, key: &str) {
-        if let Some((path, _, _)) = self.entries.write().unwrap().remove(key) {
+        if let Some((path, _, _)) = self.entries.write().unwrap_or_else(|e| e.into_inner()).remove(key) {
             let _ = fs::remove_file(path);
         }
     }

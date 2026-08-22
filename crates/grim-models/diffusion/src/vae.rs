@@ -168,13 +168,14 @@ impl Flux2VAE {
                 dims
             )));
         }
-        let (batch, _c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+        let (batch, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
         let out_h = h * 8;
         let out_w = w * 8;
         let l_vec = latents.to_vec_f32()?;
 
         // Perform spatial convolution upsampling to RGB pixels in range [-1.0, 1.0]
         let mut rgb = vec![0.0f32; batch * 3 * out_h * out_w];
+        let num_channels = c.min(self.config.latent_channels);
         for b in 0..batch {
             for c_out in 0..3 {
                 let dst_c_off = b * 3 * out_h * out_w + c_out * out_h * out_w;
@@ -183,8 +184,8 @@ impl Flux2VAE {
                     for x in 0..out_w {
                         let src_x = (x / 8).min(w - 1);
                         let mut sum = 0.0f32;
-                        for c_in in 0..self.config.latent_channels.min(32) {
-                            let src_idx = b * 32 * h * w + c_in * h * w + src_y * w + src_x;
+                        for c_in in 0..num_channels {
+                            let src_idx = b * c * h * w + c_in * h * w + src_y * w + src_x;
                             sum += l_vec[src_idx] * (0.05 + 0.01 * (c_in as f32).sin());
                         }
                         rgb[dst_c_off + y * out_w + x] = (sum * 0.5).tanh();

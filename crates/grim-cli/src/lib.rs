@@ -21,8 +21,10 @@
 )]
 
 pub mod config;
+pub mod doctor;
 pub mod echo;
 pub mod eval;
+pub mod recipe;
 pub mod template_registry;
 pub mod train;
 pub mod tui;

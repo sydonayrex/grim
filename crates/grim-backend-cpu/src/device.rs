@@ -221,8 +221,12 @@ impl CpuDevice {
                 }
             }
         }
+        // WI-E3/E6 fix: the data is written flat [seq_len, num_head_dims];
+        // returning it with the 3-D out_shape made downstream Linear::forward
+        // see a non-2-D operand and fail with "matmul expects 2-D inputs".
+        let flat_shape = Shape::new(vec![seq_len, num_head_dims]);
         Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(CpuStorage::new(out, flat_shape, DType::F32)),
             Box::new(ReadyHandle),
         ))
     }
@@ -1378,6 +1382,17 @@ impl BackendDevice for CpuDevice {
             b_bytes_owned = vec![0u8; k * n];
             &b_bytes_owned
         };
+
+        // WI-E7 fast path: Q8_0 GEMM directly on the packed bytes. Skips both
+        // the [N,K] f32 dequant materialization (~240 MB for an output head)
+        // and the transpose copy. Requires k % 32 == 0 (whole blocks).
+        if matches!(format, grim_tensor::QuantFormat::Q8_0) && k % 32 == 0 {
+            let c = grim_quant::gemm_q8_0_packed(a_data, &b_bytes, m, n, k)?;
+            return Ok((
+                Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
+                Box::new(ReadyHandle),
+            ));
+        }
 
         let b_dequant_transposed: Vec<f32> =
             match &b_packed.dtype().storage {

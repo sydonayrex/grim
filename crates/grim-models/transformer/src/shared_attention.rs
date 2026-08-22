@@ -64,13 +64,20 @@ pub fn fused_or_scalar_attention(
         None,
         None,
     ) {
-        Ok((storage, _handle)) => Ok(Tensor::new(
-            Arc::from(storage),
-            out_shape,
-            DType::F32,
-            grim_tensor::QuantProvenance::default(),
-            device.clone(),
-        )),
+        Ok((storage, _handle)) => {
+            // The fused kernel writes [steps, heads, head_dim]; every consumer
+            // (Linear::forward → device matmul) requires the flat
+            // [steps, heads*head_dim] layout the scalar path produces. Relabel
+            // without copying — the storage layout is identical row-major.
+            let flat_shape = Shape::new(vec![steps, num_heads * head_dim]);
+            Ok(Tensor::new(
+                Arc::from(storage),
+                flat_shape,
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                device.clone(),
+            ))
+        }
         Err(_) => scalar_attention(
             q,
             k_history,

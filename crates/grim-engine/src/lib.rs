@@ -165,6 +165,8 @@ pub struct Engine {
     tuned_kv_compression_bit_width: u8,
     tokens_per_sec_ema: f32,
     total_tokens_generated: u64,
+    /// WI-E2: cumulative accepted tokens (speculative verification hits).
+    accepted_tokens_total: u64,
     last_ttft_ms: Option<f64>,
     last_itl_ms: Option<f64>,
     /// Tensor-parallel config stamped onto each `LoadedModel`. Populated in
@@ -358,6 +360,7 @@ impl Engine {
             tuned_kv_compression_bit_width: 4,
             tokens_per_sec_ema: 0.0,
             total_tokens_generated: 0,
+            accepted_tokens_total: 0,
             last_ttft_ms: None,
             last_itl_ms: None,
             tp_config,
@@ -448,6 +451,15 @@ impl Engine {
     /// Total count of tokens generated since engine startup.
     pub fn total_tokens_generated(&self) -> u64 {
         self.total_tokens_generated
+    }
+
+    /// WI-E2: speculative-decoding acceptance rate — accepted / generated.
+    /// Returns None when no tokens have been generated yet.
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        if self.total_tokens_generated == 0 {
+            return None;
+        }
+        Some(self.accepted_tokens_total as f64 / self.total_tokens_generated as f64)
     }
 
     /// Invalidate radix prefix cache and reclaim unreferenced KV blocks.
@@ -701,6 +713,8 @@ impl Engine {
         self.tuned_speculative_block_len = tuned_params.speculative_block_len;
         self.tuned_kv_compression_bit_width = tuned_params.kv_compression_bit_width;
 
+        // WI-E2: accumulate accepted tokens for the acceptance-rate metric.
+        self.accepted_tokens_total += total_accepted as u64;
         let _ = (schedule_elapsed, total_accepted);
         let tick_elapsed = tick_start.elapsed();
         if total_accepted > 0 && tick_elapsed.as_secs_f32() > 0.0 {
@@ -735,7 +749,7 @@ impl Engine {
 
         if self.radix_enabled && !full_input.is_empty() {
             let (matched_blocks, matched_tokens, _exact) = {
-                let mut pool = self.block_pool.lock().unwrap();
+                let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                 pool.match_prefix_promoting(&full_input)
             };
             if !matched_blocks.is_empty() {
@@ -769,7 +783,7 @@ impl Engine {
                     if let Some(block_table) = session.block_table() {
                         let usize_blocks: Vec<usize> =
                             block_table.iter().map(|&b| b as usize).collect();
-                        let mut pool = self.block_pool.lock().unwrap();
+                        let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                         pool.insert_prefix(&full_input, &usize_blocks);
                     }
                 }
@@ -789,7 +803,7 @@ impl Engine {
                         .map(|t| t.iter().map(|&b| b as usize).collect())
                         .unwrap_or_default();
                     if !block_ids.is_empty() {
-                        let pool_guard = self.block_pool.lock().unwrap();
+                        let pool_guard = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                         if let Err(e) = router.transfer_kv_cache_real(id, &block_ids, &pool_guard) {
                             eprintln!(
                                 "[grim-engine] Disagg prefill KV transfer failed for req {id}: {e}"
@@ -823,7 +837,7 @@ impl Engine {
             if router.pool_role == grim_disagg::PoolRole::Decode {
                 let elem_per_token = self.config.num_kv_heads * self.config.head_dim;
                 let block_elems = elem_per_token * BLOCK_SIZE;
-                let mut pool = self.block_pool.lock().unwrap();
+                let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                 for block_id in 0..pool.num_blocks() {
                     // Skip if the block already has data.  Uses the explicit
                     // `received` bitset rather than a non-zero-content sniff —
@@ -934,6 +948,22 @@ impl Engine {
         positions: &grim_tensor::Tensor,
     ) -> Result<StepOutcome> {
         self.drive_forward(target_model_id, request_id, input_ids, positions)
+    }
+
+    /// Execute a grouped batch step across multiple co-scheduled requests (WI-X1).
+    ///
+    /// Drives decoding across up to N requests in a single scheduling tick,
+    /// returning each request's corresponding StepOutcome.
+    pub fn step_batch(
+        &mut self,
+        items: &[(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)],
+    ) -> Result<Vec<(u64, StepOutcome)>> {
+        let mut results = Vec::with_capacity(items.len());
+        for &(req_id, model_id, input_ids, positions) in items {
+            let outcome = self.step_one(req_id, model_id, input_ids, positions)?;
+            results.push((req_id, outcome));
+        }
+        Ok(results)
     }
 
     /// Check if a model is registered by name.
@@ -1107,21 +1137,21 @@ mod tests {
     fn test_grim_kv_quant_env_attach() {
         // Baseline: default config attaches no compressor.
         let engine = Engine::new(EngineConfig::default());
-        assert!(!engine.block_pool.lock().unwrap().has_compressor());
+        assert!(!engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).has_compressor());
 
         // With GRIM_KV_QUANT=int8 the pool must hold a compressor.
         unsafe {
             std::env::set_var("GRIM_KV_QUANT", "int8");
         }
         let engine = Engine::new(EngineConfig::default());
-        assert!(engine.block_pool.lock().unwrap().has_compressor());
+        assert!(engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).has_compressor());
 
         // off / invalid → none.
         unsafe {
             std::env::set_var("GRIM_KV_QUANT", "off");
         }
         let engine = Engine::new(EngineConfig::default());
-        assert!(!engine.block_pool.lock().unwrap().has_compressor());
+        assert!(!engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).has_compressor());
         unsafe {
             std::env::remove_var("GRIM_KV_QUANT");
         }
@@ -1333,6 +1363,34 @@ mod tests {
         let positions = ids.clone();
         let outcome = engine.step_one(1, "small", &ids, &positions).unwrap();
         assert!(outcome.logits.is_some());
+    }
+
+    #[test]
+    fn engine_step_batch_public_api() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_model("small", small_llama());
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
+        engine.enqueue_request(Request {
+            id: 2,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
+        let ids = grim_backend_cpu::cpu_tensor(vec![1.0f32; 2], grim_tensor::Shape::new(vec![2]));
+        let positions = ids.clone();
+        let items = [
+            (1u64, "small", &ids, &positions),
+            (2u64, "small", &ids, &positions),
+        ];
+        let outcomes = engine.step_batch(&items).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].1.logits.is_some());
+        assert!(outcomes[1].1.logits.is_some());
     }
 
     #[test]
@@ -1879,7 +1937,7 @@ mod tests {
 
         // Insert prefix for prompt1 into block pool
         {
-            let mut pool = engine.block_pool.lock().unwrap();
+            let mut pool = engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.insert_prefix(&prompt1, &block_ids1);
         }
 
@@ -1888,7 +1946,7 @@ mod tests {
         prompt2.extend_from_slice(&[201, 202]);
 
         let (matched_blocks, matched_tokens, _) = {
-            let mut pool = engine.block_pool.lock().unwrap();
+            let mut pool = engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.match_prefix_promoting(&prompt2)
         };
 

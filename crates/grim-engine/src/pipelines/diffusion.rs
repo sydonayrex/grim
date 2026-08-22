@@ -113,7 +113,18 @@ mod tests {
 
     #[test]
     fn test_diffusion_pipeline_instantiation() {
-        let dit_cfg = Flux2Config::default();
+        let dit_cfg = Flux2Config {
+            in_channels: 128,
+            joint_attention_dim: 32,
+            num_attention_heads: 2,
+            attention_head_dim: 16,
+            num_layers: 1,
+            num_single_layers: 1,
+            mlp_ratio: 2.0,
+            axes_dims_rope: vec![4, 4, 4, 4],
+            rope_theta: 2000.0,
+            timestep_guidance_channels: 32,
+        };
         let vae_cfg = Flux2VaeConfig::default();
         let pipe_cfg = DiffusionPipelineConfig {
             height: 64,

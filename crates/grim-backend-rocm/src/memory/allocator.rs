@@ -52,7 +52,7 @@ impl RocmCachingAllocator {
     pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
         let cls = Self::size_class(bytes);
         let reused = {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.get_mut(&cls).and_then(|v| v.pop())
         };
         if let Some(ptr_u64) = reused {
@@ -77,7 +77,7 @@ impl RocmCachingAllocator {
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
         let cls = Self::size_class(bytes);
         let over_cap = {
-            let cached = self.cached_bytes.lock().unwrap();
+            let cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());
             *cached + cls > self.cap_bytes
         };
         if over_cap || ptr.is_null() {
@@ -98,9 +98,9 @@ impl RocmCachingAllocator {
             return;
         }
         {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.entry(cls).or_default().push(ptr as u64);
-            let mut cached = self.cached_bytes.lock().unwrap();
+            let mut cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());
             *cached += cls;
         }
     }
@@ -114,7 +114,7 @@ impl RocmCachingAllocator {
         unsafe {
             let _ = crate::hipDeviceSynchronize();
         }
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         for (_cls, bufs) in pool.drain() {
             for p in bufs {
                 unsafe {
@@ -123,7 +123,7 @@ impl RocmCachingAllocator {
                 self.free_count.fetch_add(1, Ordering::Relaxed);
             }
         }
-        *self.cached_bytes.lock().unwrap() = 0;
+        *self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     }
 
     /// `(malloc_count, free_count)` — real driver allocation calls since start.

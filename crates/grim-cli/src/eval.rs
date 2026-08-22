@@ -64,11 +64,11 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
 
         let ids = grim_backend_cpu::cpu_tensor(
             ctx.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
-            grim_tensor::Shape::new(vec![ctx.len()]),
+            grim_tensor::Shape::new(vec![1, ctx.len()]),
         );
         let positions = grim_backend_cpu::cpu_tensor(
             (0..ctx.len()).map(|p| p as f32).collect::<Vec<f32>>(),
-            grim_tensor::Shape::new(vec![ctx.len()]),
+            grim_tensor::Shape::new(vec![1, ctx.len()]),
         );
 
         // Fresh session per window: each window is an independent prediction,

@@ -3725,10 +3725,12 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             )
         })
         .unwrap_or(false);
+    let acceptance_rate = engine.acceptance_rate();
     let speculation_info = serde_json::json!({
         "enabled": !spec_disabled,
         "strategy": if spec_disabled { "disabled" } else { "auto" },
-        "accepted_tokens": total_tokens
+        "accepted_tokens": total_tokens,
+        "accepted_rate": acceptance_rate
     });
     Json(serde_json::json!({
         "status": if models_info.is_empty() { "degraded" } else { "healthy" },

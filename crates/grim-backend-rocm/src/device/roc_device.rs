@@ -357,12 +357,12 @@ impl RocmDevice {
     /// can dispatch device-side collectives instead of falling back to the
     /// CPU fan-in path. [see: `RcclAllReduce::try_new`]
     pub fn set_rccl_handle(&self, handle: Option<Arc<crate::rccl::RcclAllReduce>>) {
-        *self.rccl.lock().unwrap() = handle;
+        *self.rccl.lock().unwrap_or_else(|e| e.into_inner()) = handle;
     }
 
     /// Borrow the live RCCL handle (if any) for diagnostic / external use.
     pub fn rccl_handle(&self) -> Option<Arc<crate::rccl::RcclAllReduce>> {
-        self.rccl.lock().unwrap().clone()
+        self.rccl.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Auto-init the RCCL handle from `GRIM_TP_*` env vars when multi-process
@@ -681,7 +681,7 @@ impl RocmDevice {
     pub fn set_decode_gemm_enabled(&self, enabled: bool) {
         // Write the AtomicBool shadow first (lock-free hot-path reads this).
         self.decode_gemm_enabled.store(enabled, Ordering::Relaxed);
-        let mut cfg = self.decode_gemm_config.lock().unwrap();
+        let mut cfg = self.decode_gemm_config.lock().unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
@@ -689,7 +689,7 @@ impl RocmDevice {
     pub fn set_fused_dequant_gemm_enabled(&self, enabled: bool) {
         self.fused_dequant_gemm_enabled
             .store(enabled, Ordering::Relaxed);
-        let mut cfg = self.fused_dequant_gemm_config.lock().unwrap();
+        let mut cfg = self.fused_dequant_gemm_config.lock().unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
@@ -703,14 +703,14 @@ impl RocmDevice {
 
     /// Set whether SplitK GEMM is enabled (WI-D).
     pub fn set_split_k_enabled(&self, enabled: bool) {
-        let mut cfg = self.split_k_config.lock().unwrap();
+        let mut cfg = self.split_k_config.lock().unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
     /// Set whether the JIT compiled WMMA GEMM kernel is enabled (WI-G). [see: `grim_wmma_gemm`]
     pub fn set_wmma_gemm_enabled(&self, enabled: bool) {
         self.wmma_gemm_enabled.store(enabled, Ordering::Relaxed);
-        let mut cfg = self.wmma_gemm_config.lock().unwrap();
+        let mut cfg = self.wmma_gemm_config.lock().unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
     }
 
@@ -824,7 +824,7 @@ impl RocmDevice {
     /// If a graph-capture session is active, returns the dedicated capture stream. [see: `None`]
     fn active_capture_stream(&self) -> Option<*mut c_void> {
         if self.capture_active.load(Ordering::SeqCst) {
-            *self.capture_stream.read().unwrap()
+            *self.capture_stream.read().unwrap_or_else(|e| e.into_inner())
         } else {
             None
         }
@@ -884,7 +884,7 @@ impl RocmDevice {
             ));
         }
         // Lazily create the capture stream; it lives for the device lifetime so rocblas
-        let mut cs = self.capture_stream.write().unwrap();
+        let mut cs = self.capture_stream.write().unwrap_or_else(|e| e.into_inner());
         if cs.is_none() {
             let mut stream: *mut c_void = std::ptr::null_mut();
             let res = unsafe { hipStreamCreate(&mut stream) };
@@ -966,7 +966,7 @@ impl RocmDevice {
                 res
             )));
         }
-        let mut cache = self.captured_graphs.lock().unwrap();
+        let mut cache = self.captured_graphs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = cache.insert(key.to_string(), CapturedGraph { graph, exec }) {
             unsafe {
                 let _ = hipGraphExecDestroy(old.exec);
@@ -991,10 +991,10 @@ impl RocmDevice {
         }
         // Replay on the same capture stream the graph was recorded on, so the rocblas
         let stream = {
-            let cs = self.capture_stream.read().unwrap();
+            let cs = self.capture_stream.read().unwrap_or_else(|e| e.into_inner());
             cs.unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()))
         };
-        let cache = self.captured_graphs.lock().unwrap();
+        let cache = self.captured_graphs.lock().unwrap_or_else(|e| e.into_inner());
         match cache.get(key) {
             Some(g) => {
                 // Bind rocblas to the replay stream so its captured GEMM node executes there.
@@ -1022,7 +1022,7 @@ impl RocmDevice {
 
     /// True if a graph is cached under `key` (useful for callers deciding whether to
     pub fn has_captured_graph(&self, key: &str) -> bool {
-        self.captured_graphs.lock().unwrap().contains_key(key)
+        self.captured_graphs.lock().unwrap_or_else(|e| e.into_inner()).contains_key(key)
     }
 
     // =============================================================================
@@ -1031,7 +1031,7 @@ impl RocmDevice {
 
     /// Lazily-initialized GraphCaptureManager for decode-step graph capture.
     fn ensure_graph_capture_mgr(&self) {
-        let mut mgr = self.graph_capture_mgr.lock().unwrap();
+        let mut mgr = self.graph_capture_mgr.lock().unwrap_or_else(|e| e.into_inner());
         if mgr.is_none() {
             *mgr = Some(crate::graph_capture::GraphCaptureManager::for_device(self));
         }
@@ -1054,7 +1054,7 @@ impl RocmDevice {
         k: usize,
     ) -> Result<bool> {
         self.ensure_graph_capture_mgr();
-        let mgr = self.graph_capture_mgr.lock().unwrap();
+        let mgr = self.graph_capture_mgr.lock().unwrap_or_else(|e| e.into_inner());
         let mgr = mgr.as_ref().ok_or_else(|| {
             Error::Backend(
                 "decode_graph_capture_and_replay: graph capture manager not initialized".into(),
@@ -1633,7 +1633,7 @@ impl Drop for RocmDevice {
             }
         }
         // Destroy the capture stream (owned for the device lifetime). By now the
-        if let Some(stream) = self.capture_stream.write().unwrap().take() {
+        if let Some(stream) = self.capture_stream.write().unwrap_or_else(|e| e.into_inner()).take() {
             unsafe {
                 let _ = hipStreamDestroy(stream);
             }
@@ -1660,7 +1660,7 @@ impl RocmDevice {
 
     /// Retrieve a stream from the persistent pool (round-robin checkouts).
     pub fn get_stream_from_pool(&self, idx: usize) -> Option<*mut c_void> {
-        let pool = self.stream_pool.lock().unwrap();
+        let pool = self.stream_pool.lock().unwrap_or_else(|e| e.into_inner());
         if pool.is_empty() {
             None
         } else {
@@ -4791,7 +4791,7 @@ impl BackendDevice for RocmDevice {
         let total = shape.elem_count();
         let stream = self.active_stream();
         let stream_u64 = stream as u64;
-        let rccl = self.rccl.lock().unwrap().clone();
+        let rccl = self.rccl.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let is_f32 = dtype.arith == ArithType::F32;
         // TP activations arrive as F16/BF16 single tensors per rank; routing
         // them through RCCL (instead of the old host round-trip) needs the
@@ -4993,7 +4993,7 @@ impl BackendDevice for RocmDevice {
         let is_f32 = dtype.arith == ArithType::F32;
         let stream = self.active_stream();
         let stream_u64 = stream as u64;
-        let rccl = self.rccl.lock().unwrap().clone();
+        let rccl = self.rccl.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let elem_bytes = crate::dtype_byte_size(&dtype);
 
         // ── Device-side assembly + optional RCCL all-reduce ────────────────
@@ -10682,7 +10682,7 @@ impl RocmDevice {
         winner: &crate::kernels::tile_picker::TileConfig,
         winner_ms: f64,
     ) {
-        let mut autotuner = self.autotuner.lock().unwrap();
+        let mut autotuner = self.autotuner.lock().unwrap_or_else(|e| e.into_inner());
         // &'static str keys via the interner — one leak per unique
         // (entry, arch) pair, not per call.
         let arch_leak: &'static str = self.intern_str(&self.gpu_target);
@@ -10708,7 +10708,7 @@ impl RocmDevice {
 
     /// Persist the in-memory autotune cache to a JSON file at `path`.
     pub fn save_autotune_cache(&self, path: &std::path::Path) -> Result<()> {
-        let autotuner = self.autotuner.lock().unwrap();
+        let autotuner = self.autotuner.lock().unwrap_or_else(|e| e.into_inner());
         autotuner.save_to_file(path)
     }
 
@@ -10742,7 +10742,7 @@ impl RocmDevice {
 
         // 1. Hot path: in-memory table hit.
         {
-            let autotuner = self.autotuner.lock().unwrap();
+            let autotuner = self.autotuner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cfg) = autotuner.lookup(key) {
                 return crate::kernels::tile_picker::TileConfig {
                     block_m: 0,
@@ -10845,7 +10845,7 @@ impl RocmDevice {
         let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
         // WI 2.4.3 — split_k clamp gate.
         let split_k_effective: u32 = {
-            let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
+            let split_k_enabled = self.split_k_config.lock().unwrap_or_else(|e| e.into_inner()).enabled;
             if split_k_enabled
                 && tile_config.split_k > 1
                 && (k % tile_config.split_k as usize == 0)
@@ -11391,7 +11391,7 @@ impl RocmDevice {
         // thread on a foreign ordinal. Loading a gfx1201 hsaco on gfx1200 yields
         // HIP error 209 (no binary for device).
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let mut module_cache = self.module_cache.lock().unwrap();
+        let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
         let (_module, func) = if let Some(cached) = module_cache.get(&cache_key) {
             let (m, f) = *cached;
             if let Ok(mut fast) = self.resolved_kernel_cache.lock() {

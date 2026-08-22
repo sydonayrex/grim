@@ -1054,7 +1054,7 @@ impl ScytheRing {
         };
         let slot = slot_counter % self.capacity;
         if let (Some(device), Some(staging)) = (self.device, self.staging.get(slot as usize)) {
-            let mut staging = staging.lock().unwrap();
+            let mut staging = staging.lock().unwrap_or_else(|e| e.into_inner());
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &desc as *const ScytheTaskDescriptor as *const u8,

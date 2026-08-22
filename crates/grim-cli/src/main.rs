@@ -297,6 +297,16 @@ enum Commands {
         /// a small random Llama is used for smoke testing.
         #[arg(short, long)]
         model: Option<String>,
+        /// Bench mode: 'local' (default) or 'serve' (load-test a running
+        /// server's /v1/chat/completions endpoint; §WI-E2).
+        #[arg(long, default_value = "local")]
+        mode: String,
+        /// Server port for serve mode.
+        #[arg(long, default_value_t = 11434)]
+        port: u16,
+        /// Duration in seconds for serve mode.
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
     },
     /// Evaluate model on benchmark datasets (PPL, GSM8k).
     Eval {
@@ -354,6 +364,9 @@ enum Commands {
         /// LoRA alpha.
         #[arg(long, default_value_t = 32.0)]
         alpha: f32,
+        /// WI-E5: MXFP4 quantization-aware training (STE fake-quant in forward).
+        #[arg(long)]
+        qat_mxfp4: bool,
         /// Maximum tokens per packed batch (micro-batch size in tokens).
         #[arg(long, default_value_t = 2048)]
         batch_size: usize,
@@ -1263,8 +1276,19 @@ async fn main() -> Result<()> {
             tokens,
             concurrency,
             model,
+            mode,
+            port,
+            duration,
         } => {
-            bench::cmd_bench(tokens, concurrency, model.as_deref()).await?;
+            bench::cmd_bench(
+                tokens,
+                concurrency,
+                model.as_deref(),
+                &mode,
+                port,
+                duration,
+            )
+            .await?;
         }
         Commands::Eval {
             model,
@@ -1311,6 +1335,7 @@ async fn main() -> Result<()> {
             lr,
             rank,
             alpha,
+            qat_mxfp4,
             batch_size,
             gradient_accumulation_steps,
             warmup_steps,
@@ -1417,6 +1442,7 @@ async fn main() -> Result<()> {
                 seed,
                 train_dtype,
                 use_spectral_qlora: false,
+                qat_mxfp4: qat_mxfp4,
                 lora_plus_ratio: effective_lora_plus,
                 relora_reset_steps: effective_relora_steps,
                 use_oft: effective_use_oft,

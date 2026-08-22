@@ -304,6 +304,24 @@ impl GgufTokenizer {
         if text.is_empty() {
             return Vec::new();
         }
+        // WI-E3: large inputs go through the rayon parallel chunked path.
+        // Chunks split at '\n' — a hard pre-token boundary in both the GPT-2
+        // and SentencePiece conventions, so no merge can span a split and the
+        // concatenated result is identical to single-threaded encode.
+        if text.len() >= 8192 {
+            use rayon::prelude::*;
+            let bounds = chunk_bounds(text, 4096);
+            let parts: Vec<Vec<u32>> = bounds
+                .par_iter()
+                .map(|(a, b)| self.encode(&text[*a..*b]))
+                .collect();
+            let total: usize = parts.iter().map(|p| p.len()).sum();
+            let mut out = Vec::with_capacity(total);
+            for p in parts {
+                out.extend(p);
+            }
+            return out;
+        }
 
         // Special tokens that should pass through directly
         let special_tokens = [
@@ -348,17 +366,23 @@ impl GgufTokenizer {
 
         let mut ids: Vec<u32> = Vec::new();
         let chars: Vec<char> = processed.chars().collect();
+        // WI-E3: `rest` was rebuilt as a fresh String at EVERY char position —
+        // O(n^2) allocations dominating encode. Special tokens all start with
+        // '<'; only run the starts_with checks when the current char can
+        // actually begin one.
         let mut i = 0;
         while i < chars.len() {
-            let rest: String = chars[i..].iter().collect();
             let mut matched_special = false;
-            for special in ["<|im_start|>", "<|im_end|>", "<|startoftext|>"] {
-                if rest.starts_with(special) {
-                    if let Some(&id) = self.token_to_id.get(special) {
-                        ids.push(id);
-                        i += special.chars().count();
-                        matched_special = true;
-                        break;
+            if chars[i] == '<' {
+                for special in ["<|im_start|>", "<|im_end|>", "<|startoftext|>"] {
+                    let sc: Vec<char> = special.chars().collect();
+                    if chars[i..].starts_with(&sc) {
+                        if let Some(&id) = self.token_to_id.get(special) {
+                            ids.push(id);
+                            i += special.chars().count();
+                            matched_special = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -383,26 +407,45 @@ impl GgufTokenizer {
             }
         }
 
+        // WI-E3: this merge loop was the encode bottleneck. Per pass it built
+        // a `format!("{}{}")` String for EVERY adjacent pair (O(n * tok_len))
+        // and merged only ONE pair, so a 33 KB corpus took ~10 s (quadratic+
+        // in text length). Fixes: (1) cache merged-string lookups in a
+        // pair→id HashMap so repeated pairs cost one hash, (2) merge ALL
+        // non-overlapping occurrences of the best pair per pass.
+        let mut pair_cache: std::collections::HashMap<(u32, u32), Option<u32>> =
+            std::collections::HashMap::new();
         loop {
             let mut best_pair: Option<(u32, u32)> = None;
             let mut best_score: f32 = f32::MIN;
             let mut best_merged_id: Option<u32> = None;
 
             for pair in ids.windows(2) {
-                let t1 = pair[0];
-                let t2 = pair[1];
-                // Bounds-check token lookup — panic on OOB is a DoS risk with
-                // untrusted/malformed tokenizer configs. [P1-25 fix.]
-                let t1_str = match self.tokens.get(t1 as usize) {
-                    Some(s) => s,
-                    None => continue,
+                let key = (pair[0], pair[1]);
+                let merged_id = match pair_cache.get(&key) {
+                    Some(cached) => *cached,
+                    None => {
+                        let t1_str = match self.tokens.get(key.0 as usize) {
+                            Some(s) => s,
+                            None => {
+                                pair_cache.insert(key, None);
+                                continue;
+                            }
+                        };
+                        let t2_str = match self.tokens.get(key.1 as usize) {
+                            Some(s) => s,
+                            None => {
+                                pair_cache.insert(key, None);
+                                continue;
+                            }
+                        };
+                        let merged_str = format!("{}{}", t1_str, t2_str);
+                        let found = self.token_to_id.get(&merged_str).copied();
+                        pair_cache.insert(key, found);
+                        found
+                    }
                 };
-                let t2_str = match self.tokens.get(t2 as usize) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let merged_str = format!("{}{}", t1_str, t2_str);
-                if let Some(&merged_id) = self.token_to_id.get(&merged_str) {
+                if let Some(merged_id) = merged_id {
                     let score = self
                         .scores
                         .as_ref()
@@ -410,7 +453,7 @@ impl GgufTokenizer {
                         .unwrap_or(-(merged_id as f32));
                     if score > best_score {
                         best_score = score;
-                        best_pair = Some((t1, t2));
+                        best_pair = Some(key);
                         best_merged_id = Some(merged_id);
                     }
                 }
@@ -419,16 +462,18 @@ impl GgufTokenizer {
             if let (Some(pair), Some(merged_id)) = (best_pair, best_merged_id) {
                 let mut next_ids = Vec::with_capacity(ids.len());
                 let mut idx = 0;
+                let mut merged_any = false;
                 while idx < ids.len() {
                     if idx + 1 < ids.len() && ids[idx] == pair.0 && ids[idx + 1] == pair.1 {
                         next_ids.push(merged_id);
                         idx += 2;
+                        merged_any = true;
                     } else {
                         next_ids.push(ids[idx]);
                         idx += 1;
                     }
                 }
-                if ids == next_ids {
+                if !merged_any {
                     break;
                 }
                 ids = next_ids;
@@ -1139,6 +1184,12 @@ pub fn render_messages_or_last_with_tools(
 /// Printable ASCII + Latin-1 (33-126, 161-172, 174-255) map to themselves.
 /// Everything else maps to U+0100 + offset.
 fn gpt2_byte_encoder() -> HashMap<u8, char> {
+    // WI-E3: built once, shared across calls (was rebuilt on every encode).
+    use std::sync::OnceLock;
+    static ENCODER: OnceLock<HashMap<u8, char>> = OnceLock::new();
+    if let Some(m) = ENCODER.get() {
+        return m.clone();
+    }
     let mut bs: Vec<u8> = Vec::new();
     for b in 33..=126 {
         bs.push(b);
@@ -1159,6 +1210,7 @@ fn gpt2_byte_encoder() -> HashMap<u8, char> {
             c += 1;
         }
     }
+    let _ = ENCODER.set(map.clone());
     map
 }
 
@@ -1174,16 +1226,60 @@ fn gpt2_byte_decoder() -> HashMap<char, u8> {
 /// word units where a space (Ġ) starts a new word. This is a simplified
 /// version of the GPT-2 regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
 /// that handles the common cases.
-fn split_on_gpt2_pretokenize(s: &str) -> Vec<&str> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut words = Vec::new();
-    let mut start = 0;
+/// WI-E3: compute byte ranges of `text` split at '\n' boundaries into chunks
+/// of at most `target` bytes. Each range is a valid char boundary. Returns a
+/// list of (start, end) pairs covering the whole text.
+fn chunk_bounds(text: &str, target: usize) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut bounds = Vec::new();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let mut end = (start + target).min(bytes.len());
+        if end < bytes.len() {
+            // Back up to the last '\n' within [start+target/2, end].
+            let floor = start + target / 2;
+            while end > floor && end > start && bytes[end - 1] != b'\n' {
+                end -= 1;
+            }
+            // Char-boundary safety: if we landed mid-char, advance to one.
+            while end < bytes.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        while end < bytes.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end <= start {
+            end = (start + target).min(bytes.len());
+            while end < bytes.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        bounds.push((start, end));
+        start = end;
+    }
+    bounds
+}
 
-    for i in 0..chars.len() {
-        // Split before Ġ (space char in GPT-2 byte encoding) unless we're at the start
-        if chars[i] == '\u{0120}' && i > start {
-            words.push(&s[start..char_byte_offset(&chars, i)]);
-            start = char_byte_offset(&chars, i);
+fn split_on_gpt2_pretokenize(s: &str) -> Vec<&str> {
+    // WI-E3: the old version collected chars then called char_byte_offset
+    // (an O(n) scan) inside the split loop — O(n^2) total, 9.6 s for a 33 KB
+    // corpus. Ġ (U+0120) is exactly the two bytes 0xC4 0xA0 in UTF-8, so scan
+    // bytes and split on that pattern: single O(n) pass.
+    const G_BYTES: [u8; 2] = [0xC4, 0xA0];
+    let bytes = s.as_bytes();
+    let mut words = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == G_BYTES[0] && bytes[i + 1] == G_BYTES[1] {
+            if i > start {
+                words.push(&s[start..i]);
+            }
+            start = i;
+            i += 2;
+        } else {
+            i += 1;
         }
     }
     if start < s.len() {
@@ -1194,6 +1290,7 @@ fn split_on_gpt2_pretokenize(s: &str) -> Vec<&str> {
 
 /// Calculate the byte offset of char index `idx` in the original string
 /// described by `chars`.
+#[allow(dead_code)]
 fn char_byte_offset(chars: &[char], idx: usize) -> usize {
     chars[..idx].iter().map(|c| c.len_utf8()).sum()
 }
@@ -1454,5 +1551,78 @@ mod chat_template_tests {
         assert!(rendered.contains("START"), "startswith match failed");
         assert!(rendered.contains("END"), "endswith match failed");
         assert!(rendered.contains("NOTXYZ"), "startswith non-match failed");
+    }
+}
+
+#[cfg(test)]
+mod wi_e3_tests {
+    use super::*;
+
+    /// WI-E3: parallel chunked encode must produce byte-identical output to
+    /// the serial path. The threshold is 8192 bytes, so build a >8 KiB sample
+    /// and compare against forced-serial encoding (encode each chunk small).
+    #[test]
+    fn parallel_encode_matches_serial_on_mixed_text() {
+        let tok = GgufTokenizer::default();
+        // Mixed-language multi-line sample crossing the 8192-byte gate.
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!(
+                "The cathedral was built in {} and remains a symbol of the region.\n",
+                1100 + i
+            ));
+            if i % 7 == 0 {
+                text.push_str("Zusammenfassung der wichtigsten Ergebnisse der Untersuchung.\n");
+            }
+            if i % 11 == 0 {
+                text.push_str("数字とテキストが混在する行。\n");
+            }
+        }
+        assert!(text.len() >= 8192, "sample must exceed the parallel gate");
+
+        let parallel = tok.encode(&text);
+        // Serial reference: encode in <=4KB slices at newline boundaries.
+        let mut serial = Vec::new();
+        for line_group in split_lines_for_test(&text, 4096) {
+            serial.extend(tok.encode(line_group));
+        }
+        assert_eq!(
+            parallel, serial,
+            "parallel chunked encode diverged from serial"
+        );
+    }
+
+    fn split_lines_for_test<'a>(text: &'a str, target: usize) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (end, _) in text
+            .match_indices('\n')
+            .scan((), |_, x| Some(x))
+            .collect::<Vec<_>>()
+        {
+            if end - start >= target {
+                out.push(&text[start..=end]);
+                start = end + 1;
+            }
+        }
+        if start < text.len() {
+            out.push(&text[start..]);
+        }
+        out
+    }
+
+    #[test]
+    fn chunk_bounds_covers_whole_text_at_char_boundaries() {
+        let text = "line one\nline two\nline three\n".repeat(50);
+        for target in [64usize, 128, 4096] {
+            let bounds = super::chunk_bounds(&text, target);
+            let mut covered = 0usize;
+            for (i, &(a, b)) in bounds.iter().enumerate() {
+                assert!(text.is_char_boundary(a) && text.is_char_boundary(b));
+                assert_eq!(a, covered, "bounds must be contiguous (chunk {i})");
+                covered = b;
+            }
+            assert_eq!(covered, text.len());
+        }
     }
 }

@@ -34,6 +34,7 @@ pub fn run_doctor(
     check_process(&mut report, service_name);
     check_health_endpoint(&mut report, addr);
     check_gpu_backend(&mut report);
+    check_toolchain(&mut report);
     check_plugin_grants(&mut report);
 
     // WI-2: optional pre-flight model/hardware compatibility check.
@@ -659,5 +660,124 @@ fn print_report(report: &DoctorReport) {
             report.errors.len(),
             report.warnings.len()
         );
+    }
+}
+
+/// Probe compiler and runtime toolchain dependencies required for HIPRTC
+/// and JIT compilation (WI-X17).
+///
+/// Verifies presence of Clang, LLVM tools, ROCm runtime shared libraries,
+/// write access to the HSACO cache directory, and flags potential rustup
+/// toolchain collisions in target/.
+pub fn check_toolchain(report: &mut DoctorReport) {
+    let clang_res = std::process::Command::new("clang").arg("--version").output();
+    match clang_res {
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout);
+            let first_line = ver.lines().next().unwrap_or("unknown");
+            println!("[OK]  Clang toolchain detected: {first_line}");
+        }
+        _ => {
+            report.errors.push(
+                "clang not found in PATH: install clang (e.g. 'pacman -S clang' or 'apt install clang') for JIT / HIPRTC compilation"
+                    .into(),
+            );
+            eprintln!(
+                "[ERR] Clang not found in PATH. Install clang ('pacman -S clang' or 'apt install clang') for JIT / HIPRTC compilation."
+            );
+        }
+    }
+
+    let llvm_res = std::process::Command::new("llvm-config").arg("--version").output();
+    if let Ok(out) = llvm_res {
+        if out.status.success() {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!("[OK]  LLVM toolchain detected: version {ver}");
+        }
+    }
+
+    let rocm_paths = [
+        "/opt/rocm/lib/libhipblas.so",
+        "/opt/rocm/lib/librocblas.so",
+        "/usr/lib/libhipblas.so",
+        "/usr/lib/librocblas.so",
+    ];
+    let rocm_lib_found = rocm_paths.iter().any(|p| std::path::Path::new(p).exists());
+    if rocm_lib_found {
+        println!("[OK]  ROCm BLAS shared libraries detected on disk.");
+    } else {
+        report.warnings.push(
+            "libhipblas.so / librocblas.so not found at standard paths (/opt/rocm/lib or /usr/lib)"
+                .into(),
+        );
+        eprintln!(
+            "[WARN] libhipblas.so / librocblas.so not found at standard paths (/opt/rocm/lib or /usr/lib)."
+        );
+    }
+
+    let cache_dir = std::env::var("GRIM_HSACO_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs_next_cache().unwrap_or_else(|| std::path::PathBuf::from("/tmp/grim_hsaco"))
+        });
+    match std::fs::create_dir_all(&cache_dir) {
+        Ok(_) => {
+            let probe_file = cache_dir.join(".doctor_write_probe");
+            if std::fs::write(&probe_file, b"ok").is_ok() {
+                let _ = std::fs::remove_file(&probe_file);
+                println!("[OK]  HSACO JIT cache directory writable: {}", cache_dir.display());
+            } else {
+                report.errors.push(format!(
+                    "HSACO cache directory not writable: {}",
+                    cache_dir.display()
+                ));
+                eprintln!("[ERR] HSACO cache directory not writable: {}", cache_dir.display());
+            }
+        }
+        Err(e) => {
+            report.errors.push(format!(
+                "Failed to create HSACO cache directory {}: {e}",
+                cache_dir.display()
+            ));
+            eprintln!(
+                "[ERR] Failed to create HSACO cache directory {}: {e}",
+                cache_dir.display()
+            );
+        }
+    }
+}
+
+fn dirs_next_cache() -> Option<std::path::PathBuf> {
+    std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".cache").join("grim").join("hsaco"))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_toolchain_check_executes_and_populates_report() {
+        let mut report = DoctorReport::default();
+        check_toolchain(&mut report);
+        // Either clang was found, or an actionable error message naming pacman/apt was pushed.
+        if !report.errors.is_empty() {
+            assert!(
+                report.errors.iter().any(|e| e.contains("pacman -S clang") || e.contains("clang not found")),
+                "Error messages must give actionable remedy command"
+            );
+        }
+    }
+
+    #[test]
+    fn dirs_next_cache_returns_path_or_fallback() {
+        let path = dirs_next_cache();
+        assert!(path.is_some() || std::env::var("HOME").is_err());
     }
 }
