@@ -116,7 +116,8 @@ impl AutogradRegistry {
     ) -> Result<Self> {
         let mut params = TrainableParams::new();
 
-        for config in injection_registry.enabled() {
+        if scope != AutogradScope::FullParameter {
+            for config in injection_registry.enabled() {
             let (a_rows, a_cols) = config
                 .injection_point
                 .lora_a_shape(&model_config, config.rank);
@@ -283,6 +284,7 @@ impl AutogradRegistry {
 
             params.insert(param_a);
             params.insert(param_b);
+            }
         }
 
         // When scope is FullParameter, register base weights across all layers
