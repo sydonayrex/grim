@@ -79,6 +79,9 @@ pub struct Llama {
     pub moe_blocks: Vec<Option<MoeBlock>>,
     pub norm: RmsNorm,
     pub output: Linear,
+    /// Device assignment for each transformer layer. Defaults to the model
+    /// device; farm/pipeline callers may replace it with contiguous segments.
+    pub layer_devices: Vec<Device>,
 }
 
 impl Llama {
@@ -169,6 +172,7 @@ impl Llama {
             }
         }
 
+        let layer_count = cfg.num_layers;
         Ok(Self {
             cfg,
             device: device.clone(),
@@ -177,6 +181,7 @@ impl Llama {
             moe_blocks: (0..num_layers).map(|_| None).collect(),
             norm,
             output,
+            layer_devices: vec![device.clone(); layer_count],
         })
     }
 
@@ -265,6 +270,7 @@ impl Llama {
                 )?
             }
         };
+        let layer_count = cfg.num_layers;
         Ok(Self {
             cfg,
             device: device.clone(),
@@ -273,7 +279,29 @@ impl Llama {
             moe_blocks,
             norm,
             output,
+            layer_devices: vec![device.clone(); layer_count],
         })
+    }
+
+    /// Set per-layer devices for contiguous pipeline experiments.
+    pub fn set_layer_devices(&mut self, devices: Vec<Device>) -> Result<()> {
+        if devices.len() != self.layers.len() {
+            return Err(grim_core::error::Error::Config(format!(
+                "layer device map has {} entries, expected {}",
+                devices.len(),
+                self.layers.len()
+            )));
+        }
+        self.layer_devices = devices;
+        Ok(())
+    }
+
+    /// Number of device-boundary hops in the layer map.
+    pub fn layer_device_hops(&self) -> usize {
+        self.layer_devices
+            .windows(2)
+            .filter(|w| w[0] != w[1])
+            .count()
     }
 
     pub fn random(device: Device, cfg: LlamaConfig) -> Self {
@@ -370,12 +398,13 @@ impl Llama {
         let output = linear(cfg.vocab_size, cfg.hidden_size);
         Self {
             cfg: cfg.clone(),
-            device,
+            device: device.clone(),
             tok_embeddings,
             layers,
             moe_blocks: (0..num_layers).map(|_| None).collect(),
             norm,
             output,
+            layer_devices: vec![device.clone(); cfg.num_layers],
         }
     }
 

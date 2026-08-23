@@ -990,7 +990,7 @@ async fn main() -> Result<()> {
                     }
                 });
                 if let Some(ref path) = p {
-                    if let Err(e) = engine.load_and_register_speculative(
+                    if let Err(e) = engine.load_and_register_scythe_farm_speculative(
                         m,
                         &path.display().to_string(),
                         draft_model.as_deref(),
@@ -1147,7 +1147,7 @@ async fn main() -> Result<()> {
                         }
                     });
                     if let Some(ref path) = p {
-                        if let Err(e) = engine.load_and_register_speculative(
+                        if let Err(e) = engine.load_and_register_scythe_farm_speculative(
                             m,
                             &path.display().to_string(),
                             draft_model.as_deref(),

@@ -1395,6 +1395,7 @@ async fn chat_handler(
         if let Err(e) = engine.enqueue_request(grim_engine::Request {
             id: request_id,
             prompt_tokens,
+            max_new_tokens: 0,
             priority: 0,
             consumed_tokens: 0,
             model_id: Some(model_name.clone()),
