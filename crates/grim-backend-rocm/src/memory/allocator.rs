@@ -18,8 +18,9 @@ pub struct RocmCachingAllocator {
     cached_bytes: Mutex<usize>,
     /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually [see: `hipFree`]
     cap_bytes: usize,
-    /// Device ordinal this allocator serves.
-    #[allow(dead_code)]
+    /// Device ordinal this allocator serves. Pinned around every driver call
+    /// so a thread whose HIP context drifted to another device cannot
+    /// `hipMalloc`/`hipFree` against the wrong one (WI-M1 context discipline).
     ordinal: usize,
     /// Count of real `hipMalloc` calls (misses). Always incremented.
     malloc_count: AtomicUsize,
@@ -63,12 +64,17 @@ impl RocmCachingAllocator {
             return Ok(ptr_u64 as *mut c_void);
         }
 
+        // WI-M1: `hipMalloc` allocates in the calling thread's current device
+        // context. Pin this allocator's ordinal — a pool miss from a drifted
+        // thread must not materialise the buffer on another device.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
         let res = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
         if res.is_err() {
             self.empty_cache();
             check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) })?;
         }
+        drop(_guard);
         self.malloc_count.fetch_add(1, Ordering::Relaxed);
         Ok(dev_ptr_void)
     }
@@ -79,6 +85,8 @@ impl RocmCachingAllocator {
         // a synchronized real release, ruling pool reuse in/out as the cause
         // of the "Page not present" GPU fault.
         if std::env::var("GRIM_ALLOC_NO_POOL").is_ok() {
+            // WI-M1: pin the owning ordinal for the real release (see below).
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             unsafe {
                 let _ = crate::hipDeviceSynchronize();
                 let _ = hipFree(ptr);
@@ -97,6 +105,9 @@ impl RocmCachingAllocator {
             // null stream, avoiding a full-device stall. Falls back to sync hipFree if the
             // async path is unavailable (pre-ROCm-5.4 drivers return an error code).
             // CONTRACT: ptr must not be reused by the caller after this call returns.
+            // WI-M1: pin the owning ordinal — a real release issued from a
+            // drifted thread's context frees into the wrong device's pool.
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             unsafe {
                 let res = crate::hipFreeAsync(ptr, std::ptr::null_mut());
                 if res != 0 {

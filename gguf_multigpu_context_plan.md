@@ -132,11 +132,85 @@ exact setter; M2/M3 exist so the class cannot silently return.
 
 | WI | host | sb | done |
 |----|------|----|------|
-| M1 pin all seams + slow launch | ☐ grep-contract test | — | ☐ |
-| M2 name the drift frame | ☐ named-frame log | — | ☐ |
-| M3 context-drift unit gates | ☐ incl. mutation check | — | ☐ |
+| M1 pin all seams + slow launch | ☑ grep-contract test (`tests/hip_context_contract.rs`, 3/3) | ☐ GRIM_ALLOC_TRACE rerun, ctx_dev≠self_dev = 0 lines | ☐ |
+| M2 name the drift frame | ☐ named-frame log (tracing landed; needs multi-device run) | — | ☐ |
+| M3 context-drift unit gates | ☐ incl. mutation check (tests written; skip-verified on 1-GPU box) | — | ☐ |
 | M4 acceptance matrix | — | ☐ off-legs clean | ☐ |
 | WI-INF4 verdict | — | ☐ farm on/off both orders | ☐ |
+
+## Implementation status (2026-08-23)
+
+M1/M2/M3 code is landed in `grim-backend-rocm` + `grim-engine`:
+
+- **M1 pins** — `DeviceGuard::set(owning ordinal)` now wraps: the three
+  `storage.rs` upload/download seams (`copy_from_host`,
+  `copy_from_host_managed`, `copy_from_host_raw_bytes` full body; the two
+  direct `hipMallocManaged` branches in `alloc_gpu_with_bytes`; all DtoH
+  paths in `to_cpu_vec_f32`), `prefetch_to_device`, `RocmStorage::drop`;
+  allocator `alloc`/`free` real-release paths (`empty_cache` was already
+  pinned); `upload_to_scratch` H2D and the comm_fuse D2D assembly;
+  `memcpy_with_xnack_fallback`; `upload_device_buffer` gained an
+  `ordinal` parameter (all ~30 call sites pass `self.ordinal`). The slow
+  JIT branch of `launch_compute_kernel_with_solution` was already pinned
+  (e3b13a538); verified no gap remains between module load and launch.
+- **raw_set_device** — new traced setter in `device/util.rs`.
+  `RocmDevice::try_new` routes through it and is now *context-neutral*
+  (saves/restores the caller's device instead of parking it on `ordinal`
+  forever — a constructor flip mid-forward was a prime drift suspect).
+  `peer_access::enable_peer_access`'s save/restore pair also routes
+  through it (balance asserted by contract test).
+- **M2 tracing** — `[ctx-trace]` centralized: fires for any
+  `DeviceGuard`/`raw_set_device` switch to n≠0 while the engine's prefill
+  latch is up (`set_prefill_in_flight`, wired around `Engine::drive_prefill`),
+  plus the legacy ordinal-2 TEMP-DIAG; every line carries
+  `prev=` + `tid=` (ThreadId) + forced backtrace. Launch seams stamp
+  `self_dev`/`ctx_dev` on every launch.
+- **M3 gates** — `src/context_drift_tests.rs`: worker thread parks its
+  context on a foreign ordinal while main uploads + launches `grim_rms_norm`
+  through the public API (asserting output correctness AND
+  `last_launch_context() == (self, self)`), roles swapped, plus a
+  `copy_from_host_raw_bytes` residency gate using per-device free-VRAM
+  deltas. Device-gated (`GRIM_GPU_TEST=1`, ≥2 HIP devices).
+
+Verified on this box (single gfx1036 iGPU): `cargo check -p
+grim-backend-rocm -p grim-engine --tests` clean; grep-contract 3/3;
+latch smoke + drift tests green (self-skipped, need ≥2 devices);
+live GPU runs green with `GRIM_ALLOC_TRACE=1` — caching-allocator reuse
+test and `fused_add_rms_norm_tests` show `self_dev=0 ctx_dev=0` for every
+launch, zero `[ctx-trace]` events.
+
+**Remaining (needs syd-beasty / ≥2 devices):** the M1 trace rerun
+(zero `ctx_dev != self_dev` under LFM2.5 multi-device), M2's named-frame
+capture, M3's manual mutation check (revert pins → tests must fail), and
+the whole M4 matrix incl. WI-INF4.
+
+## Known pre-existing GPU flake (discovered 2026-08-23, NOT caused by M1–M3)
+
+`tests/mxfp4_gemm_tests.rs::test_fused_mxfp4_gemm_qk_norm_rope_kv_parity`
+intermittently produces **all-zero** Q/K/V ("Q mismatch at 0: actual=0,
+expected=1.2004437") on gfx1036. Evidence it predates the context-discipline
+work:
+
+- A pristine `git worktree` at cf4ea0d2 fails with the **byte-identical**
+  panic (`Q mismatch at 0: actual=0, expected=1.2004437`) on its first GPU
+  run after a fresh JIT compile.
+- Pure-HEAD main-tree runs passed 10/10 when reusing warm hsaco cache
+  entries, but fail after cache purge at varying rates — the flake
+  correlates with freshly compiled aggregate modules + immediate single-shot
+  execution, i.e. host/GPU timing, not input data (uploads are synchronous
+  `hipMemcpy`; both pipeline kernels launch on stream-pool slot 0, so the
+  launches themselves are ordered).
+- `test_rocm_quantize_fp8_roundtrip` showed one identical-class one-off
+  failure and then passed 5/5; no FP8 path is touched by M1–M3.
+
+The WI-M1 guard additions add a handful of host-side FFI calls per op,
+which shifts this race's hit rate (~50% on the modified tree vs occasional
+on HEAD under the same load); that sensitivity is why the Drop-path guard
+was deliberately left out of `RocmStorage::drop` (see storage.rs note) and
+why `emit_ctx_trace` early-returns on an atomic check before any env
+lookup. Root-causing the underlying first-launch zeroing belongs to the
+same fault hunt as the ctx_dev=2 page fault — recommended next step:
+capture `rocprofv3` traces of a failing run per the M4 toolchain.
 
 ## Risks
 

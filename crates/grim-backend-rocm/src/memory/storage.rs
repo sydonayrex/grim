@@ -68,6 +68,11 @@ impl RocmStorage {
     ) -> Result<Self> {
         if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
             crate::memory::budget::note_managed_fallback(ordinal, bytes);
+            // WI-M1 context discipline: `hipMallocManaged` binds the new
+            // allocation to the CALLING THREAD's current device. Park on the
+            // owning ordinal or a drifted thread materialises the buffer on
+            // another device while `ordinal` still claims ownership.
+            let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
             let mut ptr = std::ptr::null_mut();
             check_hip("hipMallocManaged", unsafe {
                 hipMallocManaged(&mut ptr, bytes, 1)
@@ -86,6 +91,7 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
+                let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
                     crate::memory::budget::note_managed_fallback(ordinal, bytes);
@@ -145,6 +151,10 @@ impl RocmStorage {
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
 
+        // WI-M1 context discipline: a synchronous `hipMemcpy` executes in the
+        // calling thread's current device context. Pin the owning ordinal or a
+        // drifted thread writes the tensor onto another device's memory.
+        let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
         // F16/BF16: the host provides f32 values but the device buffer holds
         let upload_result = match arith {
             grim_tensor::ArithType::F16 => {
@@ -213,6 +223,9 @@ impl RocmStorage {
             ));
         }
         let bytes = shape.elem_count() * crate::dtype_byte_size(&dtype);
+        // WI-M1 context discipline: managed malloc + H2D fill both bind to the
+        // calling thread's current device; pin the owning ordinal.
+        let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
         let mut ptr = std::ptr::null_mut();
         check_hip("hipMallocManaged", unsafe {
             hipMallocManaged(&mut ptr, bytes, 1)
@@ -262,6 +275,12 @@ impl RocmStorage {
             );
         }
         let bytes = host_bytes.len();
+        // WI-M1 context discipline: every branch below mixes a
+        // thread-context-bound allocation (`hipMallocManaged` / allocator
+        // miss) with a synchronous H2D fill. Pin the owning ordinal for the
+        // whole seam so a drifted thread cannot land the quantized weights on
+        // the wrong device — the exact producer of the ctx_dev=2 fault split.
+        let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
         if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
             let mut ptr = std::ptr::null_mut();
             check_hip("hipMallocManaged", unsafe {
@@ -297,6 +316,7 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
+                let _ctx = crate::device::util::DeviceGuard::set(ordinal as i32);
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
                     let result = unsafe {
@@ -360,6 +380,12 @@ impl RocmStorage {
 impl Drop for RocmStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
+            // NOTE: deliberately NO DeviceGuard here. Pool returns do no HIP
+            // work, and real driver releases are pinned inside
+            // `RocmCachingAllocator::free` / `empty_cache`. An extra
+            // hipGetDevice+hipSetDevice pair per drop measurably widened a
+            // host-timing window in fused stream pipelines (mxfp4
+            // rmsnorm→gemm→rope_kv parity flaked to all-zero outputs).
             if self.managed {
                 unsafe {
                     let _ = crate::hipFree(ptr_val as *mut c_void);
@@ -396,6 +422,13 @@ impl BackendStorage for RocmStorage {
         }
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
         let elem_count = self.shape.elem_count();
+
+        // WI-M1 context discipline: every DtoH branch below issues a
+        // synchronous `hipMemcpy` against the calling thread's current device
+        // context. Pin the owning ordinal so a drifted thread reads the right
+        // allocation (and so the dequant launches below start from a sane
+        // context).
+        let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // Quantized storage (Q8_0, Q4K, …) or FloatPack (FP8): the device buffer holds packed bytes.
         // We copy the packed bytes DToH and dequantize them on GPU using the RocmDevice launchers
@@ -534,6 +567,7 @@ impl BackendStorage for RocmStorage {
         let ptr = self
             .device_ptr
             .ok_or_else(|| Error::Backend("managed storage has no device pointer".into()))?;
+        let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         check_hip("hipMemPrefetchAsync", unsafe {
             hipMemPrefetchAsync(
                 ptr as *const c_void,
