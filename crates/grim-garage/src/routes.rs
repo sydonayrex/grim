@@ -161,6 +161,9 @@ pub struct DatasetsResponse {
 #[derive(Debug, Serialize)]
 pub struct BackendProbeResponse {
     pub backends: Vec<crate::backend::BackendProbe>,
+    /// Rich GPU telemetry devices if probed
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<crate::rocm::RocmDeviceInfo>,
     /// The backend a job with no explicit preference would select.
     pub selected: String,
 }
@@ -343,9 +346,10 @@ async fn get_datasets() -> Json<DatasetsResponse> {
 }
 
 async fn get_rocm_devices() -> Json<BackendProbeResponse> {
+    let devices = probe_rocm_devices();
     Json(BackendProbeResponse {
-        backends: probe_rocm_devices()
-            .into_iter()
+        backends: devices
+            .iter()
             .map(|d| crate::backend::BackendProbe {
                 name: "rocm".into(),
                 device_kind: format!("rocm:{}", d.ordinal),
@@ -356,6 +360,7 @@ async fn get_rocm_devices() -> Json<BackendProbeResponse> {
                 ),
             })
             .collect(),
+        devices,
         selected: crate::backend::select_backend(None).label,
     })
 }
@@ -366,6 +371,7 @@ async fn get_rocm_devices() -> Json<BackendProbeResponse> {
 async fn list_backends() -> Json<BackendProbeResponse> {
     Json(BackendProbeResponse {
         backends: crate::backend::probe_all(),
+        devices: Vec::new(),
         // What a job with no explicit preference would land on.
         selected: crate::backend::select_backend(None).label,
     })
