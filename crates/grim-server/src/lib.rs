@@ -1032,7 +1032,12 @@ async fn chat_completions(
         {
             match load_model_for_server(&requested_model) {
                 Ok((model, maybe_tokenizer)) => {
-                    engine.register_model(&requested_model, model);
+                    // SCYTHE-2 farm mode when armed (see /models load path);
+                    // plain registration otherwise.
+                    let farm_path = resolve_catalog_model_path(&requested_model)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    engine.register_model_with_farm(&requested_model, model, &farm_path);
                     eprintln!(
                         "[grim-server] Loaded model '{}' on demand.",
                         requested_model
@@ -2985,7 +2990,12 @@ async fn load_model(
                     })
                 });
             *state.model_arch.lock().unwrap_or_else(|e| e.into_inner()) = arch;
-            engine.register_model(&req.model, m);
+            // SCYTHE-2 farm mode: when GRIM_SCYTHE_INFERENCE is armed and more
+            // than one ROCm GPU is visible, this registers a full weight
+            // replica per GPU and lets the controller pin sessions to ranks.
+            // Otherwise identical to register_model (WI-INF3 serving path).
+            engine.register_model_with_farm(&req.model, m, &model_path_str);
+
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -4945,6 +4955,23 @@ pub async fn serve(
     Ok(())
 }
 
+/// Catalog/path resolution shared by `load_model_for_server` and the SCYTHE-2
+/// farm loader (which needs the on-disk path to pull additional replicas).
+///
+/// P0-WI-3: prefers the `.grim` sibling whenever both exist for the same model
+/// name (set after `grim oxidize convert --rocml-profile <target>`). Direct
+/// paths still resolve directly; resolution is centralized in
+/// `catalog::resolve_model_preferring_grim` so `/v1/models/load` shares the
+/// same lookup rules as the CLI.
+fn resolve_catalog_model_path(name: &str) -> Option<std::path::PathBuf> {
+    if std::path::Path::new(name).exists() {
+        return grim_core::catalog::resolve_model_preferring_grim(name);
+    }
+    // Ensure the models dir is initialized; some callers may have skipped it.
+    let _ = grim_core::grim_models_dir();
+    grim_core::catalog::resolve_model_preferring_grim(name)
+}
+
 /// Resolve a model name from the local catalog and load it as a `CausalLm`.
 ///
 /// Returns `(model_box, Option<tokenizer>)` on success.
@@ -4955,23 +4982,9 @@ fn load_model_for_server(
     Box<dyn grim_core::model::CausalLm>,
     Option<grim_format::GgufTokenizer>,
 )> {
-    use grim_core::grim_models_dir;
     use grim_engine::model_loader;
 
-    // P0-WI-3: prefer the `.grim` sibling whenever both exist for the same model
-    // name (set after `grim oxidize convert --rocml-profile <target>`).
-    // Direct paths still resolve directly; resolution is centralized in
-    // `catalog::resolve_model_preferring_grim` so `/v1/models/load` shares the
-    // same lookup rules as the CLI.
-    let model_path = if std::path::Path::new(name).exists() {
-        grim_core::catalog::resolve_model_preferring_grim(name)
-    } else {
-        // Ensure the models dir is initialized; some callers may have skipped it.
-        let _ = grim_models_dir();
-        grim_core::catalog::resolve_model_preferring_grim(name)
-    };
-
-    let path = model_path.ok_or_else(|| {
+    let path = resolve_catalog_model_path(name).ok_or_else(|| {
         grim_core::error::Error::Config(format!(
             "model '{name}' not found in catalog. Run 'grim pull {name}' to download it."
         ))

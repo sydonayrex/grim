@@ -182,8 +182,45 @@ pub struct Engine {
     /// Background KV receiver server handle (started in Engine::new when
     /// disagg_config is Some and role is Decode or Colocated).
     kv_receiver: Option<grim_disagg::KvReceiverServer>,
+    /// Live GPU capability profiler and epoch manager.
+    /// Only constructed when world_size > 1 or `GRIM_SCYTHE_INFERENCE=1` (WI-INF1).
+    pub capability_profiler: Option<Arc<grim_backend_rocm::CapabilityProfiler>>,
+    /// SCYTHE-2 online router for continuous batching / multi-GPU placement (WI-INF2).
+    pub scythe_ctrl: Option<crate::scythe2::C2plrController>,
+    /// SCYTHE-2 farm mode (WI-INF3 serving integration): per-base-model
+    /// replica ids. Replica `r ≥ 1` of `base` is registered as
+    /// `{base}#scythe{r}` and holds a full weight copy on that rank's device;
+    /// rank 0 is the base registration itself.
+    scythe_replicas: HashMap<String, Vec<String>>,
+    /// Request → replica rank, decided by the controller at admission time.
+    /// The pinned replica executes every forward for that request's lifetime,
+    /// so its KV pages stay local to one device.
+    scythe_pin: HashMap<u64, usize>,
     /// Set GRIM_RADIX=on to enable prefix-cache reuse on prefill (WP5).
     pub radix_enabled: bool,
+}
+
+/// Effective-capability view for SCYTHE-2 farm placement: a GPU already
+/// running `load` concurrent sessions contributes roughly `1/(1+load)` of its
+/// solo throughput, so the controller's WaveTune latency argmin doubles as a
+/// load balancer instead of piling every session onto the fastest card.
+fn load_adjusted_caps(
+    caps: &[grim_tensor::backend::GpuCapability],
+    num_ranks: usize,
+    load: &[usize],
+) -> Vec<grim_tensor::backend::GpuCapability> {
+    (0..num_ranks)
+        .map(|r| {
+            let mut c = caps.get(r).cloned().unwrap_or_default();
+            c.ordinal = r;
+            c.tflops_fp16 /= (1 + load.get(r).copied().unwrap_or(0)) as f32;
+            if c.tflops_fp16 <= 0.0 {
+                // Keep latency finite so the controller never divides by zero.
+                c.tflops_fp16 = 0.001;
+            }
+            c
+        })
+        .collect()
 }
 
 impl Engine {
@@ -338,6 +375,53 @@ impl Engine {
         let target_ttft = config.target_ttft_ms as f64;
         let target_itl = config.target_itl_ms as f64;
 
+        let is_multi_gpu = tp_config
+            .as_ref()
+            .map(|tp| tp.world_size > 1)
+            .unwrap_or(false)
+            || config.tp_size > 1;
+        let scythe_inference_flag = std::env::var("GRIM_SCYTHE_INFERENCE")
+            .map(|v| v == "1" || v == "true" || v == "on")
+            .unwrap_or(false);
+
+        // WI-INF1: the profiler is the only thing constructed on the default
+        // path, and only when more than one GPU is visible. A single-GPU box
+        // pays zero probe cost (gate: test_single_gpu_capability_profiler_is_none).
+        let capability_profiler = if is_multi_gpu || scythe_inference_flag {
+            Some(Arc::new(grim_backend_rocm::CapabilityProfiler::new()))
+        } else {
+            None
+        };
+
+        // WI-INF2: the controller routes activations across GPUs *in this
+        // process* (SCYTHE-2's P2P-ring execution model), so it is armed on
+        // the count of ROCm devices visible here — not on `TP world_size`,
+        // which under Design A counts one GPU per OS process. Fewer than two
+        // visible GPUs leaves nothing to route between; the controller stays
+        // `None` even with the flag set.
+        //
+        // `num_layers` starts at the placeholder below and is re-sized to the
+        // loaded model's real depth at registration time (see
+        // `register_speculative`), one controller per loaded model.
+        const SCYTHE_NUM_LAYERS_PLACEHOLDER: usize = 32;
+        let visible_gpus = capability_profiler
+            .as_ref()
+            .map(|p| p.capabilities().len())
+            .unwrap_or(0);
+        let scythe_ctrl = if scythe_inference_flag && visible_gpus > 1 {
+            eprintln!(
+                "[scythe2] inference routing armed over {visible_gpus} visible GPUs \
+                 (GRIM_SCYTHE_INFERENCE=1)"
+            );
+            Some(crate::scythe2::C2plrController::new(
+                SCYTHE_NUM_LAYERS_PLACEHOLDER,
+                visible_gpus,
+                config.target_itl_ms as f64,
+            ))
+        } else {
+            None
+        };
+
         Self {
             config,
             scheduler,
@@ -364,6 +448,10 @@ impl Engine {
             last_itl_ms: None,
             tp_config,
             kv_receiver,
+            capability_profiler,
+            scythe_ctrl,
+            scythe_replicas: HashMap::new(),
+            scythe_pin: HashMap::new(),
             radix_enabled: std::env::var("GRIM_RADIX")
                 .map(|v| v != "0" && v != "false" && v != "off")
                 .unwrap_or(true),
@@ -381,6 +469,206 @@ impl Engine {
     /// Access the disaggregated KV receiver server instance if running in disaggregated decode role.
     pub fn kv_receiver(&self) -> Option<&grim_disagg::KvReceiverServer> {
         self.kv_receiver.as_ref()
+    }
+
+    /// Return live snapshot of visible GPU capabilities if profiler is active.
+    pub fn capabilities(&self) -> Option<Vec<grim_tensor::backend::GpuCapability>> {
+        self.capability_profiler.as_ref().map(|p| p.capabilities())
+    }
+
+    /// Return topology link matrix between visible GPUs.
+    pub fn link_matrix(&self, num_gpus: usize) -> Vec<grim_tensor::backend::ScytheLink> {
+        grim_backend_rocm::CapabilityProfiler::link_matrix(num_gpus)
+    }
+
+    /// True when SCYTHE-2 inference routing is armed (`GRIM_SCYTHE_INFERENCE`
+    /// set and more than one ROCm GPU visible).
+    pub fn scythe_armed(&self) -> bool {
+        self.scythe_ctrl.is_some()
+    }
+
+    /// Hand the engine's SCYTHE-2 controller to a streaming executor as a
+    /// [`ScytheRoute`](crate::streaming_forward::ScytheRoute) (WI-INF3).
+    ///
+    /// The route snapshots capabilities/links from the profiler lazily (on
+    /// capability-epoch change only) and maps rank → `Device::Rocm(rank)`.
+    /// Returns `false` (and touches nothing) when routing isn't armed.
+    pub fn attach_scythe_route(
+        &mut self,
+        sfb: &mut crate::streaming_forward::StreamingBlockForward,
+    ) -> bool {
+        let Some(ctrl) = self.scythe_ctrl.take() else {
+            return false;
+        };
+        let Some(ref profiler) = self.capability_profiler else {
+            // Armed controller without a profiler cannot happen by
+            // construction; put the controller back rather than dropping it.
+            self.scythe_ctrl = Some(ctrl);
+            return false;
+        };
+        sfb.attach_scythe_route(crate::streaming_forward::ScytheRoute {
+            ctrl: Arc::new(std::sync::Mutex::new(ctrl)),
+            profiler: Some(Arc::clone(profiler)),
+            caps: Vec::new(),
+            links: Vec::new(),
+            caps_epoch: u32::MAX, // force first-use refresh from the profiler
+            device_for_rank: Arc::new(|rank| grim_tensor::Device::Rocm(rank)),
+        });
+        true
+    }
+
+    /// SCYTHE-2 farm mode (WI-INF3 serving integration).
+    ///
+    /// A dense model's blocks live on one device, so per-layer placement needs
+    /// the weight-sharded ring substrate that doesn't exist yet. What CAN route
+    /// today is whole-pass placement: one full weight replica per visible GPU,
+    /// with the controller pinning each admitted session to a rank. Sessions
+    /// pinned to different ranks run genuinely in parallel; the WaveTune
+    /// estimate steers sessions toward the faster card and the load-adjusted
+    /// capability view spreads them once it saturates.
+    ///
+    /// `primary` has already been loaded by the caller on its env-chosen
+    /// device — it becomes rank 0. The remaining replicas are loaded from
+    /// `path`, one per leftover visible ROCm device. Without an armed
+    /// controller or a second GPU this degrades to plain registration.
+    pub fn register_model_with_farm(&mut self, id: &str, primary: Box<dyn CausalLm>, path: &str) {
+        let devices = crate::model_loader::visible_rocm_devices();
+        let primary_ordinal = match (self.scythe_armed(), primary.device()) {
+            (true, grim_tensor::Device::Rocm(ord)) if devices.len() > 1 => *ord,
+            _ => {
+                self.register_model(id, primary);
+                return;
+            }
+        };
+        // Rank order: primary's own ordinal first, remaining GPUs after.
+        let mut ordered: Vec<grim_tensor::Device> =
+            vec![grim_tensor::Device::Rocm(primary_ordinal)];
+        for dev in devices {
+            if dev != grim_tensor::Device::Rocm(primary_ordinal) {
+                ordered.push(dev);
+            }
+        }
+        self.register_model(id, primary);
+        let mut replica_ids = vec![id.to_string()];
+        for (rank, dev) in ordered.iter().enumerate().skip(1) {
+            match crate::model_loader::load_from_path_on_device(path, dev.clone()) {
+                Ok(replica) => {
+                    let rid = Self::scythe_replica_id(id, rank);
+                    self.register_model(&rid, replica);
+                    replica_ids.push(rid);
+                }
+                Err(e) => {
+                    // A failed replica must not silently shrink the farm below
+                    // what the controller was told to route over — fail loudly.
+                    eprintln!(
+                        "[scythe2] farm replica {rid} on {dev:?} failed to load: {e}; \
+                         removing partial farm",
+                        rid = Self::scythe_replica_id(id, rank)
+                    );
+                    for rid in &replica_ids[1..] {
+                        self.models.remove(rid);
+                    }
+                    self.scythe_replicas.remove(id);
+                    return;
+                }
+            }
+        }
+        // The controller routes over exactly the registered replica count.
+        if let Some(ctrl) = self.scythe_ctrl.as_mut() {
+            let n = replica_ids.len();
+            if ctrl.num_gpus() != n {
+                let num_layers = ctrl.layer_fps.len();
+                let budget = ctrl.budget_ms;
+                *ctrl = crate::scythe2::C2plrController::new(num_layers, n, budget);
+            }
+        }
+        eprintln!(
+            "[scythe2] farm armed: {} replica(s) of {id} across GPUs {:?}",
+            replica_ids.len(),
+            ordered
+        );
+        self.scythe_replicas.insert(id.to_string(), replica_ids);
+    }
+
+    fn scythe_replica_id(base: &str, rank: usize) -> String {
+        format!("{base}#scythe{rank}")
+    }
+
+    /// Resolve the replica id a pinned request executes on. Unpinned requests
+    /// (or pins without a matching farm) resolve to the base id unchanged.
+    fn effective_model_id(&self, request_id: u64, base: &str) -> String {
+        match self.scythe_pin.get(&request_id).copied() {
+            Some(rank) => self
+                .scythe_replicas
+                .get(base)
+                .and_then(|ids| ids.get(rank))
+                .cloned()
+                .unwrap_or_else(|| base.to_string()),
+            None => base.to_string(),
+        }
+    }
+
+    /// Controller-driven admission decision: which replica rank should run
+    /// this request's whole forward pass?
+    ///
+    /// Feeds the controller a load-adjusted capability view — a GPU already
+    /// running sessions contributes roughly `tflops / (1 + active)` — so the
+    /// WaveTune latency argmin naturally balances once the fast card fills.
+    /// Honest fallbacks, in order: no farm → 0; profiler sees no GPUs → 0
+    /// (cannot route over hardware it cannot see); controller missing → 0.
+    fn scythe_pick_rank(&mut self, base: &str, seq_len: usize) -> usize {
+        let Some(ids) = self.scythe_replicas.get(base) else {
+            return 0;
+        };
+        let n = ids.len();
+        if n <= 1 {
+            return 0;
+        }
+        let Some(ref profiler) = self.capability_profiler else {
+            return 0;
+        };
+        let caps_raw = profiler.capabilities();
+        if caps_raw.is_empty() {
+            eprintln!("[scythe2] farm present but profiler sees no GPUs; pinning to rank 0");
+            return 0;
+        }
+        let mut load = vec![0usize; n];
+        for &r in self.scythe_pin.values() {
+            if r < n {
+                load[r] += 1;
+            }
+        }
+        let caps = load_adjusted_caps(&caps_raw, n, &load);
+        let links = grim_backend_rocm::CapabilityProfiler::link_matrix(n);
+        let epoch = grim_backend_rocm::current_epoch();
+        // Proxy shape: at pass granularity only the sequence length carries
+        // signal (the bucket), and relative TFLOPS ordering drives the pick.
+        let shape = [1usize, seq_len.max(1), 1, 1];
+        let Some(ctrl) = self.scythe_ctrl.as_mut() else {
+            return 0;
+        };
+        let placement = ctrl.decide(0, &shape, &caps, &links, epoch);
+        placement.ranks.first().copied().unwrap_or(0).min(n - 1)
+    }
+
+    /// Pinned farm rank for a request, if any. Telemetry/status surface.
+    pub fn scythe_pin_of(&self, request_id: u64) -> Option<usize> {
+        self.scythe_pin.get(&request_id).copied()
+    }
+
+    /// Replica id a request currently routes to (`None` when the request has
+    /// no tracked model). Status/telemetry surface for farm-mode routing.
+    pub fn resolved_model_id(&self, request_id: u64) -> Option<String> {
+        let base = self.request_model_ids.get(&request_id)?;
+        if base.is_empty() {
+            return None;
+        }
+        Some(self.effective_model_id(request_id, base))
+    }
+
+    /// Number of farm replicas registered for `base` (0 = not a farm model).
+    pub fn scythe_farm_size(&self, base: &str) -> usize {
+        self.scythe_replicas.get(base).map_or(0, Vec::len)
     }
 
     /// Returns the exponential moving average of generated tokens per second.
@@ -507,6 +795,15 @@ impl Engine {
             .and_then(|s| s.parse::<usize>().ok());
 
         let dev = model.device().clone();
+        // WI-INF2: one SCYTHE-2 controller per loaded model, sized by the
+        // model's real transformer depth (the `Engine::new` value was a
+        // placeholder — no model is known at construction time).
+        if let Some(num_layers) = model.num_layers_hint() {
+            if let Some(ctrl) = self.scythe_ctrl.as_mut() {
+                let num_gpus = ctrl.num_gpus();
+                *ctrl = crate::scythe2::C2plrController::new(num_layers, num_gpus, ctrl.budget_ms);
+            }
+        }
         // Preserve the model's own modality hint (audio enc-dec, TTS, VC,
         // vocoder, diffusion…) so serving-layer routing sees the truth.
         // Hardcoding TextInTextOut misreported every non-text model that
@@ -712,6 +1009,22 @@ impl Engine {
     /// session and capture per-request outcomes.
     pub fn tick(&mut self) -> Result<grim_scheduler::SchedulerOutput> {
         let tick_start = Instant::now();
+
+        // Background capability profiler tick check (~100ms cadence)
+        if let Some(ref profiler) = self.capability_profiler {
+            if profiler.age() >= Duration::from_millis(100) {
+                profiler.tick();
+                // WI-INF2: pull the (possibly bumped) capability epoch into
+                // the placement cache. This is the existing mode-B staleness
+                // path — `sync_epoch` clears the fast slots so the next
+                // forward re-decides against fresh capabilities; it is not
+                // new invalidation logic.
+                if let Some(ref mut ctrl) = self.scythe_ctrl {
+                    ctrl.cache.sync_epoch(grim_backend_rocm::current_epoch());
+                }
+            }
+        }
+
         let output = self.scheduler.schedule();
         let schedule_elapsed = tick_start.elapsed();
 
@@ -1043,6 +1356,10 @@ impl Engine {
         input_ids: &grim_tensor::Tensor,
         positions: &grim_tensor::Tensor,
     ) -> Result<StepOutcome> {
+        // SCYTHE-2 farm mode: a pinned request executes on its replica, not
+        // the base registration (same weights, different device).
+        let model_id = self.effective_model_id(request_id, model_id);
+        let model_id = model_id.as_str();
         // Resolve adapters for this specific request from the adapter registry
         let adapter_ids = self
             .request_adapters
@@ -1128,19 +1445,45 @@ impl Engine {
 
     /// Allocate a session with a paged KV cache wired in and prefix caching active (§5.1).
     pub fn enqueue_request_with_kv(&mut self, request: grim_scheduler::Request) -> Result<()> {
+        // SCYTHE-2 farm mode: pin the request to a controller-chosen replica
+        // BEFORE the session exists, so its KV pages are allocated on the
+        // pinned replica's device and stay there for the request's lifetime.
+        let base_for_pin = request
+            .model_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.models.keys().next().cloned());
+        let pin_rank = match base_for_pin.as_deref() {
+            Some(base) if self.scythe_armed() && self.scythe_replicas.contains_key(base) => {
+                let rank = self.scythe_pick_rank(base, request.prompt_tokens);
+                self.scythe_pin.insert(request.id, rank);
+                Some(rank)
+            }
+            _ => None,
+        };
         // Honor the model's actual device instead of silently forcing CPU.
-        let device = match request.model_id.as_deref() {
-            Some(id) if !id.is_empty() => self
-                .models
-                .get(id)
-                .map(|m| m.device.clone())
-                .unwrap_or(grim_tensor::Device::Cpu),
-            _ => self
-                .models
-                .values()
-                .next()
-                .map(|m| m.device.clone())
-                .unwrap_or(grim_tensor::Device::Cpu),
+        // Under a farm pin, that is the pinned replica's device.
+        let device = if pin_rank.is_some() {
+            base_for_pin
+                .as_deref()
+                .map(|base| self.effective_model_id(request.id, base))
+                .and_then(|rid| self.models.get(&rid).map(|m| m.device.clone()))
+                .unwrap_or(grim_tensor::Device::Cpu)
+        } else {
+            match request.model_id.as_deref() {
+                Some(id) if !id.is_empty() => self
+                    .models
+                    .get(id)
+                    .map(|m| m.device.clone())
+                    .unwrap_or(grim_tensor::Device::Cpu),
+                _ => self
+                    .models
+                    .values()
+                    .next()
+                    .map(|m| m.device.clone())
+                    .unwrap_or(grim_tensor::Device::Cpu),
+            }
         };
         let mut kv = grim_memory::PagedKvCache::new(
             self.block_pool.clone(),
@@ -1246,6 +1589,8 @@ impl Engine {
         self.request_adapters.remove(&id);
         self.request_input_ids.remove(&id);
         self.request_last_token.remove(&id);
+        // Release the farm slot so the controller's load view stays honest.
+        self.scythe_pin.remove(&id);
     }
 
     /// Deterministic RNG snapshot for a request, used by the speculative
@@ -1311,15 +1656,18 @@ impl Engine {
     }
 
     /// `(model_id, priority)` lookup for the request — a request is
-    /// bound to exactly one model in v1.
-    fn model_for_request(&self, id: u64) -> Option<(&str, i32)> {
+    /// bound to exactly one model in v1. Under SCYTHE-2 farm mode the
+    /// returned id is the pinned replica, so every caller (prefill drive,
+    /// decode loop) routes to it without knowing farms exist.
+    fn model_for_request(&self, id: u64) -> Option<(String, i32)> {
         let model_id = self.request_model_ids.get(&id)?;
-        if model_id.is_empty() {
+        let base = if model_id.is_empty() {
             // Fallback: pick the first registered model.
-            self.models.iter().next().map(|(k, _)| (k.as_str(), 0))
+            self.models.iter().next()?.0.clone()
         } else {
-            Some((model_id.as_str(), 0))
-        }
+            model_id.clone()
+        };
+        Some((self.effective_model_id(id, &base), 0))
     }
 }
 
@@ -2232,5 +2580,160 @@ mod tests {
         ));
         engine.register_eagle3_model("llama-eagle3", small_llama(), eagle3);
         assert!(engine.models.contains_key("llama-eagle3"));
+    }
+
+    #[test]
+    fn test_single_gpu_capability_profiler_is_none() {
+        // WI-INF1 Gate: default single-GPU box must pay zero probe cost
+        let engine = Engine::new(EngineConfig::default());
+        assert!(
+            engine.capability_profiler.is_none(),
+            "single-GPU box must have capability_profiler = None"
+        );
+        assert!(
+            engine.scythe_ctrl.is_none(),
+            "single-GPU box must have scythe_ctrl = None"
+        );
+        assert!(engine.capabilities().is_none());
+    }
+
+    #[test]
+    fn test_scythe_route_attach_requires_armed_engine() {
+        // Default engine (no flag, no multi-GPU): attach is a no-op that
+        // reports false rather than arming a half-configured route.
+        let mut engine = Engine::new(EngineConfig::default());
+        assert!(!engine.scythe_armed());
+        let mut sfb = crate::streaming_forward::StreamingBlockForward::new(1, 32);
+        assert!(!engine.attach_scythe_route(&mut sfb));
+        assert!(sfb.scythe_route.is_none());
+    }
+
+    fn farm_cap(tflops: f32, ordinal: usize) -> grim_tensor::backend::GpuCapability {
+        grim_tensor::backend::GpuCapability {
+            tflops_fp16: tflops,
+            tflops_fp8: 0.0,
+            hbm_bandwidth_gbps: 100.0,
+            vram_free_bytes: 16 << 30,
+            throttle_pct: 0.0,
+            ordinal,
+        }
+    }
+
+    /// WI-INF3 serving gate (farm mode): a pinned request executes on its
+    /// replica. Replicas are built from the same fixed seed, so logits must be
+    /// byte-identical to a plain single-replica engine — the pin decides
+    /// WHERE the pass runs, never WHAT it computes.
+    #[test]
+    fn test_scythe_farm_pin_routes_across_replicas() {
+        let mut engine = Engine::new(EngineConfig::default());
+        // Arm manually (env-flag construction is the WI-INF1 gate's job);
+        // controller sized for a 2-rank farm.
+        engine.scythe_ctrl = Some(crate::scythe2::C2plrController::new(1, 2, 10.0));
+        engine.capability_profiler = Some(Arc::new(grim_backend_rocm::CapabilityProfiler::new()));
+        engine.register_model("small", small_llama());
+        engine.register_model("small#scythe1", small_llama());
+        engine
+            .scythe_replicas
+            .insert("small".into(), vec!["small".into(), "small#scythe1".into()]);
+        assert_eq!(engine.scythe_farm_size("small"), 2);
+
+        // Plain engine, same weights, for the numeric baseline.
+        let mut single = Engine::new(EngineConfig::default());
+        single.register_model("small", small_llama());
+
+        let req = |id: u64| grim_scheduler::Request {
+            id,
+            prompt_tokens: 4,
+            model_id: Some("small".into()),
+            ..Default::default()
+        };
+        single.enqueue_request_with_kv(req(41)).unwrap();
+        engine.enqueue_request_with_kv(req(7)).unwrap();
+        engine.enqueue_request_with_kv(req(8)).unwrap();
+
+        // The admission path picked some rank (host-dependent); this gate is
+        // about ROUTING, so pin both ranks explicitly and verify each one.
+        engine.scythe_pin.insert(7, 1);
+        engine.scythe_pin.insert(8, 0);
+        assert_eq!(engine.scythe_pin_of(7), Some(1));
+        assert_eq!(engine.scythe_pin_of(8), Some(0));
+        assert_eq!(
+            engine.resolved_model_id(7).as_deref(),
+            Some("small#scythe1")
+        );
+        assert_eq!(engine.resolved_model_id(8).as_deref(), Some("small"));
+
+        let ids = grim_backend_cpu::cpu_tensor(vec![3.0f32], grim_tensor::Shape::new(vec![1]));
+        let pos = grim_backend_cpu::cpu_tensor(vec![0.0f32], grim_tensor::Shape::new(vec![1]));
+        let base = single.step_one(41, "small", &ids, &pos).unwrap();
+        let on_rank1 = engine.step_one(7, "small", &ids, &pos).unwrap();
+        let on_rank0 = engine.step_one(8, "small", &ids, &pos).unwrap();
+
+        let base_v = base.logits.unwrap().to_vec_f32().unwrap();
+        assert_eq!(
+            on_rank1.logits.unwrap().to_vec_f32().unwrap(),
+            base_v,
+            "replica rank 1 must produce byte-identical logits"
+        );
+        assert_eq!(
+            on_rank0.logits.unwrap().to_vec_f32().unwrap(),
+            base_v,
+            "rank 0 must produce byte-identical logits"
+        );
+
+        // Finishing releases the farm slot.
+        engine.finish_request(7);
+        assert_eq!(engine.scythe_pin_of(7), None);
+    }
+
+    /// WI-INF5 farm corollary: the load-adjusted capability view must spread
+    /// sessions once the fast card saturates instead of pinning everything to
+    /// it — unloaded traffic goes to the 80-TFLOPS card, but with 10 sessions
+    /// already there its effective 80/11 TFLOPS drops below the idle 8-TFLOPS
+    /// card and the next admission lands there.
+    #[test]
+    fn test_load_adjusted_caps_balances_farm_placement() {
+        use grim_tensor::backend::ScytheLink;
+        let caps = vec![farm_cap(8.0, 0), farm_cap(80.0, 1)];
+        let links = vec![
+            ScytheLink::PeerDirect,
+            ScytheLink::Host,
+            ScytheLink::Host,
+            ScytheLink::PeerDirect,
+        ];
+        let shape = [1usize, 2048, 1, 1];
+
+        let mut unloaded = crate::scythe2::C2plrController::new(1, 2, 150.0);
+        let p = unloaded.decide(0, &shape, &load_adjusted_caps(&caps, 2, &[0, 0]), &links, 0);
+        assert_eq!(
+            p.ranks,
+            vec![1],
+            "unloaded admission must take the fast card"
+        );
+
+        let mut saturated = crate::scythe2::C2plrController::new(1, 2, 150.0);
+        let p2 = saturated.decide(
+            0,
+            &shape,
+            &load_adjusted_caps(&caps, 2, &[0, 10]),
+            &links,
+            0,
+        );
+        assert_eq!(
+            p2.ranks,
+            vec![0],
+            "saturated fast card must yield to the idle slow card"
+        );
+    }
+
+    /// Farm registration without an armed controller degrades to a plain
+    /// registration — no replica registry entry, no pins.
+    #[test]
+    fn test_scythe_farm_degrades_to_plain_registration() {
+        let mut engine = Engine::new(EngineConfig::default());
+        assert!(!engine.scythe_armed());
+        engine.register_model_with_farm("small", small_llama(), "/nonexistent/path.gguf");
+        assert_eq!(engine.scythe_farm_size("small"), 0);
+        assert!(engine.has_model("small"));
     }
 }

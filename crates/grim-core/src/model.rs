@@ -80,6 +80,14 @@ pub trait Model: Send + Sync {
 /// Autoregressive, token-level generation — dense transformers, Mamba, hybrids.
 pub trait CausalLm: Model {
     fn new_session(&self) -> Box<dyn crate::session::SessionT>;
+    /// Transformer depth of this model, when it is layer-structured. Used by
+    /// the engine to size per-model subsystems (e.g. the SCYTHE-2 placement
+    /// controller) at registration time. `None` (the default) means "not
+    /// layer-structured or unknown" — callers must fall back to a config
+    /// default rather than guessing.
+    fn num_layers_hint(&self) -> Option<usize> {
+        None
+    }
     fn forward(
         &self,
         session: &mut dyn crate::session::SessionT,

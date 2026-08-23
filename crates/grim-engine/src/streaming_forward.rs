@@ -133,6 +133,61 @@ fn transfer_to_device(x: &Tensor, target_device: &Device) -> Result<Tensor> {
     ))
 }
 
+/// SCYTHE-2 placement routing attached to a [`StreamingBlockForward`] (WI-INF3).
+///
+/// When present, every `forward_block` consults the controller with the real
+/// per-call `layer_idx` and activation shape — the direct analog of the fix
+/// landed in `grim-garage::run_rank_sft_forward` (no synthetic keys) — and
+/// executes the block on the controller-chosen device. Placement changes which
+/// device runs the block, never the math: every rank runs identical weights and
+/// kernels, so numerics are invariant under re-placement (pinned by the parity
+/// gate test).
+pub struct ScytheRoute {
+    /// The online placement router. Shared ownership so the engine can keep
+    /// warming/observing the same controller it handed off.
+    pub ctrl: std::sync::Arc<std::sync::Mutex<crate::scythe2::C2plrController>>,
+    /// Live capability source; refreshed only when the capability epoch moves,
+    /// so the ~50 ns decode hit path never pays for a topology probe.
+    /// `None` in CPU-only harnesses, which seed `caps`/`links` directly.
+    pub profiler: Option<Arc<grim_backend_rocm::CapabilityProfiler>>,
+    /// Capability snapshot used when `profiler` is `None` (and the seed value
+    /// otherwise overwritten on first epoch refresh).
+    pub caps: Vec<grim_tensor::backend::GpuCapability>,
+    /// Link-matrix snapshot paired with `caps` (same refresh discipline).
+    pub links: Vec<grim_tensor::backend::ScytheLink>,
+    /// Epoch the `caps`/`links` snapshot was taken at (`CAPABILITY_EPOCH`).
+    pub caps_epoch: u32,
+    /// Rank → execution device. The engine maps rank → `Device::Rocm(rank)`;
+    /// CPU-only harnesses map every rank to `Device::Cpu`, which is what lets
+    /// the parity gate prove numerics-invariance without GPUs.
+    pub device_for_rank: Arc<dyn Fn(usize) -> Device + Send + Sync>,
+}
+
+impl ScytheRoute {
+    /// Refresh `caps`/`links` iff the capability epoch moved since the snapshot
+    /// was taken. Topology probes (`link_matrix`) cost host µs-to-ms per pair,
+    /// so they must never run per layer call — only on epoch bumps (~100 ms
+    /// cadence or GPU-leave), where they amortize against a full cache miss.
+    fn refresh_if_stale(&mut self) {
+        let epoch = grim_backend_rocm::current_epoch();
+        if !self.caps.is_empty() && self.caps_epoch == epoch {
+            return;
+        }
+        if let Some(ref profiler) = self.profiler {
+            let caps = profiler.capabilities();
+            let n = caps.len().max(1);
+            self.links = grim_backend_rocm::CapabilityProfiler::link_matrix(n);
+            self.caps = caps;
+            self.caps_epoch = epoch;
+        } else if self.caps.is_empty() {
+            // No live source and nothing seeded: single anonymous device.
+            self.caps = vec![grim_tensor::backend::GpuCapability::default()];
+            self.links = vec![grim_tensor::backend::ScytheLink::PeerDirect];
+            self.caps_epoch = epoch;
+        }
+    }
+}
+
 /// Block-wise streaming forward executor for memory-bounded QLoRA fine-tuning.
 pub struct StreamingBlockForward {
     pub num_layers: usize,
@@ -144,6 +199,9 @@ pub struct StreamingBlockForward {
     /// reused across forward and recompute passes. Cleared explicitly via
     /// [`Self::clear_block_cache`] when the model or configuration changes.
     block_cache: std::sync::Mutex<HashMap<(usize, Device), LlamaBlock>>,
+    /// Optional SCYTHE-2 routing (WI-INF3). `None` keeps blocks on the
+    /// incoming tensor's device — unchanged behavior and the default.
+    pub scythe_route: Option<ScytheRoute>,
 }
 
 impl StreamingBlockForward {
@@ -155,7 +213,51 @@ impl StreamingBlockForward {
             checkpoint_buffer: GradientCheckpointBuffer::new(),
             rope_scaling: None,
             block_cache: std::sync::Mutex::new(HashMap::new()),
+            scythe_route: None,
         }
+    }
+
+    /// Attach SCYTHE-2 placement routing (WI-INF3). While attached, every
+    /// `forward_block` runs its block on the controller-chosen device.
+    pub fn attach_scythe_route(&mut self, route: ScytheRoute) {
+        self.scythe_route = Some(route);
+    }
+
+    /// Detach SCYTHE-2 routing; subsequent blocks run on the incoming device.
+    pub fn clear_scythe_route(&mut self) {
+        self.scythe_route = None;
+    }
+
+    /// WI-INF3 decision step: consult the controller with the real layer index
+    /// and activation shape, then move `x` to the chosen rank's device.
+    ///
+    /// Cache-hit path ~50 ns/layer; miss path ~10 µs/layer (TODO(gpu-verify):
+    /// budget claim measured host-side only so far — see
+    /// `benches/scythe2_decide_miss.rs` and WI-INF4).
+    fn route_for_execution(&mut self, layer_idx: usize, x: &Tensor) -> Result<Tensor> {
+        let Some(route) = self.scythe_route.as_mut() else {
+            return Ok(x.clone());
+        };
+        route.refresh_if_stale();
+        let epoch = grim_backend_rocm::current_epoch();
+        let shape = x.shape().dims();
+        let placement = {
+            let mut ctrl = route.ctrl.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.decide(layer_idx as u32, shape, &route.caps, &route.links, epoch)
+        };
+        // Primary owner = the rank holding the largest partition share; the
+        // whole block executes there. Any rank yields identical numerics —
+        // only load balance differs.
+        let target_rank = placement
+            .partition
+            .iter()
+            .copied()
+            .zip(placement.ranks.iter().copied())
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, r)| r)
+            .unwrap_or(0);
+        let target_device = (route.device_for_rank)(target_rank);
+        transfer_to_device(x, &target_device)
     }
 
     /// Drop the cached materialized blocks. Call after the underlying model
@@ -266,6 +368,7 @@ impl StreamingBlockForward {
         let x_target = transfer_to_device(x, target_device)?;
         self.forward_block(provider, cfg, layer_idx, &x_target, positions)
     }
+
     pub fn forward_block(
         &mut self,
         provider: &dyn TensorProvider,
@@ -281,12 +384,16 @@ impl StreamingBlockForward {
             )));
         }
 
+        // WI-INF3: controller-supplied placement when a SCYTHE-2 route is
+        // attached; otherwise the incoming device (fixed-rank behavior).
+        let x = self.route_for_execution(layer_idx, x)?;
+
         // Save input checkpoint for recomputation during backward pass
         self.checkpoint_buffer.save(layer_idx, x.clone());
 
         // Load block weights lazily from provider on target tensor device, run real forward
         let block = self.block(provider, cfg, layer_idx, x.device())?;
-        block.forward(x, positions.unwrap_or(&[]))
+        block.forward(&x, positions.unwrap_or(&[]))
     }
 
     /// Recompute block forward pass from saved input checkpoint during backward traversal.
@@ -879,5 +986,87 @@ mod tests {
         for (a, b) in out_vals.iter().zip(rec_vals.iter()) {
             assert!((a - b).abs() < 1e-6, "recompute mismatch: {a} vs {b}");
         }
+    }
+
+    /// WI-INF3 Gate: placement changes device routing, never numerics.
+    ///
+    /// The route is attached over an asymmetric 2-GPU topology with every
+    /// rank mapped back to `Device::Cpu`, so the routed block must produce
+    /// byte-identical output to the plain forward no matter which rank the
+    /// controller picks — the property "placement moves work, never math".
+    /// Also pins the WI-INF5 first-cut fallback: the untrained (all-zero) MLP
+    /// must steer the block to the faster card (rank 1), not sticky rank 0.
+    #[test]
+    fn scythe_route_parity_and_untrained_fallback_gate() {
+        use grim_tensor::backend::{GpuCapability, ScytheLink};
+        use std::sync::Arc;
+
+        let provider = StubProvider::new();
+        let cfg = provider.cfg.clone();
+        let x = cpu_tensor(
+            vec![0.5; cfg.hidden_size],
+            Shape::new(vec![1, cfg.hidden_size]),
+        );
+        let positions = vec![0u32];
+
+        let mut plain = StreamingBlockForward::new(4, cfg.hidden_size);
+        let plain_vec = plain
+            .forward_block(&provider, &cfg, 0, &x, Some(&positions))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        let caps: Vec<GpuCapability> = [(8.0f32, 0usize), (80.0, 1usize)]
+            .into_iter()
+            .map(|(tflops, ordinal)| GpuCapability {
+                tflops_fp16: tflops,
+                tflops_fp8: 0.0,
+                hbm_bandwidth_gbps: 100.0,
+                vram_free_bytes: 16 << 30,
+                throttle_pct: 0.0,
+                ordinal,
+            })
+            .collect();
+        let links = vec![
+            ScytheLink::PeerDirect,
+            ScytheLink::Host,
+            ScytheLink::Host,
+            ScytheLink::PeerDirect,
+        ];
+
+        let mut routed = StreamingBlockForward::new(4, cfg.hidden_size);
+        routed.attach_scythe_route(ScytheRoute {
+            ctrl: Arc::new(std::sync::Mutex::new(crate::scythe2::C2plrController::new(
+                4, 2, 10.0,
+            ))),
+            profiler: None,
+            caps,
+            links,
+            caps_epoch: 0,
+            device_for_rank: Arc::new(|_rank| Device::Cpu),
+        });
+        let routed_vec = routed
+            .forward_block(&provider, &cfg, 0, &x, Some(&positions))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(
+            plain_vec, routed_vec,
+            "SCYTHE-2 placement routing must not change block numerics"
+        );
+
+        let ctrl = routed.scythe_route.as_ref().unwrap().ctrl.clone();
+        let ctrl = ctrl.lock().unwrap_or_else(|e| e.into_inner());
+        let placed_rank = ctrl
+            .cache
+            .get(0, crate::scythe2::bucketize(&[1, cfg.hidden_size]))
+            .map(|p| p.ranks[0]);
+        assert_eq!(
+            placed_rank,
+            Some(1),
+            "untrained MLP must fall back to the WaveTune latency estimate \
+             (argmin) and land on the 80-TFLOPS card, not sticky rank 0"
+        );
     }
 }
