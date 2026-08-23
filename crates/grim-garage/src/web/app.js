@@ -20,6 +20,30 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // Dynamic Server Host / Port sync
+  function syncServerHostDisplay(isOnline = true) {
+    const statusTextEl = document.getElementById('server-status-text');
+    const statusDotEl = document.getElementById('server-status-dot');
+    const currentHost = window.location.host || '127.0.0.1:8741';
+    if (statusTextEl) {
+      statusTextEl.textContent = isOnline ? `Server Online (${currentHost})` : `Server Offline (${currentHost})`;
+    }
+    if (statusDotEl) {
+      if (isOnline) {
+        statusDotEl.classList.remove('offline');
+        statusDotEl.classList.add('online');
+      } else {
+        statusDotEl.classList.remove('online');
+        statusDotEl.classList.add('offline');
+      }
+    }
+  }
+  syncServerHostDisplay(true);
+
+  // Global cached state for evaluation
+  let cachedDevices = [];
+  let cachedModels = [];
+
   // Fetch Hardware & Init
   fetchGpuTelemetry();
   fetchModelsList();
@@ -33,9 +57,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-resume-job').addEventListener('click', () => handleJobControl('resume'));
   document.getElementById('btn-cancel-job').addEventListener('click', () => handleJobControl('cancel'));
 
-  // Autotune Trigger
+  // Autotune & Feasibility Triggers
   document.getElementById('select-model').addEventListener('change', generateAutotuneRecommendation);
-  document.getElementById('select-dataset').addEventListener('change', generateAutotuneRecommendation);
+  document.getElementById('select-dataset')?.addEventListener('change', generateAutotuneRecommendation);
+  document.getElementById('input-mode')?.addEventListener('change', generateAutotuneRecommendation);
+  document.getElementById('input-lora-rank')?.addEventListener('input', generateAutotuneRecommendation);
+  document.getElementById('input-optimizer')?.addEventListener('change', generateAutotuneRecommendation);
   document.getElementById('btn-apply-autotune').addEventListener('click', applyAutotunePreset);
 
   // Soul Eater is a fixed recipe (spectral-orthogonal adapter init + its own
@@ -142,13 +169,38 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/rocm/devices');
       if (!res.ok) throw new Error('API error');
       const data = await res.json();
+      syncServerHostDisplay(true);
       const telemetryList = document.getElementById('gpu-telemetry-list');
 
+      // Normalize device records from either data.devices or data.backends
+      let devicesList = [];
       if (data.devices && data.devices.length > 0) {
+        devicesList = data.devices;
+      } else if (data.backends && data.backends.length > 0) {
+        devicesList = data.backends.map((b, idx) => {
+          // Parse detail if needed
+          return {
+            ordinal: idx,
+            name: b.name || 'Accelerator',
+            vendor: 'Host',
+            backend: b.name || 'ROCm',
+            is_rocm_compliant: b.available,
+            gcn_arch: b.device_kind || '',
+            vram_bytes: 8 * 1024 * 1024 * 1024,
+            vram_used_bytes: 0,
+            gpu_busy_percent: 0,
+            compute_units: 36
+          };
+        });
+      }
+
+      cachedDevices = devicesList;
+
+      if (devicesList.length > 0) {
         if (telemetryList) {
           telemetryList.innerHTML = '';
-          data.devices.forEach(d => {
-            let backendTag = 'Vulkan';
+          devicesList.forEach(d => {
+            let backendTag = d.backend || 'ROCm';
             const vUpper = (d.vendor || '').toUpperCase();
             const bUpper = (d.backend || '').toUpperCase();
             if (vUpper.includes('NVIDIA') || bUpper.includes('CUDA')) {
@@ -163,34 +215,40 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!cleanName || cleanName.toLowerCase().includes('generic') || cleanName === 'Radeon GPU') {
               cleanName = d.gcn_arch ? `Radeon GPU (${d.gcn_arch})` : 'GPU Accelerator';
             }
-            const nameStr = `${backendTag} ${cleanName}`;
+            const nameStr = `${backendTag} · ${cleanName}`;
             const usedBytes = d.vram_used_bytes || 0;
-            const totalBytes = d.vram_bytes || 1;
+            const totalBytes = d.vram_bytes || (8 * 1024 * 1024 * 1024);
 
             const usedGb = (usedBytes / (1024 * 1024 * 1024)).toFixed(2);
             const totalGb = (totalBytes / (1024 * 1024 * 1024)).toFixed(1);
             const pct = Math.min(100, Math.max(0, (usedBytes / totalBytes) * 100));
 
             const item = document.createElement('div');
-            item.style.cssText = 'padding: 6px; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 4px;';
+            item.style.cssText = 'padding: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; margin-bottom: 6px;';
             item.innerHTML = `
-              <div class="gpu-name" style="font-size: 11px; font-weight: 600; color: var(--text-main); margin-bottom: 3px;">GPU ${d.ordinal}: ${nameStr}</div>
-              <div class="vram-bar-container" style="height: 6px;">
-                <div class="vram-bar" style="width: ${pct.toFixed(1)}%;"></div>
+              <div class="gpu-name" style="font-size: 11px; font-weight: 600; color: var(--text-main); margin-bottom: 4px; display: flex; justify-content: space-between;">
+                <span>GPU ${d.ordinal}: ${nameStr}</span>
+                <span style="font-size: 10px; color: var(--text-muted);">${d.compute_units ? `${d.compute_units} CUs` : ''}</span>
               </div>
-              <div class="vram-text" style="font-size: 10px; margin-top: 2px; color: var(--text-muted);">${usedGb} GB / ${totalGb} GB VRAM · ${Number(d.gpu_busy_percent || 0)}% util</div>
+              <div class="vram-bar-container" style="height: 6px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden;">
+                <div class="vram-bar" style="width: ${pct.toFixed(1)}%; height: 100%; background: ${pct > 85 ? 'var(--danger-color, #ef4444)' : 'var(--primary-accent, #6366f1)'}; transition: width 0.3s ease;"></div>
+              </div>
+              <div class="vram-text" style="font-size: 10px; margin-top: 4px; color: var(--text-muted); display: flex; justify-content: space-between;">
+                <span>${usedGb} GB / ${totalGb} GB VRAM (${pct.toFixed(0)}%)</span>
+                <span>${Number(d.gpu_busy_percent || 0)}% Load</span>
+              </div>
             `;
             telemetryList.appendChild(item);
           });
         }
 
-        const dev = data.devices[0];
+        const dev = devicesList[0];
         updateRepackCapabilities(dev);
       } else {
         if (telemetryList) {
           telemetryList.innerHTML = `
-            <div class="gpu-name">CPU Host Mode</div>
-            <div class="vram-text">RAM Allocation Active</div>
+            <div class="gpu-name" style="font-size: 12px; font-weight: 600;">CPU Host Mode</div>
+            <div class="vram-text" style="font-size: 11px; color: var(--text-muted);">System RAM Active</div>
           `;
         }
         updateRepackCapabilities(null);
@@ -199,14 +257,14 @@ document.addEventListener('DOMContentLoaded', () => {
       // Populate Multi-GPU Selection Box in Training Control Room
       const gpuContainer = document.getElementById('gpu-selection-container');
       if (gpuContainer) {
-        if (data.devices && data.devices.length > 0) {
+        if (devicesList.length > 0) {
           gpuContainer.innerHTML = '';
-          data.devices.forEach((d, idx) => {
+          devicesList.forEach((d, idx) => {
             const label = document.createElement('label');
-            label.style.cssText = 'display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: var(--text-main);';
+            label.style.cssText = 'display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: var(--text-main); margin-bottom: 4px;';
             const rawArch = (d.gcn_arch || '').split(' ')[0];
             label.innerHTML = `
-              <input type="checkbox" class="gpu-select-checkbox" data-ordinal="${d.ordinal}" data-arch="${rawArch}" ${idx === 0 ? 'checked' : ''}>
+              <input type="checkbox" class="gpu-select-checkbox" data-ordinal="${d.ordinal}" data-vram="${d.vram_bytes}" data-arch="${rawArch}" ${idx === 0 ? 'checked' : ''}>
               <span>GPU ${d.ordinal}: ${d.name} (${d.gcn_arch})</span>
               <span class="text-muted" style="margin-left: auto;">${(d.vram_bytes / (1024*1024*1024)).toFixed(1)} GB</span>
             `;
@@ -214,15 +272,23 @@ document.addEventListener('DOMContentLoaded', () => {
           });
 
           document.querySelectorAll('.gpu-select-checkbox').forEach(cb => {
-            cb.addEventListener('change', validateGpuSelection);
+            cb.addEventListener('change', () => {
+              validateGpuSelection();
+              generateAutotuneRecommendation();
+            });
           });
         } else {
           gpuContainer.innerHTML = '<span class="text-muted" style="font-size: 12px;">Host CPU Execution Mode Active</span>';
         }
       }
+
+      // Re-evaluate feasibility whenever telemetry updates
+      generateAutotuneRecommendation();
     } catch (e) {
       console.warn('GPU Probe failed:', e);
-      document.getElementById('gpu-name-display').textContent = 'Host Hardware';
+      syncServerHostDisplay(false);
+      const nameDisp = document.getElementById('gpu-name-display');
+      if (nameDisp) nameDisp.textContent = 'Host Hardware (Unreachable)';
     }
   }
 
@@ -242,10 +308,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const isMatching = archs.every(a => a === firstArch);
 
     if (isMatching) {
-      if (help) help.innerHTML = `<span style="color: var(--success-color); font-weight: 600;">✅ Parallel Multi-GPU Training Enabled (${firstArch} x${checked.length})</span>`;
+      if (help) help.innerHTML = `<span style="color: var(--success-color, #22c55e); font-weight: 600;">✅ Parallel Multi-GPU Training Enabled (${firstArch} x${checked.length})</span>`;
       if (startBtn) startBtn.disabled = false;
     } else {
-      if (help) help.innerHTML = `<span style="color: var(--danger-color); font-weight: 600;">⚠️ Multi-GPU parallel training requires matching GPU architectures (e.g. dual ${firstArch}). Cannot pair ${archs.join(' with ')}.</span>`;
+      if (help) help.innerHTML = `<span style="color: var(--danger-color, #ef4444); font-weight: 600;">⚠️ Multi-GPU parallel training requires matching GPU architectures (e.g. dual ${firstArch}). Cannot pair ${archs.join(' with ')}.</span>`;
       if (startBtn) startBtn.disabled = true;
     }
   }
@@ -261,6 +327,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (chatSelect) chatSelect.innerHTML = '<option value="">Select a model checkpoint (.grim / .gguf)...</option>';
 
       if (data.models) {
+        cachedModels = data.models;
         data.models.forEach(m => {
           const displayName = m.name || m.id || (m.path ? m.path.split('/').pop() : 'model');
           const sizeText = m.size_bytes && m.size_bytes > 0 ? ` (${(m.size_bytes / (1024*1024*1024)).toFixed(1)} GB)` : '';
@@ -280,6 +347,7 @@ document.addEventListener('DOMContentLoaded', () => {
             chatSelect.appendChild(cOpt);
           }
         });
+        generateAutotuneRecommendation();
       }
     } catch (e) {
       console.error('Fetch models error:', e);
@@ -404,8 +472,21 @@ document.addEventListener('DOMContentLoaded', () => {
         if (ev && ev.metric && typeof ev.metric.loss === 'number') {
           const loss = ev.metric.loss;
           document.getElementById('val-loss').textContent = loss.toFixed(4);
-          document.getElementById('val-vram').textContent = 'Unavailable';
-          document.getElementById('val-tokens-sec').textContent = 'Unavailable';
+          
+          if (typeof ev.metric.vram_used_mb === 'number' && ev.metric.vram_used_mb > 0) {
+            document.getElementById('val-vram').textContent = `${(ev.metric.vram_used_mb / 1024).toFixed(2)} GB`;
+          } else {
+            document.getElementById('val-vram').textContent = 'Host Alloc';
+          }
+
+          if (typeof ev.metric.samples_per_sec === 'number' && ev.metric.samples_per_sec > 0) {
+            document.getElementById('val-tokens-sec').textContent = `${ev.metric.samples_per_sec.toFixed(2)} smp/s`;
+          } else if (typeof ev.metric.tokens === 'number') {
+            document.getElementById('val-tokens-sec').textContent = `${ev.metric.tokens} tok`;
+          } else {
+            document.getElementById('val-tokens-sec').textContent = 'Active';
+          }
+
           lossHistory.push(loss);
           if (lossHistory.length > 50) lossHistory.shift();
           renderLossChart();
@@ -539,27 +620,232 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function evaluateHardwareFeasibility(modelPath, trainingMode, loraRank, optimizerName, availableVramBytes, gpuCount) {
+    // 1. Estimate Base Model Size in GB
+    let modelEntry = cachedModels.find(m => m.path === modelPath);
+    let modelSizeBytes = modelEntry && modelEntry.size_bytes > 0 ? modelEntry.size_bytes : 0;
+    
+    // If size not in entry, estimate from model name tags or default 8B (~4.5 GB in Q4, ~16 GB in FP16)
+    const nameLower = (modelPath || '').toLowerCase();
+    if (modelSizeBytes === 0) {
+      if (nameLower.includes('70b') || nameLower.includes('72b')) {
+        modelSizeBytes = nameLower.includes('q4') || nameLower.includes('crow') ? 40 * 1024 * 1024 * 1024 : 140 * 1024 * 1024 * 1024;
+      } else if (nameLower.includes('32b') || nameLower.includes('33b')) {
+        modelSizeBytes = nameLower.includes('q4') || nameLower.includes('crow') ? 18 * 1024 * 1024 * 1024 : 64 * 1024 * 1024 * 1024;
+      } else if (nameLower.includes('13b') || nameLower.includes('14b') || nameLower.includes('16b')) {
+        modelSizeBytes = nameLower.includes('q4') || nameLower.includes('crow') ? 9 * 1024 * 1024 * 1024 : 32 * 1024 * 1024 * 1024;
+      } else if (nameLower.includes('7b') || nameLower.includes('8b') || nameLower.includes('9b')) {
+        modelSizeBytes = nameLower.includes('q4') || nameLower.includes('crow') ? 5 * 1024 * 1024 * 1024 : 16 * 1024 * 1024 * 1024;
+      } else if (nameLower.includes('3b') || nameLower.includes('4b')) {
+        modelSizeBytes = nameLower.includes('q4') || nameLower.includes('crow') ? 2.5 * 1024 * 1024 * 1024 : 8 * 1024 * 1024 * 1024;
+      } else {
+        modelSizeBytes = 4.5 * 1024 * 1024 * 1024; // Default ~7B Q4
+      }
+    }
+
+    const baseWeightGb = modelSizeBytes / (1024 * 1024 * 1024);
+    const isFullFinetune = trainingMode === 'Bf16Full';
+    const isQlora = trainingMode === 'QLoRA' || trainingMode === 'SpectralQLoRA' || trainingMode === 'SoulEater';
+
+    // Base parameters estimate: ~ baseWeightGb * 2 Billion params per 4GB Q4 or 1B per 2GB FP16
+    const estimatedParamsB = nameLower.includes('70b') ? 70 : nameLower.includes('32b') ? 32 : nameLower.includes('14b') ? 14 : nameLower.includes('9b') ? 9 : nameLower.includes('8b') ? 8 : nameLower.includes('7b') ? 7 : (baseWeightGb * 1.6);
+    
+    // Trainable params: for LoRA/QLoRA it's ~0.1% to 1% of total params depending on rank (r=16 is ~0.2%)
+    const trainableParamsB = isFullFinetune ? estimatedParamsB : estimatedParamsB * (loraRank / 16.0) * 0.002;
+    
+    // Optimizer memory:
+    // AdamW FP32: 8 bytes per trainable param (m + v) + 4 bytes FP32 master weight + 4 bytes grad
+    // AdamW 8-bit: 2 bytes per param + 4 bytes grad
+    // Paged AdamW: 0-2 GB hot in VRAM (rest in RAM)
+    // LOMO / AdaLomo: 0-0.1 GB (fused backward update)
+    // Lion 8-bit: 1 byte per param
+    let optimizerBytesPerParam = 16.0; // standard AdamW
+    if (optimizerName && (optimizerName.includes('8Bit') || optimizerName.includes('8bit'))) {
+      optimizerBytesPerParam = 6.0;
+    } else if (optimizerName && optimizerName.includes('Paged')) {
+      optimizerBytesPerParam = 4.0;
+    } else if (optimizerName === 'LOMO' || optimizerName === 'Adalomo') {
+      optimizerBytesPerParam = 0.5;
+    } else if (optimizerName === 'Adafactor' || optimizerName === 'Lion') {
+      optimizerBytesPerParam = 8.0;
+    }
+
+    let optimizerGb = (trainableParamsB * 1e9 * optimizerBytesPerParam) / (1024 * 1024 * 1024);
+    if (isFullFinetune) {
+      // Full fine-tune needs base weights in FP16/BF16 (2 bytes/param) + Gradients (2-4 bytes/param) + Optimizer state
+      optimizerGb = (estimatedParamsB * 1e9 * (2 + 4 + optimizerBytesPerParam)) / (1024 * 1024 * 1024);
+    }
+
+    // 3. Activation & KV Cache memory (sequence length ~2048, batch size 1)
+    let activationGb = isFullFinetune ? 4.5 : (0.8 + (loraRank / 64.0) * 0.4);
+    
+    // Total VRAM required
+    let totalRequiredGb = baseWeightGb + optimizerGb + activationGb;
+    
+    // Single or Multi-GPU VRAM available
+    const totalGpuVramGb = (availableVramBytes * Math.max(1, gpuCount)) / (1024 * 1024 * 1024);
+    const perGpuVramGb = availableVramBytes / (1024 * 1024 * 1024);
+
+    return {
+      modelSizeBytes,
+      baseWeightGb,
+      estimatedParamsB,
+      trainableParamsB,
+      optimizerGb,
+      activationGb,
+      totalRequiredGb,
+      totalGpuVramGb,
+      perGpuVramGb,
+      isFeasible: totalRequiredGb <= (totalGpuVramGb * 0.92), // 8% headroom for ROCm runtime & OS compositor
+      shortfallGb: Math.max(0, totalRequiredGb - totalGpuVramGb)
+    };
+  }
+
   function generateAutotuneRecommendation() {
-    const model = document.getElementById('select-model').value;
+    const modelSelect = document.getElementById('select-model');
+    const model = modelSelect ? modelSelect.value : '';
     const box = document.getElementById('autotune-recommendation-box');
     const text = document.getElementById('autotune-text');
-    if (!model) return;
-    text.textContent = `Recommended for ${model.split('/').pop()}: LoRA Rank r=16. Hardware-specific VRAM requirements will be calculated after the model and training configuration are loaded.`;
+    const applyBtn = document.getElementById('btn-apply-autotune');
+    if (!box || !text) return;
+
+    if (!model) {
+      text.innerHTML = 'Select a base model and dataset to evaluate hardware telemetry and compute best-case training settings.';
+      box.style.display = 'block';
+      return;
+    }
+
+    const trainingMode = document.getElementById('input-mode')?.value || 'QLoRA';
+    const loraRank = parseInt(document.getElementById('input-lora-rank')?.value) || 16;
+    const optimizerName = document.getElementById('input-optimizer')?.value || 'AdamW';
+
+    // Get selected GPU VRAM
+    const checkedGpus = Array.from(document.querySelectorAll('.gpu-select-checkbox:checked'));
+    let primaryVramBytes = 8 * 1024 * 1024 * 1024;
+    let gpuCount = checkedGpus.length || 1;
+    if (checkedGpus.length > 0) {
+      const v = checkedGpus[0].getAttribute('data-vram');
+      if (v && parseInt(v) > 0) primaryVramBytes = parseInt(v);
+    } else if (cachedDevices.length > 0 && cachedDevices[0].vram_bytes > 0) {
+      primaryVramBytes = cachedDevices[0].vram_bytes;
+    }
+
+    const evalResult = evaluateHardwareFeasibility(model, trainingMode, loraRank, optimizerName, primaryVramBytes, gpuCount);
+    const modelName = model.split('/').pop();
+
+    if (evalResult.isFeasible) {
+      // Best case scenario passes!
+      const headroomGb = (evalResult.totalGpuVramGb - evalResult.totalRequiredGb).toFixed(1);
+      box.style.background = 'rgba(34, 197, 94, 0.08)';
+      box.style.borderColor = 'rgba(34, 197, 94, 0.35)';
+      text.innerHTML = `
+        <div style="margin-bottom: 6px;">
+          <strong style="color: var(--success-color, #22c55e); font-size: 13px;">✅ Optimal Hardware Fit (${modelName})</strong>
+        </div>
+        <div style="font-size: 12px; line-height: 1.5; color: var(--text-main);">
+          Estimated VRAM: <strong>${evalResult.totalRequiredGb.toFixed(1)} GB</strong> / <strong>${evalResult.totalGpuVramGb.toFixed(1)} GB</strong> Available (${headroomGb} GB headroom).<br>
+          • Base Weights: ${evalResult.baseWeightGb.toFixed(1)} GB | Optimizer State: ${evalResult.optimizerGb.toFixed(2)} GB | Activations: ${evalResult.activationGb.toFixed(1)} GB.<br>
+          • Recommended: <strong>${trainingMode} (r=${loraRank})</strong> with <strong>${optimizerName}</strong>, fused RMSNorm &amp; FlashAttention enabled.
+        </div>
+      `;
+      if (applyBtn) {
+        applyBtn.style.display = 'inline-block';
+        applyBtn.textContent = 'Apply Optimal Configuration';
+      }
+    } else {
+      // Exceeds VRAM capacity! Generate smart recommendations & mitigations
+      box.style.background = 'rgba(239, 68, 68, 0.08)';
+      box.style.borderColor = 'rgba(239, 68, 68, 0.35)';
+
+      let recommendations = [];
+      let canWorkWithTweaks = false;
+
+      // Check if switching to QLoRA helps
+      if (trainingMode === 'Bf16Full') {
+        recommendations.push(`Switch from <strong>Full Fine-Tuning</strong> to <strong>QLoRA / Soul Eater</strong> (reduces optimizer &amp; gradient memory by ~70%).`);
+        canWorkWithTweaks = true;
+      }
+
+      // Check if switching optimizer helps
+      if (optimizerName === 'AdamW') {
+        recommendations.push(`Switch optimizer to <strong>AdamW 8-bit</strong>, <strong>Paged AdamW (RAM Offload)</strong>, or <strong>LOMO (Zero-Grad Fused SGD)</strong>.`);
+        canWorkWithTweaks = true;
+      }
+
+      // Check if reducing rank helps
+      if (loraRank > 16) {
+        recommendations.push(`Reduce LoRA Rank from r=${loraRank} to <strong>r=16 or r=8</strong> to save activation &amp; adapter memory.`);
+        canWorkWithTweaks = true;
+      }
+
+      // Check if quantization format helps
+      if (evalResult.baseWeightGb > (evalResult.totalGpuVramGb * 0.75)) {
+        recommendations.push(`Repack model into <strong>Crow Q4_K (4.5 bpw)</strong> or <strong>Jay MXFP4 (4.1 bpw)</strong> using the Repack Studio to fit on ${evalResult.totalGpuVramGb.toFixed(1)} GB GPU.`);
+      }
+
+      // Check multi-GPU
+      if (cachedDevices.length > 1 && gpuCount === 1) {
+        recommendations.push(`Select all <strong>${cachedDevices.length} available GPUs</strong> in Multi-GPU Selection below to pool VRAM with FSDP parallel training.`);
+        canWorkWithTweaks = true;
+      }
+
+      let recommendationHtml = '';
+      if (recommendations.length > 0) {
+        recommendationHtml = `
+          <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(239,68,68,0.25);">
+            <strong style="color: #fca5a5;">💡 Recommended Solution${recommendations.length > 1 ? 's' : ''} to make this work:</strong>
+            <ul style="margin: 4px 0 0 16px; padding: 0; color: var(--text-main); font-size: 11.5px;">
+              ${recommendations.map(r => `<li style="margin-bottom: 3px;">${r}</li>`).join('')}
+            </ul>
+          </div>
+        `;
+      } else {
+        recommendationHtml = `
+          <div style="margin-top: 6px; color: #fca5a5; font-size: 12px;">
+            ⚠️ This model requires at least <strong>${evalResult.totalRequiredGb.toFixed(1)} GB VRAM</strong>, exceeding total available hardware capacity (${evalResult.totalGpuVramGb.toFixed(1)} GB). Training this model directly without higher-capacity hardware or severe quantization is not supported.
+          </div>
+        `;
+      }
+
+      text.innerHTML = `
+        <div style="margin-bottom: 4px;">
+          <strong style="color: var(--danger-color, #ef4444); font-size: 13px;">⚠️ Hardware Capacity Exceeded (${modelName})</strong>
+        </div>
+        <div style="font-size: 12px; line-height: 1.5; color: var(--text-main);">
+          Estimated VRAM: <strong style="color: var(--danger-color, #ef4444);">${evalResult.totalRequiredGb.toFixed(1)} GB</strong> / <strong>${evalResult.totalGpuVramGb.toFixed(1)} GB</strong> Available (Shortfall: <strong>${evalResult.shortfallGb.toFixed(1)} GB</strong>).
+        </div>
+        ${recommendationHtml}
+      `;
+
+      if (applyBtn) {
+        applyBtn.style.display = 'inline-block';
+        applyBtn.textContent = 'Auto-Apply Safe Low-Memory Configuration';
+      }
+    }
+
     box.style.display = 'block';
   }
 
   function applyAutotunePreset() {
+    document.getElementById('input-mode').value = 'QLoRA';
     document.getElementById('input-lora-rank').value = 16;
     document.getElementById('input-lr').value = 0.00002;
+    const optSelect = document.getElementById('input-optimizer');
+    if (optSelect) optSelect.value = 'AdamW8Bit';
     document.getElementById('check-fusion-rmsnorm').checked = true;
     document.getElementById('check-fusion-attn').checked = true;
 
+    generateAutotuneRecommendation();
+
     const box = document.getElementById('autotune-recommendation-box');
     if (box) {
-      box.innerHTML = '<span style="color: var(--success-color); font-weight: 700; font-size: 13px;">✅ Autotune Optimal Preset Applied</span>';
+      const banner = document.createElement('div');
+      banner.style.cssText = 'color: var(--success-color, #22c55e); font-weight: 700; font-size: 12px; margin-top: 6px;';
+      banner.textContent = '✅ Optimal Low-VRAM Preset Applied';
+      box.appendChild(banner);
       setTimeout(() => {
-        box.style.display = 'none';
-      }, 1500);
+        banner.remove();
+      }, 2500);
     }
   }
 

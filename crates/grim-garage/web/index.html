@@ -68,7 +68,7 @@
       <header class="top-header">
         <div class="header-status">
           <span class="status-indicator online" id="server-status-dot"></span>
-          <span class="status-text" id="server-status-text">Server Online (0.0.0.0:8741)</span>
+          <span class="status-text" id="server-status-text">Connecting to Server...</span>
         </div>
         <div class="header-actions">
           <button class="btn btn-secondary" id="btn-refresh-hardware">🔄 Probe GPU</button>
@@ -141,10 +141,18 @@
                 <div class="form-group half">
                   <label for="input-mode">Training Mode</label>
                   <select id="input-mode" class="form-control" title="What gets trained: adapters only, all weights, or a preference-optimization objective.">
+                    <option value="QLoRA" title="QLoRA — LoRA adapters on 4-bit / 8-bit block-quantized base weights. Minimum VRAM footprint." selected>QLoRA (Quantized 4-bit / 8-bit)</option>
                     <option value="Lora" title="LoRA fine-tuning — trains small low-rank adapter matrices instead of every weight. Fast, cheap, and the usual starting point.">LoRA Fine-tuning</option>
-                    <option value="Full" title="Full parameter training — unfreezes every weight in BF16. Highest fidelity, highest VRAM and time cost.">Full Parameter Training</option>
-                    <option value="DirectDPO" title="Direct Preference Optimization — tunes the model on (prompt, chosen, rejected) answer pairs without a separate reward model.">Direct DPO</option>
-                    <option title="Soul Eater fine-tuning — Muon-style Newton–Schulz orthogonalized momentum with Sign-SGD; keeps updates in the dominant low-rank subspace for stable full-ish quality at LoRA-like memory." value="SoulEater">Soul Eater Fine-tuning</option>
+                    <option value="Dora" title="Weight-Decomposed LoRA — decouples magnitude and direction for better conditioning and accuracy.">DoRA (Weight-Decomposed LoRA)</option>
+                    <option value="RsLora" title="Rank-Stabilized LoRA — scaling factor γ = α / √r for stable gradient propagation.">rsLoRA (Rank-Stabilized)</option>
+                    <option value="LoftQ" title="LoftQ — SVD quantization-aware adapter initialization for quantized bases.">LoftQ (Quant-Aware LoRA)</option>
+                    <option value="SoulEater" title="Soul Eater fine-tuning — Muon-style Newton–Schulz orthogonalized momentum with Sign-SGD; keeps updates in the dominant low-rank subspace for stable full-ish quality at LoRA-like memory.">Soul Eater Fine-tuning</option>
+                    <option value="Bf16Full" title="Full parameter training — unfreezes every weight in BF16. Highest fidelity, highest VRAM and time cost.">Full Parameter Training (BF16)</option>
+                    <option value="Dpo" title="Direct Preference Optimization — tunes the model on (prompt, chosen, rejected) answer pairs without a separate reward model.">Direct DPO</option>
+                    <option value="Orpo" title="Odds-Ratio Preference Optimization — reference-free preference tuning combined with SFT.">ORPO Preference Tuning</option>
+                    <option value="SimPo" title="Simple Preference Optimization — length-normalized reference-free preference optimization.">SimPO Preference Tuning</option>
+                    <option value="Kto" title="Kahneman-Tversky Optimization — binary feedback preference optimization.">KTO Preference Tuning</option>
+                    <option value="Grpo" title="Group Relative Policy Optimization — RLHF-style clipped surrogate reward tuning.">GRPO Reinforcement</option>
                   </select>
                 </div>
                 <div class="form-group half">
