@@ -38,6 +38,25 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('select-dataset').addEventListener('change', generateAutotuneRecommendation);
   document.getElementById('btn-apply-autotune').addEventListener('click', applyAutotunePreset);
 
+  // Soul Eater is a fixed recipe (spectral-orthogonal adapter init + its own
+  // Muon-style optimizer), not a swappable part. Lock the optimizer picker so
+  // the two controls can't disagree; the server coerces as a backstop.
+  const modeSelectEl = document.getElementById('input-mode');
+  const optimizerSelectEl = document.getElementById('input-optimizer');
+  function syncOptimizerForMode() {
+    if (!modeSelectEl || !optimizerSelectEl) return;
+    if (modeSelectEl.value === 'SoulEater') {
+      optimizerSelectEl.value = 'Muon';
+      optimizerSelectEl.disabled = true;
+      optimizerSelectEl.title = 'Locked: Soul Eater is a fixed recipe — spectral-orthogonal adapter initialization trained by its own Muon-style optimizer (Newton\u2013Schulz orthogonalized momentum + Sign-SGD). Picking a different optimizer would silently train something else.';
+    } else {
+      optimizerSelectEl.disabled = false;
+      optimizerSelectEl.title = 'How gradient steps are applied. AdamW is the safe default; the others trade memory for speed or add second-order/subspace tricks.';
+    }
+  }
+  modeSelectEl?.addEventListener('change', syncOptimizerForMode);
+  syncOptimizerForMode();
+
   function isRdna4(gcnArch) {
     if (!gcnArch) return false;
     const match = gcnArch.toLowerCase().match(/gfx(\d+)/);
@@ -456,6 +475,33 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+
+  // ── Repack format ↔ bits-per-weight coupling ──────────────────────────────
+  // Named tiers have a FIXED bits-per-weight (their identity is the codec),
+  // so the BPW field locks and displays the canonical rate. "NativeBPW"
+  // flips it around: the BPW field drives uniform-width packing and no
+  // named codec is stamped.
+  const TIER_FIXED_BPW = {
+    RavenFP8: 8.0, CrowQ4K: 4.5, JayMXFP4: 4.1,
+    RookMXFP4: 4.1, JackdawMXFP8: 8.0, MagpieMXFP8: 8.0
+  };
+  const repackModeEl = document.getElementById('select-repack-mode');
+  const bpwEl = document.getElementById('input-target-bpw');
+  function syncBpwForFormat() {
+    if (!repackModeEl || !bpwEl) return;
+    const fixed = TIER_FIXED_BPW[repackModeEl.value];
+    if (fixed !== undefined) {
+      bpwInput.value = fixed.toFixed(1);
+      bpwInput.disabled = true;
+      bpwInput.title = 'Locked: this named codec has a fixed bits-per-weight (' + fixed + ' bpw). Choose "Native Uniform Bits" to drive packing from a custom BPW instead.';
+    } else {
+      bpwInput.disabled = false;
+      bpwInput.title = 'Target bits-per-weight for native uniform row packing (2\u201316). Every weight is packed at exactly this width.';
+    }
+  }
+  repackModeEl?.addEventListener('change', syncBpwForFormat);
+  syncBpwForFormat();
+
   async function handleRunRepack() {
     const source = document.getElementById('input-repack-source').value;
     const output_name = document.getElementById('input-repack-name').value;
@@ -463,11 +509,16 @@ document.addEventListener('DOMContentLoaded', () => {
       alert('Please fill out both source model path and output name.');
       return;
     }
+    const FORMAT_ALIASES = { RavenFP8:'raven', CrowQ4K:'crow', JayMXFP4:'jay', RookMXFP4:'rook', JackdawMXFP8:'jackdaw', MagpieMXFP8:'magpie' };
     const payload = {
       source_path_or_url: source,
       output_name,
       target_bpw: parseFloat(document.getElementById('input-target-bpw').value) || 8.0
     };
+    const repackMode = document.getElementById('select-repack-mode')?.value;
+    if (repackMode && FORMAT_ALIASES[repackMode]) {
+      payload.target_format = FORMAT_ALIASES[repackMode];
+    }
     try {
       const res = await fetch('/api/convert', {
         method: 'POST',

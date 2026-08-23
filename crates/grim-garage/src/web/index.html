@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Grim's Garage — Local Training & Repack Dashboard</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/app.css">
 </head>
 <body>
   <div id="app" class="dashboard-root">
@@ -107,6 +107,10 @@
                 </div>
               </div>
 
+              <div class="section-divider">
+                <span>Data &amp; Dataset</span>
+              </div>
+
               <div class="form-row">
                 <div class="form-group half">
                   <label for="select-dataset-split">Dataset Split</label>
@@ -129,6 +133,10 @@
                 </div>
               </div>
 
+              <div class="section-divider">
+                <span>Training Configuration</span>
+              </div>
+
               <div class="form-group">
                 <label>Target Accelerator GPU(s)</label>
                 <div id="gpu-selection-container" class="form-control" style="height: auto; min-height: 42px; display: flex; flex-direction: column; gap: 6px; padding: 10px;">
@@ -140,10 +148,11 @@
               <div class="form-row">
                 <div class="form-group half">
                   <label for="input-mode">Training Mode</label>
-                  <select id="input-mode" class="form-control">
-                    <option value="Lora">LoRA Fine-tuning</option>
-                    <option value="Full">Full Parameter Training</option>
-                    <option value="DirectDPO">Direct DPO</option>
+                  <select id="input-mode" class="form-control" title="What gets trained: adapters only, all weights, or a preference-optimization objective.">
+                    <option value="Lora" title="LoRA fine-tuning — trains small low-rank adapter matrices instead of every weight. Fast, cheap, and the usual starting point.">LoRA Fine-tuning</option>
+                    <option value="Full" title="Full parameter training — unfreezes every weight in BF16. Highest fidelity, highest VRAM and time cost.">Full Parameter Training</option>
+                    <option value="DirectDPO" title="Direct Preference Optimization — tunes the model on (prompt, chosen, rejected) answer pairs without a separate reward model.">Direct DPO</option>
+                    <option title="Soul Eater fine-tuning — Muon-style Newton–Schulz orthogonalized momentum with Sign-SGD; keeps updates in the dominant low-rank subspace for stable full-ish quality at LoRA-like memory." value="SoulEater">Soul Eater Fine-tuning</option>
                   </select>
                 </div>
                 <div class="form-group half">
@@ -163,25 +172,62 @@
                 </div>
               </div>
 
+              <div class="form-row checkboxes">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="check-fusion-rmsnorm" checked> ROCm Fused RMSNorm+Matmul
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" id="check-fusion-attn" checked> ROCm Fused FlashAttention
+                </label>
+              </div>
+
+              <div class="section-divider">
+                <span>Hardware &amp; Accelerator</span>
+              </div>
+
+              <div class="autotune-box" id="autotune-recommendation-box">
+                <span class="autotune-title">✨ Hardware Autotune Recommendation</span>
+                <p id="autotune-text">Select a model and dataset to generate optimal consumer VRAM allocations.</p>
+                <button type="button" class="btn btn-sm btn-accent" id="btn-apply-autotune">Apply Autotune Preset</button>
+              </div>
+
+              <div class="section-divider">
+                <span>Optimizer &amp; Schedule</span>
+              </div>
+
               <div class="form-row">
                 <div class="form-group half">
                   <label for="input-optimizer">Optimizer</label>
-                  <select id="input-optimizer" class="form-control">
-                    <option value="AdamW" selected>AdamW (Standard FP32)</option>
-                    <option value="AdamW8Bit">AdamW 8-bit</option>
-                    <option value="PagedAdamW">Paged AdamW (RAM Offload)</option>
-                    <option value="Lion">Lion (Sign Momentum)</option>
-                    <option value="Lion8Bit">Lion 8-bit</option>
-                    <option value="Adafactor">Adafactor (Factored 2nd Moment)</option>
-                    <option value="GaloreAdamW">GaLore (SVD Low-Rank Projection)</option>
-                    <option value="QGaLoreAdamW8Bit">QGaLore (Quantized Low-Rank)</option>
-                    <option value="LOMO">LOMO (Zero-Grad Fused SGD)</option>
-                    <option value="Adalomo">AdaLomo (Adaptive LOMO)</option>
-                    <option value="CAME">CAME (Confidence-Guided Adaptive)</option>
-                    <option value="Sophia">Sophia (2nd-Order Diagonal Hessian)</option>
-                    <option value="Muon">Muon (Newton-Schulz Orthogonal)</option>
-                    <option value="MAdam">M-Adam (FP4/FP8 Add-Mult)</option>
-                    <option value="LionVote">LionVote (Adaptive Sign-Vote)</option>
+                  <select id="input-optimizer" class="form-control" title="How gradient steps are applied. AdamW is the safe default; the others trade memory for speed or add second-order/subspace tricks.">
+                  <optgroup label="Adam family — full moments + paged / low-precision variants">
+                    <option value="AdamW" title="Standard AdamW optimizer — keeps full FP32 first- and second-moment buffers per parameter. The reliable default for every training mode.">AdamW (Standard FP32)</option>
+                    <option value="AdamW8Bit" title="AdamW whose moment buffers are quantized to 8-bit — cuts optimizer VRAM roughly 4x with near-identical convergence. Pick this the moment moments stop fitting.">AdamW 8-bit</option>
+                    <option value="PagedAdamW" title="Paged AdamW — keeps hot moment pages in VRAM and offloads cold pages to host RAM, letting large models train on small GPUs at some PCIe cost.">Paged AdamW (RAM Offload)</option>
+                    <option value="PagedAdamW8Bit" title="Paged offload combined with 8-bit quantized moments — the lowest optimizer memory footprint available here.">Paged AdamW 8-bit</option>
+                    <option value="MAdam" title="M-Adam — Additive-Multiplicative Adam reformulated for ultra-low precision (FP4/FP8) moment arithmetic; targets next-gen low-precision tensor paths.">M-Adam (FP4/FP8 Add-Mult)</option>
+                  </optgroup>
+                  <optgroup label="Sign momentum — Lion family">
+                    <option value="Lion" title="Lion — replaces adaptive moments with a single sign-based momentum step; about half of AdamW's memory. Use ~3-10x smaller LR and larger weight decay.">Lion (Sign Momentum)</option>
+                    <option value="Lion8Bit" title="Lion with its momentum buffer quantized to 8-bit — the lowest-memory sign optimizer here.">Lion 8-bit</option>
+                    <option value="LionVote" title="LionVote — Lion-style sign updates with per-layer adaptive voting over the sign direction instead of trusting every coordinate blindly.">LionVote (Adaptive Sign-Vote)</option>
+                  </optgroup>
+                  <optgroup label="Factored & second-order">
+                    <option value="Adafactor" title="Adafactor — factorizes the second-moment matrix into two small vectors instead of storing it fully; very memory-efficient for wide embedding/output layers.">Adafactor (Factored 2nd Moment)</option>
+                    <option value="CAME" title="CAME — an AdamW variant whose factored second moments are gated by a confidence estimate; stays stable where plain AdamW diverges at large batch sizes or learning rates.">CAME (Confidence-Guided Adaptive)</option>
+                    <option value="Sophia" title="Sophia — second-order optimizer that probes a diagonal Hessian estimate via Hutchinson random vectors and clips updates by curvature; fewer steps to target.">Sophia (2nd-Order Diagonal Hessian)</option>
+                  </optgroup>
+                  <optgroup label="Low-rank subspace — GaLore family">
+                    <option value="GaloreAdamW" title="GaLore + AdamW — projects gradients onto a slowly-updating low-rank SVD subspace before the AdamW step, so optimizer state scales with the subspace, not the layer.">GaLore (SVD Low-Rank Projection)</option>
+                    <option value="GaloreAdamW8Bit" title="GaLore projection combined with 8-bit quantized moment buffers — low-rank subspace updates at minimal memory.">GaLore AdamW 8-bit</option>
+                    <option value="QGaLoreAdamW8Bit" title="QGaLore — GaLore's subspace projection combined with 8-bit moments and NF4-quantized base weights for maximum memory savings.">QGaLore (Quantized Low-Rank)</option>
+                  </optgroup>
+                  <optgroup label="Fused single-pass — lowest memory">
+                    <option value="LOMO" title="LOMO — fuses the backward pass and the parameter update into one step and keeps no moment buffers at all; extremely low memory, SGD-style dynamics.">LOMO (Zero-Grad Fused SGD)</option>
+                    <option value="Adalomo" title="AdaLomo — LOMO's fused single-pass update plus adaptive per-parameter learning rates; LOMO memory with Adam-like adaptivity.">AdaLomo (Adaptive LOMO)</option>
+                  </optgroup>
+                  <optgroup label="Orthogonalized updates">
+                    <option value="Muon" title="Muon — orthogonalizes each momentum update with a Newton-Schulz iteration and applies Sign-SGD magnitude with split weight decay; the update engine inside Soul Eater.">Muon (Newton-Schulz Orthogonal)</option>
+                  </optgroup>
                   </select>
                 </div>
                 <div class="form-group half">
@@ -193,21 +239,6 @@
                     <option value="InverseSqrt">Inverse Sqrt</option>
                   </select>
                 </div>
-              </div>
-
-              <div class="form-row checkboxes">
-                <label class="checkbox-label">
-                  <input type="checkbox" id="check-fusion-rmsnorm" checked> ROCm Fused RMSNorm+Matmul
-                </label>
-                <label class="checkbox-label">
-                  <input type="checkbox" id="check-fusion-attn" checked> ROCm Fused FlashAttention
-                </label>
-              </div>
-
-              <div class="autotune-box" id="autotune-recommendation-box">
-                <span class="autotune-title">✨ Hardware Autotune Recommendation</span>
-                <p id="autotune-text">Select a model and dataset to generate optimal consumer VRAM allocations.</p>
-                <button type="button" class="btn btn-sm btn-accent" id="btn-apply-autotune">Apply Autotune Preset</button>
               </div>
 
               <div class="form-actions">
@@ -282,7 +313,7 @@
         <div class="card card-panel">
           <h2>Raven FP8 / Crow Q4_K Model Repack Studio</h2>
           <p class="subtitle">Convert raw GGUF checkpoints into high-throughput ROCm `.grim` model artifacts with integrated EvoPress bitwidth optimization.</p>
-          
+
           <form id="form-repack-model" onsubmit="return false;" class="form-narrow">
             <div class="form-group">
               <label for="input-repack-source">Source Model Path or URL</label>
@@ -298,9 +329,13 @@
               <div class="form-group half">
                 <label for="select-repack-mode">Repack Format</label>
                 <select id="select-repack-mode" class="form-control">
-                  <option value="RavenFP8" id="option-raven-fp8">Raven FP8 (E4M3 Sequential - RDNA 4+)</option>
-                  <option value="CrowQ4K" id="option-crow-q4k">Crow Q4_K (Fused GPU Dequant)</option>
-                  <option value="JayMXFP4" id="option-jay-mxfp4">Jay MXFP4 (Micro-block 4-bit - RDNA 5 ONLY)</option>
+                  <option value="RavenFP8" id="option-raven-fp8" title="FP8 E4M3 native GEMM, ~8 bits-per-weight. Hardware-accelerated on RDNA 4+; older GPUs fall back to BF16.">Raven FP8 (E4M3 Sequential - RDNA 4+)</option>
+                  <option value="CrowQ4K" id="option-crow-q4k" title="GGML Q4_K super-blocks, ~4.5 bits-per-weight. Universal RDNA2+ default with fused GPU dequant kernels.">Crow Q4_K (Fused GPU Dequant)</option>
+                  <option value="JayMXFP4" id="option-jay-mxfp4" title="MXFP4 micro-block format, ~4.1 bits-per-weight. Requires RDNA 5 hardware acceleration.">Jay MXFP4 (Micro-block 4-bit - RDNA 5 ONLY)</option>
+                  <option value="RookMXFP4" title="MXFP4 E2M1 emulated — dequantizes in LDS to BF16 for WMMA GEMM, ~4.1 bpw. Works on RDNA2+.">Rook MXFP4 (Emulated WMMA)</option>
+                  <option value="JackdawMXFP8" title="MXFP8 E4M3 emulated with WMMA GEMM, ~8 bpw. Shared E8M0 exponents preserve outlier blocks; RDNA2+.">Jackdaw MXFP8 (Emulated WMMA)</option>
+                  <option value="MagpieMXFP8" title="MXFP8 block-16 storage codec (~8 bpw), RDNA2+. Same family as Jay but at FP8 precision.">Magpie MXFP8 Block-16</option>
+                  <option value="NativeBPW" title="Native uniform packing at whatever bits-per-weight you set below (2–16). Packs every weight row at that exact width — this is NOT a GGML K-quant super-block codec; use Crow/Raven/etc. for the named block formats.">Native Uniform Bits (set BPW below)</option>
                 </select>
               </div>
               <div class="form-group half">
@@ -521,7 +556,10 @@
                     <input type="range" id="diff-steps" min="1" max="100" step="1" value="28" style="width: 100%;">
                   </div>
                 </div>
+              </div>
 
+              <!-- Parameter Grid -->
+              <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
                   <div>
                     <label for="diff-width" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Width: <span id="val-diff-width">512</span>px</label>
@@ -594,7 +632,7 @@
             <!-- Panel 1: Text-to-Speech (TTS) -->
             <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
               <h3 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">🗣️ Text-to-Speech (Kokoro Model)</h3>
-              
+
               <div class="form-group" style="margin-bottom: 0;">
                 <label for="tts-text-input" style="font-weight: 600; font-size: 12px;">Input Text / Script</label>
                 <textarea id="tts-text-input" class="form-control" rows="3" placeholder="Hello from Grim engine! This audio is synthesized natively on your device." style="border-radius: 8px; resize: vertical;"></textarea>
@@ -634,7 +672,7 @@
             <!-- Panel 2: Audio-to-Audio (Vocos Vocoder) -->
             <div style="background: rgba(15,23,42,0.4); border: 1px solid var(--border-card); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px;">
               <h3 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">🎛️ Audio-to-Audio & Vocoder (Vocos)</h3>
-              
+
               <p style="font-size: 12px; color: var(--text-muted); margin: 0;">
                 Reconstruct and synthesize mel-spectrogram features through the ultra-fast Fourier-based Vocos neural vocoder.
               </p>

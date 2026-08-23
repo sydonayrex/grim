@@ -465,6 +465,24 @@ async fn start_training(
             Json(json!({ "error": "use_olora requires olora_lambda > 0.0" })),
         ));
     }
+    // Soul Eater is a fixed RECIPE, not a swappable part: spectral-orthogonal
+    // adapter initialization trained by its own Muon-family optimizer
+    // (Newton–Schulz orthogonalized momentum + Sign-SGD). The CLI enforces
+    // exactly this pairing (`is_soul_eater` forces use_spectral_qlora and the
+    // recipe assumes the Muon-style update); mirror it server-side so an API
+    // caller picking Soul Eater + AdamW can't silently train something else.
+    let mut optimizer = req.optimizer;
+    let mut use_spectral_qlora = req.use_spectral_qlora;
+    if req.training_mode == crate::jobs::TrainingMode::SoulEater {
+        if optimizer != grim_autograd::OptimizerKind::Muon {
+            eprintln!(
+                "[grim-garage] Soul Eater requires its Muon-style optimizer; coercing {:?} -> Muon",
+                optimizer
+            );
+            optimizer = grim_autograd::OptimizerKind::Muon;
+        }
+        use_spectral_qlora = true;
+    }
 
     let job = TrainingJob {
         model_path: req.model_path,
@@ -479,14 +497,14 @@ async fn start_training(
         weight_format: req.weight_format,
         preferred_backend: req.preferred_backend.clone(),
         accumulation_steps: req.accumulation_steps,
-        optimizer: req.optimizer,
+        optimizer,
         scheduler: req.scheduler,
         min_lr: (req.learning_rate * 1e-2).max(1e-10),
         num_gpus: req.num_gpus,
         use_pissa: req.use_pissa,
         use_olora: req.use_olora,
         olora_lambda: req.olora_lambda,
-        use_spectral_qlora: req.use_spectral_qlora,
+        use_spectral_qlora,
         bake_on_completion: req.bake_on_completion,
         resume_from_checkpoint: req.resume_from_checkpoint,
         status: crate::jobs::JobStatus::Pending,
@@ -2004,6 +2022,25 @@ pub fn new_app_state() -> AppState {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    /// The dashboard's Training Mode dropdown must offer every mode the
+    /// worker backend fully supports. SoulEater (adapter + Muon-style
+    /// Newton-Schulz optimizer) was backend-complete and CLI-available but
+    /// absent from the embedded UI, so the only route to it was the CLI.
+    /// The value must equal the serde variant name: `training_mode` in
+    /// StartTrainingRequest deserializes straight into `TrainingMode`.
+    #[test]
+    fn dashboard_offers_soul_eater_training_mode() {
+        let html = WebAssets::get("index.html").expect("index.html embedded");
+        let html = std::str::from_utf8(&html.data).expect("index.html is utf-8");
+        // Assert the tag TAIL so the option's value attribute must terminate
+        // it — this fails if SoulEater disappears AND if someone appends
+        // attributes that would shadow/misorder the value.
+        assert!(
+            html.contains(r#"value="SoulEater">"#),
+            "embedded dashboard is missing the SoulEater training-mode option"
+        );
+    }
 
     #[tokio::test]
     async fn health_router_returns_ok() {
