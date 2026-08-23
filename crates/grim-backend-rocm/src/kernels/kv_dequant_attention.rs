@@ -209,7 +209,8 @@ void grim_kv_dequant_attention(
                         m  = scales[s + 4] & 63;
                     } else {
                         sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
-                        m  = (scales[s + 4] >> 4)  | ((scales[s - 4] >> 6) << 4);
+                        // ggml get_scale_min_k4: m's top bits come from byte s itself.
+                        m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);
                     }
                     const int qs_byte = 32 * k + j_idx;
                     unsigned char q_nib = (off < 32) ? (qs[qs_byte] & 0x0F) : (qs[qs_byte] >> 4);
@@ -355,7 +356,8 @@ void grim_kv_dequant_attention(
                         m  = scales[s + 4] & 63;
                     } else {
                         sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
-                        m  = (scales[s + 4] >> 4)  | ((scales[s - 4] >> 6) << 4);
+                        // ggml get_scale_min_k4: m's top bits come from byte s itself.
+                        m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);
                     }
                     const int qs_byte = 32 * k + j_idx;
                     unsigned char q_nib = (off < 32) ? (qs[qs_byte] & 0x0F) : (qs[qs_byte] >> 4);
@@ -506,6 +508,24 @@ mod tests {
         assert!(
             legacy_k_blocks >= 2,
             "Legacy paths must have K and V dequant blocks"
+        );
+    }
+
+    #[test]
+    fn kv_dequant_attention_source_pins_the_q4k_min_byte() {
+        // ggml get_scale_min_k4 ("q[j-0]"): m's top 2 bits come from
+        // scales[s] itself. The K and V dequant blocks each embed the
+        // formula; both must use scales[s], never scales[s-4].
+        let good = KERNEL_SOURCE
+            .matches("m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);")
+            .count();
+        assert_eq!(
+            good, 2,
+            "K and V q4k dequant blocks must both take m's top bits from scales[s]"
+        );
+        assert!(
+            !KERNEL_SOURCE.contains(">> 4)  | ((scales[s - 4] >> 6)"),
+            "kv q4k dequant must NOT read m's top bits from scales[s-4]"
         );
     }
 
