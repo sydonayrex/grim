@@ -87,6 +87,12 @@ impl DeviceGuard {
             let _ = crate::device::handles::hipGetDevice(&mut prev);
             let _ = crate::device::handles::hipSetDevice(ordinal);
         }
+        // TEMP-DIAG (GGUF fault hunt): name whoever switches onto a
+        // non-primary device while the trace gate is set.
+        if ordinal == 2 && std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            eprintln!("[ctx-trace] DeviceGuard::set(2) prev={prev}");
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         Self { prev }
     }
 }

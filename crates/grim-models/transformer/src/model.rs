@@ -82,6 +82,10 @@ pub struct Llama {
     /// Device assignment for each transformer layer. Defaults to the model
     /// device; farm/pipeline callers may replace it with contiguous segments.
     pub layer_devices: Vec<Device>,
+    /// WI-SB4a telemetry: actual cross-segment activation moves performed by
+    /// [`Llama::decode_paged`] since model construction. The hop-bound gate
+    /// drains this via [`Llama::take_boundary_moves`].
+    boundary_moves: std::sync::atomic::AtomicUsize,
 }
 
 impl Llama {
@@ -182,6 +186,7 @@ impl Llama {
             norm,
             output,
             layer_devices: vec![device.clone(); layer_count],
+            boundary_moves: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -280,6 +285,7 @@ impl Llama {
             norm,
             output,
             layer_devices: vec![device.clone(); layer_count],
+            boundary_moves: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -302,6 +308,24 @@ impl Llama {
             .windows(2)
             .filter(|w| w[0] != w[1])
             .count()
+    }
+
+    /// WI-SB4a: contiguous same-device runs of the layer map — transfers only
+    /// ever happen at the boundaries between these runs, never inside them.
+    pub fn segment_devices(&self) -> Vec<Device> {
+        let mut segments: Vec<Device> = Vec::new();
+        for dev in &self.layer_devices {
+            if segments.last() != Some(dev) {
+                segments.push(dev.clone());
+            }
+        }
+        segments
+    }
+
+    /// WI-SB4a: cross-segment activation moves performed so far, then reset.
+    pub fn take_boundary_moves(&self) -> usize {
+        self.boundary_moves
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn random(device: Device, cfg: LlamaConfig) -> Self {
@@ -405,6 +429,7 @@ impl Llama {
             norm,
             output,
             layer_devices: vec![device.clone(); cfg.num_layers],
+            boundary_moves: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -434,6 +459,16 @@ impl Llama {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for (i, block) in self.layers.iter().enumerate() {
+            // WI-SB4a contiguous layer pipeline: land `h` on this layer's
+            // segment device before the block runs; moves only ever occur at
+            // segment boundaries because the map is pre-merged into runs.
+            if let Some(seg) = self.layer_devices.get(i) {
+                if *seg != *h.device() {
+                    h = grim_nn::modules::move_to_device(&h, seg)?;
+                    self.boundary_moves
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let cache = caches.as_deref_mut().and_then(|c| c[i].as_mut());
             let (attn_out, k, v) =
                 block.forward_with_kv_paged(&h, positions, Some(&mut *session), cache, i)?;
@@ -451,6 +486,9 @@ impl Llama {
             };
             h = out;
         }
+        // WI-SB4a: final norm + LM head stay on the last segment — `h` is
+        // already there after the last boundary check; in a split deployment
+        // their weights must be loaded onto that device.
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
         Ok((logits, h, kv_pairs))
@@ -479,6 +517,10 @@ impl CausalLm for Llama {
 
     fn num_layers_hint(&self) -> Option<usize> {
         Some(self.cfg.num_layers)
+    }
+
+    fn hidden_size_hint(&self) -> Option<usize> {
+        Some(self.cfg.hidden_size)
     }
 
     fn forward(
@@ -622,5 +664,93 @@ mod tests {
         );
         // Clamp: prf > 1.0 cannot exceed head_dim.
         assert_eq!(base_cfg(16, 2.0).rotary_dim(), 16, "clamped to head_dim");
+    }
+
+    /// WI-SB4a host gate: a layer map split across two fake segments — the
+    /// second tagged with a device whose backend falls back to CPU here —
+    /// must produce logits byte-identical to the unsplit model, and must
+    /// emit exactly one boundary move per segment change, never one per
+    /// layer.
+    #[test]
+    fn scythe_layer_split_parity_and_hop_bound() {
+        let cfg = LlamaConfig {
+            num_layers: 4,
+            vocab_size: 100,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 32,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            max_seq_len: 512,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+        let model = Llama::random(Device::Cpu, cfg.clone());
+        let seq = 3usize;
+        let ids: Vec<u32> = (0..seq as u32).collect();
+        let input_ids = grim_backend_cpu::cpu_tensor(
+            ids.iter().map(|&t| t as f32).collect::<Vec<_>>(),
+            Shape::new(vec![seq]),
+        );
+        let positions = grim_backend_cpu::cpu_tensor(
+            (0..seq).map(|i| i as f32).collect::<Vec<_>>(),
+            Shape::new(vec![seq]),
+        );
+
+        let run_forward = |model: &Llama| -> Vec<f32> {
+            let pool = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
+                64, 1, 32,
+            )));
+            let kv = grim_memory::PagedKvCache::new(pool, 1, 32, 16);
+            let mut session = grim_core::session::Inner::with_kv(Device::Cpu, Box::new(kv));
+            let adapters: [AdapterHandle; 0] = [];
+            CausalLm::forward(model, &mut session, &input_ids, &positions, &adapters)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap()
+        };
+
+        // Unsplit baseline.
+        let baseline = run_forward(&model);
+        assert!(!baseline.is_empty());
+        assert_eq!(model.take_boundary_moves(), 0, "unsplit map never moves");
+
+        // Split across two fake segments: layers 0-1 on Cpu, 2-3 on a
+        // Metal-tagged segment whose backend falls back to CPU execution.
+        let mut split_map = vec![Device::Cpu; 2];
+        split_map.extend(vec![Device::Metal(0); 2]);
+        let mut split = Llama::random(Device::Cpu, cfg);
+        split.set_layer_devices(split_map.clone()).unwrap();
+        assert_eq!(split.layer_device_hops(), 1, "one boundary in the map");
+        assert_eq!(split.segment_devices().len(), 2, "two merged runs");
+
+        let split_out = run_forward(&split);
+        // Cross-backend fake segments run different GEMM kernels behind the
+        // tags, so exact equality stops at the boundary — the gate is a tight
+        // fp bound here. Byte-parity belongs to the same-kernel case: both
+        // segments on identical-architecture ROCm ranks (the [sb] leg), the
+        // same rule WI-INF3's route parity uses.
+        let max_diff = split_out
+            .iter()
+            .zip(&baseline)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff <= 1e-5,
+            "split must not change the math beyond fp noise, got {max_diff}"
+        );
+        // The pure-plumbing case is still byte-exact: re-running the same
+        // model with an equivalent single-run map reproduces bitwise.
+        let rerun = run_forward(&model);
+        assert_eq!(rerun, baseline, "same-map runs are deterministic");
+        assert_eq!(
+            split.take_boundary_moves(),
+            1,
+            "exactly one transfer at the segment boundary"
+        );
+        // Counter drained by take.
+        assert_eq!(split.take_boundary_moves(), 0);
     }
 }

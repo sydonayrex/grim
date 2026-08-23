@@ -1,4 +1,4 @@
-//! Compile-once, cache-to-disk `.hsaco` cache for compiled HIP kernels. [see: `(entry, gpu_target, seahash(source))`, `hipModuleLoad`]
+//! Compile-once, cache-to-disk `.hsaco` cache for compiled HIP kernels. [see: `(entry, gpu_target, toolchain, seahash(source))`, `hipModuleLoad`]
 
 use std::collections::HashMap;
 use std::fs;
@@ -109,21 +109,16 @@ impl HsacoKernelCache {
         lowered_name: &str,
     ) -> Result<PathBuf> {
         let hash = seahash::hash(source.as_bytes());
-        let cache_key = format!("{}_{:016x}.hsaco", key, hash);
+        // A code object compiled by a previous ROCm/HIPRTC build can fault in
+        // `hipModuleLoad` after a driver upgrade. Keep versions separate even
+        // when source and GPU target are unchanged.
+        let cache_key = format!(
+            "{}_{}_{:016x}.hsaco",
+            key,
+            crate::device::jit_cache::toolchain_fingerprint(),
+            hash
+        );
         let cache_path = self.cache_dir.join(&cache_key);
-
-        if cache_path.exists() {
-            let metadata = fs::metadata(&cache_path)?;
-            let modified = metadata.modified()?;
-            self.entries
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    key.to_string(),
-                    (cache_path.clone(), modified, lowered_name.to_string()),
-                );
-            return Ok(cache_path);
-        }
 
         let _ = fs::create_dir_all(&self.cache_dir);
         let tmp_path = self.cache_dir.join(format!(
@@ -137,7 +132,10 @@ impl HsacoKernelCache {
                 .unwrap_or(0)
         ));
         fs::write(&tmp_path, compiled)?;
-        let _ = fs::rename(&tmp_path, &cache_path);
+        // `rename` atomically replaces an old entry. This matters after a
+        // failed or stale compile: a successful HIPRTC result must not be
+        // discarded merely because a same-key file already exists.
+        fs::rename(&tmp_path, &cache_path)?;
 
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
@@ -247,6 +245,33 @@ mod tests {
         let (got_path, got_lowered) = got.unwrap();
         assert_eq!(got_lowered, "test_kernel");
         assert!(got_path.exists());
+    }
+
+    #[test]
+    fn hsaco_kernel_cache_replaces_an_existing_code_object() {
+        let cache = HsacoKernelCache::new();
+        let key = format!(
+            "replace_existing_code_object_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source = "kernel void test() {}";
+
+        let path = cache
+            .cache_kernel(&key, source, b"old code object", "test_kernel")
+            .expect("initial code object should be cached");
+        cache
+            .cache_kernel(&key, source, b"fresh code object", "test_kernel")
+            .expect("fresh code object should replace the old one");
+
+        assert_eq!(
+            fs::read(&path).expect("cached code object should be readable"),
+            b"fresh code object"
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

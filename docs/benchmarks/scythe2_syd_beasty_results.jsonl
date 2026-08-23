@@ -1,0 +1,6 @@
+{"arm":"off","commit":"7c0e6e4","metric":"ttft_ms","order":"unknown","prompt_tokens":204,"throttle_pct":1.0,"ts":1787505725,"value":9939.454416,"wi":"SB3"}
+{"arm":"off","commit":"7c0e6e4","metric":"elapsed_ms","order":"unknown","prompt_tokens":204,"throttle_pct":1.0,"ts":1787505725,"value":9939.461129,"wi":"SB3"}
+{"arm":"off","commit":"7c0e6e4","metric":"ttft_ms","order":"unknown","prompt_tokens":2011,"throttle_pct":1.0,"ts":1787505725,"value":19669.52849,"wi":"SB3"}
+{"arm":"off","commit":"7c0e6e4","metric":"elapsed_ms","order":"unknown","prompt_tokens":2011,"throttle_pct":1.0,"ts":1787505725,"value":19669.538088,"wi":"SB3"}
+{"arm":"off","commit":"7c0e6e4","metric":"ttft_ms","order":"unknown","prompt_tokens":8013,"throttle_pct":1.0,"ts":1787505725,"value":19669.52849,"wi":"SB3"}
+{"arm":"off","commit":"7c0e6e4","metric":"elapsed_ms","order":"unknown","prompt_tokens":8013,"throttle_pct":1.0,"ts":1787505725,"value":0.004117,"wi":"SB3"}

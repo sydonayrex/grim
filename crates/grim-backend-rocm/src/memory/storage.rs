@@ -134,6 +134,13 @@ impl RocmStorage {
         allocator: &Arc<RocmCachingAllocator>,
         ordinal: usize,
     ) -> Result<Self> {
+        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            eprintln!(
+                "[alloc-trace] copy_from_host bytes={} shape={:?}",
+                host_data.len() * 4,
+                shape.dims()
+            );
+        }
         let arith = dtype.arith;
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
@@ -247,6 +254,13 @@ impl RocmStorage {
         allocator: &Arc<RocmCachingAllocator>,
         ordinal: usize,
     ) -> Result<Self> {
+        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            eprintln!(
+                "[alloc-trace] raw_bytes len={} shape={:?}",
+                host_bytes.len(),
+                shape.dims()
+            );
+        }
         let bytes = host_bytes.len();
         if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
             let mut ptr = std::ptr::null_mut();

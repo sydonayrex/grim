@@ -816,6 +816,46 @@ mod tests {
     }
 
     #[test]
+    /// TEMP-DIAG (GGUF fault hunt): rms_norm at engine shapes (204x1024).
+    #[test]
+    fn diag_rms_norm_engine_shapes() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            return;
+        };
+        use grim_tensor::{BackendDevice, DType, Shape};
+        let rows = 204usize;
+        let width = 1024usize;
+        let x: Vec<f32> = (0..rows * width)
+            .map(|i| ((i % 97) as f32) * 0.01)
+            .collect();
+        let w: Vec<f32> = vec![1.0f32; width];
+        let xs = dev
+            .from_cpu(&x, &Shape::new(vec![rows, width]), DType::F32)
+            .unwrap();
+        let ws = dev
+            .from_cpu(&w, &Shape::new(vec![width]), DType::F32)
+            .unwrap();
+        let (out, h) = dev
+            .rms_norm(
+                xs.as_ref(),
+                ws.as_ref(),
+                1e-5,
+                &Shape::new(vec![rows, width]),
+            )
+            .unwrap();
+        h.synchronize().unwrap();
+        let v = out.to_cpu_vec_f32().unwrap();
+        eprintln!(
+            "DIAG rms rows={} first={:?} last={:?}",
+            rows,
+            &v[0..4],
+            &v[v.len() - 4..]
+        );
+    }
+
     fn rms_norm_normalizes_to_unit_when_weight_is_one() {
         // x = [3,4] over row_len 2, weight = 1, eps = 0:
         let env = std::env::var(GPU_TEST_ENV).is_ok();

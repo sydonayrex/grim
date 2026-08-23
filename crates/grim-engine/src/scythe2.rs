@@ -1190,12 +1190,151 @@ impl ScytheRing {
     }
 }
 
+// ── WI-SB4a: contiguous layer-pipeline placement ─────────────────────────────
+
+/// Plan per-layer device placement for a model about to be registered in farm
+/// mode: the controller `decide()`s for every layer index over the live caps,
+/// then short same-rank runs are absorbed into their predecessor so activation
+/// transfers only ever happen at a bounded number of run boundaries
+/// (`Llama::set_layer_devices` consumes the resulting full-length map;
+/// boundary hops == number of runs − 1).
+///
+/// `min_run` is the smallest contiguous run worth paying a transfer for;
+/// passes smaller than that ping-pong devices for no bandwidth win. A value
+/// of `0` keeps every per-layer pick untouched.
+///
+/// The caller maps rank → device (farm replicas use `Device::Rocm(rank)`);
+/// this function stays rank-space so host tests can exercise the merge and
+/// hop guarantees without any GPU present.
+pub fn plan_contiguous_layer_placement(
+    num_layers: usize,
+    num_ranks: usize,
+    ctrl: &mut C2plrController,
+    caps: &[GpuCapability],
+    links: &[ScytheLink],
+    epoch: u32,
+    min_run: usize,
+) -> Vec<usize> {
+    let mut per_layer = Vec::with_capacity(num_layers);
+    for layer in 0..num_layers {
+        // Proxy shape: prefill-dominated straddle cares about the sequence
+        // bucket; hidden dims are uniform across layers of one model.
+        let shape = [1usize, 2048, 1, 1];
+        let placement = ctrl.decide(layer as u32, &shape, caps, links, epoch);
+        let rank = placement
+            .ranks
+            .first()
+            .copied()
+            .unwrap_or(0)
+            .min(num_ranks.max(1) - 1);
+        per_layer.push(rank);
+    }
+    absorb_short_runs(&per_layer, min_run)
+}
+
+/// WI-SB4a merge rule: every run shorter than `min_run` is absorbed into the
+/// run before it (the leading run absorbs forward instead). Pure so the
+/// hop-bound gate can pin its contract: output has ≤ as many runs as input,
+/// never zero runs for non-empty input, and total length is preserved.
+pub fn absorb_short_runs(per_layer: &[usize], min_run: usize) -> Vec<usize> {
+    if per_layer.is_empty() || min_run == 0 {
+        return per_layer.to_vec();
+    }
+    // Split into runs.
+    let mut runs: Vec<(usize, usize)> = Vec::new(); // (rank, len)
+    for &rank in per_layer {
+        match runs.last_mut() {
+            Some((r, len)) if *r == rank => *len += 1,
+            _ => runs.push((rank, 1)),
+        }
+    }
+    // Absorb short runs into their predecessor (first run merges forward).
+    let mut kept: Vec<(usize, usize)> = Vec::new();
+    for (rank, len) in runs {
+        if len < min_run {
+            match kept.last_mut() {
+                Some((_, prev_len)) => *prev_len += len,
+                None => kept.push((rank, len)),
+            }
+        } else {
+            kept.push((rank, len));
+        }
+        // A leading short run pushed alone can be re-absorbed by the next
+        // long run on the next iteration only via `kept`; handle the case
+        // where it stays at the head by leaving it — head transfers are free
+        // (the tensor starts wherever prefill starts).
+    }
+    // Expand back to full length.
+    let mut out = Vec::with_capacity(per_layer.len());
+    for (rank, len) in kept {
+        out.extend(std::iter::repeat(rank).take(len));
+    }
+    out.resize(per_layer.len(), *out.last().unwrap_or(&0));
+    out
+}
+
 // ── Tests (WI-4 + WI-7 gates) ─────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// WI-SB4a host gate: the merge rule preserves total length, never
+    /// increases run count, and bounds boundary hops — a ping-pong map
+    /// collapses to at most one hop under min-run smoothing.
+    #[test]
+    fn test_absorb_short_runs_hop_bound() {
+        // Identity when min_run = 0.
+        assert_eq!(absorb_short_runs(&[0, 1, 0, 1], 0), vec![0, 1, 0, 1]);
+        // Ping-pong with min_run 2 collapses to a single boundary.
+        let smoothed = absorb_short_runs(&[0, 1, 0, 1], 2);
+        assert_eq!(smoothed.len(), 4, "length preserved");
+        let hops = smoothed.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(hops <= 1, "ping-pong must collapse to ≤1 hop, got {hops}");
+        // Realistic asymmetric-pair plan: fast card takes the deep layers.
+        let planned = absorb_short_runs(&[1, 1, 0, 0, 1, 1], 3);
+        let hops = planned.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(hops <= 2, "three runs max ⇒ ≤2 hops, got {hops}");
+        // Empty and single-layer inputs stay degenerate-safe.
+        assert!(absorb_short_runs(&[], 2).is_empty());
+        assert_eq!(absorb_short_runs(&[1], 2), vec![1]);
+    }
+
+    /// WI-SB4a host gate: the planner produces a full-length map whose hop
+    /// count never exceeds what the merge rule allows, using the same
+    /// synthetic-caps pattern as the untrained-MLP gate.
+    #[test]
+    fn test_plan_contiguous_layer_placement_shape() {
+        let caps = vec![farm_caps_for_plan(8.0, 0), farm_caps_for_plan(80.0, 1)];
+        let links = plan_links();
+        let mut ctrl = C2plrController::new(8, 2, 150.0);
+        let plan = plan_contiguous_layer_placement(8, 2, &mut ctrl, &caps, &links, 0, 3);
+        assert_eq!(plan.len(), 8, "full-length layer map");
+        assert!(plan.iter().all(|&r| r < 2), "ranks stay in range");
+        let hops = plan.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(hops <= 2, "planner hops bounded, got {hops}");
+    }
+
+    fn farm_caps_for_plan(tflops: f32, ordinal: usize) -> GpuCapability {
+        GpuCapability {
+            tflops_fp16: tflops,
+            tflops_fp8: 0.0,
+            hbm_bandwidth_gbps: 100.0,
+            vram_free_bytes: 16 << 30,
+            throttle_pct: 0.0,
+            ordinal,
+        }
+    }
+
+    fn plan_links() -> Vec<ScytheLink> {
+        vec![
+            ScytheLink::PeerDirect,
+            ScytheLink::Host,
+            ScytheLink::Host,
+            ScytheLink::PeerDirect,
+        ]
+    }
 
     fn make_caps(n: usize) -> Vec<GpuCapability> {
         (0..n)

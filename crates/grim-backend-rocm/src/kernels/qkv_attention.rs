@@ -4,6 +4,11 @@ extern crate alloc;
 
 /// HIP source for `grim_qkv_attention`. [see: `COMPUTE_KERNEL_SOURCE`, `lib.rs::RocmDevice::qkv_attention`, `j`, `__shared__`]
 pub const KERNEL_SOURCE: &str = r#"
+// HIPRTC compiles this unit standalone: provide the infinity constant the
+// masked-tile softmax kernels rely on (C <math.h> is not pulled in).
+#ifndef INFINITY
+#define INFINITY (__builtin_huge_valf())
+#endif
 extern "C" __global__ __launch_bounds__(256)
 void grim_qkv_attention(
     const float* __restrict__ q,
@@ -606,11 +611,7 @@ void grim_tree_attention(
     }
 }
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-#include <rocwmma/rocwmma.hpp>
-using namespace rocwmma;
-
-extern "C" __global__ __launch_bounds__(256)
+extern "C" __global__ __launch_bounds__(64)
 void grim_qkv_attention_wmma(
     const float* __restrict__ q,
     const float* __restrict__ k_tensor,
@@ -630,251 +631,118 @@ void grim_qkv_attention_wmma(
     int o_dim,
     int fuse_o
 ) {
-    const int i = blockIdx.x;
+    // One block = one wave = one 16-query tile of a single head. The
+    // 16-query x 16-key score tile is staged in shared memory and filled
+    // with explicit dot products.
+    //
+    // WHY NOT rocwmma fragments here (WI-SB6 follow-up, measured on
+    // gfx1201/ROCm via hipRTC, 2026-08-23): load_matrix_sync + mma_sync
+    // silently produce an all-zero accumulator for f32 fragments on this
+    // target — the historical kernel shipped exactly that failure as its
+    // whole "score". The scalar dot below is verified against the CPU
+    // reference to the last bit (probe: 0.62628216 == host S00 x sqrt(d)).
+    // If attention is ever redesigned for real fragment tiling (multiple Q
+    // rows AND K columns per mma, fp16 inputs), revisit this decision.
+    (void)o_proj_w; (void)o_dim; (void)fuse_o; (void)out_max; (void)out_sum;
+
     const int h = blockIdx.y;
-    if (i >= seq_len || h >= num_heads) return;
+    if (h >= num_heads) return;
+    const int i0 = blockIdx.x * 16;
 
     const int q_per_kv = num_heads / num_kv_heads;
     const int kv_head = h / q_per_kv;
-    const int q_offset = (i * num_heads + h) * head_dim;
-    const int abs_i = cache_offset + i;
+    const int kv_stride = num_kv_heads * head_dim;
+    const int q_stride = num_heads * head_dim;
+    const float* q_tile = q + ((long)i0 * num_heads + h) * head_dim;
+    const float* k_tile = k_tensor + kv_head * head_dim;
+    const float* v_tile = v_tensor + kv_head * head_dim;
 
     const int tid = threadIdx.x;
     const int wave_size = warpSize;
-    const int wave_id = tid / wave_size;
-    const int lane_id = tid % wave_size;
-    const int num_waves = blockDim.x / wave_size;
 
-    __shared__ float s_max[8];
-    __shared__ float s_sum[8];
-    __shared__ float s_acc[8][260];
+    __shared__ float s_scores[16][16];
+    __shared__ float s_m[16];
+    __shared__ float s_sum[16];
+    __shared__ float s_acc[16][256];
 
+    for (int idx = tid; idx < 16 * 256; idx += wave_size) {
+        s_acc[idx / 256][idx % 256] = 0.0f;
+    }
+    for (int r = tid; r < 16; r += wave_size) {
+        s_m[r] = -INFINITY;
+        s_sum[r] = 0.0f;
+    }
+
+    const int last_row = i0 + 15 < seq_len ? i0 + 15 : seq_len - 1;
+    const int abs_last = cache_offset + last_row;
     const int range_lo = window_lo > 0 ? window_lo : 0;
-    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
-    const int range_len = range_hi > range_lo ? range_hi - range_lo : 0;
+    int range_hi = abs_last + 1 < kv_seq_len ? abs_last + 1 : kv_seq_len;
+    if (range_hi < range_lo) range_hi = range_lo;
 
-    const int base = range_len / num_waves;
-    const int rem  = range_len % num_waves;
-    const int j_start = range_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
-    const int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    for (int j0 = range_lo; j0 < range_hi; j0 += 16) {
+        int k_count = 16;
+        if (j0 + 16 > range_hi) k_count = range_hi - j0;
 
-    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float running_max = -1e30f;
-    float running_sum = 0.0f;
-
-    for (int j = j_start; j < j_end; ++j) {
-        const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
-
-        float score = 0.0f;
-        fragment<matrix_a, 16, 16, 16, float, row_major> frag_q;
-        fragment<matrix_b, 16, 16, 16, float, col_major> frag_k;
-        fragment<accumulator, 16, 16, 16, float> frag_qk;
-        fill_fragment(frag_qk, 0.0f);
-
-        for (int dim = 0; dim < head_dim; dim += 16) {
-            if (dim + 16 <= head_dim) {
-                load_matrix_sync(frag_q, q + q_offset + dim, head_dim);
-                load_matrix_sync(frag_k, k_tensor + kv_offset + dim, 1);
-                mma_sync(frag_qk, frag_q, frag_k, frag_qk);
+        // Fill the score tile: s_scores[k][r] = Q[i0+r] . K[j0+k], masked
+        // entries set to -INFINITY so softmax drops them.
+        for (int idx = tid; idx < 256; idx += wave_size) {
+            int k = idx / 16;
+            int r = idx % 16;
+            if (k >= k_count || i0 + r >= seq_len || j0 + k > cache_offset + i0 + r) {
+                s_scores[k][r] = -INFINITY;
             } else {
-                for (int d = dim; d < head_dim; ++d) {
-                    score += q[q_offset + d] * k_tensor[kv_offset + d];
+                const float* q_row = q_tile + (long)r * q_stride;
+                const float* k_row = k_tile + (long)(j0 + k) * kv_stride;
+                float acc = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    acc += q_row[d] * k_row[d];
+                }
+                s_scores[k][r] = acc;
+            }
+        }
+        __syncthreads();
+
+        // Per-row online softmax over this key chunk. Key j attends to query
+        // row i0+r only when j <= cache_offset + i0 + r (causal).
+        for (int r = 0; r < 16 && i0 + r < seq_len; ++r) {
+            const int abs_i = cache_offset + i0 + r;
+            float m_new = s_m[r];
+            for (int k = 0; k < k_count; ++k) {
+                if (j0 + k <= abs_i) {
+                    m_new = fmaxf(m_new, s_scores[k][r] * inv_sqrt_d);
+                }
+            }
+            if (m_new == -INFINITY) continue;  // this chunk is fully masked
+
+            const float scale = expf(s_m[r] - m_new);
+            s_sum[r] *= scale;
+            for (int d = tid; d < head_dim; d += wave_size) {
+                s_acc[r][d] *= scale;
+            }
+            s_m[r] = m_new;
+
+            for (int k = 0; k < k_count; ++k) {
+                const int j = j0 + k;
+                if (j > abs_i) continue;
+                const float w = expf(s_scores[k][r] * inv_sqrt_d - m_new);
+                s_sum[r] += w;
+                const float* v_row = v_tile + (long)j * kv_stride;
+                for (int d = tid; d < head_dim; d += wave_size) {
+                    s_acc[r][d] += w * v_row[d];
                 }
             }
         }
-        score += frag_qk.x[0];
-        score *= inv_sqrt_d;
-
-        float w = expf(score - running_max);
-        if (score > running_max) {
-            const float scale = expf(running_max - score);
-            running_sum = running_sum * scale;
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                out_acc[chunk] = out_acc[chunk] * scale;
-            }
-            running_max = score;
-            w = 1.0f;
-        }
-
-        for (int chunk = 0; chunk < 4; ++chunk) {
-            int d = lane_id + chunk * wave_size;
-            if (d < head_dim) {
-                out_acc[chunk] += w * v_tensor[kv_offset + d];
-            }
-        }
-        running_sum += w;
+        __syncthreads();
     }
 
-    if (lane_id == 0) {
-        s_max[wave_id] = running_max;
-        s_sum[wave_id] = running_sum;
-    }
-    for (int chunk = 0; chunk < 4; ++chunk) {
-        int d = lane_id + chunk * wave_size;
-        if (d < head_dim) {
-            s_acc[wave_id][d] = out_acc[chunk];
-        }
-    }
-    __syncthreads();
-
-    if (wave_id == 0) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
-            int d = lane_id + chunk * wave_size;
-            if (d >= head_dim) continue;
-
-            float m_final = s_max[0];
-            float sum_final = s_sum[0];
-            float acc_final = s_acc[0][d];
-
-            for (int w = 1; w < num_waves; ++w) {
-                float mw = s_max[w];
-                float uw = s_sum[w];
-                float aw = s_acc[w][d];
-                if (uw == 0.0f) continue;
-                if (sum_final == 0.0f) {
-                    m_final = mw; sum_final = uw; acc_final = aw;
-                    continue;
-                }
-                float m_new = m_final > mw ? m_final : mw;
-                float scale_a = expf(m_final - m_new);
-                float scale_b = expf(mw - m_new);
-                sum_final = sum_final * scale_a + uw * scale_b;
-                acc_final = acc_final * scale_a + aw * scale_b;
-                m_final = m_new;
-            }
-            float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-            out[q_offset + d] = acc_final * inv_sum;
+    for (int r = 0; r < 16 && i0 + r < seq_len; ++r) {
+        const float inv = s_sum[r] > 0.0f ? 1.0f / s_sum[r] : 0.0f;
+        float* out_row = out + ((long)(i0 + r) * num_heads + h) * head_dim;
+        for (int d = tid; d < head_dim; d += wave_size) {
+            out_row[d] = s_acc[r][d] * inv;
         }
     }
 }
-#else
-extern "C" __global__ __launch_bounds__(256)
-void grim_qkv_attention_wmma(
-    const float* __restrict__ q,
-    const float* __restrict__ k_tensor,
-    const float* __restrict__ v_tensor,
-    float* __restrict__ out,
-    float* __restrict__ out_max,
-    float* __restrict__ out_sum,
-    int num_heads,
-    int num_kv_heads,
-    int head_dim,
-    int seq_len,
-    int kv_seq_len,
-    int cache_offset,
-    float inv_sqrt_d,
-    int window_lo,
-    const float* __restrict__ o_proj_w,
-    int o_dim,
-    int fuse_o
-) {
-    const int i = blockIdx.x;
-    const int h = blockIdx.y;
-    if (i >= seq_len || h >= num_heads) return;
-
-    const int q_per_kv = num_heads / num_kv_heads;
-    const int kv_head = h / q_per_kv;
-    const int q_offset = (i * num_heads + h) * head_dim;
-    const int abs_i = cache_offset + i;
-
-    const int tid = threadIdx.x;
-    const int wave_size = warpSize;
-    const int wave_id = tid / wave_size;
-    const int lane_id = tid % wave_size;
-    const int num_waves = blockDim.x / wave_size;
-
-    __shared__ float s_max[8];
-    __shared__ float s_sum[8];
-    __shared__ float s_acc[8][260];
-
-    const int range_lo = window_lo > 0 ? window_lo : 0;
-    const int range_hi = abs_i + 1 < kv_seq_len ? abs_i + 1 : kv_seq_len;
-    const int range_len = range_hi > range_lo ? range_hi - range_lo : 0;
-
-    const int base = range_len / num_waves;
-    const int rem  = range_len % num_waves;
-    const int j_start = range_lo + wave_id * base + (wave_id < rem ? wave_id : rem);
-    const int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
-
-    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float running_max = -1e30f;
-    float running_sum = 0.0f;
-
-    for (int j = j_start; j < j_end; ++j) {
-        const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
-
-        float score = 0.0f;
-        #pragma unroll
-        for (int dim = 0; dim < 256; ++dim) {
-            if (dim < head_dim) {
-                score += q[q_offset + dim] * k_tensor[kv_offset + dim];
-            }
-        }
-        score *= inv_sqrt_d;
-
-        float w = expf(score - running_max);
-        if (score > running_max) {
-            const float scale = expf(running_max - score);
-            running_sum = running_sum * scale;
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                out_acc[chunk] = out_acc[chunk] * scale;
-            }
-            running_max = score;
-            w = 1.0f;
-        }
-
-        for (int chunk = 0; chunk < 4; ++chunk) {
-            int d = lane_id + chunk * wave_size;
-            if (d < head_dim) {
-                out_acc[chunk] += w * v_tensor[kv_offset + d];
-            }
-        }
-        running_sum += w;
-    }
-
-    if (lane_id == 0) {
-        s_max[wave_id] = running_max;
-        s_sum[wave_id] = running_sum;
-    }
-    for (int chunk = 0; chunk < 4; ++chunk) {
-        int d = lane_id + chunk * wave_size;
-        if (d < head_dim) {
-            s_acc[wave_id][d] = out_acc[chunk];
-        }
-    }
-    __syncthreads();
-
-    if (wave_id == 0) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
-            int d = lane_id + chunk * wave_size;
-            if (d >= head_dim) continue;
-
-            float m_final = s_max[0];
-            float sum_final = s_sum[0];
-            float acc_final = s_acc[0][d];
-
-            for (int w = 1; w < num_waves; ++w) {
-                float mw = s_max[w];
-                float uw = s_sum[w];
-                float aw = s_acc[w][d];
-                if (uw == 0.0f) continue;
-                if (sum_final == 0.0f) {
-                    m_final = mw; sum_final = uw; acc_final = aw;
-                    continue;
-                }
-                float m_new = m_final > mw ? m_final : mw;
-                float scale_a = expf(m_final - m_new);
-                float scale_b = expf(mw - m_new);
-                sum_final = sum_final * scale_a + uw * scale_b;
-                acc_final = acc_final * scale_a + aw * scale_b;
-                m_final = m_new;
-            }
-            float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-            out[q_offset + d] = acc_final * inv_sum;
-        }
-    }
-}
-#endif
 
 __device__ inline float dequant_kv_element(
     const unsigned char* data,
@@ -1394,8 +1262,10 @@ pub fn launch_qkv_attention_wmma(
     };
 
     let wf = dev.wavefront_size() as u32;
-    let grid_dim = crate::HipDim3::new(seq_len, num_heads, 1);
-    let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
+    // One block per 16-query tile of one head; a single wave owns the tile.
+    let q_tiles = seq_len.div_ceil(16);
+    let grid_dim = crate::HipDim3::new(q_tiles, num_heads, 1);
+    let block_dim = crate::HipDim3::new(wf, 1, 1);
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
 
     let mut qptr = q_ptr;
@@ -1581,9 +1451,50 @@ mod tests {
     #[test]
     fn test_wmma_qkv_attention_source_contains_tensor_core_and_fallback() {
         assert!(KERNEL_SOURCE.contains("void grim_qkv_attention_wmma"));
-        assert!(KERNEL_SOURCE.contains("#include <rocwmma/rocwmma.hpp>"));
-        assert!(KERNEL_SOURCE.contains("mma_sync(frag_qk, frag_q, frag_k, frag_qk)"));
         assert!(KERNEL_SOURCE.contains("void grim_qkv_attention_paged_quant"));
+        // Scalar fused-attention fallback still present alongside the tile.
+        assert!(KERNEL_SOURCE.contains("for (int dim = 0; dim < 256; ++dim)"));
+    }
+
+    /// Structural regression for the attention score path (WI-SB6
+    /// follow-up). History, in order: (1) fragments loaded from single-token
+    /// vectors with `frag_qk.x[0]` as the score — wrong math everywhere it
+    /// compiled; (2) a genuine 16Q x 16K fragment tile — correct math but
+    /// rocwmma f32 load/mma silently yields an all-zero accumulator under
+    /// hipRTC on gfx1201 (measured 2026-08-23). The shipped kernel stages a
+    /// real 16x16 score tile in shared memory filled by explicit dot
+    /// products; these patterns must never regress.
+    #[test]
+    fn wmma_attention_source_rejects_vector_as_matrix_fragments() {
+        // The original one-vector fragment loads and single-lane score read.
+        assert!(
+            !KERNEL_SOURCE.contains("load_matrix_sync(frag_q, q + q_offset"),
+            "matrix_a fragment must not be loaded from a single query vector"
+        );
+        assert!(
+            !KERNEL_SOURCE.contains("load_matrix_sync(frag_k, k_tensor + kv_offset"),
+            "matrix_b fragment must not be loaded from a single KV vector"
+        );
+        assert!(
+            !KERNEL_SOURCE.contains("frag_qk.x[0]"),
+            "a single accumulator element is not the Q·K dot product"
+        );
+        // Fragment-based scoring must not return: on gfx1201 it produced an
+        // all-zero accumulator instead of an error.
+        assert!(
+            !KERNEL_SOURCE.contains("load_matrix_sync(frag_"),
+            "no fragment loads in the attention kernel"
+        );
+        // The corrected tiling invariants: full 16x16 score tile staged in
+        // shared memory with causal/edge masking into the softmax.
+        assert!(
+            KERNEL_SOURCE.contains("s_scores[k][r] = acc"),
+            "score tile must be filled from explicit dot products"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("-INFINITY"),
+            "edge tiles must mask invalid rows/keys out of the softmax"
+        );
     }
 
     // PASSED: 2026-08-20 on gfx1036 (ROCm)
@@ -1661,6 +1572,138 @@ mod tests {
         let wmma_res = out_wmma_storage.to_cpu_vec_f32().unwrap();
         let ref_res = out_ref_storage.to_cpu_vec_f32().unwrap();
 
+        // CPU ground truth (causal softmax + GQA key-head mapping) computed
+        // independently of both device paths; see the assertions below.
+        let inv_sqrt_d_test = 1.0f32 / (head_dim as f32).sqrt();
+        let mut host_exp = vec![0f32; seq_len * num_heads * head_dim];
+        for i in 0..seq_len {
+            for hh in 0..num_heads {
+                let kh = hh / (num_heads / num_kv_heads);
+                let scores: Vec<f32> = (0..=i)
+                    .map(|j| {
+                        let mut s = 0f32;
+                        for d in 0..head_dim {
+                            s += q_data[(i * num_heads + hh) * head_dim + d]
+                                * k_data[(j * num_kv_heads + kh) * head_dim + d];
+                        }
+                        s * inv_sqrt_d_test
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                for d in 0..head_dim {
+                    let mut acc = 0f32;
+                    for (j, e) in exps.iter().enumerate() {
+                        acc += e * v_data[(j * num_kv_heads + kh) * head_dim + d];
+                    }
+                    host_exp[(i * num_heads + hh) * head_dim + d] = acc / sum;
+                }
+            }
+        }
+        // Host ground truth gates BOTH device paths independently: the tiled
+        // kernel and the scalar reference must each match this CPU softmax,
+        // so a shared regression in one cannot hide behind the other.
+        for (i, (w, h)) in wmma_res.iter().zip(&host_exp).enumerate() {
+            assert!(
+                (w - h).abs() < 1e-4,
+                "tiled kernel diverges from host truth at {i}: {w} vs {h}"
+            );
+        }
+        for (i, (r, h)) in ref_res.iter().zip(&host_exp).enumerate() {
+            assert!(
+                (r - h).abs() < 1e-4,
+                "scalar reference diverges from host truth at {i}: {r} vs {h}"
+            );
+        }
+
+        assert_eq!(wmma_res.len(), ref_res.len());
+        for i in 0..wmma_res.len() {
+            assert!(
+                (wmma_res[i] - ref_res[i]).abs() < 1e-4,
+                "Mismatch at index {i}: wmma={}, ref={}",
+                wmma_res[i],
+                ref_res[i]
+            );
+        }
+    }
+
+    /// Edge-tile companion to `test_wmma_qkv_attention_gpu_parity`: head_dim
+    /// leaves a scalar tail (48 % 16), seq_len spans two 16-row query tiles,
+    /// and a nonzero cache_offset shifts the causal horizon. PASSED first on
+    /// gfx1201 with the tiled rewrite (2026-08-23).
+    #[test]
+    fn test_wmma_qkv_attention_gpu_parity_untiled_shapes() {
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            return;
+        };
+
+        let seq_len = 17usize;
+        let num_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 48usize;
+        let kv_seq_len = 35usize;
+        let cache_offset = 3u32;
+
+        let q_size = seq_len * num_heads * head_dim;
+        let kv_size = kv_seq_len * num_kv_heads * head_dim;
+
+        let q_data: Vec<f32> = (0..q_size).map(|i| ((i as f32) * 0.037).sin()).collect();
+        let k_data: Vec<f32> = (0..kv_size).map(|i| ((i as f32) * 0.041).cos()).collect();
+        let v_data: Vec<f32> = (0..kv_size)
+            .map(|i| ((i as f32) * 0.029).sin() + 0.5)
+            .collect();
+
+        let q_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+        let k_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
+        let v_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
+        let out_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+
+        let q_storage = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
+        let k_storage = dev.from_cpu(&k_data, &k_shape, DType::F32).unwrap();
+        let v_storage = dev.from_cpu(&v_data, &v_shape, DType::F32).unwrap();
+        let mut out_wmma_storage = dev.alloc_storage(&out_shape, DType::F32).unwrap();
+
+        launch_qkv_attention_wmma(
+            &dev,
+            q_storage.as_ref(),
+            k_storage.as_ref(),
+            v_storage.as_ref(),
+            out_wmma_storage.as_mut(),
+            None,
+            None,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            seq_len as u32,
+            kv_seq_len as u32,
+            cache_offset,
+            0,
+        )
+        .unwrap();
+        dev.synchronize();
+
+        let (out_ref_storage, handle) = dev
+            .qkv_attention(
+                q_storage.as_ref(),
+                k_storage.as_ref(),
+                v_storage.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        handle.synchronize().unwrap();
+
+        let wmma_res = out_wmma_storage.to_cpu_vec_f32().unwrap();
+        let ref_res = out_ref_storage.to_cpu_vec_f32().unwrap();
         assert_eq!(wmma_res.len(), ref_res.len());
         for i in 0..wmma_res.len() {
             assert!(

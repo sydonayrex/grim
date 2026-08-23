@@ -5,7 +5,13 @@ pub fn compute_kernel_source() -> String {
         String::with_capacity(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 16384);
     s.push_str(crate::kernels::shared_device_fns::KERNEL_SOURCE);
     s.push_str(crate::kernels::charon::KERNEL_SOURCE);
-    s.push_str(crate::kernels::charon_wmma::KERNEL_SOURCE);
+    // TEMP-DIAG (GGUF fault hunt): rocwmma-containing kernels can be
+    // excluded from the aggregate TU via GRIM_DISABLE_ROCWMA_KERNELS=1 to
+    // test module-poisoning on gfx1201.
+    let skip_rocwma = std::env::var("GRIM_DISABLE_ROCWMA_KERNELS").is_ok();
+    if !skip_rocwma {
+        s.push_str(crate::kernels::charon_wmma::KERNEL_SOURCE);
+    }
     s.push_str(crate::kernels::charon_backward::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
@@ -17,7 +23,9 @@ pub fn compute_kernel_source() -> String {
     // hipRTC failed with "use of undeclared identifier" at first `run` forward on RDNA2.
     s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
-    s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
+    if !skip_rocwma {
+        s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
+    }
     s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);
     // grim_dequant_q4k must ride in the same aggregate unit — without this
     // append, hipModuleGetFunction fails with error 500 on first use.

@@ -88,6 +88,13 @@ pub trait CausalLm: Model {
     fn num_layers_hint(&self) -> Option<usize> {
         None
     }
+    /// Residual-stream width of this model, when known. Used by the engine's
+    /// WI-SB2 admission guard for the activation working-set floor.
+    /// `None` (the default) means unknown — the guard then falls back to the
+    /// KV dimension rather than inventing a width.
+    fn hidden_size_hint(&self) -> Option<usize> {
+        None
+    }
     fn forward(
         &self,
         session: &mut dyn crate::session::SessionT,

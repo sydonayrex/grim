@@ -219,15 +219,50 @@ call is grounded.
 
 | WI | host gates | sb gates | done |
 |----|-----------|----------|------|
-| SB0 differentiation | ☐ | ☐ both orders | ☐ |
-| SB1 CLI farm | ☐ | ☐ | ☐ |
-| SB2 VRAM guard | ☐ | ☐ both orders | ☐ |
-| SB3 A/B harness | ☐ | ☐ full matrix | ☐ |
-| WI-INF4 verdict | — | ☐ flag decision recorded | ☐ |
-| SB4a layer pipeline | ☐ | ☐ TTFT both orders | ☐ |
-| SB4b paged-per-segment | — | gated on SB4a | ☐ |
-| SB5 real GEMM shards | — | gated on SB4 | ☐ |
-| SB6 persistent ring | — | gated on SB5 | ☐ |
+| SB0 differentiation | ☑ distinct gfx1201/gfx1200 rows + tests | ☐ calibration still a stub (`calibrate_capability` returns `None`) — measured caps unproven | ☐ |
+| SB1 CLI farm | ☑ loader + call sites :993/:1150; degradation test | ☑ farm arms exactly 2 replicas `[Rocm(0), Rocm(1)]` (iGPU excluded from `visible_rocm_devices`) · ☐ per-rank smoke completions | ☐ |
+| SB2 VRAM guard | ☑ footprint formula w/ hidden hint; synthetic-caps gates (8 GB excl. @100k, incl. @1k, all-excluded ⇒ waitlist); queue-not-blind-pin wired via `scythe_admission_decision` + VRAM waitlist | ☐ both orders long-context pin check | ☐ |
+| SB3 A/B harness | ☑ `scythe_ab` module (§setup-4 JSONL, throttle_pct, verdict rule ≤5%/≤2%), real prompt mix (~200/2k/8k), order detection | ☐ **BLOCKED** — see validation log | ☐ |
+| WI-INF4 verdict | — | ☐ **BLOCKED** by GGUF forward fault | ☐ |
+| SB4a layer pipeline | ☑ `decode_paged` boundary transfers + `segment_devices`; planner `absorb_short_runs`; parity gate (fp-tolerance cross-backend fake segments) + hop-bound gates | ☐ TTFT split-vs-unsplit both orders (blocked) | ☐ |
+| SB4b paged-per-segment | — | gated on SB4a numbers | ☐ |
+| SB5 real GEMM shards | ◑ begun — col/row-parallel shards execute as backend `matmul` on rank devices (host fan-in remains); tolerance parity tests green | rocBLAS-per-stream, ring descriptors carrying shard pointers, rocp-compute read-out still open | ☐ |
+| SB6 persistent ring | kernel further along than "filed": opcodes 1–6 persistent-dispatch launches pass device-gated tests on this box | engine-loop integration pending | ☐ |
+
+### Validation log
+
+- 2026-08-22 (this box = syd-beasty): topology captured to
+  `docs/benchmarks/syd_beasy_topology.json` (gpu1201 + gfx1200 + gfx1036 APU;
+  APU excluded from farm ranks). Engine full suites green in BOTH
+  `GRIM_GPUS=0,1` and `GRIM_GPUS=1,0` orders.
+- **Blocker:** every GGUF model (LFM2.5-VL-3B, LFM2.5-230M, Mellum2 MoE)
+  faults the GPU ("Memory access fault … Page not present") during the first
+  prefill — arm=off too, so unrelated to SCYTHE-2. Raw kernels are healthy on
+  this box (WMMA GEMM gate passes; persistent-dispatch launches pass), which
+  bounds the fault to the GGUF dequant→device-upload path. Until fixed,
+  end-to-end TTFT/ITL legs cannot run and WI-INF4 stays undecided.
+- 2026-08-23 fault hunt (LFM2.5-230M, arm=off, caches purged each run):
+  bracketed the fault to immediately after `grim_embedding` completes and
+  before `grim_rms_norm`'s launcher entry, on the first prefill (204-token
+  prompt; load itself now completes). Systematically ELIMINATED: stale HSACO
+  (toolchain-versioned cache keys + purge), DeviceGuard context leak (impl
+  verified save/restore), allocator pool reuse (`GRIM_ALLOC_NO_POOL=1` still
+  faults), rocwmma module poisoning (`GRIM_DISABLE_ROCWMA_KERNELS=1` still
+  faults), XNACK retry mode (`HSA_XNACK=1` no change), and standalone bugs in
+  transpose/embedding/rms_norm at engine shapes (all pass isolated). Also
+  found & fixed en route: a genuine WMMA-kernel correctness bug in
+  grim_qkv_attention (vector-as-matrix fragments → zero accumulator;
+  replaced with a 16Q×16K scalar-tile kernel, see qkv_attention.rs) and
+  confirmed rocwmma f32 fragments return an empty accumulator under
+  hipRTC/gfx1201. Diagnostic hooks kept behind env gates for the next
+  session: GRIM_ALLOC_TRACE (upload/jit/launch trace + post-launch done
+  marker), GRIM_ALLOC_NO_POOL, GRIM_DISABLE_ROCWMA_KERNELS,
+  GRIM_Q4K_REPRO (minimal fused-q4k launch probe). NEXT LEADS: HSA-level
+  fault-line dump to name the faulting PC/kernel (rocprofiler or HSA event
+  callback); audit Lfm2 embed→attn_norm window including the lazy
+  [65536,1024] `grim_transpose_2d_f32` of the embedding/lm-head table that
+  runs right before embedding; verify gather layout assumption vs the
+  transposed table.
 
 ## Risks
 

@@ -26,6 +26,22 @@ pub fn jit_cache_dir() -> PathBuf {
     std::env::temp_dir().join("grim_rocm_code_objects")
 }
 
+/// Identify the HIP runtime and HIPRTC compiler that produced a code object.
+///
+/// Code objects are not a stable interchange format across ROCm upgrades, so
+/// this value must be part of every persistent-cache key.  Failed queries are
+/// retained in the fingerprint rather than silently aliasing a known version.
+pub(crate) fn toolchain_fingerprint() -> String {
+    let mut runtime = -1;
+    let mut hiprtc_major = -1;
+    let mut hiprtc_minor = -1;
+    let runtime_status = unsafe { crate::device::handles::hipRuntimeGetVersion(&mut runtime) };
+    let hiprtc_status =
+        unsafe { crate::device::handles::hiprtcVersion(&mut hiprtc_major, &mut hiprtc_minor) };
+
+    format!("hip{runtime_status}-{runtime}_hiprtc{hiprtc_status}-{hiprtc_major}.{hiprtc_minor}")
+}
+
 /// Advisory cross-process lock file guarding cache writes (WI-X9).
 fn jit_cache_lock_file() -> PathBuf {
     jit_cache_dir().join(".write.lock")
@@ -107,7 +123,12 @@ pub fn compute_cache_key(arch: &str, source: &str, options: &[std::ffi::CString]
         hasher.write(b"::");
         hasher.write(opt.as_bytes());
     }
-    format!("{}_{:016x}", arch, hasher.finish())
+    format!(
+        "{}_{}_{:016x}",
+        arch,
+        toolchain_fingerprint(),
+        hasher.finish()
+    )
 }
 
 /// Attempt to read a cached HSA code object from disk.
