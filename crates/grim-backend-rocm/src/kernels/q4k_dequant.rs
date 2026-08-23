@@ -15,7 +15,7 @@
 //! scale/min for sub-block `s`:
 //!   s<4:  sc = scales[s]&63,             m = scales[s+4]&63
 //!   s>=4: sc = (scales[s+4]&0x0F)|((scales[s-4]>>6)<<4),
-//!         m  = (scales[s+4]>>4) |((scales[s-4]>>6)<<4) [= scales[s]>>6<<4]
+//!         m  = (scales[s+4]>>4) |((scales[s]>>6)<<4)  [ggml "q[j-0]"]
 //! value = d * sc * q - min * m
 
 /// HIP source for `grim_dequant_q4k`.
@@ -40,8 +40,13 @@ extern "C" {
             sc = scales[s] & 63;
             m  = scales[s + 4] & 63;
         } else {
+            // Upstream ggml get_scale_min_k4 (ggml-quants.c): sc's top 2
+            // bits come from scales[s-4]; m's top 2 bits come from
+            // scales[s] itself ("q[j-0]" upstream). scales[s-4] in the m
+            // line reads a different byte and corrupts min values for
+            // sub-blocks 4..7.
             sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
-            m  = (scales[s + 4] >> 4)  | ((scales[s - 4] >> 6) << 4);
+            m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);
         }
 
         int qs_byte = 32 * k + j;
@@ -105,8 +110,10 @@ mod tests {
         let (sc, m) = if s < 4 {
             (scales[s] & 63, scales[s + 4] & 63)
         } else {
+            // Lockstep with the device fn above and grim_quant::get_scale_min_k4:
+            // sc top bits from scales[s-4], m top bits from scales[s].
             let sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
-            let m = (scales[s + 4] >> 4) | ((scales[s - 4] >> 6) << 4);
+            let m = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4);
             (sc, m)
         };
 
@@ -131,6 +138,17 @@ mod tests {
     fn q4k_dequant_source_contains_entry() {
         assert!(KERNEL_SOURCE.contains("grim_dequant_q4k"));
         assert!(KERNEL_SOURCE.contains("dequant_q4k_grim_element"));
+        // Structural pin (ggml get_scale_min_k4, "q[j-0]"): the m-line must
+        // take its top 2 bits from scales[s], never scales[s-4].
+        assert!(
+            KERNEL_SOURCE
+                .contains("m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);"),
+            "dequant_q4k_grim_element m-line drifted from grim_quant::get_scale_min_k4"
+        );
+        assert!(
+            !KERNEL_SOURCE.contains(">> 4)  | ((scales[s - 4] >> 6)"),
+            "dequant_q4k_grim_element must NOT read m's top bits from scales[s-4]"
+        );
     }
 
     #[test]
@@ -181,7 +199,10 @@ mod tests {
             let min_bits = 0x3400u16 + (min_exp as u16) * 0x400;
             buf[2..4].copy_from_slice(&min_bits.to_le_bytes());
             for v in &mut buf[4..16] {
-                *v = next(&mut rng_state) & 0x3F;
+                // FULL byte range: the cross-byte high bits must stay live,
+                // otherwise the scales[s-4]/scales[s] m-line variants are
+                // indistinguishable and the fixture cannot catch that bug.
+                *v = next(&mut rng_state);
             }
             for v in &mut buf[16..144] {
                 let lo = next(&mut rng_state) & 0xF;

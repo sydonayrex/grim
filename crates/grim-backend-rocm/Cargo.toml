@@ -48,7 +48,10 @@ cc = "1.0"
 # aggregate JIT unit under these gates, and KQuant GGUF models (Q4_K/Q6_K are
 # the dominant formats) hit hipModuleGetFunction error 500 at first forward
 # without them — the same failure class previously fixed for grim_dequant_q4k.
-default = ["jit-hw-adaptive", "cubecl", "q4k", "q5k", "q6k"]
+# q2k/q3k joined the default set for the same reason: dispatch routes
+# KQuantScheme::Q2K/Q3K unconditionally to launch_fused_dequant_gemm_q2k/q3k,
+# so a non-default build crashes any Q2_K/Q3_K model at first forward.
+default = ["jit-hw-adaptive", "cubecl", "q2k", "q3k", "q4k", "q5k", "q6k"]
 rocm = []
 jit-hw-adaptive = ["rocm"]
 multi-gpu-kernel = ["rocm"]
