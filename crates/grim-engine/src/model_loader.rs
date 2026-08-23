@@ -3922,11 +3922,17 @@ pub fn load_from_path_on_device(path: &str, dev: Device) -> Result<Box<dyn Causa
 /// ROCm devices visible to this process, in ordinal order. The SCYTHE-2 farm
 /// loader loads one weight replica per entry; an empty list means this process
 /// sees no AMD GPUs (CPU-only box) and farm mode cannot arm.
+/// Resolve ROCm GPUs visible to the farm registrar. Mirrors
+/// [`resolve_discrete_rocm_devices`]'s policy of taking only dedicated GPUs —
+/// integrated APU devices must never become SCYTHE-2 farm ranks (they share
+/// system memory and would skew placement) — so at most the first two probes
+/// are eligible, matching syd-beasty's discrete pair.
 pub fn visible_rocm_devices() -> Vec<Device> {
     grim_backend_rocm::RocmDevice::probe()
         .map(|devices| {
             devices
                 .iter()
+                .take(2)
                 .map(|d| Device::Rocm(d.ordinal()))
                 .collect::<Vec<_>>()
         })

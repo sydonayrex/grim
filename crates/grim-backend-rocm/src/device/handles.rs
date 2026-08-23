@@ -197,6 +197,7 @@ unsafe extern "C" {
     pub fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT;
 
     pub fn hipGetDevice(device: *mut i32) -> HipErrorT;
+    pub fn hipRuntimeGetVersion(version: *mut i32) -> HipErrorT;
     pub fn hipModuleLoad(module: *mut *mut c_void, path: *const i8) -> HipErrorT;
     pub fn hipModuleUnload(module: *mut c_void) -> HipErrorT;
     pub fn hipModuleGetFunction(
@@ -246,6 +247,7 @@ unsafe extern "C" {
         lowered_name: *mut *const i8,
     ) -> HipErrorT;
     pub fn hiprtcGetCodeSize(prog: HiprtcProgram, size: *mut usize) -> HipErrorT;
+    pub fn hiprtcVersion(major: *mut i32, minor: *mut i32) -> HipErrorT;
     pub fn hiprtcGetErrorString(error: HipErrorT) -> *const i8;
     pub fn hiprtcGetProgramLogSize(prog: HiprtcProgram, log_size: *mut usize) -> HipErrorT;
     pub fn hiprtcGetProgramLog(prog: HiprtcProgram, log: *mut i8) -> HipErrorT;

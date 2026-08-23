@@ -75,6 +75,17 @@ impl RocmCachingAllocator {
 
     /// Return a buffer to the pool (or actually free it if over cap).
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
+        // TEMP-DIAG (GGUF fault hunt): GRIM_ALLOC_NO_POOL=1 makes every free
+        // a synchronized real release, ruling pool reuse in/out as the cause
+        // of the "Page not present" GPU fault.
+        if std::env::var("GRIM_ALLOC_NO_POOL").is_ok() {
+            unsafe {
+                let _ = crate::hipDeviceSynchronize();
+                let _ = hipFree(ptr);
+            }
+            self.free_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let cls = Self::size_class(bytes);
         let over_cap = {
             let cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());

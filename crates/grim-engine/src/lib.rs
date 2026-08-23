@@ -6,6 +6,8 @@ pub mod pipelines;
 pub mod rope_scaling;
 /// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
 pub mod scythe2;
+/// WI-SB3: TTFT/ITL A/B harness — results protocol + WI-INF4 verdict rule.
+pub mod scythe_ab;
 pub mod speculative_loop;
 pub mod streaming_forward;
 /// P2: packed-step training driver (varlen grouping + one optimizer step per group).
@@ -196,6 +198,12 @@ pub struct Engine {
     /// The pinned replica executes every forward for that request's lifetime,
     /// so its KV pages stay local to one device.
     scythe_pin: HashMap<u64, usize>,
+    /// WI-SB2: requests held back because no farm rank could hold their KV
+    /// footprint at enqueue time. They never reach the scheduler or own a
+    /// session until a retry (each tick) finds a rank with room, so an
+    /// oversized prompt can never be admitted blind onto a card that cannot
+    /// hold it.
+    scythe_vram_waitlist: Vec<grim_scheduler::Request>,
     /// Set GRIM_RADIX=on to enable prefix-cache reuse on prefill (WP5).
     pub radix_enabled: bool,
 }
@@ -221,6 +229,70 @@ fn load_adjusted_caps(
             c
         })
         .collect()
+}
+
+/// WI-SB2: worst-case device memory one request can reach — its paged KV
+/// (`2·seq·kv_heads·head_dim·layers·4B`, K+V at fp32 page width) plus an
+/// activation working-set floor (`2·seq·hidden·layers·4B`). When the model
+/// doesn't report a hidden width, the KV dimension stands in rather than
+/// inventing one.
+fn scythe_request_footprint_bytes(
+    seq_len: usize,
+    max_new_tokens: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_size_hint: Option<usize>,
+    num_layers: u64,
+) -> u64 {
+    let seq = seq_len.saturating_add(max_new_tokens).max(1) as u64;
+    let kv_dim = (num_kv_heads.saturating_mul(head_dim)).max(1) as u64;
+    let hidden = hidden_size_hint.map_or(kv_dim, |h| (h as u64).max(1));
+    let layers = num_layers.max(1);
+    let kv_bytes = 2u64
+        .saturating_mul(seq)
+        .saturating_mul(kv_dim)
+        .saturating_mul(layers)
+        .saturating_mul(4);
+    let working_set = 2u64
+        .saturating_mul(seq)
+        .saturating_mul(hidden)
+        .saturating_mul(layers)
+        .saturating_mul(4);
+    kv_bytes.saturating_add(working_set)
+}
+
+/// WI-SB2: which farm ranks can hold a request's footprint. Headroom for
+/// workspace and fragmentation is covered by [`SCYTHE_VRAM_WATERMARK_BYTES`].
+/// A rank reporting zero free VRAM counts as feasible — that reading means
+/// the probe is unavailable on it, not that the card is full; rejecting those
+/// ranks would dead-lock placement exactly when visibility is worst.
+fn scythe_vram_feasible(
+    caps: &[grim_tensor::backend::GpuCapability],
+    footprint_bytes: u64,
+) -> Vec<bool> {
+    caps.iter()
+        .map(|c| {
+            c.vram_free_bytes == 0
+                || c.vram_free_bytes >= footprint_bytes.saturating_add(SCYTHE_VRAM_WATERMARK_BYTES)
+        })
+        .collect()
+}
+
+/// WI-SB2 admission guard watermark: free-VRAM headroom (512 MiB) a rank must
+/// keep above a request's computed footprint so scratch buffers, logits and
+/// allocator fragmentation never push a pinned request into an OOM.
+const SCYTHE_VRAM_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Outcome of the WI-SB2 admission guard for one request against a farm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScytheAdmission {
+    /// Route the whole request to this replica rank.
+    Pin(usize),
+    /// No rank can hold the request's footprint yet — hold it on the VRAM
+    /// waitlist instead of admitting it onto a card that cannot serve it.
+    WaitVram,
+    /// Farm routing not engaged — use the plain single-replica path unchanged.
+    Bypass,
 }
 
 impl Engine {
@@ -452,6 +524,7 @@ impl Engine {
             scythe_ctrl,
             scythe_replicas: HashMap::new(),
             scythe_pin: HashMap::new(),
+            scythe_vram_waitlist: Vec::new(),
             radix_enabled: std::env::var("GRIM_RADIX")
                 .map(|v| v != "0" && v != "false" && v != "off")
                 .unwrap_or(true),
@@ -652,34 +725,34 @@ impl Engine {
         }
     }
 
-    /// Controller-driven admission decision: which replica rank should run
-    /// this request's whole forward pass?
+    /// WI-SB2 admission guard for one request against the farm's live caps.
     ///
-    /// Feeds the controller a load-adjusted capability view — a GPU already
-    /// running sessions contributes roughly `tflops / (1 + active)` — so the
-    /// WaveTune latency argmin naturally balances once the fast card fills.
-    /// Honest fallbacks, in order: no farm → 0; profiler sees no GPUs → 0
-    /// (cannot route over hardware it cannot see); controller missing → 0.
-    fn scythe_pick_rank(
+    /// [`ScytheAdmission::Pin`] carries the controller-chosen rank;
+    /// [`ScytheAdmission::WaitVram`] means every rank failed the footprint
+    /// check (or the profiler sees nothing at all) and the caller must keep
+    /// the request out of the scheduler rather than pin it blind;
+    /// [`ScytheAdmission::Bypass`] means farm routing isn't engaged and the
+    /// plain single-replica path applies unchanged (rollback invariant).
+    fn scythe_admission_decision(
         &mut self,
         base: &str,
         seq_len: usize,
         max_new_tokens: usize,
-    ) -> Option<usize> {
+        caps_raw: &[grim_tensor::backend::GpuCapability],
+    ) -> ScytheAdmission {
         let Some(ids) = self.scythe_replicas.get(base) else {
-            return None;
+            return ScytheAdmission::Bypass;
         };
         let n = ids.len();
         if n <= 1 {
-            return Some(0);
+            return ScytheAdmission::Pin(0);
         }
-        let Some(ref profiler) = self.capability_profiler else {
-            return Some(0);
-        };
-        let caps_raw = profiler.capabilities();
+        if !self.scythe_armed() {
+            return ScytheAdmission::Bypass;
+        }
         if caps_raw.is_empty() {
             eprintln!("[scythe2] farm present but profiler sees no GPUs; leaving request queued");
-            return None;
+            return ScytheAdmission::WaitVram;
         }
         let mut load = vec![0usize; n];
         for &r in self.scythe_pin.values() {
@@ -687,39 +760,34 @@ impl Engine {
                 load[r] += 1;
             }
         }
-        // Reserve KV plus a small working-set floor before placement. A zero
-        // free-VRAM reading means the probe is unavailable, so retain the
-        // existing capability fallback rather than rejecting every request.
-        const VRAM_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
-        let layers = self
-            .models
-            .get(base)
-            .and_then(|m| m.model.num_layers_hint())
-            .unwrap_or(1) as u64;
-        let seq = seq_len.saturating_add(max_new_tokens).max(1) as u64;
-        let kv_bytes = 2u64
-            .saturating_mul(seq)
-            .saturating_mul(self.config.num_kv_heads as u64)
-            .saturating_mul(self.config.head_dim as u64)
-            .saturating_mul(layers)
-            .saturating_mul(4);
-        let working_set = 2u64
-            .saturating_mul(seq)
-            .saturating_mul((self.config.num_kv_heads * self.config.head_dim) as u64)
-            .saturating_mul(layers)
-            .saturating_mul(4);
-        let footprint = kv_bytes.saturating_add(working_set);
-        let mut caps = load_adjusted_caps(&caps_raw, n, &load);
-        for cap in &mut caps {
-            if cap.vram_free_bytes != 0
-                && cap.vram_free_bytes < footprint.saturating_add(VRAM_WATERMARK_BYTES)
-            {
+        // Reserve KV plus the activation working-set floor before placement.
+        let (layers, hidden_hint) = self.models.get(base).map_or((1, None), |m| {
+            (
+                m.model.num_layers_hint().unwrap_or(1) as u64,
+                m.model.hidden_size_hint(),
+            )
+        });
+        let footprint = scythe_request_footprint_bytes(
+            seq_len,
+            max_new_tokens,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            hidden_hint,
+            layers,
+        );
+        let mut caps = load_adjusted_caps(caps_raw, n, &load);
+        let feasible = scythe_vram_feasible(&caps, footprint);
+        for (cap, ok) in caps.iter_mut().zip(&feasible) {
+            if !ok {
                 cap.tflops_fp16 = 0.0;
             }
         }
-        if caps.iter().all(|c| c.tflops_fp16 <= 0.0) {
-            eprintln!("[scythe2] no farm rank has enough free VRAM; leaving request queued");
-            return None;
+        if feasible.iter().all(|&ok| !ok) {
+            eprintln!(
+                "[scythe2] no farm rank holds ~{} MiB; leaving request queued",
+                footprint / (1024 * 1024)
+            );
+            return ScytheAdmission::WaitVram;
         }
         let links = grim_backend_rocm::CapabilityProfiler::link_matrix(n);
         let epoch = grim_backend_rocm::current_epoch();
@@ -727,10 +795,15 @@ impl Engine {
         // signal (the bucket), and relative TFLOPS ordering drives the pick.
         let shape = [1usize, seq_len.max(1), 1, 1];
         let Some(ctrl) = self.scythe_ctrl.as_mut() else {
-            return Some(0);
+            return ScytheAdmission::Bypass;
         };
         let placement = ctrl.decide(0, &shape, &caps, &links, epoch);
-        placement.ranks.first().copied().map(|r| r.min(n - 1))
+        placement
+            .ranks
+            .first()
+            .copied()
+            .map(|r| r.min(n - 1))
+            .map_or(ScytheAdmission::WaitVram, ScytheAdmission::Pin)
     }
 
     /// Pinned farm rank for a request, if any. Telemetry/status surface.
@@ -1106,6 +1179,10 @@ impl Engine {
                 }
             }
         }
+
+        // WI-SB2: give parked requests a chance to place before this pass's
+        // admission, so freed VRAM is picked up in the same tick.
+        self.retry_scythe_vram_waitlist();
 
         let output = self.scheduler.schedule();
         let schedule_elapsed = tick_start.elapsed();
@@ -1536,19 +1613,58 @@ impl Engine {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .or_else(|| self.models.keys().next().cloned());
-        let pin_rank = match base_for_pin.as_deref() {
-            Some(base) if self.scythe_armed() && self.scythe_replicas.contains_key(base) => {
-                let rank =
-                    self.scythe_pick_rank(base, request.prompt_tokens, request.max_new_tokens);
-                if let Some(rank) = rank {
-                    self.scythe_pin.insert(request.id, rank);
+        let mut pin_rank = None;
+        if let Some(base) = base_for_pin.as_deref() {
+            if self.scythe_armed() && self.scythe_replicas.contains_key(base) {
+                // WI-SB2: consult the VRAM guard before anything is allocated.
+                let caps_raw = self
+                    .capability_profiler
+                    .as_ref()
+                    .map(|p| p.capabilities())
+                    .unwrap_or_default();
+                match self.scythe_admission_decision(
+                    base,
+                    request.prompt_tokens,
+                    request.max_new_tokens,
+                    &caps_raw,
+                ) {
+                    ScytheAdmission::Pin(rank) => {
+                        self.scythe_pin.insert(request.id, rank);
+                        pin_rank = Some(rank);
+                    }
+                    ScytheAdmission::WaitVram => {
+                        // Hold the request out of the scheduler entirely: no
+                        // session, no pin, no admission — a rank must be able
+                        // to hold it before it enters the queue.
+                        eprintln!(
+                            "[scythe2] request {} parked on VRAM waitlist (WI-SB2)",
+                            request.id
+                        );
+                        self.scythe_vram_waitlist.push(request);
+                        return Ok(());
+                    }
+                    ScytheAdmission::Bypass => {}
                 }
-                rank
             }
-            _ => None,
-        };
+        }
+        self.admit_placed_request(request, pin_rank)
+    }
+
+    /// Session creation + scheduler entry for an already-placed request.
+    /// `pin_rank` (farm mode) selects the pinned replica's device for the KV.
+    fn admit_placed_request(
+        &mut self,
+        request: grim_scheduler::Request,
+        pin_rank: Option<usize>,
+    ) -> Result<()> {
         // Honor the model's actual device instead of silently forcing CPU.
         // Under a farm pin, that is the pinned replica's device.
+        let base_for_pin = request
+            .model_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.models.keys().next().cloned());
         let device = if pin_rank.is_some() {
             base_for_pin
                 .as_deref()
@@ -1595,6 +1711,65 @@ impl Engine {
         );
         self.scheduler.enqueue(request);
         Ok(())
+    }
+
+    /// WI-SB2: retry requests parked on the VRAM waitlist at tick start —
+    /// finished sessions have freed their ranks by now. Order-stable backfill:
+    /// entries are scanned in arrival order and admitted individually as soon
+    /// as some rank can hold them; those that still fail stay queued.
+    fn retry_scythe_vram_waitlist(&mut self) {
+        if self.scythe_vram_waitlist.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.scythe_vram_waitlist);
+        for request in pending {
+            let id = request.id;
+            let base_for_pin = request
+                .model_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| self.models.keys().next().cloned());
+            let decision = base_for_pin
+                .as_deref()
+                .filter(|base| self.scythe_armed() && self.scythe_replicas.contains_key(*base))
+                .map(|base| {
+                    let caps_raw = self
+                        .capability_profiler
+                        .as_ref()
+                        .map(|p| p.capabilities())
+                        .unwrap_or_default();
+                    self.scythe_admission_decision(
+                        base,
+                        request.prompt_tokens,
+                        request.max_new_tokens,
+                        &caps_raw,
+                    )
+                })
+                .unwrap_or(ScytheAdmission::Bypass);
+            match decision {
+                ScytheAdmission::Pin(rank) => {
+                    self.scythe_pin.insert(id, rank);
+                    if let Err(e) = self.admit_placed_request(request, Some(rank)) {
+                        eprintln!("[scythe2] waitlisted request {id} failed to admit: {e}");
+                    }
+                }
+                ScytheAdmission::Bypass => {
+                    if let Err(e) = self.admit_placed_request(request, None) {
+                        eprintln!("[scythe2] waitlisted request {id} failed to admit: {e}");
+                    }
+                }
+                ScytheAdmission::WaitVram => self.scythe_vram_waitlist.push(request),
+            }
+        }
+    }
+
+    /// Number of requests currently held on the WI-SB2 VRAM waitlist — no
+    /// farm rank could hold their footprint when they arrived. Status and
+    /// observability surface; nonzero means serving capacity is exhausted
+    /// for that prompt size, not that the requests were dropped.
+    pub fn scythe_vram_waitlist_len(&self) -> usize {
+        self.scythe_vram_waitlist.len()
     }
 
     /// F3b: Enqueue a request whose prefill already ran on a remote Prefill
@@ -1676,6 +1851,8 @@ impl Engine {
         self.request_last_token.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
         self.scythe_pin.remove(&id);
+        // A cancelled request must not linger on the WI-SB2 VRAM waitlist.
+        self.scythe_vram_waitlist.retain(|r| r.id != id);
     }
 
     /// Deterministic RNG snapshot for a request, used by the speculative
@@ -2820,5 +2997,195 @@ mod tests {
         engine.register_model_with_farm("small", small_llama(), "/nonexistent/path.gguf");
         assert_eq!(engine.scythe_farm_size("small"), 0);
         assert!(engine.has_model("small"));
+    }
+
+    /// WI-SB2 host gate (synthetic caps): the footprint formula must exclude
+    /// an 8 GB-class card for a 100k-token prompt, admit the same request on
+    /// a 16 GB card, admit a 1k-token prompt on both, and report every rank
+    /// infeasible when nothing fits — which is the queue signal. A zero
+    /// free-VRAM reading is probe-unavailable and must NOT read as "full".
+    #[test]
+    fn test_scythe_vram_footprint_and_rank_filter() {
+        let cap_with_vram = |vram: u64| grim_tensor::backend::GpuCapability {
+            tflops_fp16: 10.0,
+            tflops_fp8: 0.0,
+            hbm_bandwidth_gbps: 100.0,
+            vram_free_bytes: vram,
+            throttle_pct: 0.0,
+            ordinal: 0,
+        };
+        let gib = 1024u64 * 1024 * 1024;
+        // kv_dim = 8·64 = 512, hidden = 1024, layers = 8 ⇒
+        // ~96 KiB/token ⇒ a 132k-token request needs ~12.1 GiB.
+        let dims = (8usize, 64usize, Some(1024usize), 8u64);
+        let big = scythe_request_footprint_bytes(100_000, 32_000, dims.0, dims.1, dims.2, dims.3);
+        let tiny = scythe_request_footprint_bytes(1_000, 32, dims.0, dims.1, dims.2, dims.3);
+
+        assert!(
+            big + SCYTHE_VRAM_WATERMARK_BYTES > 8 * gib,
+            "100k-token prompt must overflow an 8 GB card"
+        );
+        assert!(
+            big + SCYTHE_VRAM_WATERMARK_BYTES <= 16 * gib,
+            "100k-token prompt must still fit a 16 GB card"
+        );
+
+        // 8 GB slow card excluded, 16 GB fast card included.
+        let caps_pair = vec![cap_with_vram(8 * gib), cap_with_vram(16 * gib)];
+        assert_eq!(
+            scythe_vram_feasible(&caps_pair, big),
+            vec![false, true],
+            "100k-token prompt must pin the fast card only"
+        );
+        assert_eq!(
+            scythe_vram_feasible(&caps_pair, tiny),
+            vec![true, true],
+            "1k-token prompt must fit both cards"
+        );
+        // All-excluded ⇒ queue signal (never pinned blind).
+        let caps_small = vec![cap_with_vram(8 * gib), cap_with_vram(8 * gib)];
+        assert!(
+            scythe_vram_feasible(&caps_small, big).iter().all(|&ok| !ok),
+            "no-rank-fits must be detectable"
+        );
+        // Probe-unavailable ranks stay placeable instead of dead-locking.
+        assert_eq!(scythe_vram_feasible(&[cap_with_vram(0)], big), vec![true]);
+        // Unknown hidden width falls back to the KV dimension (smaller floor).
+        let no_hidden =
+            scythe_request_footprint_bytes(100_000, 32_000, dims.0, dims.1, None, dims.3);
+        assert!(
+            no_hidden < big,
+            "KV-dim fallback must not exceed the hidden-width floor"
+        );
+    }
+
+    /// WI-SB2 host gate: the decision layer maps the synthetic-caps guard to
+    /// Pin/WaitVram correctly — mixed pair pins the feasible fast card,
+    /// all-excluded waits, missing profiler data waits, and a 1k prompt is
+    /// never blocked by an 8 GB card.
+    #[test]
+    fn test_scythe_admission_decision_vram_guard() {
+        // kv_dim = 64·128 = 8192 ⇒ a 132k-token request needs ~8.1 GiB even
+        // with small_llama's tiny reported hidden width (32, 1 layer).
+        let cfg = EngineConfig {
+            num_kv_heads: 64,
+            head_dim: 128,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(cfg);
+        engine.scythe_ctrl = Some(crate::scythe2::C2plrController::new(1, 2, 150.0));
+        engine.register_model("small", small_llama());
+        engine.register_model("small#scythe1", small_llama());
+        engine
+            .scythe_replicas
+            .insert("small".into(), vec!["small".into(), "small#scythe1".into()]);
+
+        let cap_with_vram = |tflops: f32, vram: u64| grim_tensor::backend::GpuCapability {
+            tflops_fp16: tflops,
+            tflops_fp8: 0.0,
+            hbm_bandwidth_gbps: 100.0,
+            vram_free_bytes: vram,
+            throttle_pct: 0.0,
+            ordinal: 0,
+        };
+        let gib = 1024u64 * 1024 * 1024;
+        let caps_mixed = vec![cap_with_vram(8.0, 8 * gib), cap_with_vram(80.0, 16 * gib)];
+        let caps_both_small = vec![cap_with_vram(8.0, 8 * gib), cap_with_vram(80.0, 8 * gib)];
+        let huge = (100_000usize, 32_000usize);
+        let tiny = (1_000usize, 32usize);
+
+        assert_eq!(
+            engine.scythe_admission_decision("small", huge.0, huge.1, &caps_mixed),
+            ScytheAdmission::Pin(1),
+            "oversized prompt must land on the one card that holds it"
+        );
+        assert_eq!(
+            engine.scythe_admission_decision("small", huge.0, huge.1, &caps_both_small),
+            ScytheAdmission::WaitVram,
+            "no rank fits ⇒ wait, never pin blind"
+        );
+        assert_ne!(
+            engine.scythe_admission_decision("small", tiny.0, tiny.1, &caps_both_small),
+            ScytheAdmission::WaitVram,
+            "1k-token prompt must not be blocked by the guard"
+        );
+        assert_eq!(
+            engine.scythe_admission_decision("small", huge.0, huge.1, &[]),
+            ScytheAdmission::WaitVram,
+            "profiler seeing no GPUs ⇒ wait rather than admit onto rank 0"
+        );
+        // Unarmed engine bypasses farm routing entirely (rollback invariant).
+        let mut plain = Engine::new(EngineConfig::default());
+        plain.register_model("small", small_llama());
+        plain
+            .scythe_replicas
+            .insert("small".into(), vec!["small".into(), "small#scythe1".into()]);
+        assert_eq!(
+            plain.scythe_admission_decision("small", huge.0, huge.1, &caps_mixed),
+            ScytheAdmission::Bypass,
+        );
+    }
+
+    /// WI-SB2 host gate: an enqueue that fails the VRAM guard must leave the
+    /// request queued — no session, no scheduler entry, no pin — and a later
+    /// retry once caps exist must admit it with a pin. Deterministic on any
+    /// box: with no profiler attached, caps are empty ⇒ WaitVram; the retry
+    /// leg runs wherever real GPUs are visible.
+    #[test]
+    fn test_scythe_vram_exhaustion_queues_request() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.scythe_ctrl = Some(crate::scythe2::C2plrController::new(1, 2, 150.0));
+        engine.register_model("small", small_llama());
+        engine.register_model("small#scythe1", small_llama());
+        engine
+            .scythe_replicas
+            .insert("small".into(), vec!["small".into(), "small#scythe1".into()]);
+        assert!(engine.scythe_armed());
+
+        let req = grim_scheduler::Request {
+            id: 900,
+            prompt_tokens: 100_000,
+            max_new_tokens: 32_000,
+            model_id: Some("small".into()),
+            ..Default::default()
+        };
+        // No profiler attached ⇒ the guard cannot see any rank ⇒ queued.
+        engine.enqueue_request_with_kv(req.clone()).unwrap();
+        assert_eq!(engine.scythe_vram_waitlist_len(), 1);
+        assert!(
+            !engine.sessions.contains_key(&900),
+            "queued request must have no session"
+        );
+        assert_eq!(
+            engine.scheduler.waiting.len(),
+            0,
+            "queued request must not be scheduled"
+        );
+        assert_eq!(engine.scythe_pin_of(900), None);
+        // A tick without visible caps keeps it parked (retry path is safe).
+        engine.retry_scythe_vram_waitlist();
+        assert_eq!(engine.scythe_vram_waitlist_len(), 1);
+        // Cancelling releases the slot.
+        engine.finish_request(900);
+        assert_eq!(engine.scythe_vram_waitlist_len(), 0);
+
+        // Retry leg with real caps: skipped on boxes without ROCm devices.
+        if grim_backend_rocm::CapabilityProfiler::new()
+            .capabilities()
+            .is_empty()
+        {
+            return;
+        }
+        engine.capability_profiler = Some(Arc::new(grim_backend_rocm::CapabilityProfiler::new()));
+        engine.enqueue_request_with_kv(req).unwrap();
+        engine.retry_scythe_vram_waitlist();
+        assert_eq!(
+            engine.scythe_vram_waitlist_len(),
+            0,
+            "request must place once a rank can hold it"
+        );
+        assert!(engine.sessions.contains_key(&900));
+        assert!(engine.scythe_pin_of(900).is_some());
+        assert_eq!(engine.scheduler.waiting.len(), 1);
     }
 }

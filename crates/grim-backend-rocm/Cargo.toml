@@ -44,7 +44,11 @@ cc = "1.0"
 # forwards to it), so a bare `cargo test -p grim-backend-rocm` exercises the
 # same kernels the release binary serves. Without it the cubecl-gated parity
 # tests fail while the shipping path is green (fit-it-damn-you.md E3).
-default = ["jit-hw-adaptive", "cubecl"]
+# q4k/q5k/q6k MUST ship enabled: their fused-GEMM kernels only enter the
+# aggregate JIT unit under these gates, and KQuant GGUF models (Q4_K/Q6_K are
+# the dominant formats) hit hipModuleGetFunction error 500 at first forward
+# without them — the same failure class previously fixed for grim_dequant_q4k.
+default = ["jit-hw-adaptive", "cubecl", "q4k", "q5k", "q6k"]
 rocm = []
 jit-hw-adaptive = ["rocm"]
 multi-gpu-kernel = ["rocm"]

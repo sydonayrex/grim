@@ -10919,6 +10919,9 @@ impl RocmDevice {
         entry: &str,
         spec: Option<&crate::device::hardware_spec::HardwareSpec>,
     ) -> Result<(std::path::PathBuf, String)> {
+        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            eprintln!("[jit-trace] compiling entry={}", entry);
+        }
         let hash = seahash::hash(source.as_bytes());
         let cache_key = if let Some(spec) = spec {
             crate::kernels::jit_cache::JitCacheKey::from_spec(entry, &self.gpu_target, spec, hash)
@@ -11672,6 +11675,19 @@ impl RocmDevice {
         // rebuild, no seahash, no CString, no module-cache walk. Same
         // solution_index is required because different indices map to
         // different on-disk hsaco files (cache_key includes _sol{N}).
+        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            let mut cur_dev: i32 = -1;
+            unsafe {
+                crate::device::handles::hipGetDevice(&mut cur_dev);
+            }
+            eprintln!(
+                "[launch-trace] self_dev={} ctx_dev={} {} grid=({},{},{})",
+                self.ordinal, cur_dev, entry, grid.x, grid.y, grid.z
+            );
+        }
+        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+            eprintln!("[launch-done] {}", entry);
+        }
         let fast_key = (entry.to_string(), grid.x, grid.y, solution_index);
         let cached_func: Option<*mut c_void> = self
             .resolved_kernel_cache
@@ -11680,6 +11696,11 @@ impl RocmDevice {
             .and_then(|c| c.get(&fast_key).copied());
         if let Some(func) = cached_func {
             if !func.is_null() {
+                // P1-3 discipline: the launching thread's HIP context may be
+                // parked on another device (profiler probes, multi-device
+                // loaders). Pin THIS device or the kernel executes against
+                // foreign pointers — observed as GPU page faults on gfx1201.
+                let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 let stream = self.active_stream();
                 let args_ptr = args.as_mut_ptr();
                 check_hip("hipModuleLaunchKernel (cached)", unsafe {
@@ -11697,6 +11718,7 @@ impl RocmDevice {
                         std::ptr::null_mut(),
                     )
                 })?;
+                drop(_dev_guard);
                 return Ok(stream);
             }
         }

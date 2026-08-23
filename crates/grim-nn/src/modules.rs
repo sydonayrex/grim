@@ -91,6 +91,32 @@ pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// WI-SB4a: stage an activation onto `target` for contiguous layer-pipeline
+/// execution. Same-device calls are free clones; cross-device moves stage
+/// through host memory (`from_cpu`) so no backend-specific peer support is
+/// required. The SCYTHE-2 WI-INF3 routing path keeps its own P2P fast path
+/// (`streaming_forward::transfer_to_device`) for same-PCI-domain ROCm pairs —
+/// this helper is deliberately the simple, always-correct variant.
+///
+/// On builds without the target's backend compiled in, the storage lands on
+/// the CPU fallback while carrying `target` as its device tag, which is what
+/// makes hermetic split-vs-unsplit parity gates possible off-box ("fake
+/// segments mapped to CPU").
+pub fn move_to_device(x: &Tensor, target: &Device) -> Result<Tensor> {
+    if x.device() == target {
+        return Ok(x.clone());
+    }
+    let dev = pick_device_for_storage_device(target);
+    let out_storage = dev.from_cpu(&x.to_vec_f32()?, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(out_storage),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        target.clone(),
+    ))
+}
+
 /// Pick a `BackendDevice` for a storage `Device` directly (without an
 /// owning `Tensor`), used when reconstructing a tensor from CPU-side
 /// bytes but needing to land it back on the original device.

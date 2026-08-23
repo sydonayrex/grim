@@ -1,0 +1,3 @@
+{"devices":[
+{"ordinal":0,"gcnArchName":"gfx1201","wavefront":1,"lds_bytes":1},{"ordinal":1,"gcnArchName":"gfx1200","wavefront":1,"lds_bytes":1},{"ordinal":2,"gcnArchName":"gfx1036","wavefront":1,"lds_bytes":1}
+]}

@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use grim_tensor::BackendStorage;
 use grim_tensor::backend::ScythePlacement;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
@@ -189,6 +190,13 @@ impl Scythe2Linear {
 
     /// Column-parallel forward: each rank computes a column shard,
     /// outputs are concatenated. No collective required.
+    ///
+    /// WI-SB5 step 1: shards execute as real backend `matmul` calls on their
+    /// placed rank's device (rocBLAS-bound when the layer lives on ROCm),
+    /// replacing the host triple-loop emulation. Cross-rank fan-in is still
+    /// host-staged — ring descriptors carrying shard pointers (opcode 1/2)
+    /// remain the open second step, as does binding one rocBLAS handle per
+    /// rank stream.
     fn forward_col_parallel(
         &self,
         x: &Tensor,
@@ -198,10 +206,15 @@ impl Scythe2Linear {
     ) -> Result<Tensor> {
         let n_ranks = placement.ranks.len();
         let mut col_start = 0usize;
-        let mut shards: Vec<Vec<f32>> = Vec::with_capacity(n_ranks);
+        let mut shards: Vec<(Box<dyn BackendStorage>, usize)> = Vec::with_capacity(n_ranks);
         let mut shard_out_dim = 0usize;
 
-        for (rank_idx, &_gpu_ord) in placement.ranks.iter().enumerate() {
+        let x_dims = x.shape().dims();
+        let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
+        let k = *x_dims.last().unwrap_or(&1);
+        let x_vec = x.storage().to_cpu_vec_f32()?;
+
+        for (rank_idx, gpu_ord) in placement.ranks.iter().enumerate() {
             let ratio = placement
                 .partition
                 .get(rank_idx)
@@ -215,43 +228,50 @@ impl Scythe2Linear {
             }
             // Slice the weight for this rank's column shard.
             let w_shard = slice_output_dim(&self.full_weight, col_start, count)?;
-            // Compute x @ w_shard^T  — host-side matmul for correctness.
-            let x_vec = x.storage().to_cpu_vec_f32()?;
+            // The shard executes on its placed rank's device when the layer
+            // itself lives on ROCm; otherwise the layer's own backend runs it
+            // so off-box tests stay hermetic.
+            let rank_device = match (&self.device, gpu_ord) {
+                (Device::Rocm(_), ord) => Device::Rocm(*ord),
+                (other, _) => other.clone(),
+            };
+            let rank_dev = pick_device_for_storage_device(&rank_device);
+
+            // B operand = shard transposed to (k, count). Host transpose is
+            // O(k·count) copies against an O(m·k·count) GEMM; a cached
+            // per-shard transposed weight arrives with descriptor work.
             let w_vec = w_shard.storage().to_cpu_vec_f32()?;
-            let x_dims = x.shape().dims();
-            let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
-            let k = *x_dims.last().unwrap_or(&1);
-            let n = count;
-            let mut out_vec = vec![0.0f32; m * n];
-            for bi in 0..m {
-                for ni in 0..n {
-                    let mut acc = 0.0f32;
-                    for ki in 0..k {
-                        acc += x_vec[bi * k + ki] * w_vec[ni * k + ki];
-                    }
-                    out_vec[bi * n + ni] = acc;
+            let mut w_t = vec![0.0f32; k * count];
+            for ni in 0..count {
+                for ki in 0..k {
+                    w_t[ki * count + ni] = w_vec[ni * k + ki];
                 }
             }
-            shards.push(out_vec);
-            shard_out_dim += n;
+            let b_storage = rank_dev.from_cpu(&w_t, &Shape::new(vec![k, count]), DType::F32)?;
+            let a_storage = rank_dev.from_cpu(&x_vec, &Shape::new(vec![m, k]), DType::F32)?;
+            let (out_s, _handle) = rank_dev.matmul(
+                a_storage.as_ref(),
+                b_storage.as_ref(),
+                &Shape::new(vec![m, count]),
+            )?;
+            shards.push((out_s, count));
+            shard_out_dim += count;
             col_start += count;
         }
 
-        // Concatenate column shards.
+        // Concatenate column shards (host-staged gather across ranks).
         if shards.is_empty() {
             return Err(Error::Backend(
                 "Scythe2Linear: all column shards are empty".into(),
             ));
         }
-        let x_dims = x.shape().dims();
-        let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
         let mut concat = vec![0.0f32; m * shard_out_dim];
         let mut col_offset = 0usize;
-        for shard in &shards {
-            let n = shard.len() / m;
+        for (shard, n) in &shards {
+            let shard_vec = shard.to_cpu_vec_f32()?;
             for bi in 0..m {
                 concat[bi * shard_out_dim + col_offset..bi * shard_out_dim + col_offset + n]
-                    .copy_from_slice(&shard[bi * n..(bi + 1) * n]);
+                    .copy_from_slice(&shard_vec[bi * n..(bi + 1) * n]);
             }
             col_offset += n;
         }
@@ -312,15 +332,41 @@ impl Scythe2Linear {
                 continue;
             }
             let w_shard = slice_input_dim(&self.full_weight, row_start, count)?;
-            let w_vec = w_shard.storage().to_cpu_vec_f32()?;
+            // WI-SB5 step 1: partial products execute as device matmuls on
+            // the rank's device; the P2P fan-in of partials stays host-staged
+            // until CommFuse carries shard pointers (opcode 1/2 descriptors).
+            let rank_device = match (&self.device, placement.ranks.get(rank_idx)) {
+                (Device::Rocm(_), Some(ord)) => Device::Rocm(*ord),
+                (other, _) => other.clone(),
+            };
+            let rank_dev = pick_device_for_storage_device(&rank_device);
+
+            // A operand: this rank's K-slice of x, (m, count).
+            let mut xs = vec![0.0f32; m * count];
             for bi in 0..m {
-                for ni in 0..out_features {
-                    let mut acc = 0.0f32;
-                    for ki in 0..count {
-                        acc += x_vec[bi * in_features + row_start + ki] * w_vec[ni * count + ki];
-                    }
-                    partial_sum[bi * out_features + ni] += acc;
+                xs[bi * count..(bi + 1) * count].copy_from_slice(
+                    &x_vec[bi * in_features + row_start..bi * in_features + row_start + count],
+                );
+            }
+            // B operand: shard transposed to (count, out_features).
+            let w_vec = w_shard.storage().to_cpu_vec_f32()?;
+            let mut w_t = vec![0.0f32; count * out_features];
+            for ni in 0..out_features {
+                for ki in 0..count {
+                    w_t[ki * out_features + ni] = w_vec[ni * count + ki];
                 }
+            }
+            let a_storage = rank_dev.from_cpu(&xs, &Shape::new(vec![m, count]), DType::F32)?;
+            let b_storage =
+                rank_dev.from_cpu(&w_t, &Shape::new(vec![count, out_features]), DType::F32)?;
+            let (partial, _h) = rank_dev.matmul(
+                a_storage.as_ref(),
+                b_storage.as_ref(),
+                &Shape::new(vec![m, out_features]),
+            )?;
+            let pv = partial.to_cpu_vec_f32()?;
+            for (dst, src) in partial_sum.iter_mut().zip(pv) {
+                *dst += src;
             }
             row_start += count;
         }

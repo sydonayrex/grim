@@ -543,6 +543,10 @@ impl CausalLm for SpeculativeCausalLm {
         self.target.new_session()
     }
 
+    fn hidden_size_hint(&self) -> Option<usize> {
+        self.target.hidden_size_hint()
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,
