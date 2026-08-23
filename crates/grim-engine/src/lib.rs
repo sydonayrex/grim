@@ -532,6 +532,46 @@ impl Engine {
     /// `path`, one per leftover visible ROCm device. Without an armed
     /// controller or a second GPU this degrades to plain registration.
     pub fn register_model_with_farm(&mut self, id: &str, primary: Box<dyn CausalLm>, path: &str) {
+        self.register_model_with_farm_inner(id, primary, path, None);
+    }
+
+    /// Load a farm while keeping speculative decoding on rank 0. Replica
+    /// models are intentionally plain: the drafter is coupled to rank 0's
+    /// device and is not replicated across the farm.
+    pub fn load_and_register_scythe_farm_speculative(
+        &mut self,
+        id: &str,
+        base_path: &str,
+        draft_path: Option<&str>,
+        lookahead: bool,
+    ) -> Result<()> {
+        let base_model = crate::model_loader::load_from_path(base_path)?;
+        let drafter = if let Some(d_path) = draft_path {
+            match crate::model_loader::load_eagle3_from_path(d_path, base_model.device().clone()) {
+                Ok(eagle3) => Some(Arc::new(grim_speculative::Eagle3Drafter::new(eagle3))
+                    as Arc<dyn DraftBackbone>),
+                Err(_) => {
+                    let _ = crate::model_loader::load_from_path(d_path)?;
+                    Some(Arc::new(grim_speculative::TinyDraftBackbone::new(
+                        128256, 2048, 4, 42,
+                    )) as Arc<dyn DraftBackbone>)
+                }
+            }
+        } else {
+            None
+        };
+        let _ = lookahead;
+        self.register_model_with_farm_inner(id, base_model, base_path, drafter);
+        Ok(())
+    }
+
+    fn register_model_with_farm_inner(
+        &mut self,
+        id: &str,
+        primary: Box<dyn CausalLm>,
+        path: &str,
+        drafter: Option<Arc<dyn DraftBackbone>>,
+    ) {
         let devices = crate::model_loader::visible_rocm_devices();
         let primary_ordinal = match (self.scythe_armed(), primary.device()) {
             (true, grim_tensor::Device::Rocm(ord)) if devices.len() > 1 => *ord,
@@ -548,7 +588,11 @@ impl Engine {
                 ordered.push(dev);
             }
         }
-        self.register_model(id, primary);
+        if let Some(drafter) = drafter {
+            self.register_speculative(id, primary, Some(drafter), None, None);
+        } else {
+            self.register_model(id, primary);
+        }
         let mut replica_ids = vec![id.to_string()];
         for (rank, dev) in ordered.iter().enumerate().skip(1) {
             match crate::model_loader::load_from_path_on_device(path, dev.clone()) {
@@ -616,21 +660,26 @@ impl Engine {
     /// WaveTune latency argmin naturally balances once the fast card fills.
     /// Honest fallbacks, in order: no farm → 0; profiler sees no GPUs → 0
     /// (cannot route over hardware it cannot see); controller missing → 0.
-    fn scythe_pick_rank(&mut self, base: &str, seq_len: usize) -> usize {
+    fn scythe_pick_rank(
+        &mut self,
+        base: &str,
+        seq_len: usize,
+        max_new_tokens: usize,
+    ) -> Option<usize> {
         let Some(ids) = self.scythe_replicas.get(base) else {
-            return 0;
+            return None;
         };
         let n = ids.len();
         if n <= 1 {
-            return 0;
+            return Some(0);
         }
         let Some(ref profiler) = self.capability_profiler else {
-            return 0;
+            return Some(0);
         };
         let caps_raw = profiler.capabilities();
         if caps_raw.is_empty() {
-            eprintln!("[scythe2] farm present but profiler sees no GPUs; pinning to rank 0");
-            return 0;
+            eprintln!("[scythe2] farm present but profiler sees no GPUs; leaving request queued");
+            return None;
         }
         let mut load = vec![0usize; n];
         for &r in self.scythe_pin.values() {
@@ -638,17 +687,50 @@ impl Engine {
                 load[r] += 1;
             }
         }
-        let caps = load_adjusted_caps(&caps_raw, n, &load);
+        // Reserve KV plus a small working-set floor before placement. A zero
+        // free-VRAM reading means the probe is unavailable, so retain the
+        // existing capability fallback rather than rejecting every request.
+        const VRAM_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
+        let layers = self
+            .models
+            .get(base)
+            .and_then(|m| m.model.num_layers_hint())
+            .unwrap_or(1) as u64;
+        let seq = seq_len.saturating_add(max_new_tokens).max(1) as u64;
+        let kv_bytes = 2u64
+            .saturating_mul(seq)
+            .saturating_mul(self.config.num_kv_heads as u64)
+            .saturating_mul(self.config.head_dim as u64)
+            .saturating_mul(layers)
+            .saturating_mul(4);
+        let working_set = 2u64
+            .saturating_mul(seq)
+            .saturating_mul((self.config.num_kv_heads * self.config.head_dim) as u64)
+            .saturating_mul(layers)
+            .saturating_mul(4);
+        let footprint = kv_bytes.saturating_add(working_set);
+        let mut caps = load_adjusted_caps(&caps_raw, n, &load);
+        for cap in &mut caps {
+            if cap.vram_free_bytes != 0
+                && cap.vram_free_bytes < footprint.saturating_add(VRAM_WATERMARK_BYTES)
+            {
+                cap.tflops_fp16 = 0.0;
+            }
+        }
+        if caps.iter().all(|c| c.tflops_fp16 <= 0.0) {
+            eprintln!("[scythe2] no farm rank has enough free VRAM; leaving request queued");
+            return None;
+        }
         let links = grim_backend_rocm::CapabilityProfiler::link_matrix(n);
         let epoch = grim_backend_rocm::current_epoch();
         // Proxy shape: at pass granularity only the sequence length carries
         // signal (the bucket), and relative TFLOPS ordering drives the pick.
         let shape = [1usize, seq_len.max(1), 1, 1];
         let Some(ctrl) = self.scythe_ctrl.as_mut() else {
-            return 0;
+            return Some(0);
         };
         let placement = ctrl.decide(0, &shape, &caps, &links, epoch);
-        placement.ranks.first().copied().unwrap_or(0).min(n - 1)
+        placement.ranks.first().copied().map(|r| r.min(n - 1))
     }
 
     /// Pinned farm rank for a request, if any. Telemetry/status surface.
@@ -1456,9 +1538,12 @@ impl Engine {
             .or_else(|| self.models.keys().next().cloned());
         let pin_rank = match base_for_pin.as_deref() {
             Some(base) if self.scythe_armed() && self.scythe_replicas.contains_key(base) => {
-                let rank = self.scythe_pick_rank(base, request.prompt_tokens);
-                self.scythe_pin.insert(request.id, rank);
-                Some(rank)
+                let rank =
+                    self.scythe_pick_rank(base, request.prompt_tokens, request.max_new_tokens);
+                if let Some(rank) = rank {
+                    self.scythe_pin.insert(request.id, rank);
+                }
+                rank
             }
             _ => None,
         };

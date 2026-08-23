@@ -1,0 +1,5 @@
+Explain why measuring both throughput and latency matters in GPU inference.
+
+Write a concise technical note about KV cache memory growth as context length increases.
+
+Compare replica-per-GPU serving with splitting transformer layers across two asymmetric GPUs, including the main bandwidth tradeoff.

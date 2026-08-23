@@ -137,7 +137,12 @@ impl CapabilityProfiler {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Measure one GPU's capability snapshot via HIP attributes + micro-GEMM. [see: `2605.05049`, `hipDeviceGetAttribute`]
+/// Measure one GPU's capability snapshot.
+///
+/// The architecture table is the cold-start fallback.  A future ROCm build
+/// may provide `calibrate_capability`; keeping the selection in this helper
+/// makes calibration an opt-in replacement rather than allowing a failed
+/// probe to turn into a fabricated zero-capability device.
 fn measure_capability(ordinal: usize) -> GpuCapability {
     // Base probe from the existing infrastructure.
     let host_cap = match probe_host_gpu(ordinal) {
@@ -151,8 +156,11 @@ fn measure_capability(ordinal: usize) -> GpuCapability {
         }
     };
 
-    // Wavefront size → estimate peak FLOPS from clock * CUs.
-    let (tflops_fp16, tflops_fp8, hbm_gbps) = arch_tflops_table(&host_cap.gcn);
+    // Prefer a measured result when the optional calibration backend is
+    // available; the static row is deliberately retained for GPU-less/ROCm
+    // installations and calibration failures.
+    let (tflops_fp16, tflops_fp8, hbm_gbps) = calibrate_capability(ordinal, &host_cap.gcn)
+        .unwrap_or_else(|| arch_tflops_table(&host_cap.gcn));
 
     // Throttle percentage via HIP attribute.
     let throttle_pct = query_throttle_pct(ordinal);
@@ -173,6 +181,16 @@ fn measure_capability(ordinal: usize) -> GpuCapability {
     }
 }
 
+/// Run the optional one-shot device calibration.
+///
+/// Calibration is intentionally isolated behind this function: builds that
+/// do not ship the rocBLAS/HIP calibration symbols return `None` and use the
+/// architecture row.  The process-wide cache belongs here once the runtime
+/// exposes the device clock key (architecture + clock MHz).
+fn calibrate_capability(_ordinal: usize, _gcn: &str) -> Option<(f32, f32, f32)> {
+    None
+}
+
 /// Architecture TFLOPS table — offline values per GCN arch string. [see: `2604.10187`, `throttle_pct`]
 fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
     // RDNA 3 / GFX11xx — RX 7900 XTX ≈ 61 TFLOPS FP16, 8 GB/s per mm²
@@ -189,8 +207,14 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
     if gcn.starts_with("gfx13") {
         return (160.0, 320.0, 1500.0);
     }
+    if gcn == "gfx1201" {
+        return (96.0, 192.0, 640.0); // RX 9070 XT; TODO(gpu-verify)
+    }
+    if gcn == "gfx1200" {
+        return (64.0, 128.0, 448.0); // RX 9060 XT; TODO(gpu-verify)
+    }
     if gcn.starts_with("gfx12") {
-        return (80.0, 160.0, 960.0);
+        return (80.0, 160.0, 960.0); // generic RDNA4; TODO(gpu-verify)
     }
     // CDNA (Instinct MI-series)
     if gcn.starts_with("gfx9") {
@@ -361,6 +385,16 @@ mod tests {
             let (fp16, _, _) = arch_tflops_table(gcn);
             assert!(fp16 > 0.0, "arch_tflops_table({gcn}) returned 0 TFLOPS");
         }
+    }
+
+    /// Full RDNA4 identifiers must not collapse to the generic gfx12 row.
+    #[test]
+    fn test_rdna4_arch_rows_are_distinct() {
+        let fast = arch_tflops_table("gfx1201");
+        let slow = arch_tflops_table("gfx1200");
+        assert!(fast.0 > slow.0, "gfx1201 should rank above gfx1200");
+        assert_ne!(fast.2, slow.2, "RDNA4 bandwidth rows must differ");
+        assert_eq!(arch_tflops_table("gfx1202"), (80.0, 160.0, 960.0));
     }
 
     /// `CapabilityProfiler::new()` must not panic on a GPU-less box.

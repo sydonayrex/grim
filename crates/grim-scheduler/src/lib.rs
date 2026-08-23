@@ -17,6 +17,9 @@ pub use bandwidth_policy::BandwidthProfile;
 pub struct Request {
     pub id: u64,
     pub prompt_tokens: usize,
+    /// Maximum number of tokens this request may generate, used by admission
+    /// guards that reserve KV capacity before selecting a device.
+    pub max_new_tokens: usize,
     pub priority: i32,
     /// Tokens consumed so far in the current prefill pass (chunked prefill tracking).
     pub consumed_tokens: usize,
@@ -35,6 +38,7 @@ impl Default for Request {
         Self {
             id: 0,
             prompt_tokens: 0,
+            max_new_tokens: 0,
             priority: 0,
             consumed_tokens: 0,
             model_id: None,

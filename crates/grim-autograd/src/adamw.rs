@@ -3527,10 +3527,7 @@ mod tests {
             let mut opt = Optimizer::new(kind, 1e-2).expect("must construct");
             let mut params = TrainableParams::new();
             let w0 = vec![1.0f32, -2.0, 0.5, 3.0];
-            let t = grim_backend_cpu::cpu_tensor(
-                w0.clone(),
-                grim_tensor::Shape::new(vec![2, 2]),
-            );
+            let t = grim_backend_cpu::cpu_tensor(w0.clone(), grim_tensor::Shape::new(vec![2, 2]));
             params.insert(
                 TrainableParam::new(
                     ParamId::base(0, crate::injection::LoRAInjectionPoint::QProj),

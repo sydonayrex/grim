@@ -489,6 +489,7 @@ fn sample_next_token(
         let req = grim_scheduler::Request {
             id: request_id,
             prompt_tokens: prompt_tokens.len(),
+            max_new_tokens: 0,
             priority: 0,
             consumed_tokens: 0,
             model_id: model_id_final,

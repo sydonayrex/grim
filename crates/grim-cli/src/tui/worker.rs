@@ -352,6 +352,7 @@ impl Worker {
         let req = Request {
             id: request_id,
             prompt_tokens: prompt_ids.len(),
+            max_new_tokens: 0,
             priority: 0,
             consumed_tokens: 0,
             // always explicit: the None default routes to "first registered",
