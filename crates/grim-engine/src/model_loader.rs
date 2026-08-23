@@ -3904,6 +3904,35 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     }
 }
 
+/// Load a model onto an explicitly chosen device — the SCYTHE-2 farm-replica
+/// entry point. Unlike [`load_from_path`], no env-driven backend selection
+/// runs: the caller (the engine's farm loader) owns the per-replica device
+/// decision, and an unavailable device surfaces as that backend's own load
+/// error rather than a silent fallback.
+pub fn load_from_path_on_device(path: &str, dev: Device) -> Result<Box<dyn CausalLm>> {
+    if path.ends_with(".grim") {
+        load_model_from_grim(path, dev)
+    } else if path.ends_with(".safetensors") {
+        load_model_from_safetensors(path, dev)
+    } else {
+        load_model_from_gguf(path, dev)
+    }
+}
+
+/// ROCm devices visible to this process, in ordinal order. The SCYTHE-2 farm
+/// loader loads one weight replica per entry; an empty list means this process
+/// sees no AMD GPUs (CPU-only box) and farm mode cannot arm.
+pub fn visible_rocm_devices() -> Vec<Device> {
+    grim_backend_rocm::RocmDevice::probe()
+        .map(|devices| {
+            devices
+                .iter()
+                .map(|d| Device::Rocm(d.ordinal()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 /// Load an EAGLE3 speculative drafter model from a safetensors checkpoint.
 pub fn load_eagle3_from_path(
     path: &str,

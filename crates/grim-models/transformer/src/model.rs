@@ -448,6 +448,10 @@ impl CausalLm for Llama {
         Box::new(Inner::new(self.device.clone()))
     }
 
+    fn num_layers_hint(&self) -> Option<usize> {
+        Some(self.cfg.num_layers)
+    }
+
     fn forward(
         &self,
         session: &mut dyn SessionT,

@@ -353,14 +353,30 @@ impl C2plrController {
         );
 
         // ── Placement selection ─────────────────────────────────────────────
-        // Placement logits: argmax over first K elements.
+        // Placement logits: argmax over first K elements. With an untrained
+        // (all-zero) MLP every logit is identical, and a naive argmax pins
+        // every layer to rank 0 — on an asymmetric pair that may be the
+        // *slower* card. When the logits carry no signal (all equal), ship
+        // the WaveTune bilinear estimate alone (WI-INF5 first cut): pick the
+        // GPU with the lowest predicted GEMM latency.
         let placement_logits = &logits[..k.min(logits.len())];
-        let best_gpu = placement_logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let logits_carry_no_signal = placement_logits.windows(2).all(|w| w[0] == w[1]);
+        let best_gpu = if logits_carry_no_signal {
+            latencies
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.is_finite())
+                .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        } else {
+            placement_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
 
         // ── Partition ratios ────────────────────────────────────────────────
         // Use softmax over the partition logits slice to get ratios that sum to 1.
@@ -484,6 +500,13 @@ impl C2plrController {
     pub fn on_gpu_leave(&mut self, ordinal: usize) {
         eprintln!("[scythe2] GPU {ordinal} left — clearing PlacementCache (mode-B safety)");
         self.cache.on_gpu_leave();
+    }
+
+    /// Number of GPUs this controller was constructed for. The engine reads
+    /// this when re-sizing the controller to a newly loaded model's depth
+    /// (WI-INF2: one controller per loaded model).
+    pub fn num_gpus(&self) -> usize {
+        self.num_gpus
     }
 }
 
@@ -1276,6 +1299,85 @@ mod tests {
             assert!(
                 ctrl.cache.get(layer_id, bucket).is_none(),
                 "fast cache must be cleared after GPU leave for layer {layer_id}"
+            );
+        }
+    }
+
+    /// WI-INF5 gate (first cut): an untrained (all-zero) MLP produces
+    /// identical placement logits for every GPU; the controller must fall
+    /// back to the WaveTune bilinear latency estimate alone (argmin) instead
+    /// of sticky rank 0. On `syd-beasty`'s asymmetric pair this is what stops
+    /// every layer landing on whichever card happens to be ordinal 0.
+    #[test]
+    fn test_untrained_mlp_prefers_faster_gpu() {
+        let num_layers = 4;
+        // Rank 0 slow, rank 1 fast (asymmetric pair shape).
+        let caps = vec![
+            GpuCapability {
+                tflops_fp16: 8.0,
+                tflops_fp8: 0.0,
+                hbm_bandwidth_gbps: 51.2,
+                vram_free_bytes: 16 << 30,
+                throttle_pct: 0.0,
+                ordinal: 0,
+            },
+            GpuCapability {
+                tflops_fp16: 80.0,
+                tflops_fp8: 160.0,
+                hbm_bandwidth_gbps: 960.0,
+                vram_free_bytes: 16 << 30,
+                throttle_pct: 0.0,
+                ordinal: 1,
+            },
+        ];
+        let links = make_links(2);
+        let shape = [1usize, 2048, 4096, 128];
+
+        let mut ctrl = C2plrController::new(num_layers, 2, 150.0);
+        assert_eq!(
+            ctrl.theta_w1.iter().all(|&w| w == 0.0),
+            true,
+            "fresh controller weights must be zero for this gate"
+        );
+        for layer_id in 0..num_layers as u32 {
+            let p = ctrl.decide(layer_id, &shape, &caps, &links, 0);
+            assert_eq!(
+                p.ranks,
+                vec![1usize],
+                "untrained controller must place on the faster card (rank 1)"
+            );
+            assert!(p.partition.len() == 1 && p.partition[0].is_finite());
+        }
+    }
+
+    /// `sync_epoch` must clear the fast path when the global capability epoch
+    /// moved, so the next decide re-runs against fresh capabilities (the
+    /// engine tick's WI-INF2 staleness pull).
+    #[test]
+    fn test_sync_epoch_clears_fast_path() {
+        let num_layers = 4;
+        let caps = make_caps(2);
+        let links = make_links(2);
+        let shape = [1usize, 1, 4096, 128];
+
+        let mut ctrl = C2plrController::new(num_layers, 2, 10.0);
+        for layer_id in 0..num_layers as u32 {
+            ctrl.decide(layer_id, &shape, &caps, &links, 0);
+        }
+        let bucket = bucketize(&shape);
+        for layer_id in 0..num_layers as u32 {
+            assert!(ctrl.cache.get(layer_id, bucket).is_some());
+        }
+        // Global epoch bumped out-of-band (throttle cliff / GPU leave), then
+        // the cache is told to pull it.
+        grim_backend_rocm::bump_epoch();
+        let epoch = grim_backend_rocm::current_epoch();
+        ctrl.cache.sync_epoch(epoch);
+        assert_eq!(ctrl.cache.current_epoch, epoch);
+        for layer_id in 0..num_layers as u32 {
+            assert!(
+                ctrl.cache.get(layer_id, bucket).is_none(),
+                "fast path must be cleared after epoch sync for layer {layer_id}"
             );
         }
     }

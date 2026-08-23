@@ -40,3 +40,7 @@ grim-quant = { workspace = true }
 default = []
 cuda = ["dep:grim-backend-cuda"]
 rocm-mem = []
+
+[[bench]]
+name = "scythe2_decide_miss"
+harness = false
