@@ -103,7 +103,6 @@ use crate::{
     hipModuleLaunchKernel,
     hipModuleLoad,
     hipModuleUnload,
-    hipSetDevice,
     hipStreamBeginCapture,
     hipStreamCreate,
     hipStreamDestroy,
@@ -291,14 +290,24 @@ impl RocmDevice {
         let detected = detect_gpu_arch(ordinal as i32);
         crate::rocm_detect::auto_configure_hsa_override(&detected);
 
+        // WI-M1/M2 context discipline: construction must run on the target
+        // device's context (streams and the rocBLAS handle bind to whatever
+        // device is current), but construction must be context-NEUTRAL for
+        // the caller. This path used to park the constructing thread on
+        // `ordinal` permanently — first use of a foreign ordinal from a
+        // worker thread mid-forward flipped that thread's context, which is
+        // exactly the ctx_dev=2 fault mechanism under hunt. raw_set_device
+        // keeps every such flip visible to [ctx-trace].
+        let mut prev_dev: i32 = 0;
         unsafe {
-            let set_status = hipSetDevice(ordinal as i32);
-            if set_status != hipSuccess {
-                return Err(Error::Backend(format!(
-                    "hipSetDevice({ordinal}) failed with code {set_status} \
-                     (is the ordinal out of range?)"
-                )));
-            }
+            let _ = crate::device::handles::hipGetDevice(&mut prev_dev);
+        }
+        let set_status = crate::device::util::raw_set_device(ordinal as i32);
+        if set_status != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipSetDevice({ordinal}) failed with code {set_status} \
+                 (is the ordinal out of range?)"
+            )));
         }
 
         let mut handle_cache = None;
@@ -345,6 +354,9 @@ impl RocmDevice {
         // builds its own RcclAllReduce over the full ordinal list so
         // `RowParallelLinear::forward`'s all_reduce has a live comm handle.
         dev.auto_init_rccl();
+        // Construction is context-neutral: hand the calling thread its
+        // previous device back instead of parking it on `ordinal`.
+        let _restore = crate::device::util::raw_set_device(prev_dev);
         Ok(dev)
     }
     fn fallback(ordinal: usize) -> Self {
@@ -815,6 +827,10 @@ impl RocmDevice {
         let bytes = data.len() * elem_size;
         let align = elem_size.max(16); // safe default; matches element boundaries.
         let buf = self.scratch_pool.get(bytes, align)?;
+        // WI-M1 context discipline: the pooled buffer lives on THIS device;
+        // pin the context or a drifted thread's synchronous H2D copy lands
+        // the data on another device's memory.
+        let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // Copy host → device. We do a synchronous `hipMemcpy` here; the
         let res: HipErrorT = unsafe {
             crate::hipMemcpy(
@@ -2979,7 +2995,7 @@ impl BackendDevice for RocmDevice {
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut w_ptr = dev_ptr(w_s)?;
-        let mut idx_ptr = upload_device_buffer(indices)?;
+        let mut idx_ptr = upload_device_buffer(self.ordinal, indices)?;
         let mut dim_i = dim as i32;
         let mut total_i = total as i32;
         let (grid, block) = linear_launch(total);
@@ -4577,7 +4593,7 @@ impl BackendDevice for RocmDevice {
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
-        let mut pos_ptr = upload_device_buffer(positions)?;
+        let mut pos_ptr = upload_device_buffer(self.ordinal, positions)?;
         let mut b_i = b;
         let mut s_i = s;
         let mut d_i = d;
@@ -5141,6 +5157,11 @@ impl BackendDevice for RocmDevice {
 
         // ── Device-side assembly + optional RCCL all-reduce ────────────────
         if is_f32 {
+            // WI-M1 context discipline: the synchronous D2D memcpys below
+            // execute in the calling thread's current device context; pin
+            // THIS device or a drifted thread assembles the fan-in buffer
+            // against foreign mappings.
+            let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             let out_shape = Shape::from_slice(&[m, n_total]);
             let out_storage =
                 RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
@@ -5462,8 +5483,8 @@ impl RocmDevice {
 
         // Upload positions and inv_freq to device-resident scratch buffers.
         // These are temporary allocations freed after the stream synchronises.
-        let mut pos_ptr = upload_device_buffer(positions)?;
-        let mut freq_ptr = upload_device_buffer(&inv_freq)?;
+        let mut pos_ptr = upload_device_buffer(self.ordinal, positions)?;
+        let mut freq_ptr = upload_device_buffer(self.ordinal, &inv_freq)?;
 
         let storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
@@ -5887,9 +5908,9 @@ impl RocmDevice {
         // Upload the routing arrays (tokens, experts, weights) to the device.
         // These are freed after the launch synchronizes (mirroring the
         // embedding path's transient-buffer discipline).
-        let mut tok_ptr = upload_device_buffer(&assignment.tokens)?;
-        let mut exp_ptr = upload_device_buffer(&assignment.experts)?;
-        let mut w_ptr = upload_device_buffer(&assignment.weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &assignment.tokens)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &assignment.experts)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &assignment.weights)?;
 
         let mut a = a_ptr as *mut c_void;
         let mut gw = expert_gate_w_ptr as *mut c_void;
@@ -6112,9 +6133,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         let mut a = a_ptr as *mut c_void;
         let mut gw = expert_gate_w_ptr as *mut c_void;
@@ -6224,9 +6245,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         let mut a = a_ptr as *mut c_void;
         let mut gw = expert_gate_w_fp8_ptr as *mut c_void;
@@ -6336,9 +6357,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         let mut a = a_ptr as *mut c_void;
         let mut gw = egate_w_ptr as *mut c_void;
@@ -6448,9 +6469,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         let mut a = a_ptr as *mut c_void;
         let mut gw = egate_w_ptr as *mut c_void;
@@ -6557,9 +6578,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         let mut a = a_ptr as *mut c_void;
         let mut gw = egate_w_ptr as *mut c_void;
@@ -6657,9 +6678,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         let mut a = act_storage.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_iqk: activations has no device ptr".into())
@@ -7006,9 +7027,9 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
-        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
-        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
-        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
         // Kernel arg order matches grim_moe_fused_grouped_backward signature:
         // activations, gate_w, up_w, down_w, d_y, d_gate_w, d_up_w, d_down_w,
@@ -11675,15 +11696,24 @@ impl RocmDevice {
         // rebuild, no seahash, no CString, no module-cache walk. Same
         // solution_index is required because different indices map to
         // different on-disk hsaco files (cache_key includes _sol{N}).
-        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+        // WI-M2: every launch stamps (self_dev, ctx_dev). Under
+        // GRIM_ALLOC_TRACE it prints; in unit-test builds the WI-M3 drift
+        // gates read the same pair back through the util atomics. With both
+        // off this compiles to exactly the previous no-op.
+        let trace_on = std::env::var("GRIM_ALLOC_TRACE").is_ok();
+        if trace_on || cfg!(test) {
             let mut cur_dev: i32 = -1;
             unsafe {
                 crate::device::handles::hipGetDevice(&mut cur_dev);
             }
-            eprintln!(
-                "[launch-trace] self_dev={} ctx_dev={} {} grid=({},{},{})",
-                self.ordinal, cur_dev, entry, grid.x, grid.y, grid.z
-            );
+            #[cfg(test)]
+            crate::device::util::stamp_launch_context(self.ordinal as i32, cur_dev);
+            if trace_on {
+                eprintln!(
+                    "[launch-trace] self_dev={} ctx_dev={} {} grid=({},{},{})",
+                    self.ordinal, cur_dev, entry, grid.x, grid.y, grid.z
+                );
+            }
         }
         if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
             eprintln!("[launch-done] {}", entry);

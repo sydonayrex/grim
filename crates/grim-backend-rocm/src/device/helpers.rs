@@ -31,6 +31,10 @@ pub fn memcpy_with_xnack_fallback(
     kind: HipMemcpyKind,
     device_ordinal: usize,
 ) -> HipErrorT {
+    // WI-M1 context discipline: both the sync and the async+sync-stream copy
+    // execute against the calling thread's current device context. Pin the
+    // owning ordinal or a drifted thread copies through foreign mappings.
+    let _guard = crate::device::util::DeviceGuard::set(device_ordinal as i32);
     if crate::probe_xnack(device_ordinal) {
         unsafe {
             let mut stream: *mut c_void = std::ptr::null_mut();
@@ -146,7 +150,12 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(
 }
 
 /// Allocate a device-side scratch buffer, copy `data` into it, and return the [see: `hipFree`, `upload_to_scratch`]
-pub fn upload_device_buffer<T: Copy>(data: &[T]) -> Result<*mut c_void> {
+/// Allocate a device-side scratch buffer, copy `data` into it, and return the
+/// raw pointer. `ordinal` is the device the buffer must live on: WI-M1 pins
+/// the calling thread's context to it for the malloc + H2D copy so a drifted
+/// thread cannot land the scratch on another device.
+pub fn upload_device_buffer<T: Copy>(ordinal: usize, data: &[T]) -> Result<*mut c_void> {
+    let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
     let bytes = data.len() * std::mem::size_of::<T>();
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let mut res = unsafe { hipMalloc(&mut ptr, bytes) };

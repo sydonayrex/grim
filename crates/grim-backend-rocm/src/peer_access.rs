@@ -29,7 +29,10 @@ use crate::{HipErrorT, hipSuccess};
 // drift between ROCm releases — re-declaring at the call site keeps
 // `peer_access` self-contained. Edition 2024 requires the `unsafe`
 // marker on `extern` blocks; `unsafe` on the body callsites then
-// becomes redundant.
+// becomes redundant. The device-context calls (`hipGetDevice` /
+// `hipSetDevice`) are deliberately NOT re-declared here: WI-M1 routes
+// every context switch through `crate::device::util::raw_set_device`
+// so the [ctx-trace] drift watch sees it.
 unsafe extern "C" {
     fn hipGetDeviceCount(count: *mut i32) -> HipErrorT;
     fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
@@ -40,8 +43,6 @@ unsafe extern "C" {
     ) -> HipErrorT;
     fn hipDeviceEnablePeerAccess(peer_device: i32, flags: u32) -> HipErrorT;
     fn hipDeviceDisablePeerAccess(peer_device: i32) -> HipErrorT;
-    fn hipGetDevice(device: *mut i32) -> HipErrorT;
-    fn hipSetDevice(device: i32) -> HipErrorT;
 }
 
 /// Runtime verdict for a `(src, dst)` GPU pair. `Copy + PartialEq` so
@@ -146,11 +147,13 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
     // device, so we must pin the current device to `src` for the duration.
     // Without this, the grant lands on (or fails from) whatever device the
     // caller last touched and the topology matrix records phantom links.
+    // WI-M1: both switches go through `raw_set_device` (save/restore stays
+    // balanced here — verified by the hip_context_contract gate).
     let mut prev_device: i32 = 0;
     let mut pinned = false;
-    if unsafe { hipGetDevice(&mut prev_device) } == hipSuccess {
+    if unsafe { crate::device::handles::hipGetDevice(&mut prev_device) } == hipSuccess {
         if prev_device != src {
-            pinned = unsafe { hipSetDevice(src) } == hipSuccess;
+            pinned = crate::device::util::raw_set_device(src) == hipSuccess;
         } else {
             pinned = true;
         }
@@ -178,7 +181,7 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
         }
     };
     if pinned && prev_device != src {
-        let _ = unsafe { hipSetDevice(prev_device) };
+        let _ = crate::device::util::raw_set_device(prev_device);
     }
     outcome
 }

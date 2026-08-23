@@ -146,7 +146,8 @@ pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
 
 pub use crate::device::util::{
     ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size, dtype_f32,
-    gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch, warp_rows_launch,
+    gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch, prefill_in_flight,
+    raw_set_device, set_prefill_in_flight, warp_rows_launch,
 };
 
 // ROCmDevice itself: large struct + every impl lives in
@@ -214,3 +215,8 @@ pub use quantization::GcnArch;
 
 #[cfg(test)]
 mod lib_internal_tests;
+
+// WI-M3: context-correctness gates for the multi-GPU HIP context-drift
+// fault (gguf_multigpu_context_plan.md). Device-gated; needs >=2 GPUs.
+#[cfg(test)]
+mod context_drift_tests;

@@ -1289,7 +1289,19 @@ impl Engine {
         Ok(output)
     }
 
+    /// WI-M2 drift watch (gguf_multigpu_context_plan.md): hold the
+    /// process-wide prefill latch up for the duration of the pass. While it
+    /// is set, ANY HIP context switch to a non-zero device on any thread is
+    /// traced with a forced backtrace under `GRIM_ALLOC_TRACE`, so the setter
+    /// flipping the forward pass onto a foreign GPU is named in the log.
     fn drive_prefill(&mut self, id: u64) -> Result<()> {
+        grim_backend_rocm::set_prefill_in_flight(true);
+        let outcome = self.drive_prefill_inner(id);
+        grim_backend_rocm::set_prefill_in_flight(false);
+        outcome
+    }
+
+    fn drive_prefill_inner(&mut self, id: u64) -> Result<()> {
         let prompt_tokens = match self.scheduler.running.iter().find(|r| r.id == id) {
             Some(r) => r.prompt_tokens,
             None => return Ok(()),

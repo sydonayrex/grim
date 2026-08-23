@@ -1,6 +1,10 @@
 //! Module-level utilities used by the `RocmDevice` impl blocks. None of [see: `linear_launch`, `as_rocm`, `dev_ptr`, `arg`]
 
 use std::ffi::{CString, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicI32;
 
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::{ArithType, BackendStorage, Error, Result};
@@ -87,12 +91,7 @@ impl DeviceGuard {
             let _ = crate::device::handles::hipGetDevice(&mut prev);
             let _ = crate::device::handles::hipSetDevice(ordinal);
         }
-        // TEMP-DIAG (GGUF fault hunt): name whoever switches onto a
-        // non-primary device while the trace gate is set.
-        if ordinal == 2 && std::env::var("GRIM_ALLOC_TRACE").is_ok() {
-            eprintln!("[ctx-trace] DeviceGuard::set(2) prev={prev}");
-            eprintln!("{}", std::backtrace::Backtrace::force_capture());
-        }
+        emit_ctx_trace("DeviceGuard", ordinal, prev);
         Self { prev }
     }
 }
@@ -103,6 +102,93 @@ impl Drop for DeviceGuard {
             let _ = crate::device::handles::hipSetDevice(self.prev);
         }
     }
+}
+
+// ── Context-drift watch (gguf_multigpu_context_plan.md WI-M1/M2) ────────────
+
+/// Process-wide latch set by the engine for the duration of a prefill pass.
+/// While it is up, ANY context switch to a non-zero ordinal is traced with a
+/// forced backtrace under `GRIM_ALLOC_TRACE`, so the setter that flips the
+/// main thread's HIP context mid-forward (the ctx_dev=2 page-fault producer)
+/// is named in the log even when it does not go through `DeviceGuard`.
+static PREFILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Mark the beginning (`true`) or end (`false`) of a prefill pass. Called by
+/// the engine around `drive_prefill`; cheap enough to leave permanently wired.
+pub fn set_prefill_in_flight(on: bool) {
+    PREFILL_IN_FLIGHT.store(on, Ordering::SeqCst);
+}
+
+/// Current state of the drift-watch latch.
+pub fn prefill_in_flight() -> bool {
+    PREFILL_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+fn alloc_trace_enabled() -> bool {
+    std::env::var("GRIM_ALLOC_TRACE").is_ok()
+}
+
+/// Emit one `[ctx-trace]` line plus a forced backtrace when `target` is a
+/// context switch worth naming: the legacy TEMP-DIAG case (anything parking
+/// on ordinal 2) and — new in WI-M2 — any switch to a non-zero device while
+/// the prefill latch is up. The thread id is recorded next to `prev` so
+/// cross-thread flips are obvious in the log.
+///
+/// Hot-path cost: the overwhelmingly common case (latch down, target != 2)
+/// costs ONE atomic load and returns before any environment lookup. The
+/// env::var check deliberately runs only when a trace would actually be
+/// emitted; guard calls sit on per-op paths where an unconditional getenv
+/// measurably perturbs timing-sensitive fused pipelines.
+fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
+    let latch_up = prefill_in_flight();
+    if target != 2 && !(latch_up && target != 0) {
+        return;
+    }
+    if !alloc_trace_enabled() {
+        return;
+    }
+    eprintln!(
+        "[ctx-trace] {site} set({target}) prev={prev} tid={:?} prefill_latch={latch_up}",
+        std::thread::current().id()
+    );
+    eprintln!("{}", std::backtrace::Backtrace::force_capture());
+}
+
+/// The sanctioned raw-context setter. Every `hipSetDevice` call outside
+/// `DeviceGuard` (i.e. the two legitimate unguarded callers: the
+/// `RocmDevice::try_new` construction path and `peer_access.rs`'s
+/// save-restore pair) must route through here so the [ctx-trace] drift watch
+/// sees it. Returns the raw HIP status like the FFI it wraps.
+pub fn raw_set_device(ordinal: i32) -> crate::HipErrorT {
+    let mut prev: i32 = 0;
+    unsafe {
+        let _ = crate::device::handles::hipGetDevice(&mut prev);
+    }
+    let status = unsafe { crate::device::handles::hipSetDevice(ordinal) };
+    emit_ctx_trace("raw_set_device", ordinal, prev);
+    status
+}
+
+/// Test-only launch-seam stamps used by the WI-M3 context-drift gates:
+/// every kernel launch records `(self_dev, ctx_dev)` so a test can assert
+/// the launching thread was not parked on a foreign device.
+#[cfg(test)]
+static LAUNCH_SELF_STAMP: AtomicI32 = AtomicI32::new(-1);
+#[cfg(test)]
+static LAUNCH_CTX_STAMP: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(test)]
+pub(crate) fn stamp_launch_context(self_dev: i32, ctx_dev: i32) {
+    LAUNCH_SELF_STAMP.store(self_dev, Ordering::Relaxed);
+    LAUNCH_CTX_STAMP.store(ctx_dev, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn last_launch_context() -> (i32, i32) {
+    (
+        LAUNCH_SELF_STAMP.load(Ordering::Relaxed),
+        LAUNCH_CTX_STAMP.load(Ordering::Relaxed),
+    )
 }
 
 /// Query the device's real gfx target so JIT-compiled kernels always [see: `GRIM_GPU_TARGET`, `temp_env`, `hipDeviceProp_t`, `gcnArchName`]
