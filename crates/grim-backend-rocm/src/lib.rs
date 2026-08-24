@@ -220,3 +220,8 @@ mod lib_internal_tests;
 // fault (gguf_multigpu_context_plan.md). Device-gated; needs >=2 GPUs.
 #[cfg(test)]
 mod context_drift_tests;
+
+// Root-cause probe: first-JIT zero-logits through the production sampler
+// (scythe2 plan validation log 2026-08-23e). Device-gated.
+#[cfg(test)]
+mod sampler_zero_probe;

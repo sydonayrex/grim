@@ -527,6 +527,14 @@ impl Linear {
         let b_storage = self.w_t.storage().as_ref();
 
         let out_shape = Shape::new(vec![batch, out_dim]);
+        let qmm_trace = std::env::var_os("GRIM_QMM_TRACE").is_some();
+        if qmm_trace {
+            eprintln!(
+                "[linear] out_dim={out_dim} batch={batch} w_t_quant={} w_t_dtype={:?}",
+                self.w_t.dtype().is_quantized(),
+                self.w_t.dtype().storage
+            );
+        }
         let (out_s, h) = if self.w_t.dtype().is_quantized() {
             let quant_fmt = match &self.w_t.dtype().storage {
                 Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
@@ -545,8 +553,16 @@ impl Linear {
             };
             if let Some(fmt) = quant_fmt {
                 match dev.fused_quant_gemm(a_storage, b_storage, fmt, &out_shape) {
-                    Ok(res) => res,
+                    Ok(res) => {
+                        if qmm_trace {
+                            eprintln!("[linear] branch=fused_quant_gemm OK");
+                        }
+                        res
+                    }
                     Err(Error::Unimplemented(_)) => {
+                        if qmm_trace {
+                            eprintln!("[linear] branch=quantized_matmul fallback");
+                        }
                         // No fused kernel (e.g. CPU): fall back to the explicit
                         // dequant + GEMM path. `quantized_matmul` reads the packed
                         // bytes from `w_t` (GGUF [out,in] layout), dequants into a

@@ -3361,6 +3361,13 @@ impl BackendDevice for RocmDevice {
             ),
         };
         let k = a_storage.shape().dims().last().copied().unwrap_or(0);
+        if std::env::var_os("GRIM_QMM_TRACE").is_some() {
+            eprintln!(
+                "[qmm] ordinal={} m={m} n={n} k={k} b_dtype={:?}",
+                self.ordinal,
+                b_storage.dtype().storage
+            );
+        }
 
         let out_storage = RocmStorage::alloc_gpu(
             out_shape,

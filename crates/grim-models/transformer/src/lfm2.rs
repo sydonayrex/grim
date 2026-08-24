@@ -1066,6 +1066,7 @@ impl CausalLm for Lfm2 {
         let mut h = self
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
+        fwd_trace_stage("embed", &h);
 
         if session.model_state().is_none() {
             session.set_model_state(Box::new(vec![None::<Lfm2LayerCache>; self.layers.len()]));
@@ -1077,8 +1078,10 @@ impl CausalLm for Lfm2 {
 
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i])?;
+            fwd_trace_stage(&format!("layer{i}"), &h);
         }
         let h_normed = self.norm.forward(&h)?;
+        fwd_trace_stage("norm", &h_normed);
 
         let h_final = if let Some(ref d2o) = self.dense_2_out {
             let projected = d2o.forward(&h_normed)?;
@@ -1097,10 +1100,31 @@ impl CausalLm for Lfm2 {
             h_normed
         };
 
+        fwd_trace_stage("h_final", &h_final);
         let logits = self.output.forward(&h_final)?;
+        fwd_trace_stage("logits", &logits);
 
         session.advance_pos(seq_len);
         Ok(logits)
+    }
+}
+
+
+/// Root-cause instrumentation (validation log 2026-08-23e): env-gated
+/// activation checksums localizing the first zeroed stage of the Lfm2
+/// forward on non-zero ordinals. Enable with GRIM_FORWARD_TRACE=1.
+fn fwd_trace_stage(name: &str, t: &Tensor) {
+    if std::env::var_os("GRIM_FORWARD_TRACE").is_none() {
+        return;
+    }
+    match t.to_vec_f32() {
+        Ok(v) => eprintln!(
+            "[fwd-trace] {name}: len={} nonzero={} head={:?}",
+            v.len(),
+            v.iter().filter(|&&x| x != 0.0).count(),
+            &v[..v.len().min(4)]
+        ),
+        Err(e) => eprintln!("[fwd-trace] {name}: READ FAIL {e}"),
     }
 }
 
