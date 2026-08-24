@@ -223,24 +223,39 @@ pub fn copy_route(
         }
         RouteLink::HostBounce => {
             let staging = take_staging(stream, len)?;
-            crate::device::helpers::check_hip("copy_route: D2H copy to staging", unsafe {
-                hipMemcpyAsync(
-                    staging.as_device_ptr(),
-                    src_ptr,
-                    len,
-                    HipMemcpyKind::DeviceToHost,
-                    stream,
-                )
-            })?;
-            crate::device::helpers::check_hip("copy_route: H2D copy from staging", unsafe {
-                hipMemcpyAsync(
-                    dst_ptr,
-                    staging.as_device_ptr(),
-                    len,
-                    HipMemcpyKind::HostToDevice,
-                    stream,
-                )
-            })?;
+            // P1-3: plain `hipMemcpyAsync` executes against the calling
+            // thread's CURRENT device, but each leg dereferences a pointer
+            // owned by a specific device: the D2H leg reads `src_ptr`
+            // (src_device), the H2D leg writes `dst_ptr` (dst_device). Pin
+            // each leg to its pointer's owner or the leg silently no-ops /
+            // faults on multi-GPU boxes (same class as the matmul_op fix,
+            // 2026-08-23e). The caller's stream is kept: pool streams are
+            // created blocking-with-legacy, so ordering with the caller's
+            // queue is preserved.
+            {
+                let _leg = crate::device::util::DeviceGuard::set(src_device);
+                crate::device::helpers::check_hip("copy_route: D2H copy to staging", unsafe {
+                    hipMemcpyAsync(
+                        staging.as_device_ptr(),
+                        src_ptr,
+                        len,
+                        HipMemcpyKind::DeviceToHost,
+                        stream,
+                    )
+                })?;
+            }
+            {
+                let _leg = crate::device::util::DeviceGuard::set(dst_device);
+                crate::device::helpers::check_hip("copy_route: H2D copy from staging", unsafe {
+                    hipMemcpyAsync(
+                        dst_ptr,
+                        staging.as_device_ptr(),
+                        len,
+                        HipMemcpyKind::HostToDevice,
+                        stream,
+                    )
+                })?;
+            }
         }
     }
     Ok(())

@@ -165,3 +165,88 @@ fn peer_access_save_restore_pair_stays_balanced() {
         "peer_access.rs must keep exactly the set(src)/restore(prev) pair"
     );
 }
+
+/// WI-P13 (2026-08-23e follow-up): every raw device-context-sensitive FFI
+/// call — rocBLAS GEMMs, `hipModuleLaunchKernel`, `hipMemcpy(Async)`,
+/// `hipMemset(Async)`, `hipMalloc`/`hipFree(Async)`, `hipEventCreate`,
+/// `hipStreamCreate` — executes against the CALLING THREAD's current HIP
+/// device. The rank-1 zero-logits crash existed because `matmul_op` /
+/// `matmul_with_solution` launched rocBLAS on a drifted thread. This gate
+/// enforces the audit: in `device/roc_device.rs` and `p2p_route.rs`, any
+/// function body containing one of those calls must also contain a
+/// `DeviceGuard::set` (or `raw_set_device`) before its use, unless the
+/// function is on the by-design allowlist below.
+///
+/// Purely host-side: parses this crate's own sources; no GPU needed.
+#[test]
+fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
+    // By-design exceptions (verified by hand, see scythe2 plan log 23e):
+    // - try_new: documented context-neutral constructor that pins via
+    //   raw_set_device + restore around construction, and its inline lazy
+    //   rocblas_create_handle runs inside that pinned window.
+    // - fallback: RocmDevice::fallback constructor (no raw launches).
+    const ALLOWED_UNGUARDED: &[&str] = &["try_new", "fallback", "build"];
+
+    let audited: &[(&str, &str)] = &[
+        ("device/roc_device.rs", include_str!("../src/device/roc_device.rs")),
+        ("p2p_route.rs", include_str!("../src/p2p_route.rs")),
+    ];
+
+    let risky = [
+        "rocblas_sgemm(",
+        "rocblas_gemm_ex(",
+        "rocblas_gemm_strided_batched_ex(",
+        "hipModuleLaunchKernel(",
+        "hipMemcpyAsync(",
+        "hipMemsetAsync(",
+        "hipMalloc(",
+        "hipMallocManaged(",
+        "hipFree(",
+        "hipFreeAsync(",
+        "hipEventCreate(",
+        "hipStreamCreate(",
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    for (rel, body) in audited {
+        let mut current_fn: Option<(String, usize)> = None;
+        let mut guarded = false;
+        for (idx, line) in body.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("fn ").or_else(|| {
+                trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+            }) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    current_fn = Some((name, idx + 1));
+                    guarded = false;
+                }
+            }
+            if line.contains("DeviceGuard::set") || line.contains("raw_set_device") {
+                guarded = true;
+            }
+            let code = code_only(line);
+            if risky.iter().any(|r| code.contains(r)) {
+                if let Some((fname, _)) = &current_fn {
+                    if !guarded && !ALLOWED_UNGUARDED.contains(&fname.as_str()) {
+                        violations.push(format!(
+                            "{rel}:{}: `{fname}` issues a context-bound FFI call with no DeviceGuard in scope",
+                            idx + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "P1-3 contract breached — raw device-context FFI outside a guard:\n{}\n\
+         Route it through DeviceGuard::set (see matmul_op fix, 2026-08-23e).",
+        violations.join("\n")
+    );
+}

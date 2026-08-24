@@ -4,12 +4,12 @@ use grim_tensor::backend::BackendStorage;
 use grim_tensor::{DType, Shape};
 
 fn main() {
-    let ordinal = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(0);
+    let mut args = std::env::args().skip(1);
+    let ordinal = args.next().and_then(|a| a.parse().ok()).unwrap_or(0);
+    let m = args.next().and_then(|a| a.parse().ok()).unwrap_or(8);
+    let n = args.next().and_then(|a| a.parse().ok()).unwrap_or(65536);
     let dev = RocmDevice::try_new(ordinal).expect("try_new");
-    let (m, k, n) = (8usize, 1024usize, 65536usize);
+    let k = 1024usize;
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32) * 0.01 - 0.03).collect();
 
