@@ -268,6 +268,54 @@ impl RocmDevice {
         Ok(storage)
     }
 
+    /// WI-SB5: cross-device F32 copy via pinned staging with per-leg context
+    /// pins. Independent of RCCL/peer-access features — safe default for
+    /// small fan-in/gather transfers (decode-sized rows).
+    pub fn copy_cross_device_bounce(
+        &self,
+        dst_ordinal: usize,
+        dst_ptr: *mut c_void,
+        src_ordinal: usize,
+        src_ptr: *const c_void,
+        bytes: usize,
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut staging = RocmPinnedBuffer::<u8>::alloc(bytes)?;
+        // Leg 1: src device -> pinned host.
+        {
+            let _leg = crate::device::util::DeviceGuard::set(src_ordinal as i32);
+            check_hip("cross-bounce D2H", unsafe {
+                hipMemcpyAsync(
+                    staging.as_mut_ptr() as *mut c_void,
+                    src_ptr,
+                    bytes,
+                    HipMemcpyKind::DeviceToHost,
+                    self.active_stream(),
+                )
+            })?;
+            check_hip("cross-bounce D2H sync", unsafe {
+                hipStreamSynchronize(self.active_stream())
+            })?;
+        }
+        // Leg 2: pinned host -> dst device.
+        {
+            let _leg = crate::device::util::DeviceGuard::set(dst_ordinal as i32);
+            check_hip("cross-bounce H2D", unsafe {
+                hipMemcpyAsync(
+                    dst_ptr,
+                    staging.as_ptr() as *const c_void,
+                    bytes,
+                    HipMemcpyKind::HostToDevice,
+                    self.active_stream(),
+                )
+            })?;
+            check_hip("cross-bounce H2D sync", unsafe {
+                hipStreamSynchronize(self.active_stream())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Enqueue one descriptor upload on the device's active stream.
     pub fn copy_scythe_descriptor_async(
         &self,
