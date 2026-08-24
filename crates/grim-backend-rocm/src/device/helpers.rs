@@ -24,6 +24,46 @@ pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
 }
 
 /// Memory copy that handles XNACK automatically.
+
+/// WI-SB6 control-plane primitive: async u32-sized copy on an EXPLICIT
+/// non-blocking stream followed by synchronizing ONLY that stream. Used by
+/// the resident ring so head/stop/tail traffic is never ordered behind the
+/// eternally-polling worker kernel.
+pub fn hip_stream_synchronize_after_copy(
+    dst_dev: *mut std::ffi::c_void,
+    src: *mut std::ffi::c_void,
+    bytes: usize,
+    kind: crate::device::handles::HipMemcpyKind,
+    ordinal: usize,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
+    let rc = unsafe { crate::device::handles::hipMemcpyAsync(dst_dev, src, bytes, kind, stream) };
+    if rc != 0 {
+        return Err(Error::Backend(format!(
+            "control async copy failed: hip status {rc}"
+        )));
+    }
+    let rs = unsafe { crate::device::handles::hipStreamSynchronize(stream) };
+    if rs != 0 {
+        return Err(Error::Backend(format!(
+            "control stream sync failed: hip status {rs}"
+        )));
+    }
+    Ok(())
+}
+
+/// Synchronize one explicit stream (WI-SB6 shutdown join).
+pub fn hip_stream_synchronize(stream: *mut std::ffi::c_void) -> Result<()> {
+    let rs = unsafe { crate::device::handles::hipStreamSynchronize(stream) };
+    if rs != 0 {
+        return Err(Error::Backend(format!(
+            "stream sync failed: hip status {rs}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn memcpy_with_xnack_fallback(
     dst: *mut c_void,
     src: *const c_void,

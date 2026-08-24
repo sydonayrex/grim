@@ -150,6 +150,14 @@ unsafe extern "C" {
 
     // Graph and Stream FFI
     pub fn hipStreamCreate(stream: *mut *mut c_void) -> HipErrorT;
+    /// Create a stream with flags. `HIP_STREAM_NON_BLOCKING` (0x1) makes the
+    /// stream NOT synchronize with the legacy default stream — required for
+    /// long-lived persistent kernels that must never block control traffic.
+    pub fn hipStreamCreateWithFlags(
+        stream: *mut *mut c_void,
+        flags: u32,
+        priority: i32,
+    ) -> HipErrorT;
     pub fn hipStreamDestroy(stream: *mut c_void) -> HipErrorT;
     pub fn hipStreamSynchronize(stream: *mut c_void) -> HipErrorT;
     pub fn hipMemcpyAsync(
