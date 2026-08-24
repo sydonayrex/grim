@@ -321,11 +321,16 @@ call is grounded.
   `gguf_multigpu_context_plan.md` (gfx1036 mxfp4 parity), now reproduced on
   gfx1200 where every launch in a fresh process is first-JIT. Next-session
   lead: root-cause first-launch zeroing (rocprofiler trace of a failing run
-  per M4's toolchain note), then re-enable spreading. Interim guard shipped:
-  admission clamps load-favored non-zero ranks to rank 0 unless
-  `GRIM_SCYTHE_SPREAD=1` is set — default serve surface verified under a
-  game-loaded GPU 0 (external busy 100 % → loads [2.0, 0.04] → favors rank 1
-  → clamps → both completions served cleanly, no fault).
+  per M4's toolchain note), then re-enable spreading. RESOLVED 2026-08-23f: root cause was the unpinned rocBLAS dispatch in
+`matmul_op`/`matmul_with_solution` (rocBLAS runs on the calling thread's
+CURRENT device; context-neutral try_new leaves it on ordinal 0). Full
+P1-3 guard sweep across 26 functions + p2p_route HostBounce per-leg pins +
+copy_slice_into cross-ordinal fail-loud; enforcement lint added to
+hip_context_contract (mutation-checked). Verification: minimal repro 3/3
+correct on ordinal 1; replica1 logits bit-identical to control0; drift
+gates green both orders; live serve under game-loaded GPU0 spread
+18/17 ranks with GPU1 sampled at 88–93 %. GRIM_SCYTHE_SPREAD now defaults
+ON (opt-out =0).
 
 ## Risks
 

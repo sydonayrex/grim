@@ -866,19 +866,18 @@ impl Engine {
             ctrl.decide(0, &shape, &caps, &links, epoch)
         };
         let chosen = placement.ranks.first().copied();
-        // WI-SB1 spread gate: non-zero ranks currently crash in
-        // `sample_on_device` (page fault on the pinned replica's device —
-        // first exposed when external-busy steering produced the first ever
-        // rank-1 pin; see scythe2 plan validation log 2026-08-23e). Until
-        // that hunt lands, spreading requires an explicit opt-in so the
-        // default serve surface keeps its long-verified rank-0 behavior.
+        // WI-SB1 load spreading: ON by default since the P1-3 guard sweep
+        // fixed cross-device FFI (verification 2026-08-23f: rank-1 pins
+        // served cleanly, GPU1 sampled at 88–93 % under sustained load,
+        // 18/17 rank split over 35 live requests). Opt out with
+        // GRIM_SCYTHE_SPREAD=0.
         let spread_enabled =
-            std::env::var("GRIM_SCYTHE_SPREAD").map(|v| v == "1").unwrap_or(false);
+            std::env::var("GRIM_SCYTHE_SPREAD").map(|v| v != "0").unwrap_or(true);
         let chosen = match chosen {
             Some(r) if r != 0 && !spread_enabled => {
                 eprintln!(
-                    "[scythe2] load favored rank {r} but cross-replica serving \
-                     is not yet safe (GRIM_SCYTHE_SPREAD unset); clamping to rank 0"
+                    "[scythe2] load favored rank {r} but spreading is disabled \
+                     (GRIM_SCYTHE_SPREAD=0); clamping to rank 0"
                 );
                 Some(0)
             }
