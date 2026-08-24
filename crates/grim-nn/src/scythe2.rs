@@ -34,7 +34,9 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, DType, Device, Tensor};
 
-use crate::modules::pick_device_for_storage_device;
+use grim_backend_rocm::RocmStorage;
+
+use crate::modules::{add_tensors, pick_device_for_storage_device};
 
 // ── WI-SB5: per-shard transposed-weight residency ─────────────────────────────
 //
@@ -72,6 +74,37 @@ fn split_counts(partition: &[f32], n_ranks: usize, total: usize) -> Vec<usize> {
         }
     }
     counts
+}
+
+
+/// WI-SB5: (ordinal, device pointer) when `t` is ROCm-resident.
+fn rocm_residency(t: &Tensor) -> Option<(usize, u64)> {
+    let ord = match t.device() {
+        Device::Rocm(o) => *o,
+        _ => return None,
+    };
+    let ptr = t
+        .storage()
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .and_then(|rs| rs.device_ptr_u64())?;
+    Some((ord, ptr))
+}
+
+/// WI-SB5: wrap a rank-local GEMM output storage into a Tensor on its own
+/// device (fan-in inputs stay device-resident until the final stage).
+fn shard_output_tensor(
+    out_s: Box<dyn BackendStorage>,
+    shape: Shape,
+    rank_device: &Device,
+) -> Tensor {
+    Tensor::new(
+        Arc::from(out_s),
+        shape,
+        DType::F32,
+        grim_tensor::dtype::QuantProvenance::GrimNative,
+        rank_device.clone(),
+    )
 }
 
 /// Transposed `(k, count)` operand for a column shard, resident on the rank's
@@ -352,7 +385,7 @@ impl Scythe2Linear {
     ) -> Result<Tensor> {
         let n_ranks = placement.ranks.len();
         let mut col_start = 0usize;
-        let mut shards: Vec<(Box<dyn BackendStorage>, usize)> = Vec::with_capacity(n_ranks);
+        let mut shards: Vec<(Tensor, usize)> = Vec::with_capacity(n_ranks);
         let mut shard_out_dim = 0usize;
         // Holds the uploaded operand for CPU-rank iterations (ROCm ranks use
         // the residency cache instead).
@@ -420,21 +453,73 @@ impl Scythe2Linear {
                 b_ref,
                 &Shape::new(vec![m, count]),
             )?;
-            shards.push((out_s, count));
+            let shard_shape = Shape::new(vec![m, count]);
+            shards.push((
+                shard_output_tensor(out_s, shard_shape, &rank_device),
+                count,
+            ));
             shard_out_dim += count;
             col_start += count;
         }
 
-        // Concatenate column shards (host-staged gather across ranks).
         if shards.is_empty() {
             return Err(Error::Backend(
                 "Scythe2Linear: all column shards are empty".into(),
             ));
         }
+
+        // WI-SB5: device-side gather — route every shard row into the output
+        // matrix on the FIRST shard's device via copy_via_route. Decode batches
+        // are tiny (m ≤ 64), so per-row routed copies are cheap; larger
+        // prefills keep the legacy host-staged gather.
+        let all_rocm = shards
+            .iter()
+            .all(|(t, _)| rocm_residency(t).is_some());
+        let no_bias = self.bias.is_none();
+        if all_rocm && no_bias && m <= 64 {
+            let (lead_ord, _) = rocm_residency(&shards[0].0).expect("checked");
+            let lead_dev =
+                pick_device_for_storage_device(&Device::Rocm(lead_ord));
+            let out_shape = Shape::new(vec![m, shard_out_dim]);
+            let out_storage = lead_dev.alloc_storage(&out_shape, DType::F32)?;
+            let out_dev_ptr = out_storage
+                .as_any()
+                .downcast_ref::<RocmStorage>()
+                .and_then(|rs| rs.device_ptr_u64())
+                .ok_or_else(|| {
+                    Error::Backend("device concat: output has no device ptr".into())
+                })?;
+            let mut col_offset = 0usize;
+            for (shard_t, n) in &shards {
+                let (src_ord, src_base) = rocm_residency(shard_t).expect("checked");
+                for r in 0..m {
+                    let src_row = src_base + (r * n) as u64 * 4;
+                    let dst_row =
+                        out_dev_ptr + ((r * shard_out_dim + col_offset) as u64) * 4;
+                    grim_backend_rocm::RocmDevice::shared(src_ord).copy_via_route(
+                        src_ord as i32,
+                        lead_ord as i32,
+                        src_row as *const std::ffi::c_void,
+                        dst_row as *mut std::ffi::c_void,
+                        n * 4,
+                    )?;
+                }
+                col_offset += n;
+            }
+            return Ok(Tensor::new(
+                Arc::from(out_storage),
+                out_shape,
+                DType::F32,
+                self.full_weight.provenance().clone(),
+                self.device.clone(),
+            ));
+        }
+
+        // Legacy host-staged gather (+ bias): correct for any configuration.
         let mut concat = vec![0.0f32; m * shard_out_dim];
         let mut col_offset = 0usize;
         for (shard, n) in &shards {
-            let shard_vec = shard.to_cpu_vec_f32()?;
+            let shard_vec = shard.storage().to_cpu_vec_f32()?;
             for bi in 0..m {
                 concat[bi * shard_out_dim + col_offset..bi * shard_out_dim + col_offset + n]
                     .copy_from_slice(&shard_vec[bi * n..(bi + 1) * n]);
@@ -481,21 +566,29 @@ impl Scythe2Linear {
         let x_dims = x.shape().dims();
         let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
         let x_vec = x.storage().to_cpu_vec_f32()?;
-        let mut partial_sum = vec![0.0f32; m * out_features];
-
         let n_ranks = placement.ranks.len();
-        let mut row_start = 0usize;
-        // Same remainder rule as the column path: the concatenated K-slices
-        // must cover every input feature.
+        // WI-SB5 fan-in mode: with every rank on ROCm and NO bias, partials
+        // stay device-resident — routed cross-ordinal and accumulated
+        // pairwise via device adds on the accumulator's ordinal. Any CPU
+        // rank or bias falls back to the legacy host sum.
         let counts = split_counts(&placement.partition, n_ranks, in_features);
+        let device_fan_in = matches!(self.device, Device::Rocm(_))
+            && self.bias.is_none()
+            && placement
+                .ranks
+                .iter()
+                .all(|r| matches!(Device::Rocm(*r), Device::Rocm(_)));
+
+        let mut acc: Option<Tensor> = None;
+        let mut host_partial_sum = vec![0.0f32; m * out_features];
+        let mut row_start = 0usize;
+
         for rank_idx in 0..n_ranks {
             let count = counts[rank_idx];
             if count == 0 {
                 continue;
             }
-            // WI-SB5 step 1: partial products execute as device matmuls on
-            // the rank's device; the P2P fan-in of partials stays host-staged
-            // until CommFuse carries shard pointers (opcode 1/2 descriptors).
+            let w_shard = slice_input_dim(&self.full_weight, row_start, count)?;
             let rank_device = match (&self.device, placement.ranks.get(rank_idx)) {
                 (Device::Rocm(_), Some(ord)) => Device::Rocm(*ord),
                 (other, _) => other.clone(),
@@ -509,8 +602,7 @@ impl Scythe2Linear {
                     &x_vec[bi * in_features + row_start..bi * in_features + row_start + count],
                 );
             }
-            // WI-SB5: transposed shard operand cached resident on the rank
-            // device (built once per slice).
+            // B operand: transposed shard cached resident on the rank device.
             let b_tensor = match &rank_device {
                 Device::Rocm(ordinal) => cached_row_shard_w_t(
                     self.layer_id,
@@ -521,7 +613,6 @@ impl Scythe2Linear {
                     out_features,
                 )?,
                 _ => {
-                    let w_shard = slice_input_dim(&self.full_weight, row_start, count)?;
                     let w_vec = w_shard.storage().to_cpu_vec_f32()?;
                     let mut w_t = vec![0.0f32; count * out_features];
                     for ni in 0..out_features {
@@ -545,16 +636,69 @@ impl Scythe2Linear {
             };
             let b_ref: &dyn BackendStorage = b_tensor.storage().as_ref();
             let a_storage = rank_dev.from_cpu(&xs, &Shape::new(vec![m, count]), DType::F32)?;
-            let (partial, _h) = rank_dev.matmul(
+            let (partial_s, _h) = rank_dev.matmul(
                 a_storage.as_ref(),
                 b_ref,
                 &Shape::new(vec![m, out_features]),
             )?;
-            let pv = partial.to_cpu_vec_f32()?;
-            for (dst, src) in partial_sum.iter_mut().zip(pv) {
-                *dst += src;
+            let partial_shape = Shape::new(vec![m, out_features]);
+            let partial_t =
+                shard_output_tensor(partial_s, partial_shape.clone(), &rank_device);
+
+            if device_fan_in {
+                let (src_ord, src_ptr) =
+                    rocm_residency(&partial_t).expect("rocml partial residency");
+                match acc.take() {
+                    None => acc = Some(partial_t),
+                    Some(a) => {
+                        let acc_ord = match a.device() {
+                            Device::Rocm(o) => *o,
+                            _ => unreachable!("device fan-in requires ROCm ranks"),
+                        };
+                        let scratch_dev =
+                            pick_device_for_storage_device(&Device::Rocm(acc_ord));
+                        let scratch_storage =
+                            scratch_dev.alloc_storage(&partial_shape, DType::F32)?;
+                        let scratch_ptr = scratch_storage
+                            .as_any()
+                            .downcast_ref::<RocmStorage>()
+                            .and_then(|rs| rs.device_ptr_u64())
+                            .ok_or_else(|| {
+                                Error::Backend("scratch has no device ptr".into())
+                            })?;
+                        grim_backend_rocm::RocmDevice::shared(src_ord).copy_via_route(
+                            src_ord as i32,
+                            acc_ord as i32,
+                            src_ptr as *const std::ffi::c_void,
+                            scratch_ptr as *mut std::ffi::c_void,
+                            (m * out_features) * 4,
+                        )?;
+                        let scratch_t = Tensor::new(
+                            Arc::from(scratch_storage),
+                            partial_shape.clone(),
+                            DType::F32,
+                            self.full_weight.provenance().clone(),
+                            Device::Rocm(acc_ord),
+                        );
+                        acc = Some(add_tensors(&a, &scratch_t)?);
+                        acc = Some(add_tensors(&a, &scratch_t)?);
+                    }
+                }
+            } else {
+                let pv = partial_t.storage().to_cpu_vec_f32()?;
+                for (dst, src) in host_partial_sum.iter_mut().zip(pv) {
+                    *dst += src;
+                }
             }
             row_start += count;
+        }
+
+        let out_shape = Shape::new(vec![m, out_features]);
+        if device_fan_in {
+            let acc = acc.ok_or_else(|| {
+                Error::Backend("device fan-in produced no partials".into())
+            })?;
+            return Ok(acc);
         }
 
         // Add bias if present.
@@ -563,14 +707,13 @@ impl Scythe2Linear {
             for bi in 0..m {
                 for ni in 0..out_features {
                     if ni < b_vec.len() {
-                        partial_sum[bi * out_features + ni] += b_vec[ni];
+                        host_partial_sum[bi * out_features + ni] += b_vec[ni];
                     }
                 }
             }
         }
 
-        let out_shape = Shape::new(vec![m, out_features]);
-        let storage = dev.from_cpu(&partial_sum, &out_shape, DType::F32)?;
+        let storage = dev.from_cpu(&host_partial_sum, &out_shape, DType::F32)?;
         Ok(Tensor::new(
             Arc::from(storage),
             out_shape,
