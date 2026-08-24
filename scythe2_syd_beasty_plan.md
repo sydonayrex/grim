@@ -219,11 +219,11 @@ call is grounded.
 
 | WI | host gates | sb gates | done |
 |----|-----------|----------|------|
-| SB0 differentiation | ☑ distinct gfx1201/gfx1200 rows + tests | ☐ calibration still a stub (`calibrate_capability` returns `None`) — measured caps unproven | ☐ |
-| SB1 CLI farm | ☑ loader + call sites :993/:1150; degradation test | ☑ farm arms exactly 2 replicas `[Rocm(0), Rocm(1)]` (iGPU excluded from `visible_rocm_devices`) · ☐ per-rank smoke completions | ☐ |
-| SB2 VRAM guard | ☑ footprint formula w/ hidden hint; synthetic-caps gates (8 GB excl. @100k, incl. @1k, all-excluded ⇒ waitlist); queue-not-blind-pin wired via `scythe_admission_decision` + VRAM waitlist | ☐ both orders long-context pin check | ☐ |
-| SB3 A/B harness | ☑ `scythe_ab` module (§setup-4 JSONL, throttle_pct, verdict rule ≤5%/≤2%), real prompt mix (~200/2k/8k), order detection | ☐ **BLOCKED** — see validation log | ☐ |
-| WI-INF4 verdict | — | ☐ **BLOCKED** by GGUF forward fault | ☐ |
+| SB0 differentiation | ☑ distinct gfx1201/gfx1200 rows + tests | ☑ calibration live (WI-SB0 rocBLAS f16/f32-ex micro-GEMM + DtoD bandwidth sweep, cached per `(arch, 500 MHz clock bucket)`): gfx1201 ≈ 4.4 TFLOPS / ~311 GB/s vs gfx1200 ≈ 2.3 TFLOPS / ~245 GB/s (debug-build numbers, ordering is what placement consumes); `decide()` on real caps picks fast card in BOTH orders (`test_real_measured_caps_prefer_faster_gpu_both_orders`). En-route: HIP attribute constants were CUDA-numbered — "throttle" attr read shared-memory size → throttle_pct clamped to 1.0 → **effective TFLOPS zeroed on every GPU**; fixed + honest 0.0 | ☑ |
+| SB1 CLI farm | ☑ loader + call sites :993/:1150; degradation test | ☑ farm arms exactly 2 replicas `[Rocm(0), Rocm(1)]` in release after event-seam pin fix; smoke completions served with pins logged, status lists `#scythe1` replica telemetry; both physical cards served across F-first/S-first boots. Load-spreading implemented post-verification (`decide_forced` + pin cooldown + external busy weight 2.0) but clamped to rank 0 by default behind `GRIM_SCYTHE_SPREAD=1` until the rank-1 sampler crash is fixed (validation log 2026-08-23e) | ☑ |
+| SB2 VRAM guard | ☑ footprint formula w/ hidden hint; synthetic-caps gates (8 GB excl. @100k, incl. @1k, all-excluded ⇒ waitlist); queue-not-blind-pin wired via `scythe_admission_decision` + VRAM waitlist | ◑ pins verified via farm legs (both orders); near-capacity exclusion not reproducible on this box (16 GB cards, 230 M model ⇒ max footprint ≪ VRAM) — synthetic gates stand in | ☐ |
+| SB3 A/B harness | ☑ `scythe_ab` module (§setup-4 JSONL, throttle_pct, verdict rule ≤5%/≤2%), real prompt mix (~200/2k/8k), order detection; harness fixed (per-sample trace clear + decode drain) and measured in RELEASE | ☑ campaign run {on,off}×{F,S} interleaved rounds, 30 samples/arm per order — see results jsonl | ☑ |
+| WI-INF4 verdict | — | ☑ **STAYS OPT-IN**: mean TTFT overhead −0.09%/−0.00% (F/S, PASS ≤5%); p95 ITL overhead −18.56% (F, PASS) / **+2.43% (S, FAIL ≤2%)**. Flag default does not flip; cost model to be retuned with these numbers (§SB3 rule). Known measurement defect: `parse_samples` has no time filter so the in-harness cumulative report mixes stale fault-era rows — ts-filtered computation is authoritative | ☑ |
 | SB4a layer pipeline | ☑ `decode_paged` boundary transfers + `segment_devices`; planner `absorb_short_runs`; parity gate (fp-tolerance cross-backend fake segments) + hop-bound gates | ☐ TTFT split-vs-unsplit both orders (blocked) | ☐ |
 | SB4b paged-per-segment | — | gated on SB4a numbers | ☐ |
 | SB5 real GEMM shards | ◑ begun — col/row-parallel shards execute as backend `matmul` on rank devices (host fan-in remains); tolerance parity tests green | rocBLAS-per-stream, ring descriptors carrying shard pointers, rocp-compute read-out still open | ☐ |
@@ -257,12 +257,75 @@ call is grounded.
   hipRTC/gfx1201. Diagnostic hooks kept behind env gates for the next
   session: GRIM_ALLOC_TRACE (upload/jit/launch trace + post-launch done
   marker), GRIM_ALLOC_NO_POOL, GRIM_DISABLE_ROCWMA_KERNELS,
-  GRIM_Q4K_REPRO (minimal fused-q4k launch probe). NEXT LEADS: HSA-level
-  fault-line dump to name the faulting PC/kernel (rocprofiler or HSA event
-  callback); audit Lfm2 embed→attn_norm window including the lazy
-  [65536,1024] `grim_transpose_2d_f32` of the embedding/lm-head table that
-  runs right before embedding; verify gather layout assumption vs the
-  transposed table.
+  GRIM_Q4K_REPRO (minimal fused-q4k launch probe).
+- **2026-08-23b — BLOCKER RESOLVED.** The "GGUF forward fault" was TWO bugs,
+  both fixed and verified on-box this session:
+  1. *HIP context drift* (see `gguf_multigpu_context_plan.md`, M1–M4 all
+     closed): kernels launched under a foreign device context after raw
+     seams let the thread park elsewhere. All seams pinned; trace rerun
+     shows 0 `ctx_dev≠self_dev` lines and 0 page faults across
+     `{ROCR=0}/{ROCR=0,1}/all-visible`.
+  2. *Dequant scale-byte corruption*: Q4_K m-line read `scales[s-4]`
+     instead of upstream ggml's `scales[s]` (commit 9801d50), corrupting
+     sub-block minima; q2k/q3k fused-GEMM sources were additionally gated
+     out of default builds so default GGUF loads crashed with
+     hipModuleGetFunction error 500.
+  Residual latent defects surfaced by the newly-runnable end-to-end paths:
+  HIP attribute constants used CUDA numbering (throttle attr actually read
+  shared-memory bytes ⇒ every GPU's effective TFLOPS was zeroed — explains
+  the historical `throttle_pct: 1.0` in this file's jsonl); LFM2 fused-KV
+  scratch capped at 4096 positions against a 128k-context model (decode
+  past 4096 panicked); farm replica load died on an unpinned cached event
+  (`hipEventRecord 400`). All fixed; details in
+  `gguf_multigpu_context_plan.md` validation log.
+- 2026-08-23c — WI-INF4 A/B verdict (release build, interleaved rounds, 30
+  samples per arm per order; full rows in the sibling jsonl). The fault-hunt
+  NEXT LEADS from the previous entry are all retired: the HSA-level dump was
+  superseded by the M2 named-frame trace (flips attributed), and the
+  embed→attn_norm window audit is moot — the fault was context drift plus
+  dequant corruption, both fixed (see 2026-08-23b).
+
+  | order | mean TTFT overhead | p95 ITL overhead |
+  |-------|--------------------|------------------|
+  | F-first | −0.09 % (PASS ≤ 5 %) | −18.56 % (PASS ≤ 2 %) |
+  | S-first | −0.00 % (PASS ≤ 5 %) | **+2.43 % (FAIL > 2 %)** |
+
+  ⇒ **STAYS OPT-IN** per the §SB3 rule: the S-first ITL tail exceeds budget,
+  so `GRIM_SCYTHE_INFERENCE` keeps its opt-in default and the controller's
+  cost model gets retuned with these numbers. Absolute latencies are
+  prefill-dominated (~35 s mean TTFT on the 8k-heavy mix — the classic KV
+  path is PCIe-download-bound), so the controller's per-decision cost is
+  invisible in TTFT; the ITL delta concentrates in one ordinal order's
+  decode tail. Measurement defect to fix in the harness:
+  `scythe_ab::parse_samples` applies no time/commit filter, so its
+  cumulative report mixed stale fault-era rows (it reported ITL Δ=28.5%);
+  the ts-filtered computation above is authoritative.
+- 2026-08-23d — rank-1 idle finding + fix. Farm admissions pinned every
+  request to rank 0 on the serve surface (and a desktop game maxing GPU 0
+  did not steer traffic either): the shape-keyed PlacementCache is
+  load-blind, pins released instantly (EOS within ~2 tokens), and external
+  GPU utilization was never consulted. Fixed by `C2plrController::
+  decide_forced` (cache bypass whenever any rank carries load), a 1 s pin
+  cooldown after `finish_request`, and rsmi busy-% folded into the admission
+  load vector at weight 2.0. Unit gates green (`test_external_busy_flips_
+  placement_to_idle_rank`, `test_scythe_effective_loads_weights_and_expiry`,
+  `test_finished_pin_enters_cooldown_window`); serve-surface confirmation
+  pending rebuild.
+- 2026-08-23e — rank-1 serving crash + spread gate. With the steering live,
+  the first-ever rank-1 pin page-faulted node-1 (`Page not present`) inside
+  the server's `sample_on_device` path. Evidence: the entire forward ran
+  clean on the replica (every launch `self_dev=1 ctx_dev=1`; WI-M1/M2
+  discipline holding), and `GRIM_DEBUG_PROMPT=1` shows step-0 logits with
+  correct shape (`len=65536 width=65536`) but **all-zero values** — the same
+  signature as the known first-JIT-launch zeroing flake recorded in
+  `gguf_multigpu_context_plan.md` (gfx1036 mxfp4 parity), now reproduced on
+  gfx1200 where every launch in a fresh process is first-JIT. Next-session
+  lead: root-cause first-launch zeroing (rocprofiler trace of a failing run
+  per M4's toolchain note), then re-enable spreading. Interim guard shipped:
+  admission clamps load-favored non-zero ranks to rank 0 unless
+  `GRIM_SCYTHE_SPREAD=1` is set — default serve surface verified under a
+  game-loaded GPU 0 (external busy 100 % → loads [2.0, 0.04] → favors rank 1
+  → clamps → both completions served cleanly, no fault).
 
 ## Risks
 

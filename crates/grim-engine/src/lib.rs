@@ -198,6 +198,11 @@ pub struct Engine {
     /// The pinned replica executes every forward for that request's lifetime,
     /// so its KV pages stay local to one device.
     scythe_pin: HashMap<u64, usize>,
+    /// WI-SB1 load-spreading: ranks of recently finished requests with the
+    /// time they were released. Back-to-back admissions must still see the
+    /// predecessor's load or a burst of short requests all lands on rank 0
+    /// (each admission finds the pin map empty again).
+    scythe_pin_cooldown: Vec<(usize, std::time::Instant)>,
     /// WI-SB2: requests held back because no farm rank could hold their KV
     /// footprint at enqueue time. They never reach the scheduler or own a
     /// session until a retry (each tick) finds a rank with room, so an
@@ -212,16 +217,58 @@ pub struct Engine {
 /// running `load` concurrent sessions contributes roughly `1/(1+load)` of its
 /// solo throughput, so the controller's WaveTune latency argmin doubles as a
 /// load balancer instead of piling every session onto the fastest card.
+/// How long a finished request's rank stays counted as loaded (WI-SB1
+/// load-spreading). Long enough to bridge back-to-back admissions of short
+/// requests; short enough not to skew placement when the farm genuinely idles.
+pub(crate) const SCYTHE_PIN_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_millis(1000);
+
+/// External (non-farm) GPU utilization converts to equivalent pinned
+/// requests at this weight: a card maxed out by a desktop/game workload
+/// counts as ~2 in-flight farm requests — enough to flip a ~2:1 measured
+/// capability pair toward the idle slower card.
+const SCYTHE_EXTERNAL_BUSY_WEIGHT: f32 = 2.0;
+
+/// WI-SB1: per-rank load seen by admission = active farm pins + pins
+/// released inside the cooldown window + external busy-% converted at
+/// `busy_weight`. Pure so the weighting/expiry rules stay unit-testable.
+fn scythe_effective_loads(
+    active_pins: impl Iterator<Item = usize>,
+    released: &[(usize, std::time::Instant)],
+    cooldown: std::time::Duration,
+    external_busy_pct: &[Option<u32>],
+    num_ranks: usize,
+    busy_weight: f32,
+) -> Vec<f32> {
+    let mut load = vec![0.0f32; num_ranks];
+    for r in active_pins {
+        if r < num_ranks {
+            load[r] += 1.0;
+        }
+    }
+    for &(r, t) in released {
+        if r < num_ranks && t.elapsed() < cooldown {
+            load[r] += 1.0;
+        }
+    }
+    for (r, b) in external_busy_pct.iter().enumerate().take(num_ranks) {
+        if let Some(pct) = b {
+            load[r] += busy_weight * (*pct as f32) / 100.0;
+        }
+    }
+    load
+}
+
 fn load_adjusted_caps(
     caps: &[grim_tensor::backend::GpuCapability],
     num_ranks: usize,
-    load: &[usize],
+    load: &[f32],
 ) -> Vec<grim_tensor::backend::GpuCapability> {
     (0..num_ranks)
         .map(|r| {
             let mut c = caps.get(r).cloned().unwrap_or_default();
             c.ordinal = r;
-            c.tflops_fp16 /= (1 + load.get(r).copied().unwrap_or(0)) as f32;
+            c.tflops_fp16 /= (1.0 + load.get(r).copied().unwrap_or(0.0)).max(0.001);
             if c.tflops_fp16 <= 0.0 {
                 // Keep latency finite so the controller never divides by zero.
                 c.tflops_fp16 = 0.001;
@@ -524,6 +571,7 @@ impl Engine {
             scythe_ctrl,
             scythe_replicas: HashMap::new(),
             scythe_pin: HashMap::new(),
+            scythe_pin_cooldown: Vec::new(),
             scythe_vram_waitlist: Vec::new(),
             radix_enabled: std::env::var("GRIM_RADIX")
                 .map(|v| v != "0" && v != "false" && v != "off")
@@ -754,12 +802,25 @@ impl Engine {
             eprintln!("[scythe2] farm present but profiler sees no GPUs; leaving request queued");
             return ScytheAdmission::WaitVram;
         }
-        let mut load = vec![0usize; n];
-        for &r in self.scythe_pin.values() {
-            if r < n {
-                load[r] += 1;
-            }
-        }
+        // Active pins plus pins released inside the cooldown window, plus
+        // external (non-farm) utilization folded in at a fixed weight.
+        self.scythe_pin_cooldown
+            .retain(|(_, t)| t.elapsed() < SCYTHE_PIN_COOLDOWN);
+        let external_busy: Vec<Option<u32>> =
+            (0..n).map(|r| grim_backend_rocm::compute_utilization(r)).collect();
+        let effective_loads = scythe_effective_loads(
+            self.scythe_pin.values().copied(),
+            &self.scythe_pin_cooldown,
+            SCYTHE_PIN_COOLDOWN,
+            &external_busy,
+            n,
+            SCYTHE_EXTERNAL_BUSY_WEIGHT,
+        );
+        let any_external_busy = external_busy
+            .iter()
+            .any(|b| matches!(b, Some(pct) if *pct >= 25));
+        let any_load = effective_loads.iter().any(|&l| l > 0.0);
+
         // Reserve KV plus the activation working-set floor before placement.
         let (layers, hidden_hint) = self.models.get(base).map_or((1, None), |m| {
             (
@@ -775,7 +836,7 @@ impl Engine {
             hidden_hint,
             layers,
         );
-        let mut caps = load_adjusted_caps(caps_raw, n, &load);
+        let mut caps = load_adjusted_caps(caps_raw, n, &effective_loads);
         let feasible = scythe_vram_feasible(&caps, footprint);
         for (cap, ok) in caps.iter_mut().zip(&feasible) {
             if !ok {
@@ -797,11 +858,39 @@ impl Engine {
         let Some(ctrl) = self.scythe_ctrl.as_mut() else {
             return ScytheAdmission::Bypass;
         };
-        let placement = ctrl.decide(0, &shape, &caps, &links, epoch);
-        placement
-            .ranks
-            .first()
-            .copied()
+        // The shape-keyed PlacementCache is load-blind; while ANY rank
+        // carries load (pins or external busy) the decision must run fresh.
+        let placement = if any_load || any_external_busy {
+            ctrl.decide_forced(0, &shape, &caps, &links, epoch)
+        } else {
+            ctrl.decide(0, &shape, &caps, &links, epoch)
+        };
+        let chosen = placement.ranks.first().copied();
+        // WI-SB1 spread gate: non-zero ranks currently crash in
+        // `sample_on_device` (page fault on the pinned replica's device —
+        // first exposed when external-busy steering produced the first ever
+        // rank-1 pin; see scythe2 plan validation log 2026-08-23e). Until
+        // that hunt lands, spreading requires an explicit opt-in so the
+        // default serve surface keeps its long-verified rank-0 behavior.
+        let spread_enabled =
+            std::env::var("GRIM_SCYTHE_SPREAD").map(|v| v == "1").unwrap_or(false);
+        let chosen = match chosen {
+            Some(r) if r != 0 && !spread_enabled => {
+                eprintln!(
+                    "[scythe2] load favored rank {r} but cross-replica serving \
+                     is not yet safe (GRIM_SCYTHE_SPREAD unset); clamping to rank 0"
+                );
+                Some(0)
+            }
+            other => other,
+        };
+        if let Some(r) = chosen {
+            eprintln!(
+                "[scythe2] admission loads {:?} (external busy {:?}) -> rank {}",
+                effective_loads, external_busy, r
+            );
+        }
+        chosen
             .map(|r| r.min(n - 1))
             .map_or(ScytheAdmission::WaitVram, ScytheAdmission::Pin)
     }
@@ -848,6 +937,15 @@ impl Engine {
     /// latency value for that state.
     pub fn last_itl_ms(&self) -> Option<f64> {
         self.last_itl_ms
+    }
+
+    /// Clear the TTFT/ITL trace so a caller measuring request-by-request (the
+    /// WI-SB3 A/B harness) can distinguish a fresh measurement from the
+    /// previous request's stale one. Without this, `last_ttft_ms()` stays
+    /// `Some` forever and every later sample records the earlier value.
+    pub fn clear_latency_trace(&mut self) {
+        self.last_ttft_ms = None;
+        self.last_itl_ms = None;
     }
 
     /// Runtime speculative decoding telemetry for a specific model, or the
@@ -1642,6 +1740,10 @@ impl Engine {
                 ) {
                     ScytheAdmission::Pin(rank) => {
                         self.scythe_pin.insert(request.id, rank);
+                        eprintln!(
+                            "[scythe2] request {} ({} tok) pinned to farm rank {rank}",
+                            request.id, request.prompt_tokens
+                        );
                         pin_rank = Some(rank);
                     }
                     ScytheAdmission::WaitVram => {
@@ -1762,6 +1864,7 @@ impl Engine {
             match decision {
                 ScytheAdmission::Pin(rank) => {
                     self.scythe_pin.insert(id, rank);
+                    eprintln!("[scythe2] waitlisted request {id} admitted on farm rank {rank}");
                     if let Err(e) = self.admit_placed_request(request, Some(rank)) {
                         eprintln!("[scythe2] waitlisted request {id} failed to admit: {e}");
                     }
@@ -1862,7 +1965,14 @@ impl Engine {
         self.request_input_ids.remove(&id);
         self.request_last_token.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
-        self.scythe_pin.remove(&id);
+        // The rank stays counted for a short cooldown (see
+        // `scythe_admission_decision`) so the NEXT admission still sees it —
+        // a burst of short-lived requests otherwise always finds an empty
+        // pin map and piles onto rank 0.
+        if let Some(rank) = self.scythe_pin.remove(&id) {
+            self.scythe_pin_cooldown
+                .push((rank, std::time::Instant::now()));
+        }
         // A cancelled request must not linger on the WI-SB2 VRAM waitlist.
         self.scythe_vram_waitlist.retain(|r| r.id != id);
     }
@@ -2966,6 +3076,56 @@ mod tests {
     /// already there its effective 80/11 TFLOPS drops below the idle 8-TFLOPS
     /// card and the next admission lands there.
     #[test]
+    /// WI-SB1 load-spreading: a finished request's rank must stay counted in
+    /// the cooldown window so the next admission sees it — otherwise a burst
+    /// of short requests all observe an empty pin map and pile onto rank 0.
+    fn test_finished_pin_enters_cooldown_window() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.scythe_pin.insert(7, 1);
+        engine.finish_request(7);
+        assert!(engine.scythe_pin.get(&7).is_none(), "active pin released");
+        assert_eq!(engine.scythe_pin_cooldown.len(), 1);
+        assert_eq!(engine.scythe_pin_cooldown[0].0, 1);
+
+        // Pruning happens at admission time, not finish time: an aged-out
+        // entry is still physically present until the next decision scans
+        // it, but it must not COUNT toward load anymore (helper gate below).
+        engine.scythe_pin_cooldown[0].1 -= std::time::Duration::from_millis(2000);
+        engine.scythe_pin.insert(8, 0);
+        engine.finish_request(8);
+        let freshest = engine.scythe_pin_cooldown.last().unwrap();
+        assert_eq!(freshest.0, 0);
+        assert!(freshest.1.elapsed() < SCYTHE_PIN_COOLDOWN);
+    }
+
+    /// WI-SB1: effective-load math — active pins, cooldown-window releases,
+    /// expired releases, and external busy-% weighting.
+    #[test]
+    fn test_scythe_effective_loads_weights_and_expiry() {
+        let now = std::time::Instant::now();
+        let released = vec![
+            (0usize, now),                                          // in window
+            (1usize, now - std::time::Duration::from_millis(5000)), // expired
+            (9usize, now),                                          // out-of-range rank
+        ];
+        let busy = vec![Some(100u32), Some(50u32), None];
+        let loads = scythe_effective_loads(
+            [0usize, 1usize].into_iter(),
+            &released,
+            SCYTHE_PIN_COOLDOWN,
+            &busy,
+            3,
+            SCYTHE_EXTERNAL_BUSY_WEIGHT,
+        );
+        assert_eq!(loads[0], 4.0, "pin + fresh release + 100% busy×2.0");
+        assert_eq!(
+            loads[1], 2.0,
+            "pin + expired release dropped + 50% busy×2.0"
+        );
+        assert_eq!(loads[2], 0.0, "no pin, no telemetry -> zero load");
+    }
+
+    #[test]
     fn test_load_adjusted_caps_balances_farm_placement() {
         use grim_tensor::backend::ScytheLink;
         let caps = vec![farm_cap(8.0, 0), farm_cap(80.0, 1)];
@@ -2978,7 +3138,13 @@ mod tests {
         let shape = [1usize, 2048, 1, 1];
 
         let mut unloaded = crate::scythe2::C2plrController::new(1, 2, 150.0);
-        let p = unloaded.decide(0, &shape, &load_adjusted_caps(&caps, 2, &[0, 0]), &links, 0);
+        let p = unloaded.decide(
+            0,
+            &shape,
+            &load_adjusted_caps(&caps, 2, &[0.0, 0.0]),
+            &links,
+            0,
+        );
         assert_eq!(
             p.ranks,
             vec![1],
@@ -2989,7 +3155,7 @@ mod tests {
         let p2 = saturated.decide(
             0,
             &shape,
-            &load_adjusted_caps(&caps, 2, &[0, 10]),
+            &load_adjusted_caps(&caps, 2, &[0.0, 10.0]),
             &links,
             0,
         );
@@ -2998,6 +3164,61 @@ mod tests {
             vec![0],
             "saturated fast card must yield to the idle slow card"
         );
+    }
+
+    /// WI-SB1 load-spreading: external GPU utilization folds into the load
+    /// vector at weight 2.0 — a card maxed out by a desktop/game workload
+    /// (100 % busy ≈ +2 effective requests) must lose the fast card to an
+    /// idle slower rank on a ~2:1 measured pair.
+    #[test]
+    fn test_external_busy_flips_placement_to_idle_rank() {
+        use grim_tensor::backend::ScytheLink;
+        let caps = vec![farm_cap(12.4, 0), farm_cap(6.5, 1)];
+        let links = vec![
+            ScytheLink::PeerDirect,
+            ScytheLink::Host,
+            ScytheLink::Host,
+            ScytheLink::PeerDirect,
+        ];
+        let shape = [1usize, 2048, 1, 1];
+
+        // Idle: fast card wins outright…
+        let idle = load_adjusted_caps(&caps, 2, &[0.0, 0.0]);
+        let mut ctrl = crate::scythe2::C2plrController::new(1, 2, 150.0);
+        let p = ctrl.decide_forced(0, &shape, &idle, &links, 0);
+        assert_eq!(p.ranks, vec![0], "idle fast card must be picked");
+
+        // …but a game pinning rank 0 at 100 % busy (+2.0 effective load)
+        // halves its effective throughput and the idle slow card wins.
+        let gamed = load_adjusted_caps(&caps, 2, &[2.0, 0.0]);
+        let mut ctrl = crate::scythe2::C2plrController::new(1, 2, 150.0);
+        let p = ctrl.decide_forced(0, &shape, &gamed, &links, 0);
+        assert_eq!(
+            p.ranks,
+            vec![1],
+            "externally-saturated fast card must yield to the idle slow card"
+        );
+
+        // And the original defect: plain decide() caches the idle verdict
+        // keyed only by shape, then serves it verbatim even after the load
+        // vector changed — which is what pinned every request to rank 0.
+        // decide_forced must re-evaluate under the adjusted caps instead.
+        let mut ctrl = crate::scythe2::C2plrController::new(1, 2, 150.0);
+        let cached_rank = ctrl
+            .decide(0, &shape, &load_adjusted_caps(&caps, 2, &[0.0, 0.0]), &links, 0)
+            .ranks[0];
+        let sticky_rank = ctrl
+            .decide(0, &shape, &load_adjusted_caps(&caps, 2, &[2.0, 0.0]), &links, 0)
+            .ranks[0];
+        assert_eq!(cached_rank, 0);
+        assert_eq!(
+            sticky_rank, cached_rank,
+            "expected the load-blind cache hit being fixed here"
+        );
+        let forced_rank = ctrl
+            .decide_forced(0, &shape, &load_adjusted_caps(&caps, 2, &[2.0, 0.0]), &links, 0)
+            .ranks[0];
+        assert_eq!(forced_rank, 1);
     }
 
     /// Farm registration without an armed controller degrades to a plain

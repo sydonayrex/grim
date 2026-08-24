@@ -132,11 +132,11 @@ exact setter; M2/M3 exist so the class cannot silently return.
 
 | WI | host | sb | done |
 |----|------|----|------|
-| M1 pin all seams + slow launch | ☑ grep-contract test (`tests/hip_context_contract.rs`, 3/3) | ☐ GRIM_ALLOC_TRACE rerun, ctx_dev≠self_dev = 0 lines | ☐ |
-| M2 name the drift frame | ☐ named-frame log (tracing landed; needs multi-device run) | — | ☐ |
-| M3 context-drift unit gates | ☐ incl. mutation check (tests written; skip-verified on 1-GPU box) | — | ☐ |
-| M4 acceptance matrix | — | ☐ off-legs clean | ☐ |
-| WI-INF4 verdict | — | ☐ farm on/off both orders | ☐ |
+| M1 pin all seams + slow launch | ☑ grep-contract test (`tests/hip_context_contract.rs`, 3/3) | ☑ GRIM_ALLOC_TRACE rerun: 0 `ctx_dev≠self_dev` lines across `{ROCR=0}`, `{ROCR=0,1}`, all-visible legs (289+ traced launches; see also the event-seam extension below) | ☑ |
+| M2 name the drift frame | ☑ named-frame log: every latch-active flip attributed to `CapabilityProfiler::new → measure_capability` (probe/vram/clock/calibrate), balanced save/restore — no unattributed setter remains | — | ☑ |
+| M3 context-drift unit gates | ☑ 4/4 green single-threaded in BOTH `GRIM_GPUS=0,1` and `GRIM_GPUS=1,0`, incl. mutation check: guard no-op'd → raw_bytes residency + roles_swapped FAILED; pins restored → green. Two test defects fixed en route (see validation log 2026-08-23b) | — | ☑ |
+| M4 acceptance matrix | — | ☑ off-legs clean: `{ROCR=0}` exit 0, `{ROCR=0,1}` exit 0, `{all visible}` exit 0; 72 honest per-request samples, zero "Page not present", zero panics | ☑ |
+| WI-INF4 verdict | — | ☑ recorded: **stays opt-in** — mean TTFT overhead ≈0% both orders, p95 ITL −18.6% (F) / +2.43% (S, fails ≤2% budget); cost model retune pending (see scythe2 plan §validation log 2026-08-23c) | ☑ |
 
 ## Implementation status (2026-08-23)
 
@@ -211,6 +211,42 @@ why `emit_ctx_trace` early-returns on an atomic check before any env
 lookup. Root-causing the underlying first-launch zeroing belongs to the
 same fault hunt as the ctx_dev=2 page fault — recommended next step:
 capture `rocprofv3` traces of a failing run per the M4 toolchain.
+
+## Validation log (continued)
+
+- 2026-08-23b (syd-beasty, session 2): M1–M4 gates closed. En-route fixes,
+  all verified on-box:
+  - **Event seams** — `upload_from_host_stream_ordered` /
+    `copy_from_host_async` ran unpinned; the cached `upload_event` created
+    under a drifted context poisoned every later record →
+    `hipEventRecord failed with code 400` when farm replica `#scythe1`
+    loaded in release. Both bodies now DeviceGuard-pinned; farm arms 2/2.
+  - **Launch stamp order** — `(self_dev, ctx_dev)` was stamped at function
+    entry, *before* the P1-3 pin, so WI-M3's gates measured ambient context
+    rather than execution context (`roles_swapped` false-failed with
+    ctx=0). Stamp now taken inside each launch path under the held guard.
+  - **Drift-test helper bug** — `upload_and_launch_rms_norm` hardcoded its
+    own `(i%17)` input while `roles_swapped` compared against an `(i%13)`
+    reference: that gate could never pass on any hardware. The "mismatch"
+    values were the helper's data correctly normalized. Helper now takes
+    the caller's data. (The raw_bytes VRAM-delta gate additionally
+    requires single-threaded test execution — parallel fixtures race the
+    free-VRAM baseline.)
+  - **HIP attribute constants** (root cause found while implementing
+    scythe2 SB0): handles.rs/probe.rs used CUDA numbering, so WARP_SIZE=24
+    read ManagedMemory (=1), MULTIPROCESSOR_COUNT=16 read Integrated,
+    MAX_THREADS_PER_BLOCK=1 read AccessPolicyMaxWindowSize, LDS=3 read
+    CanMapHostMemory, PAGEABLE=231 did not exist (always errored), and the
+    profiler's "throttle" attr 74 actually selected
+    MaxSharedMemoryPerBlock (~64 KB) which clamped to throttle_pct=1.0 and
+    **zeroed every GPU's effective TFLOPS** whenever the profiler ran.
+    Corrected to ROCm 7.x enum values verified live: warp 87→32(wave32),
+    clock 13→5 (2570/2620 MHz), CUs 16→63 (WGP count), pageable
+    231→65, LDS 3→74 (64 KB). Honest 0.0 replaces the fake throttle.
+  - **LFM2 fused-KV growth** — `LFM2_FUSED_KV_CACHE_LEN = 4096` was a hard
+    cap against a 128k-context model; decoding past position 4096 panicked
+    `lfm2.rs:724` (range end 2097664 > len 2097152). The K/V scratch now
+    grows (doubling) with `cache_offset + steps`; the M4 matrix runs clean.
 
 ## Risks
 

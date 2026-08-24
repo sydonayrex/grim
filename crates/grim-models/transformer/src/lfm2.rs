@@ -626,7 +626,7 @@ impl Lfm2Block {
         let n_q = self.num_heads * self.head_dim;
         let n_k = self.num_kv_heads * self.head_dim;
         let n_v = self.num_kv_heads * self.head_dim;
-        let max_seq = LFM2_FUSED_KV_CACHE_LEN;
+        let mut max_seq = LFM2_FUSED_KV_CACHE_LEN;
 
         let cache_offset = match cache {
             Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / n_k,
@@ -650,6 +650,42 @@ impl Lfm2Block {
                 ));
             }
         };
+        // The fused-KV scratch starts at `LFM2_FUSED_KV_CACHE_LEN` positions
+        // but the model's context window is far larger; sessions whose
+        // sequence runs past the current capacity grow it (doubling) instead
+        // of reading past the allocation. K and V always share one capacity.
+        let needed = cache_offset + steps;
+        {
+            let cur = k_dev.as_ref().map(|t| t.shape().dims()[0]).unwrap_or(0);
+            if cur < needed {
+                let new_cap = needed.max(LFM2_FUSED_KV_CACHE_LEN * 2);
+                let mut grow =
+                    |slot: &mut Option<Tensor>, row_len: usize| -> Result<()> {
+                        let old_data = slot.as_ref().map(|t| t.to_vec_f32()).transpose()?;
+                        let mut data = vec![0f32; new_cap * row_len];
+                        if let Some(old) = old_data {
+                            let keep = old.len().min(data.len());
+                            data[..keep].copy_from_slice(&old[..keep]);
+                        }
+                        let shape = Shape::new(vec![new_cap, row_len]);
+                        *slot = Some(Tensor::new(
+                            Arc::from(dev.from_cpu_bytes(
+                                as_u8_slice(&data),
+                                &shape,
+                                DType::F32,
+                            )?),
+                            shape,
+                            DType::F32,
+                            QuantProvenance::GrimNative.into(),
+                            norm_x.device().clone(),
+                        ));
+                        Ok(())
+                    };
+                grow(k_dev, n_k)?;
+                grow(v_dev, n_v)?;
+                max_seq = new_cap;
+            }
+        }
         if k_dev.is_none() {
             let k_shape = Shape::new(vec![max_seq, n_k]);
             *k_dev = Some(Tensor::new(

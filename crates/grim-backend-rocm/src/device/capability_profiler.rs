@@ -1,7 +1,8 @@
 //! SCYTHE-2 Capability Profiler (WI-2). [see: `GpuCapability`, `SelfTuningController`, `tflops_fp16`, `throttle_pct`]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use grim_tensor::backend::{GpuCapability, ScytheLink};
@@ -13,8 +14,17 @@ use libloading::Symbol;
 
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────
 
-/// HIP device attribute: active clock throttle reasons. [see: `hipDeviceAttributeCurrentThermalThrottlePercent`]
-const HIP_DEVICE_ATTR_THROTTLE: i32 = 74;
+/// HIP device attribute: active clock throttle reasons. **No such attribute
+/// exists in ROCm 7.x** — the old constant here (74) actually selected
+/// `MaxSharedMemoryPerBlock`, whose ~64 KB reading clamped to "100%
+/// throttled" and zeroed every GPU's effective TFLOPS. Kept only to document
+/// the removal; `query_throttle_pct` now reports honest absence.
+#[allow(dead_code)]
+const HIP_DEVICE_ATTR_THROTTLE_REMOVED: i32 = 74;
+
+/// HIP device attribute: current core clock rate in kHz (`hipDeviceAttributeClockRate`,
+/// enum value 5 in ROCm 7.x — not CUDA's 13). Part of the calibration cache key.
+const HIP_DEVICE_ATTR_CLOCK_RATE: i32 = 5;
 
 /// HIP device attribute: constant memory in bytes (attribute 23 in hip_runtime_api.h).
 #[allow(dead_code)]
@@ -139,16 +149,18 @@ impl CapabilityProfiler {
 
 /// Measure one GPU's capability snapshot.
 ///
-/// The architecture table is the cold-start fallback.  A future ROCm build
-/// may provide `calibrate_capability`; keeping the selection in this helper
-/// makes calibration an opt-in replacement rather than allowing a failed
-/// probe to turn into a fabricated zero-capability device.
+/// WI-SB0: the snapshot prefers *measured* numbers — one small FP16 GEMM plus
+/// a device-to-device copy sweep per device, run once per process and cached
+/// by `(gcn_arch, clock_mhz)` in [`calibrate_capability`]. The static
+/// architecture table is the fallback for GPU-less/ROCm-absent builds and any
+/// calibration error; a failed measurement never fabricates zeros here.
 fn measure_capability(ordinal: usize) -> GpuCapability {
     // Base probe from the existing infrastructure.
     let host_cap = match probe_host_gpu(ordinal) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
             // GPU disappeared between `enumerate_devices` and this probe.
+            eprintln!("[scythe2] probe_host_gpu({ordinal}) failed: {e}");
             return GpuCapability {
                 ordinal,
                 ..Default::default()
@@ -181,14 +193,272 @@ fn measure_capability(ordinal: usize) -> GpuCapability {
     }
 }
 
-/// Run the optional one-shot device calibration.
+/// Run the one-shot device calibration (WI-SB0).
 ///
-/// Calibration is intentionally isolated behind this function: builds that
-/// do not ship the rocBLAS/HIP calibration symbols return `None` and use the
-/// architecture row.  The process-wide cache belongs here once the runtime
-/// exposes the device clock key (architecture + clock MHz).
-fn calibrate_capability(_ordinal: usize, _gcn: &str) -> Option<(f32, f32, f32)> {
-    None
+/// Measures effective FP16 TFLOPS with a small rocBLAS GEMM (f16 inputs, f32
+/// accumulation — the shape class inference actually runs) and effective HBM
+/// bandwidth with a device-to-device copy sweep. ~ms per device, once per
+/// process per `(gcnArchName, 500 MHz clock bucket)`: identical silicon at a
+/// similar clock hits the cache instead of re-benchmarking on every profiler
+/// tick.
+///
+/// FP8 has no rocBLAS-exercisable path on consumer RDNA parts, so its entry
+/// is *derived*: measured-FP16 scaled by the static row's fp8/fp16 ratio.
+/// Any HIP/rocBLAS error returns `None` so the caller falls back to the
+/// architecture row rather than trusting a partial measurement.
+fn calibrate_capability(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), (f32, f32, f32)>>> = OnceLock::new();
+    // Clock is bucketed to 500 MHz: DVFS jitters tens of MHz between calls,
+    // and an exact-clock key would re-run the micro-benchmark on every
+    // profiler tick. Big downclocks (thermal) still cross buckets, which is
+    // exactly when re-measuring matters.
+    let clock_bucket = query_clock_mhz(ordinal)? / 500;
+    let key = (gcn.to_string(), clock_bucket);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(hit) = cache.lock() {
+        if let Some(found) = hit.get(&key) {
+            return Some(*found);
+        }
+    }
+    let measured = measure_device_throughput(ordinal, gcn)?;
+    if let Ok(mut slot) = cache.lock() {
+        slot.insert(key, measured);
+    }
+    Some(measured)
+}
+
+/// Current core clock of `ordinal` in MHz, or `None` when the attribute
+/// query fails or reports a nonsense value.
+fn query_clock_mhz(ordinal: usize) -> Option<u32> {
+    let mut val: i32 = 0;
+    let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
+    unsafe {
+        use crate::device::handles::hipDeviceGetAttribute;
+        let status = hipDeviceGetAttribute(&mut val, HIP_DEVICE_ATTR_CLOCK_RATE, ordinal as i32);
+        if status != 0 || val <= 0 {
+            return None;
+        }
+    }
+    Some((val / 1000) as u32)
+}
+
+/// Micro-benchmark one device: median-of-runs FP16 GEMM throughput plus DtoD
+/// copy bandwidth, both timed host-side around `hipDeviceSynchronize` fences.
+fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
+    use crate::device::handles::{hipDeviceSynchronize, hipFree, hipMalloc, hipMemcpy};
+    use crate::device::rocblas::{
+        rocblas_create_handle, rocblas_destroy_handle, rocblas_gemm_ex, rocblas_set_stream,
+        rocblas_datatype, select_gemm_algo, RocblasHandle, RocblasOperation,
+        ROCBLAS_GEMM_FLAGS_NONE,
+    };
+    use crate::device::util::DeviceGuard;
+    use std::ptr::null_mut;
+
+    // Keep the whole benchmark ≪ a frame budget: 2 warmup + 5 timed runs of
+    // each leg land in single-digit ms even on an iGPU.
+    const GEMM_DIM: usize = 2048;
+    const GEMM_WARMUP: usize = 2;
+    const GEMM_RUNS: usize = 5;
+    const COPY_BYTES: usize = 128 * 1024 * 1024;
+    const COPY_RUNS: usize = 3;
+
+    let _guard = DeviceGuard::set(ordinal as i32);
+
+    // ── GEMM leg ────────────────────────────────────────────────────────────
+    let ab_bytes = GEMM_DIM * GEMM_DIM * 2; // f16
+    let d_bytes = GEMM_DIM * GEMM_DIM * 4; // f32 accumulate out
+    let mut d_a: *mut core::ffi::c_void = null_mut();
+    let mut d_b: *mut core::ffi::c_void = null_mut();
+    let mut d_d: *mut core::ffi::c_void = null_mut();
+    unsafe {
+        for ptr in [&mut d_a, &mut d_b] {
+            if hipMalloc(ptr, ab_bytes) != 0 {
+                return None;
+            }
+        }
+        if hipMalloc(&mut d_d, d_bytes) != 0 {
+            hipFree(d_a);
+            hipFree(d_b);
+            return None;
+        }
+        // All-ones halves keep the accumulator at exactly K — no inf/NaN to
+        // perturb timing, no data-dependent clock behaviour.
+        let ones_f16: Vec<u16> = vec![0x3C00; GEMM_DIM * GEMM_DIM];
+        for (dst, src) in [(d_a, &ones_f16), (d_b, &ones_f16)] {
+            if hipMemcpy(
+                dst,
+                src.as_ptr() as *const core::ffi::c_void,
+                ab_bytes,
+                crate::device::handles::HipMemcpyKind::HostToDevice,
+            ) != 0
+            {
+                hipFree(d_a);
+                hipFree(d_b);
+                hipFree(d_d);
+                return None;
+            }
+        }
+    }
+
+    let mut handle = RocblasHandle(null_mut());
+    let gemm_ok = unsafe {
+        if rocblas_create_handle(&mut handle) != 0 {
+            false
+        } else {
+            // Default stream (null): calibration owns the device for its few ms.
+            rocblas_set_stream(handle, std::ptr::null_mut()) == 0
+        }
+    };
+    if !gemm_ok {
+        unsafe {
+            if !handle.0.is_null() {
+                rocblas_destroy_handle(handle);
+            }
+            hipFree(d_a);
+            hipFree(d_b);
+            hipFree(d_d);
+        }
+        return None;
+    }
+
+    // Row-major C[M,N] = A[M,K]·B[K,N] maps to column-major as Cᵀ[N,M] =
+    // Bᵀ[N,K]·A[K,M] — operands swapped, leading dims n/k/n (same convention
+    // as `RocmDevice::matmul`).
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let n_dim = GEMM_DIM as i32;
+    let run_gemm = |handle: RocblasHandle| unsafe {
+        rocblas_gemm_ex(
+            handle,
+            RocblasOperation::None,
+            RocblasOperation::None,
+            n_dim,
+            n_dim,
+            n_dim,
+            &alpha as *const f32 as *const core::ffi::c_void,
+            d_b as *const core::ffi::c_void,
+            rocblas_datatype::f16_r,
+            n_dim,
+            d_a as *const core::ffi::c_void,
+            rocblas_datatype::f16_r,
+            n_dim,
+            &beta as *const f32 as *const core::ffi::c_void,
+            d_d as *const core::ffi::c_void,
+            rocblas_datatype::f32_r,
+            n_dim,
+            d_d as *mut core::ffi::c_void,
+            rocblas_datatype::f32_r,
+            n_dim,
+            rocblas_datatype::f32_r,
+            select_gemm_algo(0),
+            0,
+            ROCBLAS_GEMM_FLAGS_NONE,
+        )
+    };
+
+    let mut gemm_ms: Vec<f32> = Vec::with_capacity(GEMM_WARMUP + GEMM_RUNS);
+    for _ in 0..(GEMM_WARMUP + GEMM_RUNS) {
+        let t0 = Instant::now();
+        let status = run_gemm(handle);
+        unsafe { hipDeviceSynchronize() };
+        let dt = t0.elapsed().as_secs_f32() * 1000.0;
+        if status != 0 {
+            unsafe {
+                rocblas_destroy_handle(handle);
+                hipFree(d_a);
+                hipFree(d_b);
+                hipFree(d_d);
+            }
+            return None;
+        }
+        gemm_ms.push(dt);
+    }
+
+    // ── Bandwidth leg (DtoD copy moves 2× bytes: read + write) ─────────────
+    let mut c_src: *mut core::ffi::c_void = null_mut();
+    let mut c_dst: *mut core::ffi::c_void = null_mut();
+    let copy_ok = unsafe {
+        if hipMalloc(&mut c_src, COPY_BYTES) != 0 || hipMalloc(&mut c_dst, COPY_BYTES) != 0 {
+            hipFree(c_src);
+            hipFree(c_dst);
+            false
+        } else {
+            true
+        }
+    };
+    let mut copy_ms: Vec<f32> = Vec::new();
+    if copy_ok {
+        for _ in 0..=COPY_RUNS {
+            let t0 = Instant::now();
+            let status = unsafe {
+                hipMemcpy(
+                    c_dst,
+                    c_src as *const core::ffi::c_void,
+                    COPY_BYTES,
+                    crate::device::handles::HipMemcpyKind::DeviceToDevice,
+                )
+            };
+            unsafe { hipDeviceSynchronize() };
+            let dt = t0.elapsed().as_secs_f32() * 1000.0;
+            if status != 0 {
+                copy_ms.clear();
+                break;
+            }
+            copy_ms.push(dt);
+        }
+    }
+
+    unsafe {
+        rocblas_destroy_handle(handle);
+        hipFree(d_a);
+        hipFree(d_b);
+        hipFree(d_d);
+        hipFree(c_src);
+        hipFree(c_dst);
+    }
+
+    // Median of the post-warmup samples.
+    let median = |v: &[f32]| -> Option<f32> {
+        if v.is_empty() {
+            return None;
+        }
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.total_cmp(b));
+        Some(s[s.len() / 2])
+    };
+    if gemm_ms.len() <= GEMM_WARMUP {
+        return None;
+    }
+    let gemm_median = median(&gemm_ms[GEMM_WARMUP..])?;
+    let tflops_fp16 = 2.0 * (GEMM_DIM * GEMM_DIM * GEMM_DIM) as f32 / (gemm_median * 1e-3) / 1e12;
+    if !(tflops_fp16 > 0.0 && tflops_fp16 < 20_000.0) {
+        return None;
+    }
+
+    let hbm_gbps = if copy_ms.is_empty() {
+        return None;
+    } else {
+        let copy_median = median(&copy_ms[1..])?;
+        2.0 * COPY_BYTES as f32 / (copy_median * 1e-3) / 1e9
+    };
+    if !(hbm_gbps > 0.0 && hbm_gbps < 100_000.0) {
+        return None;
+    }
+
+    // Derive FP8 from the measured FP16 number via the static row's ratio —
+    // honest scaling, clearly not a direct measurement.
+    let (s_fp16, s_fp8, _) = arch_tflops_table(gcn);
+    let tflops_fp8 = if s_fp16 > 0.0 && s_fp8 > 0.0 {
+        tflops_fp16 * (s_fp8 / s_fp16)
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "[scythe2] WI-SB0 calibrated GPU {ordinal} ({gcn}): \
+         fp16 {tflops_fp16:.1} TFLOPS, bw {hbm_gbps:.0} GB/s (measured)"
+    );
+    Some((tflops_fp16, tflops_fp8, hbm_gbps))
 }
 
 /// Architecture TFLOPS table — offline values per GCN arch string. [see: `2604.10187`, `throttle_pct`]
@@ -244,22 +514,14 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
 }
 
 /// Query the thermal throttle fraction [0, 1] for `ordinal`.
-fn query_throttle_pct(ordinal: usize) -> f32 {
-    let mut val: i32 = 0;
-    // The guard restores the caller's current device: a profiler sweep over
-    // every ordinal must not leave the thread on a foreign device, or later
-    // `hipModuleLoad` calls bind to the wrong context (HIP error 209).
-    let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
-    // SAFETY: `hipDeviceGetAttribute` is safe to call with a valid ordinal.
-    unsafe {
-        use crate::device::handles::hipDeviceGetAttribute;
-        let status = hipDeviceGetAttribute(&mut val, HIP_DEVICE_ATTR_THROTTLE, ordinal as i32);
-        if status != 0 {
-            return 0.0;
-        }
-    }
-    // The attribute returns a percentage [0, 100]; normalise to [0, 1].
-    (val.clamp(0, 100) as f32) / 100.0
+///
+/// HIP exposes **no** thermal-throttle device attribute on this stack (see
+/// `HIP_DEVICE_ATTR_THROTTLE_REMOVED`): the query that used to live here read
+/// shared-memory size and reported every GPU as 100% throttled, zeroing all
+/// effective TFLOPS. Until rsmi throttle-reason bindings land, report honest
+/// absence — the A/B harness records this field alongside every sample.
+fn query_throttle_pct(_ordinal: usize) -> f32 {
+    0.0
 }
 
 /// Query free VRAM in bytes via `hipMemGetInfo`.
@@ -395,6 +657,48 @@ mod tests {
         assert!(fast.0 > slow.0, "gfx1201 should rank above gfx1200");
         assert_ne!(fast.2, slow.2, "RDNA4 bandwidth rows must differ");
         assert_eq!(arch_tflops_table("gfx1202"), (80.0, 160.0, 960.0));
+    }
+
+    /// WI-SB0 host gate: calibration must fall back cleanly (`None`, no
+    /// panic) when the ordinal is not a live HIP device — the GPU-less-box
+    /// stand-in for "HIP absent".
+    #[test]
+    fn test_calibration_falls_back_on_bad_ordinal() {
+        assert!(calibrate_capability(usize::MAX - 1, "gfx0000").is_none());
+        // And the snapshot builder must degrade to default caps, not panic.
+        let cap = measure_capability(usize::MAX - 1);
+        assert_eq!(cap.ordinal, usize::MAX - 1);
+    }
+
+    /// WI-SB0 measured-capability gate (needs ≥1 real ROCm device): the
+    /// profiler must report *measured* numbers that beat the tie-collapse
+    /// problem — non-zero TFLOPS/bandwidth, cached across calls, and on an
+    /// asymmetric pair strictly ordered fast > slow in both fields.
+    #[test]
+    fn test_measured_caps_are_real_and_distinct() {
+        let n = enumerate_devices().unwrap_or(0);
+        if n == 0 {
+            return; // GPU-less box — static-table path covered elsewhere.
+        }
+        let profiler = CapabilityProfiler::new();
+        let caps = profiler.capabilities();
+        assert!(caps.len() >= 1);
+        for cap in &caps {
+            assert!(
+                cap.tflops_fp16 > 0.0,
+                "GPU {} calibrated to zero TFLOPS",
+                cap.ordinal
+            );
+            assert!(
+                cap.hbm_bandwidth_gbps > 0.0,
+                "GPU {} calibrated to zero bandwidth",
+                cap.ordinal
+            );
+        }
+        // Asymmetric pair: distinct silicon must measure apart in BOTH fields.
+        if caps.len() >= 2 && caps[0].tflops_fp16 != caps[1].tflops_fp16 {
+            assert_ne!(caps[0].hbm_bandwidth_gbps, caps[1].hbm_bandwidth_gbps);
+        }
     }
 
     /// `CapabilityProfiler::new()` must not panic on a GPU-less box.

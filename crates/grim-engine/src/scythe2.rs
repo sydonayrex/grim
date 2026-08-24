@@ -262,6 +262,28 @@ impl C2plrController {
             .clone()
     }
 
+    /// Load-aware variant of [`C2plrController::decide`] (WI-SB1 finding):
+    /// the shape-keyed PlacementCache is load-blind — a placement decided
+    /// for idle ranks is reused verbatim even after the rank-load vector
+    /// changed (concurrent farm pins or external GPU utilization). Callers
+    /// that pass *adjusted* caps reflecting any non-zero load must use this
+    /// entry so the argmin actually sees them. Still refreshes the cache so
+    /// subsequent idle-shaped lookups stay coherent.
+    pub fn decide_forced(
+        &mut self,
+        layer_id: u32,
+        shape: &[usize],
+        caps: &[GpuCapability],
+        links: &[ScytheLink],
+        epoch: u32,
+    ) -> ScythePlacement {
+        self.cache.sync_epoch(epoch);
+        let p = self.decide_miss(layer_id, shape, caps, links);
+        let bucket = bucketize(shape);
+        self.cache.insert(layer_id, bucket, p.clone());
+        p
+    }
+
     /// Expensive path: WaveTune bilinear eval + MLP forward + Gumbel sample.
     ///
     /// At ~10 µs/layer (scythe2.md §3.4 corrected figure). This is a
@@ -1486,6 +1508,50 @@ mod tests {
                 "untrained controller must place on the faster card (rank 1)"
             );
             assert!(p.partition.len() == 1 && p.partition[0].is_finite());
+        }
+    }
+
+    /// WI-SB0 gate (needs ≥2 HIP devices): extend the untrained-MLP gate to
+    /// the profiler's *measured* capabilities. On syd-beasty's asymmetric
+    /// pair the WaveTune argmin fallback must pick the measured-fast card,
+    /// and it must do so in BOTH rank orders — slow-on-rank-0 and
+    /// fast-on-rank-0 — which is what stops sticky-rank-0 placement.
+    #[test]
+    fn test_real_measured_caps_prefer_faster_gpu_both_orders() {
+        let profiler = grim_backend_rocm::CapabilityProfiler::new();
+        let mut caps = profiler.capabilities();
+        if caps.len() < 2 {
+            return; // single-GPU box — asymmetric-pair gate does not apply
+        }
+        caps.truncate(2);
+        let links = make_links(2);
+        let shape = [1usize, 2048, 4096, 128];
+        let num_layers = 4;
+
+        // Rank order F-first and S-first: re-index `ordinal` alongside the
+        // swap so ranks always address slots 0/1 (mirrors a GRIM_GPUS flip).
+        let mut orders = [caps.clone(), caps.clone()];
+        orders[1].reverse();
+        for caps in orders {
+            assert_ne!(
+                caps[0].tflops_fp16, caps[1].tflops_fp16,
+                "pair must measure apart or this gate proves nothing"
+            );
+            let fast_rank = if caps[0].tflops_fp16 > caps[1].tflops_fp16 {
+                0
+            } else {
+                1
+            };
+            let mut ctrl = C2plrController::new(num_layers, 2, 150.0);
+            for layer_id in 0..num_layers as u32 {
+                let p = ctrl.decide(layer_id, &shape, &caps, &links, 0);
+                assert_eq!(
+                    p.ranks,
+                    vec![fast_rank],
+                    "untrained controller placed on the slower card under \
+                     real measured caps"
+                );
+            }
         }
     }
 

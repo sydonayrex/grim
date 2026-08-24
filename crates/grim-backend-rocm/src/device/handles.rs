@@ -254,19 +254,29 @@ unsafe extern "C" {
 }
 
 // ======== Attribute / advice constants ========
+//
+// Numbers verified against ROCm 7.x `hip_runtime_api.h`
+// (`hipDeviceAttribute_t`) and probed live on gfx1201/gfx1200: the previous
+// values here were CUDA numbering, so every query landed on a different
+// attribute (WARP_SIZE=24 read ManagedMemory; MULTIPROCESSOR_COUNT=16 read
+// Integrated; MAX_THREADS_PER_BLOCK=1 read AccessPolicyMaxWindowSize;
+// PAGEABLE_MEMORY_ACCESS=231 did not exist and always errored).
 
 /// XNACK and device memory attribute flags for unified memory detection.
+/// NOTE: `hipDeviceAttributeCoherentDeviceAlloc` has no backing attribute in
+/// current ROCm headers; the number is kept for API stability only.
 pub const HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC: i32 = 230;
-pub const HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: i32 = 231;
+pub const HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: i32 = 65;
 
 /// Wavefront size attribute id — passed to `hipDeviceGetAttribute`.
-pub const HIP_DEVICE_ATTRIBUTE_WARP_SIZE: i32 = 24;
+pub const HIP_DEVICE_ATTRIBUTE_WARP_SIZE: i32 = 87;
 
 /// Maximum threads per block attribute id — passed to `hipDeviceGetAttribute`.
-pub const HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 1;
+pub const HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 56;
 
-/// Multiprocessor (Compute Unit) count attribute id — passed to `hipDeviceGetAttribute`.
-pub const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
+/// Multiprocessor (workgroup processor) count attribute id. RDNA parts report
+/// WGP count here — half the shader-CU figure marketing uses.
+pub const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 63;
 
 pub const HIP_MEM_ADVISE_SET_READ_MOSTLY: i32 = 1;
 pub const HIP_MEM_ADVISE_UNSET_READ_MOSTLY: i32 = 2;
@@ -333,9 +343,10 @@ mod handles_self_tests {
 
     #[test]
     fn hip_attribute_constants_match_hip_spec() {
-        // The values pinned here correspond to the HIP runtime's [see: `hipDeviceGetAttribute`]
-        assert_eq!(HIP_DEVICE_ATTRIBUTE_WARP_SIZE, 24);
-        assert_eq!(HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, 231);
+        // The values pinned here correspond to ROCm 7.x `hipDeviceAttribute_t`
+        // (verified by parsing the installed header and probing live).
+        assert_eq!(HIP_DEVICE_ATTRIBUTE_WARP_SIZE, 87);
+        assert_eq!(HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, 65);
         assert_eq!(HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC, 230);
     }
 }

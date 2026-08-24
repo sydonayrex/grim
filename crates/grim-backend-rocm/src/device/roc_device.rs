@@ -1349,6 +1349,10 @@ impl RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
+        // WI-M1 context discipline: an async H2D enqueues on a stream bound
+        // to the calling thread's current context; pin the owning ordinal so
+        // a drifted caller cannot schedule the copy against foreign memory.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
         let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
@@ -1404,6 +1408,13 @@ impl RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
+        // WI-M1 context discipline: the async copy, the event CREATE and the
+        // event RECORD all bind to the calling thread's current context. The
+        // cached `upload_event` is reused across uploads — if the first use
+        // happened under a drifted context, every later record fails with
+        // hipErrorInvalidHandle (400). Pin the owning ordinal across the
+        // whole body so stream, event and copy all bind consistently.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
         let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
@@ -11682,6 +11693,27 @@ impl RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
+    /// WI-M2/M3: stamp (self_dev, ctx_dev) for the drift gates and print the
+    /// launch trace — called while this device's P1-3 guard is held, so the
+    /// recorded `ctx_dev` is the context the kernel actually launches under.
+    fn stamp_launch_post_pin(&self, trace_on: bool, entry: &str, grid: HipDim3) {
+        if !(trace_on || cfg!(test)) {
+            return;
+        }
+        let mut cur_dev: i32 = -1;
+        unsafe {
+            crate::device::handles::hipGetDevice(&mut cur_dev);
+        }
+        #[cfg(test)]
+        crate::device::util::stamp_launch_context(self.ordinal as i32, cur_dev);
+        if trace_on {
+            eprintln!(
+                "[launch-trace] self_dev={} ctx_dev={} {} grid=({},{},{})",
+                self.ordinal, cur_dev, entry, grid.x, grid.y, grid.z
+            );
+        }
+    }
+
     pub(crate) fn launch_compute_kernel_with_solution(
         &self,
         entry: &str,
@@ -11700,21 +11732,11 @@ impl RocmDevice {
         // GRIM_ALLOC_TRACE it prints; in unit-test builds the WI-M3 drift
         // gates read the same pair back through the util atomics. With both
         // off this compiles to exactly the previous no-op.
+        // The stamp is taken INSIDE each launch path AFTER the P1-3 device
+        // pin (`stamp_launch_post_pin`) — capturing the ambient context at
+        // function entry would record the caller's stale context instead of
+        // the one the kernel actually executes under.
         let trace_on = std::env::var("GRIM_ALLOC_TRACE").is_ok();
-        if trace_on || cfg!(test) {
-            let mut cur_dev: i32 = -1;
-            unsafe {
-                crate::device::handles::hipGetDevice(&mut cur_dev);
-            }
-            #[cfg(test)]
-            crate::device::util::stamp_launch_context(self.ordinal as i32, cur_dev);
-            if trace_on {
-                eprintln!(
-                    "[launch-trace] self_dev={} ctx_dev={} {} grid=({},{},{})",
-                    self.ordinal, cur_dev, entry, grid.x, grid.y, grid.z
-                );
-            }
-        }
         if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
             eprintln!("[launch-done] {}", entry);
         }
@@ -11731,6 +11753,7 @@ impl RocmDevice {
                 // loaders). Pin THIS device or the kernel executes against
                 // foreign pointers — observed as GPU page faults on gfx1201.
                 let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                self.stamp_launch_post_pin(trace_on, entry, grid);
                 let stream = self.active_stream();
                 let args_ptr = args.as_mut_ptr();
                 check_hip("hipModuleLaunchKernel (cached)", unsafe {
@@ -11824,6 +11847,7 @@ impl RocmDevice {
         // thread on a foreign ordinal. Loading a gfx1201 hsaco on gfx1200 yields
         // HIP error 209 (no binary for device).
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        self.stamp_launch_post_pin(trace_on, entry, grid);
         let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
         let (_module, func) = if let Some(cached) = module_cache.get(&cache_key) {
             let (m, f) = *cached;
