@@ -34,7 +34,7 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use grim_tensor::backend::BackendDevice;
+use grim_tensor::backend::{BackendDevice, BackendStorage};
 use grim_tensor::Shape;
 
 use crate::device::capability_profiler::vram_info;
@@ -112,14 +112,13 @@ fn with_drift_fixture(target: usize, foreign_ordinal: i32, f: impl FnOnce(&Drift
 const ROWS: usize = 8;
 const ROW_LEN: usize = 64;
 
-fn upload_and_launch_rms_norm(fx: &DriftFixture) -> Vec<f32> {
+fn upload_and_launch_rms_norm(fx: &DriftFixture, x_data: &[f32]) -> Vec<f32> {
     let shape = Shape::from_slice(&[ROWS, ROW_LEN]);
-    let x_data: Vec<f32> = (0..ROWS * ROW_LEN).map(|i| ((i % 17) as f32) * 0.25 - 1.0).collect();
     let ones = vec![1.0f32; ROW_LEN];
 
     // Upload through the pinned seam while the foreign context is alive.
     let x = RocmStorage::copy_from_host(
-        &x_data,
+        x_data,
         &shape,
         dtype_f32(),
         &fx.dev.allocator,
@@ -164,7 +163,7 @@ fn rms_norm_launch_stays_context_correct_while_worker_parks_on_device_1() {
     with_drift_fixture(0, 1, |fx| {
         let x_data: Vec<f32> =
             (0..ROWS * ROW_LEN).map(|i| ((i % 17) as f32) * 0.25 - 1.0).collect();
-        let got = upload_and_launch_rms_norm(fx);
+        let got = upload_and_launch_rms_norm(fx, &x_data);
         let want = cpu_rms_norm_reference(&x_data, ROW_LEN);
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
             assert!(
@@ -183,7 +182,7 @@ fn rms_norm_launch_stays_context_correct_roles_swapped() {
     with_drift_fixture(1, 0, |fx| {
         let x_data: Vec<f32> =
             (0..ROWS * ROW_LEN).map(|i| ((i % 13) as f32) * 0.5 - 2.0).collect();
-        let got = upload_and_launch_rms_norm(fx);
+        let got = upload_and_launch_rms_norm(fx, &x_data);
         let want = cpu_rms_norm_reference(&x_data, ROW_LEN);
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
             assert!(

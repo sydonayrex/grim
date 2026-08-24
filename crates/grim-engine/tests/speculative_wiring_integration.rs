@@ -2,8 +2,7 @@
 
 use grim_engine::Engine;
 use grim_models_transformer::{Eagle3, Eagle3Config, Llama, LlamaConfig};
-use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{Device, Shape};
+use grim_tensor::Device;
 use std::sync::Arc;
 
 #[test]
@@ -26,23 +25,7 @@ fn test_engine_speculative_eagle3_registration() {
         yarn: None,
     };
 
-    let base_lm = Llama {
-        cfg: base_cfg.clone(),
-        device: Device::Cpu,
-        tok_embeddings: Embedding {
-            weight: grim_backend_cpu::cpu_tensor(vec![0.01; 100 * 64], Shape::new(vec![100, 64])),
-        },
-        layers: Vec::new(),
-        moe_blocks: Vec::new(),
-        norm: RmsNorm::new(
-            grim_backend_cpu::cpu_tensor(vec![1.0; 64], Shape::new(vec![64])),
-            1e-5,
-        ),
-        output: Linear::from_tensor(
-            grim_backend_cpu::cpu_tensor(vec![0.01; 100 * 64], Shape::new(vec![100, 64])),
-            None,
-        ),
-    };
+    let base_lm = Llama::random(Device::Cpu, base_cfg.clone());
 
     // 2. Create mock EAGLE3 model
     let eagle3_cfg = Eagle3Config {

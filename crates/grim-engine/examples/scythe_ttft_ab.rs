@@ -103,6 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..iters {
         for prompt in &prompt_mix {
             let n = prompt.split_whitespace().count();
+            // Fresh per-sample trace: last_ttft_ms stays Some forever once a
+            // prefill has run, so without this clear every later sample
+            // breaks out of the loop instantly and records the stale value.
+            engine.clear_latency_trace();
             engine.enqueue_request_with_kv(Request {
                 id,
                 prompt_tokens: n,
@@ -111,11 +115,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             })?;
             let start = Instant::now();
-            for _ in 0..64 {
+            // Prefill leg: tick until this request's TTFT is observable.
+            let mut ticks = 0usize;
+            while engine.last_ttft_ms().is_none() && ticks < 512 {
                 let _ = engine.tick()?;
-                if engine.last_ttft_ms().is_some() {
-                    break;
-                }
+                ticks += 1;
+            }
+            // Decode leg: keep draining until the request stops producing
+            // decode steps (max_new_tokens reached), bounded defensively.
+            let mut idle = 0usize;
+            let mut decoded = 0usize;
+            while idle < 3 && decoded <= 64 && ticks < 1024 {
+                let out = engine.tick()?;
+                let steps = out.decode_ids.len();
+                decoded += steps;
+                idle = if steps == 0 { idle + 1 } else { 0 };
+                ticks += 1;
             }
             samples.push(ScytheAbSample {
                 arm_on: armed,

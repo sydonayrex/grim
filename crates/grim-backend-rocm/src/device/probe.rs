@@ -12,7 +12,8 @@ use super::handles::{
 };
 
 /// HIP attribute ID for maximum shared memory (LDS) per block.
-pub const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 3;
+/// ROCm 7.x enum value (the old CUDA-style `3` read CanMapHostMemory).
+pub const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
 
 /// Query maximum threads per block for a specific device ordinal.
 pub fn max_threads_per_block(device_ordinal: usize) -> u32 {
