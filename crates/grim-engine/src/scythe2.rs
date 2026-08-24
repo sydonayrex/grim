@@ -1076,6 +1076,21 @@ impl ScytheRing {
         self.len() >= self.capacity
     }
 
+    /// WI-SB6: device-resident slot array backing this ring (when constructed
+    /// with [`ScytheRing::with_device`]). The persistent-dispatch launcher
+    /// consumes this pointer.
+    pub fn slots_storage(&self) -> Option<&RocmStorage> {
+        self._device_storage.as_ref()
+    }
+
+    /// Advance the host tail by `n` consumed tasks (mirrors device progress
+    /// after a bounded persistent wave drains its batch).
+    pub fn advance_tail(&self, n: u32) {
+        for _ in 0..n {
+            let _ = self.dequeue();
+        }
+    }
+
     /// Enqueue a task descriptor and, for a device-backed ring, upload its
     /// complete 64-byte payload with one pinned async H2D copy. Because status
     /// is in that same payload, descriptor fields and status become visible as
@@ -1209,6 +1224,144 @@ impl ScytheRing {
             status: 0,
         };
         self.enqueue(desc)
+    }
+}
+
+// ── WI-SB6: engine-loop execution seam ────────────────────────────────────────
+//
+// Batches of descriptors flow host→ring→persistent-wave→complete without any
+// per-op host launch. Slice-1 semantics are batch-synchronous: `run_batch`
+// launches one bounded worker for the submitted task count and synchronizes;
+// a resident wave that keeps polling across engine ticks (stop-flag driven)
+// is the follow-up once parity is proven.
+pub struct ScytheRingExec {
+    pub ring: ScytheRing,
+    device: std::sync::Arc<RocmDevice>,
+    tail: Box<dyn grim_tensor::BackendStorage>,
+    head: Box<dyn grim_tensor::BackendStorage>,
+    stop: Box<dyn grim_tensor::BackendStorage>,
+}
+
+impl ScytheRingExec {
+    /// Device-backed ring plus the three control scalars the persistent
+    /// kernel polls (tail / head / stop), all resident on `ordinal`.
+    pub fn new(capacity: u32, ordinal: usize) -> grim_backend_rocm::Result<Self> {
+        let device = std::sync::Arc::new(RocmDevice::try_new(ordinal)?);
+        let ring = ScytheRing::with_device(capacity, &device)?;
+        let u32_dtype = grim_tensor::dtype::DType {
+            arith: grim_tensor::ArithType::U32,
+            storage: grim_tensor::dtype::Storage::Native,
+        };
+        use grim_tensor::backend::BackendDevice;
+        let scalar = |v: u32| -> grim_backend_rocm::Result<Box<dyn grim_tensor::BackendStorage>> {
+            let bytes = v.to_ne_bytes().to_vec();
+            let st = device
+                .as_ref()
+                .from_cpu_bytes(&bytes, &grim_tensor::Shape::new(vec![1]), u32_dtype.clone())
+                .map_err(|e| {
+                    grim_backend_rocm::Error::Backend(format!("ring control alloc: {e}"))
+                })?;
+            Ok(st)
+        };
+        let tail = scalar(0)?;
+        let head = scalar(0)?;
+        let stop = scalar(0)?;
+        Ok(Self { ring, device, tail, head, stop })
+    }
+
+    fn write_head_device(&self, value: u32) -> grim_backend_rocm::Result<()> {
+        let ptr = self
+            .head
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .and_then(|rs| rs.device_ptr_u64())
+            .ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ring head storage has no device ptr".into())
+            })?
+            as *mut core::ffi::c_void;
+        let bytes = value.to_ne_bytes();
+        let rc = grim_backend_rocm::memcpy_with_xnack_fallback(
+            ptr,
+            bytes.as_ptr() as *const core::ffi::c_void,
+            bytes.len(),
+            grim_backend_rocm::HipMemcpyKind::HostToDevice,
+            self.device.ordinal(),
+        );
+        if rc != 0 {
+            return Err(grim_backend_rocm::Error::Backend(format!(
+                "ScytheRingExec: head publish failed with hip status {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Enqueue one column-GEMM (opcode 1). Pointers are device addresses on
+    /// the ring's ordinal (callers take them from `RocmStorage`).
+    pub fn submit_col_gemm(
+        &mut self,
+        m: u32,
+        n: u32,
+        k: u32,
+        input_ptr: u64,
+        weight_ptr: u64,
+        output_ptr: u64,
+    ) -> grim_backend_rocm::Result<()> {
+        if self.ring.is_full() {
+            return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
+        }
+        let peer = 0u64;
+        self.ring
+            .enqueue_gemm(1, m, n, k, input_ptr, weight_ptr, output_ptr, peer)
+            .map_err(|d| {
+                grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_gemm rejected descriptor".into())
+            })?;
+        Ok(())
+    }
+
+    /// Enqueue one RMSNorm (opcode 4).
+    pub fn submit_norm(
+        &mut self,
+        num_tokens: u32,
+        hidden_dim: u32,
+        input_ptr: u64,
+        weight_ptr: u64,
+        output_ptr: u64,
+    ) -> grim_backend_rocm::Result<()> {
+        if self.ring.is_full() {
+            return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
+        }
+        self.ring
+            .enqueue_norm(num_tokens, hidden_dim, input_ptr, weight_ptr, output_ptr)
+            .map_err(|_| {
+                grim_backend_rocm::Error::Backend(
+                    "ScytheRingExec: enqueue_norm rejected".into(),
+                )
+            })
+            .map(|_| ())
+    }
+
+    /// Publish the host head, launch one bounded persistent worker, wait for
+    /// it to drain the batch, and mirror device tail progress back.
+    pub fn run_batch(&mut self) -> grim_backend_rocm::Result<u32> {
+        let tasks = self.ring.len();
+        if tasks == 0 {
+            return Ok(0);
+        }
+        self.write_head_device(self.ring.head.load(Ordering::Acquire))?;
+        let handle = self.device.launch_scythe_persistent_dispatch(
+            self.ring.slots_storage().ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ScytheRingExec: ring has no device storage".into())
+            })?,
+            self.ring.capacity,
+            self.tail.as_ref(),
+            self.head.as_ref(),
+            self.stop.as_ref(),
+            tasks,
+        )?;
+        handle.synchronize()?;
+        self.ring.advance_tail(tasks);
+        Ok(tasks)
     }
 }
 
@@ -2403,7 +2556,7 @@ mod tests {
         // This is a stub for the device-gated implementation.
         // The actual implementation lives in RocmDevice::comm_fuse_reduce
         // and is tested there.
-        Err(grim_tensor::error::Error::Backend(
+        Err(grim_tensor::error::grim_backend_rocm::Error::Backend(
             "assemble_moe_combine_f32: device-gated, requires GPU".into(),
         ))
     }

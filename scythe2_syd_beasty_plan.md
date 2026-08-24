@@ -227,7 +227,8 @@ call is grounded.
 | SB4a layer pipeline | ☑ `decode_paged` boundary transfers + `segment_devices`; planner `absorb_short_runs`; parity gate (fp-tolerance cross-backend fake segments) + hop-bound gates | ☐ TTFT split-vs-unsplit both orders (blocked) | ☐ |
 | SB4b paged-per-segment | — | gated on SB4a numbers | ☐ |
 | SB5 real GEMM shards | ◑ begun — col/row-parallel shards execute as backend `matmul` on rank devices (host fan-in remains); tolerance parity tests green | rocBLAS-per-stream, ring descriptors carrying shard pointers, rocp-compute read-out still open | ☐ |
-| SB6 persistent ring | kernel further along than "filed": opcodes 1–6 persistent-dispatch launches pass device-gated tests on this box | engine-loop integration pending | ☐ |
+| SB6 persistent ring | kernel further along than "filed": opcodes 1–6 persistent-dispatch launches pass device-gated tests on this box; **WI-SB6 slice-1 landed** — ScytheRingExec orchestration (ring + control scalars + submit_norm/submit_col_gemm + run_batch drain) and gate `scythe_ring_loop`: norm→GEMM chain via descriptors matches host reference at 1.8e-7, ring consistent post-drain | resident-wave (stop-flag) mode + production layer routing behind benchmark gate still open | ◑ |
+| SB5 real GEMM shards | shard-residency cache (transposed operands pinned per rank device keyed layer/ordinal/slice; zero-copy activations) + split_counts() remainder fix; two-rank parity gate: col 4.9e-7 / row 3.6e-7 / cached-reuse 4.9e-7 (253976e) | per-rank rocBLAS handles bound per stream; CommFuse P2P fan-in carrying shard pointers (opcode 1/2) still open | ◑ |
 
 ### Validation log
 
