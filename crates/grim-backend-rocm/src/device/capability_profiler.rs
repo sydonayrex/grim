@@ -207,6 +207,11 @@ fn measure_capability(ordinal: usize) -> GpuCapability {
 /// Any HIP/rocBLAS error returns `None` so the caller falls back to the
 /// architecture row rather than trusting a partial measurement.
 fn calibrate_capability(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
+    // Kill switch for the root-cause hunt (2026-08-23e): does disabling the
+    // micro-benchmark change second-device GEMM behavior?
+    if std::env::var("GRIM_DISABLE_CALIBRATION").is_ok() {
+        return None;
+    }
     static CACHE: OnceLock<Mutex<HashMap<(String, u32), (f32, f32, f32)>>> = OnceLock::new();
     // Clock is bucketed to 500 MHz: DVFS jitters tens of MHz between calls,
     // and an exact-clock key would re-run the micro-benchmark on every
