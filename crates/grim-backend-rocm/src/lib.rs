@@ -79,7 +79,7 @@ pub use crate::device::handles::{
     HIP_MEM_ADVISE_UNSET_COARSE_GRAIN, HIP_MEM_ADVISE_UNSET_PREFERRED_LOCATION,
     HIP_MEM_ADVISE_UNSET_READ_MOSTLY, HipDim3, HipErrorT, HipGraphKernelNodeParams,
     HipGraphMemcpyNodeParams, HipMemcpyKind, HiprtcProgram, RocmDeviceProps, RocmHandle,
-    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipEventCreate, hipEventDestroy,
+    WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipEventCreate, hipEventDestroy, hipStreamCreateWithFlags,
     hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
     hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
     hipGraphExtendFromGlobalStream, hipGraphInstantiate, hipGraphLaunch, hipGraphUpload,
@@ -140,7 +140,8 @@ pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
 
 pub use crate::device::helpers::{
-    check_hip, jit_compile_hsaco, memcpy_with_xnack_fallback, upload_device_buffer,
+    check_hip, jit_compile_hsaco, memcpy_with_xnack_fallback, hip_stream_synchronize_after_copy,
+    hip_stream_synchronize, upload_device_buffer,
 };
 pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
 

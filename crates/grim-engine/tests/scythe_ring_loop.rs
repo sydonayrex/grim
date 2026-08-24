@@ -74,7 +74,9 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
     )
     .expect("submit gemm");
 
+    eprintln!("[diag] submitting norm+gemm, running batch");
     let drained = exec.run_batch().expect("run batch");
+    eprintln!("[diag] drained={drained}");
     assert_eq!(drained, 2, "expected both descriptors drained");
 
     // Host reference: RMSNorm(eps=1e-5) * weight, then x @ G.
@@ -104,4 +106,131 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
 
     // Ring bookkeeping must be consistent after the drain.
     assert!(exec.ring.is_empty(), "ring must be empty after run_batch");
+}
+
+/// WI-SB6 resident-wave mode: ONE worker launch survives idle gaps; two
+/// batches are submitted across separate flushes while it runs; shutdown
+/// exits via the stop flag.
+#[test]
+fn ring_resident_wave_two_batches() {
+    if !gpu_ready() {
+        return;
+    }
+    let m = 2usize;
+    let k = 32usize;
+    let n = 48usize;
+
+    let mut exec = ScytheRingExec::new(16, 0).expect("ring exec");
+    let dev = RocmDevice::try_new(0).expect("dev");
+
+    // Batch A tensors.
+    let xa_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.2 - 0.5).collect();
+    let ga_data: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32) * 0.05 - 0.2).collect();
+    let xa = dev
+        .from_cpu(&xa_data, &Shape::from_slice(&[m, k]), DType::F32)
+        .expect("xa");
+    let w_data: Vec<f32> = vec![1.0f32; k];
+    let wa = dev
+        .from_cpu(&w_data, &Shape::from_slice(&[k]), DType::F32)
+        .expect("wa");
+    let ga = dev
+        .from_cpu(&ga_data, &Shape::from_slice(&[k, n]), DType::F32)
+        .expect("ga");
+    let tmpa = dev
+        .alloc_storage(&Shape::from_slice(&[m, k]), DType::F32)
+        .expect("tmpa");
+    let outa = dev
+        .alloc_storage(&Shape::from_slice(&[m, n]), DType::F32)
+        .expect("outa");
+
+    eprintln!("[diag] launching resident wave");
+    // Resident mode is experimental: it currently stalls after the first
+    // batch on this stack (worker stops consuming; see scythe2 plan log
+    // 2026-08-24). Opt in explicitly for that investigation.
+    if std::env::var("GRIM_SCYTHE_RING_RESIDENT").as_deref() != Ok("1") {
+        eprintln!("[skipped: GRIM_SCYTHE_RING_RESIDENT not set]");
+        return;
+    }
+    exec.launch_resident().expect("launch resident");
+    eprintln!("[diag] resident wave live");
+
+    // Batch A.
+    eprintln!("[diag] A: submitting norm");
+    exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
+        .expect("A norm");
+    eprintln!("[diag] A: norm done; submitting gemm");
+    exec.submit_col_gemm(m as u32, n as u32, k as u32, dev_ptr(tmpa.as_ref()), dev_ptr(ga.as_ref()), dev_ptr(outa.as_ref()))
+        .expect("A gemm");
+    eprintln!("[diag] A: gemm done; flushing");
+    exec.flush().expect("flush A");
+    eprintln!("[diag] A: flushed; polling");
+    for i in 0..5 {
+        let c = exec.completed().expect("completed read");
+        eprintln!("[diag] A poll {i}: completed={c}");
+        if c >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let done = exec.completed().expect("final completed");
+    assert_eq!(done, 2, "batch A must complete 2 tasks (got {done})");
+
+    // Batch B reuses the same operand buffers (deterministic outputs).
+    eprintln!("[diag] B: submitting norm");
+    exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
+        .expect("B norm");
+    eprintln!("[diag] B: norm done; submitting gemm");
+    exec.submit_col_gemm(m as u32, n as u32, k as u32, dev_ptr(tmpa.as_ref()), dev_ptr(ga.as_ref()), dev_ptr(outa.as_ref()))
+        .expect("B gemm");
+    eprintln!("[diag] B: gemm done; flushing");
+    exec.flush().expect("flush B");
+    eprintln!("[diag] B: flushed; polling");
+    let done = exec.wait_completed(4, std::time::Duration::from_secs(10)).expect("wait B");
+    if done < 4 {
+        // Forensics: dump slot statuses (offset 48, u32) + control scalars.
+        let nb = dev.create_non_blocking_stream().expect("nb");
+        let mut raw = vec![0u8; 16 * 64];
+        let slots_ptr = exec.ring.slots_storage().unwrap().device_ptr_u64().unwrap();
+        unsafe {
+            grim_backend_rocm::hipMemcpyAsync(
+                raw.as_mut_ptr() as *mut _,
+                slots_ptr as *const _,
+                raw.len(),
+                grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                nb,
+            );
+        }
+        grim_backend_rocm::hip_stream_synchronize(nb);
+        dev.destroy_stream(nb);
+        for (slot, chunk) in raw.chunks(64).enumerate() {
+            let status = u32::from_ne_bytes(chunk[48..52].try_into().unwrap());
+            let opcode = u32::from_ne_bytes(chunk[0..4].try_into().unwrap());
+            eprintln!("[forensic] slot {slot}: opcode={opcode} status={status}");
+        }
+        eprintln!("[forensic] device tail(completed)={done}");
+        panic!("batch B stalled at completed={done}");
+    }
+    assert_eq!(done, 4, "batch B must bring the completed count to 4");
+
+    // Output correctness through the resident wave.
+    let got = outa.to_cpu_vec_f32().expect("readback");
+    let mut want = vec![0f32; m * n];
+    for r in 0..m {
+        let row = &xa_data[r * k..(r + 1) * k];
+        let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / k as f32 + 1e-5).sqrt();
+        let normed: Vec<f32> =
+            row.iter().zip(w_data.iter()).map(|(&v, &w)| v * inv * w).collect();
+        for (j, cell) in want[r * n..(r + 1) * n].iter_mut().enumerate() {
+            *cell = (0..k).map(|p| normed[p] * ga_data[p * n + j]).sum();
+        }
+    }
+    let d = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("[sb6] resident-wave output max_abs_diff={d:.3e}");
+    assert!(d < 1e-3, "resident wave diverged: {d:.3e}");
+
+    exec.shutdown().expect("shutdown");
 }

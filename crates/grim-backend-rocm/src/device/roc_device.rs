@@ -238,13 +238,34 @@ unsafe impl Sync for RocmDevice {}
 impl RocmDevice {
     /// Allocate raw device bytes for an engine-owned persistent dispatch ring.
     pub fn alloc_scythe_ring_bytes(&self, bytes: usize) -> Result<RocmStorage> {
-        RocmStorage::alloc_gpu_with_bytes(
+        let storage = RocmStorage::alloc_gpu_with_bytes(
             &Shape::from_slice(&[bytes]),
             dtype_f32(),
             bytes,
             &self.allocator,
             self.ordinal,
-        )
+        )?;
+        // WI-SB6: ring slots MUST start zeroed — `status` byte-layout begins
+        // with PENDING(0). Uninitialized VRAM let a resident worker claim
+        // phantom descriptors with garbage opcodes and wedge the device
+        // before the host's first descriptor upload landed.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        if let Some(ptr) = storage.device_ptr_u64() {
+            let rc = unsafe {
+                crate::device::handles::hipMemset(
+                    ptr as *mut c_void,
+                    0,
+                    bytes,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Backend(format!(
+                    "alloc_scythe_ring_bytes: zeroing failed with hip status {rc}"
+                )));
+            }
+            let _ = unsafe { crate::device::handles::hipDeviceSynchronize() };
+        }
+        Ok(storage)
     }
 
     /// Enqueue one descriptor upload on the device's active stream.
@@ -264,6 +285,59 @@ impl RocmDevice {
                 bytes,
                 HipMemcpyKind::HostToDevice,
                 self.active_stream(),
+            )
+        })
+    }
+
+    /// WI-SB6: create a NON-BLOCKING stream. Unlike pool streams (created
+    /// blocking-with-legacy), a non-blocking stream never serializes with
+    /// other streams — required for the resident persistent wave so host
+    /// control traffic (head publishes, tail polls, stop) is never queued
+    /// behind an eternally-running kernel.
+    pub fn create_non_blocking_stream(&self) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut stream: *mut c_void = std::ptr::null_mut();
+        const HIP_STREAM_NON_BLOCKING: u32 = 0x1;
+        check_hip(
+            "hipStreamCreateWithFlags(NonBlocking)",
+            unsafe {
+                crate::device::handles::hipStreamCreateWithFlags(
+                    &mut stream,
+                    HIP_STREAM_NON_BLOCKING,
+                    0,
+                )
+            },
+        )?;
+        Ok(stream)
+    }
+
+    /// Destroy a stream previously returned by [`Self::create_non_blocking_stream`].
+    pub fn destroy_stream(&self, stream: *mut c_void) {
+        if !stream.is_null() {
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+            unsafe {
+                let _ = crate::device::handles::hipStreamDestroy(stream);
+            }
+        }
+    }
+
+    /// [`Self::copy_scythe_descriptor_async`] on an explicit stream — the
+    /// resident-wave control path must never enqueue behind the worker.
+    pub fn copy_scythe_descriptor_async_on(
+        &self,
+        dst: u64,
+        src: *const std::ffi::c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        check_hip("hipMemcpyAsync(ScytheRing H2D, ctrl)", unsafe {
+            hipMemcpyAsync(
+                dst as *mut std::ffi::c_void,
+                src,
+                bytes,
+                HipMemcpyKind::HostToDevice,
+                stream,
             )
         })
     }
@@ -12532,6 +12606,7 @@ impl RocmDevice {
         head: &dyn BackendStorage,
         stop: &dyn BackendStorage,
         max_tasks: u32,
+        resident: u32,
     ) -> Result<Box<dyn ComputeHandle>> {
         let mut slots_ptr = dev_ptr(as_rocm(slots)?)?;
         let mut tail_ptr = dev_ptr(as_rocm(tail)?)?;
@@ -12539,6 +12614,7 @@ impl RocmDevice {
         let mut stop_ptr = dev_ptr(as_rocm(stop)?)?;
         let mut cap = capacity;
         let mut limit = max_tasks;
+        let mut res = resident;
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",
             crate::HipDim3::new(1, 1, 1),
@@ -12550,9 +12626,50 @@ impl RocmDevice {
                 arg(&mut head_ptr),
                 arg(&mut stop_ptr),
                 arg(&mut limit),
+                arg(&mut res),
             ],
         )?;
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    /// WI-SB6: launch the persistent worker on an EXPLICIT non-blocking
+    /// stream. The batch-mode wrapper above uses the device active stream;
+    /// resident mode must own its stream so control traffic on other streams
+    /// is never ordered behind this eternally-polling kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_scythe_persistent_dispatch_on(
+        &self,
+        slots: &dyn BackendStorage,
+        capacity: u32,
+        tail: &dyn BackendStorage,
+        head: &dyn BackendStorage,
+        stop: &dyn BackendStorage,
+        max_tasks: u32,
+        resident: u32,
+        stream: *mut c_void,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut slots_ptr = dev_ptr(as_rocm(slots)?)?;
+        let mut tail_ptr = dev_ptr(as_rocm(tail)?)?;
+        let mut head_ptr = dev_ptr(as_rocm(head)?)?;
+        let mut stop_ptr = dev_ptr(as_rocm(stop)?)?;
+        let mut cap = capacity;
+        let mut limit = max_tasks;
+        let mut res = resident;
+        self.launch_compute_kernel(
+            "grim_scythe_persistent_dispatch",
+            crate::HipDim3::new(1, 1, 1),
+            crate::HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut slots_ptr),
+                arg(&mut cap),
+                arg(&mut tail_ptr),
+                arg(&mut head_ptr),
+                arg(&mut stop_ptr),
+                arg(&mut limit),
+                arg(&mut res),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(stream))))
     }
 
     /// Launch standalone Q8_0 quantization HIP kernel.

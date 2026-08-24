@@ -31,6 +31,7 @@
 //! - `rust-ffi-grim` §3 — `cargo check` gate after each WI.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -1007,6 +1008,9 @@ pub struct ScytheRing {
     _device_storage: Option<RocmStorage>,
     device: Option<*const RocmDevice>,
     staging: Vec<Mutex<RocmPinnedBuffer<u8>>>,
+    /// Explicit upload stream for resident-mode control traffic (0 = use the
+    /// device's active stream).
+    upload_stream: AtomicU64,
 }
 
 impl ScytheRing {
@@ -1024,6 +1028,7 @@ impl ScytheRing {
             _device_storage: None,
             device: None,
             staging: Vec::new(),
+            upload_stream: AtomicU64::new(0),
         }
     }
 
@@ -1056,6 +1061,7 @@ impl ScytheRing {
             // The caller must keep `device` alive for the ring's lifetime.
             device: Some(device as *const RocmDevice),
             staging,
+            upload_stream: AtomicU64::new(0),
         })
     }
 
@@ -1081,6 +1087,13 @@ impl ScytheRing {
     /// consumes this pointer.
     pub fn slots_storage(&self) -> Option<&RocmStorage> {
         self._device_storage.as_ref()
+    }
+
+    /// WI-SB6 resident mode: route descriptor uploads through an explicit
+    /// (non-blocking control) stream so they never queue behind the eternal
+    /// worker on the pool stream. `0` = default active-stream behavior.
+    pub fn set_upload_stream(&self, stream: u64) {
+        self.upload_stream.store(stream, Ordering::Release);
     }
 
     /// Advance the host tail by `n` consumed tasks (mirrors device progress
@@ -1124,12 +1137,22 @@ impl ScytheRing {
             }
             let dst = self.slots_device_ptr.load(Ordering::Acquire)
                 + slot as u64 * std::mem::size_of::<ScytheTaskDescriptor>() as u64;
+            let up_stream = self.upload_stream.load(Ordering::Acquire);
             let copy_result = unsafe {
-                (&*device).copy_scythe_descriptor_async(
-                    dst,
-                    staging.as_ptr() as *const _,
-                    std::mem::size_of::<ScytheTaskDescriptor>(),
-                )
+                if up_stream != 0 {
+                    (&*device).copy_scythe_descriptor_async_on(
+                        dst,
+                        staging.as_ptr() as *const _,
+                        std::mem::size_of::<ScytheTaskDescriptor>(),
+                        up_stream as *mut core::ffi::c_void,
+                    )
+                } else {
+                    (&*device).copy_scythe_descriptor_async(
+                        dst,
+                        staging.as_ptr() as *const _,
+                        std::mem::size_of::<ScytheTaskDescriptor>(),
+                    )
+                }
             };
             if copy_result.is_err() {
                 // Copy failed — roll back the CAS increment so the consumer
@@ -1240,6 +1263,18 @@ pub struct ScytheRingExec {
     tail: Box<dyn grim_tensor::BackendStorage>,
     head: Box<dyn grim_tensor::BackendStorage>,
     stop: Box<dyn grim_tensor::BackendStorage>,
+    /// Live persistent worker (resident mode). Batch-synchronous mode leaves
+    /// this empty.
+    worker: Option<Box<dyn grim_tensor::backend::ComputeHandle>>,
+    /// Non-blocking stream the worker runs on.
+    worker_stream: std::sync::atomic::AtomicPtr<c_void>,
+    /// Non-blocking stream for head/stop/tail control traffic.
+    control_stream: std::sync::atomic::AtomicPtr<c_void>,
+    /// Pinned 4-byte staging cell for control-plane values. Async copies
+    /// from/to PAGEABLE memory degrade to device-synchronizing transfers and
+    /// deadlock behind a resident wave — this pinned cell keeps them truly
+    /// asynchronous.
+    control_cell: Mutex<RocmPinnedBuffer<u8>>,
 }
 
 impl ScytheRingExec {
@@ -1266,10 +1301,94 @@ impl ScytheRingExec {
         let tail = scalar(0)?;
         let head = scalar(0)?;
         let stop = scalar(0)?;
-        Ok(Self { ring, device, tail, head, stop })
+        let worker_stream = std::sync::atomic::AtomicPtr::new(
+            device.create_non_blocking_stream().map_err(|e| {
+                grim_backend_rocm::Error::Backend(format!("worker stream: {e}"))
+            })?,
+        );
+        let control_stream = std::sync::atomic::AtomicPtr::new(
+            device.create_non_blocking_stream().map_err(|e| {
+                grim_backend_rocm::Error::Backend(format!("control stream: {e}"))
+            })?,
+        );
+        ring.set_upload_stream(control_stream.load(Ordering::Acquire) as u64);
+        let control_cell = Mutex::new(RocmPinnedBuffer::alloc(4)?);
+        Ok(Self {
+            ring,
+            device,
+            tail,
+            head,
+            stop,
+            worker: None,
+            worker_stream,
+            control_stream,
+            control_cell,
+        })
+    }
+
+    fn control_stream_ptr(&self) -> *mut c_void {
+        self.control_stream.load(Ordering::Acquire)
+    }
+
+    fn worker_stream_ptr(&self) -> *mut c_void {
+        self.worker_stream.load(Ordering::Acquire)
+    }
+
+    /// Async copy of one u32 between host buffer and device control scalar on
+    /// the CONTROL stream, followed by a control-stream sync. Never ordered
+    /// behind the resident worker.
+    fn control_copy_u32(&self, dev_ptr: *mut c_void, value: &mut [u8; 4], to_device: bool) {
+        use grim_backend_rocm::HipMemcpyKind;
+        let diag = std::env::var_os("GRIM_RING_DIAG").is_some();
+        let mut cell = self.control_cell.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), cell.as_mut_ptr(), 4);
+        }
+        let kind = if to_device {
+            HipMemcpyKind::HostToDevice
+        } else {
+            HipMemcpyKind::DeviceToHost
+        };
+        // Pinned-to-pinned async copy on the non-blocking control stream,
+        // fenced by a CONTROL-STREAM-ONLY sync. A pageable host buffer here
+        // degrades the async copy to a staged transfer that synchronizes
+        // against outstanding device work — i.e., it deadlocks behind the
+        // resident wave (the exact hang observed 2026-08-24).
+        let t0 = std::time::Instant::now();
+        if diag { eprintln!("[cc-diag] enter to_dev={to_device}"); }
+        // Direction matters: to_device writes dev<-cell; from_device reads
+        // dev->cell (the pinned cell is a legal D2H destination).
+        let (dst, src) = if to_device {
+            (dev_ptr, cell.as_ptr() as *const c_void)
+        } else {
+            (cell.as_mut_ptr() as *mut c_void, dev_ptr as *const c_void)
+        };
+        let rc = unsafe {
+            grim_backend_rocm::hipMemcpyAsync(dst, src, 4, kind, self.control_stream_ptr())
+        };
+        if diag { eprintln!("[cc-diag] async rc={rc} t={}us", t0.elapsed().as_micros()); }
+        if rc == 0 {
+            let rs = grim_backend_rocm::hip_stream_synchronize(self.control_stream_ptr());
+            if diag {
+                match rs {
+                    Ok(()) => eprintln!("[cc-diag] synced t={}ms", t0.elapsed().as_millis()),
+                    Err(e) => eprintln!("[cc-diag] sync ERR {e}"),
+                }
+            }
+        }
+        if !to_device {
+            unsafe {
+                std::ptr::copy_nonoverlapping(cell.as_ptr(), value.as_mut_ptr(), 4);
+            }
+        }
     }
 
     fn write_head_device(&self, value: u32) -> grim_backend_rocm::Result<()> {
+        // WI-SB6: MUST go through the pinned-cell control path. The previous
+        // implementation used memcpy_with_xnack_fallback, whose fresh-stream
+        // hipStreamSynchronize drains ALL outstanding device work — with a
+        // resident wave polling forever, that sync never returns (the
+        // 2026-08-24 flush hang).
         let ptr = self
             .head
             .as_ref()
@@ -1279,20 +1398,9 @@ impl ScytheRingExec {
             .ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ring head storage has no device ptr".into())
             })?
-            as *mut core::ffi::c_void;
-        let bytes = value.to_ne_bytes();
-        let rc = grim_backend_rocm::memcpy_with_xnack_fallback(
-            ptr,
-            bytes.as_ptr() as *const core::ffi::c_void,
-            bytes.len(),
-            grim_backend_rocm::HipMemcpyKind::HostToDevice,
-            self.device.ordinal(),
-        );
-        if rc != 0 {
-            return Err(grim_backend_rocm::Error::Backend(format!(
-                "ScytheRingExec: head publish failed with hip status {rc}"
-            )));
-        }
+            as *mut c_void;
+        let mut bytes = value.to_ne_bytes();
+        self.control_copy_u32(ptr, &mut bytes, true);
         Ok(())
     }
 
@@ -1328,6 +1436,7 @@ impl ScytheRingExec {
         weight_ptr: u64,
         output_ptr: u64,
     ) -> grim_backend_rocm::Result<()> {
+        eprintln!("[diag] submit_norm enter");
         if self.ring.is_full() {
             return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
         }
@@ -1358,10 +1467,102 @@ impl ScytheRingExec {
             self.head.as_ref(),
             self.stop.as_ref(),
             tasks,
+            0,
         )?;
-        handle.synchronize()?;
+        drop(handle);
         self.ring.advance_tail(tasks);
         Ok(tasks)
+    }
+
+    // ── WI-SB6 resident-wave mode ──────────────────────────────────────────
+
+    /// Launch ONE persistent worker that survives idle gaps: submit via
+    /// [`Self::submit_*`] + [`Self::flush`], poll [`Self::completed`], and
+    /// terminate with [`Self::shutdown`]. The wave exits only through the
+    /// stop flag.
+    pub fn launch_resident(&mut self) -> grim_backend_rocm::Result<()> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        self.flush()?;
+        let handle = self.device.launch_scythe_persistent_dispatch(
+            self.ring.slots_storage().ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ring has no device storage".into())
+            })?,
+            self.ring.capacity,
+            self.tail.as_ref(),
+            self.head.as_ref(),
+            self.stop.as_ref(),
+            u32::MAX,
+            1,
+        )?;
+        self.worker = Some(handle);
+        Ok(())
+    }
+
+    /// Publish pending submissions to the resident wave (device head update).
+    pub fn flush(&self) -> grim_backend_rocm::Result<()> {
+        self.write_head_device(self.ring.head.load(Ordering::Acquire))
+    }
+
+    /// Completed-task count as reported by the DEVICE tail (monotonic).
+    pub fn completed(&self) -> grim_backend_rocm::Result<u32> {
+        let ptr = self
+            .tail
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .and_then(|rs| rs.device_ptr_u64())
+            .ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ring tail has no device ptr".into())
+            })?
+            as *mut c_void;
+        let mut buf = 0u32.to_ne_bytes();
+        self.control_copy_u32(ptr, &mut buf, false);
+        Ok(u32::from_ne_bytes(buf))
+    }
+
+    /// Poll until the device reports `target` completed tasks or `timeout`
+    /// elapses. Returns the final completed count.
+    pub fn wait_completed(
+        &self,
+        target: u32,
+        timeout: std::time::Duration,
+    ) -> grim_backend_rocm::Result<u32> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let done = self.completed()?;
+            if done >= target {
+                return Ok(done);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(done);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Raise the stop flag and join the resident worker. The exec is single-
+    /// lifetime in resident mode (device counters are monotonic).
+    pub fn shutdown(&mut self) -> grim_backend_rocm::Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        let ptr = self
+            .stop
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .and_then(|rs| rs.device_ptr_u64())
+            .ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ring stop has no device ptr".into())
+            })?
+            as *mut c_void;
+        let mut flag = 1u32.to_ne_bytes();
+        self.control_copy_u32(ptr, &mut flag, true);
+        // Join the worker on its OWN non-blocking stream: the wave exits at
+        // the next stop check and the stream sync returns once it does.
+        grim_backend_rocm::hip_stream_synchronize(self.worker_stream_ptr())
     }
 }
 

@@ -143,7 +143,9 @@ extern "C" __device__ void grim_moe_fused_grouped_device(
 //
 // `slots` is the device-resident ring buffer (ScytheRing::slots_device_ptr).
 // `capacity` is the ring capacity (power of 2). `tail_ptr` is the device-side
-// tail counter (mirrored from the host's atomic).
+// tail counter (mirrored from the host's atomic). With `resident != 0` the
+// wave survives empty-queue gaps and exits only via `stop_ptr`/max_tasks —
+// the WI-SB6 resident-wave mode.
 // ────────────────────────────────────────────────────────────────────────
 extern "C" __global__ void grim_scythe_persistent_dispatch(
     scythe_task_descriptor_t* slots,
@@ -151,7 +153,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     unsigned int* tail_ptr,
     const unsigned int* head_ptr,
     const unsigned int* stop_ptr,
-    unsigned int max_tasks)
+    unsigned int max_tasks,
+    unsigned int resident)
 {
     // Lane zero owns queue control; the whole block cooperates on the claimed
     // descriptor so Charon receives the launch width it expects. Shared state
@@ -179,7 +182,10 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (threadIdx.x == 0)
                 terminate = atomicAdd((unsigned int*)head_ptr, 0) == atomicAdd(tail_ptr, 0);
             __syncthreads();
-            if (terminate) break;
+            // WI-SB6 resident wave: an empty queue is not a stop condition —
+            // the worker parks here until the host publishes new work via
+            // head, and exits only through stop_ptr (or max_tasks).
+            if (terminate && !resident) break;
             continue;
         }
         scythe_task_descriptor_t* desc = &slots[claimed_slot];
@@ -580,6 +586,7 @@ mod tests {
                 head.as_ref(),
                 stop.as_ref(),
                 2,
+                0,
             )
             .unwrap();
         handle.synchronize().unwrap();
@@ -682,6 +689,7 @@ mod tests {
                 head.as_ref(),
                 stop.as_ref(),
                 2,
+                0,
             )
             .unwrap();
         handle.synchronize().unwrap();
