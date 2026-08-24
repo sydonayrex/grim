@@ -154,6 +154,20 @@ fn ring_resident_wave_two_batches() {
     exec.launch_resident().expect("launch resident");
     eprintln!("[diag] resident wave live");
 
+    // Phase 0 — no idle gap: all four descriptors submitted before any
+    // polling. If THIS stalls, the ring/kernel drops work under backlog;
+    // if it passes, the defect is specific to idle-then-resume.
+    eprintln!("[diag] phase0: submitting norm");
+    exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
+        .expect("A norm");
+    eprintln!("[diag] phase0: submitting gemm");
+    exec.submit_col_gemm(m as u32, n as u32, k as u32, dev_ptr(tmpa.as_ref()), dev_ptr(ga.as_ref()), dev_ptr(outa.as_ref()))
+        .expect("A gemm");
+    exec.flush().expect("phase0 flush");
+    let done = exec.wait_completed(2, std::time::Duration::from_secs(8)).expect("wait p0");
+    println!("[sb6] phase0 completed={done}");
+    assert_eq!(done, 2, "phase0 (no-idle backlog) stalled at {done}");
+
     // Batch A.
     eprintln!("[diag] A: submitting norm");
     exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
@@ -185,8 +199,8 @@ fn ring_resident_wave_two_batches() {
     eprintln!("[diag] B: gemm done; flushing");
     exec.flush().expect("flush B");
     eprintln!("[diag] B: flushed; polling");
-    let done = exec.wait_completed(4, std::time::Duration::from_secs(10)).expect("wait B");
-    if done < 4 {
+    let done = exec.wait_completed(6, std::time::Duration::from_secs(8)).expect("wait B");
+    if done < 6 {
         // Forensics: dump slot statuses (offset 48, u32) + control scalars.
         let nb = dev.create_non_blocking_stream().expect("nb");
         let mut raw = vec![0u8; 16 * 64];
@@ -210,7 +224,7 @@ fn ring_resident_wave_two_batches() {
         eprintln!("[forensic] device tail(completed)={done}");
         panic!("batch B stalled at completed={done}");
     }
-    assert_eq!(done, 4, "batch B must bring the completed count to 4");
+    assert_eq!(done, 6, "batch B must bring the completed count to 6");
 
     // Output correctness through the resident wave.
     let got = outa.to_cpu_vec_f32().expect("readback");
