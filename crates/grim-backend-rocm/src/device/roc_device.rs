@@ -254,6 +254,9 @@ impl RocmDevice {
         src: *const std::ffi::c_void,
         bytes: usize,
     ) -> Result<()> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         check_hip("hipMemcpyAsync(ScytheRing H2D)", unsafe {
             hipMemcpyAsync(
                 dst as *mut std::ffi::c_void,
@@ -906,6 +909,9 @@ impl RocmDevice {
 
     /// Begin a generic graph-capture session keyed by `key`. Until `end_graph_capture` [see: `key`, `GRIM_CAPTURE_GRAPH`]
     pub fn begin_graph_capture(&self, _key: &str) -> Result<()> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if !self.capture_enabled {
             return Ok(());
         }
@@ -1023,6 +1029,9 @@ impl RocmDevice {
 
     /// Replay the graph previously captured under `key`. Returns `Ok(false)` when no [see: `key`, `Ok(true)`]
     pub fn replay_graph(&self, key: &str) -> Result<bool> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if !self.capture_enabled {
             return Ok(false);
         }
@@ -1102,6 +1111,9 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<bool> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         self.ensure_graph_capture_mgr();
         let mgr = self
             .graph_capture_mgr
@@ -1141,6 +1153,11 @@ impl RocmDevice {
         if batch == 0 {
             return Ok(Vec::new());
         }
+
+        // P1-3: rocBLAS batched GEMM runs on the calling thread's current
+        // device — pin to the owning ordinal or a drifted thread launches
+        // against foreign pointers (same class as the matmul_op fix).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // One-time warm-up of the rocBLAS `gemm_strided_batched_ex` kernel.
         if !self.batched_gemm_warmed.swap(true, Ordering::SeqCst) {
@@ -1490,6 +1507,9 @@ impl RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
@@ -1573,6 +1593,9 @@ impl RocmDevice {
 
     /// Pinned-memory + async device→host download for the per-token decode hot path. [see: `hipMemcpy`, `Vec<f32>`]
     pub fn read_to_host_async(&self, storage: &dyn BackendStorage) -> Result<Vec<f32>> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let elem_count = storage.shape().elem_count();
         let mut pinned = RocmPinnedBuffer::<f32>::alloc(elem_count)?;
         let dev_ptr_void = match storage.as_any().downcast_ref::<RocmStorage>() {
@@ -1615,6 +1638,9 @@ impl RocmDevice {
         storage: &dyn BackendStorage,
         dst: &mut RocmPinnedBuffer<f32>,
     ) -> Result<()> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let elem_count = storage.shape().elem_count();
         if dst.len() != elem_count {
             *dst = RocmPinnedBuffer::<f32>::alloc(elem_count)?;
@@ -1898,6 +1924,9 @@ impl RocmDevice {
 
 impl BackendDevice for RocmDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: zeros");
 
@@ -1973,12 +2002,28 @@ impl BackendDevice for RocmDevice {
         dst_elem_offset: usize,
         count: usize,
     ) -> Result<()> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let dst_s = as_rocm(dst)?;
         let src_s = as_rocm(src)?;
         if !dst_s.device_ptr_is_valid() || !src_s.device_ptr_is_valid() {
             return Err(Error::Backend(
                 "copy_slice_into: inputs lack a valid device pointer".into(),
             ));
+        }
+        // Fail loud on cross-device D2D: this plain `hipMemcpyAsync` is only
+        // valid when both storages share an ordinal (peer access is not
+        // established here — use `copy_via_route` for routed cross-device
+        // transfers). Silently proceeding was a correctness hazard beyond
+        // the context pin (2026-08-23e audit).
+        if dst_s.device_ordinal() != src_s.device_ordinal() {
+            return Err(Error::Backend(format!(
+                "copy_slice_into: cross-device D2D (dst ordinal {}, src ordinal {}) — \
+                 use copy_via_route for routed transfers",
+                dst_s.device_ordinal(),
+                src_s.device_ordinal()
+            )));
         }
         if dst_elem_offset + count > dst_s.shape().elem_count() {
             return Err(Error::Shape(format!(
@@ -2022,6 +2067,14 @@ impl BackendDevice for RocmDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: matmul_with_solution");
+
+        // P1-3: this is the plain `matmul` dispatch path — rocBLAS executes
+        // on the calling thread's current device, which after the
+        // context-neutral `try_new` is typically ordinal 0 on multi-GPU
+        // boxes. Pin before any alloc or rocBLAS call or the GEMM launches
+        // cross-device and silently writes zeros (rank-1 LM-head zeroing,
+        // 2026-08-23e — reproduced by examples/f32_matmul_probe).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // For matmul on GPU, both inputs must be RocmStorage (or we need to copy them to the device first)
         let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
@@ -2974,6 +3027,9 @@ impl BackendDevice for RocmDevice {
         indices: &[u32],
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let w_s = match as_rocm(weight) {
             Ok(s) => s,
             Err(_) => {
@@ -4575,6 +4631,9 @@ impl BackendDevice for RocmDevice {
         cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let dim = cfg.dim;
         let base = cfg.base;
         let x_s = as_rocm(x)?;
@@ -4954,6 +5013,9 @@ impl BackendDevice for RocmDevice {
         Box<dyn grim_tensor::BackendStorage>,
         Box<dyn grim_tensor::backend::ComputeHandle>,
     )> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if inputs.is_empty() {
             return Err(Error::Backend("all_reduce: no inputs".into()));
         }
@@ -5455,6 +5517,9 @@ impl RocmDevice {
         cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let dims = out_shape.dims();
         if dims.len() != 3 || dims[2] != cfg.dim {
             return Err(Error::Shape(format!(
@@ -5875,6 +5940,9 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_fused_dispatch: activations has no device ptr".into())
         })?;
@@ -6119,6 +6187,9 @@ impl RocmDevice {
         num_experts: usize,
         entry: &str,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_dispatch: activations has no device ptr".into())
         })?;
@@ -6232,6 +6303,9 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_fp8: activations has no device ptr".into())
         })?;
@@ -6344,6 +6418,9 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_mxfp4: activations has no device ptr".into())
         })?;
@@ -6456,6 +6533,9 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_mxfp8: activations has no device ptr".into())
         })?;
@@ -6565,6 +6645,9 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_q80: activations has no device ptr".into())
         })?;
@@ -6675,6 +6758,9 @@ impl RocmDevice {
         format_id: usize,
         routed_scaling_factor: f32,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use crate::kernels::charon::plan_grouped_dispatch;
         let _ = num_experts; // validated by caller; kernel reads per-expert super-blocks
 
@@ -6989,6 +7075,9 @@ impl RocmDevice {
         routed_scaling_factor: f32,
         _num_experts: usize,
     ) -> Result<*mut c_void> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_backward: activations has no device ptr".into())
         })?;
@@ -10997,6 +11086,10 @@ impl RocmDevice {
             hipEventSynchronize, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
             hipModuleUnload,
         };
+        // P1-3: module load, events and the launch all bind to the calling
+        // thread's current device — pin to the owning ordinal so autotune
+        // timing runs on the device it is tuning for.
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut start_event: *mut c_void = std::ptr::null_mut();
         let mut stop_event: *mut c_void = std::ptr::null_mut();
 
@@ -11246,6 +11339,17 @@ impl RocmDevice {
                 out_shape.dims()
             )));
         }
+
+        // P1-3 context discipline: rocBLAS executes against the CALLING
+        // THREAD's current HIP device, not the handle's construction device.
+        // `try_new` is context-neutral (restores the caller's device on
+        // return), so on a multi-GPU box the thread typically sits on
+        // ordinal 0 here while every pointer below belongs to `self.ordinal`
+        // — a cross-device GEMM that silently writes zeros or page-faults
+        // (the rank-1 LM-head zeroing, 2026-08-23e). Pin the whole dispatch:
+        // output alloc, split-K partials + reduction, rocBLAS sgemm/gemm_ex,
+        // and the WMMA fallback all share this guard's scope.
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // Allocate output GPU storage with the actual input precision
         let dtype_out = DType {
@@ -11559,6 +11663,9 @@ impl RocmDevice {
         cache_offset: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let q_dims = q.shape().dims();
         let o_dims = out_shape.dims();
         if q_dims.len() != 3 || o_dims.len() != 2 {
