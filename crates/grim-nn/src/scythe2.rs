@@ -496,13 +496,14 @@ impl Scythe2Linear {
                     let src_row = src_base + (r * n) as u64 * 4;
                     let dst_row =
                         out_dev_ptr + ((r * shard_out_dim + col_offset) as u64) * 4;
-                    grim_backend_rocm::RocmDevice::shared(src_ord).copy_via_route(
-                        src_ord as i32,
-                        lead_ord as i32,
-                        src_row as *const std::ffi::c_void,
-                        dst_row as *mut std::ffi::c_void,
-                        n * 4,
-                    )?;
+                    grim_backend_rocm::RocmDevice::shared(src_ord)
+                        .copy_cross_device_bounce(
+                            lead_ord,
+                            dst_row as *mut std::ffi::c_void,
+                            src_ord,
+                            src_row as *const std::ffi::c_void,
+                            n * 4,
+                        )?;
                 }
                 col_offset += n;
             }
@@ -666,13 +667,14 @@ impl Scythe2Linear {
                             .ok_or_else(|| {
                                 Error::Backend("scratch has no device ptr".into())
                             })?;
-                        grim_backend_rocm::RocmDevice::shared(src_ord).copy_via_route(
-                            src_ord as i32,
-                            acc_ord as i32,
-                            src_ptr as *const std::ffi::c_void,
-                            scratch_ptr as *mut std::ffi::c_void,
-                            (m * out_features) * 4,
-                        )?;
+                        grim_backend_rocm::RocmDevice::shared(src_ord)
+                            .copy_cross_device_bounce(
+                                acc_ord,
+                                scratch_ptr as *mut std::ffi::c_void,
+                                src_ord,
+                                src_ptr as *const std::ffi::c_void,
+                                (m * out_features) * 4,
+                            )?;
                         let scratch_t = Tensor::new(
                             Arc::from(scratch_storage),
                             partial_shape.clone(),
