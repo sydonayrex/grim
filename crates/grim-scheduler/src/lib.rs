@@ -289,11 +289,18 @@ impl Scheduler {
                 continue;
             }
 
-            // Chunked prefill (Sarathi-Serve style, §5.2): drain tokens up to chunked_prefill_size only under load
+            // Chunked prefill (Sarathi-Serve style, §5.2): drain tokens up to
+            // chunked_prefill_size only under load. Chunks operate on the
+            // REMAINING unconsumed tokens — F9 (audit): the previous code
+            // assigned `consumed_tokens = chunk_size` and sized chunks off the
+            // full prompt, so a request scheduled on a 3rd+ pass had its
+            // consumed count reset backward and reprocessed the entire prompt
+            // from offset 0.
+            let remaining_before = r.prompt_tokens.saturating_sub(r.consumed_tokens);
             let chunk_size = if pressure_active {
-                r.prompt_tokens.min(self.chunked_prefill_size)
+                remaining_before.min(self.chunked_prefill_size)
             } else {
-                r.prompt_tokens
+                remaining_before
             };
             if total_prefill + chunk_size > self.max_batched_tokens {
                 self.waiting.push_back(r);
@@ -301,10 +308,11 @@ impl Scheduler {
             }
 
             total_prefill += chunk_size;
-            let remaining_tokens = r.prompt_tokens.saturating_sub(chunk_size);
+            let new_consumed = r.consumed_tokens + chunk_size;
+            let remaining_tokens = r.prompt_tokens.saturating_sub(new_consumed);
             output.prefill_ids.push(r.id);
             let mut running_req = r.clone();
-            running_req.consumed_tokens = chunk_size;
+            running_req.consumed_tokens = new_consumed;
             self.running.push(running_req);
 
             if pressure_active {
@@ -314,13 +322,13 @@ impl Scheduler {
                 }
                 if remaining_tokens > 0 {
                     let mut remainder_req = r.clone();
-                    remainder_req.consumed_tokens = chunk_size;
+                    remainder_req.consumed_tokens = new_consumed;
                     self.waiting.push_back(remainder_req);
                 }
                 break;
             } else if remaining_tokens > 0 {
                 let mut remainder_req = r.clone();
-                remainder_req.consumed_tokens = chunk_size;
+                remainder_req.consumed_tokens = new_consumed;
                 self.waiting.push_back(remainder_req);
             }
         }
@@ -709,6 +717,65 @@ mod tests {
             .expect("request 0 in waiting");
         assert_eq!(req0_waiting.consumed_tokens, 50);
         assert_eq!(req0_waiting.prompt_tokens, 120);
+    }
+
+    /// F9 (audit): consumed_tokens must ACCUMULATE across scheduling passes,
+    /// not reset to the current chunk's size. A 120-token prompt under
+    /// pressure with chunk size 50 drains 50 → 100 → 120 across three
+    /// passes; the pre-fix code produced 50 → 50 → 20 (reset on every pass)
+    /// and, once pressure lifted mid-drain, reprocessed the whole prompt
+    /// because chunk sizing ignored already-consumed tokens.
+    #[test]
+    fn test_chunked_prefill_accumulates_across_passes() {
+        let ctrl = AdmissionController::new(0, 0);
+        // Small max_batched_tokens so backlog alone (120 > 100) keeps
+        // pressure_active on every pass — with one request in the queue the
+        // remainder is always the head of `waiting` next pass.
+        let mut sched = Scheduler::new(100, 8, ctrl);
+        sched.chunked_prefill_size = 50;
+
+        sched.enqueue(Request {
+            id: 7,
+            prompt_tokens: 120,
+            ..Default::default()
+        });
+
+        // Pass 1: chunk of 50.
+        let out1 = sched.schedule();
+        assert_eq!(out1.prefill_ids, vec![7]);
+        let r = sched
+            .waiting
+            .iter()
+            .find(|r| r.id == 7)
+            .expect("remainder after pass 1");
+        assert_eq!(r.consumed_tokens, 50, "pass 1 must consume 50");
+
+        // Pass 2: next 50 → cumulative 100, NOT a reset to 50.
+        let out2 = sched.schedule();
+        assert_eq!(out2.prefill_ids, vec![7]);
+        let r = sched
+            .waiting
+            .iter()
+            .find(|r| r.id == 7)
+            .expect("remainder after pass 2");
+        assert_eq!(r.consumed_tokens, 100, "pass 2 must accumulate to 100");
+
+        // Pass 3: final 20 → cumulative 120; no remainder left in waiting.
+        let out3 = sched.schedule();
+        assert_eq!(out3.prefill_ids, vec![7]);
+        assert!(
+            !sched.waiting.iter().any(|r| r.id == 7),
+            "fully-consumed request must not return to waiting"
+        );
+        // Three passes pushed three running copies (50/100/120 — the
+        // per-pass accounting record); the most recent must be complete.
+        let running = sched
+            .running
+            .iter()
+            .rev()
+            .find(|r| r.id == 7)
+            .expect("request 7 in running after final chunk");
+        assert_eq!(running.consumed_tokens, 120);
     }
 
     #[test]

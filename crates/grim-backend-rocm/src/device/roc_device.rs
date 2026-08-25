@@ -11143,8 +11143,17 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut sk = split_k as i32;
 
+        // The reduction entry point must match the partials' element type:
+        // the historical f16-only kernel silently corrupted every F32/BF16
+        // split-K GEMM (f32 partials read as _Float16, f16 bits written
+        // back into the f32 output buffer).
+        let entry = match partials_storage.dtype.arith {
+            ArithType::F32 => "grim_split_k_reduction_f32",
+            ArithType::BF16 => "grim_split_k_reduction_bf16",
+            _ => "grim_split_k_reduction",
+        };
         self.launch_compute_kernel(
-            "grim_split_k_reduction",
+            entry,
             grid_dim,
             block_dim,
             &mut [
@@ -11502,6 +11511,28 @@ impl RocmDevice {
         };
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
+
+        // WI-SB6 production routing: GRIM_SCYTHE_RING=1 rides F32 GEMMs
+        // (the dense-layer op of every decode step) through the ScytheRing
+        // persistent dispatch wave instead of the rocBLAS direct path.
+        // Benchmark-gated, never default — see device::scythe_route.
+        if dtype_out.arith == ArithType::F32
+            && crate::device::scythe_route::ring_routing_enabled()
+        {
+            let stream = crate::device::scythe_route::route_gemm(
+                self,
+                self.active_stream(),
+                a_storage,
+                b_storage,
+                &out_storage,
+                m,
+                n,
+                k,
+            )?;
+            self.launch_counter.fetch_add(1, Ordering::SeqCst);
+            let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+            return Ok((Box::new(out_storage), compute_handle));
+        }
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution).
         // Op-identity classifier: LmHead -> TLOLog tile arm; everything else bins by m.

@@ -13,6 +13,31 @@ Findings are grouped by urgency: **Live** (actively breaking something today),
 path — currently safe only because nothing calls it yet), and **Latent** (wrong
 behavior under real use, but silent — no crash, just bad output or bad perf).
 
+> **STATUS 2026-08-25 — ALL FINDINGS FIXED** (commit chain after 23f846c):
+> F0 re-verified green after kernel edits (5/5 ring suite incl. resident
+> wave). F8/F10 fixed (trait read methods, server FETCH branch, client
+> I/O timeouts, doc-comment correction, disagg loopback integration gate).
+> F9 fixed with remaining-based chunk sizing (also fixes the non-pressure
+> full-prompt reprocessing variant); downstream grep confirmed
+> `consumed_tokens` is NOT used as a position offset today — the engine
+> re-prefills whole prompts per pass regardless, an engine-side gap noted
+> in grim-engine but out of this plan's scope. F2 fixed (claim-time
+> ST_ERROR for head_dim > 256) plus the adjacent wedge: errored tasks now
+> advance the tail. F3/F4 fixed per Option A (three named schedule
+> pointers, both sides of the FFI) + `MoETaskDescriptor::upload` device
+> residency + end-to-end public-API device gate (2.3e-10). F6 resolved as
+> "delete dead computation" (single-rank is the design). F7 fixed
+> (per-layer bucket in the fast path). F5 removed. F1 follow-up verified
+> (copy_via_route HostBounce legs carry per-leg guards in
+> p2p_route::copy_route); ordinal-1 autotuner recalibration remains an
+> operational to-do (examples/tune_gemm re-run), not a code fix.
+>
+> **Bonus Tier-0 discovery while benchmarking SB6 routing** (not in the
+> original audit): `grim_split_k_reduction` was hard-typed `_Float16*`, so
+> every F32 matmul on the split-K path (m>1 or k>8192 — F32 prefill-class
+> GEMMs) silently returned garbage. Fixed with dtype-dispatched
+> f32/bf16 reduction kernels + `tests/split_k_matmul_parity.rs`.
+
 ---
 
 ## Tier 0 — Live, blocking production paths

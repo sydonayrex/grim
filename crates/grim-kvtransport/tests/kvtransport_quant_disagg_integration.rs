@@ -60,6 +60,12 @@ impl KvBlockStore for MockBlockStore {
     fn block_is_received(&self, id: BlockId) -> bool {
         self.received.get(id).copied().unwrap_or(false)
     }
+    fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
+        self.keys.get(id).cloned()
+    }
+    fn read_values(&self, id: BlockId) -> Option<Vec<f32>> {
+        self.values.get(id).cloned()
+    }
 }
 
 #[test]

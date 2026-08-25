@@ -11,6 +11,7 @@ pub mod gemm_tuning;
 pub mod handles;
 pub mod hardware_spec;
 pub mod helpers;
+pub mod scythe_route;
 pub mod jit_cache;
 pub mod layout;
 pub mod moe_hybrid_exec;

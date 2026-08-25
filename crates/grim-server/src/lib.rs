@@ -7527,6 +7527,7 @@ mod tests {
             consumed_tokens: 0,
             model_id: None,
             adapter_ids: vec![],
+            max_new_tokens: 0,
             input_ids: Some(vec![0]),
         };
         let _ = engine.enqueue_request(req);
@@ -7610,6 +7611,7 @@ mod tests {
             consumed_tokens: 0,
             model_id: None,
             adapter_ids: vec![],
+            max_new_tokens: 0,
             input_ids: Some(vec![0]),
         };
         let _ = engine.enqueue_request(req);

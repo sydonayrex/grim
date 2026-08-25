@@ -55,6 +55,31 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
     fn block_is_received(&self, id: BlockId) -> bool {
         self.block_is_received(id)
     }
+    // F8/F10: pull-mode fetch support. The inherent methods already exist;
+    // they were just never exposed through the trait the KV receiver server
+    // is generic over, so the server had no way to answer a fetch request.
+    // Call via the inherent path (`KvBlockPool::read_keys`) — the shared
+    // name would otherwise resolve to the trait method being defined here.
+    fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
+        if id < self.num_blocks() {
+            Some(KvBlockPool::read_keys(self, id).to_vec())
+        } else {
+            None
+        }
+    }
+    fn read_values(&self, id: BlockId) -> Option<Vec<f32>> {
+        if id < self.num_blocks() {
+            Some(KvBlockPool::read_values(self, id).to_vec())
+        } else {
+            None
+        }
+    }
+    fn read_layer_keys(&self, id: BlockId, layer_idx: u32) -> Option<Vec<f32>> {
+        self.read_layer_keys(id, layer_idx as usize).map(|s| s.to_vec())
+    }
+    fn read_layer_values(&self, id: BlockId, layer_idx: u32) -> Option<Vec<f32>> {
+        self.read_layer_values(id, layer_idx as usize).map(|s| s.to_vec())
+    }
     fn write_layer_keys(&mut self, id: BlockId, layer_idx: u32, keys: &[f32], num_tokens: usize) {
         self.write_layer_keys(id, layer_idx as usize, keys, num_tokens);
     }
@@ -721,9 +746,15 @@ impl KvBlockPool {
         id < self.blocks.len() && self.blocks[id].received
     }
 
-    /// F3: explicitly set whether block `id` holds complete KV data. The disagg
-    /// pull path clears this when *any* layer of a fetch fails, so a partial
-    /// transfer is retried next tick instead of attending stale pages.
+    /// Explicitly set whether block `id` holds complete KV data; clearing
+    /// the flag also resets `num_tokens` so the block reads as empty.
+    ///
+    /// NOTE (F8/F10 audit): an earlier comment described a disagg pull path
+    /// that clears this flag on partial multi-layer fetch failure "so a
+    /// partial transfer is retried next tick." No such retry/tick machinery
+    /// exists — `DisaggRouter::fetch_kv_block` is a single blocking
+    /// whole-block call. The flag is available for a future per-layer
+    /// retry design, but nothing implements it today; do not rely on it.
     pub fn set_received(&mut self, id: BlockId, received: bool) {
         if let Some(b) = self.blocks.get_mut(id) {
             if !received {

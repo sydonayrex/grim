@@ -28,6 +28,7 @@ fn test_scheduler_chunked_prefill_and_decode_interleaving() {
         model_id: None,
         adapter_ids: vec![],
         input_ids: None,
+        max_new_tokens: 0,
     };
     scheduler.enqueue(req1);
 

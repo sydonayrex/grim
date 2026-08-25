@@ -67,16 +67,18 @@ pub struct PlacementKey {
 /// with the 10 ms ITL budget (scythe2.md §3.4). A design that recomputed every
 /// layer every forward pass would blow the ITL budget by 3–8×.
 pub struct PlacementCache {
-    /// Fast path: `fast[layer_id]` holds the last-inserted placement for this
-    /// layer at the current `(shape_bucket, epoch)`. Cleared by `bump_epoch`.
-    fast: Vec<Option<ScythePlacement>>,
+    /// Fast path: `fast[layer_id]` holds the last-inserted placement for
+    /// this layer together with the shape bucket it was decided at.
+    /// Cleared by `bump_epoch`. F7 (audit): the bucket is tracked PER LAYER
+    /// — the old single global `last_bucket` made interleaved buckets across
+    /// layers (farm/pipeline concurrency) spuriously miss valid entries and
+    /// pay the ~10 µs `decide_miss` instead of the ~50 ns hit.
+    fast: Vec<Option<(u16, ScythePlacement)>>,
     /// Slow path: arbitrary `(layer_id, bucket, epoch)` → placement.
     full: HashMap<PlacementKey, ScythePlacement>,
     /// Current epoch. Read from `CAPABILITY_EPOCH` at construction; callers
     /// that drive `bump_epoch` must also call `sync_epoch` to pull the new value.
     pub current_epoch: u32,
-    /// Last shape_bucket seen. Used to detect bucket changes.
-    last_bucket: u16,
 }
 
 impl PlacementCache {
@@ -86,7 +88,6 @@ impl PlacementCache {
             fast: vec![None; num_layers],
             full: HashMap::new(),
             current_epoch: 0,
-            last_bucket: u16::MAX, // sentinel: no bucket seen yet
         }
     }
 
@@ -98,13 +99,10 @@ impl PlacementCache {
     /// 2. The shape bucket changed (e.g., prompt length crossed a power-of-2).
     /// 3. The capability epoch bumped (thermal throttle, GPU leave).
     pub fn get(&self, layer_id: u32, shape_bucket: u16) -> Option<&ScythePlacement> {
-        // Fast path: array index by layer_id.
-        let fast_hit = self
-            .fast
-            .get(layer_id as usize)
-            .and_then(|opt| opt.as_ref());
-        if let Some(p) = fast_hit {
-            if self.last_bucket == shape_bucket {
+        // Fast path: array index by layer_id; valid only when this layer's
+        // own stored bucket matches the requested one.
+        if let Some((bucket, p)) = self.fast.get(layer_id as usize).and_then(|opt| opt.as_ref()) {
+            if *bucket == shape_bucket {
                 return Some(p);
             }
         }
@@ -125,9 +123,18 @@ impl PlacementCache {
         };
         self.full.insert(key, p.clone());
         if let Some(slot) = self.fast.get_mut(layer_id as usize) {
-            *slot = Some(p);
+            *slot = Some((shape_bucket, p));
         }
-        self.last_bucket = shape_bucket;
+    }
+
+    /// Observability hook (F7 test gate): whether the next `get` for this
+    /// `(layer, bucket)` will be served by the per-layer fast path.
+    pub fn fast_path_hit(&self, layer_id: u32, shape_bucket: u16) -> bool {
+        self.fast
+            .get(layer_id as usize)
+            .and_then(|opt| opt.as_ref())
+            .map(|(bucket, _)| *bucket == shape_bucket)
+            .unwrap_or(false)
     }
 
     /// Called when `CAPABILITY_EPOCH` bumps (~100 ms cadence, or GPU leave).
@@ -401,20 +408,16 @@ impl C2plrController {
                 .unwrap_or(0)
         };
 
-        // ── Partition ratios ────────────────────────────────────────────────
-        // Use softmax over the partition logits slice to get ratios that sum to 1.
-        let part_start = k;
-        let part_end = (k + k).min(logits.len());
-        let partition = if part_end > part_start {
-            softmax(&logits[part_start..part_end])
-        } else {
-            // Fallback: equal partition.
-            vec![1.0 / k as f32; k]
-        };
+        // F6 (audit): single-rank routing is the intended design — the only
+        // multi-rank ScythePlacement consumer is grim-cli's hand-built
+        // data-parallel gradient sync, which bypasses this controller. The
+        // softmax-over-partition-logits computation that used to live here
+        // fed exactly one discarded slice (`split_counts` tops the sole
+        // rank off to 100% regardless); it is deleted rather than "fixed"
+        // so the output no longer implies multi-rank support that doesn't
+        // exist.
 
-        // ── Route selection ─────────────────────────────────────────────────
-        // Use the per-layer link matrix to pick the route for this placement.
-        // If the best_gpu is the only participant, self-link = PeerDirect.
+        // ── Route selection ─────────────────────────────────────────
         let route_link = if k == 1 {
             ScytheLink::PeerDirect
         } else {
@@ -449,7 +452,9 @@ impl C2plrController {
 
         ScythePlacement {
             ranks: vec![selected],
-            partition: vec![partition.get(selected).copied().unwrap_or(1.0)],
+            // Single-rank placement carries the whole layer (F6 note above);
+            // no per-rank split ratios exist.
+            partition: vec![1.0],
             routes: vec![route_link],
         }
     }
@@ -577,20 +582,6 @@ fn mlp_forward(w1: &[f32], w2: &[f32], x: &[f32], hidden: usize, out: usize) -> 
     y
 }
 
-/// Softmax over a slice (numerically stable).
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    if logits.is_empty() {
-        return vec![];
-    }
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    if sum == 0.0 {
-        return vec![1.0 / logits.len() as f32; logits.len()];
-    }
-    exps.iter().map(|&e| e / sum).collect()
-}
-
 // ── ScytheRing + ScytheTaskDescriptor (WI-7) ─────────────────────────────────
 
 /// 32-byte task descriptor for the lock-free VRAM ring (scythe2.md §5.3).
@@ -695,14 +686,14 @@ pub mod moe_quant_mode {
 /// device-side persistent kernel casts `weight_ptr` to
 /// `MoETaskDescriptor*` and dispatches the matching Charon forward variant.
 ///
-/// Layout: 96 bytes raw (u32×8 + f32 + u64×4 + u32 pad) → 96 bytes under
+/// Layout: 80 bytes raw (u32×7 + f32 + u64×6) → 96 bytes under
 /// `align(32)` (two cache lines). This is 1.5× the parent
 /// `ScytheTaskDescriptor`'s 64B footprint — the extra half-line is the
-/// cost of carrying four 64-bit pointers (gate/up/down weights + schedule)
-/// the kernel's existing 3-pointer interface needs. A future optimization
-/// can pack gate/up/down into a single stride-indexed `expert_weights_ptr`
-/// to drop back to one cache line; held off here to keep the
-/// descriptor-to-kernel call site pointer-arithmetic-free.
+/// cost of carrying six 64-bit pointers (gate/up/down weights + the three
+/// F3 schedule arrays) the kernel's pointer interfaces need. A future
+/// optimization can pack gate/up/down into a single stride-indexed
+/// `expert_weights_ptr` to drop back to one cache line; held off here to
+/// keep the descriptor-to-kernel call site pointer-arithmetic-free.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug)]
 pub struct MoETaskDescriptor {
@@ -732,16 +723,17 @@ pub struct MoETaskDescriptor {
     pub up_w_ptr: u64,
     /// Device pointer to the expert down weights, `[num_experts, hidden*inter]`.
     pub down_w_ptr: u64,
-    /// Device pointer to the schedule struct: three contiguous arrays
-    /// `sorted_token_ids`, `sorted_expert_ids`, `sorted_weights` (the
-    /// `moe_align_block_size` output). The exact layout of the schedule
-    /// struct is defined on-device; this pointer is opaque to the host.
-    pub schedule_ptr: u64,
-    /// Reserved for alignment / future fields (e.g. shared-expert pointers
-    /// when WI-EP3 lands). Kept explicit so the struct's size is stable
-    /// across revisions and the size/alignment assertions in the test gate
-    /// don't silently shift.
-    pub _reserved: u32,
+    /// Device pointer to `sorted_token_ids` (u32[num_tokens_post_padded]) —
+    /// F3 (audit) Option A: the routing schedule is carried as THREE
+    /// INDEPENDENT pointers, matching the convention every real Charon
+    /// call site in `roc_device.rs` already uploads (the previous single
+    /// `schedule_ptr` + contiguous-offset contract matched no producer and
+    /// had no host-side packing step).
+    pub token_ids_ptr: u64,
+    /// Device pointer to `sorted_expert_ids` (u32[num_tokens_post_padded]).
+    pub expert_ids_ptr: u64,
+    /// Device pointer to `sorted_weights` (f32[num_tokens_post_padded]).
+    pub weights_ptr: u64,
 }
 
 impl Default for MoETaskDescriptor {
@@ -758,28 +750,74 @@ impl Default for MoETaskDescriptor {
             gate_w_ptr: 0,
             up_w_ptr: 0,
             down_w_ptr: 0,
-            schedule_ptr: 0,
-            _reserved: 0,
+            token_ids_ptr: 0,
+            expert_ids_ptr: 0,
+            weights_ptr: 0,
         }
     }
 }
 
 impl MoETaskDescriptor {
+    /// Upload this descriptor to device-visible memory on `device` and
+    /// return the device address the caller MUST pass to
+    /// [`Self::enqueue_via`].
+    ///
+    /// F4 (audit): `enqueue_via` used to stuff `self as *const Self as u64`
+    /// — a HOST address — into `weight_ptr`, which the persistent kernel
+    /// dereferences as a device pointer. Making the upload an explicit step
+    /// mirrors the pattern the device-gated test already used
+    /// (`dev.from_cpu_bytes(...)` then use that pointer) and makes the
+    /// host-pointer mistake impossible to reintroduce silently.
+    pub fn upload(&self, device: &RocmDevice) -> grim_backend_rocm::Result<u64> {
+        use grim_tensor::backend::BackendDevice;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        let storage = device.from_cpu_bytes(
+            bytes,
+            &grim_tensor::Shape::new(vec![std::mem::size_of::<Self>()]),
+            grim_tensor::dtype::DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+        )?;
+        let ptr = storage
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .and_then(|rs| rs.device_ptr_u64())
+            .ok_or_else(|| grim_backend_rocm::Error::Backend("MoE upload: no device ptr".into()))?;
+        // Keep the storage alive for the process lifetime — the ring's
+        // opcode-6 arm dereferences this pointer whenever the wave runs, so
+        // it must outlive the enqueue. Leaking a 96-byte device buffer per
+        // MoE layer is negligible against the expert weights it describes.
+        std::mem::forget(storage);
+        Ok(ptr)
+    }
+
     /// Build the parent `ScytheTaskDescriptor` that enqueues this MoE task
-    /// onto the `ScytheRing`. The parent carries `opcode = 6` and a pointer
-    /// to `self` in `weight_ptr`; the input/output/peer pointers flow
-    /// through from the caller (the activations buffer, the local output
-    /// buffer, and the optional peer-output buffer for cross-GPU combine).
+    /// onto the `ScytheRing`. The parent carries `opcode = 6` and
+    /// `moe_dev_ptr` — the DEVICE address returned by [`Self::upload`] — in
+    /// `weight_ptr`; the input/output/peer pointers flow through from the
+    /// caller (the activations buffer, the local output buffer, and the
+    /// optional peer-output buffer for cross-GPU combine).
     ///
     /// This is the host-side enqueue path called by WI-EP2's cross-GPU
     /// dispatch planner once it has partitioned (token, expert) pairs into
     /// local/remote and built the schedule.
     pub fn enqueue_via(
-        &self,
+        moe_dev_ptr: u64,
         input_ptr: u64,
         output_ptr: u64,
         peer_ptr: u64,
     ) -> ScytheTaskDescriptor {
+        assert!(
+            moe_dev_ptr != 0,
+            "MoETaskDescriptor::enqueue_via requires the DEVICE pointer from upload(); \
+             a host address here is the F4 audit bug"
+        );
         ScytheTaskDescriptor {
             opcode: 6, // MoE dispatch (WI-Charon-3)
             // m/n/k are unused for opcode 6 (geometry lives in the
@@ -789,7 +827,7 @@ impl MoETaskDescriptor {
             n: 0,
             k: 0,
             input_ptr,
-            weight_ptr: self as *const Self as u64,
+            weight_ptr: moe_dev_ptr,
             output_ptr,
             peer_ptr,
             status: 0, // pending
@@ -822,10 +860,13 @@ impl MoETaskDescriptor {
         }
         // Weight pointers may legitimately be zero in a host-side test that
         // only validates geometry (no device buffer yet). Only flag the
-        // schedule pointer as required — a MoE dispatch with no schedule is
-        // always wrong.
-        if self.schedule_ptr == 0 {
-            return Err("MoETaskDescriptor: schedule_ptr must be non-null".into());
+        // schedule pointers as required — a MoE dispatch with no routing
+        // schedule is always wrong.
+        if self.token_ids_ptr == 0 || self.expert_ids_ptr == 0 || self.weights_ptr == 0 {
+            return Err(
+                "MoETaskDescriptor: token_ids_ptr/expert_ids_ptr/weights_ptr must be non-null"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -1011,12 +1052,6 @@ pub struct ScytheRing {
     /// Explicit upload stream for resident-mode control traffic (0 = use the
     /// device's active stream).
     upload_stream: AtomicU64,
-    /// WI-SB6 fix: device head value PUBLISHED (written to the device
-    /// scalar). Enqueue increments `head` immediately, but publication is
-    /// deferred to `flush()` — a resident worker that sees an advanced head
-    /// BEFORE the payload upload lands will execute a half-written
-    /// descriptor (the 2026-08-24 stall).
-    published_head: AtomicU32,
 }
 
 impl ScytheRing {
@@ -1035,7 +1070,6 @@ impl ScytheRing {
             device: None,
             staging: Vec::new(),
             upload_stream: AtomicU64::new(0),
-            published_head: AtomicU32::new(0),
         }
     }
 
@@ -1069,7 +1103,6 @@ impl ScytheRing {
             device: Some(device as *const RocmDevice),
             staging,
             upload_stream: AtomicU64::new(0),
-            published_head: AtomicU32::new(0),
         })
     }
 
@@ -1505,11 +1538,11 @@ impl ScytheRingExec {
     /// WI-SB6 fix (2026-08-24): publish ALL pending submissions at once.
     /// Called only AFTER every descriptor payload upload has completed on
     /// the control stream, so a resident worker can never claim a
-    /// half-visible descriptor. The worker only ever observes device head =
-    /// `published_head`.
+    /// half-visible descriptor. (F5 audit cleanup: the write-only host-side
+    /// `published_head` mirror was removed — the device head scalar is the
+    /// single source of truth.)
     pub fn publish_head(&mut self) -> grim_backend_rocm::Result<()> {
         let h = self.ring.head.load(Ordering::Acquire);
-        self.ring.published_head.store(h, Ordering::Release);
         self.write_head_device(h)
     }
 
@@ -1879,6 +1912,40 @@ mod tests {
 
     /// WI-4 gate B: 32-layer aggregate decide_miss must be <2 ms
     /// (≤1.3% of the 150 ms prefill budget).
+    /// F7 (audit): interleaving two shape buckets across layers must not
+    /// invalidate either layer's fast-path entry. The pre-fix global
+    /// `last_bucket` made layer 0's still-valid entry miss whenever layer 1
+    /// decided at a different bucket — silently paying ~10 µs/layer
+    /// `decide_miss` on every hit.
+    #[test]
+    fn test_interleaved_buckets_keep_per_layer_fast_path() {
+        let mut cache = PlacementCache::new(2);
+        let place = |i: usize| ScythePlacement {
+            ranks: vec![i],
+            partition: vec![1.0],
+            routes: vec![ScytheLink::Host],
+        };
+
+        // Layer 0 decided at bucket 4, layer 1 at bucket 8.
+        cache.insert(0, 4, place(0));
+        cache.insert(1, 8, place(1));
+        assert!(cache.fast_path_hit(0, 4));
+        assert!(cache.fast_path_hit(1, 8));
+
+        // Re-ask layer 0 at ITS bucket — must stay a fast hit even though
+        // the last insert was layer 1 at a different bucket.
+        assert!(
+            cache.fast_path_hit(0, 4),
+            "layer 0's entry is still valid; the global-bucket check would miss it"
+        );
+        assert_eq!(cache.get(0, 4).unwrap().ranks, vec![0]);
+
+        // A bucket change for the layer itself is still a miss on the fast
+        // path (falls through to the full map, which has no entry yet).
+        assert!(!cache.fast_path_hit(0, 8));
+        assert!(cache.get(0, 8).is_none());
+    }
+
     #[test]
     fn test_prefill_cache_miss_overhead() {
         let num_layers = 32;
@@ -2219,7 +2286,9 @@ mod tests {
         assert_eq!(d.gate_w_ptr, 0);
         assert_eq!(d.up_w_ptr, 0);
         assert_eq!(d.down_w_ptr, 0);
-        assert_eq!(d.schedule_ptr, 0);
+        assert_eq!(d.token_ids_ptr, 0);
+        assert_eq!(d.expert_ids_ptr, 0);
+        assert_eq!(d.weights_ptr, 0);
     }
 
     #[test]
@@ -2279,8 +2348,9 @@ mod tests {
             gate_w_ptr: 0x1000,
             up_w_ptr: 0x2000,
             down_w_ptr: 0x3000,
-            schedule_ptr: 0x4000,
-            _reserved: 0,
+            token_ids_ptr: 0x4000,
+            expert_ids_ptr: 0x5000,
+            weights_ptr: 0x6000,
         };
         assert!(
             good.validate().is_ok(),
@@ -2309,8 +2379,12 @@ mod tests {
         assert!(bad.validate().is_err(), "top_k > num_experts must fail");
 
         let mut bad = good;
-        bad.schedule_ptr = 0;
-        assert!(bad.validate().is_err(), "null schedule_ptr must fail");
+        bad.token_ids_ptr = 0;
+        assert!(bad.validate().is_err(), "null token_ids_ptr must fail");
+
+        let mut bad = good;
+        bad.weights_ptr = 0;
+        assert!(bad.validate().is_err(), "null weights_ptr must fail");
     }
 
     /// Integration gate (WI-Charon-3 gate 2, host-testable half): the
@@ -2335,20 +2409,25 @@ mod tests {
             gate_w_ptr: 0x1000,
             up_w_ptr: 0x2000,
             down_w_ptr: 0x3000,
-            schedule_ptr: 0x4000,
-            _reserved: 0,
+            token_ids_ptr: 0x4000,
+            expert_ids_ptr: 0x5000,
+            weights_ptr: 0x6000,
         };
-        let task = moe_desc.enqueue_via(
+        // F4: enqueue_via takes the DEVICE address produced by `upload()`;
+        // a host address here is exactly the audit bug.
+        let moe_dev_ptr = 0x9000u64;
+        let task = MoETaskDescriptor::enqueue_via(
+            moe_dev_ptr,
             0xAA00, // input_ptr
             0xBB00, // output_ptr
             0xCC00, // peer_ptr
         );
         // Opcode must be 6 (MoE dispatch).
         assert_eq!(task.opcode, 6, "MoE enqueue must set opcode = 6");
-        // weight_ptr must point at the MoETaskDescriptor.
+        // weight_ptr must carry the device-resident descriptor address.
         assert_eq!(
-            task.weight_ptr, &moe_desc as *const _ as u64,
-            "weight_ptr must point at the MoETaskDescriptor",
+            task.weight_ptr, moe_dev_ptr,
+            "weight_ptr must carry the uploaded MoETaskDescriptor address",
         );
         // Input/output/peer flow through unchanged.
         assert_eq!(task.input_ptr, 0xAA00);
@@ -2374,7 +2453,7 @@ mod tests {
         // doesn't touch device memory, so the in-process `task` value is the
         // source of truth). Verify opcode + weight_ptr pairing.
         assert_eq!(task.opcode, 6);
-        assert_eq!(task.weight_ptr, &moe_desc as *const _ as u64);
+        assert_eq!(task.weight_ptr, moe_dev_ptr);
     }
 
     // ── WI-EP2 — Cross-GPU token dispatch planner tests ──────────────────────
@@ -2620,8 +2699,9 @@ mod tests {
             gate_w_ptr: 0x1000,
             up_w_ptr: 0x2000,
             down_w_ptr: 0x3000,
-            schedule_ptr: 0x4000,
-            _reserved: 0,
+            token_ids_ptr: 0x4000,
+            expert_ids_ptr: 0x5000,
+            weights_ptr: 0x6000,
         };
         let descriptors = plan.emit_remote_descriptors(&template);
         assert_eq!(descriptors.len(), 1, "one remote batch for rank 1");
@@ -2661,10 +2741,13 @@ mod tests {
         let descriptors = plan.emit_remote_descriptors(&template);
         assert_eq!(descriptors.len(), 1, "one remote batch");
 
-        // Enqueue the descriptor onto a fresh ring.
+        // Enqueue the descriptor onto a fresh ring. F4: the weight_ptr the
+        // ring carries is the DEVICE address a real caller obtains from
+        // `MoETaskDescriptor::upload` — never the host struct's address.
         let ring = ScytheRing::new(4);
-        let (dest_rank, desc) = &descriptors[0];
-        let task = desc.enqueue_via(0xAA00, 0xBB00, 0xCC00);
+        let (dest_rank, _desc) = &descriptors[0];
+        let moe_dev_ptr = 0x9000u64;
+        let task = MoETaskDescriptor::enqueue_via(moe_dev_ptr, 0xAA00, 0xBB00, 0xCC00);
         let slot = ring
             .enqueue(task)
             .expect("enqueue on empty ring must succeed");
@@ -2673,7 +2756,7 @@ mod tests {
         assert_eq!(dequeued, 0);
         // The dequeued slot carries opcode 6 and the MoETaskDescriptor ptr.
         assert_eq!(task.opcode, 6);
-        assert_eq!(task.weight_ptr, desc as *const _ as u64);
+        assert_eq!(task.weight_ptr, moe_dev_ptr);
         assert_eq!(*dest_rank, 1);
         // Plan correctness: 1 local + 1 remote = 2 total.
         assert_eq!(plan.total_pairs(), 2);

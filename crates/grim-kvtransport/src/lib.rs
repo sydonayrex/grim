@@ -343,6 +343,34 @@ pub trait KvBlockStore: Send + Sync {
     /// "not yet arrived."
     fn block_is_received(&self, id: BlockId) -> bool;
 
+    /// Read key data for layer 0 of block `id`.  Returns `None` when the
+    /// block is out of range — pull-mode fetch (F8/F10) turns that into a
+    /// "not available" reply instead of deadlocking or fabricating data.
+    fn read_keys(&self, id: BlockId) -> Option<Vec<f32>>;
+    /// Read value data for layer 0 of block `id`.  Returns `None` when the
+    /// block is out of range.
+    fn read_values(&self, id: BlockId) -> Option<Vec<f32>>;
+
+    /// Read key data for a specific layer of block `id`.  Defaults to the
+    /// layer-0 behavior, mirroring the write-side default.
+    fn read_layer_keys(&self, id: BlockId, layer_idx: u32) -> Option<Vec<f32>> {
+        if layer_idx == 0 {
+            self.read_keys(id)
+        } else {
+            None
+        }
+    }
+
+    /// Read value data for a specific layer of block `id`.  Defaults to the
+    /// layer-0 behavior, mirroring the write-side default.
+    fn read_layer_values(&self, id: BlockId, layer_idx: u32) -> Option<Vec<f32>> {
+        if layer_idx == 0 {
+            self.read_values(id)
+        } else {
+            None
+        }
+    }
+
     /// Write key data into `id`'s block for a specific layer.
     fn write_layer_keys(&mut self, id: BlockId, layer_idx: u32, keys: &[f32], num_tokens: usize) {
         if layer_idx == 0 {
@@ -452,12 +480,14 @@ impl NetworkKvClient {
             .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
 
         // Build a fetch-request header: same format but with a zero checksum
-        // and a special request flag in layer_idx (bit 31 set).
+        // and a special request flag in layer_idx (bit 31 set). Mask bit 31
+        // out of the caller's layer so a stray high bit can't smuggle a
+        // second flag into the request.
         let req_header = KvBlockHeader {
             magic: KV_MAGIC,
             version: KV_PROTOCOL_VERSION,
             block_id: block_id as u64,
-            layer_idx: layer_idx | FETCH_REQUEST_FLAG,
+            layer_idx: (layer_idx & !FETCH_REQUEST_FLAG) | FETCH_REQUEST_FLAG,
             num_elements: block_elems as u32,
             checksum: 0,
         };
@@ -467,6 +497,16 @@ impl NetworkKvClient {
             std::time::Duration::from_millis(500),
         )
         .map_err(|e| Error::KvCache(format!("TCP fetch connection failed to {addr}: {e}")))?;
+        // Deadline the whole exchange, not just the connect: a server that
+        // never answers (protocol mismatch, wedged peer) must fail fast
+        // instead of hanging the caller's read_exact forever (F8 follow-up).
+        const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| Error::KvCache(format!("TCP fetch: set_read_timeout failed: {e}")))?;
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| Error::KvCache(format!("TCP fetch: set_write_timeout failed: {e}")))?;
 
         stream
             .write_all(&req_header.serialize())
@@ -483,6 +523,15 @@ impl NetworkKvClient {
             return Err(Error::KvCache(format!(
                 "TCP fetch: protocol mismatch magic={:#x} version={}",
                 header.magic, header.version
+            )));
+        }
+        // The receiver answers "block/layer not available here" with an
+        // empty payload rather than silence — translate that into an error
+        // so no caller mistakes it for a legitimate zero-length block.
+        if header.num_elements == 0 {
+            return Err(Error::KvCache(format!(
+                "TCP fetch: remote {addr} reports block {block_id} layer {} not available",
+                layer_idx & !FETCH_REQUEST_FLAG
             )));
         }
 
@@ -586,6 +635,55 @@ where
                              — bad magic={:#x} version={}",
                             header.magic, header.version
                         );
+                        continue;
+                    }
+
+                    // F8/F10: a fetch request (FETCH_REQUEST_FLAG set in
+                    // layer_idx) asks the server to REPLY with the block's
+                    // data instead of pushing a payload. The old loop fell
+                    // through to the push path unconditionally and blocked
+                    // reading a payload the fetcher never sends — a
+                    // deadlock between both sides on the first pull-mode
+                    // fetch. Answer from the store's read side; an empty
+                    // payload means "not available here".
+                    if header.layer_idx & FETCH_REQUEST_FLAG != 0 {
+                        let layer_idx = header.layer_idx & !FETCH_REQUEST_FLAG;
+                        let block_id = header.block_id as usize;
+                        let (k_data, v_data) = {
+                            let guard = pool.lock().unwrap();
+                            if block_id < guard.num_blocks() && guard.block_is_received(block_id) {
+                                match (
+                                    guard.read_layer_keys(block_id, layer_idx),
+                                    guard.read_layer_values(block_id, layer_idx),
+                                ) {
+                                    (Some(k), Some(v)) if k.len() == v.len() && !k.is_empty() => {
+                                        (k, v)
+                                    }
+                                    _ => (Vec::new(), Vec::new()),
+                                }
+                            } else {
+                                (Vec::new(), Vec::new())
+                            }
+                        };
+                        let resp = KvBlockHeader {
+                            magic: KV_MAGIC,
+                            version: KV_PROTOCOL_VERSION,
+                            block_id: header.block_id,
+                            layer_idx,
+                            num_elements: k_data.len() as u32,
+                            checksum: compute_checksum(&k_data, &v_data),
+                        };
+                        let mut buf = resp.serialize().to_vec();
+                        for &val in k_data.iter().chain(v_data.iter()) {
+                            buf.extend_from_slice(&val.to_le_bytes());
+                        }
+                        if let Err(e) = stream.write_all(&buf) {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: fetch reply for block {} \
+                                 layer {layer_idx} failed: {e}",
+                                header.block_id
+                            );
+                        }
                         continue;
                     }
 
@@ -947,6 +1045,12 @@ mod tests {
             fn block_is_received(&self, id: BlockId) -> bool {
                 self.received.contains(&id)
             }
+            fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
+                self.blocks.get(&id).map(|(k, _)| k.clone())
+            }
+            fn read_values(&self, id: BlockId) -> Option<Vec<f32>> {
+                self.blocks.get(&id).map(|(_, v)| v.clone())
+            }
         }
 
         impl TestStore {
@@ -1012,6 +1116,12 @@ mod tests {
             }
             fn block_is_received(&self, id: BlockId) -> bool {
                 self.received.contains(&id)
+            }
+            fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
+                self.blocks.get(&id).map(|(k, _)| k.clone())
+            }
+            fn read_values(&self, id: BlockId) -> Option<Vec<f32>> {
+                self.blocks.get(&id).map(|(_, v)| v.clone())
             }
         }
 
@@ -1092,6 +1202,115 @@ mod tests {
         assert!(
             !msg.contains("fabricated"),
             "error must not reference fabricated data: {msg}"
+        );
+    }
+
+    /// F8/F10: the receiver server must ANSWER fetch requests from the
+    /// store's read side instead of deadlocking on a payload the fetcher
+    /// never sends. Push a block, then pull it back and require exact
+    /// round-trip equality.
+    #[test]
+    fn test_fetch_block_remote_roundtrip_against_live_server() {
+        struct TestStore {
+            blocks: std::collections::HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
+            received: std::collections::HashSet<BlockId>,
+        }
+
+        impl crate::KvBlockStore for TestStore {
+            fn num_blocks(&self) -> usize {
+                128
+            }
+            fn block_elem_per_token(&self) -> usize {
+                8
+            }
+            fn block_size(&self) -> usize {
+                16
+            }
+            fn write_keys(&mut self, id: BlockId, keys: &[f32], _num_tokens: usize) {
+                self.blocks.insert(id, (keys.to_vec(), Vec::new()));
+                self.received.insert(id);
+            }
+            fn write_values(&mut self, id: BlockId, values: &[f32]) {
+                if let Some((_, v)) = self.blocks.get_mut(&id) {
+                    *v = values.to_vec();
+                }
+            }
+            fn block_is_received(&self, id: BlockId) -> bool {
+                self.received.contains(&id)
+            }
+            fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
+                self.blocks.get(&id).map(|(k, _)| k.clone())
+            }
+            fn read_values(&self, id: BlockId) -> Option<Vec<f32>> {
+                self.blocks.get(&id).map(|(_, v)| v.clone())
+            }
+        }
+
+        let port = crate::tests::find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(TestStore {
+            blocks: std::collections::HashMap::new(),
+            received: std::collections::HashSet::new(),
+        }));
+        let _handle = start_kv_receiver_server(&addr, store.clone()).unwrap();
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        let k: Vec<f32> = (0..64).map(|i| i as f32 * 0.25).collect();
+        let v: Vec<f32> = (0..64).map(|i| (i as f32 * -0.5) - 1.0).collect();
+        client
+            .send_block_remote(7, 0, &k, &v, &addr)
+            .expect("push must succeed");
+
+        // Give the receiver thread a moment to commit the write.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (got_k, got_v) = client
+            .fetch_block_remote(7, 0, &addr, 64)
+            .expect("fetch must round-trip against the live server");
+        assert_eq!(got_k, k, "fetched keys must match pushed keys");
+        assert_eq!(got_v, v, "fetched values must match pushed values");
+    }
+
+    /// F8/F10: fetching a block the server does not hold must produce a
+    /// prompt "not available" error — never silence, never fabricated data,
+    /// never a hang (the pre-fix server wedged here).
+    #[test]
+    fn test_fetch_block_remote_missing_block_errors_not_hangs() {
+        struct EmptyStore;
+        impl crate::KvBlockStore for EmptyStore {
+            fn num_blocks(&self) -> usize {
+                128
+            }
+            fn block_elem_per_token(&self) -> usize {
+                8
+            }
+            fn block_size(&self) -> usize {
+                16
+            }
+            fn write_keys(&mut self, _id: BlockId, _keys: &[f32], _num_tokens: usize) {}
+            fn write_values(&mut self, _id: BlockId, _values: &[f32]) {}
+            fn block_is_received(&self, _id: BlockId) -> bool {
+                false
+            }
+            fn read_keys(&self, _id: BlockId) -> Option<Vec<f32>> {
+                None
+            }
+            fn read_values(&self, _id: BlockId) -> Option<Vec<f32>> {
+                None
+            }
+        }
+
+        let port = crate::tests::find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(EmptyStore));
+        let _handle = start_kv_receiver_server(&addr, store).unwrap();
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        let res = client.fetch_block_remote(55, 0, &addr, 64);
+        let err = res.expect_err("fetching a block the server lacks must error");
+        assert!(
+            err.to_string().contains("not available"),
+            "error should say the block is not available: {err}"
         );
     }
 

@@ -667,4 +667,63 @@ mod tests {
 
         drop(receiver);
     }
+
+    /// F8/F10 integration gate: the decode→prefill PULL path
+    /// (`DisaggRouter::fetch_kv_block`) against a live receiver backed by a
+    /// real `KvBlockPool`. Before the fix, the server never answered fetch
+    /// requests at all — both sides deadlocked on the first pull. Populates
+    /// BOTH layers via the existing network PUSH path, then pulls them back
+    /// and requires exact round-trip equality.
+    #[test]
+    fn test_fetch_kv_block_pull_roundtrip_real_pool() {
+        // Pool geometry: 4 blocks, 2 heads, head_dim 4 → elem_per_token 8,
+        // block_elems 16*8 = 128. Both layers arrive over the wire: layer 0
+        // through `write_layer_keys(0, …)` (which mirrors into `key_data`),
+        // layer 1 through the per-layer store — this is the shape a real
+        // multi-layer handoff produces.
+        let pool = KvBlockPool::new(4, 2, 4);
+        let block_id = 1usize;
+        let k0: Vec<f32> = (0..128).map(|i| i as f32 * 0.5).collect();
+        let v0: Vec<f32> = (0..128).map(|i| (i as f32 * -0.25) - 2.0).collect();
+        let k1: Vec<f32> = vec![7.0f32; 128];
+        let v1: Vec<f32> = vec![-9.0f32; 128];
+
+        let shared_pool = Arc::new(Mutex::new(pool));
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let _receiver = crate::KvReceiverServer::new(&addr, shared_pool).unwrap();
+
+        // Push both layers through the router's own send path.
+        let router = DisaggRouter::new(&addr, &addr, PoolRole::Prefill);
+        router
+            .send_layer_block_remote(block_id, 0, &k0, &v0)
+            .expect("layer-0 push must succeed");
+        router
+            .send_layer_block_remote(block_id, 1, &k1, &v1)
+            .expect("layer-1 push must succeed");
+
+        // Let the receiver thread commit both writes before pulling.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (got_k0, got_v0) = router
+            .fetch_kv_block(block_id, 0, 128)
+            .expect("layer-0 fetch must round-trip");
+        assert_eq!(got_k0, k0, "layer-0 keys must round-trip exactly");
+        assert_eq!(got_v0, v0, "layer-0 values must round-trip exactly");
+
+        let (got_k1, got_v1) = router
+            .fetch_kv_block(block_id, 1, 128)
+            .expect("layer-1 fetch must round-trip");
+        assert_eq!(got_k1, k1, "layer-1 keys must round-trip exactly");
+        assert_eq!(got_v1, v1, "layer-1 values must round-trip exactly");
+
+        // A block the pool holds but never received data for must produce a
+        // prompt "not available" error, not a hang.
+        let res = router.fetch_kv_block(3, 0, 128);
+        let err = res.expect_err("fetching an unwritten block must error");
+        assert!(
+            err.to_string().contains("not available"),
+            "error should say the block is not available: {err}"
+        );
+    }
 }
