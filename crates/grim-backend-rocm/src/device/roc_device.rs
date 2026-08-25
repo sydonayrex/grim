@@ -371,6 +371,12 @@ impl RocmDevice {
 
     /// [`Self::copy_scythe_descriptor_async`] on an explicit stream — the
     /// resident-wave control path must never enqueue behind the worker.
+    ///
+    /// WI-SB6 root fix (2026-08-24): this upload is SYNCHRONOUS. The caller
+    /// (ring enqueue) advances the device-visible head around it; an async
+    /// copy here let a hot resident worker claim and execute a
+    /// half-written descriptor before the payload landed (silent wrong
+    /// work / wedge). 64-byte pinned-staged sync copies cost ~1-2 µs.
     pub fn copy_scythe_descriptor_async_on(
         &self,
         dst: u64,
@@ -378,14 +384,14 @@ impl RocmDevice {
         bytes: usize,
         stream: *mut c_void,
     ) -> Result<()> {
+        let _ = stream; // ordering is enforced by the blocking copy below
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        check_hip("hipMemcpyAsync(ScytheRing H2D, ctrl)", unsafe {
-            hipMemcpyAsync(
+        check_hip("hipMemcpy(ScytheRing H2D, sync ctrl)", unsafe {
+            crate::device::handles::hipMemcpy(
                 dst as *mut std::ffi::c_void,
                 src,
                 bytes,
                 HipMemcpyKind::HostToDevice,
-                stream,
             )
         })
     }
@@ -11182,8 +11188,21 @@ impl RocmDevice {
 
         if let Some((cached_path, cached_lowered)) = self.hsaco_cache.get_cached_kernel(&cache_key)
         {
+            if std::env::var_os("GRIM_RING_DIAG").is_some() {
+                eprintln!(
+                    "[prov] {} entry={} DISK-HIT key={}",
+                    self.ordinal, entry, cache_key
+                );
+            }
             Ok((cached_path, cached_lowered))
         } else {
+            if std::env::var_os("GRIM_RING_DIAG").is_some() {
+                eprintln!(
+                    "[prov] {} entry={} FRESH-COMPILE key={}",
+                    self.ordinal, entry, cache_key
+                );
+            }
+            let (code, lowered) = jit_compile_hsaco(source, entry, &self.gpu_target)?;
             let (code, lowered) = jit_compile_hsaco(source, entry, &self.gpu_target)?;
             let p = self
                 .hsaco_cache
