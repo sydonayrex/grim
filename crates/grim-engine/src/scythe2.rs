@@ -1011,6 +1011,12 @@ pub struct ScytheRing {
     /// Explicit upload stream for resident-mode control traffic (0 = use the
     /// device's active stream).
     upload_stream: AtomicU64,
+    /// WI-SB6 fix: device head value PUBLISHED (written to the device
+    /// scalar). Enqueue increments `head` immediately, but publication is
+    /// deferred to `flush()` — a resident worker that sees an advanced head
+    /// BEFORE the payload upload lands will execute a half-written
+    /// descriptor (the 2026-08-24 stall).
+    published_head: AtomicU32,
 }
 
 impl ScytheRing {
@@ -1029,6 +1035,7 @@ impl ScytheRing {
             device: None,
             staging: Vec::new(),
             upload_stream: AtomicU64::new(0),
+            published_head: AtomicU32::new(0),
         }
     }
 
@@ -1062,6 +1069,7 @@ impl ScytheRing {
             device: Some(device as *const RocmDevice),
             staging,
             upload_stream: AtomicU64::new(0),
+            published_head: AtomicU32::new(0),
         })
     }
 
@@ -1494,14 +1502,25 @@ impl ScytheRingExec {
         Ok(())
     }
 
-    /// Publish the host head, launch one bounded persistent worker, wait for
-    /// it to drain the batch, and mirror device tail progress back.
+    /// WI-SB6 fix (2026-08-24): publish ALL pending submissions at once.
+    /// Called only AFTER every descriptor payload upload has completed on
+    /// the control stream, so a resident worker can never claim a
+    /// half-visible descriptor. The worker only ever observes device head =
+    /// `published_head`.
+    pub fn publish_head(&mut self) -> grim_backend_rocm::Result<()> {
+        let h = self.ring.head.load(Ordering::Acquire);
+        self.ring.published_head.store(h, Ordering::Release);
+        self.write_head_device(h)
+    }
+
+    /// Launch one bounded persistent worker over currently PUBLISHED work
+    /// (batch-synchronous mode; resident=0).
     pub fn run_batch(&mut self) -> grim_backend_rocm::Result<u32> {
         let tasks = self.ring.len();
         if tasks == 0 {
             return Ok(0);
         }
-        self.write_head_device(self.ring.head.load(Ordering::Acquire))?;
+        self.publish_head()?;
         let handle = self.device.launch_scythe_persistent_dispatch(
             self.ring.slots_storage().ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ScytheRingExec: ring has no device storage".into())
@@ -1528,7 +1547,7 @@ impl ScytheRingExec {
         if self.worker.is_some() {
             return Ok(());
         }
-        self.flush()?;
+        self.publish_head()?;
         let handle = self.device.launch_scythe_persistent_dispatch(
             self.ring.slots_storage().ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ring has no device storage".into())
