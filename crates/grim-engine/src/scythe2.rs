@@ -1566,6 +1566,58 @@ impl ScytheRingExec {
         Ok(u32::from_ne_bytes(buf))
     }
 
+    /// WI-SB6 diagnostics: read one slot's `status` word through the control
+    /// stream (the only read path proven to work while a resident wave runs).
+    pub fn peek_slot_status(&self, slot: usize) -> grim_backend_rocm::Result<u32> {
+        let base = self
+            .ring
+            .slots_storage()
+            .ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ring has no device storage".into())
+            })?
+            .device_ptr_u64()
+            .ok_or_else(|| {
+                grim_backend_rocm::Error::Backend("ring slots have no device ptr".into())
+            })?;
+        let status_offset = 4 * 12; // 12 u32 fields precede `status` in the ABI
+        let ptr = (base + slot as u64 * 64 + status_offset as u64) as *mut c_void;
+        let mut host_cell = [0u8; 4];
+        // Reuse the pinned-cell control read (D2H): tail-side implementation.
+        self.control_read_u32_into(ptr, &mut host_cell)?;
+        Ok(u32::from_ne_bytes(host_cell))
+    }
+
+    /// DtoH 4 bytes from a device address through the control stream.
+    fn control_read_u32_into(
+        &self,
+        dev_ptr: *mut c_void,
+        out: &mut [u8; 4],
+    ) -> grim_backend_rocm::Result<()> {
+        let mut pin = grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(4)
+            .map_err(|e| grim_backend_rocm::Error::Backend(format!("pin: {e}")))?;
+        let kind = grim_backend_rocm::HipMemcpyKind::DeviceToHost;
+        let _guard = grim_backend_rocm::device::util::DeviceGuard::set(self.device.ordinal() as i32);
+        let rc = unsafe {
+            grim_backend_rocm::hipMemcpyAsync(
+                pin.as_mut_ptr() as *mut c_void,
+                dev_ptr as *const c_void,
+                4,
+                kind,
+                self.control_stream_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(grim_backend_rocm::Error::Backend(format!(
+                "control D2H failed: hip status {rc}"
+            )));
+        }
+        grim_backend_rocm::hip_stream_synchronize(self.control_stream_ptr())?;
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(pin.as_ptr(), 4)
+        });
+        Ok(())
+    }
+
     /// Poll until the device reports `target` completed tasks or `timeout`
     /// elapses. Returns the final completed count.
     pub fn wait_completed(
