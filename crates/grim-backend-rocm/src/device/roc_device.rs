@@ -12663,6 +12663,9 @@ impl RocmDevice {
         let mut cap = capacity;
         let mut limit = max_tasks;
         let mut res = resident;
+        if std::env::var_os("GRIM_RING_DIAG").is_some() {
+            eprintln!("[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}", !true);
+        }
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",
             crate::HipDim3::new(1, 1, 1),
@@ -12703,6 +12706,9 @@ impl RocmDevice {
         let mut cap = capacity;
         let mut limit = max_tasks;
         let mut res = resident;
+        if std::env::var_os("GRIM_RING_DIAG").is_some() {
+            eprintln!("[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}", !true);
+        }
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",
             crate::HipDim3::new(1, 1, 1),

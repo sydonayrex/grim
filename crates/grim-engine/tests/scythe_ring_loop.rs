@@ -108,7 +108,10 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
     assert!(exec.ring.is_empty(), "ring must be empty after run_batch");
 }
 
-/// WI-SB6 resident-wave mode: ONE worker launch survives idle gaps; two
+/// WI-SB6 resident-wave mode (EXPERIMENTAL — stalls after first drain on
+/// gfx1200/1201 stack; host args verified correct [resident=1], suspected
+/// kernel-arg marshaling or scheduler behavior — see plan log 2026-08-24):
+/// ONE worker launch survives idle gaps; two
 /// batches are submitted across separate flushes while it runs; shutdown
 /// exits via the stop flag.
 #[test]
