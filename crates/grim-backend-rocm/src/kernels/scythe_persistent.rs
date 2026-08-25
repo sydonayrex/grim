@@ -67,7 +67,7 @@ pub const KERNEL_SOURCE: &str = r#"
 // (grim_engine::scythe2). #[repr(C, align(32))] on the Rust side; the device
 // matches that layout exactly so the host-written bytes are read correctly.
 struct __align__(32) scythe_task_descriptor_t {
-    unsigned int opcode;     // 0=nop,1=col-GEMM,2=row-GEMM,3=attn,4=norm,5=CommFuse,6=MoE
+    unsigned int opcode;     // 0=nop,1=col-GEMM,2=row-GEMM,3=attn,4=norm,5=CommFuse,6=MoE,7=add
     unsigned int m, n, k;
     unsigned long long input_ptr;
     unsigned long long weight_ptr;   // opcode=6: points to moe_task_descriptor_t
@@ -108,6 +108,7 @@ struct __align__(32) moe_task_descriptor_t {
 #define OP_NORM       4u
 #define OP_COMMFUSE   5u
 #define OP_MOE        6u
+#define OP_ADD        7u
 
 // Status codes.
 #define ST_PENDING  0u
@@ -317,6 +318,17 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 if (peer_dst) peer_dst[idx] = val;
                 if (local_out) local_out[idx] = val;
             }
+        } else if (desc->opcode == OP_ADD) {
+            // WI-SB5 descriptor-linked fan-in: elementwise C = A + B over
+            // m*n elements. Used to sum row-parallel partials without any
+            // host round-trip.
+            const float* a = (const float*)desc->input_ptr;
+            const float* b = (const float*)desc->weight_ptr;
+            float* out = (float*)desc->output_ptr;
+            unsigned int elems = desc->m * desc->n;
+            for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+                out[idx] = a[idx] + b[idx];
+            }
         } else if (desc->opcode != OP_NOP) {
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
@@ -388,6 +400,7 @@ mod tests {
             ("OP_NORM", "4u"),
             ("OP_COMMFUSE", "5u"),
             ("OP_MOE", "6u"),
+            ("OP_ADD", "7u"),
         ] {
             let needle = format!("#define {name} {val}");
             assert!(
@@ -400,6 +413,11 @@ mod tests {
         assert!(
             src.contains("desc->opcode == OP_MOE"),
             "persistent kernel must dispatch on `desc->opcode == OP_MOE`",
+        );
+        // WI-SB5: the descriptor-linked fan-in arm must exist.
+        assert!(
+            src.contains("desc->opcode == OP_ADD"),
+            "persistent kernel must dispatch on `desc->opcode == OP_ADD`",
         );
         // The MoE arm must cast weight_ptr to moe_task_descriptor_t*.
         assert!(
