@@ -227,7 +227,7 @@ call is grounded.
 | SB4a layer pipeline | ☑ `decode_paged` boundary transfers + `segment_devices`; planner `absorb_short_runs`; parity gate (fp-tolerance cross-backend fake segments) + hop-bound gates | ☐ TTFT split-vs-unsplit both orders (blocked) | ☐ |
 | SB4b paged-per-segment | — | gated on SB4a numbers | ☐ |
 | SB5 real GEMM shards | **COMPLETE**: per-rank device GEMM shards; shard-residency cache (transposed operands pinned per rank device keyed layer/ordinal/slice); zero-copy activations; split_counts() remainder fix; device-side fan-in (cross-ordinal routed scratch + pairwise device adds) + device column gather (per-row bounce copies, RCCL-independent); per-rank handles satisfied by per-ordinal caches under pins; descriptor-linked fan-in proven via opcode-1 GEMMs + opcode-7 ADD through ScytheRingExec (gate `ring_row_parallel_descriptor_fanin_parity`, max-abs-diff 2.98e-7 at decode shapes). Parity on gfx1201+gfx1200: col 4.9e-7 / row 3.6e-7 / cached-reuse 4.9e-7. Occupancy read-out substitute recorded via rocprofv3 (rocprof-compute not installed) | — | ☑ |
-| SB6 persistent ring | **RESIDENT-WAVE FIXED**: bounded s_sleep backoff in empty-queue spin (root cause: unthrottled atomic busy-poll starved the single workgroup after idle gaps on RDNA4+ROCm7.2; NOT JIT flake, NOT head race — both disproven). Verified clean-boot: phase0=2/A=4/B=6 across idle gaps, parity 2.384e-7, shutdown clean; 3/3 ring suite + opcode-6 gate green. Eternal-kernel coexistence rules documented (no blocking H2D/DtoH/pinned-alloc against live wave) | production layer routing behind benchmark gate (GRIM_SCYTHE_RING=1) + ring-vs-direct decode benchmark | ◑ |
+| SB6 persistent ring | **RESIDENT-WAVE FIXED**: bounded s_sleep backoff in empty-queue spin (root cause: unthrottled atomic busy-poll starved the single workgroup after idle gaps on RDNA4+ROCm7.2; NOT JIT flake, NOT head race — both disproven). Verified clean-boot: phase0=2/A=4/B=6 across idle gaps, parity 2.384e-7, shutdown clean; 3/3 ring suite + opcode-6 gate green. Eternal-kernel coexistence rules documented (no blocking H2D/DtoH/pinned-alloc against live wave) | **COMPLETE** (2026-08-25): production F32 matmul routing behind `GRIM_SCYTHE_RING=1` (`device::scythe_route` bounded-wave channel; parity gate EXACT vs rocBLAS), ring-vs-direct decode benchmark run (`ring_vs_direct_decode` example) — verdict **no win at current kernel quality** (169×–91000× slower; single-workgroup reference GEMM + per-op publish sync), gate stays opt-in. Bonus Tier-0 find: split-K F32 corruption fixed (see AUDIT ledger row) | ☑ |
 
 ### Validation log
 
@@ -344,3 +344,31 @@ ON (opt-out =0).
 - All changes stay behind `GRIM_SCYTHE_INFERENCE`; rollback invariant
   (§setup-5) re-verified per WI keeps default-off credible until the verdict
   says otherwise.
+
+### Validation log addendum — 2026-08-25 (SB6 closeout + audit fixes)
+
+- **SB6 COMPLETE.** Production layer routing: `GRIM_SCYTHE_RING=1` reroutes
+  F32 `matmul_op` GEMMs through a per-ordinal bounded-wave ScytheRing channel
+  (`grim-backend-rocm/src/device/scythe_route.rs`). Parity gate
+  `production_ring_routing_matmul_parity`: EXACT match vs direct rocBLAS at
+  4×64×96 (0.0 diff). Ring-vs-direct decode benchmark
+  (`examples/ring_vs_direct_decode.rs`, release, gfx1201, 30 iters/shape):
+  ring is 169× (1×576×576) to 91048× (1×12288×4096) slower than direct —
+  the single-workgroup reference GEMM arm plus the per-op head-publish
+  stream sync dominate. **Verdict: no measured win; the gate stays opt-in.**
+  Competitive routing needs a multi-CU wave fan-out and/or resident mode to
+  amortize the publish sync.
+- **Audit fixes landed the same pass** (scythe-audit-fix-plan.md): F0
+  re-verified (5/5 ring suite incl. resident wave after kernel edits),
+  F8/F10 kvtransport pull-mode deadlock fixed (trait read methods + server
+  FETCH branch + client timeouts + disagg loopback gate), F9 scheduler
+  chunk accumulation fixed, F2 attention head_dim guard + error-path tail
+  advance, F3/F4 MoE descriptor device upload + three-pointer schedule
+  (e2e public-API gate at 2.3e-10), F6 dead softmax removed, F7 per-layer
+  bucket cache, F5 published_head removed.
+- **Bonus Tier-0 find**: `grim_split_k_reduction` was hard-typed `_Float16*`
+  — every F32 split-K matmul (m>1 or k>8192) silently corrupted its output
+  (~1e3-scale errors; e.g. 4×4096×4096, 1×4096×12288 were garbage on main).
+  Found by the new benchmark comparing ring vs direct against expectations.
+  Fixed with dtype-dispatched f32/bf16 reduction kernels; regression gate
+  `tests/split_k_matmul_parity.rs` (≤2.5e-7 vs CPU at all trigger shapes).

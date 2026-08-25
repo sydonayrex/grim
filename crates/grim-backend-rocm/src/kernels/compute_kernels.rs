@@ -454,6 +454,49 @@ extern "C" __global__ void grim_split_k_reduction(
     out[idx] = (_Float16)sum;
 }
 
+// Split-K partial reduction, dtype-specialized. The f16 kernel above is
+// the historical entry point; F32 and BF16 GEMMs must reduce their OWN
+// element types — routing them through the _Float16 entry read each f32
+// partial as half-precision pairs and wrote f16 bits into an f32 output
+// buffer (silent garbage for every F32 split-K GEMM, i.e. m > 1 or
+// k > 8192; found by the WI-SB6 ring-vs-direct benchmark 2026-08-25).
+extern "C" __global__ void grim_split_k_reduction_f32(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int m, int n, int split_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * n;
+    if (idx >= total) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < split_k; ++k) {
+        sum += partials[k * total + idx];
+    }
+    out[idx] = sum;
+}
+
+extern "C" __global__ void grim_split_k_reduction_bf16(
+    const unsigned short* __restrict__ partials,
+    unsigned short* __restrict__ out,
+    int m, int n, int split_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * n;
+    if (idx >= total) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < split_k; ++k) {
+        // bf16 -> f32 is a 16-bit left shift of the bit pattern.
+        unsigned int bits = ((unsigned int)partials[k * total + idx]) << 16;
+        sum += __uint_as_float(bits);
+    }
+    // f32 -> bf16 with round-to-nearest-even.
+    unsigned int s = __float_as_uint(sum);
+    unsigned int rounded = (s + 0x7fffu + ((s >> 16) & 1u)) >> 16;
+    out[idx] = (unsigned short)rounded;
+}
+
 extern "C" __global__ void grim_short_conv1d_causal_step(
     const float* x, const float* weight, const float* bias,
     float* conv_state, float* out, int batch, int channels, int kernel_size

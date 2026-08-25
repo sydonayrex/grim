@@ -269,6 +269,198 @@ fn ring_resident_wave_two_batches() {
     exec.shutdown().expect("shutdown");
 }
 
+/// F3+F4 (audit) end-to-end gate: opcode 6 driven through the REAL public
+/// Rust API — `MoETaskDescriptor::upload` (device-resident descriptor, F4),
+/// three independent schedule pointers (F3 Option A), `enqueue_via`,
+/// `ScytheRing::enqueue`, one bounded `run_batch` — and checked against a
+/// host reference of the Charon fused-grouped math. The pre-fix path handed
+/// the kernel a HOST pointer in `weight_ptr` and a contiguous schedule
+/// contract no producer ever emitted; the hand-packed device test could
+/// not catch either because it bypassed this API entirely.
+#[test]
+fn moe_opcode6_via_public_api_matches_host_reference() {
+    if !gpu_ready() {
+        return;
+    }
+    use grim_engine::scythe2::{MoETaskDescriptor, moe_quant_mode};
+
+    let hidden = 2usize;
+    let inter = 3usize;
+    let num_experts = 2usize;
+    let num_tokens = 2usize; // schedule slots (top_k = 1, no padding)
+
+    let mut exec = ScytheRingExec::new(8, 0).expect("ring exec");
+    let dev = RocmDevice::try_new(0).expect("dev");
+
+    // Deterministic operands.
+    let act: Vec<f32> = (0..num_tokens * hidden)
+        .map(|i| ((i % 5) as f32) * 0.3 - 0.4)
+        .collect();
+    let gate: Vec<f32> = (0..num_experts * inter * hidden)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let up: Vec<f32> = (0..num_experts * inter * hidden)
+        .map(|i| ((i % 6) as f32) * 0.15 - 0.2)
+        .collect();
+    let down: Vec<f32> = (0..num_experts * hidden * inter)
+        .map(|i| ((i % 8) as f32) * 0.12 - 0.45)
+        .collect();
+    let token_ids: Vec<u32> = vec![0, 1];
+    let expert_ids: Vec<u32> = vec![0, 1];
+    let weights: Vec<f32> = vec![0.8, 0.6];
+    let rsf = 0.9f32;
+
+    let u32_bytes = |v: &[u32]| -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_ne_bytes()).collect()
+    };
+    let u32_dtype = grim_tensor::dtype::DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: grim_tensor::dtype::Storage::Native,
+    };
+
+    let act_s = dev
+        .from_cpu(&act, &Shape::from_slice(&[num_tokens, hidden]), DType::F32)
+        .expect("act");
+    let gate_s = dev
+        .from_cpu(&gate, &Shape::from_slice(&[num_experts, inter * hidden]), DType::F32)
+        .expect("gate");
+    let up_s = dev
+        .from_cpu(&up, &Shape::from_slice(&[num_experts, inter * hidden]), DType::F32)
+        .expect("up");
+    let down_s = dev
+        .from_cpu(&down, &Shape::from_slice(&[num_experts, hidden * inter]), DType::F32)
+        .expect("down");
+    let tids_s = dev
+        .from_cpu_bytes(&u32_bytes(&token_ids), &Shape::from_slice(&[num_tokens]), u32_dtype.clone())
+        .expect("token ids");
+    let eids_s = dev
+        .from_cpu_bytes(&u32_bytes(&expert_ids), &Shape::from_slice(&[num_tokens]), u32_dtype.clone())
+        .expect("expert ids");
+    let ws_s = dev
+        .from_cpu(&weights, &Shape::from_slice(&[num_tokens]), DType::F32)
+        .expect("weights");
+    // Charon accumulates with atomicAdd — the output MUST start zeroed.
+    let out = dev
+        .from_cpu(&vec![0f32; num_tokens * hidden], &Shape::from_slice(&[num_tokens, hidden]), DType::F32)
+        .expect("out");
+
+    let moe = MoETaskDescriptor {
+        hidden: hidden as u32,
+        inter: inter as u32,
+        num_tokens: num_tokens as u32,
+        // Only block 0 of the grouped schedule exists (single-wave launch),
+        // so block_size must cover every slot.
+        block_size: num_tokens as u32,
+        num_experts: num_experts as u32,
+        top_k: 1,
+        quant_mode: moe_quant_mode::FP32,
+        routed_scaling_factor: rsf,
+        gate_w_ptr: dev_ptr(gate_s.as_ref()),
+        up_w_ptr: dev_ptr(up_s.as_ref()),
+        down_w_ptr: dev_ptr(down_s.as_ref()),
+        token_ids_ptr: dev_ptr(tids_s.as_ref()),
+        expert_ids_ptr: dev_ptr(eids_s.as_ref()),
+        weights_ptr: dev_ptr(ws_s.as_ref()),
+    };
+    moe.validate().expect("descriptor must validate");
+    // F4: the descriptor itself is uploaded to device memory and the DEVICE
+    // address is what rides the ring.
+    let moe_dev = moe.upload(&dev).expect("MoE descriptor upload");
+
+    let task = MoETaskDescriptor::enqueue_via(moe_dev, dev_ptr(act_s.as_ref()), dev_ptr(out.as_ref()), 0);
+    let slot = exec.ring.enqueue(task).expect("enqueue");
+    assert_eq!(slot, 0);
+    let drained = exec.run_batch().expect("run batch");
+    assert_eq!(drained, 1);
+
+    // Host reference mirroring grim_moe_fused_grouped_device:
+    // out[t][h] = rsf * w_t * Σ_j down_e[h*inter+j] * silu(gate_e[j]·a_t) * (up_e[j]·a_t)
+    let got = out.to_cpu_vec_f32().expect("readback");
+    let mut want = vec![0f32; num_tokens * hidden];
+    for (&t, &e) in token_ids.iter().zip(expert_ids.iter()) {
+        let (t, e) = (t as usize, e as usize);
+        let w = weights[t];
+        for h in 0..hidden {
+            let mut acc = 0f32;
+            for j in 0..inter {
+                let mut g = 0f32;
+                let mut u = 0f32;
+                for i in 0..hidden {
+                    g += gate[e * inter * hidden + j * hidden + i] * act[t * hidden + i];
+                    u += up[e * inter * hidden + j * hidden + i] * act[t * hidden + i];
+                }
+                let silu_g = g / (1.0 + (-g).exp());
+                acc += down[e * hidden * inter + h * inter + j] * silu_g * u;
+            }
+            want[t * hidden + h] = rsf * w * acc;
+        }
+    }
+    let d = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("[f3f4] opcode-6 public-API MoE max_abs_diff={d:.3e}");
+    assert!(d < 1e-4, "opcode-6 via public API diverged: {d:.3e}");
+}
+
+/// WI-SB6 production routing gate: with `GRIM_SCYTHE_RING=1`,
+/// `RocmDevice::matmul_op` itself must ride the persistent ring and produce
+/// byte-compatible results with the direct rocBLAS path. This is the seam
+/// real decode layers flow through when the flag is set.
+#[test]
+fn production_ring_routing_matmul_parity() {
+    if !gpu_ready() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("dev");
+
+    let m = 4usize;
+    let k = 64usize;
+    let n = 96usize;
+    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.2 - 0.8).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32) * 0.05 - 0.3).collect();
+
+    let a = dev
+        .from_cpu(&a_data, &Shape::from_slice(&[m, k]), DType::F32)
+        .expect("a");
+    let b = dev
+        .from_cpu(&b_data, &Shape::from_slice(&[k, n]), DType::F32)
+        .expect("b");
+    let out_shape = Shape::from_slice(&[m, n]);
+
+    // Direct rocBLAS baseline (BackendDevice::matmul → matmul_op).
+    let (direct, handle) = dev
+        .matmul(a.as_ref(), b.as_ref(), &out_shape)
+        .expect("direct matmul");
+    handle.synchronize().expect("direct sync");
+    let direct = direct.to_cpu_vec_f32().expect("direct readback");
+
+    // Ring-routed path: flip the production gate for the duration of this
+    // test (edition-2024 env mutation is unsafe; this binary has no other
+    // matmul callers, so the process-global flag cannot poison a sibling).
+    unsafe { std::env::set_var("GRIM_SCYTHE_RING", "1") };
+    let routed = {
+        let (out, handle) = dev
+            .matmul(a.as_ref(), b.as_ref(), &out_shape)
+            .expect("ring-routed matmul");
+        handle.synchronize().expect("routed sync");
+        out.to_cpu_vec_f32().expect("routed readback")
+    };
+    unsafe { std::env::remove_var("GRIM_SCYTHE_RING") };
+
+    let d = direct
+        .iter()
+        .zip(routed.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    println!("[sb6] production ring-vs-direct matmul max_abs_diff={d:.3e}");
+    assert!(
+        d < 1e-4,
+        "GRIM_SCYTHE_RING=1 routing must match direct rocBLAS: {d:.3e}"
+    );
+}
+
 /// WI-SB5/SB6 convergence: descriptor-linked row-parallel fan-in.
 ///
 /// Row-shard GEMMs run as opcode-1 descriptors writing disjoint partials

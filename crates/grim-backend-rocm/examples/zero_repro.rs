@@ -174,8 +174,7 @@ fn main() {
         // < vocab and reproducible for identical seeds; a broken/zeroing
         // launch shows up as token==0 every time or a fault.
         use grim_backend_rocm::{
-            memory::storage::RocmStorage,
-            sample_logits_on_device_at, BackendDevice as _, BackendStorage as _,
+            memory::storage::RocmStorage, sample_logits_on_device_at, BackendDevice as _,
         };
         let vocab = 65536usize;
         let dev = std::sync::Arc::new(
@@ -184,18 +183,16 @@ fn main() {
         );
         let data: Vec<f32> = (0..vocab).map(|i| ((i % 997) as f32) * 0.001).collect();
         for t in 0..trials {
-            let shape = grim_tensor::Shape::from_slice(&[vocab]);
-            let st = RocmStorage::copy_from_host(
-                &data,
-                &shape,
-                grim_tensor::DType::F32.into(),
-                &dev.allocator,
-                dev.ordinal,
-            )
-            .expect("logits upload");
+            let st = dev
+                .from_cpu(&data, &grim_tensor::Shape::from_slice(&[vocab]), grim_tensor::DType::F32)
+                .expect("logits upload");
+            let st = st
+                .as_any()
+                .downcast_ref::<RocmStorage>()
+                .expect("rocml storage");
             let tok = sample_logits_on_device_at(
                 &dev,
-                Box::new(st) as Box<dyn grim_tensor::BackendStorage>,
+                st,
                 vocab,
                 0.7,
                 0,
@@ -204,8 +201,9 @@ fn main() {
                 t as u32,
             );
             match tok {
-                Ok(id) => println!("  trial {t}: sampled token {id} {}",
+                Ok(Some(id)) => println!("  trial {t}: sampled token {id} {}",
                     if id < 997 { "(in weighted support)" } else { "(OUTSIDE support — suspect)" }),
+                Ok(None) => println!("  trial {t}: sampler declined (invalid input)"),
                 Err(e) => println!("  trial {t}: SAMPLE FAIL {e}"),
             }
         }

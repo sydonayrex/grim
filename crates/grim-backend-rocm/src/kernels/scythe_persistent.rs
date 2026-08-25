@@ -96,8 +96,11 @@ struct __align__(32) moe_task_descriptor_t {
     unsigned long long gate_w_ptr;
     unsigned long long up_w_ptr;
     unsigned long long down_w_ptr;
-    unsigned long long schedule_ptr;
-    unsigned int _reserved;
+    // F3 (audit) Option A: three INDEPENDENT schedule pointers, matching
+    // the three-buffer convention every real Charon call site uploads.
+    unsigned long long token_ids_ptr;
+    unsigned long long expert_ids_ptr;
+    unsigned long long weights_ptr;
 };
 
 // Opcodes (mirror grim_engine::scythe2 doc comment).
@@ -226,15 +229,15 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             const float* up_w   = (const float*)moe->up_w_ptr;
             const float* down_w = (const float*)moe->down_w_ptr;
 
-            // The schedule struct holds sorted_token_ids, sorted_expert_ids,
-            // sorted_weights contiguously; the host lays them out in that
-            // order. The device reads three pointers off schedule_ptr.
+            // F3 (audit): the schedule arrives as three independent device
+            // buffers — the same three-pointer convention the host-side
+            // Charon call sites use. No contiguous packing contract.
             const unsigned int* sorted_token_ids =
-                (const unsigned int*)moe->schedule_ptr;
+                (const unsigned int*)moe->token_ids_ptr;
             const unsigned int* sorted_expert_ids =
-                (const unsigned int*)(moe->schedule_ptr + sizeof(unsigned int) * moe->num_tokens);
+                (const unsigned int*)moe->expert_ids_ptr;
             const float* sorted_weights =
-                (const float*)(moe->schedule_ptr + 2ull * sizeof(unsigned int) * moe->num_tokens);
+                (const float*)moe->weights_ptr;
 
             // Branch on quant_mode — FP32 here, quantized variants would
             // call grim_moe_fused_grouped_{fp8,mxfp4,mxfp8,q80,iqk}.
@@ -256,17 +259,20 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             unsigned int M = desc->m;
             unsigned int N = desc->n;
             unsigned int K = desc->k;
-            for (unsigned int m_idx = threadIdx.x; m_idx < M; m_idx += blockDim.x) {
-                for (unsigned int n_idx = 0; n_idx < N; ++n_idx) {
-                    float sum = 0.0f;
-                    for (unsigned int k_idx = 0; k_idx < K; ++k_idx) {
-                        float b_val = (desc->opcode == OP_COL_GEMM)
-                            ? b[k_idx * N + n_idx]
-                            : b[n_idx * K + k_idx];
-                        sum += a[m_idx * K + k_idx] * b_val;
-                    }
-                    c[m_idx * N + n_idx] = sum;
+            // WI-SB6: stride the full M*N output space across the block.
+            // The previous m-major loop left threads >= M idle (a decode
+            // GEMM with m=1 ran on ONE thread of the 128-wide wave).
+            for (unsigned int idx = threadIdx.x; idx < M * N; idx += blockDim.x) {
+                unsigned int m_idx = idx / N;
+                unsigned int n_idx = idx % N;
+                float sum = 0.0f;
+                for (unsigned int k_idx = 0; k_idx < K; ++k_idx) {
+                    float b_val = (desc->opcode == OP_COL_GEMM)
+                        ? b[k_idx * N + n_idx]
+                        : b[n_idx * K + k_idx];
+                    sum += a[m_idx * K + k_idx] * b_val;
                 }
+                c[m_idx * N + n_idx] = sum;
             }
         } else if (desc->opcode == OP_NORM) {
             const float* a = (const float*)desc->input_ptr;
@@ -287,6 +293,17 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 }
             }
         } else if (desc->opcode == OP_ATTN) {
+            // F2 (audit): the flash-attention accumulator below is a fixed
+            // 256-lane register array; head_dim beyond that SILENTLY
+            // truncated outputs. Reject at claim time so the failure is
+            // loud, and let the tail still advance (see completion block).
+            if (desc->k > 256u) {
+                if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
+                __syncthreads();
+                if (threadIdx.x == 0) atomicAdd(tail_ptr, 1);
+                __syncthreads();
+                continue;
+            }
             const float* q = (const float*)desc->input_ptr;
             const float* k_tensor = (const float*)desc->weight_ptr;
             const float* v_tensor = (const float*)desc->peer_ptr;
@@ -352,11 +369,16 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
 
-        // Mark complete and advance tail.
+        // Mark complete and advance tail. The tail advances for ERRORED
+        // tasks too: an arm that sets ST_ERROR and skips the tail bump
+        // leaves tail < head forever, so the wave can never terminate (the
+        // unknown-opcode arm had exactly this wedge).
         __syncthreads();
-        if (threadIdx.x == 0 && desc->status == ST_RUNNING) {
-            __threadfence();
-            atomicExch((unsigned int*)&desc->status, ST_COMPLETE);
+        if (threadIdx.x == 0) {
+            if (desc->status == ST_RUNNING) {
+                __threadfence();
+                atomicExch((unsigned int*)&desc->status, ST_COMPLETE);
+            }
             atomicAdd(tail_ptr, 1);
         }
         __syncthreads();
@@ -393,7 +415,9 @@ mod tests {
             "gate_w_ptr",
             "up_w_ptr",
             "down_w_ptr",
-            "schedule_ptr",
+            "token_ids_ptr",
+            "expert_ids_ptr",
+            "weights_ptr",
         ] {
             assert!(
                 src.contains(field),
@@ -473,21 +497,48 @@ mod tests {
     }
 
     #[test]
-    fn persistent_dispatch_schedule_offsets_are_fielded_correctly() {
-        // The schedule struct is three contiguous arrays: sorted_token_ids
-        // (u32[num_tokens]), sorted_expert_ids (u32[num_tokens]),
-        // sorted_weights (f32[num_tokens]). The device must read them at
-        // offsets 0, num_tokens*4, 2*num_tokens*4 bytes from schedule_ptr.
-        // Pin that arithmetic so a mutant that drops the stride or mis-types
-        // the cast is caught.
+    fn persistent_dispatch_schedule_reads_three_named_pointers() {
+        // F3 (audit) Option A: the schedule is three INDEPENDENT buffers —
+        // sorted_token_ids (u32[]), sorted_expert_ids (u32[]),
+        // sorted_weights (f32[]) — read via the descriptor's own
+        // token_ids_ptr / expert_ids_ptr / weights_ptr fields. Pin the
+        // named-field reads so a mutant that reintroduces the (never
+        // produced by any host path) contiguous-offset arithmetic fails
+        // here.
+        let src = KERNEL_SOURCE;
+        for (field, cast) in [
+            ("token_ids_ptr", "const unsigned int*"),
+            ("expert_ids_ptr", "const unsigned int*"),
+            ("weights_ptr", "const float*"),
+        ] {
+            let needle = format!("=\n                ({cast}*)moe->{field}");
+            // whitespace-tolerant check: field read directly off the descriptor
+            assert!(
+                src.contains(&format!("moe->{field}")),
+                "schedule arm must read `{field}` off the descriptor"
+            );
+        }
+        assert!(
+            !src.contains("schedule_ptr +"),
+            "the contiguous-offset schedule contract must stay deleted"
+        );
+    }
+
+    #[test]
+    fn persistent_dispatch_attention_rejects_head_dim_over_256() {
+        // F2 (audit): head_dim > 256 must set ST_ERROR at claim time — the
+        // accumulator is a fixed 256-lane register array and used to
+        // silently truncate.
         let src = KERNEL_SOURCE;
         assert!(
-            src.contains("schedule_ptr + sizeof(unsigned int) * moe->num_tokens"),
-            "sorted_expert_ids must be read at schedule_ptr + num_tokens*4 (u32 stride)",
+            src.contains("if (desc->k > 256u)"),
+            "OP_ATTN arm must guard head_dim > 256",
         );
+        // ... and the errored task must still advance the tail so the wave
+        // cannot wedge on a permanently-unclaimed slot.
         assert!(
-            src.contains("schedule_ptr + 2ull * sizeof(unsigned int) * moe->num_tokens"),
-            "sorted_weights must be read at schedule_ptr + 2*num_tokens*4 (after both u32 arrays)",
+            src.contains("atomicAdd(tail_ptr, 1);\n            }\n        }\n        __syncthreads();") || src.contains("tail advances for ERRORED"),
+            "completion block must advance tail for errored tasks"
         );
     }
 
@@ -563,14 +614,12 @@ mod tests {
         let output2 = dev
             .from_cpu(&[0.0f32], &Shape::new(vec![1]), DType::F32)
             .unwrap();
-        let schedule = {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&0u32.to_ne_bytes());
-            bytes.extend_from_slice(&0u32.to_ne_bytes());
-            bytes.extend_from_slice(&1.0f32.to_ne_bytes());
-            dev.from_cpu_bytes(&bytes, &Shape::new(vec![3]), u32_dtype.clone())
-                .unwrap()
-        };
+        // F3: the schedule is THREE independent device buffers.
+        let token_ids = u32_storage(&[0u32]);
+        let expert_ids = u32_storage(&[0u32]);
+        let weights = dev
+            .from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
         let mut moe = vec![0u8; 96];
         moe[0..4].copy_from_slice(&1u32.to_ne_bytes());
         moe[4..8].copy_from_slice(&1u32.to_ne_bytes());
@@ -581,7 +630,9 @@ mod tests {
         moe[32..40].copy_from_slice(&gate.device_ptr().unwrap().to_ne_bytes());
         moe[40..48].copy_from_slice(&up.device_ptr().unwrap().to_ne_bytes());
         moe[48..56].copy_from_slice(&down.device_ptr().unwrap().to_ne_bytes());
-        moe[56..64].copy_from_slice(&schedule.device_ptr().unwrap().to_ne_bytes());
+        moe[56..64].copy_from_slice(&token_ids.device_ptr().unwrap().to_ne_bytes());
+        moe[64..72].copy_from_slice(&expert_ids.device_ptr().unwrap().to_ne_bytes());
+        moe[72..80].copy_from_slice(&weights.device_ptr().unwrap().to_ne_bytes());
         let moe_storage = dev
             .from_cpu_bytes(
                 &moe,
@@ -637,6 +688,160 @@ mod tests {
         assert!(
             (result2 - expected).abs() < 1e-4,
             "second opcode-6 output {result2} != {expected}"
+        );
+    }
+
+    /// F2 (audit): OP_ATTN must (a) produce correct causal attention at a
+    /// typical head_dim (128) and (b) reject head_dim > 256 at claim time
+    /// with ST_ERROR *while still advancing the tail* — the fixed
+    /// 256-lane accumulator used to silently truncate, and an errored task
+    /// that skips its tail bump wedges the wave forever.
+    #[test]
+    fn rocm_persistent_attention_head_dim_guard_device_gated() {
+        use crate::RocmDevice;
+        use grim_tensor::dtype::{ArithType, DType, Storage};
+        use grim_tensor::{BackendDevice, Shape};
+
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if !crate::gpu_test_enabled() {
+            return;
+        }
+
+        let u32_dtype = DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        };
+        let u32_storage = |values: &[u32]| {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            dev.from_cpu_bytes(&bytes, &Shape::new(vec![values.len()]), u32_dtype.clone())
+                .unwrap()
+        };
+        /// Bit-pattern D2H for the u32 control scalars (to_cpu_vec_f32
+        /// memcpys integer storage verbatim into f32 lanes).
+        fn read_u32_bits(s: &dyn grim_tensor::backend::BackendStorage) -> u32 {
+            use grim_tensor::backend::BackendStorage;
+            s.to_cpu_vec_f32().unwrap()[0].to_bits()
+        }
+
+        // ── Case A: head_dim = 128 computes correct causal attention ──
+        let seq = 2usize;
+        let head_dim = 128usize;
+        let q: Vec<f32> = (0..seq * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.125).collect();
+        let k: Vec<f32> = (0..seq * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
+        let v: Vec<f32> = (0..seq * head_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.5).collect();
+        let mut reference = vec![0.0f32; seq * head_dim];
+        let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+        for i in 0..seq {
+            let mut scores = Vec::with_capacity(i + 1);
+            for j in 0..=i {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[i * head_dim + d] * k[j * head_dim + d];
+                }
+                scores.push(dot * inv_sqrt_d);
+            }
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (j, e) in exps.iter().enumerate() {
+                    acc += e * v[j * head_dim + d];
+                }
+                reference[i * head_dim + d] = acc / sum;
+            }
+        }
+
+        let q_s = dev.from_cpu(&q, &Shape::new(vec![q.len()]), DType::F32).unwrap();
+        let k_s = dev.from_cpu(&k, &Shape::new(vec![k.len()]), DType::F32).unwrap();
+        let v_s = dev.from_cpu(&v, &Shape::new(vec![v.len()]), DType::F32).unwrap();
+        let out = dev
+            .from_cpu(&vec![-1.0f32; seq * head_dim], &Shape::new(vec![seq * head_dim]), DType::F32)
+            .unwrap();
+
+        let mut slot = vec![0u8; 64];
+        slot[0..4].copy_from_slice(&3u32.to_ne_bytes()); // opcode = OP_ATTN
+        slot[4..8].copy_from_slice(&(seq as u32).to_ne_bytes()); // m = seq_len
+        slot[8..12].copy_from_slice(&1u32.to_ne_bytes()); // n = num_heads
+        slot[12..16].copy_from_slice(&(head_dim as u32).to_ne_bytes()); // k = head_dim
+        slot[16..24].copy_from_slice(&q_s.device_ptr().unwrap().to_ne_bytes());
+        slot[24..32].copy_from_slice(&k_s.device_ptr().unwrap().to_ne_bytes());
+        slot[32..40].copy_from_slice(&out.device_ptr().unwrap().to_ne_bytes());
+        slot[40..48].copy_from_slice(&v_s.device_ptr().unwrap().to_ne_bytes());
+        let slots = dev
+            .from_cpu_bytes(&slot, &Shape::new(vec![64]), DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            })
+            .unwrap();
+
+        let tail = u32_storage(&[0]);
+        let head = u32_storage(&[1]);
+        let stop = u32_storage(&[0]);
+        let handle = dev
+            .launch_scythe_persistent_dispatch(
+                slots.as_ref(),
+                1,
+                tail.as_ref(),
+                head.as_ref(),
+                stop.as_ref(),
+                1,
+                0,
+            )
+            .unwrap();
+        handle.synchronize().unwrap();
+
+        let got = out.to_cpu_vec_f32().unwrap();
+        let mut max_diff = 0.0f32;
+        for (g, r) in got.iter().zip(reference.iter()) {
+            max_diff = max_diff.max((g - r).abs());
+        }
+        assert!(
+            max_diff < 1e-3,
+            "head_dim=128 attention must match host reference (max diff {max_diff})"
+        );
+
+        // ── Case B: head_dim = 512 errors AND releases its slot ──
+        // Pointers reference the small Case-A buffers — the guard fires
+        // before any dereference, so nothing is read or written.
+        let mut bad_slot = vec![0u8; 64];
+        bad_slot[0..4].copy_from_slice(&3u32.to_ne_bytes());
+        bad_slot[4..8].copy_from_slice(&(seq as u32).to_ne_bytes());
+        bad_slot[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        bad_slot[12..16].copy_from_slice(&512u32.to_ne_bytes()); // head_dim > 256
+        bad_slot[16..24].copy_from_slice(&q_s.device_ptr().unwrap().to_ne_bytes());
+        bad_slot[24..32].copy_from_slice(&k_s.device_ptr().unwrap().to_ne_bytes());
+        bad_slot[32..40].copy_from_slice(&out.device_ptr().unwrap().to_ne_bytes());
+        bad_slot[40..48].copy_from_slice(&v_s.device_ptr().unwrap().to_ne_bytes());
+        let bad_slots = dev
+            .from_cpu_bytes(&bad_slot, &Shape::new(vec![64]), DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            })
+            .unwrap();
+        let tail_b = u32_storage(&[0]);
+        let head_b = u32_storage(&[1]);
+        let stop_b = u32_storage(&[0]);
+        let handle_b = dev
+            .launch_scythe_persistent_dispatch(
+                bad_slots.as_ref(),
+                1,
+                tail_b.as_ref(),
+                head_b.as_ref(),
+                stop_b.as_ref(),
+                1,
+                0,
+            )
+            .unwrap();
+        handle_b.synchronize().unwrap();
+
+        let tail_after = read_u32_bits(tail_b.as_ref());
+        assert_eq!(
+            tail_after, 1,
+            "errored attention task must still advance the tail (wedge fix)"
         );
     }
 
