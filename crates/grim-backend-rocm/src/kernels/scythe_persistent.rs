@@ -163,7 +163,15 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     __shared__ unsigned int claimed_slot;
     __shared__ unsigned int active;
     __shared__ unsigned int terminate;
-    if (threadIdx.x == 0) terminate = 0;
+    // WI-SB6 idle backoff: unthrottled global atomics from a tight spin
+    // wedged the wave on RDNA4 under ROCm 7.2 (idle-gap-then-wedge,
+    // scythe2 plan log 2026-08-24). Exponential s_sleep backoff, capped,
+    // resets the moment a task claims.
+    __shared__ unsigned int backoff_shift;
+    if (threadIdx.x == 0) {
+        terminate = 0;
+        backoff_shift = 0;
+    }
     __syncthreads();
     for (unsigned int iteration = 0; iteration < max_tasks; ++iteration) {
         if (atomicAdd((unsigned int*)stop_ptr, 0) != 0u) break;
@@ -174,8 +182,10 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (tail != head) {
                 claimed_slot = tail & (capacity - 1);
                 scythe_task_descriptor_t* candidate = &slots[claimed_slot];
-                if (atomicCAS((unsigned int*)&candidate->status, ST_PENDING, ST_RUNNING) == ST_PENDING)
+                if (atomicCAS((unsigned int*)&candidate->status, ST_PENDING, ST_RUNNING) == ST_PENDING) {
                     active = 1;
+                    backoff_shift = 0; // snap back to fast polling on real work
+                }
             }
         }
         __syncthreads();
@@ -187,6 +197,15 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             // the worker parks here until the host publishes new work via
             // head, and exits only through stop_ptr (or max_tasks).
             if (terminate && !resident) break;
+            // Bounded exponential backoff: throttle the global atomic poll
+            if (threadIdx.x == 0) {
+                // s_sleep requires a compile-time-constant duration; express
+                // the exponential backoff as a repeat count of unit sleeps.
+                for (unsigned int r = 0; r < (1u << backoff_shift); ++r) {
+                    __builtin_amdgcn_s_sleep(64u);
+                }
+                if (backoff_shift < 6u) backoff_shift += 1u;
+            }
             continue;
         }
         scythe_task_descriptor_t* desc = &slots[claimed_slot];
