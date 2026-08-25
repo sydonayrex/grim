@@ -129,7 +129,8 @@ mod tests {
             match dev.jit_compile_or_cache(&cumulative.clone(), &probe_entry, None) {
                 Ok((path, _)) => {
                     let bytes = std::fs::read(&path).unwrap_or_default();
-                    let has = String::from_utf8_lossy(&bytes).contains("grim_fused_dequant_gemm_q4k");
+                    let has =
+                        String::from_utf8_lossy(&bytes).contains("grim_fused_dequant_gemm_q4k");
                     eprintln!("BISECT idx={i} bytes={} q4k_sym={}", bytes.len(), has);
                     if !has {
                         eprintln!("BISECT culprit introduced at idx={i}");
@@ -142,7 +143,6 @@ mod tests {
                 }
             }
         }
-
     }
 
     /// TEMP-DIAG (GGUF fault hunt): minimal M=1,N=16,K=256 launch through the
@@ -168,8 +168,10 @@ mod tests {
             arith: grim_tensor::ArithType::F32,
             storage: grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K),
         };
-        let alloc =
-            std::sync::Arc::new(crate::memory::allocator::RocmCachingAllocator::new(0, 1 << 30));
+        let alloc = std::sync::Arc::new(crate::memory::allocator::RocmCachingAllocator::new(
+            0,
+            1 << 30,
+        ));
         let a_s = crate::memory::storage::RocmStorage::copy_from_host(
             &a_data,
             &Shape::new(vec![M, K]),

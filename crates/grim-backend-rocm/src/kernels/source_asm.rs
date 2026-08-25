@@ -56,6 +56,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::scythe_persistent::KERNEL_SOURCE);
     s.push_str(crate::kernels::flash_decode::KERNEL_SOURCE);
     s.push_str(crate::kernels::mla_decode::KERNEL_SOURCE);
+    s.push_str(crate::kernels::gptq_gemm::GPTQ_GEMM_KERNEL_SOURCE);
     s.push_str(crate::kernels::marlin_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::bitnet_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::extend_attention::KERNEL_SOURCE);

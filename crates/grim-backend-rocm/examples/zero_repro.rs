@@ -15,13 +15,13 @@
 
 use grim_backend_rocm::{
     device::handles::{
-        hipDeviceSynchronize, hipFree, hipMalloc, hipMemcpy, hipModuleGetFunction,
-        hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, HipMemcpyKind,
+        HipMemcpyKind, hipDeviceSynchronize, hipFree, hipMalloc, hipMemcpy, hipModuleGetFunction,
+        hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload,
     },
     device::util::DeviceGuard,
     jit_compile_hsaco,
 };
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 
 const SRC_TMPL: &str = r#"
 // grim_zero_repro probe {TAG}
@@ -33,7 +33,13 @@ extern "C" __global__ void grim_zero_repro(float* out, const float* in, int n) {
 
 const N: usize = 64;
 
-fn run_trial(device_ordinal: i32, gcn: &str, tag: &str, warm_src: Option<&str>, own_stream: bool) -> bool {
+fn run_trial(
+    device_ordinal: i32,
+    gcn: &str,
+    tag: &str,
+    warm_src: Option<&str>,
+    own_stream: bool,
+) -> bool {
     let source = match warm_src {
         Some(s) => s.to_string(),
         None => SRC_TMPL.replace("{TAG}", tag),
@@ -60,7 +66,12 @@ fn run_trial(device_ordinal: i32, gcn: &str, tag: &str, warm_src: Option<&str>, 
         let ones = vec![1.0f32; N];
         let fill = vec![41.0f32; N];
         hipMemcpy(d_in, ones.as_ptr() as _, N * 4, HipMemcpyKind::HostToDevice);
-        hipMemcpy(d_out, fill.as_ptr() as _, N * 4, HipMemcpyKind::HostToDevice);
+        hipMemcpy(
+            d_out,
+            fill.as_ptr() as _,
+            N * 4,
+            HipMemcpyKind::HostToDevice,
+        );
         hipDeviceSynchronize();
 
         let path_c = CString::new(hsaco_path.to_str().unwrap()).unwrap();
@@ -83,7 +94,11 @@ fn run_trial(device_ordinal: i32, gcn: &str, tag: &str, warm_src: Option<&str>, 
                 0
             );
         }
-        let target = if own_stream { stream } else { std::ptr::null_mut() };
+        let target = if own_stream {
+            stream
+        } else {
+            std::ptr::null_mut()
+        };
 
         let (mut out_p, mut in_p) = (d_out, d_in);
         let mut n_i = N as i32;
@@ -150,8 +165,15 @@ fn run_trial(device_ordinal: i32, gcn: &str, tag: &str, warm_src: Option<&str>, 
         let ok2 = rc2 == 0 && got2[0] == 8.0;
         println!(
             "  trial {tag}: launch_rc={rc} out[0]={} | relaunch out[0]={} {}",
-            got[0], got2[0],
-            if ok1 { "OK" } else if ok2 { "FIRST-LAUNCH LOST" } else { "BOTH DEAD" }
+            got[0],
+            got2[0],
+            if ok1 {
+                "OK"
+            } else if ok2 {
+                "FIRST-LAUNCH LOST"
+            } else {
+                "BOTH DEAD"
+            }
         );
         ok1
     }
@@ -174,17 +196,20 @@ fn main() {
         // < vocab and reproducible for identical seeds; a broken/zeroing
         // launch shows up as token==0 every time or a fault.
         use grim_backend_rocm::{
-            memory::storage::RocmStorage, sample_logits_on_device_at, BackendDevice as _,
+            BackendDevice as _, memory::storage::RocmStorage, sample_logits_on_device_at,
         };
         let vocab = 65536usize;
         let dev = std::sync::Arc::new(
-            grim_backend_rocm::RocmDevice::try_new(ordinal as usize)
-                .expect("try_new"),
+            grim_backend_rocm::RocmDevice::try_new(ordinal as usize).expect("try_new"),
         );
         let data: Vec<f32> = (0..vocab).map(|i| ((i % 997) as f32) * 0.001).collect();
         for t in 0..trials {
             let st = dev
-                .from_cpu(&data, &grim_tensor::Shape::from_slice(&[vocab]), grim_tensor::DType::F32)
+                .from_cpu(
+                    &data,
+                    &grim_tensor::Shape::from_slice(&[vocab]),
+                    grim_tensor::DType::F32,
+                )
                 .expect("logits upload");
             let st = st
                 .as_any()
@@ -201,8 +226,14 @@ fn main() {
                 t as u32,
             );
             match tok {
-                Ok(Some(id)) => println!("  trial {t}: sampled token {id} {}",
-                    if id < 997 { "(in weighted support)" } else { "(OUTSIDE support — suspect)" }),
+                Ok(Some(id)) => println!(
+                    "  trial {t}: sampled token {id} {}",
+                    if id < 997 {
+                        "(in weighted support)"
+                    } else {
+                        "(OUTSIDE support — suspect)"
+                    }
+                ),
                 Ok(None) => println!("  trial {t}: sampler declined (invalid input)"),
                 Err(e) => println!("  trial {t}: SAMPLE FAIL {e}"),
             }

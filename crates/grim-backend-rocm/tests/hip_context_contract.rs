@@ -188,7 +188,10 @@ fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
     const ALLOWED_UNGUARDED: &[&str] = &["try_new", "fallback", "build"];
 
     let audited: &[(&str, &str)] = &[
-        ("device/roc_device.rs", include_str!("../src/device/roc_device.rs")),
+        (
+            "device/roc_device.rs",
+            include_str!("../src/device/roc_device.rs"),
+        ),
         ("p2p_route.rs", include_str!("../src/p2p_route.rs")),
     ];
 

@@ -1,5 +1,6 @@
 //! Model checkpoint parsers, tokenizers, metadata headers, and format converters (.gguf, .safetensors, .grim).
 
+pub mod awq;
 pub mod bolt_on;
 pub mod convert;
 pub mod format;
@@ -16,6 +17,7 @@ pub mod tprov;
 pub mod train;
 pub mod weight_format;
 
+pub use awq::{AwqConfig, AwqProvider, AwqTensorInfo, pack_awq_group_int};
 pub use ftw::{FtwDirectLoader, FtwHeader, FtwHostBank, FtwQuantFormat};
 pub use torch::{PthProvider, TorchTensorEntry};
 

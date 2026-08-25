@@ -537,7 +537,9 @@ mod tests {
         // ... and the errored task must still advance the tail so the wave
         // cannot wedge on a permanently-unclaimed slot.
         assert!(
-            src.contains("atomicAdd(tail_ptr, 1);\n            }\n        }\n        __syncthreads();") || src.contains("tail advances for ERRORED"),
+            src.contains(
+                "atomicAdd(tail_ptr, 1);\n            }\n        }\n        __syncthreads();"
+            ) || src.contains("tail advances for ERRORED"),
             "completion block must advance tail for errored tasks"
         );
     }
@@ -729,9 +731,15 @@ mod tests {
         // ── Case A: head_dim = 128 computes correct causal attention ──
         let seq = 2usize;
         let head_dim = 128usize;
-        let q: Vec<f32> = (0..seq * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.125).collect();
-        let k: Vec<f32> = (0..seq * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
-        let v: Vec<f32> = (0..seq * head_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.5).collect();
+        let q: Vec<f32> = (0..seq * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+            .collect();
+        let k: Vec<f32> = (0..seq * head_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.25)
+            .collect();
+        let v: Vec<f32> = (0..seq * head_dim)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.5)
+            .collect();
         let mut reference = vec![0.0f32; seq * head_dim];
         let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
         for i in 0..seq {
@@ -755,11 +763,21 @@ mod tests {
             }
         }
 
-        let q_s = dev.from_cpu(&q, &Shape::new(vec![q.len()]), DType::F32).unwrap();
-        let k_s = dev.from_cpu(&k, &Shape::new(vec![k.len()]), DType::F32).unwrap();
-        let v_s = dev.from_cpu(&v, &Shape::new(vec![v.len()]), DType::F32).unwrap();
+        let q_s = dev
+            .from_cpu(&q, &Shape::new(vec![q.len()]), DType::F32)
+            .unwrap();
+        let k_s = dev
+            .from_cpu(&k, &Shape::new(vec![k.len()]), DType::F32)
+            .unwrap();
+        let v_s = dev
+            .from_cpu(&v, &Shape::new(vec![v.len()]), DType::F32)
+            .unwrap();
         let out = dev
-            .from_cpu(&vec![-1.0f32; seq * head_dim], &Shape::new(vec![seq * head_dim]), DType::F32)
+            .from_cpu(
+                &vec![-1.0f32; seq * head_dim],
+                &Shape::new(vec![seq * head_dim]),
+                DType::F32,
+            )
             .unwrap();
 
         let mut slot = vec![0u8; 64];
@@ -772,10 +790,14 @@ mod tests {
         slot[32..40].copy_from_slice(&out.device_ptr().unwrap().to_ne_bytes());
         slot[40..48].copy_from_slice(&v_s.device_ptr().unwrap().to_ne_bytes());
         let slots = dev
-            .from_cpu_bytes(&slot, &Shape::new(vec![64]), DType {
-                arith: ArithType::U8,
-                storage: Storage::Native,
-            })
+            .from_cpu_bytes(
+                &slot,
+                &Shape::new(vec![64]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
+            )
             .unwrap();
 
         let tail = u32_storage(&[0]);
@@ -817,10 +839,14 @@ mod tests {
         bad_slot[32..40].copy_from_slice(&out.device_ptr().unwrap().to_ne_bytes());
         bad_slot[40..48].copy_from_slice(&v_s.device_ptr().unwrap().to_ne_bytes());
         let bad_slots = dev
-            .from_cpu_bytes(&bad_slot, &Shape::new(vec![64]), DType {
-                arith: ArithType::U8,
-                storage: Storage::Native,
-            })
+            .from_cpu_bytes(
+                &bad_slot,
+                &Shape::new(vec![64]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
+            )
             .unwrap();
         let tail_b = u32_storage(&[0]);
         let head_b = u32_storage(&[1]);

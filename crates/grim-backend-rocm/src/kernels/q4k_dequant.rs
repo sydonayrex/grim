@@ -141,8 +141,7 @@ mod tests {
         // Structural pin (ggml get_scale_min_k4, "q[j-0]"): the m-line must
         // take its top 2 bits from scales[s], never scales[s-4].
         assert!(
-            KERNEL_SOURCE
-                .contains("m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);"),
+            KERNEL_SOURCE.contains("m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);"),
             "dequant_q4k_grim_element m-line drifted from grim_quant::get_scale_min_k4"
         );
         assert!(

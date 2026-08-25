@@ -38,7 +38,7 @@ use grim_tensor::{BackendStorage, Shape};
 use crate::device::roc_device::RocmDevice;
 use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
-use crate::{Error, Result, HipMemcpyKind, hipMemcpyAsync, hipStreamSynchronize};
+use crate::{Error, HipMemcpyKind, Result, hipMemcpyAsync, hipStreamSynchronize};
 
 /// Ring capacity for the production channel. Power of two (ring index
 /// math), large enough that the host never laps the device between the
@@ -193,8 +193,7 @@ pub(crate) fn route_gemm(
     // same stream as the upload (ordered behind it), then a STREAM-scoped
     // sync: the pinned head cell must not be rewritten for the next op
     // until this copy has executed.
-    chan.head_cell.as_mut_slice()[..4]
-        .copy_from_slice(&head_value.to_ne_bytes());
+    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
     let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
     let rc = unsafe {
         hipMemcpyAsync(

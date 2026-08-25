@@ -252,9 +252,9 @@ fn query_clock_mhz(ordinal: usize) -> Option<u32> {
 fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
     use crate::device::handles::{hipDeviceSynchronize, hipFree, hipMalloc, hipMemcpy};
     use crate::device::rocblas::{
-        rocblas_create_handle, rocblas_destroy_handle, rocblas_gemm_ex, rocblas_set_stream,
-        rocblas_datatype, select_gemm_algo, RocblasHandle, RocblasOperation,
-        ROCBLAS_GEMM_FLAGS_NONE,
+        ROCBLAS_GEMM_FLAGS_NONE, RocblasHandle, RocblasOperation, rocblas_create_handle,
+        rocblas_datatype, rocblas_destroy_handle, rocblas_gemm_ex, rocblas_set_stream,
+        select_gemm_algo,
     };
     use crate::device::util::DeviceGuard;
     use std::ptr::null_mut;

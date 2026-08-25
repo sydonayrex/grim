@@ -31,16 +31,16 @@
 //! Device-gated: requires ≥2 visible HIP devices and `GRIM_GPU_TEST=1`
 //! (single-device boxes cannot express cross-device drift).
 
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
-use grim_tensor::backend::{BackendDevice, BackendStorage};
 use grim_tensor::Shape;
+use grim_tensor::backend::{BackendDevice, BackendStorage};
 
-use crate::device::capability_profiler::vram_info;
-use crate::device::util::{dtype_f32, DeviceGuard, last_launch_context};
-use crate::memory::storage::RocmStorage;
 use crate::RocmDevice;
+use crate::device::capability_profiler::vram_info;
+use crate::device::util::{DeviceGuard, dtype_f32, last_launch_context};
+use crate::memory::storage::RocmStorage;
 
 fn multi_gpu_available() -> Option<usize> {
     if !crate::gpu_test_enabled() {
@@ -94,10 +94,11 @@ struct DriftFixture {
 /// Build the target device plus a second live thread whose context is parked
 /// on `foreign_ordinal` for the duration of the closure.
 fn with_drift_fixture(target: usize, foreign_ordinal: i32, f: impl FnOnce(&DriftFixture)) {
-    let Some(_) = multi_gpu_available() else { return };
+    let Some(_) = multi_gpu_available() else {
+        return;
+    };
     let dev = Arc::new(
-        RocmDevice::try_new(target)
-            .unwrap_or_else(|e| panic!("try_new({target}) failed: {e}")),
+        RocmDevice::try_new(target).unwrap_or_else(|e| panic!("try_new({target}) failed: {e}")),
     );
     // try_new must be context-neutral: constructing a foreign device from a
     // drifted thread may not leave THIS thread parked anywhere unexpected.
@@ -161,8 +162,9 @@ fn upload_and_launch_rms_norm(fx: &DriftFixture, x_data: &[f32]) -> Vec<f32> {
 #[test]
 fn rms_norm_launch_stays_context_correct_while_worker_parks_on_device_1() {
     with_drift_fixture(0, 1, |fx| {
-        let x_data: Vec<f32> =
-            (0..ROWS * ROW_LEN).map(|i| ((i % 17) as f32) * 0.25 - 1.0).collect();
+        let x_data: Vec<f32> = (0..ROWS * ROW_LEN)
+            .map(|i| ((i % 17) as f32) * 0.25 - 1.0)
+            .collect();
         let got = upload_and_launch_rms_norm(fx, &x_data);
         let want = cpu_rms_norm_reference(&x_data, ROW_LEN);
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
@@ -180,8 +182,9 @@ fn rms_norm_launch_stays_context_correct_roles_swapped() {
     // Swapped roles: the MAIN thread drives ordinal 1 while a worker parks
     // its context back on ordinal 0.
     with_drift_fixture(1, 0, |fx| {
-        let x_data: Vec<f32> =
-            (0..ROWS * ROW_LEN).map(|i| ((i % 13) as f32) * 0.5 - 2.0).collect();
+        let x_data: Vec<f32> = (0..ROWS * ROW_LEN)
+            .map(|i| ((i % 13) as f32) * 0.5 - 2.0)
+            .collect();
         let got = upload_and_launch_rms_norm(fx, &x_data);
         let want = cpu_rms_norm_reference(&x_data, ROW_LEN);
         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {

@@ -94,13 +94,15 @@ fn chunked_prefill_processes_each_token_exactly_once() {
         "fully-consumed request must not return to waiting"
     );
 
-    // A fourth tick budget no new prefill: the engine must NOT re-run any
-    // prompt tokens (progress map already at the prompt length).
-    engine.tick().expect("tick 4");
-    assert!(
-        pos(&engine) <= 124,
-        "no prompt re-processing after the prompt is fully consumed \
-         (pos={} — decode steps may add 1 per scheduled copy)",
-        pos(&engine)
+    // A fourth tick budgets no new prefill. With the scheduler's running
+    // dedup there is exactly ONE entry for request 1, so exactly ONE
+    // decode step runs: 120 prompt tokens + 1 generated = 121.
+    let out4 = engine.tick().expect("tick 4");
+    assert!(out4.prefill_ids.is_empty());
+    assert_eq!(out4.decode_ids, vec![1]);
+    assert_eq!(
+        pos(&engine),
+        121,
+        "one decode step per tick after full prefill (running-copy dedup)"
     );
 }

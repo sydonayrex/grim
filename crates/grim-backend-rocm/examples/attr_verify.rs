@@ -9,10 +9,17 @@ fn q(attr: i32, ordinal: i32) -> i32 {
 
 fn main() {
     for ord in 0..2 {
-        println!("GPU[{ord}] attr#24(ManagedMemory per real map)={} attr#87(WarpSize?)={} \
+        println!(
+            "GPU[{ord}] attr#24(ManagedMemory per real map)={} attr#87(WarpSize?)={} \
                   attr#5(ClockRate?)={}kHz attr#63(MultiProcCount?)={} attr#56(MaxThreadsPerBlock?)={} \
                   attr#74(MaxSharedMemPerBlock?)={}",
-            q(24, ord), q(87, ord), q(5, ord), q(63, ord), q(56, ord), q(74, ord));
+            q(24, ord),
+            q(87, ord),
+            q(5, ord),
+            q(63, ord),
+            q(56, ord),
+            q(74, ord)
+        );
     }
     unsafe { hipDeviceSynchronize() };
 }
