@@ -313,7 +313,16 @@ impl Scheduler {
             output.prefill_ids.push(r.id);
             let mut running_req = r.clone();
             running_req.consumed_tokens = new_consumed;
-            self.running.push(running_req);
+            // One running entry per request: a chunked request re-enters
+            // through `waiting` every pass, and pushing a fresh copy each
+            // time accumulated duplicates (a 3-pass prefill left 3 entries,
+            // tripling that request's decode work every tick and letting
+            // preemption swap one copy while another kept running). Replace
+            // the prior entry instead of appending.
+            match self.running.iter().position(|e| e.id == r.id) {
+                Some(pos) => self.running[pos] = running_req,
+                None => self.running.push(running_req),
+            }
 
             if pressure_active {
                 // Return all other admitted requests back to the front of the waiting queue
@@ -333,9 +342,13 @@ impl Scheduler {
             }
         }
 
-        // 2. Return decode IDs for already-running sequences.
+        // 2. Return decode IDs for already-running sequences. A request
+        // still mid-prefill (chunked, remainder waiting) must NOT decode:
+        // its prompt is not fully in KV yet, and the engine's decode step
+        // would feed a prompt token as if it were generated. It idles
+        // until its remainder is scheduled.
         for r in &self.running {
-            if !output.prefill_ids.contains(&r.id) {
+            if !output.prefill_ids.contains(&r.id) && r.consumed_tokens >= r.prompt_tokens {
                 output.decode_ids.push(r.id);
             }
         }
@@ -767,17 +780,78 @@ mod tests {
             !sched.waiting.iter().any(|r| r.id == 7),
             "fully-consumed request must not return to waiting"
         );
-        // Three passes pushed three running copies (50/100/120 — the
-        // per-pass accounting record); the most recent must be complete.
+        // One running entry per request (dedup across chunk passes), and
+        // once fully consumed the request becomes decode-eligible.
+        let copies = sched.running.iter().filter(|r| r.id == 7).count();
+        assert_eq!(copies, 1, "chunk passes must replace, not accumulate, running entries");
         let running = sched
             .running
             .iter()
-            .rev()
             .find(|r| r.id == 7)
             .expect("request 7 in running after final chunk");
         assert_eq!(running.consumed_tokens, 120);
+        let out4 = sched.schedule();
+        assert_eq!(out4.decode_ids, vec![7], "fully-prefilled request decodes");
     }
 
+    /// Decode-mid-prefill exclusion: a request whose prompt is only partly
+    /// consumed (its remainder is still in `waiting`) must NOT appear in
+    /// `decode_ids` — the engine would run a decode step against an
+    /// incomplete KV and feed a prompt token as if it were generated.
+    /// A fully-consumed request decodes normally.
+    #[test]
+    fn test_decode_excludes_partially_prefilled_requests() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(100, 8, ctrl);
+        sched.chunked_prefill_size = 50;
+
+        // Mid-prefill request (chunked) + a fully-prefilled one.
+        sched.enqueue(Request {
+            id: 1,
+            prompt_tokens: 120,
+            ..Default::default()
+        });
+        let out1 = sched.schedule();
+        assert_eq!(out1.prefill_ids, vec![1]);
+        assert!(out1.decode_ids.is_empty());
+
+        // Enqueue request 2. Note queue order: under pressure the leftover
+        // admissions return to `waiting` BEFORE the processed request's
+        // remainder, so the order below is [remainder(1), 2] and after the
+        // next pass [2, remainder(1)].
+        sched.enqueue(Request {
+            id: 2,
+            prompt_tokens: 40,
+            ..Default::default()
+        });
+
+        // Pass 2 drains request 1's next chunk (50 → 100 consumed). While
+        // any part of its prompt is unconsumed it must NOT decode — the
+        // pre-fix scheduler listed it here with a half-filled KV.
+        let out2 = sched.schedule();
+        assert_eq!(out2.prefill_ids, vec![1]);
+        assert!(
+            out2.decode_ids.is_empty(),
+            "mid-prefill request must not decode (got {:?})",
+            out2.decode_ids
+        );
+
+        // Pass 3 prefills request 2 in one pass. Request 1 is STILL
+        // mid-prefill (100/120) and stays excluded even though another
+        // runnable request exists; request 2 was just prefilled this pass.
+        let out3 = sched.schedule();
+        assert_eq!(out3.prefill_ids, vec![2]);
+        assert!(out3.decode_ids.is_empty());
+
+        // Pass 4 completes request 1's prompt; request 2 now decodes.
+        let out4 = sched.schedule();
+        assert_eq!(out4.prefill_ids, vec![1]);
+        assert_eq!(out4.decode_ids, vec![2]);
+
+        // Both complete: both decode.
+        let out5 = sched.schedule();
+        assert_eq!(out5.decode_ids, vec![1, 2]);
+    }
     #[test]
     fn test_scheduler_preemption() {
         let ctrl = AdmissionController::new(0, 0);

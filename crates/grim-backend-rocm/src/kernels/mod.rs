@@ -40,6 +40,8 @@ pub mod fp8_gemm_rdna4;
 pub mod fp8_standalone;
 pub mod fused_dequant_gemm;
 pub mod fused_linear_ce;
+/// GPTQ/EfficientQAT GroupInt fused dequant-GEMM (forward + backward).
+pub mod gptq_gemm;
 pub mod iq_dequant;
 pub mod iq_gemm;
 pub mod jit_cache;

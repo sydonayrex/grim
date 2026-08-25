@@ -60,7 +60,9 @@ fn main() {
 
     for &(m, n, k) in DECODE_SHAPES {
         let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 * 0.11) - 0.9).collect();
-        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 23) as f32 * 0.07) - 0.75).collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 * 0.07) - 0.75)
+            .collect();
         let a = dev
             .from_cpu(&a_data, &Shape::from_slice(&[m, k]), DType::F32)
             .expect("a");
@@ -85,11 +87,19 @@ fn main() {
 
         // Timed: direct (flag off).
         unsafe { std::env::remove_var("GRIM_SCYTHE_RING") };
-        let direct_us = time_ops(iters, || dev.matmul(a.as_ref(), b.as_ref(), &out_shape).expect("mm").1);
+        let direct_us = time_ops(iters, || {
+            dev.matmul(a.as_ref(), b.as_ref(), &out_shape)
+                .expect("mm")
+                .1
+        });
 
         // Timed: ring-routed (flag on).
         unsafe { std::env::set_var("GRIM_SCYTHE_RING", "1") };
-        let ring_us = time_ops(iters, || dev.matmul(a.as_ref(), b.as_ref(), &out_shape).expect("mm").1);
+        let ring_us = time_ops(iters, || {
+            dev.matmul(a.as_ref(), b.as_ref(), &out_shape)
+                .expect("mm")
+                .1
+        });
         let (routed, h) = dev.matmul(a.as_ref(), b.as_ref(), &out_shape).expect("mm");
         h.synchronize().expect("sync");
         unsafe { std::env::remove_var("GRIM_SCYTHE_RING") };

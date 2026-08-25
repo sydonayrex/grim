@@ -3,7 +3,9 @@ use grim_backend_rocm::compute_utilization;
 
 fn main() {
     for ord in 0..3 {
-        println!("ordinal {ord} -> compute_utilization = {:?}",
-            compute_utilization(ord));
+        println!(
+            "ordinal {ord} -> compute_utilization = {:?}",
+            compute_utilization(ord)
+        );
     }
 }

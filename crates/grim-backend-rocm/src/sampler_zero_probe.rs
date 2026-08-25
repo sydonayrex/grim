@@ -14,7 +14,7 @@
 #[cfg(test)]
 mod tests {
     use crate::memory::storage::RocmStorage;
-    use crate::{sample_logits_on_device_at, RocmDevice};
+    use crate::{RocmDevice, sample_logits_on_device_at};
     use grim_tensor::backend::BackendStorage;
     use grim_tensor::{DType, Shape};
 
@@ -70,50 +70,31 @@ mod tests {
             );
 
             let seed = (t as u64) << 32 | 0x9E37_79B9;
-            let tok = match sample_logits_on_device_at(
-                &dev,
-                &st,
-                vocab,
-                0.7,
-                0,
-                1.0,
-                seed,
-                t as u32,
-            ) {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    eprintln!("  trial {t}: validate_input rejected input");
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("  trial {t}: SAMPLE FAIL {e}");
-                    continue;
-                }
-            };
+            let tok =
+                match sample_logits_on_device_at(&dev, &st, vocab, 0.7, 0, 1.0, seed, t as u32) {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        eprintln!("  trial {t}: validate_input rejected input");
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("  trial {t}: SAMPLE FAIL {e}");
+                        continue;
+                    }
+                };
             eprintln!("  trial {t}: token {tok}");
 
             // Immediate re-sample through the same production entry: does
             // execution recover once the module is loaded/resolved?
-            let tok2 = sample_logits_on_device_at(
-                &dev,
-                &st,
-                vocab,
-                0.7,
-                0,
-                1.0,
-                seed,
-                t as u32 + 1000,
-            )
-            .expect("device sample 2")
-            .expect("validate 2");
+            let tok2 =
+                sample_logits_on_device_at(&dev, &st, vocab, 0.7, 0, 1.0, seed, t as u32 + 1000)
+                    .expect("device sample 2")
+                    .expect("validate 2");
             eprintln!("  trial {t}: immediate re-sample token {tok2}");
 
             // Post-sample readback: did anything overwrite the buffer?
             let after = st.to_cpu_vec_f32().expect("post readback");
-            eprintln!(
-                "  trial {t}: post-sample head={:?}",
-                &after[..4]
-            );
+            eprintln!("  trial {t}: post-sample head={:?}", &after[..4]);
             assert!(
                 tok < 64,
                 "trial {t}: sampled token {tok} OUTSIDE support — first-launch \

@@ -251,13 +251,7 @@ impl RocmDevice {
         // before the host's first descriptor upload landed.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if let Some(ptr) = storage.device_ptr_u64() {
-            let rc = unsafe {
-                crate::device::handles::hipMemset(
-                    ptr as *mut c_void,
-                    0,
-                    bytes,
-                )
-            };
+            let rc = unsafe { crate::device::handles::hipMemset(ptr as *mut c_void, 0, bytes) };
             if rc != 0 {
                 return Err(Error::Backend(format!(
                     "alloc_scythe_ring_bytes: zeroing failed with hip status {rc}"
@@ -346,16 +340,13 @@ impl RocmDevice {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut stream: *mut c_void = std::ptr::null_mut();
         const HIP_STREAM_NON_BLOCKING: u32 = 0x1;
-        check_hip(
-            "hipStreamCreateWithFlags(NonBlocking)",
-            unsafe {
-                crate::device::handles::hipStreamCreateWithFlags(
-                    &mut stream,
-                    HIP_STREAM_NON_BLOCKING,
-                    0,
-                )
-            },
-        )?;
+        check_hip("hipStreamCreateWithFlags(NonBlocking)", unsafe {
+            crate::device::handles::hipStreamCreateWithFlags(
+                &mut stream,
+                HIP_STREAM_NON_BLOCKING,
+                0,
+            )
+        })?;
         Ok(stream)
     }
 
@@ -3878,6 +3869,35 @@ impl BackendDevice for RocmDevice {
                 let handle: Box<dyn ComputeHandle> = Box::new(RocmHandle::new(Some(stream)));
                 return Ok((Box::new(out_f32), handle));
             }
+            DTypeStorage::GroupInt(cfg) => {
+                // GPTQ/EfficientQAT fused dequant-GEMM: the packed four-segment
+                // blob stays resident on-device and the kernel dequantizes
+                // in-kernel (previously this arm fell through to `_ =>`,
+                // forcing a host-side F32 inflation of every GPTQ weight).
+                if !matches!(cfg.bits, 2 | 4 | 8) {
+                    return Err(Error::Backend(format!(
+                        "gptq quantized_matmul: unsupported bit width {}",
+                        cfg.bits
+                    )));
+                }
+                let (qw_off, qz_off, sc_off, gi_off, has_g_idx) =
+                    Self::gptq_segment_offsets(cfg.bits, cfg.group_size, k, n, b_storage.bytes())?;
+                self.launch_gptq_dequant_gemm(
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    cfg.bits,
+                    cfg.group_size,
+                    has_g_idx,
+                    qw_off,
+                    qz_off,
+                    sc_off,
+                    gi_off,
+                )?;
+            }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
             }
@@ -4244,6 +4264,35 @@ impl BackendDevice for RocmDevice {
                 // (dY @ B^T). This was previously falling through to the fused
                 // backward kernel, which is incorrect for native FP16/BF16 weights.
                 return self.matmul(dy, b_packed, out_shape);
+            }
+            DTypeStorage::GroupInt(cfg) => {
+                // GPTQ/EfficientQAT fused dequant backward: mirror the forward
+                // GroupInt arm instead of falling into the ResidualPacked-style
+                // `_` catch-all, whose kernel ABI (u8 scales / backup regions)
+                // does not match the GPTQ packed layout.
+                if !matches!(cfg.bits, 2 | 4 | 8) {
+                    return Err(Error::Backend(format!(
+                        "gptq quantized_matmul_backward_dx: unsupported bit width {}",
+                        cfg.bits
+                    )));
+                }
+                let (qw_off, qz_off, sc_off, gi_off, has_g_idx) =
+                    Self::gptq_segment_offsets(cfg.bits, cfg.group_size, k, n, b_storage.bytes())?;
+                self.launch_gptq_dequant_backward_gemm(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    cfg.bits,
+                    cfg.group_size,
+                    has_g_idx,
+                    qw_off,
+                    qz_off,
+                    sc_off,
+                    gi_off,
+                )?;
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(
@@ -10539,6 +10588,254 @@ impl RocmDevice {
         Some(best.0)
     }
 
+    /// Launch the GPTQ/EfficientQAT GroupInt fused dequant-GEMM (forward).
+    ///
+    /// `b_storage` holds the documented length-prefixed four-segment packed
+    /// layout (`GpuIntConfig`); `qw/qz/sc/gi` are byte offsets of each segment
+    /// within that blob, addressed in place by the kernel. B packs a [K, N]
+    /// weight ([in, out], GPTQ column-packed), matching the relabel contract
+    /// of the ROCm quantized fast path.
+    pub(crate) fn launch_gptq_dequant_gemm(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u8,
+        group_size: usize,
+        has_g_idx: bool,
+        qw_off: i64,
+        qz_off: i64,
+        sc_off: i64,
+        gi_off: i64,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gptq gemm: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gptq gemm: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gptq gemm: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("gptq gemm: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend("gptq gemm: grid too large for u32".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let values_per_word: i32 = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "gptq gemm: unsupported bit width {bits}"
+                )));
+            }
+        };
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut bits_i = bits as i32;
+        let mut gs_i = group_size as i32;
+        let mut vpw = values_per_word;
+        let mut has_gi = if has_g_idx { 1 } else { 0 };
+        let mut qw = qw_off;
+        let mut qz = qz_off;
+        let mut sc = sc_off;
+        let mut gi = gi_off;
+
+        self.launch_compute_kernel(
+            "grim_gptq_dequant_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut bits_i),
+                arg(&mut gs_i),
+                arg(&mut vpw),
+                arg(&mut has_gi),
+                arg(&mut qw),
+                arg(&mut qz),
+                arg(&mut sc),
+                arg(&mut gi),
+            ],
+        )
+    }
+
+    /// Launch the GPTQ/EfficientQAT GroupInt fused dequant-GEMM (backward).
+    /// Computes `dX[M, K] = dY[M, N] @ dequant(B)` from the same packed blob
+    /// as [`Self::launch_gptq_dequant_gemm`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_gptq_dequant_backward_gemm(
+        &self,
+        dy_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u8,
+        group_size: usize,
+        has_g_idx: bool,
+        qw_off: i64,
+        qz_off: i64,
+        sc_off: i64,
+        gi_off: i64,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gptq backward: dY has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gptq backward: b has no device ptr".into()))?;
+        let dx_ptr = dx_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gptq backward: dX has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| Error::Backend("gptq backward: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend("gptq backward: grid too large for u32".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let values_per_word: i32 = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "gptq backward: unsupported bit width {bits}"
+                )));
+            }
+        };
+
+        let mut dyptr = dy_ptr;
+        let mut bptr = b_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut bits_i = bits as i32;
+        let mut gs_i = group_size as i32;
+        let mut vpw = values_per_word;
+        let mut has_gi = if has_g_idx { 1 } else { 0 };
+        let mut qw = qw_off;
+        let mut qz = qz_off;
+        let mut sc = sc_off;
+        let mut gi = gi_off;
+
+        self.launch_compute_kernel(
+            "grim_gptq_dequant_backward_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bptr),
+                arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut bits_i),
+                arg(&mut gs_i),
+                arg(&mut vpw),
+                arg(&mut has_gi),
+                arg(&mut qw),
+                arg(&mut qz),
+                arg(&mut sc),
+                arg(&mut gi),
+            ],
+        )
+    }
+
+    /// Compute the length-prefixed GroupInt segment offsets for a packed
+    /// weight blob of `blob_bytes` bytes. Returns
+    /// `(qw_off, qz_off, sc_off, gi_off, has_g_idx)`.
+    ///
+    /// The four segments follow the documented `GpuIntConfig` convention:
+    /// `[u64 len][qweight][u64 len][qzeros][u64 len][scales][u64 len][g_idx]`,
+    /// so every offset is derivable from `(bits, group_size, k, n)` alone —
+    /// no host-side copy of the blob is needed. The declared total is
+    /// validated against `blob_bytes` (with and without a trailing g_idx
+    /// segment, since providers emit an empty-length g_idx segment when the
+    /// checkpoint has no act-order permutation) so a truncated or corrupt
+    /// blob errors loudly here instead of faulting inside the kernel.
+    /// A g_idx stored as u64 (rather than u32) is rejected explicitly — the
+    /// kernel reads u32 indices only.
+    fn gptq_segment_offsets(
+        bits: u8,
+        group_size: usize,
+        k: usize,
+        n: usize,
+        blob_bytes: usize,
+    ) -> Result<(i64, i64, i64, i64, bool)> {
+        const HDR: usize = 32; // four u64 length prefixes
+        let vpw: usize = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "gptq gemm: unsupported bit width {bits}"
+                )));
+            }
+        };
+        let qw_len = k.div_ceil(vpw) * n * 4;
+        let groups = k.div_ceil(group_size);
+        let qz_len = groups * n.div_ceil(vpw) * 4;
+        let sc_len = groups * n * 4;
+        let base = HDR + qw_len + 8 + qz_len + 8 + sc_len;
+
+        let no_gi_total = base; // empty g_idx segment: [u64 0]
+        let gi_total_u32 = base + 8 + k * 4;
+        let gi_total_u64 = base + 8 + k * 8;
+
+        let (has_g_idx, total) = if blob_bytes == no_gi_total {
+            (false, no_gi_total)
+        } else if blob_bytes == gi_total_u32 {
+            (true, gi_total_u32)
+        } else if blob_bytes == gi_total_u64 {
+            return Err(Error::Backend(
+                "gptq gemm: 64-bit g_idx entries not supported by the fused kernel".into(),
+            ));
+        } else {
+            return Err(Error::Backend(format!(
+                "gptq gemm: packed blob size {blob_bytes} matches no valid \
+                 GroupInt layout for bits={bits} group_size={group_size} k={k} n={n} \
+                 (expected {no_gi_total}, {gi_total_u32}, or {gi_total_u64})"
+            )));
+        };
+
+        Ok((
+            8,
+            (HDR + qw_len + 8) as i64,
+            (HDR + qw_len + 8 + qz_len + 8) as i64,
+            base as i64 + 8,
+            has_g_idx,
+        ))
+    }
+
     /// Launch Marlin-style Interleaved W4A16 GEMM.
     pub fn launch_marlin_gemm_w4a16(
         &self,
@@ -11516,8 +11813,7 @@ impl RocmDevice {
         // (the dense-layer op of every decode step) through the ScytheRing
         // persistent dispatch wave instead of the rocBLAS direct path.
         // Benchmark-gated, never default — see device::scythe_route.
-        if dtype_out.arith == ArithType::F32
-            && crate::device::scythe_route::ring_routing_enabled()
+        if dtype_out.arith == ArithType::F32 && crate::device::scythe_route::ring_routing_enabled()
         {
             let stream = crate::device::scythe_route::route_gemm(
                 self,
@@ -12717,7 +13013,10 @@ impl RocmDevice {
         let mut limit = max_tasks;
         let mut res = resident;
         if std::env::var_os("GRIM_RING_DIAG").is_some() {
-            eprintln!("[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}", !true);
+            eprintln!(
+                "[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}",
+                !true
+            );
         }
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",
@@ -12760,7 +13059,10 @@ impl RocmDevice {
         let mut limit = max_tasks;
         let mut res = resident;
         if std::env::var_os("GRIM_RING_DIAG").is_some() {
-            eprintln!("[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}", !true);
+            eprintln!(
+                "[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}",
+                !true
+            );
         }
         self.launch_compute_kernel(
             "grim_scythe_persistent_dispatch",

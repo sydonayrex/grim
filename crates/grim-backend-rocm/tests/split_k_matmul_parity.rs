@@ -19,8 +19,12 @@ fn gpu_ready() -> bool {
 }
 
 fn check_shape(dev: &RocmDevice, m: usize, n: usize, k: usize) -> f32 {
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 * 0.01) - 0.08).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 * 0.01) - 0.06).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 17) as f32 * 0.01) - 0.08)
+        .collect();
+    let b_data: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 13) as f32 * 0.01) - 0.06)
+        .collect();
     let a = dev
         .from_cpu(&a_data, &Shape::from_slice(&[m, k]), DType::F32)
         .unwrap();
@@ -60,7 +64,11 @@ fn f32_split_k_matmul_matches_cpu_reference() {
     // Both split-K triggers: m > 1 (prefill-class) and k > 8192
     // (long-reduction decode-class). Thresholds sized so an fp-tolerance
     // failure is unmissable — the pre-fix kernel erred in the ~1e3 range.
-    for &(m, n, k) in &[(4usize, 64usize, 4096usize), (1, 64, 12288), (4, 4096, 4096)] {
+    for &(m, n, k) in &[
+        (4usize, 64usize, 4096usize),
+        (1, 64, 12288),
+        (4, 4096, 4096),
+    ] {
         let d = check_shape(&dev, m, n, k);
         println!("[split-k] m={m} n={n} k={k} max_abs_diff={d:.3e}");
         assert!(

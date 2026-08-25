@@ -10,13 +10,19 @@ fn main() {
     let n = args.next().and_then(|a| a.parse().ok()).unwrap_or(65536);
     let dev = RocmDevice::try_new(ordinal).expect("try_new");
     let k = 1024usize;
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32) * 0.01 - 0.03).collect();
 
     let shape_a = Shape::from_slice(&[m, k]);
     let shape_b = Shape::from_slice(&[k, n]);
-    let a = dev.from_cpu(&a_data, &shape_a, DType::F32).expect("upload A");
-    let b = dev.from_cpu(&b_data, &shape_b, DType::F32).expect("upload B");
+    let a = dev
+        .from_cpu(&a_data, &shape_a, DType::F32)
+        .expect("upload A");
+    let b = dev
+        .from_cpu(&b_data, &shape_b, DType::F32)
+        .expect("upload B");
 
     let out_shape = Shape::from_slice(&[m, n]);
     let (out, handle) = dev
