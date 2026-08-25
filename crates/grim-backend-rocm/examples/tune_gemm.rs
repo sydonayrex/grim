@@ -1,13 +1,38 @@
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::device::capability_profiler::CapabilityProfiler;
 use grim_tensor::backend::BackendDevice;
 use grim_tensor::{ArithType, DType, Shape, dtype::Storage as DTypeStorage};
 use std::time::Instant;
 
 fn main() {
-    let dev = match RocmDevice::try_new(0) {
+    // Ordinal is an argument: the 2026-08-25 recalibration ran both cards
+    // (the pre-DeviceGuard-fix ordinal-1 data was suspect, and the split-K
+    // F32 corruption invalidates any tuning measured before it).
+    let ordinal: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // WI-SB0 capability calibration for every visible device (measured
+    // fresh — the cache is per-process). Printed as JSON lines so runs can
+    // be appended to docs/benchmarks verbatim.
+    let profiler = CapabilityProfiler::new();
+    for cap in profiler.capabilities() {
+        println!(
+            "{{\"bench\":\"sb0_calibration\",\"ordinal\":{},\"tflops_fp16\":{:.4},\"tflops_fp8\":{:.4},\"hbm_gbps\":{:.2},\"throttle_pct\":{:.4},\"vram_free_mib\":{}}}",
+            cap.ordinal,
+            cap.tflops_fp16,
+            cap.tflops_fp8,
+            cap.hbm_bandwidth_gbps,
+            cap.throttle_pct,
+            cap.vram_free_bytes >> 20
+        );
+    }
+
+    let dev = match RocmDevice::try_new(ordinal) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("RocmDevice::try_new(0) failed: {e}");
+            eprintln!("RocmDevice::try_new({ordinal}) failed: {e}");
             std::process::exit(1);
         }
     };

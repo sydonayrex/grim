@@ -29,8 +29,16 @@ behavior under real use, but silent — no crash, just bad output or bad perf).
 > "delete dead computation" (single-rank is the design). F7 fixed
 > (per-layer bucket in the fast path). F5 removed. F1 follow-up verified
 > (copy_via_route HostBounce legs carry per-leg guards in
-> p2p_route::copy_route); ordinal-1 autotuner recalibration remains an
-> operational to-do (examples/tune_gemm re-run), not a code fix.
+> p2p_route::copy_route). Ordinal-1 autotuner recalibration DONE
+> (2026-08-25, post split-K fix): WI-SB0 calibration re-measured on both
+> dGPUs (gfx1201 6.89 TFLOPS/365.6 GB/s, gfx1200 6.47/283.1 — fast-card
+> ordering preserved); the solution-index sweep proved noise-dominated
+> (non-reproducible across runs, async launches without per-iter sync), so
+> no gfx1201/1200 rows were added to `lookup_solution_index` and default 0
+> stands. The F9 engine-side gap (whole-prompt re-prefill per pass, which
+> duplicated KV on every pass after the first) is also fixed: the engine
+> now prefills only the un-prefilled slice with true positions
+> (`prefill_progress`, gate `chunked_prefill_engine`).
 >
 > **Bonus Tier-0 discovery while benchmarking SB6 routing** (not in the
 > original audit): `grim_split_k_reduction` was hard-typed `_Float16*`, so
