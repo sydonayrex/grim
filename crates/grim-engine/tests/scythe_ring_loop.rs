@@ -186,22 +186,15 @@ fn ring_resident_wave_two_batches() {
         .expect("pinned diag buffer");
     for i in 0..12 {
         let c = exec.completed().expect("completed read");
-        let mut line = format!("[diag] A poll {i}: completed={c}");
-        for slot in 0..6 {
-            match exec.peek_slot_status(slot) {
-                Ok(st) => line += &format!(" s{slot}.st={st}"),
-                Err(e) => line += &format!(" s{slot}.ERR({e})"),
-            }
-        }
-        eprintln!("{line}");
-        if c >= 2 {
+        eprintln!("[diag] A poll {i}: completed={c}");
+        if c >= 4 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(700));
     }
     let done = exec.completed().expect("final completed");
-    assert!(done >= 2, "batch A stalled: completed={done}");
-    assert_eq!(done, 2, "batch A must complete exactly 2 tasks (got {done})");
+    assert!(done >= 4, "batch A stalled: completed={done}");
+    assert_eq!(done, 4, "phase0+A must total 4 tasks (got {done})");
 
     // Batch B reuses the same operand buffers (deterministic outputs).
     eprintln!("[diag] B: submitting norm");
@@ -213,7 +206,15 @@ fn ring_resident_wave_two_batches() {
     eprintln!("[diag] B: gemm done; flushing");
     exec.flush().expect("flush B");
     eprintln!("[diag] B: flushed; polling");
-    let done = exec.wait_completed(6, std::time::Duration::from_secs(8)).expect("wait B");
+    let mut done = 0u32;
+    for i in 0..10 {
+        done = exec.completed().expect("completed read B");
+        eprintln!("[diag] B poll {i}: completed={done}");
+        if done >= 6 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+    }
     if done < 6 {
         // Forensics: dump slot statuses (offset 48, u32) + control scalars.
         let nb = dev.create_non_blocking_stream().expect("nb");
@@ -239,6 +240,11 @@ fn ring_resident_wave_two_batches() {
         panic!("batch B stalled at completed={done}");
     }
     assert_eq!(done, 6, "batch B must bring the completed count to 6");
+
+    // Join the wave BEFORE any standard DtoH: pageable-staged reads cannot
+    // complete while an eternal kernel runs (device-scope staging).
+    exec.shutdown().expect("shutdown");
+    eprintln!("[diag] wave shut down; reading outputs");
 
     // Output correctness through the resident wave.
     let got = outa.to_cpu_vec_f32().expect("readback");
