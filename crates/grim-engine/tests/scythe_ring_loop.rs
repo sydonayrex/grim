@@ -251,3 +251,110 @@ fn ring_resident_wave_two_batches() {
 
     exec.shutdown().expect("shutdown");
 }
+
+/// WI-SB5/SB6 convergence: descriptor-linked row-parallel fan-in.
+///
+/// Row-shard GEMMs run as opcode-1 descriptors writing disjoint partials
+/// into resident ring-ordinal buffers; an opcode-7 ADD sums them. Every
+/// pointer is a resident-buffer reference — no host slices cross the ring.
+/// Parity vs monolithic matmul within fp tolerance.
+#[test]
+fn ring_row_parallel_descriptor_fanin_parity() {
+    if !gpu_ready() {
+        return;
+    }
+    let m = 4usize;
+    let k = 64usize;
+    let n = 128usize;
+    let half = k / 2;
+
+    let mut exec = ScytheRingExec::new(16, 0).expect("ring exec");
+    let dev = RocmDevice::try_new(0).expect("dev");
+
+    let w_flat: Vec<f32> = (0..n * k).map(|i| ((i % 23) as f32) * 0.03 - 0.3).collect();
+    let x_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.2 - 0.8).collect();
+    let x = dev
+        .from_cpu(&x_data, &Shape::from_slice(&[m, k]), DType::F32)
+        .expect("x");
+
+    // Per-shard operands: transposed B[k_half,n] slices plus this rank's
+    // K-slice of x — exactly what a real row-parallel rank receives.
+    let mut b_t = Vec::new();   // device storages
+    let mut a_s = Vec::new();   // device storages
+    let bounds = [(0usize, half), (half, k - half)];
+    for &(k_start, k_count) in &bounds {
+        // B^T slice: rows k_start..k_start+k_count of W, transposed to [k_count, n].
+        let mut bt = vec![0f32; k_count * n];
+        for ni in 0..n {
+            for ki in 0..k_count {
+                bt[ki * n + ni] = w_flat[ni * k + (k_start + ki)];
+            }
+        }
+        let bt_shape = Shape::from_slice(&[k_count, n]);
+        b_t.push(
+            dev.from_cpu(&bt, &bt_shape, DType::F32)
+                .expect("bt upload"),
+        );
+        let mut xs = vec![0f32; m * k_count];
+        for r in 0..m {
+            for c in 0..k_count {
+                xs[r * k_count + c] = x_data[r * k + k_start + c];
+            }
+        }
+        let xs_shape = Shape::from_slice(&[m, k_count]);
+        a_s.push(dev.from_cpu(&xs, &xs_shape, DType::F32).expect("xs upload"));
+    }
+
+    let p0 = dev.alloc_storage(&Shape::from_slice(&[m, n]), DType::F32).expect("p0");
+    let p1 = dev.alloc_storage(&Shape::from_slice(&[m, n]), DType::F32).expect("p1");
+    let summed = dev
+        .alloc_storage(&Shape::from_slice(&[m, n]), DType::F32)
+        .expect("summed");
+
+    exec.submit_col_gemm(
+        m as u32, n as u32, half as u32,
+        dev_ptr(a_s[0].as_ref()), dev_ptr(b_t[0].as_ref()), dev_ptr(p0.as_ref()),
+    )
+    .expect("gemm shard0");
+    exec.submit_col_gemm(
+        m as u32,
+        n as u32,
+        (k - half) as u32,
+        dev_ptr(a_s[1].as_ref()),
+        dev_ptr(b_t[1].as_ref()),
+        dev_ptr(p1.as_ref()),
+    )
+    .expect("gemm shard1");
+    exec.submit_add(
+        m as u32,
+        n as u32,
+        dev_ptr(p0.as_ref()),
+        dev_ptr(p1.as_ref()),
+        dev_ptr(summed.as_ref()),
+    )
+    .expect("submit add");
+
+    let drained = exec.run_batch().expect("run batch");
+    assert_eq!(drained, 3, "expected gemm+gemm+add drained");
+    eprintln!("[sb56] drained={drained}");
+
+    // Host reference: y = x @ W^T over the FULL k.
+    let mut want = vec![0f32; m * n];
+    for r in 0..m {
+        for j in 0..n {
+            let mut accv = 0f32;
+            for p in 0..k {
+                accv += x_data[r * k + p] * w_flat[j * k + p];
+            }
+            want[r * n + j] = accv;
+        }
+    }
+    let got = summed.to_cpu_vec_f32().expect("readback");
+    let d = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("[sb56] descriptor fan-in max_abs_diff={d:.3e}");
+    assert!(d < 1e-3, "descriptor-linked fan-in diverged: {d:.3e}");
+}

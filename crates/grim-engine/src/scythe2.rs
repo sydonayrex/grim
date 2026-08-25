@@ -1248,6 +1248,31 @@ impl ScytheRing {
         };
         self.enqueue(desc)
     }
+
+    /// WI-SB5/SB6: enqueue an elementwise ADD (opcode 7) — the fan-in
+    /// primitive that sums row-parallel partials entirely on device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_add(
+        &self,
+        rows: u32,
+        cols: u32,
+        a_ptr: u64,
+        b_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<u32, ScytheTaskDescriptor> {
+        let desc = ScytheTaskDescriptor {
+            opcode: 7,
+            m: rows,
+            n: cols,
+            k: 0,
+            input_ptr: a_ptr,
+            weight_ptr: b_ptr,
+            output_ptr,
+            peer_ptr: 0,
+            status: 0,
+        };
+        self.enqueue(desc)
+    }
 }
 
 // ── WI-SB6: engine-loop execution seam ────────────────────────────────────────
@@ -1448,6 +1473,25 @@ impl ScytheRingExec {
                 )
             })
             .map(|_| ())
+    }
+
+    /// WI-SB5/SB6: enqueue elementwise ADD (opcode 7) over `rows*cols` f32
+    /// elements. All pointers are device addresses on the ring's ordinal.
+    pub fn submit_add(
+        &mut self,
+        rows: u32,
+        cols: u32,
+        a_ptr: u64,
+        b_ptr: u64,
+        output_ptr: u64,
+    ) -> grim_backend_rocm::Result<()> {
+        if self.ring.is_full() {
+            return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
+        }
+        self.ring.enqueue_add(rows, cols, a_ptr, b_ptr, output_ptr).map_err(|_| {
+            grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_add rejected".into())
+        })?;
+        Ok(())
     }
 
     /// Publish the host head, launch one bounded persistent worker, wait for
