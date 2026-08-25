@@ -181,16 +181,27 @@ fn ring_resident_wave_two_batches() {
     eprintln!("[diag] A: gemm done; flushing");
     exec.flush().expect("flush A");
     eprintln!("[diag] A: flushed; polling");
-    for i in 0..5 {
+    let nb = dev.create_non_blocking_stream().expect("diag stream");
+    let mut pin = grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(16 * 64)
+        .expect("pinned diag buffer");
+    for i in 0..12 {
         let c = exec.completed().expect("completed read");
-        eprintln!("[diag] A poll {i}: completed={c}");
+        let mut line = format!("[diag] A poll {i}: completed={c}");
+        for slot in 0..6 {
+            match exec.peek_slot_status(slot) {
+                Ok(st) => line += &format!(" s{slot}.st={st}"),
+                Err(e) => line += &format!(" s{slot}.ERR({e})"),
+            }
+        }
+        eprintln!("{line}");
         if c >= 2 {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(700));
     }
     let done = exec.completed().expect("final completed");
-    assert_eq!(done, 2, "batch A must complete 2 tasks (got {done})");
+    assert!(done >= 2, "batch A stalled: completed={done}");
+    assert_eq!(done, 2, "batch A must complete exactly 2 tasks (got {done})");
 
     // Batch B reuses the same operand buffers (deterministic outputs).
     eprintln!("[diag] B: submitting norm");
