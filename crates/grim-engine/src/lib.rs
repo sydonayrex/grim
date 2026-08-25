@@ -159,11 +159,23 @@ pub struct Engine {
     /// from `Request::input_ids`. Used by `drive_prefill` to feed real
     /// prompt tokens instead of synthetic position indices.
     pub request_input_ids: HashMap<u64, Vec<u32>>,
+    /// Per-request count of prompt tokens already prefilled (chunked
+    /// prefill bookkeeping, F9 follow-on). The scheduler's
+    /// `consumed_tokens` says how many tokens the SCHEDULER has budgeted;
+    /// this map says how many the ENGINE has actually run through the
+    /// model. Each pass prefills only `[progress, consumed)` — models
+    /// append KV sequentially, so re-running already-prefilled tokens
+    /// would duplicate their KV entries and corrupt the sequence.
+    pub prefill_progress: HashMap<u64, usize>,
     /// Per-request last generated token. Updated after each decode step
     /// via `record_generated_token`. Used by `drive_decode` to feed the
     /// previously sampled token instead of the position index.
     pub request_last_token: HashMap<u64, u32>,
-    self_tuning_controller: grim_scheduler::SelfTuningController,
+    /// Self-tuning knob controller (§5.7). Owns `chunked_prefill_size` and
+    /// `max_batched_tokens` — `tick()` re-applies them every pass, so tests
+    /// that need deterministic chunking pin the knobs HERE (floor = ceiling
+    /// = initial), not on the scheduler.
+    pub self_tuning_controller: grim_scheduler::SelfTuningController,
     /// Tuned speculative params (MIN-3: applied, not discarded).
     tuned_speculative_block_len: usize,
     tuned_kv_compression_bit_width: u8,
@@ -553,6 +565,7 @@ impl Engine {
             request_model_ids: HashMap::new(),
             request_adapters: HashMap::new(),
             request_input_ids: HashMap::new(),
+            prefill_progress: HashMap::new(),
             request_last_token: HashMap::new(),
             self_tuning_controller: grim_scheduler::SelfTuningController::new(
                 target_ttft,
@@ -1399,12 +1412,30 @@ impl Engine {
     }
 
     fn drive_prefill_inner(&mut self, id: u64) -> Result<()> {
-        let prompt_tokens = match self.scheduler.running.iter().find(|r| r.id == id) {
-            Some(r) => r.prompt_tokens,
+        // Chunked prefill (F9 follow-on): the scheduler may carry several
+        // running copies of `id` (one per pass, each with the cumulative
+        // consumed count), so take the LATEST bound, not the first copy's.
+        let mut prompt_tokens = None;
+        let mut consumed_tokens = 0usize;
+        for r in self.scheduler.running.iter().filter(|r| r.id == id) {
+            prompt_tokens = Some(r.prompt_tokens);
+            consumed_tokens = consumed_tokens.max(r.consumed_tokens);
+        }
+        let prompt_tokens = match prompt_tokens {
+            Some(p) => p,
             None => return Ok(()),
         };
         if prompt_tokens == 0 {
             return Ok(());
+        }
+        // Only the tokens the scheduler has budgeted but the engine has not
+        // yet prefilled run through the model. Everything else (radix
+        // matching, KV registration, disagg handoff) still sees the full
+        // prompt below.
+        let already = self.prefill_progress.get(&id).copied().unwrap_or(0);
+        let target = consumed_tokens.min(prompt_tokens);
+        if target <= already {
+            return Ok(()); // this pass budgeted no new prompt tokens
         }
         // Build the full input_ids tensor: use real token IDs if provided,
         // otherwise fall back to synthetic position indices (0..prompt_tokens)
@@ -1439,17 +1470,26 @@ impl Engine {
             }
         }
 
+        // The chunk actually prefilled this pass: tokens [already, target)
+        // with their true positions. Models place KV by sequential append,
+        // so the session position after this call equals `target` — each
+        // prompt token is appended exactly once across all passes.
+        let chunk: Vec<u32> = full_input[already..target].to_vec();
+        let chunk_len = chunk.len();
         let ids = grim_backend_cpu::cpu_tensor(
-            full_input.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
-            grim_tensor::Shape::new(vec![prompt_tokens]),
+            chunk.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
+            grim_tensor::Shape::new(vec![chunk_len]),
         );
         let positions = grim_backend_cpu::cpu_tensor(
-            (0..prompt_tokens).map(|t| t as f32).collect::<Vec<f32>>(),
-            grim_tensor::Shape::new(vec![prompt_tokens]),
+            (already..target).map(|t| t as f32).collect::<Vec<f32>>(),
+            grim_tensor::Shape::new(vec![chunk_len]),
         );
         if let Some((model_id, _)) = self.model_for_request(id) {
             let model_id = model_id.to_string();
             let outcome = self.drive_forward(&model_id, id, &ids, &positions)?;
+            // Record progress only after the forward succeeded — a failed
+            // pass must retry the same chunk, not skip it.
+            self.prefill_progress.insert(id, target);
             // `current_pos` is owned by the model/session — the underlying
             // forward already advanced it via `session.advance_pos(seq_len)`.
             // The engine does *not* double-count.
@@ -1962,6 +2002,7 @@ impl Engine {
         self.request_model_ids.remove(&id);
         self.request_adapters.remove(&id);
         self.request_input_ids.remove(&id);
+        self.prefill_progress.remove(&id);
         self.request_last_token.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
         // The rank stays counted for a short cooldown (see
