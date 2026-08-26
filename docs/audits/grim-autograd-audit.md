@@ -90,3 +90,39 @@ refactor (Storage variant additions in grim-tensor/dtype.rs +
 grim-compressed-tensors) was mid-flight in the same tree; if the commit's
 CI is red inside grim-format/convert.rs, that is the other workstream's
 transient state, not these fixes.
+
+
+---
+
+## Addendum — quant workstream wiring gates (2026-08-26)
+
+Follow-on wiring for the compressed-tensors formats (workstream consolidated
+under this session to stop parallel edits):
+
+- **W4A16 (Marlin) dense: WIRED + GATED.** New `W4A16` dispatch arm in
+  `quantized_matmul` routes the resident blob
+  (`[codes N*K/8 u32][scales f32]`) through
+  `launch_marlin_gemm_w4a16_blob` → `grim_marlin_gemm_w4a16_f32`.
+  Gate `w4a16_dense_dispatch_matches_dequant_reference`: GPU output ==
+  exact dequantized-weight reference.
+- **WNA16 / EmbeddingWNA16Int: dequant services wired + gated.** Public
+  `RocmDevice::dequant_wna16_to_f32` / `dequant_embedding_wna16_int_to_f32`
+  expose the on-device decoders for expert/table materialization. Gates run
+  GPU decode vs host MSB-first reference (4-bit/2-block and 3-bit/embedding).
+- **Loud contracts replace silent garbage.** The old `_ =>` dispatch fallbacks
+  fed PACKED BYTES into F32 matmuls. Kernel-less variants
+  (`CompressedTensorsW8A8Int8/Fp8`, WNA16 fused-GEMM, all weight-only
+  backward) now return descriptive errors. Gate:
+  `kernel_less_variants_fail_loudly_not_silently`.
+- **Repaired the parallel session's kernel sources** (compressed_gemm.rs):
+  device helpers were defined after first use with Rust `f32::from_bits`
+  syntax in HIP C — every kernel in the aggregate JIT unit failed to compile;
+  the WNA16 bit-decoder had a negative-shift UB extracting wrong bits; both
+  launchers passed 3-4 args against 5-6-param kernels. Rewritten and
+  arity-corrected; blob headers in tests fixed to the documented u32 fields.
+
+**Still open (kernel authoring, tracked):** fused GEMM kernels for
+CompressedTensorsW8A8 Int8/Fp8 and WNA16; MoE grouped-kernel consumption of
+packed expert blobs (today MoE sizes buffers for these formats via moe.rs and
+materializes through the new dequant services — packed-resident grouped MoE
+is future kernel work).
