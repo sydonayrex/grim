@@ -628,7 +628,7 @@ mod tests {
         let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
         let mut optimizer =
             crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
-        
+        let res = crate::backward::backward_step(&tape, loss_grad, out2, &mut params, &mut optimizer);
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("backward_step must refuse a multi-entry parameter"),
