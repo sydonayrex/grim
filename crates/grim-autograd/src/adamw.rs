@@ -1149,6 +1149,9 @@ impl Default for AdamW8BitConfig {
 pub struct AdamW8Bit {
     pub config: AdamW8BitConfig,
     pub step_count: usize,
+    /// Audit fix (A1 class): per-parameter update counts for `step_param` —
+    /// see AdamW.param_steps.
+    pub param_steps: HashMap<ParamId, usize>,
     /// 1st moment vector (m) quantized as Q8_0 blocks per parameter ID.
     pub m_q80: HashMap<ParamId, Vec<u8>>,
     /// 2nd moment vector (v) quantized as Q8_0 blocks per parameter ID.
@@ -1172,6 +1175,7 @@ impl AdamW8Bit {
         Self {
             config,
             step_count: 0,
+            param_steps: HashMap::new(),
             m_q80: HashMap::new(),
             v_q80: HashMap::new(),
         }
@@ -1193,8 +1197,14 @@ impl AdamW8Bit {
         let lr = self.config.lr;
         let weight_decay = self.config.weight_decay;
 
-        let bias_correction1 = 1.0 - beta1.powi(self.step_count.max(1) as i32);
-        let bias_correction2 = 1.0 - beta2.powi(self.step_count.max(1) as i32);
+                // Audit fix (A1): per-param correction — see AdamW.param_steps.
+        let sc = {
+            let t = self.param_steps.entry(id).or_insert(0);
+            *t += 1;
+            *t
+        };
+        let bias_correction1 = 1.0 - beta1.powi(sc as i32);
+        let bias_correction2 = 1.0 - beta2.powi(sc as i32);
 
         let dev = crate::pick_device_for_tensor(&param.data);
         let shape = param.data.shape().clone();
@@ -1369,6 +1379,8 @@ pub struct MomentPage {
 pub struct PagedAdamW {
     pub config: PagedAdamWConfig,
     pub step_count: usize,
+    /// Audit fix (A1 class): per-parameter update counts for `step_param`.
+    pub param_steps: HashMap<ParamId, usize>,
     /// Pages indexed by (ParamId, page_index)
     pub pages: HashMap<(ParamId, usize), MomentPage>,
     /// Set of (ParamId, page_index) that were mutated in the current step
@@ -1390,6 +1402,7 @@ impl PagedAdamW {
     pub fn new(config: PagedAdamWConfig) -> Self {
         Self {
             config,
+            param_steps: HashMap::new(),
             step_count: 0,
             pages: HashMap::new(),
             dirty_set: std::collections::HashSet::new(),
@@ -1425,8 +1438,14 @@ impl PagedAdamW {
         let weight_decay = self.config.weight_decay;
         let page_size = self.config.page_size.max(1);
 
-        let bias_correction1 = 1.0 - beta1.powi(self.step_count.max(1) as i32);
-        let bias_correction2 = 1.0 - beta2.powi(self.step_count.max(1) as i32);
+                // Audit fix (A1): per-param correction — see AdamW.param_steps.
+        let sc = {
+            let t = self.param_steps.entry(id).or_insert(0);
+            *t += 1;
+            *t
+        };
+        let bias_correction1 = 1.0 - beta1.powi(sc as i32);
+        let bias_correction2 = 1.0 - beta2.powi(sc as i32);
 
         let dev = crate::pick_device_for_tensor(&param.data);
         let shape = param.data.shape().clone();
@@ -2582,11 +2601,14 @@ pub struct MAdam {
     pub step_count: usize,
     pub m: HashMap<ParamId, Box<dyn BackendStorage>>,
     pub v: HashMap<ParamId, Box<dyn BackendStorage>>,
+    /// Audit fix (A1 class): per-parameter update counts for `step_param`.
+    pub param_steps: HashMap<ParamId, usize>,
 }
 
 impl MAdam {
     pub fn new(config: MAdamConfig) -> Self {
         Self {
+            param_steps: HashMap::new(),
             config,
             step_count: 0,
             m: HashMap::new(),
@@ -2613,15 +2635,17 @@ impl MAdam {
         let gamma = self.config.gamma;
         let wd = self.config.weight_decay;
 
-        let sc = if self.step_count == 0 {
-            1
-        } else {
-            self.step_count
+        // Audit fix (A1): per-param correction — see AdamW.param_steps.
+        let sc = {
+            let t = self.param_steps.entry(id).or_insert(0);
+            *t += 1;
+            *t
         };
-        let bc1 = 1.0 - beta1.powi(sc as i32);
-        let bc2 = 1.0 - beta2.powi(sc as i32);
+        let bias_correction1 = 1.0 - beta1.powi(sc as i32);
+        let bias_correction2 = 1.0 - beta2.powi(self.step_count.max(1) as i32);
 
-        let shape = param.data.shape();
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
         let elem_count = shape.elem_count();
         let dev = crate::pick_device_for_tensor(&param.data);
 
