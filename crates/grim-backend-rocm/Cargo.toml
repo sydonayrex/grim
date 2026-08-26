@@ -66,6 +66,9 @@ rocm-aiter = ["rocm"]
 # `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime.
 cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys", "rocm"]
 rccl = ["rocm"]
+# Public test shims (device::gptq_test_shim) letting tests/ exercise the
+# GPTQ fused dequant-GEMM launchers without widening the production API.
+gpu-test-shims = []
 
 # ── Quant variant feature gates ─────────────────────────────────────────────
 # Each gate controls one quant family's kernel modules, their wmma/charon/moe

@@ -192,6 +192,7 @@ mod tests {
             let o = w * 4;
             u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
         };
+        let bits_u = bits as usize;
         let mask = (1u32 << bits) - 1;
         let group = match g_idx {
             Some(g) => read_u32(g, in_idx) as usize,
@@ -206,7 +207,7 @@ mod tests {
             ((w0 | (w1 << 32) | (w2 << 64)) >> bit & 0x7) as u32
         } else {
             let w = read_u32(qweight, (in_idx / vpw) * n + out_idx);
-            (w >> ((in_idx % vpw) * bits)) & mask
+            (w >> ((in_idx % vpw) * bits_u)) & mask
         };
         let zero = if bits == 3 {
             let zb = group * (3 * n.div_ceil(32)) + out_idx / 32;
@@ -218,7 +219,7 @@ mod tests {
         } else {
             let zrow = n.div_ceil(vpw);
             let w = read_u32(qzeros, group * zrow + out_idx / vpw);
-            ((w >> ((out_idx % vpw) * bits)) & mask) as usize + 1
+            ((w >> ((out_idx % vpw) * bits_u)) & mask) as usize + 1
         };
         let scale = f32::from_le_bytes([
             scales[(group * n + out_idx) * 4],
@@ -246,8 +247,9 @@ mod tests {
         let mut qweight = vec![0u8; words_qw * 4];
         let mut expect = vec![0f32; k * n];
         for ki in 0..k {
+            let g = ki / gs;
             for ni in 0..n {
-                let code: u32 = ((ki * 7 + ni * 3) % 15) + 1; // avoid 0 vs zero-pt confusion
+                let code: u32 = (((ki * 7 + ni * 3) % 15) + 1) as u32;
                 let w = (ki / 8) * n + ni;
                 let off = (ki % 8) * 4;
                 let cur = u32::from_le_bytes([
@@ -258,8 +260,11 @@ mod tests {
                 ]);
                 let updated = cur | (code << off);
                 qweight[w * 4..w * 4 + 4].copy_from_slice(&updated.to_le_bytes());
-                let zero = ((ki + ni) % 8) as f32 + 1.0;
-                let scale = 0.25 + 0.5 * ((ki + ni) % 3) as f32;
+                // Oracle values match the per-group data written below:
+                // group `g` carries zero/scale as a function of its group-index
+                // `g*gs` and the output column `ni`, exactly what the decoder reads.
+                let zero = ((g * gs + ni) % 8) as f32 + 1.0;
+                let scale = 0.25 + 0.5 * ((g * gs + ni) % 3) as f32;
                 expect[ki * n + ni] = (code as f32 - zero) * scale;
             }
         }
@@ -269,8 +274,8 @@ mod tests {
         let mut scales = vec![0u8; groups * n * 4];
         for g in 0..groups {
             for ni in 0..n {
-                let ki = g * gs; // representative in-index for expected zero/scale
-                let zero = ((ki + ni) % 8) + 1;
+                let group_idx = g * gs;
+                let zero = ((group_idx + ni) % 8) + 1;
                 let zw = g * n.div_ceil(8) + ni / 8;
                 let off = (ni % 8) * 4;
                 let cur = u32::from_le_bytes([
@@ -281,7 +286,7 @@ mod tests {
                 ]);
                 let updated = cur | (((zero as u32) - 1) << off);
                 qzeros[zw * 4..zw * 4 + 4].copy_from_slice(&updated.to_le_bytes());
-                let s = 0.25 + 0.5 * ((ki + ni) % 3) as f32;
+                let s = 0.25 + 0.5 * ((group_idx + ni) % 3) as f32;
                 scales[(g * n + ni) * 4..(g * n + ni) * 4 + 4].copy_from_slice(&s.to_le_bytes());
             }
         }
