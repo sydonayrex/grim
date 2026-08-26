@@ -745,14 +745,24 @@ impl CausalLm for MiniCpmModel {
         let emb = self.tok_embeddings.weight.to_vec_f32()?;
 
         for (idx, &id) in ids.iter().enumerate() {
-            if (id as usize) < self.cfg.vocab_size {
-                let start = (id as usize) * self.cfg.hidden_size;
-                let end = start + self.cfg.hidden_size;
-                if end <= emb.len() {
-                    hidden[idx * self.cfg.hidden_size..(idx + 1) * self.cfg.hidden_size]
-                        .copy_from_slice(&emb[start..end]);
-                }
+            // Audit fix (grim-models M13): out-of-vocabulary ids used to be
+            // SILENTLY zeroed (an invisible no-op token); they now fail with
+            // the offending id.
+            if (id as usize) >= self.cfg.vocab_size {
+                return Err(grim_core::error::Error::Config(format!(
+                    "MiniCPM: token id {} out of range for vocab_size {}",
+                    id as usize, self.cfg.vocab_size
+                )));
             }
+            let start = (id as usize) * self.cfg.hidden_size;
+            let end = start + self.cfg.hidden_size;
+            if end > emb.len() {
+                return Err(grim_core::error::Error::Config(
+                    "MiniCPM: embedding table smaller than vocab_size".into(),
+                ));
+            }
+            hidden[idx * self.cfg.hidden_size..(idx + 1) * self.cfg.hidden_size]
+                .copy_from_slice(&emb[start..end]);
         }
 
         // Apply `scale_emb` only when the model metadata specifies it. MiniCPM2/3
@@ -776,14 +786,20 @@ impl CausalLm for MiniCpmModel {
             self.device.clone(),
         );
 
-        let pos_vec: Vec<u32> = if positions.shape().dims().iter().product::<usize>() == seq_len {
+        // Audit fix (grim-models M9): length mismatch is an error, not a
+        // silent renumber from zero.
+        let pos_count = positions.shape().dims().iter().product::<usize>();
+        let pos_vec: Vec<u32> = if pos_count == seq_len {
             positions
                 .to_vec_f32()?
                 .into_iter()
                 .map(|x| x as u32)
                 .collect()
         } else {
-            (0..seq_len).map(|i| i as u32).collect()
+            return Err(grim_core::error::Error::Shape(format!(
+                "MiniCPM::forward: positions tensor has {} elements for {} input ids",
+                pos_count, seq_len
+            )));
         };
 
         let (logits, hidden_state, kv_pairs) =
@@ -909,6 +925,27 @@ mod audit_tests {
         grim_core::CausalLm::forward(&model, &mut sess, &cpu_ids(&[3, 9]), &cpu_ids(&[0, 1]), &adapters)
             .expect("forward");
         assert_eq!(sess.current_pos(), 2, "session pos must advance by seq_len");
+    }
+
+    /// Audit gate (M13): out-of-vocabulary token ids must be a LOUD error,
+    /// not silently-zeroed no-op tokens.
+    #[test]
+    fn minicpm_forward_rejects_out_of_vocab_ids() {
+        let model = tiny_model();
+        let mut sess = Inner::new(model.device.clone());
+        let adapters: [grim_core::model::AdapterHandle; 0] = [];
+        let res = grim_core::CausalLm::forward(
+            &model,
+            &mut sess,
+            &cpu_ids(&[9999]), // vocab_size is 64 in the fixture
+            &cpu_ids(&[0]),
+            &adapters,
+        );
+        let err = res.expect_err("OOV id must error");
+        assert!(
+            err.to_string().contains("out of range"),
+            "error should name the OOV token: {err}"
+        );
     }
 
     /// Audit gate: the paged KV path must store POST-RoPE keys — paged and

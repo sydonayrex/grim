@@ -340,6 +340,59 @@ impl Lfm2Block {
         })
     }
 
+    /// Load-time coherence check (grim-models audit M11): the forward paths
+    /// unwrap the variant-specific `Option` fields, so an incoherent block
+    /// (e.g. shortconv projection without its kernel, or a full-attention
+    /// block missing QK norms) used to PANIC at first forward. Validate the
+    /// variant contract at load time instead and name the missing field.
+    pub fn validate(&self, idx: usize) -> Result<()> {
+        let ctx = |field: &str| {
+            grim_core::error::Error::Config(format!(
+                "lfm2 layer {idx}: {} is required by this block variant but was not loaded",
+                field
+            ))
+        };
+        if self.shortconv_in_proj.is_some() {
+            // ShortConv attention variant.
+            let required = [
+                ("shortconv_conv", self.shortconv_conv.is_some()),
+                ("shortconv_conv_vec", self.shortconv_conv_vec.is_some()),
+                ("shortconv_out_proj", self.shortconv_out_proj.is_some()),
+            ];
+            for (name, present) in required {
+                if !present {
+                    return Err(ctx(name));
+                }
+            }
+        } else {
+            // Full-attention / fused-QKV variants: the F32 reference path
+            // unconditionally unwraps these.
+            let required = [
+                ("wq", self.wq.is_some()),
+                ("wk", self.wk.is_some()),
+                ("wv", self.wv.is_some()),
+                ("wo", self.wo.is_some()),
+                ("attn_q_norm", self.attn_q_norm.is_some()),
+                ("attn_k_norm", self.attn_k_norm.is_some()),
+            ];
+            for (name, present) in required {
+                if !present {
+                    return Err(ctx(name));
+                }
+            }
+            // The fused MXFP4 pair must be coherent if present at all.
+            if self.wqkv_codes.is_some() != self.wqkv_exps.is_some() {
+                return Err(grim_core::error::Error::Config(format!(
+                    "lfm2 layer {idx}: wqkv_codes/wqkv_exps must be loaded together"
+                )));
+            }
+        }
+        if self.is_moe && self.ffn_gate_inp.is_none() {
+            return Err(ctx("ffn_gate_inp"));
+        }
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Tensor, cache: &mut Option<Lfm2LayerCache>) -> Result<Tensor> {
         let norm_x = self.attn_norm.forward(x)?;
 
@@ -994,7 +1047,11 @@ impl Lfm2 {
             Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            layers.push(Lfm2Block::load(&ws.pp("blk").pp(&i.to_string()), &cfg, i)?);
+            let block = Lfm2Block::load(&ws.pp("blk").pp(&i.to_string()), &cfg, i)?;
+            // Audit fix: fail at LOAD time with the layer index and missing
+            // field, not with a panic on the first forward.
+            block.validate(i)?;
+            layers.push(block);
         }
         let norm = match RmsNorm::load(&ws.pp("token_embd_norm"), cfg.hidden_size, cfg.rms_norm_eps)
         {
@@ -1163,4 +1220,148 @@ fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         out[i] = silu * u[i];
     }
     device_tensor(out, gate.shape().clone(), gate.device())
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    /// Audit gate (M11): an incoherent block variant must be NAMED by
+    /// validate() instead of panicking at first forward.
+    #[test]
+    fn lfm2_validate_names_missing_variant_fields() {
+        let eps = 1e-5f32;
+        let norm = RmsNorm {
+            weight: grim_backend_cpu::cpu_tensor(vec![1.0f32; 8], grim_tensor::Shape::new(vec![8])),
+            eps,
+        };
+        let lin = Linear::from_tensor(
+            grim_backend_cpu::cpu_tensor(
+                vec![0.0f32; 64],
+                grim_tensor::Shape::new(vec![8, 8]),
+            ),
+            None,
+        );
+        // Full-attention block with wq/wk/wv but NO wo / QK norms.
+        let block = Lfm2Block {
+            attn_norm: norm.clone(),
+            wq: Some(lin.clone()),
+            wk: Some(lin.clone()),
+            wv: Some(lin.clone()),
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_norm: norm.clone(),
+            ffn_gate: lin.clone(),
+            ffn_up: lin.clone(),
+            ffn_down: lin,
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            shortconv_in_proj: None,
+            shortconv_conv: None,
+            shortconv_conv_vec: None,
+            shortconv_out_proj: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            rope_theta: 10_000.0,
+            eps,
+        };
+        let err = block.validate(3).expect_err("incoherent block must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("layer 3") && (msg.contains("wo") || msg.contains("wq")),
+            "validate must name the layer and missing field: {msg}"
+        );
+
+        // ShortConv variant missing its kernel.
+        let mut conv_block = Lfm2Block {
+            attn_norm: norm,
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_norm: RmsNorm {
+                weight: grim_backend_cpu::cpu_tensor(
+                    vec![1.0f32; 8],
+                    grim_tensor::Shape::new(vec![8]),
+                ),
+                eps,
+            },
+            ffn_gate: Linear::from_tensor(
+                grim_backend_cpu::cpu_tensor(
+                    vec![0.0f32; 64],
+                    grim_tensor::Shape::new(vec![8, 8]),
+                ),
+                None,
+            ),
+            ffn_up: Linear::from_tensor(
+                grim_backend_cpu::cpu_tensor(
+                    vec![0.0f32; 64],
+                    grim_tensor::Shape::new(vec![8, 8]),
+                ),
+                None,
+            ),
+            ffn_down: Linear::from_tensor(
+                grim_backend_cpu::cpu_tensor(
+                    vec![0.0f32; 64],
+                    grim_tensor::Shape::new(vec![8, 8]),
+                ),
+                None,
+            ),
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            shortconv_in_proj: Some(Linear::from_tensor(
+                grim_backend_cpu::cpu_tensor(
+                    vec![0.0f32; 192],
+                    grim_tensor::Shape::new(vec![24, 8]),
+                ),
+                None,
+            )),
+            shortconv_conv: None,
+            shortconv_conv_vec: None,
+            shortconv_out_proj: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            rope_theta: 10_000.0,
+            eps,
+        };
+        let err = conv_block.validate(5).expect_err("shortconv without kernel must fail");
+        assert!(
+            err.to_string().contains("shortconv_conv"),
+            "validate must name the missing shortconv field: {err}"
+        );
+        // And a coherent ShortConv block passes.
+        conv_block.shortconv_conv = Some(grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 12],
+            grim_tensor::Shape::new(vec![6, 2]),
+        ));
+        conv_block.shortconv_conv_vec = Some(vec![0.1f32; 12]);
+        conv_block.shortconv_out_proj = Some(Linear::from_tensor(
+            grim_backend_cpu::cpu_tensor(vec![0.0f32; 64], grim_tensor::Shape::new(vec![8, 8])),
+            None,
+        ));
+        assert!(conv_block.validate(5).is_ok(), "coherent ShortConv block must pass");
+    }
 }
