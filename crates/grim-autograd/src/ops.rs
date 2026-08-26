@@ -491,10 +491,18 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
             Storage::Native => &empty_scales,
         };
 
-        if b_quantized && (b_on_rocm || b_on_cuda || b_on_vulkan || b_on_metal) {
+        // Audit fix (A3): this fused path serves the WEIGHT-STYLE contract
+        // C = A @ Bᵀ with B stored [n, k] — the layout every production
+        // caller (streaming_forward record_matmul, transpose_b = true) and
+        // the dx kernels themselves use. The previous gate also admitted the
+        // DOCUMENTED non-transposed contract (B [k, n]) whose grads are
+        // garbage through these kernels (both wrong on gfx1201 vs the CPU
+        // reference); that case now falls back to the verified host loops.
+        if !args.transpose_a && args.transpose_b
+            && (b_on_rocm || b_on_cuda || b_on_vulkan || b_on_metal) {
             let bpw = bpw_from_dtype(&args.b.dtype());
             let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_tensor(&args.b);
-            if let Ok((grad_a_storage, _handle)) = dev.quantized_matmul_backward_dx(
+            let (grad_a_storage, _handle) = dev.quantized_matmul_backward_dx(
                 args.out_grad.storage().as_ref(),
                 args.b.storage().as_ref(),
                 b_scales,
@@ -504,29 +512,40 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 k,
                 args.a.shape(),
                 Some(&residuals),
-            ) {
-                let grad_a = Tensor::new(
-                    Arc::from(grad_a_storage),
-                    args.a.shape().clone(),
-                    DType::F32,
-                    args.a.provenance().clone(),
-                    args.a.device().clone(),
-                );
+            )?;
+            let grad_a = Tensor::new(
+                Arc::from(grad_a_storage),
+                args.a.shape().clone(),
+                DType::F32,
+                args.a.provenance().clone(),
+                args.a.device().clone(),
+            );
 
-                let (storage_b, _) = dev.matmul(
-                    args.a.storage().as_ref(),
-                    args.out_grad.storage().as_ref(),
-                    args.b.shape(),
-                )?;
-                let grad_b = Tensor::new(
-                    Arc::from(storage_b),
-                    args.b.shape().clone(),
-                    DType::F32,
-                    args.b.provenance().clone(),
-                    args.b.device().clone(),
-                );
-                return Ok((grad_a, grad_b));
+            // Audit fix (grim-autograd A3): grad_b for the weight-style
+            // contract C = A @ Bᵀ (B stored [n, k]) is
+            // dB_stored[p][q] = sum_i G[i][p] * A[i][q]. The previous device
+            // call `matmul(A, G)` was neither of those.
+            let a_host = args.a.to_vec_f32()?;
+            let g_host = args.out_grad.to_vec_f32()?;
+            let (n_stored, k_stored) = (args.b.shape().dims()[0], args.b.shape().dims()[1]);
+            let mut db_vec = vec![0.0f32; n_stored * k_stored];
+            for i in 0..m {
+                for p in 0..n_stored {
+                    let gp = g_host[i * n + p];
+                    for q in 0..k_stored {
+                        db_vec[p * k_stored + q] += gp * a_host[i * k + q];
+                    }
+                }
             }
+            let storage_b = dev.from_cpu(&db_vec, args.b.shape(), DType::F32)?;
+            let grad_b = Tensor::new(
+                Arc::from(storage_b),
+                args.b.shape().clone(),
+                DType::F32,
+                args.b.provenance().clone(),
+                args.b.device().clone(),
+            );
+            return Ok((grad_a, grad_b));
         }
     }
 
