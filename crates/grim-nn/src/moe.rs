@@ -173,6 +173,231 @@ pub struct ExpertBank {
     pub down: Vec<Linear>,
 }
 
+// ── Quant workstream: per-expert bank splitters ──────────────────────────────
+//
+// These decompress/split BANK-level packed blobs (Storage::W4A16 /
+// Storage::GroupInt / Storage::WNA16) into per-expert slabs for
+// `ExpertBank::load_quantized`. W4A16 and GPTQ stay packed per expert —
+// `Linear::forward` -> `quantized_matmul` routes their storage dtypes to the
+// marlin/gptq fused kernels by dtype match. WNA16 has no packed GEMM yet, so
+// its experts dequantize on host here (documented load-time strategy).
+
+/// Split a Marlin-style W4A16 bank into per-expert blobs.
+///
+/// Bank layout (`Storage::W4A16` contract, N = num_experts * out rows):
+/// `[codes (N*K/8) u32 LE][scales (N*groups) f32 LE]`. Both segments are
+/// row-major over OUTPUT channels, so expert e's slab is two contiguous
+/// sub-slices reassembled as `[codes_e][scales_e]`.
+pub(crate) fn w4a16_split_bank(
+    bytes: &[u8],
+    num_experts: usize,
+    out: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<Vec<Vec<u8>>, grim_tensor::error::Error> {
+    if k % 8 != 0 {
+        return Err(grim_tensor::error::Error::Backend(format!(
+            "w4a16 bank split: K={k} must be divisible by 8"
+        )));
+    }
+    let words_per_row = k / 8;
+    let groups_per_row = k.div_ceil(group_size);
+    let codes_bytes_total = num_experts * out * words_per_row * 4;
+    let scales_bytes_total = num_experts * out * groups_per_row * 4;
+    if bytes.len() < codes_bytes_total + scales_bytes_total {
+        return Err(grim_tensor::error::Error::Backend(format!(
+            "w4a16 bank split: {} bytes, need {}",
+            bytes.len(),
+            codes_bytes_total + scales_bytes_total
+        )));
+    }
+    let mut blobs = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let c0 = e * out * words_per_row * 4;
+        let c1 = c0 + out * words_per_row * 4;
+        let s0 = codes_bytes_total + e * out * groups_per_row * 4;
+        let s1 = s0 + out * groups_per_row * 4;
+        let mut blob = Vec::with_capacity((c1 - c0) + (s1 - s0));
+        blob.extend_from_slice(&bytes[c0..c1]);
+        blob.extend_from_slice(&bytes[s0..s1]);
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
+/// Split a GPTQ/GroupInt bank into per-expert four-segment prefixed blobs
+/// matching `roc_device::gptq_segment_offsets`:
+/// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx]`.
+///
+/// Expert e owns output columns [e*n_e, (e+1)*n_e) of the [K, N]-packed
+/// weight. Requires n_e divisible by values-per-word so packed words never
+/// straddle experts. g_idx is shared across experts and copied whole.
+pub(crate) fn gptq_split_bank(
+    bytes: &[u8],
+    bits: u8,
+    group_size: usize,
+    num_experts: usize,
+    out: usize,
+    k: usize,
+) -> Result<Vec<Vec<u8>>, grim_tensor::error::Error> {
+    let vpw: usize = match bits {
+        2 => 16,
+        4 => 8,
+        8 => 1,
+        _ => {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "gptq bank split: unsupported bit width {bits} (2/4/8 only)"
+            )));
+        }
+    };
+    let n = num_experts * out;
+    let groups = k.div_ceil(group_size);
+
+    // Segment table — same math as roc_device::gptq_segment_offsets.
+    let qw_len = k.div_ceil(vpw) * n * 4;
+    let qz_len = groups * n.div_ceil(vpw) * 4;
+    let sc_len = groups * n * 4;
+    let gi_data_off = 8 + qw_len + 8 + qz_len + 8 + sc_len + 8;
+    let has_g_idx = bytes.len() == gi_data_off + k * 4;
+    if !has_g_idx && bytes.len() != gi_data_off {
+        return Err(grim_tensor::error::Error::Backend(format!(
+            "gptq bank split: {} bytes matches no valid segment table",
+            bytes.len()
+        )));
+    }
+
+    let qw_data = 8usize;
+    let qz_data = qw_data + qw_len + 8;
+    let sc_data = qz_data + qz_len + 8;
+
+    let u64le = |v: usize| (v as u64).to_le_bytes().to_vec();
+
+    let mut blobs = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let c0 = e * out;
+        let mut blob = Vec::new();
+
+        // qweight: ONE u32 word per (K-chunk, column); each word packs vpw
+        // consecutive in_idx codes for that column. Layout is
+        // [K/vpw chunks][N words] — so each expert's run is `out` whole
+        // words per chunk at column offset c0 (contiguous because we require
+        // out % vpw == 0).
+        blob.extend_from_slice(&u64le(k.div_ceil(vpw) * out * 4));
+        for chunk in 0..k.div_ceil(vpw) {
+            let src = qw_data + chunk * n * 4 + c0 * 4;
+            blob.extend_from_slice(&bytes[src..src + out * 4]);
+        }
+
+        // qzeros: ONE word per (group, col-chunk) — these DO pack vpw
+        // columns per word, so the per-expert run is out/vpw words.
+        blob.extend_from_slice(&u64le(groups * out.div_ceil(vpw) * 4));
+        for g in 0..groups {
+            let src = qz_data + g * n.div_ceil(vpw) * 4 + (c0 / vpw) * 4;
+            blob.extend_from_slice(&bytes[src..src + out.div_ceil(vpw) * 4]);
+        }
+
+        // scales f32 [groups, N]: contiguous column slice.
+        blob.extend_from_slice(&u64le(groups * out * 4));
+        for g in 0..groups {
+            let src = sc_data + g * n * 4 + c0 * 4;
+            blob.extend_from_slice(&bytes[src..src + out * 4]);
+        }
+
+        // g_idx: shared across experts — full segment when present, else a
+        // zero-length prefix (the convention gptq_segment_offsets expects).
+        if has_g_idx {
+            blob.extend_from_slice(&u64le(k * 4));
+            blob.extend_from_slice(&bytes[gi_data_off..gi_data_off + k * 4]);
+        } else {
+            blob.extend_from_slice(&u64le(0));
+        }
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
+/// WNA16 has no packed GEMM yet: dequantize on host at load time (the
+/// documented strategy for backends without a fused kernel). Blob layout:
+/// `[u32 n_bit][u32 blocks][codes MSB-first][f16 block scales][f32 ts]`,
+/// 256-weight blocks. Returns NATIVE-F32 per-expert slabs.
+pub(crate) fn wna16_split_or_dequant(
+    bytes: &[u8],
+    num_experts: usize,
+    out: usize,
+    k: usize,
+) -> Result<Vec<Vec<u8>>, grim_tensor::error::Error> {
+    let n_bit = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let blocks = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let total_weights = num_experts * out * k;
+    if blocks != total_weights.div_ceil(256) {
+        return Err(grim_tensor::error::Error::Backend(
+            "wna16 bank: block count mismatch".into(),
+        ));
+    }
+    let code_bytes = total_weights * n_bit;
+    let code_start = 8usize;
+    let scales_start = code_start + code_bytes.div_ceil(8);
+    let ts_off = scales_start + blocks * 2;
+    if bytes.len() < ts_off + 4 {
+        return Err(grim_tensor::error::Error::Backend(
+            "wna16 bank: blob shorter than header+scales+tail".into(),
+        ));
+    }
+    let tensor_scale =
+        f32::from_le_bytes(bytes[ts_off..ts_off + 4].try_into().unwrap());
+
+    let decode = |lane: usize| -> u32 {
+        let start_bit = lane * n_bit;
+        let mut code = 0u32;
+        for b in 0..n_bit {
+            let pos = start_bit + b;
+            let bit = (bytes[code_start + pos / 8] >> (7 - (pos % 8))) & 1;
+            code = (code << 1) | bit as u32;
+        }
+        code
+    };
+
+    let mut weights = vec![0.0f32; total_weights];
+    for i in 0..total_weights {
+        let blk = i / 256;
+        let h = u16::from_le_bytes([
+            bytes[scales_start + blk * 2],
+            bytes[scales_start + blk * 2 + 1],
+        ]);
+        weights[i] = decode(i) as f32 * f16_bits_to_f32(h) * tensor_scale;
+    }
+
+    let stride = out * k;
+    let mut blobs = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let mut blob = Vec::with_capacity(stride * 4);
+        for &w in &weights[e * stride..(e + 1) * stride] {
+            blob.extend_from_slice(&w.to_le_bytes());
+        }
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x3FF) as u32;
+    match exp {
+        0x1F => f32::from_bits(sign | 0x7F800000 | (if mant != 0 { 0x400000 } else { 0 })),
+        0 => {
+            if mant == 0 {
+                f32::from_bits(sign)
+            } else {
+                let v = (mant as f32) * 2f32.powi(-24);
+                if sign != 0 { -v } else { v }
+            }
+        }
+        e => f32::from_bits(sign | ((e - 15 + 127) << 23) | (mant << 13)),
+    }
+}
+
+
 impl ExpertBank {
     /// Construct directly from per-expert `Linear`s (used by tests and
     /// synthetic construction).
@@ -308,8 +533,60 @@ impl ExpertBank {
                 Storage::FloatPack(FloatPackScheme::MxFp4)
             );
 
+            // Quant workstream wiring: per-expert extraction for the
+            // compressed-tensors formats. W4A16 and GroupInt (GPTQ) stay
+            // packed per expert — `Linear::forward` -> `quantized_matmul`
+            // routes them to the marlin/gptq fused kernels by storage dtype.
+            // WNA16 has no packed GEMM yet, so its experts are dequantized on
+            // host here (load-time strategy; a device dequant service exists
+            // for resident-blob use in grim-backend-rocm).
+            let per_expert_blobs: Option<Vec<Vec<u8>>> =
+                match &raw.dtype.storage {
+                    Storage::W4A16(w4) => Some(w4a16_split_bank(
+                        &raw.bytes,
+                        num_experts,
+                        *out,
+                        *in_,
+                        w4.group_size,
+                    )?),
+                    Storage::GroupInt(gi) => Some(gptq_split_bank(
+                        &raw.bytes,
+                        gi.bits,
+                        gi.group_size,
+                        num_experts,
+                        *out,
+                        *in_,
+                    )?),
+                    Storage::WNA16 => Some(wna16_split_or_dequant(
+                        &raw.bytes,
+                        num_experts,
+                        *out,
+                        *in_,
+                    )?),
+                    _ => None,
+                };
+
             for e in 0..num_experts {
                 let per_expert = elem_count / num_experts;
+                if let Some(blobs) = &per_expert_blobs {
+                    // Split-blob path: each expert's reassembled blob carries
+                    // the bank's storage dtype so `Linear::forward` keeps
+                    // routing it to the format's fused kernel / dequant arm.
+                    let rt = grim_tensor::provider::RawTensor {
+                        bytes: blobs[e].clone(),
+                        shape: vec![*out, *in_],
+                        dtype: raw.dtype.clone(),
+                        provenance: raw.provenance.clone(),
+                    };
+                    let t = ws.materialize_raw(rt, Shape::new(vec![*out, *in_]))?;
+                    let lin = Linear::from_tensor(t, bias_opt(has_bias, *out));
+                    match p_idx {
+                        0 => gate.push(lin),
+                        1 => up.push(lin),
+                        _ => down.push(lin),
+                    }
+                    continue;
+                }
                 let (bytes, dtype): (Vec<u8>, grim_tensor::dtype::DType) = if is_framed_mxfp4 {
                     // MXFP4 rides the fused dequant-GEMM path through
                     // `Linear::forward` -> `quantized_matmul` (ROCm dispatch at
@@ -375,6 +652,7 @@ impl ExpertBank {
         }
         Ok(Self { gate, up, down })
     }
+
 
     /// Native (F32/F16/BF16) path: dequantize on host as before.
     #[allow(clippy::too_many_arguments)]
@@ -449,6 +727,106 @@ struct RocmResidentWeights {
 }
 
 #[cfg(feature = "rocm-mem")]
+/// Dequantize one expert weight tensor to row-major F32 on `ordinal`.
+///
+/// Native storages ride `to_vec_f32`. Packed formats use their own GPU
+/// launchers at materialization time:
+/// - W4A16: marlin kernel over an identity activation — C = I @ deq(B)ᵀ is
+///   the transposed weight; host-transposed back to row-major after readback.
+/// - GroupInt (GPTQ): forward kernel with identity activation — C = I @ D is
+///   exactly the row-major [K=out, N=in] dequantized weight.
+/// - WNA16: `dequant_wna16_to_f32` decodes the resident blob directly.
+pub(crate) fn rocm_dequant_expert_weight(
+    weight: &Tensor,
+    ordinal: usize,
+) -> Result<Vec<f32>, grim_tensor::error::Error> {
+    use grim_tensor::backend::BackendDevice;
+    let dev = RocmDevice::try_new(ordinal)?;
+    let dims = weight.shape().dims();
+    let (n_rows, k_dim) = (dims[0], dims[1]);
+    let out_box = match weight.dtype().storage {
+        Storage::W4A16(w4) => {
+            let c_box = dev.dequant_w4a16_blob_to_f32(
+                weight.storage().as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::error::Error::Backend(
+                        "w4a16 expert not rocm".into(),
+                    ))?,
+                n_rows,
+                k_dim,
+                w4.group_size,
+            )?;
+            if std::env::var_os("GRIM_MOE_DIAG").is_some() {
+                eprintln!("[moe-diag] w4a16 materialized shape={:?}", weight.shape().dims());
+            }
+            // Service returns Dᵀ row-major [k_dim, n_rows]; transpose to
+            // the weight layout [n_rows, k_dim].
+            let c_t = Tensor::new(
+                std::sync::Arc::from(c_box),
+                Shape::new(vec![k_dim, n_rows]),
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                Device::Rocm(ordinal),
+            );
+            let c = c_t.to_vec_f32()?;
+            let mut d = vec![0.0f32; n_rows * k_dim];
+            for r in 0..n_rows {
+                for c2 in 0..k_dim {
+                    d[r * k_dim + c2] = c[c2 * n_rows + r];
+                }
+            }
+            return Ok(d);
+        }
+        Storage::GroupInt(gi) => {
+            let c_box = dev.gptq_dequant_identity_to_f32(
+                weight.storage().as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::error::Error::Backend(
+                        "gptq expert not rocm".into(),
+                    ))?,
+                n_rows,
+                k_dim,
+                gi.bits,
+                gi.group_size,
+            )?;
+            // C = D row-major [k_dim, n_rows]; transpose to [n_rows, k_dim].
+            let c_t = Tensor::new(
+                std::sync::Arc::from(c_box),
+                Shape::new(vec![k_dim, n_rows]),
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                Device::Rocm(ordinal),
+            );
+            let c = c_t.to_vec_f32()?;
+            let mut d = vec![0.0f32; n_rows * k_dim];
+            for r in 0..n_rows {
+                for c2 in 0..k_dim {
+                    d[r * k_dim + c2] = c[c2 * n_rows + r];
+                }
+            }
+            return Ok(d);
+        }
+        Storage::WNA16 => {
+            let b_rocm = weight.storage().as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| grim_tensor::error::Error::Backend(
+                    "wna16 expert not rocm".into(),
+                ))?;
+            dev.dequant_wna16_blob_to_f32(b_rocm, n_rows * k_dim)?
+        }
+        _ => return Ok(weight.to_vec_f32()?),
+    };
+    let t = Tensor::new(
+        std::sync::Arc::from(out_box),
+        weight.shape().clone(),
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        Device::Rocm(ordinal),
+    );
+    Ok(t.to_vec_f32()?)
+}
+
+
 impl RocmResidentWeights {
     fn build(
         experts: &ExpertBank,
@@ -461,9 +839,21 @@ impl RocmResidentWeights {
         let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
         let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
         for e in 0..num_experts {
-            gate_flat.extend_from_slice(&experts.gate[e].weight.to_vec_f32()?);
-            up_flat.extend_from_slice(&experts.up[e].weight.to_vec_f32()?);
-            down_flat.extend_from_slice(&experts.down[e].weight.to_vec_f32()?);
+            // Audit-wiring fix (quant workstream): W4A16 / GroupInt / WNA16
+            // packed experts were reinterpreted by to_vec_f32 as raw f32
+            // (nibble codes read as floats -> 1e16-scale garbage / NaN in
+            // every routed forward). Dequantize them properly at
+            // materialization time through the format's own GPU launcher or
+            // dequant service instead.
+            for (flat_dst, lin) in [
+                (&mut gate_flat, &experts.gate[e]),
+                (&mut up_flat, &experts.up[e]),
+                (&mut down_flat, &experts.down[e]),
+            ] {
+                let flat = crate::moe::rocm_dequant_expert_weight(&lin.weight, ordinal)?;
+                assert_eq!(flat.len(), lin.weight.shape().elem_count());
+                flat_dst.extend_from_slice(&flat);
+            }
         }
 
         let dev = RocmDevice::try_new(ordinal)?;
@@ -609,6 +999,13 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
         }
         // GroupInt: variable, approximate as 1 byte per element
         Storage::GroupInt(_) => elem_count,
+        // CompressedTensors W8A8 Int8/Fp8: 1 byte per element (int8 / fp8).
+        Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
+            elem_count
+        }
+        // W4A16: 4-bit packed codes (~0.5 byte/elem); per-group f32 scales are
+        // small relative to weights, so this is a conservative lower bound.
+        Storage::W4A16(_) => elem_count / 2,
         // ResidualPacked: packed residual format with per-block scales.
         // Use bpw (bits per weight) to compute byte size.
         Storage::ResidualPacked(config) => (elem_count * config.bpw as usize + 7) / 8,
@@ -620,6 +1017,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 _ => elem_count * 4, // fallback
             }
         }
+        _ => elem_count * 4,
     }
 }
 

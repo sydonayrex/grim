@@ -8782,6 +8782,41 @@ impl RocmDevice {
     /// weights, decoded on-device. Layout contract mirrors
     /// `Storage::WNA16`: [u32 n_bit][u32 num_blocks][codes][f16 block
     /// scales][f32 tensor scale], 256-weight blocks, MSB-first codes.
+    pub fn dequant_wna16_blob_to_f32(
+        &self,
+        blob: &dyn BackendStorage,
+        num_weights: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
+        // Header [u32 n_bit][u32 blocks] read via pinned D2H — internal, so
+        // callers never touch device_ptr / streams.
+        let packed_rocm = blob.as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("wna16 blob not rocm".into()))?;
+        let mut pinned = RocmPinnedBuffer::<u8>::alloc(8)?;
+        {
+            let _g = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+            let src_ptr = packed_rocm.device_ptr
+                .ok_or_else(|| Error::Backend("wna16 blob has no device ptr".into()))?;
+            check_hip("wna16 head D2H", unsafe {
+                hipMemcpyAsync(
+                    pinned.as_mut_ptr() as *mut c_void,
+                    src_ptr as *const c_void,
+                    8,
+                    HipMemcpyKind::DeviceToHost,
+                    self.active_stream(),
+                )
+            })?;
+            check_hip("wna16 head D2H sync", unsafe {
+                hipStreamSynchronize(self.active_stream())
+            })?;
+        }
+        let head: Vec<u8> =
+            unsafe { std::slice::from_raw_parts(pinned.as_ptr(), 8).to_vec() };
+        let n_bit = u32::from_le_bytes(head[0..4].try_into().unwrap()) as u8;
+        let num_blocks = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
+        self.dequant_wna16_to_f32(packed_rocm, num_weights, n_bit, num_blocks)
+    }
+
     pub fn dequant_wna16_to_f32(
         &self,
         packed: &RocmStorage,
@@ -11118,6 +11153,141 @@ impl RocmDevice {
                 arg(&mut gs),
             ],
         )
+    }
+
+    /// Public materialization service (quant workstream): dequantize a
+    /// Marlin W4A16 packed expert blob to row-major F32 [k_dim? no —]
+    ///
+    /// Returns Dᵀ flattened ([k_dim, n_rows] where C = A @ Dᵀ was computed
+    /// with an identity activation), i.e. the caller transposes if it needs
+    /// row-major [n_rows, k_dim].
+    pub fn dequant_w4a16_blob_to_f32(
+        &self,
+        blob: &RocmStorage,
+        n_rows: usize,
+        k_dim: usize,
+        group_size: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
+        use grim_tensor::ArithType;
+        let id: Vec<f32> = (0..k_dim)
+            .flat_map(|i| (0..k_dim).map(move |j| if i == j { 1.0f32 } else { 0.0 }))
+            .collect();
+        let a = self.from_cpu(&id, &Shape::new(vec![k_dim, k_dim]), DType::F32)?;
+        let out_shape = Shape::new(vec![k_dim, n_rows]);
+        let out = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let a_rocm = a
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("identity not rocm".into()))?;
+        let _h =
+            self.launch_marlin_gemm_w4a16_blob(a_rocm, blob, &out, k_dim, n_rows, k_dim, group_size)?;
+        Ok(Box::new(out))
+    }
+
+    /// Public materialization service (quant workstream): run the GPTQ
+    /// forward-dequant GEMM with an identity activation so C = D, the full
+    /// row-major [n_out, k_in] dequantized weight.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gptq_dequant_identity_to_f32(
+        &self,
+        blob: &RocmStorage,
+        n_out: usize,
+        k_in: usize,
+        bits: u8,
+        group_size: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
+        use grim_tensor::ArithType;
+        let mut vpw: i32 = match bits {
+            2 => 16,
+            3 => 32,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "gptq dequant identity: unsupported bit width {bits}"
+                )));
+            }
+        };
+        let mut has_i: i32 = 0;
+        let (qw, qz, sc, gi, has_g_idx) =
+            Self::gptq_segment_offsets(bits, group_size, k_in, n_out, blob.bytes())?;
+        // C = A @ D with A = I[K=k_in] gives C = D row-major [k_in, n_out]
+        // (the CALLER transposes to weight layout [n_out, k_in]).
+        let id: Vec<f32> = (0..k_in)
+            .flat_map(|i| (0..k_in).map(move |j| if i == j { 1.0f32 } else { 0.0 }))
+            .collect();
+        let a = self.from_cpu(&id, &Shape::new(vec![k_in, k_in]), DType::F32)?;
+        let out_shape = Shape::new(vec![k_in, n_out]);
+        let out = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let a_rocm = a
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("identity not rocm".into()))?;
+        let mut aptr = a_rocm.device_ptr.unwrap() as *mut c_void;
+        let mut bptr = blob.device_ptr.unwrap() as *mut c_void;
+        let mut optr = out.device_ptr.unwrap() as *mut c_void;
+        let mut m_i = k_in as i32;
+        let mut n_i = n_out as i32;
+        let mut k_i = k_in as i32;
+        let mut bits_i = bits as i32;
+        let mut gs_i = group_size as i32;
+
+        let mut qw_i = qw;
+        let mut qz_i = qz;
+        let mut sc_i = sc;
+        let mut gi_i = gi;
+        let grid_x = ((n_out * n_out + 255) / 256) as u32;
+        self.launch_compute_kernel(
+            "grim_gptq_dequant_gemm",
+            HipDim3::new(grid_x, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut m_i),
+                arg(&mut n_i),
+                arg(&mut k_i),
+                arg(&mut bits_i),
+                arg(&mut gs_i),
+                arg(&mut vpw),
+                arg(&mut has_i),
+                arg(&mut qw_i),
+                arg(&mut qz_i),
+                arg(&mut sc_i),
+                arg(&mut gi_i),
+            ],
+        )?;
+        Ok(Box::new(out))
+    }
+
+    /// Raw-args GPTQ forward-dequant GEMM for identity-activation
+    /// materialization (grim-nn dequantizes packed experts through
+    /// C = I @ D with this entry). Grid: one 256-thread block per 256 outputs.
+    pub(crate) fn launch_gptq_dequant_gemm_raw(
+        &self,
+        args: &mut [*mut c_void],
+        grid_dim: HipDim3,
+        block_dim: HipDim3,
+    ) -> Result<()> {
+        self.launch_compute_kernel("grim_gptq_dequant_gemm", grid_dim, block_dim, args)?;
+        Ok(())
     }
 
     /// Launch Marlin-style Interleaved W4A16 GEMM.
