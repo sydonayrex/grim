@@ -604,7 +604,9 @@ mod tests {
         let x = tape.register(cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])));
         let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
         let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
-        // SAME A matrix used by two different LoRA applications (weight tying).
+        // SAME A matrix used by two CHAINED LoRA applications (weight tying):
+        // out1 = f(x; A, B1), out2 = f(out1; A, B2), loss = out2 — so A
+        // contributes through two entries that BOTH lie on the loss path.
         let a_data = cpu_tensor(vec![0.5, 0.5], Shape::new(vec![1, 2]));
         let b1_data = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2, 1]));
         let b2_data = cpu_tensor(vec![2.0, 2.0], Shape::new(vec![2, 1]));
@@ -617,7 +619,7 @@ mod tests {
         let b2_pid = ParamId::b(0, 2, LoRAInjectionPoint::VProj);
         let b2_id = tape.register_param(b2_pid, b2_data.clone());
         let base2 = tape.register(cpu_tensor(vec![0.0, 0.0], Shape::new(vec![1, 2])));
-        let _out2 = tape.record_lora_apply(base2, x, a_id, b2_id, cpu_tensor(vec![2.0, 2.0], Shape::new(vec![1, 2])), 1.0, 1, pid_a, b2_pid);
+        let out2 = tape.record_lora_apply(base2, out1, a_id, b2_id, cpu_tensor(vec![2.0, 2.0], Shape::new(vec![1, 2])), 1.0, 1, pid_a, b2_pid);
 
         params.insert(crate::param::TrainableParam::new(pid_a, a_data.clone()).unwrap());
         params.insert(crate::param::TrainableParam::new(pid_b, b1_data).unwrap());
@@ -626,7 +628,7 @@ mod tests {
         let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
         let mut optimizer =
             crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
-        let res = crate::backward::backward_step(&tape, loss_grad, out1, &mut params, &mut optimizer);
+        
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("backward_step must refuse a multi-entry parameter"),
