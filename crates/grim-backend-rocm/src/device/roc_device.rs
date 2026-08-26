@@ -10783,14 +10783,14 @@ impl RocmDevice {
     /// blob errors loudly here instead of faulting inside the kernel.
     /// A g_idx stored as u64 (rather than u32) is rejected explicitly — the
     /// kernel reads u32 indices only.
-    fn gptq_segment_offsets(
+    pub(crate) fn gptq_segment_offsets(
         bits: u8,
         group_size: usize,
         k: usize,
         n: usize,
         blob_bytes: usize,
     ) -> Result<(i64, i64, i64, i64, bool)> {
-        const HDR: usize = 32; // four u64 length prefixes
+        const _: usize = 32; // four interleaved u64 length prefixes total
         let vpw: usize = match bits {
             2 => 16,
             4 => 8,
@@ -10805,16 +10805,23 @@ impl RocmDevice {
         let groups = k.div_ceil(group_size);
         let qz_len = groups * n.div_ceil(vpw) * 4;
         let sc_len = groups * n * 4;
-        let base = HDR + qw_len + 8 + qz_len + 8 + sc_len;
 
-        let no_gi_total = base; // empty g_idx segment: [u64 0]
-        let gi_total_u32 = base + 8 + k * 4;
-        let gi_total_u64 = base + 8 + k * 8;
+        // Each segment is preceded by ITS OWN u64 length prefix:
+        //   [u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx]
+        // so data starts are 8 / (8+qw+8) / (8+qw+8+qz+8) / (+8+sc), and the
+        // blob ends with the (possibly empty-length) g_idx prefix.
+        let qz_data = 8 + qw_len + 8;
+        let sc_data = qz_data + qz_len + 8;
+        let gi_data = sc_data + sc_len + 8;
 
-        let (has_g_idx, total) = if blob_bytes == no_gi_total {
-            (false, no_gi_total)
+        let no_gi_total = gi_data; // empty g_idx segment: just the zeroed u64
+        let gi_total_u32 = gi_data + k * 4;
+        let gi_total_u64 = gi_data + k * 8;
+
+        let has_g_idx = if blob_bytes == no_gi_total {
+            false
         } else if blob_bytes == gi_total_u32 {
-            (true, gi_total_u32)
+            true
         } else if blob_bytes == gi_total_u64 {
             return Err(Error::Backend(
                 "gptq gemm: 64-bit g_idx entries not supported by the fused kernel".into(),
@@ -10827,13 +10834,7 @@ impl RocmDevice {
             )));
         };
 
-        Ok((
-            8,
-            (HDR + qw_len + 8) as i64,
-            (HDR + qw_len + 8 + qz_len + 8) as i64,
-            base as i64 + 8,
-            has_g_idx,
-        ))
+        Ok((8, qz_data as i64, sc_data as i64, gi_data as i64, has_g_idx))
     }
 
     /// Launch Marlin-style Interleaved W4A16 GEMM.
