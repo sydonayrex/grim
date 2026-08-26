@@ -230,13 +230,32 @@ pub fn fused_or_scalar_attention_paged(
             ))
         }
         Err(_) => {
-            // Fallback to scalar attention if paged device kernel is unavailable
-            let k_flat = k_pages.to_cpu_vec_f32().unwrap_or_default();
-            let v_flat = v_pages.to_cpu_vec_f32().unwrap_or_default();
+            // Fallback to scalar attention when the paged device kernel is
+            // unavailable. Audit fix (grim-models): the pre-fix fallback
+            // IGNORED the block table (treating the page arena as a linear
+            // history — wrong whenever blocks are non-contiguous) and
+            // `unwrap_or_default()`-ed failed D2H reads into EMPTY K/V
+            // (fabricated zeros). It now gathers rows through the block
+            // table and propagates read errors.
+            let bt_host = block_tables.to_cpu_vec_f32()?;
+            let block_table: Vec<usize> =
+                bt_host.iter().map(|&b| b as usize).collect();
+            let kv_stride = num_kv_heads * head_dim;
+            let k_flat = k_pages.to_cpu_vec_f32()?;
+            let v_flat = v_pages.to_cpu_vec_f32()?;
+            let k_hist = gather_paged_history(
+                &k_flat,
+                &block_table,
+                page_size,
+                kv_stride,
+                kv_seq_len,
+            )?;
+            let v_hist =
+                gather_paged_history(&v_flat, &block_table, page_size, kv_stride, kv_seq_len)?;
             scalar_attention(
                 q,
-                &k_flat,
-                &v_flat,
+                &k_hist,
+                &v_hist,
                 num_heads,
                 num_kv_heads,
                 head_dim,
@@ -250,6 +269,44 @@ pub fn fused_or_scalar_attention_paged(
             )
         }
     }
+}
+
+/// Gather `kv_seq_len` logical history rows out of a paged KV arena using
+/// the per-sequence block table: logical position `p` lives at physical row
+/// `block_table[p / page_size] * page_size + (p % page_size)`.
+pub fn gather_paged_history(
+    pages: &[f32],
+    block_table: &[usize],
+    page_size: usize,
+    row_elems: usize,
+    kv_seq_len: usize,
+) -> grim_core::error::Result<Vec<f32>> {
+    use grim_core::error::Error;
+    if page_size == 0 || row_elems == 0 {
+        return Err(Error::Shape(
+            "gather_paged_history: page_size and row_elems must be > 0".into(),
+        ));
+    }
+    let total_rows = pages.len() / row_elems;
+    let mut hist = Vec::with_capacity(kv_seq_len * row_elems);
+    for pos in 0..kv_seq_len {
+        let block = *block_table.get(pos / page_size).ok_or_else(|| {
+            Error::Shape(format!(
+                "gather_paged_history: block table has {} entries, need {} for kv_seq_len {}",
+                block_table.len(),
+                pos / page_size + 1,
+                kv_seq_len
+            ))
+        })?;
+        let row = block * page_size + (pos % page_size);
+        if row >= total_rows {
+            return Err(Error::Shape(format!(
+                "gather_paged_history: physical row {row} out of range ({total_rows} rows)"
+            )));
+        }
+        hist.extend_from_slice(&pages[row * row_elems..(row + 1) * row_elems]);
+    }
+    Ok(hist)
 }
 
 /// Like [`fused_or_scalar_attention`] but with an explicit softmax scale
@@ -370,6 +427,44 @@ fn scalar_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit gate: the paged fallback's gather must follow the BLOCK TABLE,
+    /// not assume the arena is linear history. Pages are filled with
+    /// position-encoded values in permuted physical order; the gather must
+    /// reconstruct linear order exactly.
+    #[test]
+    fn gather_paged_history_follows_block_table() {
+        let page_size = 4usize;
+        let row_elems = 2usize;
+        let kv_seq_len = 10usize; // 2.5 pages → 3-page block table
+        // Physical arena where row r holds value r as [r.0, r.25].
+        let n_pages = 5usize;
+        let mut arena = vec![0.0f32; n_pages * page_size * row_elems];
+        for r in 0..n_pages * page_size {
+            arena[r * row_elems] = r as f32;
+            arena[r * row_elems + 1] = r as f32 + 0.25;
+        }
+        // Logical pages 0..3 map to PHYSICAL pages 4, 0, 3 (permuted).
+        let block_table = vec![4usize, 0, 3];
+
+        let got = gather_paged_history(&arena, &block_table, page_size, row_elems, kv_seq_len)
+            .expect("gather");
+
+        assert_eq!(got.len(), kv_seq_len * row_elems);
+        for pos in 0..kv_seq_len {
+            let expect_row = (block_table[pos / page_size] * page_size + pos % page_size) as f32;
+            assert_eq!(got[pos * row_elems], expect_row, "logical pos {pos}");
+            assert_eq!(
+                got[pos * row_elems + 1],
+                expect_row + 0.25,
+                "logical pos {pos}"
+            );
+        }
+
+        // Short block table must error, never fabricate.
+        let short = gather_paged_history(&arena, &[0], page_size, row_elems, kv_seq_len);
+        assert!(short.is_err(), "short block table must error");
+    }
 
     /// The scalar fallback must match a straightforward textbook reference
     /// with causal + sliding-window masking, including at nonzero offsets.

@@ -261,37 +261,40 @@ impl MambaBlock {
         state.h.copy_from_slice(&state_data);
         state.pos += 1;
 
-        // Build output token and project out.
-        let mut out = vec![0.0f32; h_in];
+        // Build output token and project out. (Audit fix: this vec was sized
+        // `h_in` but written for `d_inner` entries — out of bounds whenever
+        // d_inner > hidden.)
+        let mut out = vec![0.0f32; self.d_inner];
         for n in 0..self.d_inner {
-            out[n] = scan_data[n];
+            out[n] = scan_data.get(n).copied().unwrap_or(0.0);
         }
-        let out_t = cpu_tensor(out, Shape::new(vec![1, h_in]));
+        let out_t = cpu_tensor(out, Shape::new(vec![1, self.d_inner]));
         let residual = self.out_proj.forward(&out_t)?;
         Ok(residual)
     }
 
     /// CPU fallback path for Mamba selective scan.
     fn step_block_cpu(&self, x: &Tensor, state: &mut MambaState) -> Result<Tensor> {
-        let dev = CpuDevice::new();
-        let h_in = x.shape().dims().last().copied().unwrap_or(0);
-        let _ = dev;
         // Step-wise selective SSM scan.
-        // In v1, take the next row of `x` (one token) and update state.
-        let xd = x.to_vec_f32()?;
-        if xd.is_empty() {
-            return Err(Error::Shape("empty Mamba input".into()));
+        //
+        // Audit fix (grim-models): this path previously skipped `in_proj`
+        // entirely and sliced the RAW hidden vector as if it were the xz
+        // pair, then indexed past its end — an out-of-bounds panic for any
+        // config with `2 * d_inner > hidden_size` (i.e. every real Mamba
+        // shape). Block contract: norm(hidden) → in_proj → xz of length
+        // 2*d_inner (scan input x = xz[..d_inner], gate z = xz[d_inner..])
+        // → selective scan → out_proj back to hidden.
+        let x_norm = self.norm.forward(x)?;
+        let xz_t = self.in_proj.forward(&x_norm)?;
+        let xz = xz_t.to_vec_f32()?;
+        if xz.len() < 2 * self.d_inner {
+            return Err(Error::Shape(format!(
+                "mamba step_block_cpu: in_proj produced {} elements, need 2*d_inner={}",
+                xz.len(),
+                2 * self.d_inner
+            )));
         }
-        // MOD-4 fix: take the first `h_in` elements (batch=1 token) instead of
-        // replicating `xd[0]` across the whole vector.
-        let x_flat: Vec<f32> = xd.iter().take(h_in).copied().collect();
-        let x_norm = self
-            .norm
-            .forward(&cpu_tensor(x_flat, Shape::new(vec![1, h_in])))?;
-        let xz = self.in_proj.forward(&x_norm)?;
-        let xz_data = xz.to_vec_f32()?;
-        let d_inner = self.d_inner;
-        let _ = d_inner;
+        let x_flat: Vec<f32> = xz[..self.d_inner].to_vec();
 
         // MOD-3 fix: proper discretized SSM recurrence. The previous code used a
         // placeholder `xz_data[s] * (state.pos as f32 * 0.01)` term that has no
@@ -301,7 +304,7 @@ impl MambaBlock {
         // where A = a_log, B = b_param, and x_n is the input to channel `n`
         // (mirroring the GPU kernel `h_new = a * h_prev + x_n * b_row[s]`).
         for n in 0..state.d_inner {
-            let x_n = xz_data[n];
+            let x_n = x_flat[n];
             for s in 0..state.d_state {
                 let a = self.a_log[n * state.d_state + s];
                 let b = self
@@ -316,16 +319,17 @@ impl MambaBlock {
         }
         state.pos += 1;
 
-        // Build an output token by summing state over s and projecting out.
-        let mut out = vec![0.0f32; h_in];
+        // Build an output token by summing state over s, gated by z, then
+        // project back to hidden width via out_proj.
+        let mut out = vec![0.0f32; self.d_inner];
         for n in 0..self.d_inner {
             let mut acc = 0.0f32;
             for s in 0..self.d_state {
                 acc += state.h[n * self.d_state + s];
             }
-            out[n] = acc + xz_data[state.d_inner + n] * self.d_param[n];
+            out[n] = acc + xz[self.d_inner + n] * self.d_param[n];
         }
-        let out_t = cpu_tensor(out, Shape::new(vec![1, h_in]));
+        let out_t = cpu_tensor(out, Shape::new(vec![1, self.d_inner]));
         let residual = self.out_proj.forward(&out_t)?;
         Ok(residual)
     }
@@ -519,12 +523,89 @@ impl CausalLm for Mamba {
 
     fn forward(
         &self,
-        _session: &mut dyn grim_core::session::SessionT,
+        session: &mut dyn grim_core::session::SessionT,
         input_ids: &Tensor,
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let mut state = self.init_state(1);
-        self.step(&mut *state, input_ids)
+        // Audit fix (grim-models): this used to call `init_state(1)` fresh on
+        // EVERY forward and discard it — a stateful SSM driven through the
+        // engine was completely context-free after its first token (each
+        // decode step saw one token from zeroed state; prefill worked, every
+        // subsequent token was garbage). The state now lives on the session
+        // and advances across calls, mirroring the KV-cache contract.
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(self.init_state(1)));
+        }
+        let cell = session.model_state_mut().ok_or_else(|| {
+            Error::Session("mamba: session model_state vanished".into())
+        })?;
+        let boxed_state = cell
+            .downcast_mut::<Box<dyn SsmState>>()
+            .ok_or_else(|| {
+                Error::Session("mamba: session model_state holds another model's state".into())
+            })?;
+        let logits = self.step(boxed_state.as_mut(), input_ids)?;
+        let seq_len = input_ids.shape().elem_count();
+        session.advance_pos(seq_len);
+        Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use grim_core::model::CausalLm;
+    use grim_core::session::{Inner, SessionT};
+
+    /// Audit gate (grim-models): CausalLm::forward must thread the SSM state
+    /// across calls via session.model_state — the pre-fix code re-initialized
+    /// a fresh state on EVERY call, so engine decode was context-free after
+    /// the first token. The second call's logits through one session must
+    /// equal an explicit init→step→step reference, and the session position
+    /// must advance per call.
+    #[test]
+    fn mamba_forward_keeps_state_across_calls() {
+        let cfg = MambaConfig {
+            vocab_size: 64,
+            hidden_size: 16,
+            d_state: 4,
+            d_inner: 32,
+            d_conv: 4,
+            num_layers: 2,
+            conv_kernel: 4,
+            rms_norm_eps: 1e-5,
+        };
+        let model = Mamba::random(Device::Cpu, cfg);
+        let tok =
+            |v: f32| cpu_tensor(vec![v], Shape::new(vec![1]));
+
+        let mut sess = Inner::new(Device::Cpu);
+        let _first = CausalLm::forward(&model, &mut sess, &tok(1.0), &tok(0.0), &[]).unwrap();
+        let second_with_state =
+            CausalLm::forward(&model, &mut sess, &tok(2.0), &tok(0.0), &[])
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+        assert_eq!(
+            sess.current_pos(),
+            2,
+            "session position must advance once per forward call"
+        );
+
+        // Reference: explicitly carried state (init once, step twice).
+        let mut state = model.init_state(1);
+        let _ = model.step(state.as_mut(), &tok(1.0)).unwrap();
+        let ref_second = model
+            .step(state.as_mut(), &tok(2.0))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(
+            second_with_state, ref_second,
+            "CausalLm::forward must thread SSM state across calls — a mismatch \
+             means the session state was reset between calls"
+        );
     }
 }

@@ -195,16 +195,16 @@ impl MiniCpmBlock {
         layer: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let orig_dims = x.shape().dims().to_vec();
+        // Audit fix: these rank conversions must PHYSICALLY reshape the
+        // storage — a hand-rolled Tensor::new relabel leaves the storage
+        // 3-D and CPU matmul validates storage rank ("matmul expects 2-D
+        // inputs" on every multi-token forward).
         let (x_2d, is_3d) = if orig_dims.len() == 3 {
-            let total_tokens = orig_dims[0] * orig_dims[1];
             (
-                Tensor::new(
-                    x.storage().clone(),
-                    Shape::new(vec![total_tokens, orig_dims[2]]),
-                    x.dtype(),
-                    x.provenance().clone(),
-                    x.device().clone(),
-                ),
+                crate::block::reshaped_view(
+                    x,
+                    &Shape::new(vec![orig_dims[0] * orig_dims[1], orig_dims[2]]),
+                )?,
                 true,
             )
         } else {
@@ -221,12 +221,30 @@ impl MiniCpmBlock {
 
         let paged_attn_out = if let Some(sess) = session {
             if sess.has_paged_kv() {
-                sess.append_kv_layer(layer, &k, &v).ok();
-                if let (Some(bt), Some((k_pages, v_pages, page_size))) =
-                    (sess.block_table(), sess.paged_kv_handles(layer))
-                {
-                    self.paged_self_attention(&q_rot, bt, &k_pages, &v_pages, page_size, positions)
+                // The pages must hold POST-RoPE keys (the classic
+                // LlamaLayerCache path caches k_rot and the dense attention
+                // reads it directly — the pre-fix code appended the RAW k,
+                // so every paged attention scored rotated queries against
+                // un-rotated keys).
+                // A FAILED append must skip the paged read: attending over
+                // pages missing this call's K/V silently corrupts output;
+                // falling back to the classic cache path is always correct.
+                if sess.append_kv_layer(layer, &k_rot, &v).is_ok() {
+                    if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                        (sess.block_table(), sess.paged_kv_handles(layer))
+                    {
+                        self.paged_self_attention(
+                            &q_rot,
+                            bt,
+                            &k_pages,
+                            &v_pages,
+                            page_size,
+                            positions,
+                        )
                         .ok()
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -244,13 +262,10 @@ impl MiniCpmBlock {
 
         let attn_out_2d = if attn_out.shape().dims().len() == 3 {
             let dims = attn_out.shape().dims();
-            Tensor::new(
-                attn_out.storage().clone(),
-                Shape::new(vec![dims[0] * dims[1], dims[2]]),
-                attn_out.dtype(),
-                attn_out.provenance().clone(),
-                attn_out.device().clone(),
-            )
+            crate::block::reshaped_view(
+                &attn_out,
+                &Shape::new(vec![dims[0] * dims[1], dims[2]]),
+            )?
         } else {
             attn_out
         };
@@ -300,13 +315,7 @@ impl MiniCpmBlock {
 
         let out_2d = grim_nn::modules::add_on_device(&added, &ffn_out)?;
         let out = if is_3d {
-            Tensor::new(
-                out_2d.storage().clone(),
-                Shape::new(orig_dims),
-                out_2d.dtype(),
-                out_2d.provenance().clone(),
-                out_2d.device().clone(),
-            )
+            crate::block::reshaped_view(&out_2d, &Shape::new(orig_dims))?
         } else {
             out_2d
         };
@@ -403,7 +412,19 @@ impl MiniCpmBlock {
         _positions: &[u32],
     ) -> Result<Tensor> {
         let q_dims = q.shape().dims().to_vec();
-        let (b, s) = (q_dims[0], q_dims[1]);
+        // Accept both 3-D (B, S, H*D) and 2-D (S, H*D) producers: the block
+        // converts its input to 2-D before the projections, so the classic
+        // path hands this function a 2-D q. (Audit fix: the pre-fix code
+        // indexed q_dims[1] as S unconditionally — garbage shapes for 2-D.)
+        let (b, s) = match q_dims.len() {
+            3 => (q_dims[0], q_dims[1]),
+            2 => (1, q_dims[0]),
+            _ => {
+                return Err(grim_core::error::Error::Shape(format!(
+                    "minicpm prefilled_self_attention: expected 2-D or 3-D q, got {q_dims:?}"
+                )));
+            }
+        };
         let scale = 1.0 / (self.cfg.head_dim as f32).sqrt();
 
         let q_data = q.to_vec_f32()?;
@@ -476,16 +497,94 @@ impl MiniCpmBlock {
         ))
     }
 
+    /// Paged attention over the session KV pages. Audit fix (grim-models):
+    /// this was a STUB that ignored the block table and pages entirely and
+    /// computed `prefilled_self_attention(q, q, q)` — every engine-served
+    /// MiniCPM token attended to garbage (its own query as keys AND values)
+    /// instead of its history. Real implementation: gather the
+    /// block-table-addressed history (post-RoPE K + raw V, appended by the
+    /// caller BEFORE this call) and run offset-aware causal attention.
+    #[allow(clippy::too_many_arguments)]
     fn paged_self_attention(
         &self,
         q: &Tensor,
-        _block_table: &[u32],
-        _k_pages: &Tensor,
-        _v_pages: &Tensor,
-        _page_size: usize,
+        block_table: &[u32],
+        k_pages: &Tensor,
+        v_pages: &Tensor,
+        page_size: usize,
         positions: &[u32],
     ) -> Result<Tensor> {
-        self.prefilled_self_attention(q, q, q, positions)
+        use crate::kv_attention::causal_attention;
+        let num_heads = self.cfg.local_num_heads;
+        let num_kv_heads = self.cfg.local_num_kv_heads;
+        let head_dim = self.cfg.head_dim;
+        let q_dims = q.shape().dims().to_vec();
+        let (b, s) = match q_dims.len() {
+            3 => (q_dims[0], q_dims[1]),
+            2 => (1, q_dims[0]),
+            _ => {
+                return Err(grim_core::error::Error::Shape(format!(
+                    "minicpm paged_self_attention: expected 2-D or 3-D q, got {q_dims:?}"
+                )));
+            }
+        };
+        let kv_stride = num_kv_heads * head_dim;
+        let cache_offset = positions.first().copied().unwrap_or(0) as usize;
+        let kv_seq_len = cache_offset + s;
+
+        let bt: Vec<usize> = block_table.iter().map(|&v| v as usize).collect();
+        let k_flat = k_pages.to_vec_f32()?;
+        let v_flat = v_pages.to_vec_f32()?;
+        let k_hist = crate::shared_attention::gather_paged_history(
+            &k_flat,
+            &bt,
+            page_size,
+            kv_stride,
+            kv_seq_len,
+        )?;
+        let v_hist = crate::shared_attention::gather_paged_history(
+            &v_flat,
+            &bt,
+            page_size,
+            kv_stride,
+            kv_seq_len,
+        )?;
+
+        let q_data = q.to_vec_f32()?;
+        let row_elems = num_heads * head_dim;
+        let kv_head: Vec<usize> = (0..num_heads).map(|h| h * num_kv_heads / num_heads).collect();
+        let mut out_total = Vec::with_capacity(b * s * row_elems);
+        for bi in 0..b {
+            let q_slice = &q_data[bi * s * row_elems..(bi + 1) * s * row_elems];
+            let out = causal_attention(
+                q_slice,
+                &k_hist,
+                &v_hist,
+                s,
+                kv_seq_len,
+                cache_offset,
+                num_heads,
+                head_dim,
+                row_elems,
+                kv_stride,
+                &kv_head,
+            );
+            out_total.extend_from_slice(&out);
+        }
+
+        let dev = pick_device_for_storage_device(&self.dev);
+        let storage = dev.from_cpu(
+            &out_total,
+            &Shape::new(vec![b, s, row_elems]),
+            DType::F32,
+        )?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            Shape::new(vec![b, s, row_elems]),
+            DType::F32,
+            q.provenance().clone(),
+            self.dev.clone(),
+        ))
     }
 }
 
@@ -550,15 +649,11 @@ impl MiniCpmModel {
         let h = self.norm.forward(&h)?;
         let orig_h_dims = h.shape().dims().to_vec();
         let (h_2d, is_3d) = if orig_h_dims.len() == 3 {
-            let total_tokens = orig_h_dims[0] * orig_h_dims[1];
             (
-                Tensor::new(
-                    h.storage().clone(),
-                    Shape::new(vec![total_tokens, orig_h_dims[2]]),
-                    h.dtype(),
-                    h.provenance().clone(),
-                    h.device().clone(),
-                ),
+                crate::block::reshaped_view(
+                    &h,
+                    &Shape::new(vec![orig_h_dims[0] * orig_h_dims[1], orig_h_dims[2]]),
+                )?,
                 true,
             )
         } else {
@@ -698,7 +793,164 @@ impl CausalLm for MiniCpmModel {
             session.append_kv(k, v)?;
         }
         session.set_last_hidden_state(hidden_state);
+        // Audit fix (grim-models): MiniCPM never advanced the session
+        // position, so the engine's decode start_pos was stuck at 0 and
+        // EVERY decode token ran at RoPE position 0 while the KV cache grew.
+        session.advance_pos(seq_len);
 
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use grim_core::session::{Inner, SessionT};
+    use grim_nn::WeightSource;
+    use grim_tensor::dtype::{Device as TDevice, QuantProvenance};
+    use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
+    use grim_tensor::Shape;
+
+    /// In-memory provider so MiniCpmModel::load can run without a GGUF
+    /// (mirrors moe_block's FullProvider pattern).
+    #[derive(Clone)]
+    struct FullProvider {
+        tensors: std::collections::HashMap<String, RawTensor>,
+    }
+
+    impl TensorProvider for FullProvider {
+        fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                grim_tensor::error::Error::Backend(format!("tensor '{name}' not found"))
+            })
+        }
+        fn meta(&self, _name: &str) -> grim_tensor::error::Result<TensorMeta> {
+            Ok(TensorMeta {
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+                shape: vec![],
+                fusion_mask: 0,
+            })
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn tiny_model() -> MiniCpmModel {
+        let (vocab, hidden, inter) = (64usize, 16usize, 16usize);
+        let (heads, kv_heads, head_dim) = (2usize, 1usize, 8usize);
+        let mut t = std::collections::HashMap::new();
+        let mut put = |name: String, shape: Vec<usize>, data: Vec<f32>| {
+            t.insert(name, RawTensor { bytes: f32_bytes(&data), shape, dtype: DType::F32, provenance: QuantProvenance::GrimNative });
+        };
+        let rnd: Vec<f32> = (0..vocab * hidden).map(|i| ((i % 37) as f32 * 0.02) - 0.35).collect();
+        put("tok_embeddings.weight".into(), vec![vocab, hidden], rnd);
+        let layer_names = [
+            ("attn_norm.weight".to_string(), vec![hidden], vec![1.0f32; hidden]),
+            ("ffn_norm.weight".to_string(), vec![hidden], vec![1.0f32; hidden]),
+            ("attn.wq.weight".to_string(), vec![heads * head_dim, hidden],
+                (0..heads * head_dim * hidden).map(|i| ((i % 11) as f32 * 0.01) - 0.05).collect()),
+            ("attn.wk.weight".to_string(), vec![kv_heads * head_dim, hidden],
+                (0..kv_heads * head_dim * hidden).map(|i| ((i % 7) as f32 * 0.01) - 0.03).collect()),
+            ("attn.wv.weight".to_string(), vec![kv_heads * head_dim, hidden],
+                (0..kv_heads * head_dim * hidden).map(|i| ((i % 13) as f32 * 0.01) - 0.06).collect()),
+            ("attn.wo.weight".to_string(), vec![hidden, heads * head_dim],
+                (0..hidden * heads * head_dim).map(|i| ((i % 17) as f32 * 0.01) - 0.08).collect()),
+            ("ffn.w_gate.weight".to_string(), vec![inter, hidden],
+                (0..inter * hidden).map(|i| ((i % 5) as f32 * 0.01) - 0.02).collect()),
+            ("ffn.w_up.weight".to_string(), vec![inter, hidden],
+                (0..inter * hidden).map(|i| ((i % 9) as f32 * 0.01) - 0.04).collect()),
+            ("ffn.w_down.weight".to_string(), vec![hidden, inter],
+                (0..hidden * inter).map(|i| ((i % 15) as f32 * 0.01) - 0.07).collect()),
+        ];
+        for (name, shape, data) in layer_names {
+            put(format!("layers.0.{name}"), shape, data);
+        }
+        // norm.weight is legitimately ALL ONES (audit: must not be rejected).
+        put("norm.weight".into(), vec![hidden], vec![1.0f32; hidden]);
+        let out_w: Vec<f32> = (0..vocab * hidden).map(|i| ((i % 23) as f32 * 0.01) - 0.1).collect();
+        put("output.weight".into(), vec![vocab, hidden], out_w);
+
+        let provider = FullProvider { tensors: t };
+        let ws = WeightSource::root(&provider, TDevice::Cpu);
+        let cfg = MiniCpmConfig {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            num_layers: 1,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            scale_emb: None,
+            scale_depth: None,
+            dim_model_base: None,
+        };
+        MiniCpmModel::load(&ws, cfg).expect("tiny minicpm load")
+    }
+
+    fn cpu_ids(ids: &[u32]) -> grim_tensor::Tensor {
+        grim_backend_cpu::cpu_tensor(
+            ids.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
+            Shape::new(vec![ids.len()]),
+        )
+    }
+
+    /// Audit gate: MiniCPM must advance the session position — pre-fix it
+    /// never did, so every engine decode token ran at RoPE position 0.
+    #[test]
+    fn minicpm_forward_advances_session_position() {
+        let model = tiny_model();
+        let mut sess = Inner::new(model.device.clone());
+        let adapters: [grim_core::model::AdapterHandle; 0] = [];
+        grim_core::CausalLm::forward(&model, &mut sess, &cpu_ids(&[3, 9]), &cpu_ids(&[0, 1]), &adapters)
+            .expect("forward");
+        assert_eq!(sess.current_pos(), 2, "session pos must advance by seq_len");
+    }
+
+    /// Audit gate: the paged KV path must store POST-RoPE keys — paged and
+    /// classic attention over identical input must agree. Pre-fix the paged
+    /// append stored RAW keys while the query ran rotated, so the two paths
+    /// diverged on any input with nonzero positions.
+    #[test]
+    fn minicpm_paged_matches_classic_attention() {
+        let model = tiny_model();
+        let ids = [3u32, 9u32];
+        let pos = [0u32, 1];
+        let adapters: [grim_core::model::AdapterHandle; 0] = [];
+
+        // Classic path (per-layer cache in model_state).
+        let mut classic = Inner::new(model.device.clone());
+        let logits_classic =
+            grim_core::CausalLm::forward(&model, &mut classic, &cpu_ids(&ids), &cpu_ids(&pos), &adapters)
+                .expect("classic forward");
+
+        // Paged path (PagedKvCache-backed session).
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(
+            grim_memory::KvBlockPool::new(64, 1, 8),
+        ));
+        let mut kv = grim_memory::PagedKvCache::new(pool, 1, 8, grim_memory::BLOCK_SIZE);
+        let backend = grim_nn::pick_device_for_storage_device(&model.device);
+        kv.set_device(model.device.clone(), backend);
+        let mut paged = Inner::with_kv(model.device.clone(), Box::new(kv));
+        let logits_paged =
+            grim_core::CausalLm::forward(&model, &mut paged, &cpu_ids(&ids), &cpu_ids(&pos), &adapters)
+                .expect("paged forward");
+
+        let a = logits_classic.to_vec_f32().unwrap();
+        let b = logits_paged.to_vec_f32().unwrap();
+        assert_eq!(a.len(), b.len());
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "paged path must match classic (post-RoPE key storage): max diff {max_diff}"
+        );
     }
 }
