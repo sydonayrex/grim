@@ -2641,17 +2641,16 @@ impl MAdam {
             *t += 1;
             *t
         };
-        let bias_correction1 = 1.0 - beta1.powi(sc as i32);
-        let bias_correction2 = 1.0 - beta2.powi(self.step_count.max(1) as i32);
+        let bc1 = 1.0 - beta1.powi(sc as i32);
+        let bc2 = 1.0 - beta2.powi(sc as i32);
 
         let dev = crate::pick_device_for_tensor(&param.data);
         let shape = param.data.shape().clone();
         let elem_count = shape.elem_count();
-        let dev = crate::pick_device_for_tensor(&param.data);
 
         if !self.m.contains_key(&id) {
-            let m_init = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-            let v_init = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            let m_init = dev.from_cpu(&vec![0.0f32; elem_count], &shape, DType::F32)?;
+            let v_init = dev.from_cpu(&vec![0.0f32; elem_count], &shape, DType::F32)?;
             self.m.insert(id, m_init);
             self.v.insert(id, v_init);
         }
@@ -2711,10 +2710,10 @@ impl MAdam {
             new_data.push(p - lr * (step_val + wd * p));
         }
 
-        *m_st = dev.from_cpu(&m_new, shape, DType::F32)?;
-        *v_st = dev.from_cpu(&v_new, shape, DType::F32)?;
+        *m_st = dev.from_cpu(&m_new, &shape, DType::F32)?;
+        *v_st = dev.from_cpu(&v_new, &shape, DType::F32)?;
 
-        let storage = dev.from_cpu(&new_data, shape, DType::F32)?;
+        let storage = dev.from_cpu(&new_data, &shape, DType::F32)?;
         param.data = Tensor::new(
             Arc::from(storage),
             shape.clone(),
