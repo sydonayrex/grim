@@ -107,6 +107,12 @@ impl AttentionDispatcher {
     /// their owning paths: MLA via `BackendDevice::mla_absorbed_decode` in
     /// the DeepSeek loaders, paged via `block.rs::paged_self_attention`,
     /// Sage via the ROCm `sage_attention` entry.
+    /// `has_hardware_matrix` is CALLER-SUPPLIED (audit M10): the dispatcher
+    /// cannot know the backend's matrix-core support from a `Device` enum
+    /// alone, and the previous hardcoded `false` made the returned tier
+    /// claim Tier2 even when the fused kernel ran on hardware matrix cores.
+    /// Pass the capability you queried from the backend; CPU devices still
+    /// always classify Tier3.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_gqa(
         q: &[f32],
@@ -117,6 +123,7 @@ impl AttentionDispatcher {
         head_dim: usize,
         steps: usize,
         window: Option<usize>,
+        has_hardware_matrix: bool,
         device: &grim_tensor::Device,
     ) -> grim_core::error::Result<(Tensor, AttentionTier)> {
         let topology = AttentionTopology::StandardGqa {
@@ -126,7 +133,7 @@ impl AttentionDispatcher {
             sm_scale: 1.0 / (head_dim as f32).sqrt(),
         };
         let is_gpu = !matches!(device, grim_tensor::Device::Cpu);
-        let tier = Self::select_tier(&topology, false, is_gpu);
+        let tier = Self::select_tier(&topology, has_hardware_matrix, is_gpu);
         let out = crate::shared_attention::fused_or_scalar_attention(
             q,
             k_history,

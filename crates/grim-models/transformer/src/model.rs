@@ -551,14 +551,22 @@ impl CausalLm for Llama {
         // MAJ-3: use the positions tensor passed by the engine instead of
         // hardcoding 0..seq_len. During decode the engine passes the actual
         // current_pos so RoPE sees the correct absolute position.
-        let pos_vec: Vec<u32> = if positions.shape().dims().iter().product::<usize>() == seq_len {
+        // Audit fix (grim-models M9): a length MISMATCH used to silently
+        // renumber positions from 0 — masking caller bugs and corrupting
+        // RoPE for chunked/offset decodes. It is now a loud error.
+        let pos_count = positions.shape().dims().iter().product::<usize>();
+        let pos_vec: Vec<u32> = if pos_count == seq_len {
             positions
                 .to_vec_f32()?
                 .into_iter()
                 .map(|x| x as u32)
                 .collect()
         } else {
-            (0..seq_len).map(|i| i as u32).collect()
+            return Err(grim_tensor::Error::Shape(format!(
+                "Llama::forward: positions tensor has {} elements for {} input ids",
+                pos_count, seq_len
+            ))
+            .into());
         };
         // Two execution paths:
         //  * paged  — when the session carries a `PagedKvCache` (engine
@@ -767,6 +775,29 @@ mod tests {
         );
         // Counter drained by take.
         assert_eq!(split.take_boundary_moves(), 0);
+    }
+
+    /// Audit gate (M9): a positions tensor whose length doesn't match the
+    /// input ids must be a LOUD error — the silent renumber-from-zero
+    /// fallback masked caller bugs and corrupted RoPE for offset decodes.
+    #[test]
+    fn llama_forward_rejects_mismatched_positions_length() {
+        let model = Llama::random(Device::Cpu, base_cfg(32, 1.0));
+        let ids = grim_backend_cpu::cpu_tensor(
+            vec![1.0f32, 2.0, 3.0],
+            grim_tensor::Shape::new(vec![3]),
+        );
+        let bad_positions = grim_backend_cpu::cpu_tensor(
+            vec![0.0f32, 1.0],
+            grim_tensor::Shape::new(vec![2]),
+        );
+        let mut sess = Inner::new(model.device.clone());
+        let res = CausalLm::forward(&model, &mut sess, &ids, &bad_positions, &[]);
+        let err = res.expect_err("mismatched positions must error");
+        assert!(
+            err.to_string().contains("positions"),
+            "error should mention positions: {err}"
+        );
     }
 
     /// Audit gate: all-ones norm weights must LOAD (real checkpoints ship
