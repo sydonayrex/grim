@@ -228,7 +228,6 @@ pub fn pack_awq_group_int(
         .ok_or_else(|| Error::Backend("AWQ: tensor info missing out_features".into()))?;
     let bits = info.bits;
     let vpw = if bits == 4 { 8 } else { 1 };
-    let mask = if bits == 4 { 0xFu32 } else { 0xFFu32 };
     let words_qw = in_features.div_ceil(vpw) * out_features;
     if qweight.len() < words_qw * 4 {
         return Err(Error::Backend(format!(
@@ -258,7 +257,7 @@ pub fn pack_awq_group_int(
 
     // Zero-point convention matches GPTQ exactly: both formats decode as
     // (code - (stored_zero + 1)) * scale, so qzeros pass through unchanged.
-    let mut qz_out = qzeros[..words_qz * 4].to_vec();
+    let qz_out = qzeros[..words_qz * 4].to_vec();
 
     // Widen scales f16 → f32.
     let mut sc_out = vec![0u8; groups * out_features * 4];
