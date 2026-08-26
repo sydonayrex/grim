@@ -257,6 +257,13 @@ pub fn backward_step(
     // Checkpoint-replay overlay (WI-X13): recomputed activations live here.
     let mut overlay: HashMap<TensorId, Tensor> = HashMap::new();
     let mut active_segment: Option<usize> = None;
+    // Audit fix (grim-models-adjacent pass): a parameter contributing through
+    // MULTIPLE tape entries gets an optimizer step PER ENTRY here — partial
+    // gradient stepped, zeroed, next partial stepped again. That silently
+    // mis-trains tied/shared params (Adam moments update once per fragment,
+    // not once per summed gradient). Fail loudly instead.
+    let mut stepped_params: std::collections::HashSet<crate::param::ParamId> =
+        std::collections::HashSet::new();
 
     for entry in tape.iter_rev() {
         if !ctx.grads.contains_key(&entry.output) {
@@ -288,11 +295,25 @@ pub fn backward_step(
 
                 // Fused LOMO step: immediately step parameter and release gradient buffer
                 if let Some(param_a) = trainable_params.get_mut(*a) {
+                    if !stepped_params.insert(*a) {
+                        return Err(Error::Backend(format!(
+                            "backward_step: parameter {a:?} contributes through multiple tape \
+                             entries; the fused path would step it once per fragment. Sum the \
+                             gradients on the plain `backward` path instead."
+                        )));
+                    }
                     param_a.accumulate_grad(&g_a)?;
                     optimizer.step_param(*a, param_a)?;
                     param_a.zero_grad()?;
                 }
                 if let Some(param_b) = trainable_params.get_mut(*b) {
+                    if !stepped_params.insert(*b) {
+                        return Err(Error::Backend(format!(
+                            "backward_step: parameter {b:?} contributes through multiple tape \
+                             entries; the fused path would step it once per fragment. Sum the \
+                             gradients on the plain `backward` path instead."
+                        )));
+                    }
                     param_b.accumulate_grad(&g_b)?;
                     optimizer.step_param(*b, param_b)?;
                     param_b.zero_grad()?;
@@ -322,6 +343,13 @@ pub fn backward_step(
 
                 if let Some(pid) = entry.param_id {
                     if let Some(param) = trainable_params.get_mut(pid) {
+                        if !stepped_params.insert(pid) {
+                            return Err(Error::Backend(format!(
+                                "backward_step: parameter {pid:?} contributes through multiple tape \
+                                 entries; the fused path would step it once per fragment. Sum the \
+                                 gradients on the plain `backward` path instead."
+                            )));
+                        }
                         param.accumulate_grad(&g_a)?;
                         optimizer.step_param(pid, param)?;
                         param.zero_grad()?;
@@ -366,6 +394,13 @@ pub fn backward_step(
 
                 if let Some(pid) = weight_param {
                     if let Some(param) = trainable_params.get_mut(*pid) {
+                        if !stepped_params.insert(*pid) {
+                            return Err(Error::Backend(format!(
+                                "backward_step: parameter {pid:?} contributes through multiple tape \
+                                 entries; the fused path would step it once per fragment. Sum the \
+                                 gradients on the plain `backward` path instead."
+                            )));
+                        }
                         param.accumulate_grad(&dw)?;
                         optimizer.step_param(*pid, param)?;
                         param.zero_grad()?;
@@ -401,6 +436,13 @@ pub fn backward_step(
 
                 if let Some(pid) = weight_param {
                     if let Some(param) = trainable_params.get_mut(*pid) {
+                        if !stepped_params.insert(*pid) {
+                            return Err(Error::Backend(format!(
+                                "backward_step: parameter {pid:?} contributes through multiple tape \
+                                 entries; the fused path would step it once per fragment. Sum the \
+                                 gradients on the plain `backward` path instead."
+                            )));
+                        }
                         param.accumulate_grad(&dw)?;
                         optimizer.step_param(*pid, param)?;
                         param.zero_grad()?;
@@ -549,5 +591,49 @@ mod tests {
         assert!(grads.contains_key(&base));
         let stepped_a = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
         assert_ne!(initial_a, stepped_a);
+    }
+
+    /// Audit gate: a parameter contributing through MULTIPLE tape entries
+    /// must make `backward_step` fail loudly — stepping each fragment
+    /// separately mis-trains tied/shared params.
+    #[test]
+    fn backward_step_refuses_multi_entry_param() {
+        let mut tape = Tape::new();
+        let mut params = TrainableParams::new();
+
+        let x = tape.register(cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])));
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+        // SAME A matrix used by two different LoRA applications (weight tying).
+        let a_data = cpu_tensor(vec![0.5, 0.5], Shape::new(vec![1, 2]));
+        let b1_data = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2, 1]));
+        let b2_data = cpu_tensor(vec![2.0, 2.0], Shape::new(vec![2, 1]));
+
+        let a_id = tape.register_param(pid_a, a_data.clone());
+        let b1_id = tape.register_param(pid_b, b1_data.clone());
+        let base1 = tape.register(cpu_tensor(vec![0.0, 0.0], Shape::new(vec![1, 2])));
+        let out1 = tape.record_lora_apply(base1, x, a_id, b1_id, cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])), 1.0, 1, pid_a, pid_b);
+
+        let b2_pid = ParamId::b(0, 2, LoRAInjectionPoint::VProj);
+        let b2_id = tape.register_param(b2_pid, b2_data.clone());
+        let base2 = tape.register(cpu_tensor(vec![0.0, 0.0], Shape::new(vec![1, 2])));
+        let _out2 = tape.record_lora_apply(base2, x, a_id, b2_id, cpu_tensor(vec![2.0, 2.0], Shape::new(vec![1, 2])), 1.0, 1, pid_a, b2_pid);
+
+        params.insert(crate::param::TrainableParam::new(pid_a, a_data.clone()).unwrap());
+        params.insert(crate::param::TrainableParam::new(pid_b, b1_data).unwrap());
+        params.insert(crate::param::TrainableParam::new(b2_pid, b2_data).unwrap());
+
+        let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
+        let mut optimizer =
+            crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
+        let res = crate::backward::backward_step(&tape, loss_grad, out1, &mut params, &mut optimizer);
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("backward_step must refuse a multi-entry parameter"),
+        };
+        assert!(
+            err.to_string().contains("multiple tape entries"),
+            "error should explain the refusal: {err}"
+        );
     }
 }

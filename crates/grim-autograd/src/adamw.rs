@@ -641,6 +641,14 @@ pub struct AdamW {
     pub m: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
     /// 2nd moment vector (v) per trainable parameter ID (device-resident).
     pub v: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
+    /// Audit fix (grim-models-adjacent pass): PER-PARAMETER time steps for
+    /// `step_param` (the fused LOMO/backward_step path). The old code derived
+    /// bias corrections from `step_count`, which only `step()` increments —
+    /// a fused streaming run never advanced it, so bias correction stayed at
+    /// t=1 forever and updates were permanently mis-scaled (~1/beta1). Each
+    /// parameter now counts its own update; `step()` remains the batch entry
+    /// and behaves identically because it steps every param once.
+    pub param_steps: HashMap<ParamId, usize>,
 }
 
 impl std::fmt::Debug for AdamW {
@@ -662,6 +670,7 @@ impl AdamW {
             step_count: 0,
             m: HashMap::new(),
             v: HashMap::new(),
+            param_steps: HashMap::new(),
         }
     }
 
@@ -698,10 +707,16 @@ impl AdamW {
         };
         let weight_decay = self.config.weight_decay;
 
-        let sc = if self.step_count == 0 {
-            1
-        } else {
-            self.step_count
+        // Audit fix: bias corrections now come from THIS parameter's own
+        // update count (incremented below), not from `step_count` — which
+        // only the batch `step()` entry increments. The fused streaming path
+        // (`backward_step`) calls `step_param` directly, so its bias
+        // correction used to stay frozen at t=1 forever (~1/beta1 update
+        // mis-scale).
+        let sc = {
+            let t = self.param_steps.entry(id).or_insert(0);
+            *t += 1;
+            *t
         };
         let bias_correction1 = 1.0 - beta1.powi(sc as i32);
         let bias_correction2 = 1.0 - beta2.powi(sc as i32);
@@ -3548,6 +3563,75 @@ mod tests {
             assert!(
                 p.data.to_vec_f32().unwrap()[0] != w0[0],
                 "{kind:?} must update weights"
+            );
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    /// Audit gate: fused streaming steps (`step_param` called directly, as
+    /// `backward_step` does) must evolve the bias correction per update.
+    /// Pre-fix, `step_count` was never advanced on this path so corrections
+    /// stayed frozen at t=1 forever.
+    ///
+    /// Sequence g = [1, 0]: after t=1 AdamW lands at exactly -lr; at t=2 the
+    /// zero gradient leaves pure momentum, and the CORRECT t=2 correction
+    /// gives p2 = -lr - lr·m̂₂/(√v̂₂+ε):
+    ///   m₂ = β₁·0.1        = 0.09
+    ///   v₂ = β₂·0.001      = 0.000999
+    ///   ĉ₁ = 1-β₁²         = 0.19 ; ĉ₂ = 1-β₂² = 0.001999
+    ///   p₂ = -0.1 - 0.1·(0.09/0.19)/√(0.000999/0.001999) ≈ -0.166946
+    /// A frozen t=1 instead yields ≈ -0.189959 — the gate separates them.
+    #[test]
+    fn step_param_advances_per_param_bias_correction() {
+        use grim_backend_cpu::cpu_tensor;
+        use grim_tensor::Shape;
+
+        let mut opt = Optimizer::AdamW(AdamW::new(AdamWConfig {
+            lr: 0.1,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            lora_plus_ratio: 1.0,
+        }));
+        let pid = ParamId::a(0, 1, crate::injection::LoRAInjectionPoint::QProj);
+        let mut param =
+            crate::param::TrainableParam::new(pid, cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4])))
+                .unwrap();
+
+        // t=1 with g=1 → exactly -lr.
+        param
+            .accumulate_grad(&cpu_tensor(vec![1.0f32; 4], Shape::new(vec![4])))
+            .unwrap();
+        opt.step_param(pid, &mut param).unwrap();
+        let p1 = param.data.to_vec_f32().unwrap();
+        for &d in &p1 {
+            assert!((d - (-0.1)).abs() < 1e-4, "t=1 must be exactly -lr, got {d}");
+        }
+
+        // t=2 with g=0 → momentum-only continuation under the t=2 correction.
+        param.zero_grad().unwrap();
+        opt.step_param(pid, &mut param).unwrap();
+        let p2 = param.data.to_vec_f32().unwrap();
+
+        let m2 = 0.9f32 * 0.1;
+        let v2 = 0.999f32 * 0.001;
+        let c1 = 1.0 - 0.9f32.powi(2);
+        let c2 = 1.0 - 0.999f32.powi(2);
+        let expected_p2 = -0.1f32 - 0.1 * (m2 / c1) / ((v2 / c2).sqrt() + 1e-8);
+        for &d in &p2 {
+            assert!(
+                (d - expected_p2).abs() < 1e-4,
+                "t=2 position {d} != hand-computed {expected_p2} — bias correction frozen?"
+            );
+            assert!(
+                (d - (-0.189_959)).abs() > 1e-3,
+                "t=2 position matches the FROZEN t=1 correction — regression"
             );
         }
     }
