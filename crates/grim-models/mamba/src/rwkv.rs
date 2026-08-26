@@ -54,9 +54,51 @@ impl ModelConfig for RwkvConfig {
     }
 }
 
+/// Per-session RWKV recurrence state (batch = 1).
+///
+/// Layout: `data[layer][slot][channel]` flattened, slot order
+/// `[attn_xx, attn_aa, attn_bb, attn_pp, ffn_xx]` — the RWKV-4 five-buffer
+/// state: token-shift carries (`*_xx`) and the WKV numerator/denominator/max
+/// triples (`aa`/`bb`/`pp`).
 #[derive(Clone, Debug)]
 pub struct RwkvState {
-    pub state_xy: Vec<f32>,
+    pub data: Vec<f32>,
+    pub num_layers: usize,
+    pub hidden: usize,
+}
+
+/// Slot stride per layer.
+const RWKV_SLOTS_PER_LAYER: usize = 5;
+
+impl RwkvState {
+    fn layer_offset(&self, layer: usize) -> usize {
+        layer * RWKV_SLOTS_PER_LAYER * self.hidden
+    }
+
+    /// Mutable split of one layer's five slots (bounds-checked).
+    fn layer_slots_mut(
+        &mut self,
+        layer: usize,
+    ) -> Result<[&mut [f32]; 5]> {
+        let hidden = self.hidden;
+        let base = self.layer_offset(layer);
+        let end = base + RWKV_SLOTS_PER_LAYER * hidden;
+        if end > self.data.len() {
+            return Err(Error::Session(format!(
+                "RWKV state too small: {} elements, need {}",
+                self.data.len(),
+                end
+            )));
+        }
+        let s = &mut self.data[base..end];
+        // Disjoint split (split_at_mut chains avoid aliasing borrows):
+        // slots are [xx_attn | aa | bb | pp | xx_ffn].
+        let (s01, rest) = s.split_at_mut(2 * hidden);
+        let (s0, s1) = s01.split_at_mut(hidden);
+        let (s23, s4) = rest.split_at_mut(2 * hidden);
+        let (s2, s3) = s23.split_at_mut(hidden);
+        Ok([s0, s1, s2, s3, s4])
+    }
 }
 
 impl SsmState for RwkvState {
@@ -68,7 +110,10 @@ impl SsmState for RwkvState {
             .as_any()
             .downcast_ref::<RwkvState>()
             .ok_or_else(|| Error::Session("downcast failed".into()))?;
-        self.state_xy.copy_from_slice(&other.state_xy);
+        if other.data.len() != self.data.len() {
+            return Err(Error::Session("RWKV state size mismatch".into()));
+        }
+        self.data.copy_from_slice(&other.data);
         Ok(())
     }
     fn as_any(&self) -> &dyn Any {
@@ -81,6 +126,9 @@ impl SsmState for RwkvState {
 
 pub struct RwkvBlock {
     pub norm: RmsNorm,
+    /// Second block layernorm (v4 `ln_2`, applied before the channel mix).
+    /// Falls back to a unit norm when the checkpoint lacks it.
+    pub norm2: RmsNorm,
     pub time_mix_key: Linear,
     pub time_mix_value: Linear,
     pub time_mix_receptance: Linear,
@@ -89,6 +137,17 @@ pub struct RwkvBlock {
     pub channel_mix_receptance: Linear,
     pub channel_mix_value: Linear,
     pub device: Device,
+    /// RWKV-4 recurrence parameters, `[hidden]` each. Loaded from real
+    /// checkpoints (`att.time_mix_k/r`, `att.time_decay`, `att.time_first`,
+    /// `ffn.time_mix_k/r`); synthetic/test models get neutral defaults so
+    /// the recurrence still runs (documented in the audit).
+    pub tm_mix_k: Vec<f32>,
+    pub tm_mix_v: Vec<f32>,
+    pub tm_mix_r: Vec<f32>,
+    pub time_decay: Vec<f32>,
+    pub time_first: Vec<f32>,
+    pub ffn_tm_mix_k: Vec<f32>,
+    pub ffn_tm_mix_r: Vec<f32>,
 }
 
 impl RwkvBlock {
@@ -159,8 +218,34 @@ impl RwkvBlock {
             "ffn.value",
         )?;
 
+        // RWKV-4 recurrence parameters. Real checkpoints carry them; absent
+        // tensors (synthetic models) get neutral defaults — mixes of 0.5 and
+        // a mild decay/first pair — so the state threading still exercises.
+        let vec_param = |name: &str, default: f32| -> Vec<f32> {
+            ws.get(Shape::new(vec![cfg.hidden_size]), name)
+                .map(|t| t.to_vec_f32().unwrap_or_else(|_| vec![default; cfg.hidden_size]))
+                .unwrap_or_else(|_| vec![default; cfg.hidden_size])
+        };
+        let tm_mix_k = vec_param("att.time_mix_k", 0.5);
+        let tm_mix_v = vec_param("att.time_mix_v", 0.5);
+        let tm_mix_r = vec_param("att.time_mix_r", 0.5);
+        // Both buffers are stored RAW in log space by v4 checkpoints
+        // (decay is ADDED to the running max between tokens; first is added
+        // to the current key inside the step). Defaults are mild synthetic
+        // values, not transforms of real ones.
+        let time_decay = vec_param("att.time_decay", -0.6);
+        let time_first = vec_param("att.time_first", 3.0);
+        let ffn_tm_mix_k = vec_param("ffn.time_mix_k", 0.5);
+        let ffn_tm_mix_r = vec_param("ffn.time_mix_r", 0.5);
+        let norm2 = RmsNorm::load(&ws.pp("ln_2"), cfg.hidden_size, cfg.rms_norm_eps as f32)
+            .unwrap_or(RmsNorm {
+                weight: cpu_tensor(vec![1.0f32; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                eps: cfg.rms_norm_eps as f32,
+            });
+
         Ok(Self {
             norm,
+            norm2,
             time_mix_key,
             time_mix_value,
             time_mix_receptance,
@@ -169,178 +254,146 @@ impl RwkvBlock {
             channel_mix_receptance,
             channel_mix_value,
             device,
+            tm_mix_k,
+            tm_mix_v,
+            tm_mix_r,
+            time_decay,
+            time_first,
+            ffn_tm_mix_k,
+            ffn_tm_mix_r,
         })
     }
 
-    /// Forward one step. When `self.device` is `Device::Rocm`, dispatches
-    /// to the JIT-compiled `grim_rwkv_time_mix` and `grim_rwkv_channel_mix`
-    /// HIP kernels (Phase 2 — mambo5.md Item 14).
-    pub fn step(&self, x: &Tensor, _state: &mut RwkvState) -> Result<Tensor> {
-        // GPU dispatch path: RWKV time-mix + channel-mix HIP kernels.
-        if let Device::Rocm(ordinal) = self.device {
-            #[cfg(feature = "rocm")]
-            {
-                if let Ok(result) = self.step_gpu(x, ordinal) {
-                    return Ok(result);
-                }
-            }
-            #[cfg(not(feature = "rocm"))]
-            {
-                let _ = ordinal;
-            }
-            // Fall through to CPU fallback on any GPU dispatch failure.
+    /// Forward ONE token through this block, threading the RWKV-4 recurrence
+    /// state.
+    ///
+    /// Audit fix (grim-models): the previous implementation ignored its state
+    /// parameter entirely — the time-mix was a memoryless elementwise
+    /// `sigmoid(r)·k·v`, so served RWKV had no context after prefill. This is
+    /// the canonical v4 single-token recurrence:
+    ///
+    /// * attention token-shift: k/v/r project `tm·x + (1-tm)·xx_prev`
+    ///   (xx_prev = previous token's post-norm hidden);
+    /// * WKV one-token update per channel:
+    ///   `ww = u + k; p = max(pp, k); e1 = exp(pp-p); e2 = exp(ww-p);
+    ///    y = (e1·aa + e2·v)/(e1·bb + e2); aa' = num; bb' = den;
+    ///    pp' = p + w` (w = time_decay, log-space);
+    /// * channel-mix token-shift with ReLU on the mixed key.
+    ///
+    /// The ROCm `rwkv_time_mix` kernel dispatch was REMOVED, not just
+    /// bypassed: its signature has no state I/O, so it can never implement
+    /// this recurrence — using it produced silently context-free output. The
+    /// kernels remain in the backend for future state-aware wiring.
+    pub fn step(
+        &self,
+        x: &Tensor,
+        layer_idx: usize,
+        state: &mut RwkvState,
+    ) -> Result<Tensor> {
+        let dim = self.cfg_hidden();
+        let x_vec = x.to_vec_f32()?;
+        if x_vec.len() != dim {
+            return Err(Error::Shape(format!(
+                "RWKV block step expects [{dim}] hidden, got {}",
+                x_vec.len()
+            )));
         }
-        self.step_cpu(x)
-    }
+        let [attn_xx, aa, bb, pp, ffn_xx] = state.layer_slots_mut(layer_idx)?;
 
-    /// GPU dispatch path for RWKV via `BackendDevice::rwkv_time_mix` and
-    /// `BackendDevice::rwkv_channel_mix`.
-    #[cfg(feature = "rocm")]
-    fn step_gpu(&self, x: &Tensor, ordinal: usize) -> Result<Tensor> {
-        use grim_backend_rocm::RocmDevice;
-        use grim_tensor::BackendDevice;
-
-        let dev = RocmDevice::try_new(ordinal)?;
-        let dim = x.shape().dims().last().copied().unwrap_or(0);
-        let x_data = x.to_vec_f32()?;
-        if x_data.is_empty() {
-            return Err(Error::Shape("empty RWKV input".into()));
-        }
-
-        // Time-mix: project x through key/value/receptance/output weights.
-        let norm_x = self.norm.forward(x)?;
-        let k = self.time_mix_key.forward(&norm_x)?;
-        let v = self.time_mix_value.forward(&norm_x)?;
-        let r = self.time_mix_receptance.forward(&norm_x)?;
-        let att_out = self.time_mix_output.forward(&norm_x)?;
-
-        // Upload to GPU for time-mix kernel dispatch.
-        let x_gpu = dev.from_cpu(&x_data, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let k_gpu = dev.from_cpu(
-            &k.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-        let v_gpu = dev.from_cpu(
-            &v.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-        let r_gpu = dev.from_cpu(
-            &r.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-        let w_gpu = dev.from_cpu(
-            &att_out.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-
-        let out_shape = Shape::new(vec![1, dim]);
-        let (tm_out, _) = dev.rwkv_time_mix(
-            x_gpu.as_ref(),
-            w_gpu.as_ref(),
-            k_gpu.as_ref(),
-            v_gpu.as_ref(),
-            r_gpu.as_ref(),
-            1,
-            dim,
-            1,
-            &out_shape,
-        )?;
-        let tm_data = tm_out.to_cpu_vec_f32()?;
-
-        // Use time-mix output (tm_data) in the residual, not att_out.
-        // [P1-32 fix: use tm_data in residual.]
-        let x_res1 = add_tensors(x, &cpu_tensor(tm_data, Shape::new(vec![1, dim])))
-            .map_err(grim_core::Error::Tensor)?;
-        let x_res1_data = x_res1.to_vec_f32()?;
-
-        // Channel-mix: project through key/receptance/value weights.
-        // ffn_v must use its own weight (channel_mix_value), not ffn_k's.
-        // [P1-32 fix: ffn_v uses channel_mix_value weight.]
-        let ffn_k = self.channel_mix_key.forward(&x_res1)?;
-        let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
-        let ffn_v = self.channel_mix_value.forward(&x_res1)?;
-
-        let x_res1_gpu = dev.from_cpu(
-            &x_res1_data,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-        let ffn_k_gpu = dev.from_cpu(
-            &ffn_k.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-        let ffn_r_gpu = dev.from_cpu(
-            &ffn_r.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-        let ffn_v_gpu = dev.from_cpu(
-            &ffn_v.to_vec_f32()?,
-            &Shape::new(vec![1, dim]),
-            grim_tensor::DType::F32,
-        )?;
-
-        let (cm_out, _) = dev.rwkv_channel_mix(
-            x_res1_gpu.as_ref(),
-            ffn_k_gpu.as_ref(),
-            ffn_r_gpu.as_ref(),
-            ffn_v_gpu.as_ref(),
-            1,
-            dim,
-            &out_shape,
-        )?;
-        let cm_data = cm_out.to_cpu_vec_f32()?;
-
-        let result = cpu_tensor(cm_data, Shape::new(vec![1, dim]));
-        Ok(result)
-    }
-
-    /// CPU fallback path for RWKV time-mix + channel-mix.
-    fn step_cpu(&self, x: &Tensor) -> Result<Tensor> {
-        let norm_x = self.norm.forward(x)?;
-        let k = self.time_mix_key.forward(&norm_x)?;
-        let v = self.time_mix_value.forward(&norm_x)?;
-        let r = self.time_mix_receptance.forward(&norm_x)?;
-
-        let k_vec = k.to_vec_f32()?;
-        let v_vec = v.to_vec_f32()?;
-        let r_vec = r.to_vec_f32()?;
-        let dim = k_vec.len();
-
-        let mut time_mix_in = vec![0.0f32; dim];
+        // ── Attention (time-mix) ─────────────────────────────────────────
+        // Token shift against the stored PREVIOUS post-norm hidden.
+        let mut shifted = vec![0.0f32; 3 * dim];
         for i in 0..dim {
-            let sig_r = 1.0 / (1.0 + (-r_vec[i]).exp());
-            time_mix_in[i] = sig_r * (k_vec[i] * v_vec[i]);
+            let mix_k = self.tm_mix_k[i];
+            let mix_v = self.tm_mix_v[i];
+            let mix_r = self.tm_mix_r[i];
+            shifted[i] = mix_k * x_vec[i] + (1.0 - mix_k) * attn_xx[i];
+            shifted[dim + i] = mix_v * x_vec[i] + (1.0 - mix_v) * attn_xx[i];
+            shifted[2 * dim + i] = mix_r * x_vec[i] + (1.0 - mix_r) * attn_xx[i];
+        }
+        // Post-norm current hidden becomes the next call's shift carry.
+        let norm_x = self.norm.forward(x)?.to_vec_f32()?;
+        attn_xx.copy_from_slice(&norm_x);
+
+        let mixed = cpu_tensor(shifted.clone(), Shape::new(vec![3, dim]));
+        let flat = |t: &Tensor, off: usize| -> Result<Vec<f32>> {
+            Ok(t.to_vec_f32()?[off..off + dim].to_vec())
+        };
+        let k_t = self.time_mix_key.forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
+        let v_t = self.time_mix_value.forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
+        let r_t = self.time_mix_receptance.forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
+
+        // One-token WKV update (see doc comment) + sigmoid(r) gate.
+        let k_vec = k_t.to_vec_f32()?;
+        let v_vec = v_t.to_vec_f32()?;
+        let r_vec = r_t.to_vec_f32()?;
+        let mut attn_y = vec![0.0f32; dim];
+        const MIN_VALUE: f32 = -1e38f32;
+        for i in 0..dim {
+            let k_ch = k_vec[i];
+            let ww = self.time_first[i] + k_ch;
+            let p = pp[i].max(k_ch);
+            let e11 = (pp[i] - p).exp();
+            let e22 = (ww - p).exp();
+            let num = e11 * aa[i] + e22 * v_vec[i];
+            let den = e11 * bb[i] + e22;
+            attn_y[i] = {
+                let sig_r = 1.0 / (1.0 + (-r_vec[i]).exp());
+                sig_r * if den != 0.0 { num / den } else { 0.0 }
+            };
+            aa[i] = num;
+            bb[i] = den;
+            pp[i] = p + self.time_decay[i];
         }
 
-        let att_out = self
-            .time_mix_output
-            .forward(&cpu_tensor(time_mix_in, Shape::new(vec![1, dim])))?;
-        // Use time-mix output in residual.
-        // [P1-32 fix: use tm_data in residual.]
+        let att_out =
+            self.time_mix_output
+                .forward(&cpu_tensor(attn_y, Shape::new(vec![1, dim])))?;
         let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
 
-        let _ffn_k = self.channel_mix_key.forward(&x_res1)?;
-        let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
-        // ffn_v must use its own weight, not ffn_k's.
-        // [P1-32 fix: ffn_v uses channel_mix_value weight.]
-        let ffn_v = self.channel_mix_value.forward(&x_res1)?;
-
-        let ffn_r_vec = ffn_r.to_vec_f32()?;
-        let ffn_v_vec = ffn_v.to_vec_f32()?;
-        let mut ffn_out = vec![0.0f32; ffn_v_vec.len()];
-        for i in 0..ffn_v_vec.len() {
-            let sig_r = 1.0 / (1.0 + (-ffn_r_vec[i]).exp());
-            ffn_out[i] = sig_r * ffn_v_vec[i];
+        // ── Channel mix (FFN) ────────────────────────────────────────────
+        // v4: token shift against the stored PREVIOUS post-LN2 residual;
+        // current residual goes through ln2; k passes ReLU after mixing, r
+        // gates with sigmoid.
+        let x_res1_normed = self.norm2.forward(&x_res1)?.to_vec_f32()?;
+        let mut ffn_k_in = vec![0.0f32; dim];
+        let mut ffn_r_in = vec![0.0f32; dim];
+        for i in 0..dim {
+            let mix_k = self.ffn_tm_mix_k[i];
+            let mix_r = self.ffn_tm_mix_r[i];
+            ffn_k_in[i] = mix_k * x_res1_normed[i] + (1.0 - mix_k) * ffn_xx[i];
+            ffn_r_in[i] = mix_r * x_res1_normed[i] + (1.0 - mix_r) * ffn_xx[i];
+            ffn_xx[i] = x_res1_normed[i];
         }
 
-        let ffn_t = cpu_tensor(ffn_out, Shape::new(vec![1, dim]));
-        add_tensors(&x_res1, &ffn_t).map_err(grim_core::Error::Tensor)
+        let ffn_r = self
+            .channel_mix_receptance
+            .forward(&cpu_tensor(ffn_r_in, Shape::new(vec![1, dim])))?;
+        let ffn_k = self
+            .channel_mix_key
+            .forward(&cpu_tensor(ffn_k_in, Shape::new(vec![1, dim])))?;
+        let ffn_r_vec = ffn_r.to_vec_f32()?;
+        let ffn_k_vec = ffn_k.to_vec_f32()?;
+
+        // ReLU on the projected key, sigmoid(r) gate, value projection.
+        let mut gated = vec![0.0f32; dim];
+        for i in 0..dim {
+            let sig_r = 1.0 / (1.0 + (-ffn_r_vec[i]).exp());
+            gated[i] = sig_r * ffn_k_vec[i].max(0.0);
+        }
+        let ffn_v = self
+            .channel_mix_value
+            .forward(&cpu_tensor(gated, Shape::new(vec![1, dim])))?;
+
+        // Residual: x_res1 + ffn_out.
+        let out = add_tensors(&x_res1, &ffn_v).map_err(grim_core::Error::Tensor)?;
+        Ok(out)
+    }
+}
+
+impl RwkvBlock {
+    fn cfg_hidden(&self) -> usize {
+        self.time_mix_key.weight.shape().dims()[1]
     }
 }
 
@@ -439,37 +492,62 @@ impl Model for Rwkv {
 
 impl StatefulSequence for Rwkv {
     fn init_state(&self, batch: usize) -> Box<dyn SsmState> {
+        assert_eq!(batch, 1, "RWKV state threading supports batch 1");
+        let hidden = self.cfg.hidden_size;
+        let mut data = vec![0.0f32; self.cfg.num_layers * 5 * hidden];
+        for l in 0..self.cfg.num_layers {
+            // slot 3 per layer is pp (WKV running max): start at -inf so the
+            // first token's e1 vanishes and time_first dominates (v4 init).
+            let base = l * 5 * hidden + 3 * hidden;
+            for v in data[base..base + hidden].iter_mut() {
+                *v = -1e38f32;
+            }
+        }
         Box::new(RwkvState {
-            state_xy: vec![0.0f32; batch * self.cfg.hidden_size],
+            data,
+            num_layers: self.cfg.num_layers,
+            hidden,
         })
     }
 
+    /// Step the whole model over `input`'s tokens IN ORDER, threading the
+    /// recurrence across tokens AND calls. Returns logits for the LAST
+    /// position.
     fn step(&self, state: &mut dyn SsmState, input: &Tensor) -> Result<Tensor> {
         let s = state
             .as_any_mut()
             .downcast_mut::<RwkvState>()
-            .ok_or_else(|| Error::Session("downcast failed".into()))?;
-        // Embedding gather: for each token ID, look up the corresponding row
-        // in the embedding table. NOT a Linear matrix multiply.
-        // [P1-32 fix: emb is an embedding gather, not Linear forward.]
-        let input_ids = input.to_vec_f32()?;
-        let emb_rows: Vec<Vec<f32>> = input_ids
-            .iter()
-            .map(|&id| {
-                let idx = id as usize * self.emb_shape.1;
-                self.emb[idx..idx + self.emb_shape.1].to_vec()
-            })
-            .collect();
-        let emb_out = cpu_tensor(
-            emb_rows.iter().flatten().cloned().collect::<Vec<f32>>(),
-            Shape::new(vec![input_ids.len(), self.emb_shape.1]),
-        );
-        let mut h = emb_out;
-        for layer in &self.layers {
-            h = layer.step(&h, s)?;
+            .ok_or_else(|| Error::Session("RWKV state downcast failed".into()))?;
+        if s.num_layers != self.cfg.num_layers || s.hidden != self.cfg.hidden_size {
+            return Err(Error::Session(
+                "RWKV state was initialized for a different model".into(),
+            ));
         }
-        let h = self.ln_out.forward(&h)?;
-        Ok(self.head.forward(&h)?)
+        // Embedding gather: token ID -> table row. NOT a Linear matmul.
+        let input_ids = input.to_vec_f32()?;
+        if input_ids.is_empty() {
+            return Err(Error::Shape("empty RWKV input".into()));
+        }
+        let mut last_logits = None;
+        for &id in &input_ids {
+            let idx = id as usize * self.emb_shape.1;
+            if idx + self.emb_shape.1 > self.emb.len() {
+                return Err(Error::Shape(format!(
+                    "RWKV token id {} out of range for vocab {}",
+                    id as usize, self.emb_shape.0
+                )));
+            }
+            let mut h = cpu_tensor(
+                self.emb[idx..idx + self.emb_shape.1].to_vec(),
+                Shape::new(vec![1, self.emb_shape.1]),
+            );
+            for (l, layer) in self.layers.iter().enumerate() {
+                h = layer.step(&h, l, s)?;
+            }
+            let h = self.ln_out.forward(&h)?;
+            last_logits = Some(self.head.forward(&h)?);
+        }
+        Ok(last_logits.expect("non-empty input guarantees one forward"))
     }
 }
 
@@ -480,12 +558,173 @@ impl CausalLm for Rwkv {
 
     fn forward(
         &self,
-        _session: &mut dyn grim_core::session::SessionT,
+        session: &mut dyn grim_core::session::SessionT,
         input_ids: &Tensor,
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let mut state = self.init_state(1);
-        self.step(&mut *state, input_ids)
+        // Audit fix (grim-models): the recurrence state now lives on the
+        // SESSION and advances across calls — the pre-fix code created a
+        // fresh state per call (and the recurrence math itself ignored
+        // state), so decode was context-free after prefill.
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(self.init_state(1)));
+        }
+        let cell = session.model_state_mut().ok_or_else(|| {
+            Error::Session("rwkv: session model_state vanished".into())
+        })?;
+        let boxed_state = cell.downcast_mut::<Box<dyn SsmState>>().ok_or_else(|| {
+            Error::Session("rwkv: session model_state holds another model's state".into())
+        })?;
+        let logits = self.step(boxed_state.as_mut(), input_ids)?;
+        let seq_len = input_ids.shape().elem_count();
+        session.advance_pos(seq_len);
+        Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use grim_core::model::CausalLm;
+    use grim_core::session::{Inner, SessionT};
+
+    fn tiny_rwkv() -> Rwkv {
+        // Weights are built directly (no GGUF): random-ish deterministic
+        // tables so the recurrence has signal.
+        let cfg = RwkvConfig {
+            vocab_size: 64,
+            hidden_size: 16,
+            num_layers: 2,
+            rms_norm_eps: 1e-5,
+        };
+        fn lcg(seed: &mut u64) -> f32 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }
+        let mut lin_seed = 0x5EED_C0DEu64;
+        let mut mk_lin = |n: usize| {
+            Linear::from_tensor(
+                cpu_tensor(
+                    (0..n * cfg.hidden_size)
+                        .map(|_| lcg(&mut lin_seed) * 0.1)
+                        .collect::<Vec<f32>>(),
+                    Shape::new(vec![n, cfg.hidden_size]),
+                ),
+                None,
+            )
+        };
+        let norm = |eps: f32| RmsNorm {
+            weight: cpu_tensor(vec![1.0f32; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            eps,
+        };
+        let layers = (0..cfg.num_layers)
+            .map(|_| RwkvBlock {
+                norm: norm(cfg.rms_norm_eps as f32),
+                norm2: norm(cfg.rms_norm_eps as f32),
+                time_mix_key: mk_lin(cfg.hidden_size),
+                time_mix_value: mk_lin(cfg.hidden_size),
+                time_mix_receptance: mk_lin(cfg.hidden_size),
+                time_mix_output: mk_lin(cfg.hidden_size),
+                channel_mix_key: mk_lin(cfg.hidden_size),
+                channel_mix_receptance: mk_lin(cfg.hidden_size),
+                channel_mix_value: mk_lin(cfg.hidden_size),
+                device: Device::Cpu,
+                tm_mix_k: vec![0.4; cfg.hidden_size],
+                tm_mix_v: vec![0.5; cfg.hidden_size],
+                tm_mix_r: vec![0.6; cfg.hidden_size],
+                time_decay: vec![-0.7; cfg.hidden_size],
+                time_first: vec![3.0; cfg.hidden_size],
+                ffn_tm_mix_k: vec![0.45; cfg.hidden_size],
+                ffn_tm_mix_r: vec![0.55; cfg.hidden_size],
+            })
+            .collect();
+        let ln_out = RmsNorm {
+            weight: cpu_tensor(vec![1.0f32; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            eps: cfg.rms_norm_eps as f32,
+        };
+        let head_data: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i % 29) as f32 * 0.02) - 0.25)
+            .collect();
+        let head = Linear::from_tensor(
+            cpu_tensor(head_data, Shape::new(vec![cfg.vocab_size, cfg.hidden_size])),
+            None,
+        );
+        Rwkv {
+            cfg: cfg.clone(),
+            device: Device::Cpu,
+            emb: {
+                let mut emb_seed = 0xBEEF_F00Du64;
+                (0..cfg.vocab_size * cfg.hidden_size)
+                    .map(|_| lcg(&mut emb_seed) * 0.2 - 0.1)
+                    .collect()
+            },
+            emb_shape: (cfg.vocab_size, cfg.hidden_size),
+            layers,
+            ln_out,
+            head,
+        }
+    }
+
+    fn tok(v: f32) -> Tensor {
+        cpu_tensor(vec![v], Shape::new(vec![1]))
+    }
+
+    /// Audit gate: the recurrence state must persist on the session across
+    /// CausalLm::forward calls — the second call's logits through one
+    /// session must equal explicit init→step→step threading — and the
+    /// session position must advance.
+    #[test]
+    fn rwkv_forward_keeps_state_across_calls() {
+        let model = tiny_rwkv();
+        let mut sess = Inner::new(model.device.clone());
+        let _a = CausalLm::forward(&model, &mut sess, &tok(1.0), &tok(0.0), &[]).unwrap();
+        let b_session =
+            CausalLm::forward(&model, &mut sess, &tok(2.0), &tok(0.0), &[])
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+        assert_eq!(sess.current_pos(), 2, "pos advances per call");
+
+        // Explicit state-threading reference.
+        let mut st = model.init_state(1);
+        let _ = model.step(st.as_mut(), &tok(1.0)).unwrap();
+        let b_ref = model
+            .step(st.as_mut(), &tok(2.0))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        assert_eq!(
+            b_session, b_ref,
+            "CausalLm::forward must thread RWKV recurrence state across calls"
+        );
+    }
+
+    /// Audit gate: the recurrence must actually MATTER — the same final
+    /// token after different histories produces different logits. (The
+    /// pre-fix model was memoryless by construction and failed this.)
+    #[test]
+    fn rwkv_recurrence_changes_output_with_history() {
+        let model = tiny_rwkv();
+        let mut s1 = Inner::new(model.device.clone());
+        let mut s2 = Inner::new(model.device.clone());
+        let adapters: [AdapterHandle; 0] = [];
+        for t in [1.0f32] {
+            let _ = CausalLm::forward(&model, &mut s1, &tok(t), &tok(0.0), &adapters).unwrap();
+            let _ = CausalLm::forward(&model, &mut s2, &tok(t + 40.0), &tok(0.0), &adapters).unwrap();
+        }
+        let l1 = CausalLm::forward(&model, &mut s1, &tok(7.0), &tok(0.0), &adapters)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let l2 = CausalLm::forward(&model, &mut s2, &tok(7.0), &tok(0.0), &adapters)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let diff: f32 = l1.iter().zip(l2.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(
+            diff > 1e-3,
+            "identical token after different histories must differ (recurrence dead): {diff}"
+        );
     }
 }

@@ -258,6 +258,24 @@ pub enum Ling3Attn {
     Mla(grim_nn::MlaAttention),
 }
 
+/// Per-layer session cache (audit fix): KDA layers carry conv + recurrent
+/// state; MLA layers carry the post-RoPE KV history. Boxed so the enum stays
+/// small.
+pub enum Ling3LayerCache {
+    Kda(grim_nn::KdaLayerCache),
+    Mla(Box<grim_nn::MlaKvCache>),
+}
+
+impl Ling3LayerCache {
+    /// Build the cache matching this attention variant.
+    pub fn new_for(attn: &Ling3Attn) -> Self {
+        match attn {
+            Ling3Attn::Kda(_) => Self::Kda(grim_nn::KdaLayerCache::new()),
+            Ling3Attn::Mla(_) => Self::Mla(Box::new(grim_nn::MlaKvCache::new())),
+        }
+    }
+}
+
 pub struct Ling3TinyLayer {
     pub input_layernorm: grim_nn::RmsNorm,
     pub attn: Ling3Attn,
@@ -441,11 +459,42 @@ impl CausalLm for Ling3Tiny {
 
     fn forward(
         &self,
-        _session: &mut dyn SessionT,
+        session: &mut dyn SessionT,
         input_ids: &Tensor,
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
+        // Audit fix (grim-models): per-layer caches now live on the SESSION
+        // and every call threads them into the attention variants — the
+        // pre-fix code passed None everywhere and ignored the session, so
+        // decode attended only to itself (fully stateless). KDA layers get
+        // real conv/recurrent state; MLA layers get the post-RoPE KV history.
+        if session.model_state().is_none() {
+            let caches: Vec<Ling3LayerCache> = self
+                .layers
+                .iter()
+                .map(|l| Ling3LayerCache::new_for(&l.attn))
+                .collect();
+            session.set_model_state(Box::new(caches));
+        }
+        let caches_cell = session.model_state_mut().ok_or_else(|| {
+            grim_core::error::Error::Session("Ling3Tiny: model_state vanished".into())
+        })?;
+        let caches = caches_cell
+            .downcast_mut::<Vec<Ling3LayerCache>>()
+            .ok_or_else(|| {
+                grim_core::error::Error::Session(
+                    "Ling3Tiny: model_state holds another model's caches".into(),
+                )
+            })?;
+        if caches.len() != self.layers.len() {
+            return Err(grim_core::error::Error::Session(format!(
+                "Ling3Tiny: {} caches for {} layers",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+
         let seq_len = input_ids.shape().dims().iter().product();
         let indices = input_ids
             .to_vec_f32()?
@@ -462,13 +511,27 @@ impl CausalLm for Ling3Tiny {
             .map(|v| v as u32)
             .collect();
 
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             let residual = h.clone();
             let normed_input = layer.input_layernorm.forward(&h)?;
 
-            let attn_out = match &layer.attn {
-                Ling3Attn::Kda(kda) => kda.forward(&normed_input, None)?,
-                Ling3Attn::Mla(mla) => mla.forward(&normed_input, &pos_vec, None)?,
+            let attn_cache = caches.get_mut(i);
+            let attn_out = match (&layer.attn, attn_cache) {
+                (
+                    Ling3Attn::Kda(kda),
+                    Some(Ling3LayerCache::Kda(c)),
+                ) => kda.forward(&normed_input, Some(c))?,
+                (Ling3Attn::Kda(kda), None) => kda.forward(&normed_input, None)?,
+                (
+                    Ling3Attn::Mla(mla),
+                    Some(Ling3LayerCache::Mla(c)),
+                ) => mla.forward(&normed_input, &pos_vec, Some(c.as_mut()))?,
+                (Ling3Attn::Mla(mla), None) => mla.forward(&normed_input, &pos_vec, None)?,
+                _ => {
+                    return Err(grim_core::error::Error::Session(
+                        "Ling3Tiny: cache variant does not match attention variant".into(),
+                    ))
+                }
             };
 
             let h_post_attn = grim_nn::add_tensors(&residual, &attn_out)?;
@@ -479,11 +542,14 @@ impl CausalLm for Ling3Tiny {
         }
 
         let normed = self.norm.forward(&h)?;
-        if let Some(lm_head) = &self.lm_head {
-            Ok(lm_head.forward(&normed)?)
+        let out = if let Some(lm_head) = &self.lm_head {
+            lm_head.forward(&normed)?
         } else {
-            Ok(normed)
-        }
+            normed
+        };
+        // Audit fix: advance the engine-visible position per call.
+        session.advance_pos(seq_len);
+        Ok(out)
     }
 }
 

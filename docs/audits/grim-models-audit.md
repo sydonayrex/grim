@@ -71,25 +71,40 @@ fixture; parity ≤1e-4).
 `advance_pos`: identical failure mode to M1.1 (decode at position 0 forever).
 Fixed + same-class reasoning as above.
 
-## Trap — documented, deliberately not "fixed" in this pass
+## Trap — FIXED in the follow-up pass (same day)
 
-### M4. bailingmoe3 (Ling3Tiny): fully stateless forward
-`_session` unused, attention called with `None` cache (single-token decode
-attends only to itself — the exact Group-B bug class kv_attention.rs was
-written to kill), no `advance_pos`. NOT loader-wired today
-(`ModelArchitecture::BailingMoe3` loads **Qwen3Moe** instead), so nothing
-reaches this code — hence Trap, not Live. NOTE the loader mapping itself is
-suspect: BailingMoeV3 is an MLA/KDA-hybrid architecture; loading such a
-checkpoint as Qwen3Moe will fail loudly on missing tensors (acceptable) but
-the branch should either wire Ling3Tiny properly or refuse the architecture.
+### M4. bailingmoe3 (Ling3Tiny): fully stateless forward — FIXED + loader refuses
+Ling3Tiny's forward now threads per-layer caches held on the session
+(`Ling3LayerCache`: KDA → real `KdaLayerCache` conv/recurrent state; MLA →
+post-RoPE KV history), advances `advance_pos`, and errors on variant/cache
+mismatches. This required implementing the MLA cache in grim-nn itself:
+`MlaAttention::forward` appended-and-attended over a flat post-RoPE history
+when a cache is attached (`MlaKvCache` gained token-major `hist_*` fields);
+the uncached prefill path is untouched. Gate:
+`mla_cached_decode_matches_full_prefill` in grim-nn (cached [1]+[1] decode ==
+uncached [1,2] prefill, ≤1e-5). The loader's BailingMoe3→**Qwen3Moe** mapping
+is REMOVED: the architecture is now refused with a loud Config error until
+Ling3Tiny has a GGUF hparams/tensor mapping — silently building a mismatched
+model was the worst outcome. Ling3Tiny remains constructible via its own
+config path for when that mapping lands.
 
-### M5. RWKV: state threading unimplemented
-`mamba/src/rwkv.rs::step(&self, x, _state)` ignores its state parameter;
-CPU/GPU steps are stateless per call. Same observable behavior as M2.1
-(context-free decode) and Mamba/RWKV ARE loader-wired. Fixing requires real
-WKV/token-shift state plumbing through `step_cpu`/`step_gpu` — design work,
-not an audit patch. Until then RWKV serving is correct only for single-shot
-prompt-in/logits-out use.
+### M5. RWKV: state threading unimplemented — IMPLEMENTED
+`rwkv.rs` now runs the canonical RWKV-4 single-token recurrence with real
+state: per-layer five-buffer state `[attn_xx, aa, bb, pp, ffn_xx]` on the
+session; token-shift mixes against the previous post-LN hidden; the WKV
+one-token update (`ww = u + k`, `pp' = p + w`) with decay/first loaded from
+checkpoint buffers `att.time_decay`/`att.time_first`/time-mix ratios
+(neutral defaults for synthetic models so the recurrence still exercises);
+channel-mix token-shift through the newly-loaded `ln_2`. The ROCm
+`rwkv_time_mix`/`rwkv_channel_mix` auto-dispatch was REMOVED, not bypassed —
+their signatures have no state I/O, so they can never implement recurrence
+and were producing silently context-free output on ROCm builds; they remain
+in the backend for future state-aware wiring. `StatefulSequence::step` walks
+multi-token inputs token-by-token; `CausalLm::forward` persists state +
+advances position. Gates: `rwkv_forward_keeps_state_across_calls`
+(byte-exact vs explicit init→step→step threading), 
+`rwkv_recurrence_changes_output_with_history` (identical final token after
+different histories must differ — the pre-fix memoryless model failed this).
 
 ## Latent — recorded
 
