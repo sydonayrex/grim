@@ -198,7 +198,7 @@ fn is_unimplemented(e: &Error) -> bool {
 /// match the target, materialize a physically reshaped storage instead
 /// (D2D copy on backends with `alloc_storage`/`copy_slice_into`, host
 /// roundtrip elsewhere) — backend matmuls derive shapes from the storage.
-fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
+pub(crate) fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
     if x.shape().elem_count() != shape.elem_count() {
         return Err(Error::Shape(format!(
             "reshaped_view: element count mismatch {:?} vs {:?}",
@@ -563,12 +563,28 @@ impl LlamaBlock {
                 // directly, so the paged pages must match exactly.
                 let k_rot =
                     self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
-                sess.append_kv_layer(layer, &k_rot, &v).ok();
-                if let (Some(bt), Some((k_pages, v_pages, page_size))) =
-                    (sess.block_table(), sess.paged_kv_handles(layer))
-                {
-                    self.paged_self_attention(&q, bt, &k_pages, &v_pages, page_size, positions)
+                // A FAILED append must skip the paged read — attending over
+                // pages missing this call's K/V silently corrupts output
+                // (the `.ok()` here used to swallow the error and read the
+                // stale pages anyway). The classic-cache fallback is always
+                // correct.
+                let appended = sess.append_kv_layer(layer, &k_rot, &v).is_ok();
+                if appended {
+                    if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                        (sess.block_table(), sess.paged_kv_handles(layer))
+                    {
+                        self.paged_self_attention(
+                            &q,
+                            bt,
+                            &k_pages,
+                            &v_pages,
+                            page_size,
+                            positions,
+                        )
                         .ok()
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }

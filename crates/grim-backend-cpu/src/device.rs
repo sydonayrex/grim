@@ -254,6 +254,13 @@ impl BackendDevice for CpuDevice {
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
         if a_dims.len() != 2 || b_dims.len() != 2 {
+            if std::env::var_os("GRIM_MATMUL_TRACE").is_some() {
+                panic!(
+                    "[matmul-trace] rank>2 operand: a={:?} b={:?}",
+                    a.shape().dims(),
+                    b.shape().dims()
+                );
+            }
             return Err(Error::Shape("matmul expects 2-D inputs".into()));
         }
         let (m, k) = (a_dims[0], a_dims[1]);

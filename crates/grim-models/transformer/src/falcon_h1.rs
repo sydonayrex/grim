@@ -321,7 +321,12 @@ impl CausalLm for FalconH1Model {
                     .expect("FalconH1::forward: model_state downcast after init")
             }
         };
-        self.forward_cpu(caches, &ids, &positions_vec)
+        let logits = self.forward_cpu(caches, &ids, &positions_vec)?;
+        // Audit fix (grim-models): FalconH1 never advanced the session
+        // position — the engine's decode start_pos stayed at 0, so every
+        // decode token ran at RoPE position 0 while its KV cache grew.
+        session.advance_pos(ids.len());
+        Ok(logits)
     }
 }
 

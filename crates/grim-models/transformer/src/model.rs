@@ -145,18 +145,7 @@ impl Llama {
         // at load time rather than silently returning Unimplemented on first forward.
         // [P1-36 fix: fail loudly on zeroed weights.]
         let check_not_zeroed = |name: &str, tensor: &grim_tensor::Tensor| {
-            let data = tensor.to_vec_f32();
-            if let Ok(data) = data {
-                let all_zero = data.iter().all(|&v| v.abs() < 1e-10);
-                let all_same = data.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10);
-                if all_zero || all_same {
-                    return Err(grim_tensor::Error::Backend(format!(
-                        "{name}: weights appear to be zeroed or constant — \
-                         model may be structurally broken"
-                    )));
-                }
-            }
-            Ok(())
+            weights_look_broken(name, tensor)
         };
         check_not_zeroed("tok_embeddings", &tok_embeddings.weight)?;
         check_not_zeroed("norm", &norm.weight)?;
@@ -620,8 +609,34 @@ impl CausalLm for Llama {
     }
 }
 
+/// Load-time weight sanity gate (P1-36, refined by the grim-models audit):
+/// rejects all-zero tensors everywhere, and all-CONSTANT tensors only when
+/// rank >= 2. The constant check is deliberately skipped for rank-1 tensors:
+/// RMS-norm weights of exactly 1.0 are legitimate and ship in real
+/// checkpoints — the old unconditional `all_same` check false-rejected them.
+pub fn weights_look_broken(name: &str, tensor: &grim_tensor::Tensor) -> Result<()> {
+    let Ok(data) = tensor.to_vec_f32() else {
+        return Ok(()); // non-f32 (quantized) weights skip this f32 heuristic
+    };
+    if data.iter().all(|&v| v.abs() < 1e-10) {
+        return Err(grim_tensor::Error::Backend(format!(
+            "{name}: weights appear to be zeroed — model may be structurally broken"
+        ))
+        .into());
+    }
+    if tensor.shape().dims().len() >= 2 && data.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10) {
+        return Err(grim_tensor::Error::Backend(format!(
+            "{name}: weights appear to be constant — model may be structurally broken"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use super::*;
 
     fn base_cfg(head_dim: usize, prf: f32) -> LlamaConfig {
@@ -752,5 +767,34 @@ mod tests {
         );
         // Counter drained by take.
         assert_eq!(split.take_boundary_moves(), 0);
+    }
+
+    /// Audit gate: all-ones norm weights must LOAD (real checkpoints ship
+    /// them); a constant matrix must still fail loudly.
+    #[test]
+    fn weights_look_broken_allows_constant_rank1_rejects_constant_matrices() {
+        let ones_1d = grim_backend_cpu::cpu_tensor(
+            vec![1.0f32; 8],
+            grim_tensor::Shape::new(vec![8]),
+        );
+        assert!(
+            weights_look_broken("norm.weight", &ones_1d).is_ok(),
+            "all-ones 1-D norm weight is legitimate and must not be rejected"
+        );
+
+        let const_mat = grim_backend_cpu::cpu_tensor(
+            vec![2.5f32; 16],
+            grim_tensor::Shape::new(vec![4, 4]),
+        );
+        assert!(
+            weights_look_broken("wq.weight", &const_mat).is_err(),
+            "constant matrix must still be rejected"
+        );
+
+        let zeros = grim_backend_cpu::cpu_tensor(
+            vec![0.0f32; 8],
+            grim_tensor::Shape::new(vec![8]),
+        );
+        assert!(weights_look_broken("embed", &zeros).is_err(), "zeros always rejected");
     }
 }
