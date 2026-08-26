@@ -3898,6 +3898,42 @@ impl BackendDevice for RocmDevice {
                     gi_off,
                 )?;
             }
+            DTypeStorage::W4A16(w4) => {
+                // Quant workstream wiring: Marlin-style fused W4A16 GEMM over
+                // the resident blob ([codes u32][scales f32], B stored [N, K/8]).
+                if k % 8 != 0 {
+                    return Err(Error::Backend(format!(
+                        "w4a16 quantized_matmul: K={k} must be divisible by 8"
+                    )));
+                }
+                self.launch_marlin_gemm_w4a16_blob(
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    w4.group_size,
+                )?;
+            }
+            DTypeStorage::WNA16 | DTypeStorage::EmbeddingWNA16Int => {
+                // Weight-only N-bit: dequant-on-device service exists
+                // (launch_dequant_wna16) but no fused GEMM kernel is wired
+                // yet — fail loudly rather than feeding packed bytes to the
+                // f32 matmul fallback (silent garbage).
+                return Err(Error::Backend(
+                    "quantized_matmul: WNA16/EmbeddingWNA16Int has no fused GPU GEMM yet;                      dequantize the weight at load (dequant_wna16_to_f32) and run F32"
+                        .into(),
+                ));
+            }
+            DTypeStorage::CompressedTensorsW8A8Int8 | DTypeStorage::CompressedTensorsW8A8Fp8 => {
+                // No GPU kernel authored yet for compressed-tensors W8A8 —
+                // fail loudly instead of the packed-bytes-as-f32 fallback.
+                return Err(Error::Backend(
+                    "quantized_matmul: CompressedTensorsW8A8 Int8/Fp8 GPU kernel not wired yet;                      tracked in the compressed-tensors workstream"
+                        .into(),
+                ));
+            }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
             }
@@ -4293,6 +4329,24 @@ impl BackendDevice for RocmDevice {
                     sc_off,
                     gi_off,
                 )?;
+            }
+            DTypeStorage::W4A16(_) | DTypeStorage::WNA16 | DTypeStorage::EmbeddingWNA16Int => {
+                // Weight-only quantization is inference-only: there is no
+                // weight-gradient kernel for these formats. Fail loudly —
+                // the old `_ =>` fallback fed packed codes to the F16
+                // dequant-backward gemm (silent garbage dX).
+                return Err(Error::Backend(
+                    "quantized_matmul_backward_dx: weight-only formats (W4A16/WNA16/\
+                     EmbeddingWNA16Int) have no backward kernel; these are inference-only"
+                        .into(),
+                ));
+            }
+            DTypeStorage::CompressedTensorsW8A8Int8 | DTypeStorage::CompressedTensorsW8A8Fp8 => {
+                return Err(Error::Backend(
+                    "quantized_matmul_backward_dx: CompressedTensorsW8A8 backward kernel \
+                     not wired yet (compressed-tensors workstream)"
+                        .into(),
+                ));
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(
@@ -8682,6 +8736,169 @@ impl RocmDevice {
         self.launch_generic_dequant("grim_dequant_iq4xs", packed_storage, out_storage, n_blocks)
     }
 
+    // ─── Standalone compressed-tensor dequant launchers ─────────────────────
+
+    pub(crate) fn launch_dequant_wna16(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        num_weights: usize,
+        n_bit: i32,
+        num_blocks: i32,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wna16 dequant: packed has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wna16 dequant: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((num_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend("wna16 dequant: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_w = num_weights as i32;
+        let mut n_bit_v = n_bit;
+        let mut nb = num_blocks;
+        self.launch_compute_kernel(
+            "grim_dequant_wna16",
+
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut packed),
+                arg(&mut out),
+                arg(&mut n_w),
+                arg(&mut n_bit_v),
+                arg(&mut nb),
+            ],
+        )
+    }
+
+    /// Public dequant service (quant workstream): WNA16 packed blob → F32
+    /// weights, decoded on-device. Layout contract mirrors
+    /// `Storage::WNA16`: [u32 n_bit][u32 num_blocks][codes][f16 block
+    /// scales][f32 tensor scale], 256-weight blocks, MSB-first codes.
+    pub fn dequant_wna16_to_f32(
+        &self,
+        packed: &RocmStorage,
+        num_weights: usize,
+        n_bit: u8,
+        num_blocks: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out_shape = Shape::from_slice(&[num_weights]);
+        let out = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let _h = self.launch_dequant_wna16(
+            packed,
+            &out,
+            num_weights,
+            n_bit as i32,
+            num_blocks as i32,
+        )?;
+        let stream = self.active_stream();
+        check_hip("hipStreamSynchronize(wna16 dequant)", unsafe {
+            crate::device::handles::hipStreamSynchronize(stream)
+        })?;
+        Ok(Box::new(out))
+    }
+
+    pub(crate) fn launch_dequant_embedding_wna16_int(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        total_elements: usize,
+        n_bit: i32,
+        embedding_dim: i32,
+        tensor_scale: f32,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| {
+                Error::Backend("emb_wna16_int dequant: packed has no device ptr".into())
+            })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| {
+                Error::Backend("emb_wna16_int dequant: out has no device ptr".into())
+            })?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((total_elements as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| {
+                Error::Backend("emb_wna16_int dequant: grid overflow".into())
+            })?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_el = total_elements as i32;
+        let mut n_bit_v = n_bit;
+        let mut dim = embedding_dim;
+        let mut ts = tensor_scale;
+        self.launch_compute_kernel(
+            "grim_dequant_embedding_wna16_int",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut packed),
+                arg(&mut out),
+                arg(&mut n_el),
+                arg(&mut n_bit_v),
+                arg(&mut dim),
+                arg(&mut ts),
+            ],
+        )
+    }
+
+    /// Public dequant service (quant workstream): EmbeddingWNA16Int packed
+    /// blob → F32 embedding table, decoded on-device. Layout contract
+    /// mirrors `Storage::EmbeddingWNA16Int`: [u32 n_bit][u32
+    /// embedding_dim][u32 num_rows][codes MSB-first].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_embedding_wna16_int_to_f32(
+        &self,
+        packed: &RocmStorage,
+        total_elements: usize,
+        n_bit: u8,
+        embedding_dim: usize,
+        tensor_scale: f32,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out_shape = Shape::from_slice(&[total_elements]);
+        let out = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let _h = self.launch_dequant_embedding_wna16_int(
+            packed,
+            &out,
+            total_elements,
+            n_bit as i32,
+            embedding_dim as i32,
+            tensor_scale,
+        )?;
+        let stream = self.active_stream();
+        check_hip("hipStreamSynchronize(emb wna16 dequant)", unsafe {
+            crate::device::handles::hipStreamSynchronize(stream)
+        })?;
+        Ok(Box::new(out))
+    }
+
     /// Generic helper for standalone dequant kernels that take (packed, out, n_blocks).
     fn launch_generic_dequant(
         &self,
@@ -10835,6 +11052,72 @@ impl RocmDevice {
         };
 
         Ok((8, qz_data as i64, sc_data as i64, gi_data as i64, has_g_idx))
+    }
+
+    /// Audit-wiring (quant workstream): W4A16 blobs are a SINGLE packed
+    /// segment pair — `[codes (N*K/8 u32)][scales (N*groups f32)]` per the
+    /// `Storage::W4A16` layout contract — so the dense dispatch path needs a
+    /// launcher that derives the scales pointer from the same device buffer
+    /// instead of requiring two separate storages.
+    pub fn launch_marlin_gemm_w4a16_blob(
+        &self,
+        a_storage: &RocmStorage,
+        blob_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<*mut c_void> {
+        if k % 8 != 0 {
+            return Err(Error::Backend(format!(
+                "marlin_w4a16: K={k} must be divisible by 8"
+            )));
+        }
+        let codes_bytes = n * (k / 8) * std::mem::size_of::<u32>();
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_w4a16: a has no device ptr".into()))?;
+        let blob_ptr = blob_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_w4a16: blob has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_w4a16: out has no device ptr".into()))?;
+        if blob_storage.bytes() < codes_bytes + n * (k.div_ceil(group_size)) * std::mem::size_of::<f32>() {
+            return Err(Error::Backend(
+                "marlin_w4a16: blob smaller than codes+scales segments".into(),
+            ));
+        }
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_dim = HipDim3::new(((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+
+        // Kernel contract: A row-major [M, K] f32; C [M, N] f32.
+        let mut aptr = a_ptr;
+        let mut bptr = blob_ptr;
+        let mut sptr = (blob_ptr as usize + codes_bytes) as *mut c_void;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut gs = group_size as i32;
+
+        self.launch_compute_kernel(
+            "grim_marlin_gemm_w4a16_f32",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut sptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut gs),
+            ],
+        )
     }
 
     /// Launch Marlin-style Interleaved W4A16 GEMM.
