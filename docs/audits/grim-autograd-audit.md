@@ -35,18 +35,25 @@ now refuses loudly (`stepped_params` set + descriptive error directing the
 caller to plain `backward`, which sums correctly). Gate:
 `backward_step_refuses_multi_entry_param`.
 
-## Suspect — needs device verification (not changed)
+## Suspect — VERIFIED LIVE ON HARDWARE, FIXED
 
-### A3. Quantized-B GPU grad_b operand order in `matmul_backward`
-When B is quantized and a fused GPU backward dispatch succeeds for grad_a,
-grad_b is computed as `dev.matmul(a, out_grad, b.shape())`. Under the
-row-major convention documented in roc_device's matmul_op this evaluates
-`A[m,k] @ G[?]` whose inner dims only line up when m == m — i.e. it looks
-dimensionally wrong for the standard dB = Aᵀ@G unless the backend matmul
-performs an implicit transpose. Could not execute this path here (requires
-quantized weights on ROCm/CUDA/Metal/Vulkan). VERIFY before trusting
-quantized LoRA training gradients; if wrong, symptoms are silently-wrong
-weight gradients only through the GPU fast path.
+### A3. Quantized-B GPU fast path: both gradients wrong under the documented contract
+Device-verified on gfx1201 (`quantized_matmul_backward_gate`, Q4K, non-square
+2×4×3): when `quantized_matmul_backward_dx` succeeded, **both** grads diverged
+from the CPU reference — grad_a because the dx kernels serve the WEIGHT-STYLE
+convention (B stored [n, k], C = A @ Bᵀ) while the fast path also admitted the
+documented non-transposed contract (B [k, n]); grad_b because it was computed
+as `dev.matmul(A, G)` (= A@G, not Aᵀ@G). Fix: the fused path now serves ONLY
+the weight-style convention that production callers (`streaming_forward`
+record_matmul, transpose_b = true) use — gate flipped to
+`!transpose_a && transpose_b`; grad_b computed as dB_stored[p][q] =
+Σ_i G[i][p]·A[i][q] on host (B is the small trainable matrix; no device
+transpose primitive exists); the documented non-transposed case falls back to
+the verified CPU loops. Gate asserts GPU-vs-CPU parity ≤5e-2 through the real
+Q4K dx kernel. NOTE: the Q8_0 JIT source was mid-refactor by the parallel
+compressed-tensors workstream during verification; the gate uses host-packed
+Q4K instead. Same-class suspect NOT changed: `MAdam::step_param` shares the
+frozen-t shape of A1 (fixed in the follow-up commit alongside 8Bit/PagedAdamW).
 
 ## Latent — recorded
 
