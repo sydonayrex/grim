@@ -3260,23 +3260,19 @@ fn load_model_with_providers(
         }
 
         ModelArchitecture::BailingMoe3 => {
-            let cfg = grim_models_transformer::Qwen3MoeConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                num_experts: hparams.expert_count.unwrap_or(8),
-                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
-                routed_scaling_factor: hparams.routed_scaling_factor,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-            };
-            let m = grim_models_transformer::Qwen3Moe::load_tp(device.clone(), &ws, cfg, tp)?;
-            Ok(Box::new(m))
+            // Audit fix (grim-models): this branch loaded BailingMoeV3
+            // checkpoints as Qwen3Moe — architecturally wrong (BailingMoeV3
+            // is an MLA/KDA-hybrid MoE; its GGUF tensor names do not match
+            // Qwen3-MoE). The in-crate Ling3Tiny implementation exists but
+            // has no GGUF hparams/tensor mapping yet, so refuse loudly
+            // instead of silently building a mismatched model.
+            Err(grim_core::error::Error::Config(
+                "BailingMoeV3 (bailingmoe3 / bailing_hybrid) is not loadable from GGUF: \
+                 its MLA+KDA hybrid architecture has no GGUF tensor mapping in this \
+                 loader (loading it as Qwen3MoE was wrong and has been removed). \
+                 Wire Ling3Tiny's loader or convert the checkpoint."
+                    .into(),
+            ))
         }
 
         ModelArchitecture::Chameleon => {

@@ -1639,15 +1639,25 @@ mod tests {
 /// Multi-head Latent Attention (MLA) compressed KV cache for decode generation.
 #[derive(Debug, Clone)]
 pub struct MlaKvCache {
-    pub compressed_kv: Option<Tensor>,
-    pub k_rope: Option<Tensor>,
+    /// Post-RoPE nope-segment key history, laid out per token:
+    /// `[past_len][num_heads * qk_nope_head_dim]`.
+    pub hist_k_nope: Vec<f32>,
+    /// Post-RoPE rope-segment key history, `[past_len][num_heads * qk_rope_head_dim]`
+    /// in the [head, pos] order `forward` produces.
+    pub hist_k_rope: Vec<f32>,
+    /// Value history, `[past_len][num_heads * v_head_dim]`.
+    pub hist_v: Vec<f32>,
+    /// Tokens already in the history.
+    pub past_len: usize,
 }
 
 impl MlaKvCache {
     pub fn new() -> Self {
         Self {
-            compressed_kv: None,
-            k_rope: None,
+            hist_k_nope: Vec::new(),
+            hist_k_rope: Vec::new(),
+            hist_v: Vec::new(),
+            past_len: 0,
         }
     }
 }
@@ -1856,7 +1866,7 @@ impl MlaAttention {
         &self,
         x: &Tensor,
         positions: &[u32],
-        _cache: Option<&mut MlaKvCache>,
+        cache: Option<&mut MlaKvCache>,
     ) -> Result<Tensor> {
         let dims = x.shape().dims();
         let (b, s, _d) = (dims[0], dims[1], dims[2]);
@@ -1989,6 +1999,87 @@ impl MlaAttention {
         );
         let q_rope = self.rope.forward(&q_rope_t, positions)?.to_vec_f32()?;
         let k_rope = self.rope.forward(&k_rope_t, positions)?.to_vec_f32()?;
+
+        // Audit fix (grim-models): with a cache attached, this call's
+        // post-RoPE K rows and V rows are APPENDED to the per-layer history
+        // and attention runs over the full [0 .. past+s) window — real
+        // incremental decode. The pre-fix implementation ignored its cache
+        // parameter entirely (`_cache`), so every decode step attended only
+        // to itself. Batch-1 (engine serving shape).
+        if let Some(c) = cache {
+            if b != 1 {
+                return Err(grim_tensor::error::Error::Shape(
+                    "MlaAttention cached path supports batch 1".into(),
+                ));
+            }
+            c.hist_k_nope.extend_from_slice(&k_nope);
+            c.hist_v.extend_from_slice(&v_vec);
+            // k_rope arrives HEAD-major ([head][pos]); store TOKEN-major
+            // ([pos][head]) so cross-call history addressing stays uniform.
+            let rope_dim = self.qk_rope_head_dim;
+            for si in 0..s {
+                for hi in 0..self.num_heads {
+                    let off = (hi * s + si) * rope_dim;
+                    c.hist_k_rope
+                        .extend_from_slice(&k_rope[off..off + rope_dim]);
+                }
+            }
+            c.past_len += s;
+            let past = c.past_len - s;
+            let kv_total = c.past_len;
+            let scale = 1.0 / (qk_head_dim as f32).sqrt();
+            let mut out = vec![0.0f32; s * v_stride];
+            for hi in 0..self.num_heads {
+                for t in 0..s {
+                    let q_off = t * qn_stride + hi * self.qk_nope_head_dim;
+                    let qr_off =
+                        hi * s * self.qk_rope_head_dim + t * self.qk_rope_head_dim;
+                    let causal_limit = past + t;
+                    let mut scores = vec![0.0f32; causal_limit + 1];
+                    for t2 in 0..=causal_limit {
+                        // History rows are stored token-major, heads inside.
+                        let kn_off = t2 * qn_stride + hi * self.qk_nope_head_dim;
+                        // Token-major history: row t2 holds all heads' rope.
+                        let kr2_off =
+                            t2 * self.num_heads * self.qk_rope_head_dim
+                                + hi * self.qk_rope_head_dim;
+                        let mut dot = 0.0f32;
+                        for i in 0..self.qk_nope_head_dim {
+                            dot += q_nope[q_off + i] * c.hist_k_nope[kn_off + i];
+                        }
+                        for i in 0..self.qk_rope_head_dim {
+                            dot += q_rope[qr_off + i] * c.hist_k_rope[kr2_off + i];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                    let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for sc in scores.iter_mut() {
+                        *sc = (*sc - mx).exp();
+                        sum += *sc;
+                    }
+                    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                    let o_off = t * v_stride + hi * self.v_head_dim;
+                    for i in 0..self.v_head_dim {
+                        let mut acc = 0.0f32;
+                        for (t2, sc) in scores.iter().enumerate() {
+                            let v_off = t2 * v_stride + hi * self.v_head_dim;
+                            acc += sc * inv * c.hist_v[v_off + i];
+                        }
+                        out[o_off + i] = acc;
+                    }
+                }
+            }
+            let out_shape = Shape::new(vec![s, self.num_heads * self.v_head_dim]);
+            let out_t = Tensor::new(
+                Arc::from(dev.from_cpu(&out, &out_shape, DType::F32)?),
+                out_shape,
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            );
+            return Ok(self.o_proj.forward(&out_t)?);
+        }
 
         // Causal scaled-dot-product attention per head (fixes the missing-attention bug).
         let scale = 1.0 / (qk_head_dim as f32).sqrt();
@@ -2744,5 +2835,90 @@ impl ConvTranspose1d {
             x.provenance().clone(),
             x.device().clone(),
         ))
+    }
+}
+
+
+#[cfg(test)]
+mod mla_cache_tests {
+    use super::*;
+    use grim_backend_cpu::cpu_tensor;
+    use grim_tensor::{DType, Shape, Tensor};
+
+    /// Audit gate (grim-models): MlaAttention's cached decode path must
+    /// produce the SAME activations as a full prefill over the identical
+    /// sequence — one [1,2] pass with no cache vs two [1,1] passes sharing
+    /// an MlaKvCache. The pre-fix implementation ignored its cache
+    /// parameter entirely, making incremental decode self-attentive only.
+    #[test]
+    fn mla_cached_decode_matches_full_prefill() {
+        let hidden = 8usize;
+        let q_lora = 8usize;
+        let kv_lora = 8usize;
+        let heads = 2usize;
+        let nope = 4usize;
+        let rope_dim = 4usize;
+        let v_dim = 4usize;
+
+        let mut seed = 0xA11CEu64;
+        fn lcg(seed: &mut u64) -> f32 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }
+        let mut lin = move |rows: usize, cols: usize| {
+            Linear::from_tensor(
+                cpu_tensor(
+                    (0..rows * cols).map(|_| lcg(&mut seed) * 0.1).collect::<Vec<f32>>(),
+                    Shape::new(vec![rows, cols]),
+                ),
+                None,
+            )
+        };
+        let qk_head_dim = nope + rope_dim;
+        let mla = MlaAttention {
+            q_a_proj: lin(q_lora, hidden),
+            q_a_norm: RmsNorm::new(cpu_tensor(vec![1.0; q_lora], Shape::new(vec![q_lora])), 1e-5),
+            q_b_proj: lin(heads * qk_head_dim, q_lora),
+            kv_a_proj_with_mqa: lin(kv_lora, hidden),
+            kv_a_norm: RmsNorm::new(cpu_tensor(vec![1.0; kv_lora], Shape::new(vec![kv_lora])), 1e-5),
+            kv_b_proj: lin(heads * (nope + rope_dim + v_dim), kv_lora),
+            o_proj: lin(hidden, heads * v_dim),
+            q_norm: None,
+            k_norm: None,
+            num_heads: heads,
+            qk_nope_head_dim: nope,
+            qk_rope_head_dim: rope_dim,
+            v_head_dim: v_dim,
+            rope: Rope::new(rope_dim, 10_000.0),
+        };
+
+        // Full prefill of a 2-token sequence, positions [0, 1], no cache.
+        let x_full = cpu_tensor(
+            (0..2 * hidden).map(|i| ((i % 7) as f32 * 0.3) - 0.9).collect::<Vec<f32>>(),
+            Shape::new(vec![1, 2, hidden]),
+        );
+        let full = mla.forward(&x_full, &[0, 1], None).expect("prefill");
+        let full_v = full.to_vec_f32().unwrap();
+
+        // Incremental: token 0 then token 1 through ONE cache.
+        let mut cache = MlaKvCache::new();
+        let x0 = cpu_tensor(x_full.to_vec_f32().unwrap()[..hidden].to_vec(), Shape::new(vec![1, 1, hidden]));
+        let x1 = cpu_tensor(x_full.to_vec_f32().unwrap()[hidden..].to_vec(), Shape::new(vec![1, 1, hidden]));
+        let step0 = mla.forward(&x0, &[0], Some(&mut cache)).expect("cached step 0");
+        assert_eq!(cache.past_len, 1);
+        let step1 = mla.forward(&x1, &[1], Some(&mut cache)).expect("cached step 1");
+        assert_eq!(cache.past_len, 2);
+
+        let s0 = step0.to_vec_f32().unwrap();
+        let s1 = step1.to_vec_f32().unwrap();
+        for (i, (&f, &inc)) in full_v[..v_dim * heads].iter().zip(s0.iter()).enumerate() {
+            assert!((f - inc).abs() < 1e-5, "token0 [{i}]: {f} vs {inc}");
+        }
+        for (i, (&f, &inc)) in full_v[v_dim * heads..].iter().zip(s1.iter()).enumerate() {
+            assert!(
+                (f - inc).abs() < 1e-5,
+                "token1 [{i}] cached-vs-prefill divergence: {f} vs {inc}"
+            );
+        }
     }
 }
