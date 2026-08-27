@@ -937,7 +937,7 @@ pub(crate) fn rocm_dequant_expert_weight(
     weight: &Tensor,
     ordinal: usize,
 ) -> Result<Vec<f32>, grim_tensor::error::Error> {
-    use grim_tensor::backend::BackendDevice;
+    
     let dev = RocmDevice::try_new(ordinal)?;
     let dims = weight.shape().dims();
     let (n_rows, k_dim) = (dims[0], dims[1]);

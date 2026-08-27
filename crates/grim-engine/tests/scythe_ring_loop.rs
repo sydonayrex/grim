@@ -181,8 +181,8 @@ fn ring_resident_wave_two_batches() {
     eprintln!("[diag] A: gemm done; flushing");
     exec.flush().expect("flush A");
     eprintln!("[diag] A: flushed; polling");
-    let nb = dev.create_non_blocking_stream().expect("diag stream");
-    let mut pin = grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(16 * 64)
+    let _nb = dev.create_non_blocking_stream().expect("diag stream");
+    let _pin = grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(16 * 64)
         .expect("pinned diag buffer");
     for i in 0..12 {
         let c = exec.completed().expect("completed read");
@@ -482,7 +482,7 @@ fn ring_row_parallel_descriptor_fanin_parity() {
 
     let w_flat: Vec<f32> = (0..n * k).map(|i| ((i % 23) as f32) * 0.03 - 0.3).collect();
     let x_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.2 - 0.8).collect();
-    let x = dev
+    let _x = dev
         .from_cpu(&x_data, &Shape::from_slice(&[m, k]), DType::F32)
         .expect("x");
 

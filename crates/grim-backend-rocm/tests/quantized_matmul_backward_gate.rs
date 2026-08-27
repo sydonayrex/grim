@@ -9,7 +9,7 @@
 use grim_autograd::ops::{MatMulArgs, matmul_backward};
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::BackendStorage;
-use grim_tensor::backend::{BackendDevice, ComputeHandle};
+use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Device, Shape, Tensor};
 use std::sync::Arc;
 

@@ -1765,7 +1765,7 @@ mod tests {
 mod f10_mirror_tests {
     use super::*;
     use grim_backend_cpu::CpuDevice;
-    use grim_tensor::TensorProvider;
+    
 
     /// F10 ITL gate (deterministic proxy): with the dirty-block mirror, a
     /// decode/prefill sequence uploads each physical block exactly once plus
@@ -1779,7 +1779,7 @@ mod f10_mirror_tests {
         kv.set_device(Device::Cpu, Arc::new(CpuDevice::new()));
 
         let stride = 2 * 4; // num_kv_heads * head_dim
-        let mut append = |kv: &mut PagedKvCache, n: usize, tag: f32| {
+        let append = |kv: &mut PagedKvCache, n: usize, tag: f32| {
             let data: Vec<f32> = (0..n * stride).map(|i| tag + i as f32 * 0.01).collect();
             let k = grim_backend_cpu::cpu_tensor(data.clone(), Shape::new(vec![n, stride]));
             let v = grim_backend_cpu::cpu_tensor(data, Shape::new(vec![n, stride]));

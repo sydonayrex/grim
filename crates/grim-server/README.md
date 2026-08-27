@@ -44,6 +44,7 @@ graph TD
 
 ## Public API Overview
 - **`AppState`**: Shared state holding the `Engine` mutex, the active `GgufTokenizer`, the server model path, and the WASM plugin registry.
+- **Web UI & Telemetry Dashboard (`/`)**: Built-in dark mode dashboard displaying live generation speed, TTFT, inter-token latency, GPU VRAM allocations, KV cache saturation, admission scheduler metrics, and loaded model catalogs.
 - **REST Endpoints**: 
   - `POST /v1/chat/completions`: Main inference endpoint supporting full SSE streaming and strict schema validation.
   - `POST /v1/requests/{id}/pause` & `resume`: Controls sequence execution within the engine's scheduler.
@@ -51,6 +52,10 @@ graph TD
 - **`ErrorCode`**: Stable, machine-actionable error enumeration (e.g. `DuplicateToolCall`, `DeterminismMismatch`) returned in standard `invalid_request_error` JSON bodies.
 - **Tool Calling (`tool_parse.rs`)**: Integrates structured parsing of `<think>` and tool invocation tags into `message.tool_calls`.
 - **Cancellation**: Implements `CancellationToken` tracking and the `RequestCleanupGuard` RAII struct to prevent KV cache leaks on client disconnects.
+
+## Live Telemetry Dashboard
+
+![Grim Server Live Dashboard](../../docs/assets/server_dashboard.png)
 
 ## Usage Example
 ```rust

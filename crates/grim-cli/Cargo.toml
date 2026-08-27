@@ -60,3 +60,6 @@ default = ["rocm"]
 rocm = ["grim-backend-rocm/cubecl"]
 cuda = ["dep:grim-backend-cuda"]
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]
+
+[lints]
+workspace = true

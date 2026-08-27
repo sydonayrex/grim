@@ -27,3 +27,6 @@ oxiblas = ["dep:matrixmultiply"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

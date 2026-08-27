@@ -20,7 +20,7 @@ fn wrap(st: Box<dyn grim_tensor::BackendStorage>, shape: Shape, device: Device) 
     )
 }
 
-fn gpu(dev: &RocmDevice) -> bool {
+fn gpu(_dev: &RocmDevice) -> bool {
     grim_backend_rocm::gpu_test_enabled()
 }
 

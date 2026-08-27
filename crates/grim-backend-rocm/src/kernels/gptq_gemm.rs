@@ -310,7 +310,7 @@ mod tests {
         let (k, n, bits, gs) = (4usize, 2usize, 4u32, 2usize);
         let groups = k / gs;
         let mut qweight = vec![0u8; k.div_ceil(8) * n * 4];
-        let mut qzeros = vec![0u8; groups * n.div_ceil(8) * 4];
+        let qzeros = vec![0u8; groups * n.div_ceil(8) * 4];
         let mut scales = vec![0u8; groups * n * 4];
         // Zero-point 0 everywhere, scales 1.0 → w = code.
         for g in 0..groups {

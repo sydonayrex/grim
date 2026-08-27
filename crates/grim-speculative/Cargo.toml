@@ -20,3 +20,5 @@ grim-backend-cpu = { workspace = true }
 
 [features]
 default = []
+[lints]
+workspace = true

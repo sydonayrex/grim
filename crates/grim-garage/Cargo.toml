@@ -62,3 +62,6 @@ gpu-selection = [
     "grim-autograd/gpu-selection",
     "grim-nn/gpu-selection",
 ]
+
+[lints]
+workspace = true

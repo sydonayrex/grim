@@ -16,3 +16,5 @@ grim-backend-cpu = { path = "../grim-backend-cpu" }
 
 [features]
 default = []
+[lints]
+workspace = true

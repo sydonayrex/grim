@@ -511,7 +511,7 @@ mod tests {
             ("expert_ids_ptr", "const unsigned int*"),
             ("weights_ptr", "const float*"),
         ] {
-            let needle = format!("=\n                ({cast}*)moe->{field}");
+            let _needle = format!("=\n                ({cast}*)moe->{field}");
             // whitespace-tolerant check: field read directly off the descriptor
             assert!(
                 src.contains(&format!("moe->{field}")),

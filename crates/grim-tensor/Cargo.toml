@@ -16,3 +16,6 @@ default = []
 
 [dev-dependencies]
 grim-backend-cpu = { workspace = true }
+
+[lints]
+workspace = true

@@ -712,7 +712,7 @@ impl Lfm2Block {
             let cur = k_dev.as_ref().map(|t| t.shape().dims()[0]).unwrap_or(0);
             if cur < needed {
                 let new_cap = needed.max(LFM2_FUSED_KV_CACHE_LEN * 2);
-                let mut grow =
+                let grow =
                     |slot: &mut Option<Tensor>, row_len: usize| -> Result<()> {
                         let old_data = slot.as_ref().map(|t| t.to_vec_f32()).transpose()?;
                         let mut data = vec![0f32; new_cap * row_len];

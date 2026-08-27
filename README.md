@@ -77,6 +77,22 @@ cargo test --workspace
 | `plugins/` | Native and WebAssembly plugin artifacts. |
 | `third-party/` | Vendor-patched third-party dependency source crates. |
 
+## Dashboards & Web UI
+
+Grim provides built-in, local-first web dashboards for real-time inference telemetry and local adapter training.
+
+### Grim Engine Server Dashboard (`grim-server`)
+
+The `grim-server` crate serves an OpenAI- and Ollama-compatible REST API accompanied by a live multi-GPU telemetry dashboard at `http://127.0.0.1:11434/` (or custom configured port). It monitors generation speed, time-to-first-token, inter-token latency, speculative acceptance rates, per-GPU VRAM usage, paged KV cache saturation, and admission queue states in real time.
+
+![Grim Server Live Dashboard](docs/assets/server_dashboard.png)
+
+### Grim's Garage Training Control Room (`grim-garage`)
+
+`grim-garage` provides a browser-based training and quantization control center at `http://127.0.0.1:8741`. It supports hardware-aware autotuning, QLoRA fine-tuning, quantization repack workflows (including RDNA 4 Raven FP8 and RDNA 5 Jay MXFP4), dataset tokenization inspection, and multi-GPU FSDP orchestration.
+
+![Grim's Garage Training Dashboard](docs/assets/garage_dashboard.png)
+
 ## Documentation Links
 
 - [Onboarding Guide](docs/onboarding.md)

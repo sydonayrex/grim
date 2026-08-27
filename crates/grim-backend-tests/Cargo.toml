@@ -26,3 +26,6 @@ cuda = ["dep:grim-backend-cuda"]
 name = "op_timing"
 harness = false
 
+
+[lints]
+workspace = true
