@@ -46,6 +46,7 @@ graph TD
 - **`Engine` / `EngineConfig`**: The primary orchestrator handling configuration, model registration, and stepping the generation loop.
 - **`LoadedModel` & `LoadedAdapter`**: Internal structs maintaining registered models and LoRA adapters.
 - **`Engine::tick()`**: The main stepping function that polls the scheduler, dispatches prefills/decodes, manages speculative fallbacks, and tracks timing (TTFT/ITL).
+- **`SpeculativeLoop`**: Driver for device-native rejection sampling and parallel Medusa / Eagle speculative candidate tree verification.
 - **`Engine::register_model` / `register_with_dspark`**: Interfaces for loading raw auto-regressive models or models coupled with draft/Markov speculation heads.
 - **`scythe2::*`**: Implementations for C²PLR continuous batching logic, PlacementCache, and ScytheRing operations.
 - **`rope_scaling::*` / `streaming_forward::*` / `model_loader::*` / `packing::*`**: Various inference pipeline utilities.
