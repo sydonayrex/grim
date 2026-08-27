@@ -65,15 +65,10 @@ cargo test --workspace
 
 | Directory / File | Description |
 |---|---|
-| `.agents/` | Agent configuration and local customization skills for project tooling. |
-| `.github/` | Continuous integration workflow definitions for build, test, and lint checking. |
-| `.opencode/`, `.poolside/`, `.rocm/`, `.zcode/`, `.zl/` | Hardware probe files and environment settings for ROCm and tool configurations. |
 | `crates/` | Workspace crate source implementations. |
 | `dist/` | Distribution installation scripts and systemd service configuration files. |
 | `docs/` | Comprehensive technical documentation and user guides. |
-| `models/` | Cache directory for downloaded model weights and GGUF checkpoints. |
 | `mutants.toml` | Mutation testing configuration file for `cargo-mutants`. |
-| `old/` | Historical specification files and legacy reference prompts. |
 | `plugins/` | Native and WebAssembly plugin artifacts. |
 | `third-party/` | Vendor-patched third-party dependency source crates. |
 
