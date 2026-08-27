@@ -4028,6 +4028,10 @@ fn cuda_dequant_quantized_storage(
             "quantized_matmul_backward_dx: expected quantized b, got Native ({:?})",
             dtype
         ))),
+        _ => Err(Error::Unimplemented(format!(
+            "quantized_matmul_backward_dx: host dequant for storage {:?} not implemented",
+            dtype.storage
+        ))),
     }
 }
 

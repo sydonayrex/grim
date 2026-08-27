@@ -172,6 +172,8 @@ fn kernel_less_variants_fail_loudly_not_silently() {
     let out_shape = Shape::new(vec![2, 4]);
     let a_gpu = dev.from_cpu(&vec![1.0f32; 16], &a_shape, DType::F32).unwrap();
 
+    // These formats now have wired forward kernels (W8A8 Int8/Fp8, WNA16);
+    // they must NOT silently fall back to packed-bytes-as-f32.
     for (name, storage) in [
         (
             "CompressedTensorsW8A8Int8",
@@ -197,19 +199,40 @@ fn kernel_less_variants_fail_loudly_not_silently() {
             grim_tensor::QuantFormat::Q4K,
             &out_shape,
         );
-        let err = match res {
-            Err(e) => e,
-            Ok(_) => panic!(
-                "{name} has no GPU kernel — must fail loudly instead of the \
-                 packed-bytes-as-f32 fallback"
-            ),
-        };
-        let msg = err.to_string();
         assert!(
-            msg.contains("not wired") || msg.contains("no fused"),
-            "{name}: error should state the wiring gap: {msg}"
+            res.is_ok(),
+            "{name}: now has a wired forward kernel; must succeed (not silently fallback)"
         );
     }
+
+    // EmbeddingWNA16Int is an embedding format, not a GEMM — must still fail
+    // loudly if mistakenly routed through quantized_matmul.
+    let emb_dt = DType {
+        arith: ArithType::F32,
+        storage: DTypeStorage::EmbeddingWNA16Int,
+    };
+    let b_gpu = dev
+        .from_cpu_bytes(&vec![0u8; b_shape.elem_count()], &b_shape, emb_dt)
+        .unwrap();
+    let res = dev.quantized_matmul(
+        a_gpu.as_ref(),
+        b_gpu.as_ref(),
+        &[],
+        grim_tensor::QuantFormat::Q4K,
+        &out_shape,
+    );
+    let err = match res {
+        Err(e) => e,
+        Ok(_) => panic!(
+            "EmbeddingWNA16Int has no GEMM kernel — must fail loudly instead of the \
+             packed-bytes-as-f32 fallback"
+        ),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("embedding") || msg.contains("dequantize at load"),
+        "EmbeddingWNA16Int: error should state the embedding-only nature: {msg}"
+    );
 }
 
 
@@ -238,7 +261,7 @@ fn f16_to_f32(h: u16) -> f32 {
         let v = (m >> 13) as f32 * (1.0 / 1024.0) * (1.0 / 16384.0);
         return if h & 0x8000 != 0 { -v } else { v };
     }
-    f32::from_bits(s | e | m | 0x38800000)
+    f32::from_bits(s | e | m | 0x38000000)
 }
 
 /// Audit gate: WNA16 GPU dequant must match the host MSB-first decoder and

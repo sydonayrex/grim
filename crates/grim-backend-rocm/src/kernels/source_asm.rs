@@ -67,6 +67,9 @@ pub fn compute_kernel_source() -> String {
     // the same aggregate translation unit so `launch_compute_kernel` resolves it.
     s.push_str(crate::kernels::device_sampler::DEVICE_SAMPLER_KERNEL_SOURCE);
     s.push_str(crate::kernels::mxfp4_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::compressed_gemm::WEIGHT_NA16_KERNEL);
+    s.push_str(crate::kernels::compressed_gemm::EMBEDDING_NA16_INT_KERNEL);
+    s.push_str(crate::kernels::compressed_gemm::W8A8_GEMM_KERNEL);
     s
 }
 

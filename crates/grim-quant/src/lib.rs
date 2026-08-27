@@ -1393,6 +1393,165 @@ pub fn dequant_mxfp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Dequantize WNA16 (weight-only N-bit with per-block f16 scale + per-tensor f32 scale).
+///
+/// # Layout
+/// `[u32 n_bit][u32 num_blocks][u8 packed_codes...][f16 per_block_scales...][f32 tensor_scale]`
+///
+/// - `n_bit`: bits per weight (2..=8).
+/// - `num_blocks`: number of 256-weight blocks.
+/// - `packed_codes`: MSB-first N-bit codes, ceil(256*n_bit/8) bytes per block.
+/// - `per_block_scales`: one f16 scale per block, 2 bytes each.
+/// - `tensor_scale`: one f32 per-tensor scale.
+///
+/// Each weight is reconstructed as `code * block_scale * tensor_scale`.
+pub fn dequant_wna16(data: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+    if data.len() < 12 {
+        return Err(Error::Backend(
+            "WNA16: payload too short for header (need >= 12 bytes)".into(),
+        ));
+    }
+    let n_bit = u32::from_le_bytes(data[0..4].try_into().unwrap()) as u8;
+    let num_blocks = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    if !(2..=8).contains(&n_bit) {
+        return Err(Error::Backend(format!(
+            "WNA16: n_bit={n_bit} out of range 2..=8"
+        )));
+    }
+    let code_bytes_per_block = ((256 * n_bit as usize) + 7) / 8;
+    let codes_len = num_blocks * code_bytes_per_block;
+    let scales_offset = 8 + codes_len;
+    let tensor_scale_offset = scales_offset + num_blocks * 2;
+    if data.len() < tensor_scale_offset + 4 {
+        return Err(Error::Backend(format!(
+            "WNA16: payload too short for full layout (need >= {}, got {})",
+            tensor_scale_offset + 4,
+            data.len()
+        )));
+    }
+    let tensor_scale = f32::from_le_bytes(data[tensor_scale_offset..tensor_scale_offset + 4]
+        .try_into()
+        .unwrap());
+
+    let mut out = Vec::with_capacity(elem_count);
+    for block_idx in 0..num_blocks {
+        let block_scale = f16_to_f32(
+            data[scales_offset + block_idx * 2],
+            data[scales_offset + block_idx * 2 + 1],
+        );
+        let block_start = 8 + block_idx * code_bytes_per_block;
+        let block_end = block_start + code_bytes_per_block;
+        let block_codes = &data[block_start..block_end];
+        let block_elem_count = if block_idx == num_blocks - 1 {
+            elem_count - block_idx * 256
+        } else {
+            256
+        };
+        for lane in 0..block_elem_count {
+            let code = decode_msb_nbit(block_codes, 0, lane, n_bit);
+            out.push(code as f32 * block_scale * tensor_scale);
+        }
+    }
+    Ok(out)
+}
+
+/// Dequantize EmbeddingWNA16Int (embedding matrix stored as N-bit integers,
+/// row-major, with one f32 per-tensor scale).
+///
+/// # Layout
+/// `[u32 n_bit][u32 embedding_dim][u32 num_rows][u8 packed_codes...][f32 tensor_scale]`
+///
+/// - `n_bit`: bits per entry (2..=8).
+/// - `embedding_dim`: entries per row.
+/// - `num_rows`: number of rows.
+/// - `packed_codes`: MSB-first N-bit codes, ceil(embedding_dim*n_bit/8) bytes per row.
+/// - `tensor_scale`: one f32 per-tensor scale (last 4 bytes).
+///
+/// Each entry is reconstructed as `code * tensor_scale`.
+pub fn dequant_embedding_wna16_int(data: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+    if data.len() < 16 {
+        return Err(Error::Backend(
+            "EmbeddingWNA16Int: payload too short for header (need >= 16 bytes)".into(),
+        ));
+    }
+    let n_bit = u32::from_le_bytes(data[0..4].try_into().unwrap()) as u8;
+    let embedding_dim =
+        u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let num_rows = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    if !(2..=8).contains(&n_bit) {
+        return Err(Error::Backend(format!(
+            "EmbeddingWNA16Int: n_bit={n_bit} out of range 2..=8"
+        )));
+    }
+    let code_bytes_per_row = ((embedding_dim * n_bit as usize) + 7) / 8;
+    let codes_len = num_rows * code_bytes_per_row;
+    let tensor_scale_offset = 12 + codes_len;
+    if data.len() < tensor_scale_offset + 4 {
+        return Err(Error::Backend(format!(
+            "EmbeddingWNA16Int: payload too short for full layout (need >= {}, got {})",
+            tensor_scale_offset + 4,
+            data.len()
+        )));
+    }
+    let tensor_scale = f32::from_le_bytes(data[tensor_scale_offset..tensor_scale_offset + 4]
+        .try_into()
+        .unwrap());
+
+    let mut out = Vec::with_capacity(elem_count);
+    for row_idx in 0..num_rows {
+        let row_start = 12 + row_idx * code_bytes_per_row;
+        let row_end = row_start + code_bytes_per_row;
+        let row_codes = &data[row_start..row_end];
+        let row_elem_count = if row_idx == num_rows - 1 {
+            elem_count - row_idx * embedding_dim
+        } else {
+            embedding_dim
+        };
+        for col in 0..row_elem_count {
+            let code = decode_msb_nbit(row_codes, 0, col, n_bit);
+            out.push(code as f32 * tensor_scale);
+        }
+    }
+    Ok(out)
+}
+///
+/// Codes are packed MSB-first within each byte, crossing byte boundaries as
+/// needed. `bit_pos = lane * n_bit`, and the decoder reads across the bytes
+/// that contain those bits.
+fn decode_msb_nbit(code_bytes: &[u8], block_offset_bytes: usize, lane: usize, n_bit: u8) -> u32 {
+    let bit_pos = (lane as u32).wrapping_mul(n_bit as u32);
+    let byte_idx = (bit_pos / 8) as usize;
+    let bit_in_byte = (bit_pos % 8) as u32;
+    let mut code: u32 = 0;
+    let mut consumed: u32 = 0;
+    let mut b = byte_idx;
+    let mut shift = (8 - bit_in_byte) as u32;
+    while consumed < n_bit as u32 {
+        let byte = code_bytes[block_offset_bytes + b];
+        let take = if shift == 0 {
+            8u32
+        } else {
+            shift
+        };
+        let take = if take > n_bit as u32 - consumed {
+            n_bit as u32 - consumed
+        } else {
+            take
+        };
+        let mask = if shift == 0 {
+            0xFFu32
+        } else {
+            ((1u32 << take) - 1u32) << (8 - shift)
+        };
+        let bits = (byte as u32 & mask) >> (8 - shift - take);
+        code |= bits << consumed;
+        consumed += take;
+        b += 1;
+        shift = 0;
+    }
+    code
+}
+
 /// Canonical NF4 (normalized float-4) lookup table (bitsandbytes / QLoRA standard).
 /// 16 quantiles of the standard normal distribution N(0, 1) scaled to [-1, 1].
 pub const NF4_LUT: [f32; 16] = [
