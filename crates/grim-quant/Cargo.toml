@@ -25,3 +25,6 @@ grim-format = { workspace = true }
 grim-nn = { workspace = true, features = ["rocm-mem"] }
 grim-backend-rocm = { workspace = true }
 grim-tensor = { workspace = true }
+
+[lints]
+workspace = true

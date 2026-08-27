@@ -44,3 +44,6 @@ rocm-mem = []
 [[bench]]
 name = "scythe2_decide_miss"
 harness = false
+
+[lints]
+workspace = true

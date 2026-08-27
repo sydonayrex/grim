@@ -645,7 +645,7 @@ pub fn weights_look_broken(name: &str, tensor: &grim_tensor::Tensor) -> Result<(
 mod tests {
     use super::*;
 
-    use super::*;
+    
 
     fn base_cfg(head_dim: usize, prf: f32) -> LlamaConfig {
         LlamaConfig {

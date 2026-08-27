@@ -121,7 +121,7 @@ fn gptq_quantize_bank(
     let mut seed = 0x9E37u64;
     let mut rand = move || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((seed >> 33) as f32 / u32::MAX as f32)
+        (seed >> 33) as f32 / u32::MAX as f32
     };
     let mut qweight = vec![0u32; k.div_ceil(vpw) * n_total];
     let mut qzeros = vec![0u32; groups * n_total.div_ceil(vpw)];
@@ -364,7 +364,7 @@ impl MoEFixture {
             ("ffn_up_exps.weight", INTER, HIDDEN),
             ("ffn_down_exps.weight", HIDDEN, INTER),
         ];
-        let refs = [&self.ref_gate, &self.ref_up, &self.ref_down];
+        let _refs = [&self.ref_gate, &self.ref_up, &self.ref_down];
         let mut map: HashMap<String, (Vec<u8>, Vec<usize>, DType, QuantProvenance)> =
             HashMap::new();
         let slabs: [&[Vec<f32>]; 3] = [&self.ref_gate, &self.ref_up, &self.ref_down];
@@ -401,7 +401,7 @@ impl MoEFixture {
 }
 
 fn quant_moe_parity(fixture: MoEFixture, label: &str) {
-    let dev = match RocmDevice::try_new(0) {
+    let _dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[skipped: no ROCm device: {e:?}]");

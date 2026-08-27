@@ -31,3 +31,6 @@ wat = "1.0"
 default = ["wasm-sandbox"]
 wasm-sandbox = ["wasmtime"]
 dylib-loading = ["libloading"]
+
+[lints]
+workspace = true

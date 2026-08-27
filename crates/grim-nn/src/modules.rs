@@ -2026,7 +2026,7 @@ impl MlaAttention {
             }
             c.past_len += s;
             let past = c.past_len - s;
-            let kv_total = c.past_len;
+            let _kv_total = c.past_len;
             let scale = 1.0 / (qk_head_dim as f32).sqrt();
             let mut out = vec![0.0f32; s * v_stride];
             for hi in 0..self.num_heads {
@@ -2843,7 +2843,7 @@ impl ConvTranspose1d {
 mod mla_cache_tests {
     use super::*;
     use grim_backend_cpu::cpu_tensor;
-    use grim_tensor::{DType, Shape, Tensor};
+    use grim_tensor::Shape;
 
     /// Audit gate (grim-models): MlaAttention's cached decode path must
     /// produce the SAME activations as a full prefill over the identical

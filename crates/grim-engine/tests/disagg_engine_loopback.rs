@@ -350,7 +350,7 @@ fn test_pure_transferred_kv_decode_without_local_prefill() {
         let ppool = prefill_engine.block_pool.lock().unwrap();
         let dsession = decode_engine.sessions.get(&1).unwrap();
         for b in 0..2usize {
-            let (dk, dv) = dsession
+            let (dk, _dv) = dsession
                 .kv_cache()
                 .and_then(|kv| kv.layer_block_slice(0, b))
                 .expect("hydrated session must expose layer-0 block slice");

@@ -48,3 +48,5 @@ cuda = ["dep:grim-backend-cuda", "grim-engine/cuda"]
 # `sampler` field wiring is still exercised by the default-on mock-sampler E2E
 # test (`test_chat_completions_routes_through_named_plugin_sampler`).
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]
+[lints]
+workspace = true

@@ -126,9 +126,24 @@ q6k = []
 # iq = []
 # q8_0 = []
 
+[[test]]
+name = "gptq_gemm_gpu_parity"
+required-features = ["gpu-test-shims"]
+
+[[test]]
+name = "awq_gemm_gpu_parity"
+required-features = ["gpu-test-shims"]
+
+[[test]]
+name = "charon_compressed_gpu"
+required-features = ["gpu-test-shims"]
+
 [dev-dependencies]
 grim-quant = { workspace = true }
 grim-nn = { workspace = true }
 grim-autograd = { workspace = true }
 grim-backend-cpu = { path = "../grim-backend-cpu" }
 grim-kvquant = { path = "../grim-kvquant" }
+
+[lints]
+workspace = true

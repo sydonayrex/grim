@@ -153,7 +153,7 @@ mod tests {
             return;
         }
         let dev = crate::RocmDevice::try_new(0).expect("device");
-        use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
+        use grim_tensor::{BackendStorage, DType, Shape};
 
         const M: usize = 1;
         const N: usize = 16;
@@ -188,7 +188,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut c_s = crate::memory::storage::RocmStorage::alloc_gpu(
+        let c_s = crate::memory::storage::RocmStorage::alloc_gpu(
             &Shape::new(vec![M, N]),
             DType::F32,
             &alloc,

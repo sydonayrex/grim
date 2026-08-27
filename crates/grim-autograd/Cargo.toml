@@ -29,3 +29,6 @@ gpu-selection = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 [dev-dependencies]
 grim-quant = { workspace = true }
 
+
+[lints]
+workspace = true

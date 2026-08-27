@@ -1487,7 +1487,7 @@ impl ScytheRingExec {
         let peer = 0u64;
         self.ring
             .enqueue_gemm(1, m, n, k, input_ptr, weight_ptr, output_ptr, peer)
-            .map_err(|d| {
+            .map_err(|_d| {
                 grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_gemm rejected descriptor".into())
             })?;
         Ok(())
@@ -1693,7 +1693,7 @@ impl ScytheRingExec {
     /// Raise the stop flag and join the resident worker. The exec is single-
     /// lifetime in resident mode (device counters are monotonic).
     pub fn shutdown(&mut self) -> grim_backend_rocm::Result<()> {
-        let Some(worker) = self.worker.take() else {
+        let Some(_worker) = self.worker.take() else {
             return Ok(());
         };
         let ptr = self
@@ -2397,7 +2397,7 @@ mod tests {
     /// is device-gated per gate (3).
     #[test]
     fn moe_descriptor_enqueues_via_scythe_ring_as_opcode_6() {
-        let moe_desc = MoETaskDescriptor {
+        let _moe_desc = MoETaskDescriptor {
             hidden: 4096,
             inter: 14336,
             num_tokens: 16,

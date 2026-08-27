@@ -37,6 +37,10 @@ graph TD
 - `MetricStreamEvent`: SSE payloads for real-time loss and throughput graphs.
 - `probe_rocm_devices`: Utility for identifying local AMD hardware limits.
 
+## Training Control Room UI
+
+![Grim's Garage Training Dashboard](../../docs/assets/garage_dashboard.png)
+
 ## Usage Example
 ```bash
 # Start the Garage server

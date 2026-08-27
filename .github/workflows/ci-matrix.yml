@@ -45,7 +45,7 @@ jobs:
       - name: ROCm backend GPU test suite
         env:
           GRIM_RUN_GPU_TESTS: "1"
-        run: cargo test -p grim-backend-rocm --tests
+        run: cargo test -p grim-backend-rocm --tests --features gpu-test-shims
 
       - name: Eval smoke (ppl delta < 2% vs golden)
         run: |

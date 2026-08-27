@@ -2,7 +2,7 @@
 
 use std::any::Any;
 
-use grim_backend_cpu::{CpuDevice, cpu_tensor};
+use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{
     AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig, SsmState, StatefulSequence,

@@ -387,9 +387,6 @@ impl Scythe2Linear {
         let mut col_start = 0usize;
         let mut shards: Vec<(Tensor, usize)> = Vec::with_capacity(n_ranks);
         let mut shard_out_dim = 0usize;
-        // Holds the uploaded operand for CPU-rank iterations (ROCm ranks use
-        // the residency cache instead).
-        let mut b_uploaded: Option<Box<dyn BackendStorage>> = None;
 
         let x_dims = x.shape().dims();
         let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);

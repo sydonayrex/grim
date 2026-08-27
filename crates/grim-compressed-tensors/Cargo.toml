@@ -10,3 +10,6 @@ description = "Grim Compact Tensor (.gcct) container format and type tags for co
 
 [lib]
 path = "src/lib.rs"
+
+[lints]
+workspace = true

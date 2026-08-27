@@ -19,3 +19,6 @@ thiserror = { workspace = true }
 [features]
 default = []
 rocm = ["grim-backend-rocm"]
+
+[lints]
+workspace = true
