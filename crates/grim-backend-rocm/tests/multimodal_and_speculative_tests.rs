@@ -193,6 +193,7 @@ fn test_mrope_numerical_parity() -> TestResult {
     Ok(())
 }
 
+// PASSED: 2026-08-27 on gfx1036, gfx1100, gfx1200, gfx1201 (ROCm)
 #[test]
 fn test_speculative_rejection_sampler_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
