@@ -30,7 +30,7 @@ pub fn kv_to_block_major(
     head_dim: usize,
     block_size: usize,
 ) -> Vec<f32> {
-    let num_blocks = (num_tokens + block_size - 1) / block_size;
+    let num_blocks = num_tokens.div_ceil(block_size);
     let mut out = vec![0.0f32; num_blocks * num_heads * head_dim * block_size];
 
     for block_idx in 0..num_blocks {
@@ -63,7 +63,7 @@ pub fn kv_from_block_major(
     head_dim: usize,
     block_size: usize,
 ) -> Vec<f32> {
-    let num_blocks = (num_tokens + block_size - 1) / block_size;
+    let num_blocks = num_tokens.div_ceil(block_size);
     let mut out = vec![0.0f32; num_tokens * num_heads * head_dim];
 
     for block_idx in 0..num_blocks {
@@ -117,7 +117,7 @@ pub struct WavefrontTiledLayout {
 impl WavefrontTiledLayout {
     pub fn new(rows: usize, cols: usize, wavefront_size: u32) -> Self {
         let wf = wavefront_size as usize;
-        let num_wavefronts = (rows + wf - 1) / wf;
+        let num_wavefronts = rows.div_ceil(wf);
         let cols_padded = padded_dims(0, cols, wavefront_size).1;
         Self {
             wavefront_size,
@@ -212,7 +212,7 @@ impl PackedQuantLayout {
             let row_vals = &weights[start..end];
 
             let bits_needed = self.cols as u64 * self.bits as u64;
-            let bytes_needed = (bits_needed + 7) / 8;
+            let bytes_needed = bits_needed.div_ceil(8);
             let out_start = out.len();
             out.resize(out_start + bytes_needed as usize, 0u8);
 
@@ -250,7 +250,7 @@ impl PackedQuantLayout {
     /// Unpacks bit-packed bytes back to f32 elements.
     pub fn unpack(&self, packed: &[u8]) -> Vec<f32> {
         let mut out = vec![0.0f32; self.rows * self.cols];
-        let row_bytes = ((self.cols as u64 * self.bits as u64 + 7) / 8 + 255) & !255;
+        let row_bytes = ((self.cols as u64 * self.bits as u64).div_ceil(8) + 255) & !255;
         let row_bytes = row_bytes as usize;
 
         for r in 0..self.rows {
@@ -319,13 +319,13 @@ impl PackedQuantWmmaLayout {
     /// Bytes needed to pack one row of `cols` elements at `bits`, unaligned.
     pub fn row_packed_bytes(&self) -> usize {
         let bits = self.cols as u64 * self.bits as u64;
-        ((bits + 7) / 8) as usize
+        bits.div_ceil(8) as usize
     }
 
     /// Wave64-aligned row pitch (matches `PackedQuantLayout`'s packing), so a
     pub fn row_stride_bytes(&self) -> usize {
         let raw = self.row_packed_bytes();
-        (raw + 255) & !255
+        raw.div_ceil(256) * 256
     }
 
     /// Total packed payload size: `rows × row_stride`, Wave64-aligned per row.
@@ -336,7 +336,7 @@ impl PackedQuantWmmaLayout {
     /// Pack one row of f32 weights into the fragment-aligned byte blob [see: `PackedQuantLayout::pack`]
     pub fn pack_row(&self, row: &[f32]) -> Vec<u8> {
         let bits = self.cols as u64 * self.bits as u64;
-        let bytes_needed = (bits + 7) / 8;
+        let bytes_needed = bits.div_ceil(8);
         let mut out = vec![0u8; bytes_needed as usize];
         for (i, &v) in row.iter().enumerate() {
             let levels = (1u32 << self.bits) as f32;
@@ -398,9 +398,7 @@ pub fn align_tensor_for_rocm_gemm(
     for row in 0..rows {
         let src_start = row * cols;
         let dst_start = row * cols_padded;
-        for col in 0..cols {
-            padded[dst_start + col] = data[src_start + col];
-        }
+        padded[dst_start..dst_start + cols].copy_from_slice(&data[src_start..src_start + cols]);
     }
 
     // Pad remaining rows with zeros
@@ -438,8 +436,8 @@ pub fn align_quantized_tensor_for_rocm_gemm(
     };
     let orig_vals = rows * cols;
     let padded_vals = rows_padded * cols;
-    let orig_bytes = (orig_vals + vals_per_byte - 1) / vals_per_byte;
-    let padded_bytes = (padded_vals + vals_per_byte - 1) / vals_per_byte;
+    let orig_bytes = orig_vals.div_ceil(vals_per_byte);
+    let padded_bytes = padded_vals.div_ceil(vals_per_byte);
 
     let mut padded = vec![0u8; padded_bytes];
     if !data.is_empty() {
@@ -522,7 +520,7 @@ mod wmma_tests {
         let bits = 4u8;
 
         // Reference row pitch: the WI-A PackedQuant convention is
-        let raw_bytes = ((cols as u64 * bits as u64 + 7) / 8) as usize;
+        let raw_bytes = (cols as u64 * bits as u64).div_ceil(8) as usize;
         let ref_pitch = (raw_bytes + 255) & !255;
 
         // WI-R7: PackedQuantWmmaLayout with arbitrary fragment shape.
@@ -559,7 +557,7 @@ mod wmma_tests {
 
     /// Inline reference packing (big-endian-bit / little-endian-byte) so the
     fn ref_pack_row(row: &[f32], bits: u8) -> Vec<u8> {
-        let raw = (row.len() as u64 * bits as u64 + 7) / 8;
+        let raw = (row.len() as u64 * bits as u64).div_ceil(8);
         let mut out = vec![0u8; raw as usize];
         let levels = (1u32 << bits) as f32;
         for (i, &v) in row.iter().enumerate() {

@@ -238,18 +238,12 @@ pub fn fused_or_scalar_attention_paged(
             // (fabricated zeros). It now gathers rows through the block
             // table and propagates read errors.
             let bt_host = block_tables.to_cpu_vec_f32()?;
-            let block_table: Vec<usize> =
-                bt_host.iter().map(|&b| b as usize).collect();
+            let block_table: Vec<usize> = bt_host.iter().map(|&b| b as usize).collect();
             let kv_stride = num_kv_heads * head_dim;
             let k_flat = k_pages.to_cpu_vec_f32()?;
             let v_flat = v_pages.to_cpu_vec_f32()?;
-            let k_hist = gather_paged_history(
-                &k_flat,
-                &block_table,
-                page_size,
-                kv_stride,
-                kv_seq_len,
-            )?;
+            let k_hist =
+                gather_paged_history(&k_flat, &block_table, page_size, kv_stride, kv_seq_len)?;
             let v_hist =
                 gather_paged_history(&v_flat, &block_table, page_size, kv_stride, kv_seq_len)?;
             scalar_attention(
@@ -475,7 +469,8 @@ mod tests {
         let head_dim = 8;
         let kv_len = 24usize;
         let steps = 3usize;
-        let window = Some(10usize);
+        const TEST_WINDOW: usize = 10;
+        let window = Some(TEST_WINDOW);
 
         let mut q = vec![0.0f32; steps * num_heads * head_dim];
         let mut k = vec![0.0f32; kv_len * num_kv_heads * head_dim];
@@ -523,7 +518,7 @@ mod tests {
             for h in 0..num_heads {
                 let kvh = (h * num_kv_heads) / num_heads;
                 let causal_limit = cache_offset + t;
-                let window_start = (causal_limit + 1).saturating_sub(window.unwrap());
+                let window_start = (causal_limit + 1).saturating_sub(TEST_WINDOW);
                 let mut scores = Vec::with_capacity(causal_limit - window_start + 1);
                 for t2 in window_start..=causal_limit {
                     let mut dot = 0.0;
@@ -564,7 +559,8 @@ mod tests {
         let head_dim = 8;
         let kv_len = 24usize;
         let steps = 3usize;
-        let window = Some(10usize);
+        const TEST_WINDOW: usize = 10;
+        let window = Some(TEST_WINDOW);
         let kv_stride = num_kv_heads * head_dim;
 
         let mut seed = 0xfeed_beefu64;

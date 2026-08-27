@@ -236,6 +236,8 @@ fn mxfp8_kernel_matches_cpu_oracle() {
     assert_bit_exact("mxfp8", &got, &expected);
 }
 
+// The dyn-Fn parameter keeps each quant-format case a one-liner at the call site.
+#[allow(clippy::type_complexity)]
 fn run_iq(
     name: &str,
     block_bytes: usize,

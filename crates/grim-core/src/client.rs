@@ -66,7 +66,10 @@ pub async fn download_model(model_ref: &str, output: Option<String>) -> Result<(
             let total = p.total.unwrap_or(0);
             let completed = p.completed.unwrap_or(0);
             if total > 0 {
-                let pct = completed * 100 / total;
+                let pct = completed
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(0);
                 print!(
                     "\r  [{:>3}%] {:.2} / {:.2} GB",
                     pct,
@@ -1156,7 +1159,7 @@ async fn get_content_length(client: &reqwest::Client, url: &str) -> Option<u64> 
 
 fn derive_filename_from_url(url: &str) -> String {
     url.split('/')
-        .last()
+        .next_back()
         .unwrap_or("model.gguf")
         .split('?')
         .next()

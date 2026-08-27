@@ -2,7 +2,7 @@
 //! dequantized weight matrix. Device-gated: GRIM_GPU_TEST=1.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::{BackendDevice, BackendStorage};
+use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Device, Shape, Storage, Tensor};
 use std::sync::Arc;
 
@@ -18,7 +18,9 @@ fn w4a16_dequant_service_round_trips() {
     }
 
     let (n_rows, k_dim, group_size) = (4usize, 8usize, 8usize);
-    let mut w: Vec<f32> = (0..n_rows * k_dim).map(|i| ((i % 11) as f32 * 0.37) - 1.9).collect();
+    let mut w: Vec<f32> = (0..n_rows * k_dim)
+        .map(|i| ((i % 11) as f32 * 0.37) - 1.9)
+        .collect();
 
     // Quantize per row, per group; rewrite w to exact dequant values.
     let words_per_row = k_dim / 8;
@@ -29,7 +31,9 @@ fn w4a16_dequant_service_round_trips() {
         for g in 0..groups_per_row {
             let lo = g * group_size;
             let hi = (lo + group_size).min(k_dim);
-            let max_abs = (lo..hi).map(|c| w[row * k_dim + c].abs()).fold(0.0f32, f32::max);
+            let max_abs = (lo..hi)
+                .map(|c| w[row * k_dim + c].abs())
+                .fold(0.0f32, f32::max);
             let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 7.0 };
             scales[row * groups_per_row + g] = scale;
             for c in lo..hi {

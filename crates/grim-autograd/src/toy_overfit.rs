@@ -36,6 +36,7 @@ fn init2(rows: usize, cols: usize, seed: i32) -> Tensor {
 
 /// Run one LoRA stage forward `y = base + scale * (x @ A^T) @ B^T` on CPU,
 /// recording it on `tape` exactly as `train.rs` would.
+#[allow(clippy::too_many_arguments)]
 fn lora_stage(
     tape: &mut Tape,
     dev: &CpuDevice,

@@ -73,28 +73,23 @@ pub fn strict_attention(
         for qt in 0..num_tokens {
             // scores[kt] = (q · k[kt]) * scale.
             let mut scores = vec![0.0f32; num_tokens];
-            for kt in 0..num_tokens {
+            for (score_row, score) in scores.iter_mut().enumerate() {
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     dot += q[qt * num_heads * head_dim + h * head_dim + d]
-                        * k[kt * kv_stride + kvh * head_dim + d];
+                        * k[score_row * kv_stride + kvh * head_dim + d];
                 }
-                scores[kt] = dot * scale;
+                *score = dot * scale;
             }
             // Stable softmax in-place on scores.
-            let mut max = f32::NEG_INFINITY;
-            for kt in 0..num_tokens {
-                if scores[kt] > max {
-                    max = scores[kt];
-                }
-            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
-            for kt in 0..num_tokens {
-                scores[kt] = (scores[kt] - max).exp();
-                sum += scores[kt];
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                sum += *score;
             }
-            for kt in 0..num_tokens {
-                scores[kt] /= sum;
+            for score in &mut scores {
+                *score /= sum;
             }
             // Weighted sum against V.
             for d in 0..head_dim {
@@ -206,8 +201,8 @@ pub fn strict_attention_partial_online(
                     } else {
                         (prev_m - new_m).exp()
                     };
-                    running_sum[d] = running_sum[d] * scale_prev;
-                    acc[d] = acc[d] * scale_prev;
+                    running_sum[d] *= scale_prev;
+                    acc[d] *= scale_prev;
                     running_max[d] = new_m;
                     let w = if s == new_m {
                         1.0f32
@@ -358,7 +353,7 @@ mod tests {
         let mut next = || {
             s = lcg_f32(s);
             // Map to [-1, 1].
-            ((s as f32 / u32::MAX as f32) * 2.0 - 1.0) as f32
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
         let q: Vec<f32> = (0..seq_len * q_stride).map(|_| next()).collect();
         let k: Vec<f32> = (0..kv_seq_len * kv_stride).map(|_| next()).collect();

@@ -14,21 +14,12 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| {
-        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
-    }) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
+        .ok()
 }
 
 fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr() as *const u8,
-            slice.len() * std::mem::size_of::<T>(),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
 fn cpu_rmsnorm(x: &[f32], gamma: &[f32], m: usize, k: usize, eps: f32) -> Vec<f32> {
@@ -56,8 +47,8 @@ fn cpu_rope_in_place(
     theta: f32,
     positions: &[u32],
 ) {
-    for row in 0..m {
-        let pos = positions[row] as f32;
+    for (&pos_raw, row) in positions.iter().zip(0..m) {
+        let pos = pos_raw as f32;
         for h in 0..num_heads {
             let base = row * (num_heads * head_dim) + h * head_dim;
             for i in 0..(rotary_dim / 2) {
@@ -109,6 +100,8 @@ fn cpu_yarn_inv_freq(
 }
 
 /// YaRN RoPE on the CPU, mirroring `grim_rope_yarn` (mscale applied to sin/cos).
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_rope_yarn_in_place(
     x: &mut [f32],
     m: usize,
@@ -120,12 +113,12 @@ fn cpu_rope_yarn_in_place(
     positions: &[u32],
 ) {
     let rotary_half = rotary_dim / 2;
-    for row in 0..m {
-        let pos = positions[row] as f32;
+    for (&pos_raw, row) in positions.iter().zip(0..m) {
+        let pos = pos_raw as f32;
         for h in 0..num_heads {
             let base = row * (num_heads * head_dim) + h * head_dim;
-            for i in 0..rotary_half {
-                let angle = pos * inv_freq[i];
+            for (i, &freq) in inv_freq[..rotary_half].iter().enumerate() {
+                let angle = pos * freq;
                 let cos_a = angle.cos() * mscale;
                 let sin_a = angle.sin() * mscale;
 

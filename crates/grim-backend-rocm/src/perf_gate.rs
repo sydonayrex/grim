@@ -101,13 +101,13 @@ impl BaselineTable {
         baseline_cycles_per_call: f64,
         threshold_pct: f64,
     ) -> Result<()> {
-        if !(baseline_cycles_per_call > 0.0) {
+        if baseline_cycles_per_call <= 0.0 {
             return Err(Error::Backend(format!(
                 "BaselineTable::set_entry: baseline_cycles_per_call must be > 0 (kernel={})",
                 kernel
             )));
         }
-        if !(threshold_pct > 0.0) {
+        if threshold_pct <= 0.0 {
             return Err(Error::Backend(format!(
                 "BaselineTable::set_entry: threshold_pct must be > 0 (kernel={})",
                 kernel
@@ -173,13 +173,13 @@ fn validate_wire(wire: &BaselineTableJson) -> Result<()> {
         if e.kernel.is_empty() {
             return Err(Error::Backend("baseline json: empty kernel name".into()));
         }
-        if !(e.baseline_cycles_per_call > 0.0) {
+        if e.baseline_cycles_per_call <= 0.0 {
             return Err(Error::Backend(format!(
                 "baseline json: baseline_cycles_per_call must be > 0 ({})",
                 e.kernel
             )));
         }
-        if !(e.threshold_pct > 0.0) {
+        if e.threshold_pct <= 0.0 {
             return Err(Error::Backend(format!(
                 "baseline json: threshold_pct must be > 0 ({})",
                 e.kernel
@@ -313,6 +313,16 @@ impl PerfGate {
     }
 }
 
+// We expose a tiny mutator for the self-test only. It bypasses the public
+// `set_entry` validator (which is exercised in the public tests).
+// Not part of the public API.
+impl BaselineTable {
+    #[doc(hidden)]
+    pub fn inner_mut_for_tests(&mut self) -> &mut HashMap<String, BaselineEntry> {
+        &mut self.inner
+    }
+}
+
 #[cfg(test)]
 mod gate_self_tests {
     //! Tiny self-tests that prove the gate uses the threshold the spec
@@ -356,15 +366,5 @@ mod gate_self_tests {
             matches!(v, Verdict::Regressed { .. }),
             "+20% slower regresses"
         );
-    }
-}
-
-// We expose a tiny mutator for the self-test only. It bypasses the public
-// `set_entry` validator (which is exercised in the public tests).
-// Not part of the public API.
-impl BaselineTable {
-    #[doc(hidden)]
-    pub fn inner_mut_for_tests(&mut self) -> &mut HashMap<String, BaselineEntry> {
-        &mut self.inner
     }
 }

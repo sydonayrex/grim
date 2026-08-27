@@ -223,7 +223,7 @@ impl ArchCompatSpec {
             .or_else(|| text.and_then(|t| t.head_dim))
             .unwrap_or_else(|| {
                 if num_heads > 0 {
-                    hidden_size / num_heads
+                    hidden_size.checked_div(num_heads).unwrap_or(hidden_size)
                 } else {
                     128
                 }

@@ -124,7 +124,6 @@ pub fn shard_raw_tensor(
         ));
     };
 
-    let rank = rank as usize;
     if rank >= world_size {
         return Err(Error::IndexOutOfBounds(format!(
             "rank {rank} >= world_size {world_size}"
@@ -252,7 +251,7 @@ mod tests {
         };
         let shard = shard_raw_tensor(raw, 1, 0, 2).expect("dim1 shard ok");
         assert_eq!(shard.shape, vec![4, 1]);
-        assert_eq!(shard.bytes.len(), 4 * 1 * 4);
+        assert_eq!(shard.bytes.len(), 4 * 4);
     }
 
     /// shard_boundary_valid: divisibility + block alignment checks.

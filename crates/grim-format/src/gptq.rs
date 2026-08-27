@@ -96,25 +96,22 @@ fn read_quant_params(
         }
     }
 
-    if bits.is_none() || group_size.is_none() {
-        if config_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(config_path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(qcfg) = val.get("quantization_config") {
-                        if let Some(b) = qcfg.get("bits").and_then(|v| v.as_u64()).map(|v| v as u32)
-                        {
-                            bits = Some(b);
-                        }
-                        if let Some(g) = qcfg
-                            .get("group_size")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
-                        {
-                            group_size = Some(g);
-                        }
-                        if let Some(d) = qcfg.get("desc_act").and_then(|v| v.as_bool()) {
-                            desc_act = Some(d);
-                        }
+    if (bits.is_none() || group_size.is_none()) && config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(qcfg) = val.get("quantization_config") {
+                    if let Some(b) = qcfg.get("bits").and_then(|v| v.as_u64()).map(|v| v as u32) {
+                        bits = Some(b);
+                    }
+                    if let Some(g) = qcfg
+                        .get("group_size")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                    {
+                        group_size = Some(g);
+                    }
+                    if let Some(d) = qcfg.get("desc_act").and_then(|v| v.as_bool()) {
+                        desc_act = Some(d);
                     }
                 }
             }
@@ -164,11 +161,7 @@ impl GptqProvider {
         let (info, metadata, data_region_start) =
             crate::safetensors::read_safetensors_header(reader)?;
 
-        let (bits, group_size, default_desc_act) = match read_quant_params(&resolved_str, &metadata)
-        {
-            Ok(params) => params,
-            Err(e) => return Err(e),
-        };
+        let (bits, group_size, default_desc_act) = read_quant_params(&resolved_str, &metadata)?;
 
         let mut tensors = HashMap::new();
         for (name, tensor_info) in &info {
@@ -500,10 +493,10 @@ pub fn dequant_gptq_tensor(
 pub fn packed_elem_count(shape: &[usize], bits: u32) -> usize {
     let elem = shape.iter().product::<usize>();
     match bits {
-        2 => (elem + 15) / 16,     // 16 values per u32
-        3 => (elem + 31) / 32 * 3, // 32 values across 3 u32 words
-        4 => (elem + 7) / 8,       // 8 values per u32
-        8 => elem,                 // 1 value per u32
+        2 => elem.div_ceil(16),     // 16 values per u32
+        3 => elem.div_ceil(32) * 3, // 32 values across 3 u32 words
+        4 => elem.div_ceil(8),      // 8 values per u32
+        8 => elem,                  // 1 value per u32
         _ => elem,
     }
 }
@@ -692,7 +685,7 @@ mod tests {
 
         let mut expected = vec![0.0f32; in_features * out_features];
         let mut qweight = vec![0u8; (in_features / values_per_word) * out_features * 4];
-        let words_per_row_zeros = (out_features + values_per_word - 1) / values_per_word;
+        let words_per_row_zeros = out_features.div_ceil(values_per_word);
         let mut qzeros = vec![0u8; (in_features / group_size) * words_per_row_zeros * 4];
         let mut scales = vec![0u8; (in_features / group_size) * out_features * 4];
 
@@ -799,17 +792,17 @@ mod tests {
 
         // Pack 3-bit codes into qweight
         let mut u128_cols = vec![0u128; out_features];
-        for out_idx in 0..out_features {
+        for (out_idx, col) in u128_cols.iter_mut().enumerate() {
             for in_idx in 0..in_features {
                 let code = ((in_idx + out_idx) % 8) as u128;
                 let total_bit = in_idx * 3;
-                u128_cols[out_idx] |= (code & 0x7) << total_bit;
+                *col |= (code & 0x7) << total_bit;
             }
         }
-        for out_idx in 0..out_features {
-            let w0 = (u128_cols[out_idx] & 0xFFFFFFFF) as u32;
-            let w1 = ((u128_cols[out_idx] >> 32) & 0xFFFFFFFF) as u32;
-            let w2 = ((u128_cols[out_idx] >> 64) & 0xFFFFFFFF) as u32;
+        for (out_idx, &col) in u128_cols.iter().enumerate() {
+            let w0 = (col & 0xFFFFFFFF) as u32;
+            let w1 = ((col >> 32) & 0xFFFFFFFF) as u32;
+            let w2 = ((col >> 64) & 0xFFFFFFFF) as u32;
 
             let idx0 = out_idx;
             let idx1 = out_features + out_idx;

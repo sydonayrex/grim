@@ -60,7 +60,7 @@ impl NoiseScheduler for DdimScheduler {
         latents: &grim_tensor::Tensor,
         timestep: u32,
     ) -> Result<grim_tensor::Tensor> {
-        if !self.timesteps.iter().any(|&t| t == timestep) {
+        if !self.timesteps.contains(&timestep) {
             return Err(Error::Config(format!("DDIM unknown timestep {timestep}")));
         }
         let lshape = latents.shape().dims().to_vec();
@@ -212,8 +212,7 @@ mod tests {
         let lat = tensor_with(vec![1.0f32; 8], vec![2, 4]);
         let n = tensor_with(vec![0.1f32; 8], vec![2, 4]);
         let err = <DdimScheduler as NoiseScheduler>::step(&sched, &n, &lat, 9999)
-            .err()
-            .expect("step should fail on unknown timestep");
+            .expect_err("step should fail on unknown timestep");
         match err {
             Error::Config(_) => {}
             other => panic!("expected Config error, got {:?}", other),
@@ -270,8 +269,7 @@ mod tests {
         let lat = tensor_with(vec![1.0f32; 8], vec![2, 4]);
         let n = tensor_with(vec![0.1f32; 8], vec![2, 4]);
         let err = <EulerScheduler as NoiseScheduler>::step(&sched, &n, &lat, 9999)
-            .err()
-            .expect("step should fail on unknown timestep");
+            .expect_err("step should fail on unknown timestep");
         match err {
             Error::Config(_) => {}
             other => panic!("expected Config error, got {:?}", other),

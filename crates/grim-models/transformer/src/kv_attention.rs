@@ -161,7 +161,6 @@ pub fn cpu() -> Device {
     Device::Cpu
 }
 
-
 #[cfg(test)]
 mod audit_tests {
     use super::*;
@@ -173,8 +172,7 @@ mod audit_tests {
         use grim_tensor::Shape;
         let mut cache = RefKvCache::new();
         // Rank-1 k_new (no row width).
-        let k_bad =
-            cpu_tensor(vec![1.0f32, 2.0], Shape::new(vec![2]));
+        let k_bad = cpu_tensor(vec![1.0f32, 2.0], Shape::new(vec![2]));
         let res = append_and_get(&mut cache, &k_bad, &[1.0, 2.0]);
         assert!(res.is_err(), "rank-1 k_new must error");
 
@@ -185,9 +183,12 @@ mod audit_tests {
 
         // Well-formed call still round-trips.
         // One [1, 2] row appended → one cached token.
-        let (_, _, total) =
-            append_and_get(&mut cache, &cpu_tensor(vec![3.0f32, 4.0], Shape::new(vec![1, 2])), &[3.0, 4.0])
-                .unwrap();
+        let (_, _, total) = append_and_get(
+            &mut cache,
+            &cpu_tensor(vec![3.0f32, 4.0], Shape::new(vec![1, 2])),
+            &[3.0, 4.0],
+        )
+        .unwrap();
         assert_eq!(total, 1);
         assert_eq!(cache.past_len, 1);
     }

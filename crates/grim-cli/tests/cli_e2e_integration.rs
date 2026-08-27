@@ -42,11 +42,13 @@ fn test_template_registry_lookup_and_rendering() {
 
 #[test]
 fn test_doctor_report_suggestions_and_health_checks() {
-    let mut report = DoctorReport::default();
-    report.health_endpoint_ok = Some(true);
-    report.gpu_detected = Some(true);
-    report.gpu_backend_actual = Some("ROCm".to_string());
-    report.plugin_grants_enforced = Some(true);
+    let report = DoctorReport {
+        health_endpoint_ok: Some(true),
+        gpu_detected: Some(true),
+        gpu_backend_actual: Some("ROCm".to_string()),
+        plugin_grants_enforced: Some(true),
+        ..DoctorReport::default()
+    };
 
     assert_eq!(report.health_endpoint_ok, Some(true));
     assert_eq!(report.gpu_detected, Some(true));

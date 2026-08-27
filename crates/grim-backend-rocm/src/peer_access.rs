@@ -4,12 +4,12 @@
 //! RCCL collective, what kind of link do I have here?". The answer is
 //! one of three verdicts:
 //!
-//! - `P2P`         — native peer-class DMA (Instinct xGMI / consumer
-//!                   PCIe with direct path discovered);
-//! - `Pcie`        — peer-enabled but routing through PCIe (consumer
-//!                   RDNA2/3/4 typical);
-//! - `Host`        — peer access disabled or unreachable; the caller
-//!                   must bounce through host pinned memory.
+//! - `P2P` — native peer-class DMA (Instinct xGMI / consumer PCIe with
+//!   direct path discovered);
+//! - `Pcie` — peer-enabled but routing through PCIe (consumer RDNA2/3/4
+//!   typical);
+//! - `Host` — peer access disabled or unreachable; the caller must bounce
+//!   through host pinned memory.
 //!
 //! Skill attribution:
 //! - `rocm-multi-gpu-rccl` — peer probe before any peer memcopy.
@@ -258,7 +258,7 @@ fn is_instinct(arch: &str) -> bool {
 /// Query `hipGetDeviceProperties` and surface the `gcnArchName` string.
 /// Returns the `"gfx9999"` fallback on GPU-less boxes so the verdict
 /// branch isn't forced into `Other` by missing devices.
-unsafe fn gcn_arch_for(device: i32) -> Cow<'static, String> {
+unsafe fn gcn_arch_for(device: i32) -> Cow<'static, str> {
     let mut buf = vec![0u8; 8192];
     let r = unsafe { hipGetDeviceProperties(buf.as_mut_ptr() as *mut c_void, device) };
     if r != hipSuccess || buf.is_empty() {

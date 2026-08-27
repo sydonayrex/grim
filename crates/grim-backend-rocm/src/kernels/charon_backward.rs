@@ -293,7 +293,8 @@ mod tests {
 
     #[test]
     fn validate_backward_inputs_rejects_null_and_bad_geometry() {
-        let p = 0x1 as *mut c_void;
+        // Deliberate dangling (non-null, non-aligned) sentinel pointer.
+        let p = std::ptr::dangling_mut::<c_void>();
         // null pointer
         assert!(
             validate_backward_inputs(std::ptr::null(), p, p, p, p, p, p, p, 4, 4, 4, 4).is_err()

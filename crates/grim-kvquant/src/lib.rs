@@ -12,17 +12,12 @@ pub mod kv_omni;
 pub use kv_omni::{KvOmniConfig, KvOmniEvictor, ModalityPolicy, OmniKvCompressor};
 
 /// Modality tag for KV-cache blocks, used by KV-OMNI routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum KvModality {
+    #[default]
     Text,
     Audio,
     Visual,
-}
-
-impl Default for KvModality {
-    fn default() -> Self {
-        KvModality::Text
-    }
 }
 
 impl KvModality {
@@ -53,12 +48,12 @@ pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
     // Generate random matrix using deterministic LCG
     let mut state = seed;
     let mut random_mat = vec![0.0f32; dim * dim];
-    for i in 0..(dim * dim) {
+    for slot in random_mat.iter_mut() {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let u1 = ((state >> 40) as u32 as f32) / 16777216.0;
         let u2 = (((state & 0xFFFFFFFF) >> 8) as u32 as f32) / 16777216.0;
         // Box-Muller transform
-        random_mat[i] = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * PI * u2).cos();
+        *slot = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * PI * u2).cos();
     }
 
     // Simplified Gram-Schmidt orthogonalization
@@ -164,16 +159,10 @@ impl Default for KvQuantConfig {
 /// The hook currently returns `Err(Unsupported)` because no HIP kernel is
 /// yet wired; it exists as the correct dispatch point for a future kernel
 /// without scattering GPU-device branches through call sites.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct KvDequantAttentionConfig {
     /// `true` = dispatch to GPU path when `device_type != Device::Cpu`.
     pub enabled: bool,
-}
-
-impl Default for KvDequantAttentionConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 /// On-disk KV-block descriptor (WI-R4 bridge).
@@ -646,7 +635,7 @@ impl BitWriter {
 
     /// Approximate bytes reserved for `n_elems` of `bits_per_elem` bits.
     fn capacity_for(n_elems: usize, bits_per_elem: u8) -> usize {
-        (n_elems * bits_per_elem as usize + 7) / 8
+        (n_elems * bits_per_elem as usize).div_ceil(8)
     }
 }
 
@@ -727,7 +716,7 @@ impl KvCompressor for LloydMaxCompressor {
         let mut key_meta: Vec<f32> = Vec::new();
         let key_bits;
         {
-            let bits = self.config.key_bits.max(1).min(8);
+            let bits = self.config.key_bits.clamp(1, 8);
             let levels = (1u32 << bits) as f32; // total codebook size, e.g. 8 for 3-bit
             let _inv_levels = 1.0 / (levels - 1.0).max(1.0);
             let mut writer = BitWriter {
@@ -738,7 +727,7 @@ impl KvCompressor for LloydMaxCompressor {
                 .buf
                 .reserve(BitWriter::capacity_for(k_data.len(), bits) + 4);
 
-            for group_idx in 0..((k_data.len() + group_size - 1) / group_size) {
+            for group_idx in 0..k_data.len().div_ceil(group_size) {
                 let start = group_idx * group_size;
                 let end = (start + group_size).min(k_data.len());
                 let slice = &k_data[start..end];
@@ -756,7 +745,7 @@ impl KvCompressor for LloydMaxCompressor {
                     let n = ((x / std_dev) + 1.0) * 0.5;
                     let n = n.clamp(0.0, 1.0);
                     let q = (n * (levels - 1.0)).round().clamp(0.0, levels - 1.0) as u32;
-                    debug_assert_eq!(q < (1u32 << bits) as u32, true);
+                    debug_assert!(q < (1u32 << bits));
                     let _ = _inv_levels;
                     writer.push(q, bits);
                 }
@@ -770,7 +759,7 @@ impl KvCompressor for LloydMaxCompressor {
         let mut value_meta = Vec::new(); // Pairs of (scale, min)
         let value_bits;
         {
-            let vb_bits = self.config.value_bits.max(1).min(8);
+            let vb_bits = self.config.value_bits.clamp(1, 8);
             let max_q = ((1u32 << vb_bits) - 1).max(1);
             let mut writer = BitWriter {
                 buf: Vec::new(),
@@ -780,7 +769,7 @@ impl KvCompressor for LloydMaxCompressor {
                 .buf
                 .reserve(BitWriter::capacity_for(v_data.len(), vb_bits) + 4);
 
-            for group_idx in 0..((v_data.len() + group_size - 1) / group_size) {
+            for group_idx in 0..v_data.len().div_ceil(group_size) {
                 let start = group_idx * group_size;
                 let end = (start + group_size).min(v_data.len());
                 let slice = &v_data[start..end];
@@ -832,12 +821,12 @@ impl KvCompressor for LloydMaxCompressor {
 
         // 1. Dequantize Keys via symmetric uniform at the same density used
         // during compress.
-        let kb_bits = self.config.key_bits.max(1).min(8);
+        let kb_bits = self.config.key_bits.clamp(1, 8);
         let levels = (1u32 << kb_bits) as f32;
         let denom = (levels - 1.0).max(1.0);
         let mut k_reader = BitReader::new(&block.key_bits);
         let mut k_data = Vec::with_capacity(total_elems);
-        for group_idx in 0..((total_elems + group_size - 1) / group_size) {
+        for group_idx in 0..total_elems.div_ceil(group_size) {
             let start = group_idx * group_size;
             let end = (start + group_size).min(total_elems);
             let std_dev = block.key_meta[group_idx];
@@ -884,10 +873,10 @@ impl KvCompressor for LloydMaxCompressor {
 
         // 2. Dequantize Values via asymmetric uniform at the same density used
         // during compress.
-        let vb_bits = self.config.value_bits.max(1).min(8);
+        let vb_bits = self.config.value_bits.clamp(1, 8);
         let mut v_reader = BitReader::new(&block.value_bits);
         let mut v_data = Vec::with_capacity(total_elems);
-        for group_idx in 0..((total_elems + group_size - 1) / group_size) {
+        for group_idx in 0..total_elems.div_ceil(group_size) {
             let start = group_idx * group_size;
             let end = (start + group_size).min(total_elems);
             let scale = block.value_meta[group_idx * 2];
@@ -983,7 +972,7 @@ impl KvCompressor for LloydMaxCompressor {
                 let mut scores = vec![0.0; block.num_tokens];
                 let mut max_score = f32::NEG_INFINITY;
 
-                for kt in 0..block.num_tokens {
+                for (kt, score_slot) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0;
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
@@ -1001,7 +990,7 @@ impl KvCompressor for LloydMaxCompressor {
                         dot += (q_int8 as f32 / 127.0) * (k_int8 as f32 / 127.0);
                     }
                     let score = dot * scale;
-                    scores[kt] = score;
+                    *score_slot = score;
                     if score > max_score {
                         max_score = score;
                     }
@@ -1009,20 +998,20 @@ impl KvCompressor for LloydMaxCompressor {
 
                 // Softmax
                 let mut sum_exp = 0.0;
-                for kt in 0..block.num_tokens {
-                    scores[kt] = f32::exp(scores[kt] - max_score);
-                    sum_exp += scores[kt];
+                for score in &mut scores {
+                    *score = f32::exp(*score - max_score);
+                    sum_exp += *score;
                 }
-                for kt in 0..block.num_tokens {
-                    scores[kt] /= sum_exp;
+                for score in &mut scores {
+                    *score /= sum_exp;
                 }
 
                 // Weighted sum
                 for d in 0..head_dim {
                     let mut val = 0.0;
-                    for kt in 0..block.num_tokens {
+                    for (kt, &score) in scores.iter().enumerate() {
                         let v_idx = (kt * block.num_kv_heads + kv_h) * head_dim + d;
-                        val += scores[kt] * v_data[v_idx];
+                        val += score * v_data[v_idx];
                     }
                     let out_idx = (t * num_heads + h) * head_dim + d;
                     out_data[out_idx] = val;
@@ -1277,7 +1266,7 @@ impl KvCompressor for IdentityCompressor {
                 let mut scores = vec![0.0; block.num_tokens];
                 let mut max_score = f32::NEG_INFINITY;
 
-                for kt in 0..block.num_tokens {
+                for (kt, score_slot) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0;
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
@@ -1285,7 +1274,7 @@ impl KvCompressor for IdentityCompressor {
                         dot += q_data[q_idx] * k_data[k_idx];
                     }
                     let score = dot * scale;
-                    scores[kt] = score;
+                    *score_slot = score;
                     if score > max_score {
                         max_score = score;
                     }
@@ -1293,20 +1282,20 @@ impl KvCompressor for IdentityCompressor {
 
                 // Softmax
                 let mut sum_exp = 0.0;
-                for kt in 0..block.num_tokens {
-                    scores[kt] = f32::exp(scores[kt] - max_score);
-                    sum_exp += scores[kt];
+                for score in &mut scores {
+                    *score = f32::exp(*score - max_score);
+                    sum_exp += *score;
                 }
-                for kt in 0..block.num_tokens {
-                    scores[kt] /= sum_exp;
+                for score in &mut scores {
+                    *score /= sum_exp;
                 }
 
                 // Weighted sum
                 for d in 0..head_dim {
                     let mut val = 0.0;
-                    for kt in 0..block.num_tokens {
+                    for (kt, &score) in scores.iter().enumerate() {
                         let v_idx = (kt * block.num_kv_heads + kv_h) * head_dim + d;
-                        val += scores[kt] * v_data[v_idx];
+                        val += score * v_data[v_idx];
                     }
                     let out_idx = (t * num_heads + h) * head_dim + d;
                     out_data[out_idx] = val;

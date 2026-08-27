@@ -52,14 +52,12 @@ fn main() -> ExitCode {
     for k in tkeys {
         println!("{k} = {:?}", meta.get(k).unwrap());
     }
-    if let Some(v) = meta.get("tokenizer.chat_template") {
-        if let GgufValue::String(s) = v {
-            std::fs::write("/tmp/minicpm5_chat_template.jinja", s).expect("write template");
-            println!(
-                "\nwrote chat template to /tmp/minicpm5_chat_template.jinja ({} chars)",
-                s.len()
-            );
-        }
+    if let Some(GgufValue::String(s)) = meta.get("tokenizer.chat_template") {
+        std::fs::write("/tmp/minicpm5_chat_template.jinja", s).expect("write template");
+        println!(
+            "\nwrote chat template to /tmp/minicpm5_chat_template.jinja ({} chars)",
+            s.len()
+        );
     }
     println!("\n-- general.* metadata keys --");
     let mut gkeys: Vec<&String> = meta.keys().filter(|k| k.starts_with("general.")).collect();

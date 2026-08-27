@@ -93,9 +93,9 @@ pub fn orpo_odds_ratio_loss(
     Ok(avg_loss)
 }
 
-/// Normalize rollout rewards for Group Relative Policy Optimization (GRPO).
-///
-/// Computes `r_norm_i = (r_i - mean(r)) / (std(r) + eps)` across candidate outputs for a prompt.
+// Normalize rollout rewards for Group Relative Policy Optimization (GRPO).
+//
+// Computes `r_norm_i = (r_i - mean(r)) / (std(r) + eps)` across candidate outputs for a prompt.
 
 /// Compute Kahneman-Tversky Optimization (KTO) loss.
 pub fn kto_loss(

@@ -669,8 +669,6 @@ impl RocmDevice {
                 _ => {
                     if warp_size == 64 && gpu_target.starts_with("gfx9") {
                         WavefrontSize::W64
-                    } else if warp_size == 32 {
-                        WavefrontSize::W32
                     } else {
                         WavefrontSize::W32 // Default RDNA fallback
                     }
@@ -1313,7 +1311,7 @@ impl RocmDevice {
                 got: b_dims.to_vec(),
             });
         }
-        if out_shape.dims() != &[m, n] {
+        if out_shape.dims() != [m, n] {
             return Err(Error::Shape(format!(
                 "expected out [{m},{n}], got {:?}",
                 out_shape.dims()
@@ -1326,7 +1324,7 @@ impl RocmDevice {
         for i in 1..batch {
             let ai = as_rocm(a[i])?;
             let bi = as_rocm(b[i])?;
-            if ai.shape().dims() != &[m, k] || bi.shape().dims() != &[k, n] {
+            if ai.shape().dims() != [m, k] || bi.shape().dims() != [k, n] {
                 return Err(Error::Shape(
                     "matmul_batched: all batch entries must share shape [m,k]/[k,n]".into(),
                 ));
@@ -1338,9 +1336,9 @@ impl RocmDevice {
             }
         }
 
-        let stride_a = (m * k) as usize;
-        let stride_b = (k * n) as usize;
-        let stride_d = (m * n) as usize;
+        let stride_a = m * k;
+        let stride_b = k * n;
+        let stride_d = m * n;
 
         // Pack inputs into contiguous device buffers (device-to-device copies).
         let a_packed = RocmStorage::alloc_gpu(
@@ -2074,8 +2072,8 @@ impl BackendDevice for RocmDevice {
 
         if res != hipSuccess {
             // Free on failure
-            if storage.device_ptr.is_some() {
-                let ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+            if let Some(ptr) = storage.device_ptr {
+                let ptr_void = ptr as *mut c_void;
                 unsafe {
                     _ = hipFree(ptr_void);
                 }
@@ -2242,7 +2240,7 @@ impl BackendDevice for RocmDevice {
             });
         }
 
-        if out_shape.dims() != &[m, n] {
+        if out_shape.dims() != [m, n] {
             return Err(Error::Shape(format!(
                 "expected out [{m},{n}], got {:?}",
                 out_shape.dims()
@@ -3944,10 +3942,8 @@ impl BackendDevice for RocmDevice {
                 // Fused dequant-GEMM over the resident blob; the header
                 // carries n_bit/num_blocks.
                 let hdr = Self::wna16_read_header(b_storage, self.ordinal)?;
-                let mut n_bit_v =
-                    u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as i32;
-                let mut blocks_v =
-                    u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as i32;
+                let mut n_bit_v = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as i32;
+                let mut blocks_v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as i32;
                 self.launch_elementwise_dequant_gemm(
                     "grim_wna16_dequant_gemm",
                     a_storage,
@@ -4599,11 +4595,7 @@ impl BackendDevice for RocmDevice {
                 } else {
                     hidden_dim / num_kv_heads.max(1)
                 };
-                let num_heads = if head_dim > 0 {
-                    hidden_dim / head_dim
-                } else {
-                    1
-                };
+                let num_heads = hidden_dim.checked_div(head_dim).unwrap_or(1);
                 (seq_len, num_heads, head_dim)
             } else {
                 return Err(Error::Shape(
@@ -5252,7 +5244,7 @@ impl BackendDevice for RocmDevice {
             b_s,
             c_s,
             d_s,
-            &state_s,
+            state_s,
             &out_storage,
             batch,
             dim_dstate,
@@ -5652,7 +5644,7 @@ impl BackendDevice for RocmDevice {
             .collect();
 
         let result =
-            crate::kernels::comm_fuse::comm_fuse_fan_in(&slice_refs, m, n_total, &partials[0].1)?;
+            crate::kernels::comm_fuse::comm_fuse_fan_in(&slice_refs, m, n_total, partials[0].1)?;
 
         let out_shape = Shape::from_slice(&[result.shape.0, result.shape.1]);
         let out_storage = self.from_cpu(&result.data, &out_shape, DType::F32)?;
@@ -5995,7 +5987,7 @@ impl RocmDevice {
 
         const BLOCK_SIZE: usize = 256;
         let total_elems = m * n;
-        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let grid_x = (total_elems.div_ceil(BLOCK_SIZE)) as u32;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
 
@@ -6063,14 +6055,14 @@ impl RocmDevice {
 
         let (grid_dim, block_dim) = if is_native_wmma {
             // Native rocWMMA path: 16x16 tile per block, 1 wavefront (32 threads for W32).
-            let grid_x = ((n + 15) / 16) as u32;
-            let grid_y = ((m + 15) / 16) as u32;
+            let grid_x = n.div_ceil(16) as u32;
+            let grid_y = m.div_ceil(16) as u32;
             (HipDim3::new(grid_x, grid_y, 1), HipDim3::new(32, 1, 1))
         } else {
             // Scalar fallback path: 1D grid of 256 threads.
             const BLOCK_SIZE: usize = 256;
             let total_elems = m * n;
-            let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+            let grid_x = (total_elems.div_ceil(BLOCK_SIZE)) as u32;
             (
                 HipDim3::new(grid_x, 1, 1),
                 HipDim3::new(BLOCK_SIZE as u32, 1, 1),
@@ -6134,8 +6126,8 @@ impl RocmDevice {
 
         // 16×16 tiling: one thread per output element, tile = 16 threads
         const TILE: usize = 16;
-        let grid_x = ((n + TILE - 1) / TILE) as u32;
-        let grid_y = ((m + TILE - 1) / TILE) as u32;
+        let grid_x = (n.div_ceil(TILE)) as u32;
+        let grid_y = (m.div_ceil(TILE)) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
         let block_dim = HipDim3::new(TILE as u32, TILE as u32, 1);
 
@@ -6196,7 +6188,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_gemm: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
                 Error::Backend(format!(
@@ -6492,12 +6484,25 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
-        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
-        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
-        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
-        let ascale_r = a_scale_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+        let ascale_r = a_scale_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
 
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.launch_charon_grouped_dispatch_w8a8_int8(
             activations,
             gate_r.device_ptr.unwrap(),
@@ -6529,12 +6534,25 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
-        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
-        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
-        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
-        let ascale_r = a_scale_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+        let ascale_r = a_scale_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
 
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.launch_charon_grouped_dispatch_w8a8_fp8(
             activations,
             gate_r.device_ptr.unwrap(),
@@ -6577,12 +6595,25 @@ impl RocmDevice {
         down_stride: u64,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
-        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
-        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
-        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
-        let ascale_r = a_scale_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+        let ascale_r = a_scale_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
 
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.launch_charon_grouped_dispatch_awq(
             activations,
             gate_r.device_ptr.unwrap(),
@@ -6610,7 +6641,6 @@ impl RocmDevice {
     }
 
     /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
-
     ///
     /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing
     /// layout (`SortedRouting`) produced by `moe_align_block_size` and calls
@@ -7377,10 +7407,9 @@ impl RocmDevice {
         let mut uw = eup_w_ptr;
         let mut dw = edown_w_ptr;
         let mut ascale = a_scale_ptr;
-        let mut optr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("charon_grouped_w8a8_int8: out has no device ptr".into()))?
-            as *mut c_void;
+        let mut optr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_w8a8_int8: out has no device ptr".into())
+        })? as *mut c_void;
         let mut hidden_i = hidden as i32;
         let mut inter_i = inter as i32;
         let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
@@ -7478,10 +7507,9 @@ impl RocmDevice {
         let mut uw = eup_w_ptr;
         let mut dw = edown_w_ptr;
         let mut ascale = a_scale_ptr;
-        let mut optr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("charon_grouped_w8a8_fp8: out has no device ptr".into()))?
-            as *mut c_void;
+        let mut optr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_w8a8_fp8: out has no device ptr".into())
+        })? as *mut c_void;
         let mut hidden_i = hidden as i32;
         let mut inter_i = inter as i32;
         let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
@@ -8606,7 +8634,7 @@ impl RocmDevice {
     ) -> Result<Vec<f32>> {
         // num_experts is derived from the gate-scale layout produced by the test:
         //   gate_scale is [num_experts, inter, hidden/16]  (block_size=16 along hidden)
-        let h16 = (hidden + 15) / 16;
+        let h16 = hidden.div_ceil(16);
         let num_experts = expert_gate_scale.len() / (inter * h16.max(1));
         let block_size = 128usize;
 
@@ -8737,7 +8765,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_backward: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
                 Error::Backend(format!(
@@ -8853,7 +8881,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("madam_update: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
                 Error::Backend(format!(
@@ -8873,11 +8901,11 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
-        let mut lr_f = lr as f32;
-        let mut b1 = beta1 as f32;
-        let mut b2 = beta2 as f32;
-        let mut ep = eps as f32;
-        let mut stp = step as i32;
+        let mut lr_f = lr;
+        let mut b1 = beta1;
+        let mut b2 = beta2;
+        let mut ep = eps;
+        let mut stp = step;
 
         self.launch_compute_kernel(
             "grim_madam_update_f32",
@@ -8926,10 +8954,10 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
-                Error::Backend(format!("fused_dequant_gemm_q4k: grid too large for u32"))
+                Error::Backend("fused_dequant_gemm_q4k: grid too large for u32".to_string())
             })?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
@@ -8984,12 +9012,10 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_backward_q4k: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
-                Error::Backend(format!(
-                    "fused_dequant_backward_q4k: grid too large for u32"
-                ))
+                Error::Backend("fused_dequant_backward_q4k: grid too large for u32".to_string())
             })?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
@@ -9042,7 +9068,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend(format!("{}: m*n overflow", name)))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9092,7 +9118,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend(format!("{}: m*k overflow", name)))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9134,7 +9160,7 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("dequant_q4k: out has no device ptr".into()))?;
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((n_blocks as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((n_blocks as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("dequant_q4k: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9164,7 +9190,7 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("dequant_fp8: out has no device ptr".into()))?;
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((n_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((n_weights as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("dequant_fp8: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9198,7 +9224,7 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("dequant_mxfp4: out has no device ptr".into()))?;
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((n_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((n_weights as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("dequant_mxfp4: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9238,7 +9264,7 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("dequant_mxfp8: out has no device ptr".into()))?;
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((n_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((n_weights as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("dequant_mxfp8: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9336,7 +9362,7 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("wna16 dequant: out has no device ptr".into()))?;
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((num_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((num_weights as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("wna16 dequant: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -9348,7 +9374,6 @@ impl RocmDevice {
         let mut nb = num_blocks;
         self.launch_compute_kernel(
             "grim_dequant_wna16",
-
             grid_dim,
             block_dim,
             &mut [
@@ -9372,13 +9397,15 @@ impl RocmDevice {
     ) -> Result<Box<dyn BackendStorage>> {
         // Header [u32 n_bit][u32 blocks] read via pinned D2H — internal, so
         // callers never touch device_ptr / streams.
-        let packed_rocm = blob.as_any()
+        let packed_rocm = blob
+            .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("wna16 blob not rocm".into()))?;
         let mut pinned = RocmPinnedBuffer::<u8>::alloc(8)?;
         {
             let _g = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            let src_ptr = packed_rocm.device_ptr
+            let src_ptr = packed_rocm
+                .device_ptr
                 .ok_or_else(|| Error::Backend("wna16 blob has no device ptr".into()))?;
             check_hip("wna16 head D2H", unsafe {
                 hipMemcpyAsync(
@@ -9393,8 +9420,7 @@ impl RocmDevice {
                 hipStreamSynchronize(self.active_stream())
             })?;
         }
-        let head: Vec<u8> =
-            unsafe { std::slice::from_raw_parts(pinned.as_ptr(), 8).to_vec() };
+        let head: Vec<u8> = unsafe { std::slice::from_raw_parts(pinned.as_ptr(), 8).to_vec() };
         let n_bit = u32::from_le_bytes(head[0..4].try_into().unwrap()) as u8;
         let num_blocks = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
         self.dequant_wna16_to_f32(packed_rocm, num_weights, n_bit, num_blocks)
@@ -9417,13 +9443,8 @@ impl RocmDevice {
             &self.allocator,
             self.ordinal,
         )?;
-        let _h = self.launch_dequant_wna16(
-            packed,
-            &out,
-            num_weights,
-            n_bit as i32,
-            num_blocks as i32,
-        )?;
+        let _h =
+            self.launch_dequant_wna16(packed, &out, num_weights, n_bit as i32, num_blocks as i32)?;
         let stream = self.active_stream();
         check_hip("hipStreamSynchronize(wna16 dequant)", unsafe {
             crate::device::handles::hipStreamSynchronize(stream)
@@ -9440,22 +9461,16 @@ impl RocmDevice {
         embedding_dim: i32,
         tensor_scale: f32,
     ) -> Result<*mut c_void> {
-        let packed_ptr = packed_storage
-            .device_ptr
-            .ok_or_else(|| {
-                Error::Backend("emb_wna16_int dequant: packed has no device ptr".into())
-            })?;
+        let packed_ptr = packed_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("emb_wna16_int dequant: packed has no device ptr".into())
+        })?;
         let out_ptr = out_storage
             .device_ptr
-            .ok_or_else(|| {
-                Error::Backend("emb_wna16_int dequant: out has no device ptr".into())
-            })?;
+            .ok_or_else(|| Error::Backend("emb_wna16_int dequant: out has no device ptr".into()))?;
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((total_elements as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((total_elements as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
-            .map_err(|_| {
-                Error::Backend("emb_wna16_int dequant: grid overflow".into())
-            })?;
+            .map_err(|_| Error::Backend("emb_wna16_int dequant: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
         let mut packed = packed_ptr;
@@ -10240,7 +10255,7 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("dequant_q8_0: out has no device ptr".into()))?;
 
         const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((n_blocks as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = ((n_blocks as u64).div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("dequant_q8_0: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -10282,10 +10297,10 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_gemm_fp8: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
-                Error::Backend(format!("fused_dequant_gemm_fp8: grid too large for u32"))
+                Error::Backend("fused_dequant_gemm_fp8: grid too large for u32".to_string())
             })?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
@@ -10336,12 +10351,10 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_backward_fp8: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
-                Error::Backend(format!(
-                    "fused_dequant_backward_fp8: grid too large for u32"
-                ))
+                Error::Backend("fused_dequant_backward_fp8: grid too large for u32".to_string())
             })?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
@@ -10391,10 +10404,10 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp4: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
-                Error::Backend(format!("fused_dequant_gemm_mxfp4: grid too large for u32"))
+                Error::Backend("fused_dequant_gemm_mxfp4: grid too large for u32".to_string())
             })?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
@@ -10451,10 +10464,10 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp8: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| {
-                Error::Backend(format!("fused_dequant_gemm_mxfp8: grid too large for u32"))
+                Error::Backend("fused_dequant_gemm_mxfp8: grid too large for u32".to_string())
             })?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
@@ -10527,8 +10540,8 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: out has no device ptr".into()))?;
 
         let block_dim = HipDim3::new(16, 16, 1);
-        let grid_x = ((n + 15) / 16) as u32;
-        let grid_y = ((m + 15) / 16) as u32;
+        let grid_x = n.div_ceil(16) as u32;
+        let grid_y = m.div_ceil(16) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
 
         let mut aptr = a_ptr;
@@ -10593,11 +10606,7 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("mxfp4_gemm_splitk: partials alloc failed".into()))?;
 
         const SPLITK_BLOCK: usize = 64;
-        let grid_dim = HipDim3::new(
-            ((n + SPLITK_BLOCK - 1) / SPLITK_BLOCK) as u32,
-            m as u32,
-            num_splits,
-        );
+        let grid_dim = HipDim3::new((n.div_ceil(SPLITK_BLOCK)) as u32, m as u32, num_splits);
         let block_dim = HipDim3::new(SPLITK_BLOCK as u32, 1, 1);
 
         let mut aptr = a_ptr;
@@ -10627,7 +10636,7 @@ impl RocmDevice {
 
         const REDUCE_BLOCK: usize = 256;
         let total = m * n;
-        let reduce_grid = HipDim3::new(((total + REDUCE_BLOCK - 1) / REDUCE_BLOCK) as u32, 1, 1);
+        let reduce_grid = HipDim3::new((total.div_ceil(REDUCE_BLOCK)) as u32, 1, 1);
         let reduce_block = HipDim3::new(REDUCE_BLOCK as u32, 1, 1);
 
         let mut optr = out_ptr;
@@ -10674,8 +10683,8 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dx has no device ptr".into()))?;
 
         let block_dim = HipDim3::new(16, 16, 1);
-        let grid_x = ((k + 15) / 16) as u32;
-        let grid_y = ((m + 15) / 16) as u32;
+        let grid_x = k.div_ceil(16) as u32;
+        let grid_y = m.div_ceil(16) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
 
         let mut dyptr = dy_ptr;
@@ -10732,7 +10741,7 @@ impl RocmDevice {
         })?;
 
         let block_dim = HipDim3::new(64, 1, 1);
-        let grid_dim = HipDim3::new(m as u32, ((n + 63) / 64) as u32, 1);
+        let grid_dim = HipDim3::new(m as u32, n.div_ceil(64) as u32, 1);
 
         let mut xptr = x_ptr;
         let mut gammaptr = gamma_ptr;
@@ -10810,7 +10819,7 @@ impl RocmDevice {
 
         let n_total = (num_q_heads + 2 * num_kv_heads) * head_dim;
         let block_dim = HipDim3::new(64, 1, 1);
-        let grid_dim = HipDim3::new(m as u32, ((n_total + 63) / 64) as u32, 1);
+        let grid_dim = HipDim3::new(m as u32, n_total.div_ceil(64) as u32, 1);
 
         let mut xptr = x_ptr;
         let mut gammaptr = gamma_ptr;
@@ -11460,7 +11469,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("gptq gemm: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("gptq gemm: grid too large for u32".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -11549,7 +11558,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("gptq backward: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("gptq backward: grid too large for u32".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -11705,7 +11714,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("awq gemm: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("awq gemm: grid too large for u32".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -11787,7 +11796,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("awq backward: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("awq backward: grid too large for u32".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -11907,14 +11916,16 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("marlin_w4a16: out has no device ptr".into()))?;
-        if blob_storage.bytes() < codes_bytes + n * (k.div_ceil(group_size)) * std::mem::size_of::<f32>() {
+        if blob_storage.bytes()
+            < codes_bytes + n * (k.div_ceil(group_size)) * std::mem::size_of::<f32>()
+        {
             return Err(Error::Backend(
                 "marlin_w4a16: blob smaller than codes+scales segments".into(),
             ));
         }
 
         let block_dim = HipDim3::new(16, 16, 1);
-        let grid_dim = HipDim3::new(((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+        let grid_dim = HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
 
         // Kernel contract: A row-major [M, K] f32; C [M, N] f32.
         let mut aptr = a_ptr;
@@ -11956,16 +11967,22 @@ impl RocmDevice {
         k: usize,
         extra_args: &mut [*mut c_void],
     ) -> Result<()> {
-        let mut aptr = a.device_ptr
-            .ok_or_else(|| Error::Backend("dequant gemm: a has no device ptr".into()))? as *mut c_void;
-        let mut bptr = blob.device_ptr
-            .ok_or_else(|| Error::Backend("dequant gemm: blob has no device ptr".into()))? as *mut c_void;
-        let mut optr = out.device_ptr
-            .ok_or_else(|| Error::Backend("dequant gemm: out has no device ptr".into()))? as *mut c_void;
+        let mut aptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm: a has no device ptr".into()))?
+            as *mut c_void;
+        let mut bptr = blob
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm: blob has no device ptr".into()))?
+            as *mut c_void;
+        let mut optr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm: out has no device ptr".into()))?
+            as *mut c_void;
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
-        let grid_x = ((m * n + 255) / 256) as u32;
+        let grid_x = (m * n).div_ceil(256) as u32;
         let mut args: Vec<*mut c_void> = vec![
             arg(&mut aptr),
             arg(&mut bptr),
@@ -11997,16 +12014,22 @@ impl RocmDevice {
         k: usize,
         extra_args: &mut [*mut c_void],
     ) -> Result<()> {
-        let mut dyptr = dy.device_ptr
-            .ok_or_else(|| Error::Backend("dequant gemm backward: dY has no device ptr".into()))? as *mut c_void;
-        let mut bptr = blob.device_ptr
-            .ok_or_else(|| Error::Backend("dequant gemm backward: blob has no device ptr".into()))? as *mut c_void;
-        let mut dxptr = dx.device_ptr
-            .ok_or_else(|| Error::Backend("dequant gemm backward: dX has no device ptr".into()))? as *mut c_void;
+        let mut dyptr = dy
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm backward: dY has no device ptr".into()))?
+            as *mut c_void;
+        let mut bptr = blob
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm backward: blob has no device ptr".into()))?
+            as *mut c_void;
+        let mut dxptr = dx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm backward: dX has no device ptr".into()))?
+            as *mut c_void;
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
-        let grid_x = ((m * k + 255) / 256) as u32;
+        let grid_x = (m * k).div_ceil(256) as u32;
         let mut args: Vec<*mut c_void> = vec![
             arg(&mut dyptr),
             arg(&mut bptr),
@@ -12030,7 +12053,8 @@ impl RocmDevice {
         let dev = RocmDevice::try_new(ordinal)?;
         let mut pinned = RocmPinnedBuffer::<u8>::alloc(8)?;
         let _g = crate::device::util::DeviceGuard::set(ordinal as i32);
-        let ptr = blob.device_ptr
+        let ptr = blob
+            .device_ptr
             .ok_or_else(|| Error::Backend("wna16 header: no device ptr".into()))?;
         check_hip("wna16 header D2H", unsafe {
             hipMemcpyAsync(
@@ -12081,8 +12105,8 @@ impl RocmDevice {
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("identity not rocm".into()))?;
-        let _h =
-            self.launch_marlin_gemm_w4a16_blob(a_rocm, blob, &out, k_dim, n_rows, k_dim, group_size)?;
+        let _h = self
+            .launch_marlin_gemm_w4a16_blob(a_rocm, blob, &out, k_dim, n_rows, k_dim, group_size)?;
         Ok(Box::new(out))
     }
 
@@ -12146,7 +12170,7 @@ impl RocmDevice {
         let mut qz_i = qz;
         let mut sc_i = sc;
         let mut gi_i = gi;
-        let grid_x = ((n_out * n_out + 255) / 256) as u32;
+        let grid_x = (n_out * n_out).div_ceil(256) as u32;
         self.launch_compute_kernel(
             "grim_gptq_dequant_gemm",
             HipDim3::new(grid_x, 1, 1),
@@ -12170,7 +12194,6 @@ impl RocmDevice {
         )?;
         Ok(Box::new(out))
     }
-
 
     /// Launch Marlin-style Interleaved W4A16 GEMM.
     pub fn launch_marlin_gemm_w4a16(
@@ -12198,7 +12221,7 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("marlin_gemm: out has no device ptr".into()))?;
 
         let block_dim = HipDim3::new(16, 16, 1);
-        let grid_dim = HipDim3::new(((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+        let grid_dim = HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
 
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
@@ -12259,7 +12282,7 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("bitnet_gemm: out has no device ptr".into()))?;
 
         let block_dim = HipDim3::new(16, 16, 1);
-        let grid_dim = HipDim3::new(((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+        let grid_dim = HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
 
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
@@ -12767,7 +12790,7 @@ impl RocmDevice {
 
         const BLOCK_SIZE: usize = 256;
         let total_elems = m * n;
-        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let grid_x = (total_elems.div_ceil(BLOCK_SIZE)) as u32;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
 
@@ -12891,8 +12914,8 @@ impl RocmDevice {
             let _ = hipEventRecord(start_event, std::ptr::null_mut());
 
             let grid = HipDim3::new(
-                (dims.m + cand.grid_stride_m - 1) / cand.grid_stride_m,
-                (dims.n + cand.grid_stride_n - 1) / cand.grid_stride_n,
+                dims.m.div_ceil(cand.grid_stride_m),
+                dims.n.div_ceil(cand.grid_stride_n),
                 1,
             );
             let block = HipDim3::new(cand.threads, 1, 1);
@@ -14424,7 +14447,7 @@ impl RocmDevice {
         out: &RocmStorage,
         total: usize,
     ) -> Result<*mut c_void> {
-        let n_blocks = (total + 31) / 32;
+        let n_blocks = total.div_ceil(32);
         let grid = crate::HipDim3 {
             x: n_blocks as u32,
             y: 1,
@@ -14479,7 +14502,7 @@ impl RocmDevice {
         use grim_tensor::{FloatPackScheme, KQuantScheme, QuantFormat};
         let (out_bytes, output_dtype) = match format {
             QuantFormat::Q8_0 => {
-                let n_blocks = (total + 31) / 32;
+                let n_blocks = total.div_ceil(32);
                 (
                     n_blocks * 34,
                     DType {
@@ -14637,7 +14660,7 @@ impl RocmDevice {
         let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
         let inv_sqrt_d_stable = inv_sqrt_d_ptr;
         let quant_bits_i = quant_bits as i32;
-        let quant_format_i = config.quant_format.kernel_arg() as i32;
+        let quant_format_i = config.quant_format.kernel_arg();
 
         let mut qp = q_ptr;
         let mut kp = k_ptr;
@@ -14750,8 +14773,7 @@ impl RocmDevice {
         let mut total_loss = 0.0f32;
         let inv_batch = 1.0 / (batch_size as f32);
 
-        for b in 0..batch_size {
-            let target_token = targets[b];
+        for (b, &target_token) in targets.iter().enumerate() {
             if target_token >= vocab_size {
                 return Err(Error::Backend(format!(
                     "cross_entropy_gpu: target token {} out of bounds for vocab_size {}",
@@ -14913,7 +14935,7 @@ impl RocmDevice {
         let mut ksl_i = kv_seq_len as i32;
         let mut sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-        let grid = HipDim3::new(num_heads as u32, ((seq_len + 127) / 128) as u32, 1);
+        let grid = HipDim3::new(num_heads as u32, seq_len.div_ceil(128) as u32, 1);
         let block = HipDim3::new(128, 1, 1);
 
         self.launch_compute_kernel(
@@ -15205,7 +15227,7 @@ impl RocmDevice {
         let total_elems: u64 = (batch as u64)
             .checked_mul(dim_dinner as u64)
             .ok_or_else(|| Error::Backend("selective_scan: batch*dim_dinner overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("selective_scan: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -15362,7 +15384,7 @@ impl RocmDevice {
         let total_elems: u64 = (batch as u64)
             .checked_mul(dim as u64)
             .ok_or_else(|| Error::Backend("rwkv_time_mix: batch*dim overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("rwkv_time_mix: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -15427,7 +15449,7 @@ impl RocmDevice {
         let total_elems: u64 = (batch as u64)
             .checked_mul(dim as u64)
             .ok_or_else(|| Error::Backend("rwkv_channel_mix: batch*dim overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("rwkv_channel_mix: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -15483,7 +15505,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(n as u64)
             .ok_or_else(|| Error::Backend("fp8_mfma: m*n overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("fp8_mfma: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -15535,7 +15557,7 @@ impl RocmDevice {
         let total_elems: u64 = (m as u64)
             .checked_mul(k as u64)
             .ok_or_else(|| Error::Backend("fp8_mfma_bwd: m*k overflow".into()))?;
-        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("fp8_mfma_bwd: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);

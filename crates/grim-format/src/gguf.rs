@@ -377,7 +377,7 @@ pub struct GgufFile {
 // ---------------------------------------------------------------------------
 
 /// AMD GCN architecture identifiers for ROCm profile hints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrimRocmlProfile {
     /// CDNA2 compute (MI210, MI250)
     Cdna2,
@@ -392,17 +392,12 @@ pub enum GrimRocmlProfile {
     /// All supported architectures (no specialization)
     All,
     /// Unknown — no ROCm-specific optimization hints
+    #[default]
     Unknown,
 }
 
-impl Default for GrimRocmlProfile {
-    fn default() -> Self {
-        GrimRocmlProfile::Unknown
-    }
-}
-
 impl GrimRocmlProfile {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "cdna2" => GrimRocmlProfile::Cdna2,
             "cdna3" | "mi300x" => GrimRocmlProfile::Cdna3,
@@ -469,7 +464,7 @@ pub enum GrimTrainQuantMode {
 }
 
 impl GrimTrainQuantMode {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "fp4" => Some(Self::Fp4),
             "nf4" => Some(Self::Nf4),
@@ -496,7 +491,7 @@ pub enum GrimFusionOp {
 }
 
 impl GrimFusionOp {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "rmsnorm_matmul" => Some(Self::RmsNormMatMul),
             "qkv_attention" => Some(Self::QkvAttention),
@@ -740,10 +735,8 @@ fn gguf_value_from_json(v: &serde_json::Value) -> Option<GgufValue> {
                     return Some(GgufValue::Int32(i as i32));
                 }
                 Some(GgufValue::Int64(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(GgufValue::Float64(f))
             } else {
-                None
+                n.as_f64().map(GgufValue::Float64)
             }
         }
         serde_json::Value::Array(arr) => {
@@ -771,7 +764,7 @@ impl GrimMetadata {
         let quant_version = metadata.get("grim.quant_version").and_then(|v| v.as_u32());
         let rocml_profile_str = metadata.get("grim.rocml.profile").and_then(|v| v.as_str());
         let profile = rocml_profile_str
-            .map(GrimRocmlProfile::from_str)
+            .map(GrimRocmlProfile::parse)
             .unwrap_or_default();
         let wavefront_size = metadata
             .get("grim.rocml.wavefront_size")
@@ -802,12 +795,12 @@ impl GrimMetadata {
             .map(String::from);
         let quant_overrides = metadata
             .get("grim.quant_overrides")
-            .and_then(|v| read_grim_quant_overrides(v))
+            .and_then(read_grim_quant_overrides)
             .unwrap_or_default();
         let train_quant_mode = metadata
             .get("grim.train.quant_mode")
             .and_then(|v| v.as_str())
-            .and_then(GrimTrainQuantMode::from_str);
+            .and_then(GrimTrainQuantMode::parse);
         let train_fusion_ops = metadata
             .get("grim.train.fusion_ops")
             .and_then(read_grim_fusion_ops)
@@ -1230,7 +1223,7 @@ impl GrimMetadata {
         let profile = obj
             .get("rocml_profile")
             .and_then(|v| v.as_str())
-            .map(GrimRocmlProfile::from_str)
+            .map(GrimRocmlProfile::parse)
             .unwrap_or_default();
         let wavefront_size = obj
             .get("wavefront_size")
@@ -1269,14 +1262,14 @@ impl GrimMetadata {
         let train_quant_mode = obj
             .get("train_quant_mode")
             .and_then(|v| v.as_str())
-            .and_then(GrimTrainQuantMode::from_str);
+            .and_then(GrimTrainQuantMode::parse);
         let train_fusion_ops = obj
             .get("train_fusion_ops")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .filter_map(GrimFusionOp::from_str)
+                    .filter_map(GrimFusionOp::parse)
                     .collect()
             })
             .unwrap_or_default();
@@ -1286,7 +1279,7 @@ impl GrimMetadata {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .filter_map(GrimFusionOp::from_str)
+                    .filter_map(GrimFusionOp::parse)
                     .collect()
             })
             .unwrap_or_default();
@@ -1505,7 +1498,7 @@ fn read_grim_fusion_ops(value: &GgufValue) -> Option<Vec<GrimFusionOp>> {
         values
             .iter()
             .filter_map(|v| v.as_str())
-            .filter_map(GrimFusionOp::from_str)
+            .filter_map(GrimFusionOp::parse)
             .collect(),
     )
 }
@@ -1693,8 +1686,7 @@ fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
-    Ok(String::from_utf8(buf)
-        .map_err(|e| Error::Backend(format!("GGUF string not valid UTF-8: {e}")))?)
+    String::from_utf8(buf).map_err(|e| Error::Backend(format!("GGUF string not valid UTF-8: {e}")))
 }
 
 fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
@@ -2142,12 +2134,9 @@ mod tests {
     /// exactly like its RDNA3/RDNA4 siblings.
     #[test]
     fn rocml_profile_rdna2_parses_aliases_and_round_trips() {
-        assert_eq!(GrimRocmlProfile::from_str("rdna2"), GrimRocmlProfile::Rdna2);
-        assert_eq!(
-            GrimRocmlProfile::from_str("gfx1036"),
-            GrimRocmlProfile::Rdna2
-        );
-        assert_eq!(GrimRocmlProfile::from_str("RDNA2"), GrimRocmlProfile::Rdna2);
+        assert_eq!(GrimRocmlProfile::parse("rdna2"), GrimRocmlProfile::Rdna2);
+        assert_eq!(GrimRocmlProfile::parse("gfx1036"), GrimRocmlProfile::Rdna2);
+        assert_eq!(GrimRocmlProfile::parse("RDNA2"), GrimRocmlProfile::Rdna2);
         assert_eq!(GrimRocmlProfile::Rdna2.wavefront_size(), 64);
         assert_eq!(GrimRocmlProfile::Rdna2.lds_size(), 32768);
 
@@ -2336,14 +2325,14 @@ mod tests {
                 assert_eq!(inner1[0], GgufValue::Uint32(1));
                 assert_eq!(inner1[1], GgufValue::Uint32(2));
             } else {
-                panic!("expected inner array at index 0, got {:?}", &outer[0]);
+                panic!("expected inner array at index 0, got {:?}", outer[0]);
             }
             if let GgufValue::Array(inner2) = &outer[1] {
                 assert_eq!(inner2.len(), 2);
                 assert_eq!(inner2[0], GgufValue::Uint32(3));
                 assert_eq!(inner2[1], GgufValue::Uint32(4));
             } else {
-                panic!("expected inner array at index 1, got {:?}", &outer[1]);
+                panic!("expected inner array at index 1, got {:?}", outer[1]);
             }
         } else {
             panic!("expected outer array, got {:?}", value);

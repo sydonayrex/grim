@@ -163,7 +163,7 @@ fn q4k_golden_cross_byte_scale_min_subblock_offset() {
     // Sanity: an earlier sub-block (iter k=0, is=0 low branch) using sc0=1,m0=0,
     // d=1.0. Put a nibble there too so the low-branch path is also exercised
     // and a mutant that only handles j>=4 still gets caught on the j<4 side.
-    buf[16] = 4 | (0 << 4); // lo nibble 4, hi nibble 0 -> out[0]=1.0*4 - 0.0
+    buf[16] = 4; // lo nibble 4, hi nibble 0 -> out[0]=1.0*4 - 0.0
     let out2 = dequant_q4k(&buf, 256).expect("q4k re-dequant");
     assert_close(out2[0], 1.0 * 4.0, "q4k low-branch sc0/m0 lo weight");
     // The cross-byte weight must remain stable across the rebuild.
@@ -308,17 +308,17 @@ fn fp8_e4m3_golden_normalized_and_subnormal() {
     buf[0..4].copy_from_slice(&1.0f32.to_le_bytes());
 
     // byte 0: sign0 | exp=7  | mant=0  -> (0/8+1)*2^0 = 1.0
-    buf[4] = 0b0_0111_000;
+    buf[4] = 0b00111000;
     // byte 1: sign0 | exp=8  | mant=0  -> (0/8+1)*2^1 = 2.0
-    buf[5] = 0b0_1000_000;
+    buf[5] = 0b01000000;
     // byte 2: sign0 | exp=6  | mant=4  -> (4/8+1)*2^-1 = 1.5*0.5 = 0.75
-    buf[6] = 0b0_0110_100;
+    buf[6] = 0b00110100;
     // byte 3: sign1 | exp=7  | mant=0  -> -(1.0)
-    buf[7] = 0b1_0111_000;
+    buf[7] = 0b10111000;
     // byte 4: subnormal exp=0 mant=1   -> value = mant/512 = 1.0/512
-    buf[8] = 0b0_0000_001;
+    buf[8] = 0b00000001;
     // byte 5: subnormal exp=0 mant=3 sign1 -> -3/512
-    buf[9] = 0b1_0000_011;
+    buf[9] = 0b10000011;
 
     let out = dequant_fp8(&buf, 6).expect("fp8 dequant");
     assert_eq!(out.len(), 6);
@@ -384,7 +384,7 @@ fn f16_to_f32_via_q80_zero_normalized_subnormal() {
     // the standard subnormal decode is mant * 2^(1-14-10) = mant * 2^-24.
     {
         let out = block_with_scale_and_unit_codes(0x0200);
-        let want = (512u32 as f32) * 2f32.powi(-24);
+        let want = 512_f32 * 2f32.powi(-24);
         for (i, v) in out.iter().enumerate() {
             assert_close(*v, want, &format!("f16 subnormal 0x0200 at {i}"));
         }

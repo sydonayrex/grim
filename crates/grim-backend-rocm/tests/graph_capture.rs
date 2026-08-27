@@ -39,16 +39,17 @@ fn gpu_device() -> Option<RocmDevice> {
         return None;
     }
     unsafe { std::env::set_var("GRIM_CAPTURE_GRAPH", "1") };
-    match std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(|| {
         RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
-    }) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    })
+    .ok()
 }
 
 /// Upload inputs to the device. Synchronous `hipMemcpy` is ILLEGAL inside a
 /// capture region, so this must run OUTSIDE `begin_graph_capture`.
+// Argument list mirrors the kernel's launch parameters one-to-one, and the
+// storage-tuple return is the shared test-fixture shape used by upload/run.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn upload_inputs(
     dev: &RocmDevice,
     a: &[f32],
@@ -76,6 +77,8 @@ fn upload_inputs(
 
 /// Run `matmul -> add -> rms_norm` on already-uploaded inputs. Capture-safe:
 /// no host-synchronous copies are issued here.
+// The inputs tuple is the shared test-fixture shape produced by upload_inputs.
+#[allow(clippy::type_complexity)]
 fn run_compute(
     dev: &RocmDevice,
     inputs: &(
@@ -98,6 +101,9 @@ fn run_compute(
 
 /// Run the op sequence eagerly (inputs uploaded, compute outside capture)
 /// and return the flattened f32 output.
+// Argument list mirrors the kernel's launch parameters one-to-one, and the
+// inputs tuple is the shared test-fixture shape produced by upload_inputs.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_seq(
     dev: &RocmDevice,
     a: &[f32],
@@ -109,7 +115,7 @@ fn run_seq(
     n: usize,
 ) -> TestResult<Vec<f32>> {
     let inputs = upload_inputs(dev, a, b, c, w, m, k, n)?;
-    let out = run_compute(&dev, &inputs, m, k, n)?;
+    let out = run_compute(dev, &inputs, m, k, n)?;
     Ok(out.to_cpu_vec_f32()?)
 }
 

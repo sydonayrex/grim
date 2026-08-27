@@ -78,32 +78,28 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
         // Load based on plugin kind
         match manifest.kind {
             PluginKind::Wasm => {
-                match resolve_entry(&plugin_subdir, &manifest.entry).and_then(|p| {
+                let wasm_path = resolve_entry(&plugin_subdir, &manifest.entry).and_then(|p| {
                     verify_entry_digest(&p, manifest.sha256.as_deref())?;
                     Ok(p)
-                }) {
-                    Ok(wasm_path) => {
-                        let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
-                            grim_tensor::Error::Backend(format!("Failed to read WASM: {e}"))
-                        })?;
-                        let limits = manifest.limits.clone().unwrap_or_default();
-                        let loader = WasmPluginLoader::new(&manifest.name, limits);
+                })?;
+                let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
+                    grim_tensor::Error::Backend(format!("Failed to read WASM: {e}"))
+                })?;
+                let limits = manifest.limits.clone().unwrap_or_default();
+                let loader = WasmPluginLoader::new(&manifest.name, limits);
 
-                        match loader.create_sampler(&wasm_bytes) {
-                            Ok(sampler) => {
-                                registry.register_sampler(manifest.name.clone(), sampler);
-                                let _ = registry.register_manifest(manifest);
-                                count += 1;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: Failed to load WASM plugin '{}': {}",
-                                    manifest.name, e
-                                );
-                            }
-                        }
+                match loader.create_sampler(&wasm_bytes) {
+                    Ok(sampler) => {
+                        registry.register_sampler(manifest.name.clone(), sampler);
+                        let _ = registry.register_manifest(manifest);
+                        count += 1;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to load WASM plugin '{}': {}",
+                            manifest.name, e
+                        );
+                    }
                 }
             }
             PluginKind::Dylib => {

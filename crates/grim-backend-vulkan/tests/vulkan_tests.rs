@@ -116,7 +116,7 @@ fn test_vulkan_all_reduce_parity() {
     let dev = VulkanDevice::new();
 
     let shape = Shape::new(vec![8]);
-    let inputs_data = vec![
+    let inputs_data = [
         vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
         vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],

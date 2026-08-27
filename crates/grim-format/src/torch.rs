@@ -40,9 +40,9 @@ pub struct PthProvider {
 impl PthProvider {
     /// Load a PyTorch `.pth` or `.pt` checkpoint from a filesystem path.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path).map_err(|e| Error::Io(e))?;
+        let mut file = File::open(path).map_err(Error::Io)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|e| Error::Io(e))?;
+        file.read_to_end(&mut bytes).map_err(Error::Io)?;
         Self::load_from_bytes(&bytes)
     }
 
@@ -250,7 +250,7 @@ fn find_u32_le(bytes: &[u8], sig: u32) -> Option<usize> {
     let start = bytes.len().saturating_sub(66_000);
     let mut i = bytes.len() - 4;
     loop {
-        if &bytes[i..i + 4] == pat {
+        if bytes[i..i + 4] == pat {
             return Some(i);
         }
         if i == 0 || i < start {

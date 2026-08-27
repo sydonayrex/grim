@@ -308,7 +308,7 @@ impl Kokoro {
             curr_channels = out_channels;
         }
 
-        let w_post = (0..1 * curr_channels * 7)
+        let w_post = (0..curr_channels * 7)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
         let conv_post = Conv1d::new(

@@ -72,9 +72,12 @@ struct CacheEntry {
     latency_ms: f64,
 }
 
-#[derive(Debug)]
+type MetalAutotuneCache =
+    Mutex<HashMap<(u64, usize, usize, usize, ShapeClass), (MetalTileConfig, f64)>>;
+
+#[derive(Debug, Default)]
 pub struct MetalAutotuner {
-    cache: Mutex<HashMap<(u64, usize, usize, usize, ShapeClass), (MetalTileConfig, f64)>>,
+    cache: MetalAutotuneCache,
 }
 
 impl MetalAutotuner {

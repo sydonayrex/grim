@@ -236,6 +236,10 @@ impl TraceTable {
     }
 
     /// Total rows stored (including ineligible, for diagnostics).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -319,9 +323,10 @@ pub struct SampleRecord {
 /// Shared sink for per-candidate sample logging. Dispatch-site `BenchFn` closures receive
 /// one of these and call `log_candidate` for every measured candidate.
 ///
-/// Construct once per autotune session at the dispatch site (i.e. where `Autotuner::for_device`
-/// + `BenchFn` are assembled), and pass the same `SampleLogger` into every closure so all
-/// candidates across all shapes funnel into the same `{gpu_arch}_samples.jsonl`.
+/// Construct once per autotune session at the dispatch site (i.e. where the
+/// `Autotuner::for_device` and `BenchFn` pair is assembled), and pass the same `SampleLogger`
+/// into every closure so all candidates across all shapes funnel into the same
+/// `{gpu_arch}_samples.jsonl`.
 ///
 /// File is opened/closed per write (append mode) so a crash never loses the in-memory records
 /// already flushed; a streaming buffered writer would be a later optimization if the volume
@@ -334,6 +339,9 @@ pub struct SampleLogger {
 
 impl SampleLogger {
     /// Path that this logger writes to: `{cache_dir}/{gpu_arch}_samples.jsonl`.
+    // Returns the derived log path on purpose, not `Self` — callers need the path
+    // before a logger bound to it can be constructed.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(cache_dir: &Path, gpu_arch: &str) -> PathBuf {
         let p = cache_dir.join(format!("{gpu_arch}_samples.jsonl"));
         if let Some(parent) = p.parent() {
@@ -456,7 +464,7 @@ impl SampleLogger {
     {
         BenchLogged {
             logger: self,
-            kernel: kernel,
+            kernel,
             m_class,
             format,
             grid_x,
@@ -598,13 +606,7 @@ impl LatencyPredictor {
             .collect();
         let valid: Vec<(AutotuneConfig, f32)> = preds
             .iter()
-            .filter_map(|(c, p)| {
-                if let Some(v) = p {
-                    Some((c.clone(), *v))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(c, p)| p.map(|v| (*c, v)))
             .collect();
         if valid.is_empty() {
             // No prediction data — fall back to full bench.
@@ -1170,7 +1172,7 @@ mod tests {
          -> Result<(AutotuneConfig, u64)> {
             Ok((
                 AutotuneConfig {
-                    block_dim: grid_x as u32 * block_x,
+                    block_dim: grid_x * block_x,
                     tile_kv: 64,
                     grid_stride: 1,
                     cycles_per_invocation: 0,
@@ -1230,7 +1232,6 @@ mod tests {
         );
         // Must not panic. We can't easily assert the warn (no log capture here),
         // but the function must return.
-        assert!(true);
         // Teardown: remove the blocked subdir so the parent dir can be removed.
         std::fs::remove_dir_all(&subdir).ok();
         std::fs::remove_dir(&dir).ok();
@@ -1379,7 +1380,7 @@ mod tests {
         // When both candidates have the same predicted latency (same mean trace),
         // both should survive with factor 1.5 (since norm ≈ 128/128 = 1.0 for cfg_good,
         // and 64/128 = 0.5 for cfg_poor — so cfg_poor predicts lower latency).
-        let cfgs = vec![cfg_good.clone(), cfg_poor.clone()];
+        let cfgs = vec![cfg_good, cfg_poor];
         let shortlist = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, cfgs);
         // With a 1.5x factor, both survive since they're close.
         assert!(!shortlist.is_empty());
@@ -1478,7 +1479,7 @@ mod tests {
         let predictor = LatencyPredictor::new(table, 2.0);
         // cfg_b has 10x higher latency than cfg_a in trace; with factor 2.0,
         // cfg_b should be dropped. cfg_a survives.
-        let cfgs = vec![cfg_a.clone(), cfg_b.clone()];
+        let cfgs = vec![cfg_a, cfg_b];
         let shortlist = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, cfgs);
         assert!(
             shortlist.contains(&cfg_a),
@@ -1531,7 +1532,7 @@ mod tests {
             .unwrap();
 
         let predictor = LatencyPredictor::new(table, 10.0);
-        let cfgs = vec![cfg_fast.clone(), cfg_slow.clone()];
+        let cfgs = vec![cfg_fast, cfg_slow];
         let shortlist = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, cfgs);
         // With factor 10.0, both should survive (500/50 = 10x).
         assert!(shortlist.contains(&cfg_fast));

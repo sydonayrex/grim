@@ -8,10 +8,10 @@ use grim_tensor::{
 };
 use std::sync::Arc;
 
-/// Compute cross-entropy loss and its backward gradient w.r.t logits.
-///
-/// `logits` has shape `[batch_size, vocab_size]`; `targets` has shape `[batch_size]`.
-/// Returns `(loss_float, loss_grad_tensor)`. CONTRACT: target token IDs must be `< vocab_size`.
+// Compute cross-entropy loss and its backward gradient w.r.t logits.
+//
+// `logits` has shape `[batch_size, vocab_size]`; `targets` has shape `[batch_size]`.
+// Returns `(loss_float, loss_grad_tensor)`. CONTRACT: target token IDs must be `< vocab_size`.
 
 /// Compute Fused Linear Cross Entropy without allocating full [B, V] logits tensor.
 ///
@@ -237,8 +237,7 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Te
     let mut grad_vec = vec![0.0f32; batch_size * vocab_size];
     let mut total_loss = 0.0f32;
 
-    for b in 0..batch_size {
-        let target_token = targets[b];
+    for (b, &target_token) in targets.iter().enumerate() {
         if target_token >= vocab_size {
             return Err(Error::Backend(format!(
                 "target token {} out of bounds for vocab_size {}",

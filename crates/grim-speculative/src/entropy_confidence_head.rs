@@ -38,18 +38,18 @@ impl ConfidenceHead for EntropyConfidenceHead {
             }
             let mut sum = 0.0f32;
             let mut probs = vec![0.0f32; vocab];
-            for v in 0..vocab {
-                probs[v] = (row[v] - max).exp();
-                sum += probs[v];
+            for (v, slot) in probs.iter_mut().enumerate() {
+                *slot = (row[v] - max).exp();
+                sum += *slot;
             }
-            for v in 0..vocab {
-                probs[v] /= sum;
+            for slot in &mut probs {
+                *slot /= sum;
             }
             // Entropy.
             let mut h = 0.0f32;
-            for v in 0..vocab {
-                if probs[v] > 1e-9 {
-                    h -= probs[v] * probs[v].ln();
+            for &p in &probs {
+                if p > 1e-9 {
+                    h -= p * p.ln();
                 }
             }
             // exp(-H) ∈ (0, 1], with higher = more confident.

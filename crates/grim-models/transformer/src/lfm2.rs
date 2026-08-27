@@ -60,8 +60,8 @@ pub enum Lfm2LayerCache {
         k: Vec<f32>,
         v: Vec<f32>,
         /// Device-resident KV cache arena for the fused MXFP4 path (ROCm only).
-        k_dev: Option<Tensor>,
-        v_dev: Option<Tensor>,
+        k_dev: Option<Box<Tensor>>,
+        v_dev: Option<Box<Tensor>>,
     },
 }
 
@@ -190,7 +190,7 @@ impl Lfm2Block {
                             "shortconv.conv.weight",
                         )
                     })?;
-                let conv_vec = conv.to_vec_f32().ok().map(|raw| raw);
+                let conv_vec = conv.to_vec_f32().ok();
                 let out_proj = Some(Linear::load(
                     &ws.pp("shortconv.out_proj"),
                     cfg.hidden_size,
@@ -545,20 +545,20 @@ impl Lfm2Block {
                         // host-history path when the backend lacks the copies.
                         if k_dev.is_none() {
                             let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
-                            *k_dev = Some(Tensor::new(
+                            *k_dev = Some(Box::new(Tensor::new(
                                 Arc::from(dev.zeros(&shape, DType::F32)?),
                                 shape.clone(),
                                 DType::F32,
-                                QuantProvenance::GrimNative.into(),
+                                QuantProvenance::GrimNative,
                                 norm_x.device().clone(),
-                            ));
-                            *v_dev = Some(Tensor::new(
+                            )));
+                            *v_dev = Some(Box::new(Tensor::new(
                                 Arc::from(dev.zeros(&shape, DType::F32)?),
                                 shape,
                                 DType::F32,
-                                QuantProvenance::GrimNative.into(),
+                                QuantProvenance::GrimNative,
                                 norm_x.device().clone(),
-                            ));
+                            )));
                         }
                         let off_elems = past * kv_stride;
                         let cnt_elems = steps * kv_stride;
@@ -712,28 +712,23 @@ impl Lfm2Block {
             let cur = k_dev.as_ref().map(|t| t.shape().dims()[0]).unwrap_or(0);
             if cur < needed {
                 let new_cap = needed.max(LFM2_FUSED_KV_CACHE_LEN * 2);
-                let grow =
-                    |slot: &mut Option<Tensor>, row_len: usize| -> Result<()> {
-                        let old_data = slot.as_ref().map(|t| t.to_vec_f32()).transpose()?;
-                        let mut data = vec![0f32; new_cap * row_len];
-                        if let Some(old) = old_data {
-                            let keep = old.len().min(data.len());
-                            data[..keep].copy_from_slice(&old[..keep]);
-                        }
-                        let shape = Shape::new(vec![new_cap, row_len]);
-                        *slot = Some(Tensor::new(
-                            Arc::from(dev.from_cpu_bytes(
-                                as_u8_slice(&data),
-                                &shape,
-                                DType::F32,
-                            )?),
-                            shape,
-                            DType::F32,
-                            QuantProvenance::GrimNative.into(),
-                            norm_x.device().clone(),
-                        ));
-                        Ok(())
-                    };
+                let grow = |slot: &mut Option<Box<Tensor>>, row_len: usize| -> Result<()> {
+                    let old_data = slot.as_ref().map(|t| t.to_vec_f32()).transpose()?;
+                    let mut data = vec![0f32; new_cap * row_len];
+                    if let Some(old) = old_data {
+                        let keep = old.len().min(data.len());
+                        data[..keep].copy_from_slice(&old[..keep]);
+                    }
+                    let shape = Shape::new(vec![new_cap, row_len]);
+                    *slot = Some(Box::new(Tensor::new(
+                        Arc::from(dev.from_cpu_bytes(as_u8_slice(&data), &shape, DType::F32)?),
+                        shape,
+                        DType::F32,
+                        QuantProvenance::GrimNative,
+                        norm_x.device().clone(),
+                    )));
+                    Ok(())
+                };
                 grow(k_dev, n_k)?;
                 grow(v_dev, n_v)?;
                 max_seq = new_cap;
@@ -741,21 +736,21 @@ impl Lfm2Block {
         }
         if k_dev.is_none() {
             let k_shape = Shape::new(vec![max_seq, n_k]);
-            *k_dev = Some(Tensor::new(
+            *k_dev = Some(Box::new(Tensor::new(
                 Arc::from(dev.zeros(&k_shape, DType::F32)?),
                 k_shape,
                 DType::F32,
-                QuantProvenance::GrimNative.into(),
+                QuantProvenance::GrimNative,
                 norm_x.device().clone(),
-            ));
+            )));
             let v_shape = Shape::new(vec![max_seq, n_v]);
-            *v_dev = Some(Tensor::new(
+            *v_dev = Some(Box::new(Tensor::new(
                 Arc::from(dev.zeros(&v_shape, DType::F32)?),
                 v_shape,
                 DType::F32,
-                QuantProvenance::GrimNative.into(),
+                QuantProvenance::GrimNative,
                 norm_x.device().clone(),
-            ));
+            )));
         }
 
         let q_shape = Shape::new(vec![steps, n_q]);
@@ -763,7 +758,7 @@ impl Lfm2Block {
             Arc::from(dev.zeros(&q_shape, DType::F32)?),
             q_shape,
             DType::F32,
-            QuantProvenance::GrimNative.into(),
+            QuantProvenance::GrimNative,
             norm_x.device().clone(),
         );
 
@@ -880,27 +875,27 @@ impl Lfm2Block {
             for f in 0..n_ff {
                 let mut g_sum = 0.0f32;
                 let mut u_sum = 0.0f32;
-                for d in 0..hidden {
+                for (d, x) in x_s.iter().enumerate() {
                     let g_idx = best_e * n_ff * hidden + f * hidden + d;
                     let u_idx = best_e * n_ff * hidden + f * hidden + d;
-                    g_sum += x_s[d] * gate_exps_vec[g_idx];
-                    u_sum += x_s[d] * up_exps_vec[u_idx];
+                    g_sum += x * gate_exps_vec[g_idx];
+                    u_sum += x * up_exps_vec[u_idx];
                 }
                 gate_e[f] = g_sum;
                 up_e[f] = u_sum;
             }
 
             let mut activated = vec![0.0f32; n_ff];
-            for f in 0..n_ff {
-                let silu = gate_e[f] / (1.0 + (-gate_e[f]).exp());
-                activated[f] = silu * up_e[f];
+            for (a, (g, u)) in activated.iter_mut().zip(gate_e.iter().zip(up_e.iter())) {
+                let silu = g / (1.0 + (-g).exp());
+                *a = silu * u;
             }
 
             for d in 0..hidden {
                 let mut acc = 0.0f32;
-                for f in 0..n_ff {
+                for (f, &a) in activated.iter().enumerate() {
                     let d_idx = best_e * n_ff * hidden + f * hidden + d;
-                    acc += activated[f] * down_exps_vec[d_idx];
+                    acc += a * down_exps_vec[d_idx];
                 }
                 out[s * hidden + d] = acc * best_p;
             }
@@ -914,6 +909,14 @@ impl Lfm2Block {
 /// projection weights into one `[N_total, hidden]` matrix, MXFP4-quantize it,
 /// and upload the packed codes/exps plus the per-head Q/K norm weights.
 /// Returns `(codes, exps, gamma_q, gamma_k)`, all as device tensors.
+/// Fused QKV pack tensors: `(codes, exps, gamma_q, gamma_k)`.
+type FusedQkvPack = (
+    Option<Tensor>,
+    Option<Tensor>,
+    Option<Tensor>,
+    Option<Tensor>,
+);
+
 fn build_fused_qkv_pack(
     wq: &Linear,
     wk: &Linear,
@@ -921,12 +924,7 @@ fn build_fused_qkv_pack(
     attn_q_norm: &RmsNorm,
     attn_k_norm: &RmsNorm,
     cfg: &Lfm2Config,
-) -> Result<(
-    Option<Tensor>,
-    Option<Tensor>,
-    Option<Tensor>,
-    Option<Tensor>,
-)> {
+) -> Result<FusedQkvPack> {
     let n_q = cfg.num_heads * cfg.head_dim;
     let n_k = cfg.num_kv_heads * cfg.head_dim;
     let n_v = cfg.num_kv_heads * cfg.head_dim;
@@ -973,7 +971,7 @@ fn build_fused_qkv_pack(
         Arc::from(codes_storage),
         codes_shape,
         codes_dtype,
-        QuantProvenance::GrimNative.into(),
+        QuantProvenance::GrimNative,
         device.clone(),
     );
     let exps_t = Tensor::new(
@@ -983,21 +981,21 @@ fn build_fused_qkv_pack(
             arith: ArithType::U8,
             storage: Storage::Native,
         },
-        QuantProvenance::GrimNative.into(),
+        QuantProvenance::GrimNative,
         device.clone(),
     );
     let gq_t = Tensor::new(
         Arc::from(gq_storage),
         gamma_shape.clone(),
         DType::F32,
-        QuantProvenance::GrimNative.into(),
+        QuantProvenance::GrimNative,
         device.clone(),
     );
     let gk_t = Tensor::new(
         Arc::from(gk_storage),
         gamma_shape.clone(),
         DType::F32,
-        QuantProvenance::GrimNative.into(),
+        QuantProvenance::GrimNative,
         device.clone(),
     );
     Ok((Some(codes_t), Some(exps_t), Some(gq_t), Some(gk_t)))
@@ -1166,7 +1164,6 @@ impl CausalLm for Lfm2 {
     }
 }
 
-
 /// Root-cause instrumentation (validation log 2026-08-23e): env-gated
 /// activation checksums localizing the first zeroed stage of the Lfm2
 /// forward on non-zero ordinals. Enable with GRIM_FORWARD_TRACE=1.
@@ -1187,12 +1184,7 @@ fn fwd_trace_stage(name: &str, t: &Tensor) {
 
 /// Reinterpret a slice of `T` as raw bytes (for `from_cpu_bytes` uploads).
 fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr() as *const u8,
-            slice.len() * std::mem::size_of::<T>(),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {
@@ -1205,7 +1197,7 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
             Arc::from(storage),
             shape,
             DType::F32,
-            grim_tensor::QuantProvenance::GrimNative.into(),
+            grim_tensor::QuantProvenance::GrimNative,
             device.clone(),
         ))
     }
@@ -1236,10 +1228,7 @@ mod audit_tests {
             eps,
         };
         let lin = Linear::from_tensor(
-            grim_backend_cpu::cpu_tensor(
-                vec![0.0f32; 64],
-                grim_tensor::Shape::new(vec![8, 8]),
-            ),
+            grim_backend_cpu::cpu_tensor(vec![0.0f32; 64], grim_tensor::Shape::new(vec![8, 8])),
             None,
         );
         // Full-attention block with wq/wk/wv but NO wo / QK norms.
@@ -1300,24 +1289,15 @@ mod audit_tests {
                 eps,
             },
             ffn_gate: Linear::from_tensor(
-                grim_backend_cpu::cpu_tensor(
-                    vec![0.0f32; 64],
-                    grim_tensor::Shape::new(vec![8, 8]),
-                ),
+                grim_backend_cpu::cpu_tensor(vec![0.0f32; 64], grim_tensor::Shape::new(vec![8, 8])),
                 None,
             ),
             ffn_up: Linear::from_tensor(
-                grim_backend_cpu::cpu_tensor(
-                    vec![0.0f32; 64],
-                    grim_tensor::Shape::new(vec![8, 8]),
-                ),
+                grim_backend_cpu::cpu_tensor(vec![0.0f32; 64], grim_tensor::Shape::new(vec![8, 8])),
                 None,
             ),
             ffn_down: Linear::from_tensor(
-                grim_backend_cpu::cpu_tensor(
-                    vec![0.0f32; 64],
-                    grim_tensor::Shape::new(vec![8, 8]),
-                ),
+                grim_backend_cpu::cpu_tensor(vec![0.0f32; 64], grim_tensor::Shape::new(vec![8, 8])),
                 None,
             ),
             ffn_gate_inp: None,
@@ -1347,7 +1327,9 @@ mod audit_tests {
             rope_theta: 10_000.0,
             eps,
         };
-        let err = conv_block.validate(5).expect_err("shortconv without kernel must fail");
+        let err = conv_block
+            .validate(5)
+            .expect_err("shortconv without kernel must fail");
         assert!(
             err.to_string().contains("shortconv_conv"),
             "validate must name the missing shortconv field: {err}"
@@ -1362,6 +1344,9 @@ mod audit_tests {
             grim_backend_cpu::cpu_tensor(vec![0.0f32; 64], grim_tensor::Shape::new(vec![8, 8])),
             None,
         ));
-        assert!(conv_block.validate(5).is_ok(), "coherent ShortConv block must pass");
+        assert!(
+            conv_block.validate(5).is_ok(),
+            "coherent ShortConv block must pass"
+        );
     }
 }

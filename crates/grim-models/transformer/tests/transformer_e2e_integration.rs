@@ -100,8 +100,19 @@ fn test_attention_dispatcher_tier_selection_and_gqa() {
     let q = vec![0.5f32; 4 * 16];
     let k = vec![0.5f32; 2 * 16];
     let v = vec![0.5f32; 2 * 16];
-    let (out, tier) =
-        AttentionDispatcher::dispatch_gqa(&q, &k, &v, 4, 2, 16, 1, None, /*has_hardware_matrix=*/ false, &Device::Cpu).unwrap();
+    let (out, tier) = AttentionDispatcher::dispatch_gqa(
+        &q,
+        &k,
+        &v,
+        4,
+        2,
+        16,
+        1,
+        None,
+        /*has_hardware_matrix=*/ false,
+        &Device::Cpu,
+    )
+    .unwrap();
     assert_eq!(tier, AttentionTier::Tier3CpuFallback);
     assert_eq!(out.shape().elem_count(), 4 * 16);
 }

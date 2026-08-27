@@ -309,12 +309,12 @@ impl VitBlock {
                     }
                 }
                 let mut sum_exp = 0.0f32;
-                for j in 0..seq {
-                    scores[j] = (scores[j] - max_score).exp();
-                    sum_exp += scores[j];
+                for score in &mut scores {
+                    *score = (*score - max_score).exp();
+                    sum_exp += *score;
                 }
-                for j in 0..seq {
-                    scores[j] /= sum_exp;
+                for score in &mut scores {
+                    *score /= sum_exp;
                 }
                 for d in 0..hd {
                     let mut val = 0.0f32;
@@ -523,8 +523,8 @@ impl Vit {
         let pw = patch;
         let patch_dim = c * ph * pw;
         // CLS token at index 0 — apply positional embedding pos_embed[0].
-        for o in 0..hidden {
-            tokens[o] = self.cls_token[o] + self.pos_embed[o];
+        for (o, tok) in tokens[..hidden].iter_mut().enumerate() {
+            *tok = self.cls_token[o] + self.pos_embed[o];
         }
         for py in 0..per_side {
             for px in 0..per_side {
@@ -542,8 +542,8 @@ impl Vit {
                 let proj_offset = (1 + py * per_side + px) * hidden;
                 for o in 0..hidden {
                     let mut acc = self.patch_proj_b[o];
-                    for i in 0..patch_dim {
-                        acc += self.patch_proj_w[o * patch_dim + i] * patch_vec[i];
+                    for (i, &pv) in patch_vec.iter().enumerate() {
+                        acc += self.patch_proj_w[o * patch_dim + i] * pv;
                     }
                     // Apply positional embedding once (pos_embed[1..] for patches).
                     tokens[proj_offset + o] = acc + self.pos_embed[proj_offset + o];

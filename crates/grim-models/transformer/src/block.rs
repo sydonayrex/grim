@@ -573,15 +573,8 @@ impl LlamaBlock {
                     if let (Some(bt), Some((k_pages, v_pages, page_size))) =
                         (sess.block_table(), sess.paged_kv_handles(layer))
                     {
-                        self.paged_self_attention(
-                            &q,
-                            bt,
-                            &k_pages,
-                            &v_pages,
-                            page_size,
-                            positions,
-                        )
-                        .ok()
+                        self.paged_self_attention(&q, bt, &k_pages, &v_pages, page_size, positions)
+                            .ok()
                     } else {
                         None
                     }
@@ -615,7 +608,7 @@ impl LlamaBlock {
         };
         let attn_out = self.wo.forward(&attn_out)?;
 
-        let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
+        let added = grim_nn::modules::add_on_device(x_2d, &attn_out)?;
 
         // MoE layers: the dense SwiGLU triple is disabled; the caller routes
         // `added` (post-attention residual) through a `MoeBlock`. Return it
@@ -766,14 +759,14 @@ impl LlamaBlock {
                     x.device().clone(),
                 );
                 let out = reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]))?;
-                return Ok(out);
+                Ok(out)
             }
             Err(_) => {
                 // Fallback: use the grim_nn Rope module (which itself may
                 // roundtrip on CPU, but at least it's a single call).
                 let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
                 // The fallback returns the correct shape already.
-                return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
+                reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]))
             }
         }
     }
@@ -784,7 +777,7 @@ impl LlamaBlock {
         k: &Tensor,
         v: &Tensor,
         positions: &[u32],
-        mut cache: Option<&mut LlamaLayerCache>,
+        cache: Option<&mut LlamaLayerCache>,
     ) -> Result<Tensor> {
         use grim_tensor::BackendStorage;
         let _t0 = std::time::Instant::now();
@@ -826,7 +819,7 @@ impl LlamaBlock {
         let mut host_vecs: Option<(Vec<f32>, Vec<f32>)> = None;
         let kv_len; // assigned in every branch below (definite initialization)
 
-        if let Some(c) = cache.as_deref_mut() {
+        if let Some(c) = cache {
             match cache_append_kv(
                 dev.as_ref(),
                 &mut c.k_device,
@@ -979,13 +972,13 @@ impl LlamaBlock {
             let kvh = (h * cfg.local_num_kv_heads) / cfg.local_num_heads;
             for t in 0..q_len {
                 let mut scores = vec![0.0f32; kv_len];
-                for t2 in 0..kv_len {
+                for (t2, score) in scores.iter_mut().enumerate().take(kv_len) {
                     let mut dot = 0.0f32;
                     for d in 0..cfg.head_dim {
                         dot += qd[t * num_head_dims + h * cfg.head_dim + d]
                             * full_k[t2 * kv_stride + kvh * cfg.head_dim + d];
                     }
-                    scores[t2] = dot * scale;
+                    *score = dot * scale;
                 }
                 if let Some(slopes) = alibi {
                     for (j, s) in scores.iter_mut().enumerate() {
@@ -998,9 +991,9 @@ impl LlamaBlock {
                 } else {
                     0
                 };
-                for t2 in 0..kv_len {
+                for (t2, score) in scores.iter_mut().enumerate().take(kv_len) {
                     if t2 > causal_limit || t2 < window_start {
-                        scores[t2] = f32::NEG_INFINITY;
+                        *score = f32::NEG_INFINITY;
                     }
                 }
 
@@ -1107,7 +1100,7 @@ impl LlamaBlock {
         // view the downstream `wo` matmul expects. Use `reshaped_view` so the
         // storage shape matches the declared shape on every backend (the CPU
         // matmul validates storage rank).
-        Ok(reshaped_view(&attn_out, &out_shape_2d)?)
+        reshaped_view(&attn_out, &out_shape_2d)
     }
 }
 
@@ -1243,8 +1236,7 @@ mod tests {
     }
 
     fn make_tensor(data: Vec<f32>, shape: &[usize]) -> Tensor {
-        let t = cpu_tensor(data, Shape::new(shape.to_vec()));
-        t
+        cpu_tensor(data, Shape::new(shape.to_vec()))
     }
 
     /// Phase-1 correctness proof at the block level: a `LlamaBlock` driven
@@ -1369,8 +1361,12 @@ mod tests {
 
         // Change the 3rd token — positions 0 and 1 should be unaffected
         let mut x_mod = x_data.clone();
-        for i in (2 * cfg.hidden_size)..(3 * cfg.hidden_size) {
-            x_mod[i] += 100.0;
+        for x in x_mod
+            .iter_mut()
+            .skip(2 * cfg.hidden_size)
+            .take(cfg.hidden_size)
+        {
+            *x += 100.0;
         }
         let x2 = make_tensor(x_mod, &[3, cfg.hidden_size]);
         let out2 = block.forward(&x2, &[0, 1, 2]).unwrap();
@@ -1556,7 +1552,7 @@ mod tests {
             let s1 = (0..cfg.head_dim)
                 .map(|d| {
                     qd[t * num_head_dims + h * cfg.head_dim + d]
-                        * kd[1 * kv_stride + kvh * cfg.head_dim + d]
+                        * kd[kv_stride + kvh * cfg.head_dim + d]
                 })
                 .sum::<f32>()
                 * scale;
@@ -1945,50 +1941,50 @@ mod tests {
 
         // Column-parallel weights (sharded along dim=0, rows).
         check_col(
-            &block_full.wq.weight(),
-            &block_r0.wq.weight(),
-            &block_r1.wq.weight(),
+            block_full.wq.weight(),
+            block_r0.wq.weight(),
+            block_r1.wq.weight(),
             "wq",
         );
         check_col(
-            &block_full.wk.weight(),
-            &block_r0.wk.weight(),
-            &block_r1.wk.weight(),
+            block_full.wk.weight(),
+            block_r0.wk.weight(),
+            block_r1.wk.weight(),
             "wk",
         );
         check_col(
-            &block_full.wv.weight(),
-            &block_r0.wv.weight(),
-            &block_r1.wv.weight(),
+            block_full.wv.weight(),
+            block_r0.wv.weight(),
+            block_r1.wv.weight(),
             "wv",
         );
         check_col(
-            &block_full.w_gate.as_ref().unwrap().weight(),
-            &block_r0.w_gate.as_ref().unwrap().weight(),
-            &block_r1.w_gate.as_ref().unwrap().weight(),
+            block_full.w_gate.as_ref().unwrap().weight(),
+            block_r0.w_gate.as_ref().unwrap().weight(),
+            block_r1.w_gate.as_ref().unwrap().weight(),
             "w_gate",
         );
         check_col(
-            &block_full.w_up.as_ref().unwrap().weight(),
-            &block_r0.w_up.as_ref().unwrap().weight(),
-            &block_r1.w_up.as_ref().unwrap().weight(),
+            block_full.w_up.as_ref().unwrap().weight(),
+            block_r0.w_up.as_ref().unwrap().weight(),
+            block_r1.w_up.as_ref().unwrap().weight(),
             "w_up",
         );
 
         // Row-parallel weights (sharded along dim=1, columns).
         // wo: [32, 32] → shard [32, 16]; w_down: [32, 64] → shard [32, 32].
         check_row(
-            &block_full.wo.weight(),
-            &block_r0.wo.weight(),
-            &block_r1.wo.weight(),
+            block_full.wo.weight(),
+            block_r0.wo.weight(),
+            block_r1.wo.weight(),
             cfg.num_heads * cfg.head_dim,
             cfg.hidden_size / 2,
             "wo",
         );
         check_row(
-            &block_full.w_down.as_ref().unwrap().weight(),
-            &block_r0.w_down.as_ref().unwrap().weight(),
-            &block_r1.w_down.as_ref().unwrap().weight(),
+            block_full.w_down.as_ref().unwrap().weight(),
+            block_r0.w_down.as_ref().unwrap().weight(),
+            block_r1.w_down.as_ref().unwrap().weight(),
             cfg.hidden_size,
             cfg.intermediate_size / 2,
             "w_down",

@@ -163,13 +163,13 @@ impl BertBlock {
                     }
                 }
                 let mut sum_exp = 0.0f32;
-                for j in 0..seq_len {
-                    scores[j] = (scores[j] - max_score).exp();
-                    sum_exp += scores[j];
+                for score in &mut scores {
+                    *score = (*score - max_score).exp();
+                    sum_exp += *score;
                 }
                 if sum_exp > 0.0 {
-                    for j in 0..seq_len {
-                        scores[j] /= sum_exp;
+                    for score in &mut scores {
+                        *score /= sum_exp;
                     }
                 }
                 for d in 0..head_dim {

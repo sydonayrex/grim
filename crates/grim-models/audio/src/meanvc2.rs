@@ -245,7 +245,7 @@ impl MeanVC2 {
 
         let mut conv_layers = Vec::with_capacity(config.conv_layers);
         for _ in 0..config.conv_layers {
-            let cw = (0..config.dim * 1 * 5)
+            let cw = (0..config.dim * 5)
                 .map(|_| (rng.next_f32() - 0.5) * 0.02)
                 .collect();
             conv_layers.push(Conv1d::new(

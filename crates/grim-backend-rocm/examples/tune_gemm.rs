@@ -67,7 +67,7 @@ fn main() {
         let out_shape = Shape::from_slice(&[m, n]);
 
         let mut best_index = 0;
-        let mut best_time = std::f64::MAX;
+        let mut best_time = f64::MAX;
 
         // Sweep solution indices 0 to 80
         for index in 0..80 {

@@ -55,7 +55,6 @@ impl JitCacheKey {
 }
 
 /// Cache for compiled .hsaco kernels. The in-memory map also stores the
-
 /// (possibly C++-mangled) *lowered* kernel name so `hipModuleGetFunction` can
 /// resolve kernels that hipRTC emits mangled (e.g. `grim_moe_fused_grouped_fp8`).
 #[derive(Debug)]

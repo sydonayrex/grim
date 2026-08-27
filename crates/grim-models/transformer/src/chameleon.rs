@@ -415,6 +415,6 @@ mod tests {
     fn test_chameleon_config() {
         let cfg = ChameleonConfig::default();
         assert_eq!(cfg.hidden_size, 8192);
-        assert_eq!(cfg.swin_norm, true);
+        assert!(cfg.swin_norm);
     }
 }

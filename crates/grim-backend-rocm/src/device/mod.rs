@@ -117,9 +117,7 @@ pub mod gptq_test_shim {
         qz_off: i64,
         sc_off: i64,
     ) -> Result<*mut std::ffi::c_void> {
-        dev.launch_awq_dequant_gemm(
-            a, b, out, m, n, k, bits, group_size, qw_off, qz_off, sc_off,
-        )
+        dev.launch_awq_dequant_gemm(a, b, out, m, n, k, bits, group_size, qw_off, qz_off, sc_off)
     }
 
     /// Launch the AWQ fused dequant-GEMM (backward).
@@ -160,7 +158,17 @@ pub mod gptq_test_shim {
         rsf: f32,
     ) -> Result<*mut std::ffi::c_void> {
         dev.launch_charon_grouped_dispatch_w8a8_int8(
-            act, egate_w_ptr, eup_w_ptr, edown_w_ptr, a_scale_ptr, sorted, out, hidden, inter, num_experts, rsf,
+            act,
+            egate_w_ptr,
+            eup_w_ptr,
+            edown_w_ptr,
+            a_scale_ptr,
+            sorted,
+            out,
+            hidden,
+            inter,
+            num_experts,
+            rsf,
         )
     }
 
@@ -181,7 +189,17 @@ pub mod gptq_test_shim {
         rsf: f32,
     ) -> Result<*mut std::ffi::c_void> {
         dev.launch_charon_grouped_dispatch_w8a8_fp8(
-            act, egate_w_ptr, eup_w_ptr, edown_w_ptr, a_scale_ptr, sorted, out, hidden, inter, num_experts, rsf,
+            act,
+            egate_w_ptr,
+            eup_w_ptr,
+            edown_w_ptr,
+            a_scale_ptr,
+            sorted,
+            out,
+            hidden,
+            inter,
+            num_experts,
+            rsf,
         )
     }
 
@@ -212,9 +230,27 @@ pub mod gptq_test_shim {
         rsf: f32,
     ) -> Result<*mut std::ffi::c_void> {
         dev.launch_charon_grouped_dispatch_awq(
-            act, egate_w_ptr, eup_w_ptr, edown_w_ptr, a_scale_ptr, sorted, out, hidden, inter, num_experts,
-            bits, group_size, gate_qw_off, gate_qz_off, gate_sc_off, gate_stride, down_qw_off, down_qz_off, down_sc_off, down_stride, rsf,
+            act,
+            egate_w_ptr,
+            eup_w_ptr,
+            edown_w_ptr,
+            a_scale_ptr,
+            sorted,
+            out,
+            hidden,
+            inter,
+            num_experts,
+            bits,
+            group_size,
+            gate_qw_off,
+            gate_qz_off,
+            gate_sc_off,
+            gate_stride,
+            down_qw_off,
+            down_qz_off,
+            down_sc_off,
+            down_stride,
+            rsf,
         )
     }
 }
-

@@ -35,19 +35,14 @@
 //! loss backward arrives with WI-T5 (it slots in as one more op).
 
 /// Controls which parameters are recorded on the backward tape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutogradScope {
     /// Only LoRA adapter + base-weight deltas at injection points (current QLoRA behavior).
+    #[default]
     LoRAOnly,
     /// All trainable parameters including frozen base weights (full fine-tuning WI-T8).
     /// Requires recording MatMul, Add, Scale ops for every weight matrix in the model.
     FullParameter,
-}
-
-impl Default for AutogradScope {
-    fn default() -> Self {
-        AutogradScope::LoRAOnly
-    }
 }
 
 pub mod adamw;

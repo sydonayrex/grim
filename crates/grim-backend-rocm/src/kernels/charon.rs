@@ -1460,8 +1460,8 @@ pub fn moe_align_block_size(
         if run == 0 {
             continue;
         }
-        for s in expert_offset[e]..expert_offset[e] + run {
-            sorted_expert_ids[s] = e as u32;
+        for slot in &mut sorted_expert_ids[expert_offset[e]..expert_offset[e] + run] {
+            *slot = e as u32;
         }
     }
     let mut sorted_weights = vec![0.0f32; num_tokens_post_padded];
@@ -1536,7 +1536,7 @@ pub(crate) fn plan_fused_dispatch(
     let grid_x = if n == 0 {
         0
     } else {
-        ((n as u32 + block_x - 1) / block_x) as u32
+        (n as u32).div_ceil(block_x)
     };
     CharonLaunchPlan { grid_x, block_x }
 }
@@ -1580,7 +1580,7 @@ pub(crate) fn plan_fused_dispatch_with_autotuner(
     let grid_x = if n == 0 {
         0
     } else {
-        ((n as u32 + block_x - 1) / block_x) as u32
+        (n as u32).div_ceil(block_x)
     };
     CharonLaunchPlan { grid_x, block_x }
 }
@@ -1592,7 +1592,7 @@ impl SortedRouting {
         if self.block_size == 0 {
             return 0;
         }
-        ((self.num_tokens_post_padded + self.block_size - 1) / self.block_size) as u32
+        (self.num_tokens_post_padded.div_ceil(self.block_size)) as u32
     }
 }
 

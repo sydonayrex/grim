@@ -91,8 +91,10 @@ mod tests {
 
     #[test]
     fn lora_panel_excludes_quant_picker_by_default() {
-        let mut form = HyperparamFormV1::default();
-        form.training_mode = "LoRA".into();
+        let form = HyperparamFormV1 {
+            training_mode: "LoRA".into(),
+            ..HyperparamFormV1::default()
+        };
         let p = TrainingPanelV1::from_form(&form);
         // LoRA *can* benefit from quant-aware materialization, so we expose
         // the picker; users can leave it at Q4_K. (panel always shows for LoRA/QLoRA.)
@@ -102,8 +104,10 @@ mod tests {
 
     #[test]
     fn qlora_panel_lists_three_quant_options() {
-        let mut form = HyperparamFormV1::default();
-        form.training_mode = "QLoRA".into();
+        let form = HyperparamFormV1 {
+            training_mode: "QLoRA".into(),
+            ..HyperparamFormV1::default()
+        };
         let p = TrainingPanelV1::from_form(&form);
         assert_eq!(p.quant_format_options.len(), 3);
         assert!(p.qlora_recommended.contains(&"Q4_K".to_string()));
@@ -111,8 +115,10 @@ mod tests {
 
     #[test]
     fn bf16_panel_hides_quant_picker() {
-        let mut form = HyperparamFormV1::default();
-        form.training_mode = "Bf16-Full".into();
+        let form = HyperparamFormV1 {
+            training_mode: "Bf16-Full".into(),
+            ..HyperparamFormV1::default()
+        };
         let p = TrainingPanelV1::from_form(&form);
         assert!(!p.show_quant_format_picker);
         assert!(p.help_text.contains("Materialization"));
@@ -120,19 +126,26 @@ mod tests {
 
     #[test]
     fn reinforcement_learning_panels_exist_and_hide_quant_picker() {
-        let mut form = HyperparamFormV1::default();
-
-        form.training_mode = "GRPO".into();
+        let form = HyperparamFormV1 {
+            training_mode: "GRPO".into(),
+            ..HyperparamFormV1::default()
+        };
         let p_grpo = TrainingPanelV1::from_form(&form);
         assert!(!p_grpo.show_quant_format_picker);
         assert!(p_grpo.help_text.contains("Group Relative Policy"));
 
-        form.training_mode = "DPO".into();
+        let form = HyperparamFormV1 {
+            training_mode: "DPO".into(),
+            ..HyperparamFormV1::default()
+        };
         let p_dpo = TrainingPanelV1::from_form(&form);
         assert!(!p_dpo.show_quant_format_picker);
         assert!(p_dpo.help_text.contains("Direct Preference"));
 
-        form.training_mode = "ORPO".into();
+        let form = HyperparamFormV1 {
+            training_mode: "ORPO".into(),
+            ..HyperparamFormV1::default()
+        };
         let p_orpo = TrainingPanelV1::from_form(&form);
         assert!(!p_orpo.show_quant_format_picker);
         assert!(p_orpo.help_text.contains("Odds-Ratio"));
@@ -166,8 +179,10 @@ mod tests {
         // post-fix behavior is the panel rendering a recognizable
         // `unknown (...)` title and help text that doesn't claim the
         // mode *is* BF16.
-        let mut form = HyperparamFormV1::default();
-        form.training_mode = "Lo-RA".into();
+        let form = HyperparamFormV1 {
+            training_mode: "Lo-RA".into(),
+            ..HyperparamFormV1::default()
+        };
         let p = TrainingPanelV1::from_form(&form);
         assert!(p.panel_title.contains("unknown"));
         assert!(p.panel_title.contains("Lo-RA"));
@@ -181,8 +196,10 @@ mod tests {
     #[test]
     fn unknown_rl_mode_is_explicitly_labeled() {
         // Slot between well-known RL modes for deprecation / typo space.
-        let mut form = HyperparamFormV1::default();
-        form.training_mode = "PPO".into();
+        let form = HyperparamFormV1 {
+            training_mode: "PPO".into(),
+            ..HyperparamFormV1::default()
+        };
         let p = TrainingPanelV1::from_form(&form);
         assert!(p.panel_title.contains("unknown"));
         // Quant picker must remain hidden: an unknown mode shouldn't

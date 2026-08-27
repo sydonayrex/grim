@@ -227,8 +227,10 @@ mod tests {
         for _ in 0..10 {
             writeln!(f, r#"{{"text": "hello world"}}"#).unwrap();
         }
-        let mut tokenizer = GgufTokenizer::default();
-        tokenizer.tokens = vec!["hello".into(), "world".into()];
+        let mut tokenizer = GgufTokenizer {
+            tokens: vec!["hello".into(), "world".into()],
+            ..GgufTokenizer::default()
+        };
         tokenizer.token_to_id.insert("hello".into(), 1);
         tokenizer.token_to_id.insert("world".into(), 2);
         let mut loader = JsonlBatchIterator::new(path.to_str().unwrap(), tokenizer, 64, 2)

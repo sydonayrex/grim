@@ -28,10 +28,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
 }
 
 /// Round an f32 value through f16 to simulate GPU storage precision.

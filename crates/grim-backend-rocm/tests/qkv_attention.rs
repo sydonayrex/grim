@@ -35,6 +35,8 @@ use grim_tensor::{BackendDevice, DType, Shape};
 ///
 /// Causal mask: query at absolute position `(cache_offset + i)` attends to
 /// key positions `j` with `j <= cache_offset + i`.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn reference_attention(
     q: &[f32],
     k: &[f32],
@@ -195,7 +197,7 @@ fn qkv_attention_reference_exact_hand_calculated_causal() {
     // expected out[0] = 0.3302386 * 10 + 0.6697614 * 30 = 3.302386 + 20.092842 = 23.395228
     // expected out[1] = 0.3302386 * 20 + 0.6697614 * 40 = 6.604772 + 26.790456 = 33.395228
     let expected_1_0 = 23.395228f32;
-    let expected_1_1 = 33.395228f32;
+    let expected_1_1 = 33.395_23_f32;
     assert!(
         (got[2] - expected_1_0).abs() < 1e-4,
         "got[2] = {}, want {}",

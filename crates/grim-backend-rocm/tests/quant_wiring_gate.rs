@@ -9,13 +9,12 @@
 //!
 //! Device-gated: `GRIM_GPU_TEST=1`.
 
-use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
 use grim_backend_rocm::DTypeStorage;
+use grim_backend_rocm::RocmDevice;
 use grim_tensor::ArithType;
+use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Device, Shape, Storage, Tensor};
 use std::sync::Arc;
-
 
 fn as_rocm_ref(st: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::RocmStorage {
     st.as_any()
@@ -23,11 +22,7 @@ fn as_rocm_ref(st: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::Rocm
         .expect("rocml storage")
 }
 
-fn wrap_arc(
-    st: Box<dyn grim_tensor::BackendStorage>,
-    shape: Shape,
-    device: Device,
-) -> Tensor {
+fn wrap_arc(st: Box<dyn grim_tensor::BackendStorage>, shape: Shape, device: Device) -> Tensor {
     Tensor::new(
         std::sync::Arc::from(st),
         shape,
@@ -115,11 +110,7 @@ fn w4a16_dense_dispatch_matches_dequant_reference() {
 
     let a_gpu = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
     let b_gpu = dev
-        .from_cpu_bytes(
-            &blob_bytes,
-            &b_shape,
-            w4a16_dtype(group_size),
-        )
+        .from_cpu_bytes(&blob_bytes, &b_shape, w4a16_dtype(group_size))
         .unwrap();
 
     // Production seam: quantized_matmul dispatches on the storage dtype.
@@ -170,7 +161,7 @@ fn kernel_less_variants_fail_loudly_not_silently() {
     let a_shape = Shape::new(vec![2, 8]);
     let b_shape = Shape::new(vec![8, 4]);
     let out_shape = Shape::new(vec![2, 4]);
-    let a_gpu = dev.from_cpu(&vec![1.0f32; 16], &a_shape, DType::F32).unwrap();
+    let a_gpu = dev.from_cpu(&[1.0f32; 16], &a_shape, DType::F32).unwrap();
 
     // These formats now have wired forward kernels (W8A8 Int8/Fp8, WNA16);
     // they must NOT silently fall back to packed-bytes-as-f32.
@@ -235,7 +226,6 @@ fn kernel_less_variants_fail_loudly_not_silently() {
     );
 }
 
-
 /// MSB-first packer — inverse of the kernel's grim_decode_msb_nbit.
 fn pack_msb_nbit(codes: &[u32], n_bit: u8) -> Vec<u8> {
     let total_bits = codes.len() * n_bit as usize;
@@ -255,9 +245,13 @@ fn f16_to_f32(h: u16) -> f32 {
     let s = ((h & 0x8000) as u32) << 16;
     let e = ((h & 0x7C00) as u32) << 13;
     let m = ((h & 0x03FF) as u32) << 13;
-    if e == 0x7C00 { return f32::from_bits(s | 0x7F800000 | if m != 0 { 0x400000 } else { 0 }); }
+    if e == 0x7C00 {
+        return f32::from_bits(s | 0x7F800000 | if m != 0 { 0x400000 } else { 0 });
+    }
     if e == 0 {
-        if m == 0 { return f32::from_bits(s); }
+        if m == 0 {
+            return f32::from_bits(s);
+        }
         let v = (m >> 13) as f32 * (1.0 / 1024.0) * (1.0 / 16384.0);
         return if h & 0x8000 != 0 { -v } else { v };
     }
@@ -319,7 +313,12 @@ fn wna16_dequant_service_matches_host_reference() {
     let packed_gpu = dev.from_cpu_bytes(&blob, &packed_shape, dt_u8).unwrap();
 
     let out_st = dev
-        .dequant_wna16_to_f32(as_rocm_ref(packed_gpu.as_ref()), num_weights, n_bit, num_blocks)
+        .dequant_wna16_to_f32(
+            as_rocm_ref(packed_gpu.as_ref()),
+            num_weights,
+            n_bit,
+            num_blocks,
+        )
         .expect("wna16 dequant service");
     let got = wrap_arc(out_st, Shape::new(vec![num_weights]), Device::Rocm(0))
         .to_vec_f32()
@@ -401,7 +400,14 @@ fn embedding_wna16_dequant_matches_host_reference() {
     let got = wrap_arc(out_st, Shape::new(vec![total]), Device::Rocm(0))
         .to_vec_f32()
         .unwrap();
-    eprintln!("[emb-diag] got={:?} want={:?}", got, codes.iter().map(|c| *c as f32 * tensor_scale).collect::<Vec<_>>());
+    eprintln!(
+        "[emb-diag] got={:?} want={:?}",
+        got,
+        codes
+            .iter()
+            .map(|c| *c as f32 * tensor_scale)
+            .collect::<Vec<_>>()
+    );
 
     for i in 0..total {
         let want = codes[i] as f32 * tensor_scale;

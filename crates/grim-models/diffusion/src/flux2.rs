@@ -246,7 +246,7 @@ impl FluxJointBlock {
             txt_h1
                 .to_vec_f32()?
                 .into_iter()
-                .map(|v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v * v * v)).tanh()))
+                .map(|v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh()))
                 .collect(),
             txt_h1.shape().clone(),
         );
@@ -265,7 +265,7 @@ impl FluxJointBlock {
             img_h1
                 .to_vec_f32()?
                 .into_iter()
-                .map(|v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v * v * v)).tanh()))
+                .map(|v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh()))
                 .collect(),
             img_h1.shape().clone(),
         );
@@ -401,7 +401,7 @@ impl FluxSingleBlock {
         let act = cpu_tensor(
             h1.to_vec_f32()?
                 .into_iter()
-                .map(|v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v * v * v)).tanh()))
+                .map(|v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh()))
                 .collect(),
             h1.shape().clone(),
         );

@@ -74,8 +74,8 @@ impl EplbRouter {
         // Replicate top hot experts into underutilized ranks
         let mut replicated_experts = Vec::new();
         if replication_slots > 0 && num_ranks > 1 {
-            for i in 0..replication_slots.min(num_experts) {
-                let (hot_expert_id, _hot_load) = indexed_loads[i];
+            for &(hot_expert_id, _hot_load) in &indexed_loads[..replication_slots.min(num_experts)]
+            {
                 let primary_rank = expert_to_rank[hot_expert_id];
 
                 // Pick secondary rank with lowest load other than primary

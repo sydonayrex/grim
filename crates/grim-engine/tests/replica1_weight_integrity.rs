@@ -6,23 +6,31 @@
 //! Device-gated (needs ≥2 HIP devices): GRIM_GPU_TEST=1.
 
 use grim_engine::model_loader::{load_from_path_on_device, load_model_from_gguf};
-use grim_tensor::TensorProvider;
 use grim_models_transformer::Lfm2;
-
+use grim_tensor::TensorProvider;
 
 fn host_dequant(raw: &grim_tensor::provider::RawTensor) -> Vec<f32> {
     use grim_quant::*;
     let n: usize = raw.shape.iter().product();
     let bytes = &raw.bytes;
     match &raw.dtype.storage {
-        grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K) => dequant_q4k(bytes, n).expect("q4k"),
-        grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q6K) => dequant_q6k(bytes, n).expect("q6k"),
-        grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80) => dequant_q80(bytes, n).expect("q8"),
+        grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K) => {
+            dequant_q4k(bytes, n).expect("q4k")
+        }
+        grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q6K) => {
+            dequant_q6k(bytes, n).expect("q6k")
+        }
+        grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80) => {
+            dequant_q80(bytes, n).expect("q8")
+        }
         other => panic!("unexpected storage {other:?}"),
     }
 }
 
-const MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/LFM2.5-230M-Q4_K_M.gguf");
+const MODEL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../models/LFM2.5-230M-Q4_K_M.gguf"
+);
 
 #[test]
 fn replica1_weights_match_host_dequant() {
@@ -85,8 +93,10 @@ fn replica1_weights_match_host_dequant() {
             bad_out += 1;
         }
     }
-    assert_eq!(bad_out, 0, "{bad_out} mismatching elements in output.weight");
-
+    assert_eq!(
+        bad_out, 0,
+        "{bad_out} mismatching elements in output.weight"
+    );
 }
 
 #[test]
@@ -99,8 +109,8 @@ fn control0_weights_match_host_dequant() {
     let raw = provider.get_packed("token_embd.weight").expect("packed");
     let host = host_dequant(&raw);
 
-    let model = load_model_from_gguf(MODEL, grim_tensor::Device::Rocm(0))
-        .expect("control load on Rocm(0)");
+    let model =
+        load_model_from_gguf(MODEL, grim_tensor::Device::Rocm(0)).expect("control load on Rocm(0)");
     let llama = model
         .as_any()
         .downcast_ref::<Lfm2>()

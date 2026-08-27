@@ -24,10 +24,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
 }
 
 fn f16_to_f32(b0: u8, b1: u8) -> f32 {
@@ -39,7 +36,7 @@ fn f16_to_f32(b0: u8, b1: u8) -> f32 {
         if mant == 0 {
             return if sign == 1 { -0.0 } else { 0.0 };
         }
-        let res = (mant as f32) / 1024.0 * 0.000061_0351_5625;
+        let res = (mant as f32) / 1024.0 * 0.000_061_035_156;
         return if sign == 1 { -res } else { res };
     }
     if exp == 31 {
@@ -64,7 +61,7 @@ fn dequant_q3k_element_host(block: &[u8; 110], in_sb: usize) -> f32 {
     let a1 = u32::from_le_bytes([scales[4], scales[5], scales[6], scales[7]]);
     let tmp = u32::from_le_bytes([scales[8], scales[9], scales[10], scales[11]]);
     let qw = [
-        (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4),
+        (a0 & KMASK2) | ((tmp & KMASK1) << 4),
         (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4),
         ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4),
         ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4),
@@ -72,7 +69,7 @@ fn dequant_q3k_element_host(block: &[u8; 110], in_sb: usize) -> f32 {
     let mut sc = [0i8; 16];
     for j in 0..4usize {
         let w = qw[j];
-        sc[j * 4 + 0] = (w & 0xFF) as i8;
+        sc[j * 4] = (w & 0xFF) as i8;
         sc[j * 4 + 1] = ((w >> 8) & 0xFF) as i8;
         sc[j * 4 + 2] = ((w >> 16) & 0xFF) as i8;
         sc[j * 4 + 3] = ((w >> 24) & 0xFF) as i8;
@@ -95,14 +92,14 @@ fn dequant_q3k_element_host(block: &[u8; 110], in_sb: usize) -> f32 {
 
 fn build_block(seed: u32) -> [u8; 110] {
     let mut b = [0u8; 110];
-    for i in 0..32usize {
-        b[i] = (i.wrapping_mul(7).wrapping_add(seed as usize)) as u8;
+    for (i, v) in b[..32].iter_mut().enumerate() {
+        *v = (i.wrapping_mul(7).wrapping_add(seed as usize)) as u8;
     }
-    for i in 0..64usize {
-        b[32 + i] = (i.wrapping_mul(13).wrapping_add(seed as usize)) as u8;
+    for (i, v) in b[32..96].iter_mut().enumerate() {
+        *v = (i.wrapping_mul(13).wrapping_add(seed as usize)) as u8;
     }
-    for i in 0..12usize {
-        b[96 + i] = (i.wrapping_mul(17).wrapping_add(seed as usize)) as u8;
+    for (i, v) in b[96..108].iter_mut().enumerate() {
+        *v = (i.wrapping_mul(17).wrapping_add(seed as usize)) as u8;
     }
     b[108] = 0x00; // d = 1.0 fp16
     b[109] = 0x3C;
@@ -115,9 +112,9 @@ fn test_q3k_element_matches_cpu_reference_across_seeds() {
         let block = build_block(seed);
         let cpu_all = dequant_q3k(&block, 256).expect("dequant_q3k");
         let mut max_err: f32 = 0.0;
-        for i in 0..256usize {
+        for (i, &cpu_ref) in cpu_all.iter().enumerate() {
             let elem = dequant_q3k_element_host(&block, i);
-            let err = (elem - cpu_all[i]).abs();
+            let err = (elem - cpu_ref).abs();
             if err > max_err {
                 max_err = err;
             }
@@ -271,7 +268,7 @@ fn gpu_element_as_host(block: &[u8; 110], in_sb: usize) -> f32 {
     let a1 = u32::from_le_bytes([scales[4], scales[5], scales[6], scales[7]]);
     let tmp = u32::from_le_bytes([scales[8], scales[9], scales[10], scales[11]]);
     let qw = [
-        (a0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4),
+        (a0 & KMASK2) | ((tmp & KMASK1) << 4),
         (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4),
         ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4),
         ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4),
@@ -279,7 +276,7 @@ fn gpu_element_as_host(block: &[u8; 110], in_sb: usize) -> f32 {
     let mut sc = [0i8; 16];
     for j in 0..4usize {
         let w = qw[j];
-        sc[j * 4 + 0] = (w & 0xFF) as i8;
+        sc[j * 4] = (w & 0xFF) as i8;
         sc[j * 4 + 1] = ((w >> 8) & 0xFF) as i8;
         sc[j * 4 + 2] = ((w >> 16) & 0xFF) as i8;
         sc[j * 4 + 3] = ((w >> 24) & 0xFF) as i8;
@@ -309,9 +306,9 @@ fn test_gpu_kernel_index_math_matches_cpu_reference() {
     for seed in 0..16u32 {
         let block = build_block(seed);
         let cpu = dequant_q3k(&block, 256).expect("dequant_q3k");
-        for i in 0..256usize {
+        for (i, &cpu_ref) in cpu.iter().enumerate() {
             let gpu = gpu_element_as_host(&block, i);
-            let err = (gpu - cpu[i]).abs();
+            let err = (gpu - cpu_ref).abs();
             assert!(
                 err < 1e-6,
                 "seed={seed} i={i}: GPU-index-math {gpu} != cpu {err}"

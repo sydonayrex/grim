@@ -63,7 +63,7 @@ fn test_silu_mul_quantize_parity() {
             .zip(q_rocm_vec.iter())
             .all(|(c, r)| {
                 let ci = (*c as u8) as i32;
-                let ri = (*r as f32).round() as i32;
+                let ri = (*r).round() as i32;
                 (ci - ri).abs() <= 1
             })
     );

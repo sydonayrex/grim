@@ -181,7 +181,7 @@ pub fn compile_gptq_kernel(
         _ => "gfx900",
     };
 
-    let options = crate::device::util::hiprtc_options_for_arch(&target);
+    let options = crate::device::util::hiprtc_options_for_arch(target);
     let option_ptrs: Vec<*const i8> = options.iter().map(|c| c.as_ptr()).collect();
 
     let source_cstr = std::ffi::CString::new(source)

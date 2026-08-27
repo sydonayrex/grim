@@ -1,5 +1,7 @@
 //! Llama/Mistral-style dense transformer — `CausalLm` implementation.
 
+/// Decode outputs: `(hidden_after_blocks, logits, per-layer (key, value) KV pairs)`.
+type DecodeOutputs = (Tensor, Tensor, Vec<(Tensor, Tensor)>);
 use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
@@ -144,24 +146,23 @@ impl Llama {
         // Weight sanity check: models that loaded with zeroed weights should fail
         // at load time rather than silently returning Unimplemented on first forward.
         // [P1-36 fix: fail loudly on zeroed weights.]
-        let check_not_zeroed = |name: &str, tensor: &grim_tensor::Tensor| {
-            weights_look_broken(name, tensor)
-        };
+        let check_not_zeroed =
+            |name: &str, tensor: &grim_tensor::Tensor| weights_look_broken(name, tensor);
         check_not_zeroed("tok_embeddings", &tok_embeddings.weight)?;
         check_not_zeroed("norm", &norm.weight)?;
-        check_not_zeroed("output", &output.weight())?;
+        check_not_zeroed("output", output.weight())?;
         for (i, layer) in layers.iter().enumerate() {
             check_not_zeroed(&format!("layer.{i}.attn_norm"), &layer.attn_norm.weight)?;
             check_not_zeroed(&format!("layer.{i}.ffn_norm"), &layer.ffn_norm.weight)?;
-            check_not_zeroed(&format!("layer.{i}.wq"), &layer.wq.weight())?;
-            check_not_zeroed(&format!("layer.{i}.wk"), &layer.wk.weight())?;
-            check_not_zeroed(&format!("layer.{i}.wv"), &layer.wv.weight())?;
-            check_not_zeroed(&format!("layer.{i}.wo"), &layer.wo.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wq"), layer.wq.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wk"), layer.wk.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wv"), layer.wv.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wo"), layer.wo.weight())?;
             if let Some(ref g) = layer.w_gate {
-                check_not_zeroed(&format!("layer.{i}.w_gate"), &g.weight())?;
+                check_not_zeroed(&format!("layer.{i}.w_gate"), g.weight())?;
             }
             if let Some(ref d) = layer.w_down {
-                check_not_zeroed(&format!("layer.{i}.w_down"), &d.weight())?;
+                check_not_zeroed(&format!("layer.{i}.w_down"), d.weight())?;
             }
         }
 
@@ -428,11 +429,7 @@ impl Llama {
             .forward(&[token], 1, self.cfg.hidden_size)?)
     }
 
-    pub fn decode(
-        &self,
-        hidden: &Tensor,
-        positions: &[u32],
-    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+    pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<DecodeOutputs> {
         let mut throwaway = Inner::new(self.device.clone());
         self.decode_paged(hidden, positions, &mut throwaway, None, 0)
     }
@@ -444,7 +441,7 @@ impl Llama {
         session: &mut dyn SessionT,
         mut caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
         _layer: usize,
-    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+    ) -> Result<DecodeOutputs> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for (i, block) in self.layers.iter().enumerate() {
@@ -645,8 +642,6 @@ pub fn weights_look_broken(name: &str, tensor: &grim_tensor::Tensor) -> Result<(
 mod tests {
     use super::*;
 
-    
-
     fn base_cfg(head_dim: usize, prf: f32) -> LlamaConfig {
         LlamaConfig {
             vocab_size: 100,
@@ -783,14 +778,10 @@ mod tests {
     #[test]
     fn llama_forward_rejects_mismatched_positions_length() {
         let model = Llama::random(Device::Cpu, base_cfg(32, 1.0));
-        let ids = grim_backend_cpu::cpu_tensor(
-            vec![1.0f32, 2.0, 3.0],
-            grim_tensor::Shape::new(vec![3]),
-        );
-        let bad_positions = grim_backend_cpu::cpu_tensor(
-            vec![0.0f32, 1.0],
-            grim_tensor::Shape::new(vec![2]),
-        );
+        let ids =
+            grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0, 3.0], grim_tensor::Shape::new(vec![3]));
+        let bad_positions =
+            grim_backend_cpu::cpu_tensor(vec![0.0f32, 1.0], grim_tensor::Shape::new(vec![2]));
         let mut sess = Inner::new(model.device.clone());
         let res = CausalLm::forward(&model, &mut sess, &ids, &bad_positions, &[]);
         let err = res.expect_err("mismatched positions must error");
@@ -804,28 +795,24 @@ mod tests {
     /// them); a constant matrix must still fail loudly.
     #[test]
     fn weights_look_broken_allows_constant_rank1_rejects_constant_matrices() {
-        let ones_1d = grim_backend_cpu::cpu_tensor(
-            vec![1.0f32; 8],
-            grim_tensor::Shape::new(vec![8]),
-        );
+        let ones_1d =
+            grim_backend_cpu::cpu_tensor(vec![1.0f32; 8], grim_tensor::Shape::new(vec![8]));
         assert!(
             weights_look_broken("norm.weight", &ones_1d).is_ok(),
             "all-ones 1-D norm weight is legitimate and must not be rejected"
         );
 
-        let const_mat = grim_backend_cpu::cpu_tensor(
-            vec![2.5f32; 16],
-            grim_tensor::Shape::new(vec![4, 4]),
-        );
+        let const_mat =
+            grim_backend_cpu::cpu_tensor(vec![2.5f32; 16], grim_tensor::Shape::new(vec![4, 4]));
         assert!(
             weights_look_broken("wq.weight", &const_mat).is_err(),
             "constant matrix must still be rejected"
         );
 
-        let zeros = grim_backend_cpu::cpu_tensor(
-            vec![0.0f32; 8],
-            grim_tensor::Shape::new(vec![8]),
+        let zeros = grim_backend_cpu::cpu_tensor(vec![0.0f32; 8], grim_tensor::Shape::new(vec![8]));
+        assert!(
+            weights_look_broken("embed", &zeros).is_err(),
+            "zeros always rejected"
         );
-        assert!(weights_look_broken("embed", &zeros).is_err(), "zeros always rejected");
     }
 }

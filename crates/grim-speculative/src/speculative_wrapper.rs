@@ -132,11 +132,12 @@ impl SpeculativeCausalLm {
         is_weight_streaming_active: bool,
         available_vram_bytes: Option<usize>,
     ) -> Self {
-        if draft.is_some() && markov.is_some() && confidence.is_some() {
+        if let (Some(draft), Some(markov), Some(confidence)) =
+            (draft.as_ref(), markov.as_ref(), confidence.as_ref())
+        {
             if is_weight_streaming_active {
                 if let Some(available_vram) = available_vram_bytes {
-                    let draft_ref = draft.as_ref().unwrap();
-                    let estimated_size = draft_ref.estimated_footprint_bytes();
+                    let estimated_size = draft.estimated_footprint_bytes();
                     if estimated_size > available_vram {
                         if let Some(mtp) = native_mtp {
                             return Self::with_native_mtp(target, mtp);
@@ -147,9 +148,9 @@ impl SpeculativeCausalLm {
             }
             Self::with_dspark(
                 target,
-                draft.unwrap(),
-                markov.unwrap(),
-                confidence.unwrap(),
+                draft.clone(),
+                markov.clone(),
+                confidence.clone(),
                 ConfidenceScheduler::new(
                     ThroughputProfile::default(),
                     SpeculationConfig::default(),
@@ -336,9 +337,7 @@ impl SpeculativeCausalLm {
 
                     if sched.should_adapt_draft() {
                         let mut accepted_mask = vec![false; verify_len];
-                        for i in 0..accepted_count {
-                            accepted_mask[i] = true;
-                        }
+                        accepted_mask[..accepted_count].fill(true);
                         let target_hidden_states = session
                             .get_last_hidden_state()
                             .and_then(|t| t.to_vec_f32().ok());

@@ -75,8 +75,8 @@ impl Sophia {
             )));
         }
 
-        for i in 0..hessian_diag.len() {
-            state.hessian[i] = beta2 * state.hessian[i] + (1.0 - beta2) * hessian_diag[i];
+        for (i, slot) in state.hessian.iter_mut().enumerate() {
+            *slot = beta2 * *slot + (1.0 - beta2) * hessian_diag[i];
         }
 
         Ok(())

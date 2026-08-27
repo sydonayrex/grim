@@ -254,15 +254,15 @@ pub const LING3_TINY_TENSOR_KEYS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 pub enum Ling3Attn {
-    Kda(grim_nn::KdaAttention),
-    Mla(grim_nn::MlaAttention),
+    Kda(Box<grim_nn::KdaAttention>),
+    Mla(Box<grim_nn::MlaAttention>),
 }
 
 /// Per-layer session cache (audit fix): KDA layers carry conv + recurrent
 /// state; MLA layers carry the post-RoPE KV history. Boxed so the enum stays
 /// small.
 pub enum Ling3LayerCache {
-    Kda(grim_nn::KdaLayerCache),
+    Kda(Box<grim_nn::KdaLayerCache>),
     Mla(Box<grim_nn::MlaKvCache>),
 }
 
@@ -270,7 +270,7 @@ impl Ling3LayerCache {
     /// Build the cache matching this attention variant.
     pub fn new_for(attn: &Ling3Attn) -> Self {
         match attn {
-            Ling3Attn::Kda(_) => Self::Kda(grim_nn::KdaLayerCache::new()),
+            Ling3Attn::Kda(_) => Self::Kda(Box::new(grim_nn::KdaLayerCache::new())),
             Ling3Attn::Mla(_) => Self::Mla(Box::new(grim_nn::MlaKvCache::new())),
         }
     }
@@ -347,7 +347,7 @@ impl Ling3Tiny {
                 let conv_bias = ws.get_unconstrained(&format!("{kda_p}.conv.bias")).ok();
                 let o_w = ws.get_unconstrained(&format!("{kda_p}.o_proj.weight"))?;
 
-                Ling3Attn::Kda(grim_nn::KdaAttention {
+                Ling3Attn::Kda(Box::new(grim_nn::KdaAttention {
                     q_proj: grim_nn::Linear::from_tensor(q_w, None),
                     k_proj: grim_nn::Linear::from_tensor(k_w, None),
                     v_proj: grim_nn::Linear::from_tensor(v_w, None),
@@ -360,7 +360,7 @@ impl Ling3Tiny {
                     num_heads: cfg.num_attention_heads,
                     head_dim: cfg.head_dim,
                     v_dim: cfg.v_head_dim,
-                })
+                }))
             } else {
                 let mla_p = format!("{prefix}.self_attn");
                 let q_a_w = ws.get_unconstrained(&format!("{mla_p}.q_a_proj.weight"))?;
@@ -382,7 +382,7 @@ impl Ling3Tiny {
 
                 let rope = grim_nn::Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
 
-                Ling3Attn::Mla(grim_nn::MlaAttention {
+                Ling3Attn::Mla(Box::new(grim_nn::MlaAttention {
                     q_a_proj: grim_nn::Linear::from_tensor(q_a_w, None),
                     q_a_norm: grim_nn::RmsNorm::new(q_a_ln_w, cfg.rms_norm_eps),
                     q_b_proj: grim_nn::Linear::from_tensor(q_b_w, None),
@@ -397,7 +397,7 @@ impl Ling3Tiny {
                     qk_rope_head_dim: cfg.qk_rope_head_dim,
                     v_head_dim: cfg.v_head_dim,
                     rope,
-                })
+                }))
             };
 
             let gate_w = ws.get_unconstrained(&format!("{prefix}.moe.gate.weight"))?;
@@ -517,20 +517,18 @@ impl CausalLm for Ling3Tiny {
 
             let attn_cache = caches.get_mut(i);
             let attn_out = match (&layer.attn, attn_cache) {
-                (
-                    Ling3Attn::Kda(kda),
-                    Some(Ling3LayerCache::Kda(c)),
-                ) => kda.forward(&normed_input, Some(c))?,
+                (Ling3Attn::Kda(kda), Some(Ling3LayerCache::Kda(c))) => {
+                    kda.forward(&normed_input, Some(c))?
+                }
                 (Ling3Attn::Kda(kda), None) => kda.forward(&normed_input, None)?,
-                (
-                    Ling3Attn::Mla(mla),
-                    Some(Ling3LayerCache::Mla(c)),
-                ) => mla.forward(&normed_input, &pos_vec, Some(c.as_mut()))?,
+                (Ling3Attn::Mla(mla), Some(Ling3LayerCache::Mla(c))) => {
+                    mla.forward(&normed_input, &pos_vec, Some(c.as_mut()))?
+                }
                 (Ling3Attn::Mla(mla), None) => mla.forward(&normed_input, &pos_vec, None)?,
                 _ => {
                     return Err(grim_core::error::Error::Session(
                         "Ling3Tiny: cache variant does not match attention variant".into(),
-                    ))
+                    ));
                 }
             };
 

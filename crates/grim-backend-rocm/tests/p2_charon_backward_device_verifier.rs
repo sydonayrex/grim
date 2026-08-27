@@ -36,12 +36,8 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| {
-        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
-    }) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +167,7 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
         .collect();
 
     // d_y = 1 for all (sum objective).
-    let d_y = vec![1.0f32; HIDDEN];
+    let d_y = [1.0f32; HIDDEN];
 
     for t in 0..BATCH {
         let chosen = &indices[t];
@@ -187,8 +183,8 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             let down_w = &fw.down[e];
 
             // Forward recomputation.
-            let mut h_gate = vec![0.0f32; INTER];
-            let mut h_up = vec![0.0f32; INTER];
+            let mut h_gate = [0.0f32; INTER];
+            let mut h_up = [0.0f32; INTER];
             for j in 0..INTER {
                 for i in 0..HIDDEN {
                     h_gate[j] += gate_w[j * HIDDEN + i] * x_row[i];
@@ -198,7 +194,7 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             let act: Vec<f32> = (0..INTER).map(|j| silu(h_gate[j]) * h_up[j]).collect();
 
             // d_down_w + d_act.
-            let mut d_act = vec![0.0f32; INTER];
+            let mut d_act = [0.0f32; INTER];
             for h in 0..HIDDEN {
                 let dyh_s = s * d_y[h];
                 for j in 0..INTER {
@@ -208,8 +204,8 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             }
 
             // SiLU-SwiGLU activation grad.
-            let mut d_h_gate = vec![0.0f32; INTER];
-            let mut d_h_up = vec![0.0f32; INTER];
+            let mut d_h_gate = [0.0f32; INTER];
+            let mut d_h_up = [0.0f32; INTER];
             for j in 0..INTER {
                 d_h_gate[j] = d_act[j] * silu_grad(h_gate[j]) * h_up[j];
                 d_h_up[j] = d_act[j] * silu(h_gate[j]);

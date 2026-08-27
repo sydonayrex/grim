@@ -386,9 +386,10 @@ impl DType {
 /// `WeightSource::get` and carried on every tensor so the dequant kernel
 /// selects the correct layout per tensor (preventing re-quantization of
 /// already-quantization-aware-trained weights).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum QuantProvenance {
     /// Not quantized, or produced by grim-quant's own post-training pass.
+    #[default]
     GrimNative,
     /// Produced by an external QAT pipeline. Never re-quantized by grim-quant.
     ExternalQat {
@@ -423,12 +424,6 @@ pub enum QuantProvenance {
 impl QuantProvenance {
     pub fn is_external_qat(&self) -> bool {
         matches!(self, QuantProvenance::ExternalQat { .. })
-    }
-}
-
-impl Default for QuantProvenance {
-    fn default() -> Self {
-        QuantProvenance::GrimNative
     }
 }
 

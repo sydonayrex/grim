@@ -23,8 +23,8 @@ pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
     }
 }
 
+///
 /// Memory copy that handles XNACK automatically.
-
 /// WI-SB6 control-plane primitive: async u32-sized copy on an EXPLICIT
 /// non-blocking stream followed by synchronizing ONLY that stream. Used by
 /// the resident ring so head/stop/tail traffic is never ordered behind the
@@ -196,7 +196,7 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(
 /// thread cannot land the scratch on another device.
 pub fn upload_device_buffer<T: Copy>(ordinal: usize, data: &[T]) -> Result<*mut c_void> {
     let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
-    let bytes = data.len() * std::mem::size_of::<T>();
+    let bytes = std::mem::size_of_val(data);
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let mut res = unsafe { hipMalloc(&mut ptr, bytes) };
     if res != hipSuccess {

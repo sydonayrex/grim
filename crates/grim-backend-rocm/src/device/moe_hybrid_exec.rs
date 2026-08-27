@@ -225,7 +225,7 @@ impl MoeHybridExecutor {
                 let cpu_assigned = &plan.cpu_compute_experts;
 
                 Some(s.spawn(move || {
-                    let res = cpu_worker_pool.dispatch_partial(
+                    cpu_worker_pool.dispatch_partial(
                         tokens,
                         routed_indices,
                         routed_weights,
@@ -238,8 +238,7 @@ impl MoeHybridExecutor {
                         inter_dim,
                         num_experts,
                         top_k,
-                    );
-                    res
+                    )
                 }))
             } else {
                 None

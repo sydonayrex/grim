@@ -46,8 +46,10 @@ fn hyperparam_form_serializes_to_camel_case_keys() {
 
 #[test]
 fn hyperparam_form_clamps_lora_rank_to_set() {
-    let mut form = HyperparamFormV1::default();
-    form.lora_rank = 99; // not in {8,16,32,64}
+    let form = HyperparamFormV1 {
+        lora_rank: 99, // not in {8,16,32,64}
+        ..HyperparamFormV1::default()
+    };
     let cleaned = form.normalized();
     assert!(
         cleaned.lora_rank == 8
@@ -59,8 +61,10 @@ fn hyperparam_form_clamps_lora_rank_to_set() {
 
 #[test]
 fn training_panel_routes_attention_to_quantization_floor() {
-    let mut form = HyperparamFormV1::default();
-    form.training_mode = "QLoRA".into();
+    let form = HyperparamFormV1 {
+        training_mode: "QLoRA".into(),
+        ..HyperparamFormV1::default()
+    };
     let panel = TrainingPanelV1::from_form(&form);
     assert!(panel.show_quant_format_picker);
     assert_eq!(panel.quant_format_options.len(), 3);

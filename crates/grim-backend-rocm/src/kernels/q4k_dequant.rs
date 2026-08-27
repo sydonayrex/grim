@@ -162,7 +162,7 @@ mod tests {
         scales[4] = 0x00; // m0  = 0
         scales[8] = 0x35; // sc4_lo=5, m4_lo=3
         buf[4..16].copy_from_slice(&scales);
-        buf[16] = 4 | (0 << 4); // out[0]: d*sc0*4 - min*m0 = 4.0
+        buf[16] = 4; // out[0]: d*sc0*4 - min*m0 = 4.0 (d0=1, sc0=0, min*m0=0)
         buf[80] = 10 | (7 << 4); // out[128] lo nibble=10
 
         let oracle = grim_quant::dequant_q4k(&buf, 256).expect("cpu dequant");

@@ -118,6 +118,7 @@ impl SoulEaterAdapter {
 
     /// Compute backward gradients for 3-factor SoulEater adapter:
     /// Returns (g_x, g_u, g_v, g_sigma).
+    #[allow(clippy::type_complexity)]
     pub fn backward(
         &self,
         out_grad: &Tensor,
@@ -306,6 +307,7 @@ impl SoulEaterOptimizer {
     /// 4. Apply inverse-FIM preconditioning (with diagonal damping).
     /// 5. Update U, V with momentum + Newton-Schulz orthogonalization.
     /// 6. Update Σ with preconditioned direction (not 1-bit Sign-SGD).
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         name: &str,

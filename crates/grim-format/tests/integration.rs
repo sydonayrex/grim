@@ -44,7 +44,7 @@ fn write_test_gguf() -> (Vec<u8>, String) {
     }
 
     // Tensor payload: 16 F32 values spread across 64 bytes.
-    buf.extend(std::iter::repeat(0xABu8).take(payload_bytes));
+    buf.extend(std::iter::repeat_n(0xABu8, payload_bytes));
     // Pad the file out to a 32-byte boundary so any trailing reads succeed.
     while buf.len() % 32 != 0 {
         buf.push(0);
@@ -444,5 +444,5 @@ fn grim_provider_meta_populates_fusion_mask_from_extension() {
     assert!(meta.has_qkv_attention_fusion(), "bit1 must be set");
 
     // A tensor with no extension defaults to mask 0.
-    assert_eq!(provider.meta("does.not.exist").is_err(), true);
+    assert!(provider.meta("does.not.exist").is_err());
 }

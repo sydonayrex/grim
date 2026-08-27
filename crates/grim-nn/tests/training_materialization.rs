@@ -40,6 +40,7 @@ impl TensorProvider for MemProvider {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn memory_provider_with(
     entries: &[(&str, Vec<u8>, Vec<usize>, DType, QuantProvenance)],
 ) -> MemProvider {

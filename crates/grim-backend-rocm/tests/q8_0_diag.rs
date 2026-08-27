@@ -26,14 +26,10 @@ fn build_q8_0_bytes() -> Vec<u8> {
     }
     // Block 3: scale=2.0, codes=[0;32]
     raw.extend_from_slice(&f16_bits.to_le_bytes());
-    for _ in 0..QK8_0 {
-        raw.push(0);
-    }
+    raw.resize(raw.len() + QK8_0, 0);
     // Block 4: scale=2.0, codes=[7;32]
     raw.extend_from_slice(&f16_bits.to_le_bytes());
-    for _ in 0..QK8_0 {
-        raw.push(7);
-    }
+    raw.extend(std::iter::repeat_n(7u8, QK8_0));
     raw
 }
 

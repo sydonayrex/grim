@@ -237,7 +237,7 @@ fn test_cpu_vulkan_metal_softmax_numerical_parity() {
     );
 
     for &p in &probs {
-        assert!(p >= 0.0 && p <= 1.0, "Probability {p} out of bounds");
+        assert!((0.0..=1.0).contains(&p), "Probability {p} out of bounds");
     }
     assert_eq!(
         probs

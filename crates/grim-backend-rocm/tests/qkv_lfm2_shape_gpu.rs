@@ -6,6 +6,8 @@
 use grim_backend_rocm::{BackendDevice, RocmDevice, Shape};
 use grim_tensor::DType;
 
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn reference_attention(
     q: &[f32], // [steps, heads*dim]
     k: &[f32], // [kv_len, kv_heads*dim]

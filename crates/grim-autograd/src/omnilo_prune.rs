@@ -127,17 +127,17 @@ impl OmniloRankAllocator {
         let mut diff = total_budget as isize - ranks.iter().map(|&r| r as isize).sum::<isize>();
         while diff != 0 {
             let mut moved = false;
-            for i in 0..num_layers {
+            for slot in ranks.iter_mut() {
                 if diff == 0 {
                     break;
                 }
-                let r = ranks[i] as isize;
+                let r = *slot as isize;
                 if diff > 0 && r < config.max_rank_per_layer as isize {
-                    ranks[i] += 1;
+                    *slot += 1;
                     diff -= 1;
                     moved = true;
                 } else if diff < 0 && r > config.min_rank_per_layer as isize {
-                    ranks[i] -= 1;
+                    *slot -= 1;
                     diff += 1;
                     moved = true;
                 }
@@ -192,17 +192,17 @@ impl OmniloRankAllocator {
             let mut diff = config.total_rank_budget as isize - current_sum as isize;
             while diff != 0 {
                 let mut moved = false;
-                for i in 0..num_layers {
+                for slot in raw.iter_mut() {
                     if diff == 0 {
                         break;
                     }
-                    let r = raw[i] as isize;
+                    let r = *slot as isize;
                     if diff > 0 && r < config.max_rank_per_layer as isize {
-                        raw[i] += 1;
+                        *slot += 1;
                         diff -= 1;
                         moved = true;
                     } else if diff < 0 && r > config.min_rank_per_layer as isize {
-                        raw[i] -= 1;
+                        *slot -= 1;
                         diff += 1;
                         moved = true;
                     }

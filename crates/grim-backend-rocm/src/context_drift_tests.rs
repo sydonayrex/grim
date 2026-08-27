@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use grim_tensor::Shape;
-use grim_tensor::backend::{BackendDevice, BackendStorage};
+use grim_tensor::backend::BackendDevice;
 
 use crate::RocmDevice;
 use crate::device::capability_profiler::vram_info;

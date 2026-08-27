@@ -89,11 +89,8 @@ mod tests {
     fn rocblas_handle_cache_initializes_lazily() {
         // Without HIP installed, this returns an Error. We accept either.
         let dev = RocmDevice::new(0);
-        let res = dev.get_rocblas_handle();
-        match res {
-            Ok(_h) => {}
-            Err(_) => {}
-        }
+        // Either outcome is accepted (GPU-less boxes return an Error).
+        let _ = dev.get_rocblas_handle();
     }
 
     #[test]
@@ -194,7 +191,7 @@ mod tests {
 
         let src: Vec<f32> = (0..35 * 40).map(|i| i as f32 * 0.5).collect();
         let tiled = wf.tile(&src, 35, 40);
-        assert_eq!(tiled.len(), 1 * 64 * 64);
+        assert_eq!(tiled.len(), 64 * 64);
 
         let recovered = wf.untile(&tiled, 35, 40);
         assert_eq!(recovered.len(), 35 * 40);
@@ -404,7 +401,7 @@ mod tests {
             if ax >= 65504.0f32 {
                 return sign | 0x7C00; // overflow → +inf
             }
-            if ax < 5.960464477539063e-8f32 {
+            if ax < 5.9604645e-8f32 {
                 return 0x0000; // underflow → zero
             }
             // Extract fp32 exponent/mantissa.
@@ -417,7 +414,7 @@ mod tests {
                     (mant32 as f32) * 2.0f32.powi(-24) * if x < 0.0 { -1.0f32 } else { 1.0f32 };
                 return f32_to_fp16(val);
             }
-            let exp_f = (exp32 as i32) - 127; // unbiased
+            let exp_f = exp32 - 127; // unbiased
             let mant_f = 1.0f32 + (mant32 as f32) / 1024.0f32;
             // Convert to fp16: exp16 = exp_f + 15, mant16 = round(mant_f * 1024).
             let exp16 = exp_f + 15;
@@ -637,7 +634,7 @@ mod tests {
         // 70x60 tensor with 4-bit quantization - 70 not multiple of 64
         let orig_rows = 70;
         let orig_cols = 60;
-        let data: Vec<u8> = vec![0xAB; (orig_rows * orig_cols / 2) as usize];
+        let data: Vec<u8> = vec![0xAB; orig_rows * orig_cols / 2];
         let shape = vec![orig_rows, orig_cols];
         let (_padded, new_shape) = align_quantized_tensor_for_rocm_gemm(&data, &shape, 4, 64);
 
@@ -815,7 +812,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// TEMP-DIAG (GGUF fault hunt): rms_norm at engine shapes (204x1024).
     #[test]
     fn diag_rms_norm_engine_shapes() {
@@ -856,6 +852,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn rms_norm_normalizes_to_unit_when_weight_is_one() {
         // x = [3,4] over row_len 2, weight = 1, eps = 0:
         let env = std::env::var(GPU_TEST_ENV).is_ok();
@@ -995,7 +992,7 @@ mod tests {
             let exp_0 = sig_1 * 1.0 * 2.0;
 
             let sig_neg1 = 1.0f32 / (1.0f32 + (1.0f32).exp());
-            let exp_1 = (-1.0f32 * sig_neg1) * 3.0;
+            let exp_1 = sig_neg1 * -3.0;
 
             close_rocm(out[0], exp_0, "rocm_silu_mul w0");
             close_rocm(out[1], exp_1, "rocm_silu_mul w1");
@@ -1307,14 +1304,10 @@ mod tests {
         let dev = RocmDevice::new(0);
 
         let x = dev
-            .from_cpu(
-                &vec![1.0f32; 4 * 8],
-                &Shape::from_slice(&[4, 8]),
-                DType::F32,
-            )
+            .from_cpu(&[1.0f32; 4 * 8], &Shape::from_slice(&[4, 8]), DType::F32)
             .unwrap();
         let w_norm = dev
-            .from_cpu(&vec![1.0f32; 8], &Shape::from_slice(&[8]), DType::F32)
+            .from_cpu(&[1.0f32; 8], &Shape::from_slice(&[8]), DType::F32)
             .unwrap();
         let w_mat = dev
             .from_cpu(
@@ -1420,10 +1413,10 @@ mod tests {
         let dev = RocmDevice::new(0);
 
         let a = dev
-            .from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4, 4]), DType::F16)
+            .from_cpu(&[1.0f32; 16], &Shape::from_slice(&[4, 4]), DType::F16)
             .unwrap();
         let b = dev
-            .from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4, 4]), DType::F16)
+            .from_cpu(&[1.0f32; 16], &Shape::from_slice(&[4, 4]), DType::F16)
             .unwrap();
         let out = dev.zeros(&Shape::from_slice(&[4, 4]), DType::F16).unwrap();
 
@@ -1973,8 +1966,8 @@ mod tests {
                         } else {
                             (prev_m - new_m).exp()
                         };
-                        running_sum[d] = running_sum[d] * scale_prev;
-                        acc[d] = acc[d] * scale_prev;
+                        running_sum[d] *= scale_prev;
+                        acc[d] *= scale_prev;
                         running_max[d] = new_m;
                         // Weight for this j.
                         let w = if s == new_m {
@@ -2246,7 +2239,7 @@ mod tests {
         let (m, n, k, bpw) = (2usize, 2usize, 4usize, 2u8);
 
         // ── B_codes: pack into row_bytes-aligned buffer ───────────────────
-        let row_bytes = ((k * bpw as usize + 7) / 8 + 255) & !255;
+        let row_bytes = (k * bpw as usize).div_ceil(8).div_ceil(256) * 256;
         let mut b_codes_host = vec![0u8; n * row_bytes];
         // Row 0: codes [3,2,1,0]
         b_codes_host[0] = pack_bpw2_byte([3, 2, 1, 0]);
@@ -2316,11 +2309,11 @@ mod tests {
         let b_deq: Vec<Vec<f32>> = vec![dequant, dequant2];
 
         let mut expected_f32 = Vec::with_capacity(m * k);
-        for row in 0..m {
-            for k_idx in 0..k {
+        for dy_row in dy.iter() {
+            for (k_idx, b_col) in b_deq.iter().enumerate() {
                 let mut acc = 0.0f32;
                 for col in 0..n {
-                    acc += dy[row][col] * b_deq[col][k_idx] * scales[col];
+                    acc += dy_row[col] * b_col[k_idx] * scales[col];
                 }
                 // The kernel casts the f32 accumulator to f16 before storing.
                 let f16_val = half::f16::from_f32(acc);
@@ -2494,9 +2487,8 @@ mod tests {
             d * (sc as f32) * (q_code as f32) - dmin * (m as f32)
         };
 
-        for in_sb in 0..256 {
+        for (in_sb, &cpu_deq) in cpu_expected.iter().enumerate() {
             let gpu_deq = host_dequant_q5k_element(&data, in_sb);
-            let cpu_deq = cpu_expected[in_sb];
             assert!(
                 (gpu_deq - cpu_deq).abs() < 1e-4,
                 "Elem {} mismatch: GPU mirror got {}, CPU reference got {}",
@@ -2555,9 +2547,8 @@ mod tests {
             d * (sc as f32) * (q_code as f32 - 32.0f32)
         };
 
-        for in_sb in 0..256 {
+        for (in_sb, &cpu_deq) in cpu_expected.iter().enumerate() {
             let gpu_deq = host_dequant_q6k_element(&data, in_sb);
-            let cpu_deq = cpu_expected[in_sb];
             assert!(
                 (gpu_deq - cpu_deq).abs() < 1e-4,
                 "Elem {} mismatch: GPU Q6_K mirror got {}, CPU reference got {}",
@@ -2699,12 +2690,12 @@ mod tests {
         // so the parity check is bit-exact rather than tolerance-limited at
         // large magnitudes where 1 ulp dwarfs any fixed tolerance.
         let mut want = gemm_out.clone();
-        for i in 0..batch {
-            for j in 0..out_dim {
+        for (i, &a_s) in a_scale.iter().enumerate() {
+            for (j, &b_s) in b_scale.iter().enumerate() {
                 let idx = i * out_dim + j;
                 let mut s = 1.0f32;
-                s *= a_scale[i];
-                s *= b_scale[j];
+                s *= a_s;
+                s *= b_s;
                 let mut v = gemm_out[idx] * s;
                 v += bias[j];
                 want[idx] = v;

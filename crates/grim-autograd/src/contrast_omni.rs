@@ -107,23 +107,23 @@ impl ContrastOmniLoss {
             let mut var = vec![0.0f32; dim];
             for &idx in indices {
                 let start = idx * dim;
-                for d in 0..dim {
-                    mean[d] += features[start + d];
+                for (d, slot) in mean.iter_mut().enumerate() {
+                    *slot += features[start + d];
                 }
             }
             let count = indices.len() as f32;
-            for d in 0..dim {
-                mean[d] /= count;
+            for slot in mean.iter_mut() {
+                *slot /= count;
             }
             for &idx in indices {
                 let start = idx * dim;
-                for d in 0..dim {
-                    let delta = features[start + d] - mean[d];
-                    var[d] += delta * delta;
+                for (d, slot) in var.iter_mut().enumerate() {
+                    let delta = features[start + d] - *slot;
+                    *slot += delta * delta;
                 }
             }
-            for d in 0..dim {
-                var[d] /= count.max(1.0);
+            for slot in var.iter_mut() {
+                *slot /= count.max(1.0);
             }
             modality_stats.insert(*mid, (mean, var));
         }

@@ -111,7 +111,7 @@ impl MellumConfig {
                 value
                     .get("intermediate_size")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u64
+                    .unwrap_or(0)
             }) as usize;
 
         // Sliding window: may be "sliding_window" or "max_window_layers" with
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(yarn.original_max_pos, 8192);
         assert!((yarn.beta_fast - 32.0).abs() < 1e-6);
         assert!((yarn.beta_slow - 1.0).abs() < 1e-6);
-        assert!((yarn.attention_factor - 1.2772588722239782).abs() < 1e-6);
+        assert!((yarn.attention_factor - 1.277_258_9).abs() < 1e-6);
     }
 
     #[test]

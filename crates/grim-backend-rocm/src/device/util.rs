@@ -22,7 +22,7 @@ pub const ROCM_COMPUTE_BLOCK: u32 = 256;
 
 /// Grid/block dims for a 1-D launch over `total` elements.
 pub fn linear_launch(total: usize) -> (crate::HipDim3, crate::HipDim3) {
-    let grid = (total as u32 + ROCM_COMPUTE_BLOCK - 1) / ROCM_COMPUTE_BLOCK;
+    let grid = (total as u32).div_ceil(ROCM_COMPUTE_BLOCK);
     (
         crate::HipDim3::new(grid, 1, 1),
         crate::HipDim3::new(ROCM_COMPUTE_BLOCK, 1, 1),
@@ -34,7 +34,7 @@ pub fn linear_launch(total: usize) -> (crate::HipDim3, crate::HipDim3) {
 /// warp owning one row with `__shfl_xor` reductions.
 pub fn warp_rows_launch(rows: usize) -> (crate::HipDim3, crate::HipDim3) {
     const WARPS_PER_BLOCK: usize = (ROCM_COMPUTE_BLOCK as usize) / 32;
-    let grid = ((rows.max(1) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK) as u32;
+    let grid = (rows.max(1).div_ceil(WARPS_PER_BLOCK)) as u32;
     (
         crate::HipDim3::new(grid, 1, 1),
         crate::HipDim3::new(ROCM_COMPUTE_BLOCK, 1, 1),
@@ -42,7 +42,7 @@ pub fn warp_rows_launch(rows: usize) -> (crate::HipDim3, crate::HipDim3) {
 }
 
 /// Helper: downcast a `BackendStorage` to `RocmStorage`, returning a
-pub fn as_rocm<'a>(s: &'a dyn BackendStorage) -> Result<&'a RocmStorage> {
+pub fn as_rocm(s: &dyn BackendStorage) -> Result<&RocmStorage> {
     s.as_any()
         .downcast_ref::<RocmStorage>()
         .ok_or_else(|| Error::Backend("expected RocmStorage input".into()))

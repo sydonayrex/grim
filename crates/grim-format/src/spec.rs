@@ -231,7 +231,7 @@ impl LayoutHintTag {
 /// Up to two of these attach per tensor. Each describes an additive
 /// correction stream packed at `bpw` bits with its own per-row u8 scale
 /// region.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BackupLayer {
     /// Offset of the packed backup codes inside the payload region,
     /// Wave64-aligned. 0 = absent.
@@ -244,18 +244,6 @@ pub struct BackupLayer {
     pub scale_offset: u64,
     /// Size of the per-row scale bytes for this backup.
     pub scale_size: u64,
-}
-
-impl Default for BackupLayer {
-    fn default() -> Self {
-        Self {
-            codes_offset: 0,
-            codes_size: 0,
-            bpw: 0,
-            scale_offset: 0,
-            scale_size: 0,
-        }
-    }
 }
 
 impl BackupLayer {
@@ -294,14 +282,8 @@ impl BackupLayer {
 /// The reader does not interpret these; they are passed through to the
 /// backend kernel verbatim. Defaults to all zeros (= "let the kernel
 /// decide").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LayoutDescriptor(pub [u32; 4]);
-
-impl Default for LayoutDescriptor {
-    fn default() -> Self {
-        Self([0, 0, 0, 0])
-    }
-}
 
 // ---------------------------------------------------------------------------
 // GrimTensorExt — per-tensor capability declaration
@@ -1115,11 +1097,11 @@ mod tests {
         };
         let json = layout.to_json();
         let restored = KvCacheLayout::from_json(&json).expect("round-trip");
-        assert_eq!(restored.kv_rotated, true);
+        assert!(restored.kv_rotated);
         assert_eq!(restored.kv_bits_k, 3);
         assert_eq!(restored.kv_bits_v, 4);
         assert_eq!(restored.kv_eviction_map_offset, 0x1000);
-        assert_eq!(restored.kv_sink_fp16, true);
+        assert!(restored.kv_sink_fp16);
     }
 
     /// A JSON object lacking `kv_bits_k` still parses (defaults to 0).

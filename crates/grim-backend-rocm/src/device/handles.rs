@@ -111,7 +111,6 @@ pub type HiprtcProgram = *mut c_void;
 // ======== HIP / hiprtc FFI declarations ========
 
 #[link(name = "amdhip64", kind = "dylib")]
-#[link(name = "hiprtc", kind = "dylib")]
 unsafe extern "C" {
     pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
     pub fn hipMallocManaged(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
@@ -232,7 +231,11 @@ unsafe extern "C" {
         blockSize: i32,
         dynamicSMemSize: usize,
     ) -> HipErrorT;
+}
 
+// hiprtc lives in its own shared object, so it gets a separate link block.
+#[link(name = "hiprtc", kind = "dylib")]
+unsafe extern "C" {
     pub fn hiprtcCreateProgram(
         prog: *mut HiprtcProgram,
         src: *const i8,

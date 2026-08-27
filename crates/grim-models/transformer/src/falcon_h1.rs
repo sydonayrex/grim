@@ -334,7 +334,7 @@ impl FalconH1Model {
     /// CPU forward: `(input_ids, positions) -> logits [seq_len, vocab_size]`.
     pub fn forward_cpu(
         &self,
-        caches: &mut Vec<FalconH1LayerCache>,
+        caches: &mut [FalconH1LayerCache],
         input_ids: &[u32],
         positions: &[u32],
     ) -> Result<Tensor> {
@@ -426,6 +426,8 @@ fn forward_block_cpu(
 }
 
 /// GQA attention with RoPE and a growing KV cache stored in `cache`.
+/// All eight parameters describe one attention step; a struct would add indirection without clarity.
+#[allow(clippy::too_many_arguments)]
 fn gqa_attn_with_cache(
     b: &FalconH1Block,
     cfg: &FalconH1Config,
@@ -576,7 +578,7 @@ fn silu(x: f32) -> f32 {
 
 fn wrap(data: &[f32], seq_len: usize, dim: usize, device: &Device) -> Result<Tensor> {
     let shape = Shape::new(vec![seq_len, dim]);
-    Ok(device_tensor(data.to_vec(), shape, device)?)
+    device_tensor(data.to_vec(), shape, device)
 }
 
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {
@@ -589,7 +591,7 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
         std::sync::Arc::from(storage),
         shape,
         DType::F32,
-        grim_tensor::QuantProvenance::GrimNative.into(),
+        grim_tensor::QuantProvenance::GrimNative,
         device.clone(),
     ))
 }

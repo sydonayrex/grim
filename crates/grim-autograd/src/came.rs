@@ -137,11 +137,11 @@ impl Came {
             c_grad[c] = sum_sq / (rows as f32);
         }
 
-        for r in 0..rows {
-            state.exp_avg_sq_row[r] = beta2 * state.exp_avg_sq_row[r] + (1.0 - beta2) * r_grad[r];
+        for (r, slot) in state.exp_avg_sq_row.iter_mut().enumerate() {
+            *slot = beta2 * *slot + (1.0 - beta2) * r_grad[r];
         }
-        for c in 0..cols {
-            state.exp_avg_sq_col[c] = beta2 * state.exp_avg_sq_col[c] + (1.0 - beta2) * c_grad[c];
+        for (c, slot) in state.exp_avg_sq_col.iter_mut().enumerate() {
+            *slot = beta2 * *slot + (1.0 - beta2) * c_grad[c];
         }
 
         let mean_r: f32 = (state.exp_avg_sq_row.iter().sum::<f32>() / (rows as f32)).max(1e-12);

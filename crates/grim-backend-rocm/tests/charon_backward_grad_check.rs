@@ -256,7 +256,7 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
         let chosen = &indices[t];
         let w = &weights[t];
         // d_y = 1 for every output element (sum objective).
-        let d_y = vec![1.0f32; HIDDEN];
+        let d_y = [1.0f32; HIDDEN];
 
         for (rank, &e) in chosen.iter().enumerate() {
             let combine = w[rank];
@@ -277,8 +277,8 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
 
             // h_gate[j] = sum_i gate_w[j*hidden + i] * x[i]   (j indexes inter)
             // h_up[j]   = sum_i up_w[j*hidden + i] * x[i]
-            let mut h_gate = vec![0.0f32; INTER];
-            let mut h_up = vec![0.0f32; INTER];
+            let mut h_gate = [0.0f32; INTER];
+            let mut h_up = [0.0f32; INTER];
             for j in 0..INTER {
                 for i in 0..HIDDEN {
                     h_gate[j] += gate_w[j * HIDDEN + i] * x_row[i];
@@ -294,7 +294,7 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             //
             // d_act[j] = sum_h s * d_y[h] * down_w[e][h, j]   — scaled by s via
             // the column-j contraction of `down_w` against the scaled d_y.
-            let mut d_act = vec![0.0f32; INTER];
+            let mut d_act = [0.0f32; INTER];
             for h in 0..HIDDEN {
                 let dy_h_scaled = s * d_y[h];
                 for j in 0..INTER {
@@ -315,8 +315,8 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             // dropping the `h_up` factor. The by-name gradient gate surfaced
             // this as an `analytic = fd / h_up` discrepancy (ratio ≈ 1/h_up
             // exactly); fixed here and in the kernel source.
-            let mut d_h_gate = vec![0.0f32; INTER];
-            let mut d_h_up = vec![0.0f32; INTER];
+            let mut d_h_gate = [0.0f32; INTER];
+            let mut d_h_up = [0.0f32; INTER];
             for j in 0..INTER {
                 let sg = silu_grad(h_gate[j]);
                 let sval = silu(h_gate[j]);
@@ -539,7 +539,7 @@ fn d_x_gradient_matches_fd_by_name() {
             0.0,
         )
     };
-    assert_grad_matches_fd("d_x", &g.d_x, |i| fd_for(i), true);
+    assert_grad_matches_fd("d_x", &g.d_x, fd_for, true);
 }
 
 /// Cross-check: the four named gradients together must reproduce the sum-
@@ -586,12 +586,12 @@ fn directional_derivative_under_combined_named_grads() {
             analytic_dd += g.d_gate_w[e][k] * dir_gate[e][k];
             analytic_dd += g.d_up_w[e][k] * dir_up[e][k];
         }
-        for k in 0..HIDDEN * INTER {
-            analytic_dd += g.d_down_w[e][k] * dir_down[e][k];
+        for (dw, dd) in g.d_down_w[e].iter().zip(dir_down[e].iter()) {
+            analytic_dd += dw * dd;
         }
     }
-    for k in 0..BATCH * HIDDEN {
-        analytic_dd += g.d_x[k] * dir_x[k];
+    for (dx, ddir) in g.d_x.iter().zip(dir_x.iter()) {
+        analytic_dd += dx * ddir;
     }
 
     // Finite-difference directional derivative along the same direction.
@@ -604,14 +604,23 @@ fn directional_derivative_under_combined_named_grads() {
             fw_plus.up[e][k] += EPS * dir_up[e][k];
             fw_minus.up[e][k] -= EPS * dir_up[e][k];
         }
-        for k in 0..HIDDEN * INTER {
-            fw_plus.down[e][k] += EPS * dir_down[e][k];
-            fw_minus.down[e][k] -= EPS * dir_down[e][k];
+        for ((fp, fm), dd) in fw_plus.down[e]
+            .iter_mut()
+            .zip(fw_minus.down[e].iter_mut())
+            .zip(dir_down[e].iter())
+        {
+            *fp += EPS * dd;
+            *fm -= EPS * dd;
         }
     }
-    for k in 0..BATCH * HIDDEN {
-        fw_plus.x[k] += EPS * dir_x[k];
-        fw_minus.x[k] -= EPS * dir_x[k];
+    for ((fp, fm), ddir) in fw_plus
+        .x
+        .iter_mut()
+        .zip(fw_minus.x.iter_mut())
+        .zip(dir_x.iter())
+    {
+        *fp += EPS * ddir;
+        *fm -= EPS * ddir;
     }
     let fd_dd = (objective(&fw_plus) - objective(&fw_minus)) / (2.0 * EPS);
 

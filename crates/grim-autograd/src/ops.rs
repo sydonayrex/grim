@@ -6,18 +6,18 @@ use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
 use grim_tensor::{DType, Device, Error, Shape, Storage, Tensor, error::Result};
 use std::sync::Arc;
 
-/// DoRA (Weight-Decomposed LoRA) forward pass.
-///
-/// Implements the weight-decomposed LoRA from the Unsloth/DoRA paper.
-///
-/// Mathematical formulas from the plan spec:
-/// 1. Directional matrix: V = W_0 + γ * B @ A
-/// 2. Column-wise L2 norm for output row i: n_i = ||V[i,:]||_2 = sqrt(sum_j V[i,j]^2 + ε)
-/// 3. Normalized directional matrix: V_hat[i,j] = V[i,j] / n_i
-/// 4. Effective weight: W_eff[i,j] = m_i * V_hat[i,j]
-/// 5. Output for input X: Y = X @ W_eff^T
-///
-/// Returns Y = X @ W_eff^T.
+// DoRA (Weight-Decomposed LoRA) forward pass.
+//
+// Implements the weight-decomposed LoRA from the Unsloth/DoRA paper.
+//
+// Mathematical formulas from the plan spec:
+// 1. Directional matrix: V = W_0 + γ * B @ A
+// 2. Column-wise L2 norm for output row i: n_i = ||V[i,:]||_2 = sqrt(sum_j V[i,j]^2 + ε)
+// 3. Normalized directional matrix: V_hat[i,j] = V[i,j] / n_i
+// 4. Effective weight: W_eff[i,j] = m_i * V_hat[i,j]
+// 5. Output for input X: Y = X @ W_eff^T
+//
+// Returns Y = X @ W_eff^T.
 
 pub fn dora_forward(
     x: &Tensor,
@@ -430,8 +430,7 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
         },
         Storage::GroupInt(cfg) => cfg.bits,
         Storage::ResidualPacked(cfg) => cfg.bpw,
-        Storage::CompressedTensorsW8A8Int8
-        | Storage::CompressedTensorsW8A8Fp8 => 8,
+        Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => 8,
         Storage::W4A16(_) => 4,
         Storage::Native => 32,
         _ => (dtype.arith.byte_size() as u8) * 8,
@@ -504,8 +503,10 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         // (B [k, n]) whose grads are garbage through these kernels (both
         // wrong on gfx1201 vs the CPU reference); that case now falls back
         // to the verified host loops.
-        if !args.transpose_a && args.transpose_b
-            && (b_on_rocm || b_on_cuda || b_on_vulkan || b_on_metal) {
+        if !args.transpose_a
+            && args.transpose_b
+            && (b_on_rocm || b_on_cuda || b_on_vulkan || b_on_metal)
+        {
             let bpw = bpw_from_dtype(&args.b.dtype());
             let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_tensor(&args.b);
             let (grad_a_storage, _handle) = dev.quantized_matmul_backward_dx(
@@ -886,7 +887,7 @@ pub fn lora_backward(
         x.device().clone(),
     );
 
-    return Ok((grad_base, grad_x, grad_a, grad_b));
+    Ok((grad_base, grad_x, grad_a, grad_b))
 }
 
 /// SwiGLU backward: `output = silu(gate) * up`.
@@ -1238,6 +1239,7 @@ pub fn vera_backward(
 /// this function computes `output = base + scale * (x @ A^T) @ B^T`, registers trainable parameters `A` and `B`
 /// on `tape`, and records a `LoRAApply` tape entry. Returns `(output_tensor_id, output_tensor)`.
 /// If no adapter is enabled at this point, returns `(base_id, base)`.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_and_record_lora(
     autograd_reg: &crate::registry::AutogradRegistry,
     tape: &mut crate::tape::Tape,
@@ -1323,6 +1325,7 @@ pub fn apply_and_record_lora(
 ///
 /// Evaluates Gate and Up linear projections with LoRA adapters (if registered),
 /// applies SwiGLU activation (`silu(gate) * up`), and registers the resulting activation on `tape`.
+#[allow(clippy::too_many_arguments)]
 pub fn fused_swiglu_lora_mlp(
     autograd_reg: &crate::registry::AutogradRegistry,
     tape: &mut crate::tape::Tape,
@@ -1760,6 +1763,127 @@ pub fn fake_quant_int4_backward(_args: &FakeQuantInt4Args, grad_output: &Tensor)
     Ok(out)
 }
 
+/// OFT (Orthogonal Fine-Tuning) forward pass.
+/// Multiplies the base weight by an orthogonal expansion:
+/// W_out = W + scale * (r^T @ (r @ W))
+pub fn oft_forward(
+    w: &[f32],
+    r_factor: &[f32],
+    scale: f32,
+    rows: usize,
+    cols: usize,
+    rank: usize,
+) -> Result<Vec<f32>> {
+    if w.len() != rows * cols {
+        return Err(Error::Backend(format!(
+            "oft_forward: w length {} != {}x{}",
+            w.len(),
+            rows,
+            cols
+        )));
+    }
+    if r_factor.len() != rank * cols {
+        return Err(Error::Backend(format!(
+            "oft_forward: r_factor length {} != {}x{}",
+            r_factor.len(),
+            rank,
+            cols
+        )));
+    }
+
+    // tmp[k, i] = sum_j r[k, j] * w[i, j]
+    let mut tmp = vec![0.0f32; rank * rows];
+    for k in 0..rank {
+        for i in 0..rows {
+            let mut s = 0.0f32;
+            for j in 0..cols {
+                s += r_factor[k * cols + j] * w[i * cols + j];
+            }
+            tmp[k * rows + i] = s;
+        }
+    }
+
+    let mut out = w.to_vec();
+    for i in 0..rows {
+        for j in 0..cols {
+            let mut s = 0.0f32;
+            for k in 0..rank {
+                s += r_factor[k * cols + j] * tmp[k * rows + i];
+            }
+            out[i * cols + j] += scale * s;
+        }
+    }
+    Ok(out)
+}
+
+/// OFT (Orthogonal Fine-Tuning) backward pass.
+/// Computes gradients for base weight `w` and orthogonal factor `r_factor`.
+pub fn oft_backward(
+    out_grad: &[f32],
+    w: &[f32],
+    r_factor: &[f32],
+    scale: f32,
+    rows: usize,
+    cols: usize,
+    rank: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if out_grad.len() != rows * cols || w.len() != rows * cols {
+        return Err(Error::Backend("oft_backward: dimension mismatch".into()));
+    }
+    if r_factor.len() != rank * cols {
+        return Err(Error::Backend(
+            "oft_backward: r_factor length mismatch".into(),
+        ));
+    }
+
+    let mut tmp = vec![0.0f32; rank * rows];
+    for k in 0..rank {
+        for i in 0..rows {
+            let mut s = 0.0f32;
+            for j in 0..cols {
+                s += r_factor[k * cols + j] * w[i * cols + j];
+            }
+            tmp[k * rows + i] = s;
+        }
+    }
+
+    let mut out_tmp = vec![0.0f32; rank * rows];
+    for k in 0..rank {
+        for i in 0..rows {
+            let mut s = 0.0f32;
+            for j in 0..cols {
+                s += r_factor[k * cols + j] * out_grad[i * cols + j];
+            }
+            out_tmp[k * rows + i] = s;
+        }
+    }
+
+    let mut grad_w = vec![0.0f32; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            let mut s = 0.0f32;
+            for k in 0..rank {
+                s += r_factor[k * cols + j] * out_tmp[k * rows + i];
+            }
+            grad_w[i * cols + j] = out_grad[i * cols + j] + scale * s;
+        }
+    }
+
+    let mut grad_r = vec![0.0f32; rank * cols];
+    for k in 0..rank {
+        for j in 0..cols {
+            let mut s = 0.0f32;
+            for i in 0..rows {
+                s += out_grad[i * cols + j] * tmp[k * rows + i]
+                    + out_tmp[k * rows + i] * w[i * cols + j];
+            }
+            grad_r[k * cols + j] = scale * s;
+        }
+    }
+
+    Ok((grad_w, grad_r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1994,7 +2118,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(out_tensor.shape().dims(), &[1, 2]);
-        assert!(tape.len() > 0);
+        assert!(!tape.is_empty());
     }
 
     #[test]
@@ -2031,7 +2155,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(out_tensor.shape().dims(), &[1, 4]);
-        assert!(tape.len() > 0);
+        assert!(!tape.is_empty());
     }
 
     // --- FakeQuantInt4 (P5 Task 5.3) ---
@@ -2439,125 +2563,4 @@ mod tests {
             );
         }
     }
-}
-
-/// OFT (Orthogonal Fine-Tuning) forward pass.
-/// Multiplies the base weight by an orthogonal expansion:
-/// W_out = W + scale * (r^T @ (r @ W))
-pub fn oft_forward(
-    w: &[f32],
-    r_factor: &[f32],
-    scale: f32,
-    rows: usize,
-    cols: usize,
-    rank: usize,
-) -> Result<Vec<f32>> {
-    if w.len() != rows * cols {
-        return Err(Error::Backend(format!(
-            "oft_forward: w length {} != {}x{}",
-            w.len(),
-            rows,
-            cols
-        )));
-    }
-    if r_factor.len() != rank * cols {
-        return Err(Error::Backend(format!(
-            "oft_forward: r_factor length {} != {}x{}",
-            r_factor.len(),
-            rank,
-            cols
-        )));
-    }
-
-    // tmp[k, i] = sum_j r[k, j] * w[i, j]
-    let mut tmp = vec![0.0f32; rank * rows];
-    for k in 0..rank {
-        for i in 0..rows {
-            let mut s = 0.0f32;
-            for j in 0..cols {
-                s += r_factor[k * cols + j] * w[i * cols + j];
-            }
-            tmp[k * rows + i] = s;
-        }
-    }
-
-    let mut out = w.to_vec();
-    for i in 0..rows {
-        for j in 0..cols {
-            let mut s = 0.0f32;
-            for k in 0..rank {
-                s += r_factor[k * cols + j] * tmp[k * rows + i];
-            }
-            out[i * cols + j] += scale * s;
-        }
-    }
-    Ok(out)
-}
-
-/// OFT (Orthogonal Fine-Tuning) backward pass.
-/// Computes gradients for base weight `w` and orthogonal factor `r_factor`.
-pub fn oft_backward(
-    out_grad: &[f32],
-    w: &[f32],
-    r_factor: &[f32],
-    scale: f32,
-    rows: usize,
-    cols: usize,
-    rank: usize,
-) -> Result<(Vec<f32>, Vec<f32>)> {
-    if out_grad.len() != rows * cols || w.len() != rows * cols {
-        return Err(Error::Backend("oft_backward: dimension mismatch".into()));
-    }
-    if r_factor.len() != rank * cols {
-        return Err(Error::Backend(
-            "oft_backward: r_factor length mismatch".into(),
-        ));
-    }
-
-    let mut tmp = vec![0.0f32; rank * rows];
-    for k in 0..rank {
-        for i in 0..rows {
-            let mut s = 0.0f32;
-            for j in 0..cols {
-                s += r_factor[k * cols + j] * w[i * cols + j];
-            }
-            tmp[k * rows + i] = s;
-        }
-    }
-
-    let mut out_tmp = vec![0.0f32; rank * rows];
-    for k in 0..rank {
-        for i in 0..rows {
-            let mut s = 0.0f32;
-            for j in 0..cols {
-                s += r_factor[k * cols + j] * out_grad[i * cols + j];
-            }
-            out_tmp[k * rows + i] = s;
-        }
-    }
-
-    let mut grad_w = vec![0.0f32; rows * cols];
-    for i in 0..rows {
-        for j in 0..cols {
-            let mut s = 0.0f32;
-            for k in 0..rank {
-                s += r_factor[k * cols + j] * out_tmp[k * rows + i];
-            }
-            grad_w[i * cols + j] = out_grad[i * cols + j] + scale * s;
-        }
-    }
-
-    let mut grad_r = vec![0.0f32; rank * cols];
-    for k in 0..rank {
-        for j in 0..cols {
-            let mut s = 0.0f32;
-            for i in 0..rows {
-                s += out_grad[i * cols + j] * tmp[k * rows + i]
-                    + out_tmp[k * rows + i] * w[i * cols + j];
-            }
-            grad_r[k * cols + j] = scale * s;
-        }
-    }
-
-    Ok((grad_w, grad_r))
 }

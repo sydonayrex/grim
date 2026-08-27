@@ -8,8 +8,8 @@
 //!
 //! Device-gated: `GRIM_GPU_TEST=1`.
 
-use grim_engine::scythe2::ScytheRingExec;
 use grim_backend_rocm::RocmDevice;
+use grim_engine::scythe2::ScytheRingExec;
 use grim_tensor::backend::{BackendDevice, BackendStorage};
 use grim_tensor::{DType, Shape};
 
@@ -44,7 +44,9 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
 
     let x_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.3 - 1.2).collect();
     let w_data: Vec<f32> = (0..k).map(|i| ((i % 5) as f32) * 0.2 + 0.5).collect();
-    let g_data: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32) * 0.02 - 0.12).collect();
+    let g_data: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 13) as f32) * 0.02 - 0.12)
+        .collect();
 
     let x = dev
         .from_cpu(&x_data, &Shape::from_slice(&[m, k]), DType::F32)
@@ -62,8 +64,14 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
         .alloc_storage(&Shape::from_slice(&[m, n]), DType::F32)
         .expect("out");
 
-    exec.submit_norm(m as u32, k as u32, dev_ptr(x.as_ref()), dev_ptr(w.as_ref()), dev_ptr(tmp.as_ref()))
-        .expect("submit norm");
+    exec.submit_norm(
+        m as u32,
+        k as u32,
+        dev_ptr(x.as_ref()),
+        dev_ptr(w.as_ref()),
+        dev_ptr(tmp.as_ref()),
+    )
+    .expect("submit norm");
     exec.submit_col_gemm(
         m as u32,
         n as u32,
@@ -86,8 +94,11 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
         let row = &x_data[r * k..(r + 1) * k];
         let ss: f32 = row.iter().map(|v| v * v).sum::<f32>() / k as f32;
         let inv = 1.0 / (ss + eps).sqrt();
-        let normed: Vec<f32> =
-            row.iter().zip(w_data.iter()).map(|(&v, &gw)| v * inv * gw).collect();
+        let normed: Vec<f32> = row
+            .iter()
+            .zip(w_data.iter())
+            .map(|(&v, &gw)| v * inv * gw)
+            .collect();
         for (j, cell) in want[r * n..(r + 1) * n].iter_mut().enumerate() {
             let mut acc = 0f32;
             for p in 0..k {
@@ -102,7 +113,10 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("[sb6] ring norm->gemm chain max_abs_diff={d:.3e}");
-    assert!(d < 1e-3, "SB6 ring chain diverged from host reference: {d:.3e}");
+    assert!(
+        d < 1e-3,
+        "SB6 ring chain diverged from host reference: {d:.3e}"
+    );
 
     // Ring bookkeeping must be consistent after the drain.
     assert!(exec.ring.is_empty(), "ring must be empty after run_batch");
@@ -161,29 +175,57 @@ fn ring_resident_wave_two_batches() {
     // polling. If THIS stalls, the ring/kernel drops work under backlog;
     // if it passes, the defect is specific to idle-then-resume.
     eprintln!("[diag] phase0: submitting norm");
-    exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
-        .expect("A norm");
+    exec.submit_norm(
+        m as u32,
+        k as u32,
+        dev_ptr(xa.as_ref()),
+        dev_ptr(wa.as_ref()),
+        dev_ptr(tmpa.as_ref()),
+    )
+    .expect("A norm");
     eprintln!("[diag] phase0: submitting gemm");
-    exec.submit_col_gemm(m as u32, n as u32, k as u32, dev_ptr(tmpa.as_ref()), dev_ptr(ga.as_ref()), dev_ptr(outa.as_ref()))
-        .expect("A gemm");
+    exec.submit_col_gemm(
+        m as u32,
+        n as u32,
+        k as u32,
+        dev_ptr(tmpa.as_ref()),
+        dev_ptr(ga.as_ref()),
+        dev_ptr(outa.as_ref()),
+    )
+    .expect("A gemm");
     exec.flush().expect("phase0 flush");
-    let done = exec.wait_completed(2, std::time::Duration::from_secs(8)).expect("wait p0");
+    let done = exec
+        .wait_completed(2, std::time::Duration::from_secs(8))
+        .expect("wait p0");
     println!("[sb6] phase0 completed={done}");
     assert_eq!(done, 2, "phase0 (no-idle backlog) stalled at {done}");
 
     // Batch A.
     eprintln!("[diag] A: submitting norm");
-    exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
-        .expect("A norm");
+    exec.submit_norm(
+        m as u32,
+        k as u32,
+        dev_ptr(xa.as_ref()),
+        dev_ptr(wa.as_ref()),
+        dev_ptr(tmpa.as_ref()),
+    )
+    .expect("A norm");
     eprintln!("[diag] A: norm done; submitting gemm");
-    exec.submit_col_gemm(m as u32, n as u32, k as u32, dev_ptr(tmpa.as_ref()), dev_ptr(ga.as_ref()), dev_ptr(outa.as_ref()))
-        .expect("A gemm");
+    exec.submit_col_gemm(
+        m as u32,
+        n as u32,
+        k as u32,
+        dev_ptr(tmpa.as_ref()),
+        dev_ptr(ga.as_ref()),
+        dev_ptr(outa.as_ref()),
+    )
+    .expect("A gemm");
     eprintln!("[diag] A: gemm done; flushing");
     exec.flush().expect("flush A");
     eprintln!("[diag] A: flushed; polling");
     let _nb = dev.create_non_blocking_stream().expect("diag stream");
-    let _pin = grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(16 * 64)
-        .expect("pinned diag buffer");
+    let _pin =
+        grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(16 * 64).expect("pinned diag buffer");
     for i in 0..12 {
         let c = exec.completed().expect("completed read");
         eprintln!("[diag] A poll {i}: completed={c}");
@@ -198,11 +240,24 @@ fn ring_resident_wave_two_batches() {
 
     // Batch B reuses the same operand buffers (deterministic outputs).
     eprintln!("[diag] B: submitting norm");
-    exec.submit_norm(m as u32, k as u32, dev_ptr(xa.as_ref()), dev_ptr(wa.as_ref()), dev_ptr(tmpa.as_ref()))
-        .expect("B norm");
+    exec.submit_norm(
+        m as u32,
+        k as u32,
+        dev_ptr(xa.as_ref()),
+        dev_ptr(wa.as_ref()),
+        dev_ptr(tmpa.as_ref()),
+    )
+    .expect("B norm");
     eprintln!("[diag] B: norm done; submitting gemm");
-    exec.submit_col_gemm(m as u32, n as u32, k as u32, dev_ptr(tmpa.as_ref()), dev_ptr(ga.as_ref()), dev_ptr(outa.as_ref()))
-        .expect("B gemm");
+    exec.submit_col_gemm(
+        m as u32,
+        n as u32,
+        k as u32,
+        dev_ptr(tmpa.as_ref()),
+        dev_ptr(ga.as_ref()),
+        dev_ptr(outa.as_ref()),
+    )
+    .expect("B gemm");
     eprintln!("[diag] B: gemm done; flushing");
     exec.flush().expect("flush B");
     eprintln!("[diag] B: flushed; polling");
@@ -229,7 +284,7 @@ fn ring_resident_wave_two_batches() {
                 nb,
             );
         }
-        grim_backend_rocm::hip_stream_synchronize(nb);
+        let _ = grim_backend_rocm::hip_stream_synchronize(nb);
         dev.destroy_stream(nb);
         for (slot, chunk) in raw.chunks(64).enumerate() {
             let status = u32::from_ne_bytes(chunk[48..52].try_into().unwrap());
@@ -252,8 +307,11 @@ fn ring_resident_wave_two_batches() {
     for r in 0..m {
         let row = &xa_data[r * k..(r + 1) * k];
         let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / k as f32 + 1e-5).sqrt();
-        let normed: Vec<f32> =
-            row.iter().zip(w_data.iter()).map(|(&v, &w)| v * inv * w).collect();
+        let normed: Vec<f32> = row
+            .iter()
+            .zip(w_data.iter())
+            .map(|(&v, &w)| v * inv * w)
+            .collect();
         for (j, cell) in want[r * n..(r + 1) * n].iter_mut().enumerate() {
             *cell = (0..k).map(|p| normed[p] * ga_data[p * n + j]).sum();
         }
@@ -310,9 +368,7 @@ fn moe_opcode6_via_public_api_matches_host_reference() {
     let weights: Vec<f32> = vec![0.8, 0.6];
     let rsf = 0.9f32;
 
-    let u32_bytes = |v: &[u32]| -> Vec<u8> {
-        v.iter().flat_map(|x| x.to_ne_bytes()).collect()
-    };
+    let u32_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
     let u32_dtype = grim_tensor::dtype::DType {
         arith: grim_tensor::ArithType::U32,
         storage: grim_tensor::dtype::Storage::Native,
@@ -322,26 +378,50 @@ fn moe_opcode6_via_public_api_matches_host_reference() {
         .from_cpu(&act, &Shape::from_slice(&[num_tokens, hidden]), DType::F32)
         .expect("act");
     let gate_s = dev
-        .from_cpu(&gate, &Shape::from_slice(&[num_experts, inter * hidden]), DType::F32)
+        .from_cpu(
+            &gate,
+            &Shape::from_slice(&[num_experts, inter * hidden]),
+            DType::F32,
+        )
         .expect("gate");
     let up_s = dev
-        .from_cpu(&up, &Shape::from_slice(&[num_experts, inter * hidden]), DType::F32)
+        .from_cpu(
+            &up,
+            &Shape::from_slice(&[num_experts, inter * hidden]),
+            DType::F32,
+        )
         .expect("up");
     let down_s = dev
-        .from_cpu(&down, &Shape::from_slice(&[num_experts, hidden * inter]), DType::F32)
+        .from_cpu(
+            &down,
+            &Shape::from_slice(&[num_experts, hidden * inter]),
+            DType::F32,
+        )
         .expect("down");
     let tids_s = dev
-        .from_cpu_bytes(&u32_bytes(&token_ids), &Shape::from_slice(&[num_tokens]), u32_dtype.clone())
+        .from_cpu_bytes(
+            &u32_bytes(&token_ids),
+            &Shape::from_slice(&[num_tokens]),
+            u32_dtype.clone(),
+        )
         .expect("token ids");
     let eids_s = dev
-        .from_cpu_bytes(&u32_bytes(&expert_ids), &Shape::from_slice(&[num_tokens]), u32_dtype.clone())
+        .from_cpu_bytes(
+            &u32_bytes(&expert_ids),
+            &Shape::from_slice(&[num_tokens]),
+            u32_dtype.clone(),
+        )
         .expect("expert ids");
     let ws_s = dev
         .from_cpu(&weights, &Shape::from_slice(&[num_tokens]), DType::F32)
         .expect("weights");
     // Charon accumulates with atomicAdd — the output MUST start zeroed.
     let out = dev
-        .from_cpu(&vec![0f32; num_tokens * hidden], &Shape::from_slice(&[num_tokens, hidden]), DType::F32)
+        .from_cpu(
+            &vec![0f32; num_tokens * hidden],
+            &Shape::from_slice(&[num_tokens, hidden]),
+            DType::F32,
+        )
         .expect("out");
 
     let moe = MoETaskDescriptor {
@@ -367,7 +447,8 @@ fn moe_opcode6_via_public_api_matches_host_reference() {
     // address is what rides the ring.
     let moe_dev = moe.upload(&dev).expect("MoE descriptor upload");
 
-    let task = MoETaskDescriptor::enqueue_via(moe_dev, dev_ptr(act_s.as_ref()), dev_ptr(out.as_ref()), 0);
+    let task =
+        MoETaskDescriptor::enqueue_via(moe_dev, dev_ptr(act_s.as_ref()), dev_ptr(out.as_ref()), 0);
     let slot = exec.ring.enqueue(task).expect("enqueue");
     assert_eq!(slot, 0);
     let drained = exec.run_batch().expect("run batch");
@@ -488,8 +569,8 @@ fn ring_row_parallel_descriptor_fanin_parity() {
 
     // Per-shard operands: transposed B[k_half,n] slices plus this rank's
     // K-slice of x — exactly what a real row-parallel rank receives.
-    let mut b_t = Vec::new();   // device storages
-    let mut a_s = Vec::new();   // device storages
+    let mut b_t = Vec::new(); // device storages
+    let mut a_s = Vec::new(); // device storages
     let bounds = [(0usize, half), (half, k - half)];
     for &(k_start, k_count) in &bounds {
         // B^T slice: rows k_start..k_start+k_count of W, transposed to [k_count, n].
@@ -500,10 +581,7 @@ fn ring_row_parallel_descriptor_fanin_parity() {
             }
         }
         let bt_shape = Shape::from_slice(&[k_count, n]);
-        b_t.push(
-            dev.from_cpu(&bt, &bt_shape, DType::F32)
-                .expect("bt upload"),
-        );
+        b_t.push(dev.from_cpu(&bt, &bt_shape, DType::F32).expect("bt upload"));
         let mut xs = vec![0f32; m * k_count];
         for r in 0..m {
             for c in 0..k_count {
@@ -514,15 +592,23 @@ fn ring_row_parallel_descriptor_fanin_parity() {
         a_s.push(dev.from_cpu(&xs, &xs_shape, DType::F32).expect("xs upload"));
     }
 
-    let p0 = dev.alloc_storage(&Shape::from_slice(&[m, n]), DType::F32).expect("p0");
-    let p1 = dev.alloc_storage(&Shape::from_slice(&[m, n]), DType::F32).expect("p1");
+    let p0 = dev
+        .alloc_storage(&Shape::from_slice(&[m, n]), DType::F32)
+        .expect("p0");
+    let p1 = dev
+        .alloc_storage(&Shape::from_slice(&[m, n]), DType::F32)
+        .expect("p1");
     let summed = dev
         .alloc_storage(&Shape::from_slice(&[m, n]), DType::F32)
         .expect("summed");
 
     exec.submit_col_gemm(
-        m as u32, n as u32, half as u32,
-        dev_ptr(a_s[0].as_ref()), dev_ptr(b_t[0].as_ref()), dev_ptr(p0.as_ref()),
+        m as u32,
+        n as u32,
+        half as u32,
+        dev_ptr(a_s[0].as_ref()),
+        dev_ptr(b_t[0].as_ref()),
+        dev_ptr(p0.as_ref()),
     )
     .expect("gemm shard0");
     exec.submit_col_gemm(

@@ -341,6 +341,8 @@ impl SmoothQuantActScales {
         }
     }
 
+    // Inherent accessor kept for API compatibility with the other scale views.
+    #[allow(clippy::should_implement_trait)]
     pub fn borrow(&self) -> &[f32] {
         &self.channels
     }

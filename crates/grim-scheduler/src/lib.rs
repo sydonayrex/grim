@@ -13,7 +13,7 @@ pub mod bandwidth_policy;
 pub use bandwidth_policy::BandwidthProfile;
 
 /// A request in the scheduler system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     pub id: u64,
     pub prompt_tokens: usize,
@@ -31,21 +31,6 @@ pub struct Request {
     /// instead of synthetic position indices during prefill. Length must match
     /// `prompt_tokens` when present.
     pub input_ids: Option<Vec<u32>>,
-}
-
-impl Default for Request {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            prompt_tokens: 0,
-            max_new_tokens: 0,
-            priority: 0,
-            consumed_tokens: 0,
-            model_id: None,
-            adapter_ids: Vec::new(),
-            input_ids: None,
-        }
-    }
 }
 
 /// Admission decision for an incoming request.
@@ -783,7 +768,10 @@ mod tests {
         // One running entry per request (dedup across chunk passes), and
         // once fully consumed the request becomes decode-eligible.
         let copies = sched.running.iter().filter(|r| r.id == 7).count();
-        assert_eq!(copies, 1, "chunk passes must replace, not accumulate, running entries");
+        assert_eq!(
+            copies, 1,
+            "chunk passes must replace, not accumulate, running entries"
+        );
         let running = sched
             .running
             .iter()

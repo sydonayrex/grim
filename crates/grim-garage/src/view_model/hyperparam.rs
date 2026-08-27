@@ -213,8 +213,10 @@ mod tests {
     use super::*;
 
     fn normalized_with_rank(rank: u32) -> HyperparamFormV1 {
-        let mut f = HyperparamFormV1::default();
-        f.lora_rank = rank;
+        let f = HyperparamFormV1 {
+            lora_rank: rank,
+            ..HyperparamFormV1::default()
+        };
         f.normalized()
     }
 

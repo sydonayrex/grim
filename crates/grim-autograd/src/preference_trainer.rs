@@ -139,6 +139,7 @@ impl PreferenceTrainer {
     /// # Contract
     /// Evaluates the configured preference loss (`Dpo`, `Kto`, `Simpo`, `Orpo`, `Grpo`) and
     /// returns `(loss_val, chosen_logp_grad, rejected_logp_grad)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_preference_step(
         &self,
         kind: PreferenceKind,

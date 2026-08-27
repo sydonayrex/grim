@@ -56,7 +56,6 @@ fn shard_wt_cache() -> &'static Mutex<HashMap<ShardKey, Arc<Tensor>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-
 /// WI-SB5: floor-rounded partition ratios lose up to `n_ranks - 1` units of
 /// the split dimension; distribute the remainder to the last non-empty rank
 /// so sharded output always covers the full dimension.
@@ -75,7 +74,6 @@ fn split_counts(partition: &[f32], n_ranks: usize, total: usize) -> Vec<usize> {
     }
     counts
 }
-
 
 /// WI-SB5: (ordinal, device pointer) when `t` is ROCm-resident.
 fn rocm_residency(t: &Tensor) -> Option<(usize, u64)> {
@@ -118,7 +116,11 @@ fn cached_col_shard_w_t(
     k: usize,
 ) -> Result<Tensor> {
     let key: ShardKey = (layer_id, ordinal, start, count);
-    if let Some(t) = shard_wt_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+    if let Some(t) = shard_wt_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&key).cloned())
+    {
         return Ok((*t).clone());
     }
     let w_shard = slice_output_dim(weight, start, count)?;
@@ -156,7 +158,11 @@ fn cached_row_shard_w_t(
     out_features: usize,
 ) -> Result<Tensor> {
     let key: ShardKey = (layer_id, ordinal, start, count);
-    if let Some(t) = shard_wt_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+    if let Some(t) = shard_wt_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&key).cloned())
+    {
         return Ok((*t).clone());
     }
     let w_shard = slice_input_dim(weight, start, count)?;
@@ -416,8 +422,9 @@ impl Scythe2Linear {
             // rank device (built once per slice); `x` is zero-copy when it is
             // already resident there.
             let b_tensor;
-            let b_ref: &dyn BackendStorage;
-            match &rank_device {
+            let b_uploaded;
+
+            let b_ref: &dyn BackendStorage = match &rank_device {
                 Device::Rocm(ordinal) => {
                     b_tensor = cached_col_shard_w_t(
                         self.layer_id,
@@ -427,7 +434,7 @@ impl Scythe2Linear {
                         count,
                         k,
                     )?;
-                    b_ref = b_tensor.storage().as_ref();
+                    b_tensor.storage().as_ref()
                 }
                 _ => {
                     // Slice the weight for this rank's column shard.
@@ -440,21 +447,15 @@ impl Scythe2Linear {
                         }
                     }
                     b_uploaded =
-                        Some(rank_dev.from_cpu(&w_t, &Shape::new(vec![k, count]), DType::F32)?);
-                    b_ref = b_uploaded.as_deref().expect("uploaded this iteration");
+                        rank_dev.from_cpu(&w_t, &Shape::new(vec![k, count]), DType::F32)?;
+                    b_uploaded.as_ref()
                 }
-            }
+            };
             let a_op = x_operand_for(x, &x_vec, &rank_device, m, k);
-            let (out_s, _handle) = rank_dev.matmul(
-                a_op.as_ref(),
-                b_ref,
-                &Shape::new(vec![m, count]),
-            )?;
+            let (out_s, _handle) =
+                rank_dev.matmul(a_op.as_ref(), b_ref, &Shape::new(vec![m, count]))?;
             let shard_shape = Shape::new(vec![m, count]);
-            shards.push((
-                shard_output_tensor(out_s, shard_shape, &rank_device),
-                count,
-            ));
+            shards.push((shard_output_tensor(out_s, shard_shape, &rank_device), count));
             shard_out_dim += count;
             col_start += count;
         }
@@ -469,38 +470,31 @@ impl Scythe2Linear {
         // matrix on the FIRST shard's device via copy_via_route. Decode batches
         // are tiny (m ≤ 64), so per-row routed copies are cheap; larger
         // prefills keep the legacy host-staged gather.
-        let all_rocm = shards
-            .iter()
-            .all(|(t, _)| rocm_residency(t).is_some());
+        let all_rocm = shards.iter().all(|(t, _)| rocm_residency(t).is_some());
         let no_bias = self.bias.is_none();
         if all_rocm && no_bias && m <= 64 {
             let (lead_ord, _) = rocm_residency(&shards[0].0).expect("checked");
-            let lead_dev =
-                pick_device_for_storage_device(&Device::Rocm(lead_ord));
+            let lead_dev = pick_device_for_storage_device(&Device::Rocm(lead_ord));
             let out_shape = Shape::new(vec![m, shard_out_dim]);
             let out_storage = lead_dev.alloc_storage(&out_shape, DType::F32)?;
             let out_dev_ptr = out_storage
                 .as_any()
                 .downcast_ref::<RocmStorage>()
                 .and_then(|rs| rs.device_ptr_u64())
-                .ok_or_else(|| {
-                    Error::Backend("device concat: output has no device ptr".into())
-                })?;
+                .ok_or_else(|| Error::Backend("device concat: output has no device ptr".into()))?;
             let mut col_offset = 0usize;
             for (shard_t, n) in &shards {
                 let (src_ord, src_base) = rocm_residency(shard_t).expect("checked");
                 for r in 0..m {
                     let src_row = src_base + (r * n) as u64 * 4;
-                    let dst_row =
-                        out_dev_ptr + ((r * shard_out_dim + col_offset) as u64) * 4;
-                    grim_backend_rocm::RocmDevice::shared(src_ord)
-                        .copy_cross_device_bounce(
-                            lead_ord,
-                            dst_row as *mut std::ffi::c_void,
-                            src_ord,
-                            src_row as *const std::ffi::c_void,
-                            n * 4,
-                        )?;
+                    let dst_row = out_dev_ptr + ((r * shard_out_dim + col_offset) as u64) * 4;
+                    grim_backend_rocm::RocmDevice::shared(src_ord).copy_cross_device_bounce(
+                        lead_ord,
+                        dst_row as *mut std::ffi::c_void,
+                        src_ord,
+                        src_row as *const std::ffi::c_void,
+                        n * 4,
+                    )?;
                 }
                 col_offset += n;
             }
@@ -581,8 +575,7 @@ impl Scythe2Linear {
         let mut host_partial_sum = vec![0.0f32; m * out_features];
         let mut row_start = 0usize;
 
-        for rank_idx in 0..n_ranks {
-            let count = counts[rank_idx];
+        for (rank_idx, &count) in counts.iter().enumerate() {
             if count == 0 {
                 continue;
             }
@@ -640,8 +633,7 @@ impl Scythe2Linear {
                 &Shape::new(vec![m, out_features]),
             )?;
             let partial_shape = Shape::new(vec![m, out_features]);
-            let partial_t =
-                shard_output_tensor(partial_s, partial_shape.clone(), &rank_device);
+            let partial_t = shard_output_tensor(partial_s, partial_shape.clone(), &rank_device);
 
             if device_fan_in {
                 let (src_ord, src_ptr) =
@@ -653,25 +645,21 @@ impl Scythe2Linear {
                             Device::Rocm(o) => *o,
                             _ => unreachable!("device fan-in requires ROCm ranks"),
                         };
-                        let scratch_dev =
-                            pick_device_for_storage_device(&Device::Rocm(acc_ord));
+                        let scratch_dev = pick_device_for_storage_device(&Device::Rocm(acc_ord));
                         let scratch_storage =
                             scratch_dev.alloc_storage(&partial_shape, DType::F32)?;
                         let scratch_ptr = scratch_storage
                             .as_any()
                             .downcast_ref::<RocmStorage>()
                             .and_then(|rs| rs.device_ptr_u64())
-                            .ok_or_else(|| {
-                                Error::Backend("scratch has no device ptr".into())
-                            })?;
-                        grim_backend_rocm::RocmDevice::shared(src_ord)
-                            .copy_cross_device_bounce(
-                                acc_ord,
-                                scratch_ptr as *mut std::ffi::c_void,
-                                src_ord,
-                                src_ptr as *const std::ffi::c_void,
-                                (m * out_features) * 4,
-                            )?;
+                            .ok_or_else(|| Error::Backend("scratch has no device ptr".into()))?;
+                        grim_backend_rocm::RocmDevice::shared(src_ord).copy_cross_device_bounce(
+                            acc_ord,
+                            scratch_ptr as *mut std::ffi::c_void,
+                            src_ord,
+                            src_ptr as *const std::ffi::c_void,
+                            (m * out_features) * 4,
+                        )?;
                         let scratch_t = Tensor::new(
                             Arc::from(scratch_storage),
                             partial_shape.clone(),
@@ -679,7 +667,6 @@ impl Scythe2Linear {
                             self.full_weight.provenance().clone(),
                             Device::Rocm(acc_ord),
                         );
-                        acc = Some(add_tensors(&a, &scratch_t)?);
                         acc = Some(add_tensors(&a, &scratch_t)?);
                     }
                 }
@@ -694,9 +681,8 @@ impl Scythe2Linear {
 
         let out_shape = Shape::new(vec![m, out_features]);
         if device_fan_in {
-            let acc = acc.ok_or_else(|| {
-                Error::Backend("device fan-in produced no partials".into())
-            })?;
+            let acc =
+                acc.ok_or_else(|| Error::Backend("device fan-in produced no partials".into()))?;
             return Ok(acc);
         }
 
@@ -792,7 +778,7 @@ mod tests {
         // W^T = [[1,0,0,1],[0,1,0,1],[0,0,1,1]]
         // x[0]=[1,2,3] → [1, 2, 3, 6]
         // x[1]=[4,5,6] → [4, 5, 6, 15]
-        let expected = vec![1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0];
+        let expected = [1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0];
         let max_diff = y_vec
             .iter()
             .zip(expected.iter())
@@ -827,7 +813,7 @@ mod tests {
 
         // Reference: x @ W^T  = [1*1+2*0, 1*0+2*1, 1*1+2*1, 1*(-1)+2*1]
         //                      = [1, 2, 3, 1]
-        let expected = vec![1.0, 2.0, 3.0, 1.0];
+        let expected = [1.0, 2.0, 3.0, 1.0];
         let max_diff = y_vec
             .iter()
             .zip(expected.iter())

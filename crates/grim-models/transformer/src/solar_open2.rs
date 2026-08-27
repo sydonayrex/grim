@@ -77,10 +77,8 @@ impl SolarOpen2Config {
         let raw_head_dim = u("head_dim", 0);
         let head_dim = if raw_head_dim > 0 {
             raw_head_dim
-        } else if num_heads > 0 {
-            hidden_size / num_heads
         } else {
-            128
+            hidden_size.checked_div(num_heads).unwrap_or(128)
         };
 
         SolarOpen2Config {

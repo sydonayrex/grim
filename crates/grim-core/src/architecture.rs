@@ -167,6 +167,9 @@ pub enum ModelArchitecture {
 impl ModelArchitecture {
     /// Parse string identifier into `ModelArchitecture` enum variant.
     /// Matches GGUF `general.architecture` strings and HuggingFace `model_type` values.
+    // Deliberate inherent constructor: ~50 workspace-wide call sites rely on
+    // the infallible signature (unknown ids map to `Unknown`, not an Err).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let s_lower = s.to_lowercase();
         match s_lower.as_str() {

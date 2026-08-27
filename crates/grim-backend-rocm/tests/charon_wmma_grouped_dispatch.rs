@@ -38,6 +38,8 @@ fn gpu_device() -> Option<RocmDevice> {
 
 // ── deterministic synthetic MoE (same generators as golden_charon_moe_gpu) ──
 
+// The three-tensor return mirrors the GPU weight layout exactly.
+#[allow(clippy::type_complexity)]
 fn deterministic_expert_weights() -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut gate = Vec::with_capacity(NUM_EXPERTS);
     let mut up = Vec::with_capacity(NUM_EXPERTS);

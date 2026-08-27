@@ -531,12 +531,15 @@ pub fn validate_pattern(pat: &str, text: &str) -> bool {
         regex.matches(text)
     } else {
         if pat.starts_with('^') && pat.ends_with('$') {
-            let inner = &pat[1..pat.len() - 1];
+            let inner = pat
+                .strip_prefix('^')
+                .and_then(|p| p.strip_suffix('$'))
+                .unwrap_or(pat);
             text == inner || text.starts_with(inner)
-        } else if pat.starts_with('^') {
-            text.starts_with(&pat[1..])
-        } else if pat.ends_with('$') {
-            text.ends_with(&pat[..pat.len() - 1])
+        } else if let Some(inner) = pat.strip_prefix('^') {
+            text.starts_with(inner)
+        } else if let Some(inner) = pat.strip_suffix('$') {
+            text.ends_with(inner)
         } else {
             text.contains(pat)
         }

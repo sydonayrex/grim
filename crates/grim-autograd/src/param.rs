@@ -207,7 +207,7 @@ impl TrainableParams {
     /// to prevent gradient explosions.
     pub fn clip_grad_norm(&mut self, max_norm: f32) {
         let mut total_norm_sq = 0.0f32;
-        for (_, param) in &self.params {
+        for param in self.params.values() {
             if param.frozen {
                 continue;
             }
@@ -220,13 +220,13 @@ impl TrainableParams {
         let total_norm = total_norm_sq.sqrt();
         if total_norm > max_norm && total_norm > 0.0 {
             let scale = max_norm / total_norm;
-            for (_, param) in &mut self.params {
+            for param in self.params.values_mut() {
                 if param.frozen {
                     continue;
                 }
                 if let Ok(grad_vec) = param.grad().to_vec_f32() {
                     let scaled: Vec<f32> = grad_vec.iter().map(|v| v * scale).collect();
-                    let dev = crate::pick_device_for_tensor(&param.grad());
+                    let dev = crate::pick_device_for_tensor(param.grad());
                     if let Ok(new_storage) =
                         dev.from_cpu(&scaled, param.grad().shape(), param.grad().dtype())
                     {
@@ -303,7 +303,7 @@ impl TrainableParams {
         // gradients on-device via ncclAllReduce to avoid the D2H round-trip.
         if let Some(rccl_handle) = rccl {
             if num_gpus > 1 {
-                for (_, param) in self.params.iter_mut() {
+                for param in self.params.values_mut() {
                     let dev_ptr = param.grad.storage().device_ptr();
                     let count = param.grad.shape().elem_count();
 
@@ -366,7 +366,7 @@ impl TrainableParams {
         // ── Single-rank accumulation only ─────────────────────────────────
         // A host accumulation is not a multi-rank reduction. Multi-rank calls
         // were rejected above so this path cannot silently diverge replicas.
-        for (_, param) in self.params.iter_mut() {
+        for param in self.params.values_mut() {
             let mut grad_vec = param.grad.to_vec_f32()?;
             for value in &mut grad_vec {
                 *value *= contribution_weight;
@@ -379,7 +379,7 @@ impl TrainableParams {
 
     /// Zero all gradient buffers — called at the start of each training step.
     pub fn zero_all_grads(&mut self) -> Result<()> {
-        for (_, param) in self.params.iter_mut() {
+        for param in self.params.values_mut() {
             param.zero_grad()?;
         }
         Ok(())

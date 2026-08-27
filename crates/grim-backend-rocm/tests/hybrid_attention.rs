@@ -220,12 +220,10 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
             let cpu_partial = &cpu_partials[meta_idx];
 
             // Merge the two triples
-            let merged = merge_partials(&gpu_partial, &cpu_partial);
+            let merged = merge_partials(&gpu_partial, cpu_partial);
             let finalized = merged.finalize();
 
-            for d in 0..head_dim {
-                hybrid_out[qh_offset + d] = finalized[d];
-            }
+            hybrid_out[qh_offset..qh_offset + head_dim].copy_from_slice(&finalized[..head_dim]);
         }
     }
 

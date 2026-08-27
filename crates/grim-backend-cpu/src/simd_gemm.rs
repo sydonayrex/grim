@@ -77,6 +77,7 @@ fn gemm_f32_scalar(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [
 }
 
 /// Fused LoRA GEMM: `Y = X*W^T + scale*((X*A)*B)`.
+#[allow(clippy::too_many_arguments)]
 pub fn gemm_f32_lora_fused(
     m: usize,
     n: usize,
@@ -120,12 +121,12 @@ mod tests {
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
         ];
         // C[i][j] = sum_k A[i][k] * B[j][k].
-        let expected = vec![
+        let expected = [
             30.0, 70.0, 110.0, // C[0][0..2]
             70.0, 174.0, 278.0, // C[1][0..2]
         ];
 
-        let mut c = vec![0.0f32; 6];
+        let mut c = [0.0f32; 6];
         gemm_f32_simd(2, 3, 4, &a, &b, &mut c);
 
         for i in 0..6 {
@@ -148,7 +149,7 @@ mod tests {
         // C[0][j] = sum_k A[0*K+k] * B[j*K+k]
         // C[0][0] = 1*1 + 2*2 + 3*3 + 4*4 = 30
         // C[0][1] = 1*5 + 2*6 + 3*7 + 4*8 = 70
-        let expected = vec![30.0, 70.0];
+        let expected = [30.0, 70.0];
 
         let mut c = vec![0.0f32; 2];
         gemm_f32_simd(1, 2, 4, &a, &b, &mut c);
@@ -179,7 +180,7 @@ mod tests {
         let scale = 2.0;
 
         // Hand-computed: X*W^T=[7,10,17]; X*A=[7,4]; (X*A)*B=[7,18,12]; Y=[21,46,41].
-        let expected = vec![21.0, 46.0, 41.0];
+        let expected = [21.0, 46.0, 41.0];
 
         let mut y = vec![0.0f32; 3];
         gemm_f32_lora_fused(m, n, k, lora_rank, &x, &w, &a, &b, scale, &mut y);

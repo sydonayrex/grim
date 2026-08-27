@@ -171,7 +171,7 @@ mod tests {
         scales[4] = 0x80; // m0 low6=0, top2=0b10 (true source of m4's high bits)
         scales[8] = 0x35; // sc4 lo nibble=5, m4 hi nibble=3
         buf[4..16].copy_from_slice(&scales);
-        buf[16] = 4 | (0 << 4);
+        buf[16] = 4;
         buf[80] = 10 | (7 << 4); // out[128]: s=4 lo nibble path
         buf[81] = 6 | (2 << 4); // out[129]: s=4 lo nibble 6
 

@@ -215,9 +215,9 @@ impl TensorParallelConfig {
     /// `Result`) misconfigured config rather than silently degrading.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.world_size == 0 {
-            return Err(format!(
-                "invalid TensorParallelConfig: world_size must be >= 1 (got 0)"
-            ));
+            return Err(
+                "invalid TensorParallelConfig: world_size must be >= 1 (got 0)".to_string(),
+            );
         }
         if self.world_size == 1 {
             if self.rank != 0 {
@@ -1930,24 +1930,24 @@ impl MlaAttention {
                     // q_rope in [b*num_heads, s, rope_dim]: row=bi*num_heads+hi, col=si
                     let qr_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
                         + si * self.qk_rope_head_dim;
-                    for i in 0..self.qk_nope_head_dim {
-                        q_nope[qn_off + i] = q_vec[q_base + i];
-                    }
-                    for i in 0..self.qk_rope_head_dim {
-                        q_rope[qr_off + i] = q_vec[q_base + self.qk_nope_head_dim + i];
-                    }
+                    q_nope[qn_off..qn_off + self.qk_nope_head_dim]
+                        .copy_from_slice(&q_vec[q_base..q_base + self.qk_nope_head_dim]);
+                    q_rope[qr_off..qr_off + self.qk_rope_head_dim].copy_from_slice(
+                        &q_vec[q_base + self.qk_nope_head_dim
+                            ..q_base + self.qk_nope_head_dim + self.qk_rope_head_dim],
+                    );
 
                     let kv_base = ((bi * s + si) * self.num_heads + hi) * kv_head_dim;
                     let kn_off = (bi * s + si) * qn_stride + hi * self.qk_nope_head_dim;
                     let kr_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
                         + si * self.qk_rope_head_dim;
                     let v_off = (bi * s + si) * v_stride + hi * self.v_head_dim;
-                    for i in 0..self.qk_nope_head_dim {
-                        k_nope[kn_off + i] = kv_vec[kv_base + i];
-                    }
-                    for i in 0..self.qk_rope_head_dim {
-                        k_rope[kr_off + i] = kv_vec[kv_base + self.qk_nope_head_dim + i];
-                    }
+                    k_nope[kn_off..kn_off + self.qk_nope_head_dim]
+                        .copy_from_slice(&kv_vec[kv_base..kv_base + self.qk_nope_head_dim]);
+                    k_rope[kr_off..kr_off + self.qk_rope_head_dim].copy_from_slice(
+                        &kv_vec[kv_base + self.qk_nope_head_dim
+                            ..kv_base + self.qk_nope_head_dim + self.qk_rope_head_dim],
+                    );
                     for i in 0..self.v_head_dim {
                         v_vec[v_off + i] =
                             kv_vec[kv_base + self.qk_nope_head_dim + self.qk_rope_head_dim + i];
@@ -2032,17 +2032,15 @@ impl MlaAttention {
             for hi in 0..self.num_heads {
                 for t in 0..s {
                     let q_off = t * qn_stride + hi * self.qk_nope_head_dim;
-                    let qr_off =
-                        hi * s * self.qk_rope_head_dim + t * self.qk_rope_head_dim;
+                    let qr_off = hi * s * self.qk_rope_head_dim + t * self.qk_rope_head_dim;
                     let causal_limit = past + t;
                     let mut scores = vec![0.0f32; causal_limit + 1];
-                    for t2 in 0..=causal_limit {
+                    for (t2, score_slot) in scores.iter_mut().enumerate() {
                         // History rows are stored token-major, heads inside.
                         let kn_off = t2 * qn_stride + hi * self.qk_nope_head_dim;
                         // Token-major history: row t2 holds all heads' rope.
-                        let kr2_off =
-                            t2 * self.num_heads * self.qk_rope_head_dim
-                                + hi * self.qk_rope_head_dim;
+                        let kr2_off = t2 * self.num_heads * self.qk_rope_head_dim
+                            + hi * self.qk_rope_head_dim;
                         let mut dot = 0.0f32;
                         for i in 0..self.qk_nope_head_dim {
                             dot += q_nope[q_off + i] * c.hist_k_nope[kn_off + i];
@@ -2050,7 +2048,7 @@ impl MlaAttention {
                         for i in 0..self.qk_rope_head_dim {
                             dot += q_rope[qr_off + i] * c.hist_k_rope[kr2_off + i];
                         }
-                        scores[t2] = dot * scale;
+                        *score_slot = dot * scale;
                     }
                     let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut sum = 0.0f32;
@@ -2078,7 +2076,7 @@ impl MlaAttention {
                 x.provenance().clone(),
                 x.device().clone(),
             );
-            return Ok(self.o_proj.forward(&out_t)?);
+            return self.o_proj.forward(&out_t);
         }
 
         // Causal scaled-dot-product attention per head (fixes the missing-attention bug).
@@ -2093,7 +2091,7 @@ impl MlaAttention {
                         + t * self.qk_rope_head_dim;
                     // scores over the causal window t2 in 0..=t
                     let mut scores = vec![0.0f32; t + 1];
-                    for t2 in 0..=t {
+                    for (t2, score_slot) in scores.iter_mut().enumerate() {
                         let kn_off = (bi * s + t2) * qn_stride + hi * self.qk_nope_head_dim;
                         // k_rope in [b*num_heads, s, rope_dim]: row=bi*num_heads+hi, col=t2
                         let kr2_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
@@ -2105,7 +2103,7 @@ impl MlaAttention {
                         for i in 0..self.qk_rope_head_dim {
                             dot += q_rope[qr_off + i] * k_rope[kr2_off + i];
                         }
-                        scores[t2] = dot * scale;
+                        *score_slot = dot * scale;
                     }
                     // softmax over the causal window
                     let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2122,9 +2120,9 @@ impl MlaAttention {
                     let o_off = (bi * s + t) * v_stride + hi * self.v_head_dim;
                     for i in 0..self.v_head_dim {
                         let mut acc = 0.0f32;
-                        for t2 in 0..=t {
+                        for (t2, &score) in scores.iter().enumerate() {
                             let v_off = (bi * s + t2) * v_stride + hi * self.v_head_dim;
-                            acc += scores[t2] * v_vec[v_off + i];
+                            acc += score * v_vec[v_off + i];
                         }
                         out[o_off + i] = acc;
                     }
@@ -2238,12 +2236,8 @@ mod mla_attention_tests {
         let dev = cpu_dev();
         Tensor::new(
             Arc::from(
-                dev.from_cpu(
-                    &vec![0.3f32; 1 * 3 * 16],
-                    &Shape::new(vec![1, 3, 16]),
-                    DType::F32,
-                )
-                .unwrap(),
+                dev.from_cpu(&[0.3f32; 3 * 16], &Shape::new(vec![1, 3, 16]), DType::F32)
+                    .unwrap(),
             ),
             Shape::new(vec![1, 3, 16]),
             DType::F32,
@@ -2348,8 +2342,8 @@ impl KdaAttention {
                         .clamp(0.0, 1.0);
                     let decay = 1.0 / (1.0 + (-a_vec.get(token_off).copied().unwrap_or(0.0)).exp());
 
-                    for i in 0..state_size {
-                        state[i] *= decay;
+                    for st in state[..state_size].iter_mut() {
+                        *st *= decay;
                     }
 
                     let mut a_t = vec![0.0f32; self.v_dim];
@@ -2571,6 +2565,9 @@ impl Conv1d {
     }
 
     /// Load a `Conv1d` module from a `WeightSource`.
+    // Parameters mirror the serialized Conv1d layout 1:1; grouping them into
+    // a struct would just relocate the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         ws: &WeightSource<'_>,
         out_c: usize,
@@ -2838,7 +2835,6 @@ impl ConvTranspose1d {
     }
 }
 
-
 #[cfg(test)]
 mod mla_cache_tests {
     use super::*;
@@ -2868,7 +2864,9 @@ mod mla_cache_tests {
         let mut lin = move |rows: usize, cols: usize| {
             Linear::from_tensor(
                 cpu_tensor(
-                    (0..rows * cols).map(|_| lcg(&mut seed) * 0.1).collect::<Vec<f32>>(),
+                    (0..rows * cols)
+                        .map(|_| lcg(&mut seed) * 0.1)
+                        .collect::<Vec<f32>>(),
                     Shape::new(vec![rows, cols]),
                 ),
                 None,
@@ -2877,10 +2875,16 @@ mod mla_cache_tests {
         let qk_head_dim = nope + rope_dim;
         let mla = MlaAttention {
             q_a_proj: lin(q_lora, hidden),
-            q_a_norm: RmsNorm::new(cpu_tensor(vec![1.0; q_lora], Shape::new(vec![q_lora])), 1e-5),
+            q_a_norm: RmsNorm::new(
+                cpu_tensor(vec![1.0; q_lora], Shape::new(vec![q_lora])),
+                1e-5,
+            ),
             q_b_proj: lin(heads * qk_head_dim, q_lora),
             kv_a_proj_with_mqa: lin(kv_lora, hidden),
-            kv_a_norm: RmsNorm::new(cpu_tensor(vec![1.0; kv_lora], Shape::new(vec![kv_lora])), 1e-5),
+            kv_a_norm: RmsNorm::new(
+                cpu_tensor(vec![1.0; kv_lora], Shape::new(vec![kv_lora])),
+                1e-5,
+            ),
             kv_b_proj: lin(heads * (nope + rope_dim + v_dim), kv_lora),
             o_proj: lin(hidden, heads * v_dim),
             q_norm: None,
@@ -2894,7 +2898,9 @@ mod mla_cache_tests {
 
         // Full prefill of a 2-token sequence, positions [0, 1], no cache.
         let x_full = cpu_tensor(
-            (0..2 * hidden).map(|i| ((i % 7) as f32 * 0.3) - 0.9).collect::<Vec<f32>>(),
+            (0..2 * hidden)
+                .map(|i| ((i % 7) as f32 * 0.3) - 0.9)
+                .collect::<Vec<f32>>(),
             Shape::new(vec![1, 2, hidden]),
         );
         let full = mla.forward(&x_full, &[0, 1], None).expect("prefill");
@@ -2902,11 +2908,21 @@ mod mla_cache_tests {
 
         // Incremental: token 0 then token 1 through ONE cache.
         let mut cache = MlaKvCache::new();
-        let x0 = cpu_tensor(x_full.to_vec_f32().unwrap()[..hidden].to_vec(), Shape::new(vec![1, 1, hidden]));
-        let x1 = cpu_tensor(x_full.to_vec_f32().unwrap()[hidden..].to_vec(), Shape::new(vec![1, 1, hidden]));
-        let step0 = mla.forward(&x0, &[0], Some(&mut cache)).expect("cached step 0");
+        let x0 = cpu_tensor(
+            x_full.to_vec_f32().unwrap()[..hidden].to_vec(),
+            Shape::new(vec![1, 1, hidden]),
+        );
+        let x1 = cpu_tensor(
+            x_full.to_vec_f32().unwrap()[hidden..].to_vec(),
+            Shape::new(vec![1, 1, hidden]),
+        );
+        let step0 = mla
+            .forward(&x0, &[0], Some(&mut cache))
+            .expect("cached step 0");
         assert_eq!(cache.past_len, 1);
-        let step1 = mla.forward(&x1, &[1], Some(&mut cache)).expect("cached step 1");
+        let step1 = mla
+            .forward(&x1, &[1], Some(&mut cache))
+            .expect("cached step 1");
         assert_eq!(cache.past_len, 2);
 
         let s0 = step0.to_vec_f32().unwrap();

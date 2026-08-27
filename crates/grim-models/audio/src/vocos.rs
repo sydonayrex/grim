@@ -72,7 +72,7 @@ struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     fn new(dim: usize, intermediate: usize, rng: &mut SimpleRng) -> Self {
-        let dw_weight = (0..dim * 1 * 7)
+        let dw_weight = (0..dim * 7)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
         let dw_conv = Conv1d::new(
@@ -153,7 +153,7 @@ impl ConvNeXtBlock {
         let h_gelu = cpu_tensor(
             h.to_vec_f32()?
                 .into_iter()
-                .map(|v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v * v * v)).tanh()))
+                .map(|v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh()))
                 .collect(),
             h.shape().clone(),
         );

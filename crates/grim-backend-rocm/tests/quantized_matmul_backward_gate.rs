@@ -8,7 +8,6 @@
 
 use grim_autograd::ops::{MatMulArgs, matmul_backward};
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::BackendStorage;
 use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Device, Shape, Tensor};
 use std::sync::Arc;
@@ -90,8 +89,16 @@ fn quantized_b_gpu_backward_matches_cpu_reference() {
     .unwrap_or_else(|e| panic!("quantized GPU matmul_backward failed: {e}"));
 
     for (name, got, want) in [
-        ("grad_a", gpu_ga.to_vec_f32().unwrap(), ref_ga.to_vec_f32().unwrap()),
-        ("grad_b", gpu_gb.to_vec_f32().unwrap(), ref_gb.to_vec_f32().unwrap()),
+        (
+            "grad_a",
+            gpu_ga.to_vec_f32().unwrap(),
+            ref_ga.to_vec_f32().unwrap(),
+        ),
+        (
+            "grad_b",
+            gpu_gb.to_vec_f32().unwrap(),
+            ref_gb.to_vec_f32().unwrap(),
+        ),
     ] {
         assert_eq!(got.len(), want.len(), "{name} length");
         let md = got

@@ -16,7 +16,7 @@ pub fn dequant_row(
     let mut out = vec![0.0f32; row_stride];
     let bpw = ext.map(|e| e.default_bpw).unwrap_or(default_bpw);
 
-    let row_bytes = ((row_stride * bpw as usize + 7) / 8 + 255) & !255;
+    let row_bytes = ((row_stride * bpw as usize).div_ceil(8) + 255) & !255;
     let row_start_idx = row_idx * row_bytes;
     let row_data = if row_start_idx < packed_bits.len() {
         &packed_bits[row_start_idx..]
@@ -24,7 +24,7 @@ pub fn dequant_row(
         &[]
     };
 
-    for i in 0..row_stride {
+    for (i, slot) in out.iter_mut().enumerate() {
         let bit_offset = i * bpw as usize;
         let byte_offset = bit_offset / 8;
         let in_byte_offset = bit_offset % 8;
@@ -55,7 +55,7 @@ pub fn dequant_row(
 
         let levels = (1u32 << bpw) as f32;
         let normalized = code as f32 / (levels - 1.0);
-        out[i] = normalized * 2.0 - 1.0;
+        *slot = normalized * 2.0 - 1.0;
     }
 
     let scale_val = if !scales.is_empty() && row_idx < scales.len() {
@@ -71,7 +71,7 @@ pub fn dequant_row(
     if let Some(ext) = ext {
         if ext.backup1.is_present() && ext.gptq_ordered > 0 {
             let b1_bpw = ext.backup1.bpw;
-            let b1_row_bytes = ((row_stride * b1_bpw as usize + 7) / 8 + 255) & !255;
+            let b1_row_bytes = ((row_stride * b1_bpw as usize).div_ceil(8) + 255) & !255;
             let b1_row_start = ext.backup1.codes_offset as usize + row_idx * b1_row_bytes;
 
             let b1_scale_idx = ext.backup1.scale_offset as usize + row_idx;
@@ -81,7 +81,7 @@ pub fn dequant_row(
                 1.0f32
             };
 
-            for i in 0..row_stride {
+            for (i, slot) in out.iter_mut().enumerate() {
                 let bit_offset = i * b1_bpw as usize;
                 let byte_offset = bit_offset / 8;
                 let in_byte_offset = bit_offset % 8;
@@ -119,14 +119,14 @@ pub fn dequant_row(
                 let levels = (1u32 << b1_bpw) as f32;
                 let normalized = code as f32 / (levels - 1.0);
                 let dequant_b1 = (normalized * 2.0 - 1.0) * b1_scale;
-                out[i] += dequant_b1;
+                *slot += dequant_b1;
             }
         }
 
         // WI-T8.1: backup2 mirror without `gptq_ordered > 0` (reserved for LoRA adapters).
         if ext.backup2.is_present() {
             let b2_bpw = ext.backup2.bpw;
-            let b2_row_bytes = ((row_stride * b2_bpw as usize + 7) / 8 + 255) & !255;
+            let b2_row_bytes = ((row_stride * b2_bpw as usize).div_ceil(8) + 255) & !255;
             let b2_row_start = ext.backup2.codes_offset as usize + row_idx * b2_row_bytes;
             let b2_scale_idx = ext.backup2.scale_offset as usize + row_idx;
             let b2_scale = if b2_scale_idx < packed_bits.len() {
@@ -135,7 +135,7 @@ pub fn dequant_row(
                 1.0f32
             };
 
-            for i in 0..row_stride {
+            for (i, slot) in out.iter_mut().enumerate() {
                 let bit_offset = i * b2_bpw as usize;
                 let byte_offset = bit_offset / 8;
                 let in_byte_offset = bit_offset % 8;
@@ -173,7 +173,7 @@ pub fn dequant_row(
                 let levels = (1u32 << b2_bpw) as f32;
                 let normalized = code as f32 / (levels - 1.0);
                 let dequant_b2 = (normalized * 2.0 - 1.0) * b2_scale;
-                out[i] += dequant_b2;
+                *slot += dequant_b2;
             }
         }
     }
@@ -197,7 +197,7 @@ mod tests {
     fn pack_row_test(weights: &[f32], bpw: u8) -> Vec<u8> {
         let mut out = Vec::new();
         let bits_needed = weights.len() as u64 * bpw as u64;
-        let bytes_needed = (bits_needed + 7) / 8;
+        let bytes_needed = bits_needed.div_ceil(8);
         out.resize(bytes_needed as usize, 0u8);
 
         for (i, &v) in weights.iter().enumerate() {
@@ -259,16 +259,18 @@ mod tests {
         backup_len_bytes: usize,
     ) -> GrimTensorExt {
         use grim_format::BackupLayer;
-        let mut ext = GrimTensorExt::default();
-        ext.default_bpw = 4;
-        ext.backup2 = BackupLayer {
-            codes_offset: backup_codes_offset,
-            codes_size: backup_len_bytes as u64,
-            bpw: backup_bpw,
-            scale_offset: backup_scale_offset,
-            scale_size: 1,
-        };
-        ext
+
+        GrimTensorExt {
+            default_bpw: 4,
+            backup2: BackupLayer {
+                codes_offset: backup_codes_offset,
+                codes_size: backup_len_bytes as u64,
+                bpw: backup_bpw,
+                scale_offset: backup_scale_offset,
+                scale_size: 1,
+            },
+            ..GrimTensorExt::default()
+        }
     }
 
     // WI-T8.1: additive merge of backup2 codes; empty/zero bytes must be no-op (detach).
@@ -328,7 +330,7 @@ mod tests {
 
         // Detach (WI-T8.1): zero codes+scale; scale=0 → contribution=0 (bytes are state).
         let mut detached_buf = primary_packed.clone();
-        detached_buf.extend(std::iter::repeat(0u8).take(backup_codes.len()));
+        detached_buf.extend(std::iter::repeat_n(0u8, backup_codes.len()));
         detached_buf.push(0u8);
         let detached = dequant_row(0, row_stride, &detached_buf, &[255], bpw, Some(&ext), &[]);
         for (i, &w) in weights.iter().enumerate() {

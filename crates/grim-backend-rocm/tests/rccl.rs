@@ -186,7 +186,7 @@ fn rccl_selected_pair_matches_requested_topology() -> TestResult {
 #[test]
 fn collective_config_default_is_disabled() -> TestResult {
     let cfg = CollectiveConfig::default();
-    assert_eq!(cfg.enabled, false);
+    assert!(!cfg.enabled);
     Ok(())
 }
 
@@ -211,8 +211,9 @@ fn rocm_comm_new_is_err_when_unavailable() -> TestResult {
 #[cfg(feature = "rccl")]
 #[test]
 fn rocm_comm_ffi_linked() -> TestResult {
-    // A dangling symbol would be a *link* error, not a runtime one.
-    assert!(true, "RCCL RocmComm FFI linked (build-time check)");
+    // A dangling symbol would be a *link* error, not a runtime one, so simply
+    // linking this test binary proves the FFI symbols resolve.
+    let _linked = "RCCL RocmComm FFI linked (build-time check)";
     Ok(())
 }
 
@@ -242,8 +243,9 @@ fn p2p_memcpy_is_err_when_unavailable() -> TestResult {
 #[cfg(feature = "rccl")]
 #[test]
 fn p2p_ffi_linked() -> TestResult {
-    // A dangling symbol would be a *link* error, not a runtime one.
-    assert!(true, "RCCL P2P FFI linked (build-time check)");
+    // A dangling symbol would be a *link* error, not a runtime one, so simply
+    // linking this test binary proves the FFI symbols resolve.
+    let _linked = "RCCL P2P FFI linked (build-time check)";
     Ok(())
 }
 
@@ -253,7 +255,7 @@ fn p2p_ffi_linked() -> TestResult {
 fn kv_dequant_attention_config_default_is_disabled() -> TestResult {
     use grim_backend_rocm::KvDequantAttentionConfig;
     let cfg = KvDequantAttentionConfig::default();
-    assert_eq!(cfg.enabled, false);
+    assert!(!cfg.enabled);
     assert_eq!(cfg.wavefront_size, 64);
     Ok(())
 }

@@ -30,7 +30,7 @@ pub fn reset_managed_fallback_instrumentation() {
 /// Record that an allocation fell back to HIP managed memory and surface the
 /// risk to the user once per process. AMD's SVM (the backing mechanism for
 /// `hipMallocManaged`) evicts FIFO with no reuse awareness and — as of ROCm
-/// >= 6.8.0 — migrates in 2 MiB fault granularity; under genuine
+/// 6.8.0 or later — migrates in 2 MiB fault granularity; under genuine
 /// oversubscription this can collapse throughput to near zero. grim cannot
 /// adopt the driver-level fix (it requires patching AMDGPU/TTM, not
 /// upstreamed), so the honest remediation is: say it plainly, once, and point

@@ -88,17 +88,17 @@ mod tests {
 
     #[test]
     fn garage_seed_is_in_unit_alpha_range() {
-        assert!(GARAGE_SEED_OKLCH.a >= 0.0 && GARAGE_SEED_OKLCH.a <= 1.0);
+        const { assert!(GARAGE_SEED_OKLCH.a >= 0.0 && GARAGE_SEED_OKLCH.a <= 1.0) };
     }
 
     #[test]
     fn garage_seed_lightness_in_oklch_perceptual_range() {
-        assert!(GARAGE_SEED_OKLCH.l >= 0.0 && GARAGE_SEED_OKLCH.l <= 1.0);
+        const { assert!(GARAGE_SEED_OKLCH.l >= 0.0 && GARAGE_SEED_OKLCH.l <= 1.0) };
     }
 
     #[test]
     fn sidebar_surface_is_lighter_than_seed() {
-        assert!(GarageSurface::SIDEBAR.oklch.l > GARAGE_SEED_OKLCH.l);
+        const { assert!(GarageSurface::SIDEBAR.oklch.l > GARAGE_SEED_OKLCH.l) };
     }
 
     #[test]

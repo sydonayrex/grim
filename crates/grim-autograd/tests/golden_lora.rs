@@ -71,7 +71,7 @@ fn test_apply_and_record_lora_golden_mutation_resistant() {
     // (x @ A^T) @ B^T = [2.0, 4.0, 6.0, 8.0]
     // out = [0.5, 0.5, 0.5, 0.5] + [2.0, 4.0, 6.0, 8.0] = [2.5, 4.5, 6.5, 8.5]
     let out_vec = out_tensor.to_vec_f32().unwrap();
-    let expected = vec![2.5f32, 4.5, 6.5, 8.5];
+    let expected = [2.5f32, 4.5, 6.5, 8.5];
     assert_eq!(out_vec.len(), expected.len());
     for (i, (&actual, &exp)) in out_vec.iter().zip(expected.iter()).enumerate() {
         assert!(

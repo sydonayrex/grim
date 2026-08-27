@@ -18,18 +18,13 @@ pub enum TrainingMode {
 }
 
 /// Precision kind selected by a turbo-finance stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PrecisionKind {
     Fp16,
+    #[default]
     Bf16,
     Fp8,
     Fp4,
-}
-
-impl Default for PrecisionKind {
-    fn default() -> Self {
-        PrecisionKind::Bf16
-    }
 }
 
 impl fmt::Display for PrecisionKind {
@@ -243,8 +238,6 @@ mod tests {
             let p = scheduler.advance(12);
             if step < 5 {
                 assert_eq!(p, Some(PrecisionKind::Fp8));
-            } else if step < 10 {
-                assert_eq!(p, Some(PrecisionKind::Fp4));
             } else {
                 assert_eq!(p, Some(PrecisionKind::Fp4));
             }
@@ -266,7 +259,7 @@ mod tests {
 
         let mut scheduler = TurboFinetuneScheduler::new(config);
         let layers = scheduler.update_lisa(7, 8);
-        assert_eq!(layers, vec![7 % 8, (7 + (0.5 * 8.0) as usize) % 8]);
+        assert_eq!(layers, vec![7, (7 + (0.5 * 8.0) as usize) % 8]);
     }
 
     #[test]

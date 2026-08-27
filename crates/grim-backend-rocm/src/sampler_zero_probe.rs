@@ -52,14 +52,9 @@ mod tests {
         for t in 0..trials {
             // Fresh upload per trial: mirrors the server, where logits are a
             // brand-new storage each step.
-            let st = RocmStorage::copy_from_host(
-                &data,
-                &shape,
-                DType::F32.into(),
-                &dev.allocator,
-                dev.ordinal,
-            )
-            .expect("logits upload");
+            let st =
+                RocmStorage::copy_from_host(&data, &shape, DType::F32, &dev.allocator, dev.ordinal)
+                    .expect("logits upload");
 
             // Upload-integrity check: DtoH round-trip BEFORE sampling.
             let back = st.to_cpu_vec_f32().expect("readback");

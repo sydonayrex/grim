@@ -29,15 +29,15 @@ impl CpuNumaTopology {
                 .count();
             if node_count > 0 {
                 numa_nodes = node_count;
-                cores_per_node = (logical_cores / numa_nodes).max(1);
+                cores_per_node = logical_cores.checked_div(numa_nodes).unwrap_or(0).max(1);
             }
         }
 
         let mut distance_matrix = vec![vec![10u32; numa_nodes]; numa_nodes];
-        for i in 0..numa_nodes {
-            for j in 0..numa_nodes {
+        for (i, row) in distance_matrix.iter_mut().enumerate() {
+            for (j, distance) in row.iter_mut().enumerate() {
                 if i != j {
-                    distance_matrix[i][j] = 21; // Standard remote NUMA distance
+                    *distance = 21; // Standard remote NUMA distance
                 }
             }
         }
@@ -54,7 +54,7 @@ impl CpuNumaTopology {
         if self.cores_per_node == 0 {
             0
         } else {
-            (core_id / self.cores_per_node) % self.numa_nodes
+            core_id.checked_div(self.cores_per_node).unwrap_or(0) % self.numa_nodes
         }
     }
 }

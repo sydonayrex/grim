@@ -50,6 +50,8 @@ fn roc_device_exposes_tree_attention_method() {
         //
         // No explicit `self` in this fn-pointer type; the closure
         // takes &RocmDevice separately as the first arg.
+        // Intentionally mirrors the full kernel launch signature in one fn-pointer type.
+        #[allow(clippy::type_complexity)]
         let _phantom: fn(
             &RocmDevice,
             q: &dyn grim_tensor::BackendStorage,
