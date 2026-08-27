@@ -89,4 +89,132 @@ pub mod gptq_test_shim {
             dy, b, dx, m, n, k, bits, group_size, has_g_idx, qw_off, qz_off, sc_off, gi_off,
         )
     }
+
+    /// Compute AWQ segment offsets (see [`RocmDevice::awq_segment_offsets`]).
+    pub fn awq_offsets_for_test(
+        bits: u8,
+        group_size: usize,
+        k: usize,
+        n: usize,
+        blob_bytes: usize,
+    ) -> Result<(i64, i64, i64)> {
+        RocmDevice::awq_segment_offsets(bits, group_size, k, n, blob_bytes)
+    }
+
+    /// Launch the AWQ fused dequant-GEMM (forward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_awq_dequant_gemm_for_test(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u8,
+        group_size: usize,
+        qw_off: i64,
+        qz_off: i64,
+        sc_off: i64,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_awq_dequant_gemm(
+            a, b, out, m, n, k, bits, group_size, qw_off, qz_off, sc_off,
+        )
+    }
+
+    /// Launch the AWQ fused dequant-GEMM (backward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_awq_dequant_backward_gemm_for_test(
+        dev: &RocmDevice,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u8,
+        group_size: usize,
+        qw_off: i64,
+        qz_off: i64,
+        sc_off: i64,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_awq_dequant_backward_gemm(
+            dy, b, dx, m, n, k, bits, group_size, qw_off, qz_off, sc_off,
+        )
+    }
+
+    /// Launch Charon W8A8 INT8 grouped MoE kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_charon_grouped_dispatch_w8a8_int8_for_test(
+        dev: &RocmDevice,
+        act: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        rsf: f32,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_charon_grouped_dispatch_w8a8_int8(
+            act, egate_w_ptr, eup_w_ptr, edown_w_ptr, a_scale_ptr, sorted, out, hidden, inter, num_experts, rsf,
+        )
+    }
+
+    /// Launch Charon W8A8 FP8 grouped MoE kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_charon_grouped_dispatch_w8a8_fp8_for_test(
+        dev: &RocmDevice,
+        act: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        rsf: f32,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_charon_grouped_dispatch_w8a8_fp8(
+            act, egate_w_ptr, eup_w_ptr, edown_w_ptr, a_scale_ptr, sorted, out, hidden, inter, num_experts, rsf,
+        )
+    }
+
+    /// Launch Charon AWQ grouped MoE kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_charon_grouped_dispatch_awq_for_test(
+        dev: &RocmDevice,
+        act: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        bits: u8,
+        group_size: usize,
+        gate_qw_off: i64,
+        gate_qz_off: i64,
+        gate_sc_off: i64,
+        gate_stride: u64,
+        down_qw_off: i64,
+        down_qz_off: i64,
+        down_sc_off: i64,
+        down_stride: u64,
+        rsf: f32,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_charon_grouped_dispatch_awq(
+            act, egate_w_ptr, eup_w_ptr, edown_w_ptr, a_scale_ptr, sorted, out, hidden, inter, num_experts,
+            bits, group_size, gate_qw_off, gate_qz_off, gate_sc_off, gate_stride, down_qw_off, down_qz_off, down_sc_off, down_stride, rsf,
+        )
+    }
 }
+

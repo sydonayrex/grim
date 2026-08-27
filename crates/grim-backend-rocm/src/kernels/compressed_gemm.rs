@@ -168,6 +168,10 @@ extern "C" __global__ void grim_dequant_embedding_wna16_int(
 /// activation quantization is applied upstream per-token and is out of
 /// scope for the weight-side dequant GEMM).
 pub const W8A8_GEMM_KERNEL: &str = r#"
+// ── Forward: C[M, N] = A[M, K] @ deq(B)
+// ── Backward: dX[M, K] = dY[M, N] @ deq(B)[N, K]
+// Both use the same blob layouts; backward swaps the accumulation axis.
+
 extern "C" __global__ void grim_w8a8_int8_dequant_gemm(
     const float* __restrict__ A,
     const unsigned char* __restrict__ blob,
@@ -188,13 +192,37 @@ extern "C" __global__ void grim_w8a8_int8_dequant_gemm(
 
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
-        // int8 code, row-major [N, K]: code(col, k).
         signed char c = (signed char)codes[(long long)col * K + k];
-        // Use volatile to prevent compiler from caching the scale read.
         float w = (float)c * ((volatile const float*)scales)[col];
         acc += A[row * K + k] * w;
     }
     C[row * N + col] = acc;
+}
+
+extern "C" __global__ void grim_w8a8_int8_dequant_gemm_backward_dx(
+    const float* __restrict__ dY,
+    const unsigned char* __restrict__ blob,
+    float* __restrict__ dX,
+    int M, int N, int K)
+{
+    const unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long total = (unsigned long long)M * K;
+    if (idx >= total) return;
+
+    const int row = (int)(idx / K);
+    const int k = (int)(idx % K);
+
+    const unsigned char* codes = blob + 8;
+    const float* scales = (const float*)(blob + 8 + (long long)N * K);
+
+    float acc = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        signed char c = (signed char)codes[(long long)j * K + k];
+        float w = (float)c * scales[j];
+        acc += dY[row * N + j] * w;
+    }
+    dX[row * K + k] = acc;
 }
 
 extern "C" __global__ void grim_w8a8_fp8_dequant_gemm(
@@ -211,9 +239,7 @@ extern "C" __global__ void grim_w8a8_fp8_dequant_gemm(
     const int row = (int)(idx / N);
     const int col = (int)(idx % N);
 
-    // [u64 scale_len][fp8 codes (N*K)][f32 per-tensor scale]
     const unsigned char* codes = blob + 8;
-    // Use volatile to prevent compiler from caching the scale read.
     const float tensor_scale = *(volatile const float*)(blob + 8 + (long long)N * K);
 
     float acc = 0.0f;
@@ -222,6 +248,31 @@ extern "C" __global__ void grim_w8a8_fp8_dequant_gemm(
         acc += A[row * K + k] * w;
     }
     C[row * N + col] = acc;
+}
+
+extern "C" __global__ void grim_w8a8_fp8_dequant_gemm_backward_dx(
+    const float* __restrict__ dY,
+    const unsigned char* __restrict__ blob,
+    float* __restrict__ dX,
+    int M, int N, int K)
+{
+    const unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long total = (unsigned long long)M * K;
+    if (idx >= total) return;
+
+    const int row = (int)(idx / K);
+    const int k = (int)(idx % K);
+
+    const unsigned char* codes = blob + 8;
+    const float tensor_scale = *(volatile const float*)(blob + 8 + (long long)N * K);
+
+    float acc = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        float w = fp8_e4m3_to_float_hip(codes[(long long)j * K + k]) * tensor_scale;
+        acc += dY[row * N + j] * w;
+    }
+    dX[row * K + k] = acc;
 }
 
 extern "C" __global__ void grim_wna16_dequant_gemm(
@@ -240,22 +291,17 @@ extern "C" __global__ void grim_wna16_dequant_gemm(
     const int row = (int)(idx / N);
     const int col = (int)(idx % N);
 
-    // [u32 n_bit][u32 num_blocks][codes][f16 block scales][f32 ts] —
-    // flat 256-weight blocks over the row-major [N, K] weight.
     const int code_bytes_per_block = ((256 * (int)n_bit) + 7) / 8;
     const int code_start = 8;
     const int scales_start = code_start + code_bytes_per_block * num_blocks;
     const int ts_off = scales_start + num_blocks * 2;
-    // Use volatile to prevent compiler from caching the blob read in registers.
-    // Without volatile, the HIP compiler may hoist the read and reuse a stale
-    // value across loop iterations, producing near-zero outputs.
     const float ts = __uint_as_float(*(volatile const unsigned int*)(blob + ts_off));
 
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
         long long flat = (long long)col * K + k;
-        int block_idx = (int)(flat >> 8);        // flat / 256
-        int lane = (int)(flat & 255);            // flat % 256
+        int block_idx = (int)(flat >> 8);
+        int lane = (int)(flat & 255);
         const unsigned char* block_codes =
             blob + code_start + block_idx * code_bytes_per_block;
         unsigned short h = ((unsigned short)blob[scales_start + block_idx * 2])
@@ -264,5 +310,41 @@ extern "C" __global__ void grim_wna16_dequant_gemm(
         acc += A[row * K + k] * ((float)code * grim_f16_to_f32_hip(h) * ts);
     }
     C[row * N + col] = acc;
+}
+
+extern "C" __global__ void grim_wna16_dequant_gemm_backward_dx(
+    const float* __restrict__ dY,
+    const unsigned char* __restrict__ blob,
+    float* __restrict__ dX,
+    int M, int N, int K,
+    int n_bit,
+    int num_blocks)
+{
+    const unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long total = (unsigned long long)M * K;
+    if (idx >= total) return;
+
+    const int row = (int)(idx / K);
+    const int k = (int)(idx % K);
+
+    const int code_bytes_per_block = ((256 * (int)n_bit) + 7) / 8;
+    const int code_start = 8;
+    const int scales_start = code_start + code_bytes_per_block * num_blocks;
+    const float ts = __uint_as_float(*(volatile const unsigned int*)(blob + scales_start + num_blocks * 2));
+
+    float acc = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        long long flat = (long long)j * K + k;
+        int block_idx = (int)(flat >> 8);
+        int lane = (int)(flat & 255);
+        const unsigned char* block_codes =
+            blob + code_start + block_idx * code_bytes_per_block;
+        unsigned short h = ((unsigned short)blob[scales_start + block_idx * 2])
+            | ((unsigned short)blob[scales_start + block_idx * 2 + 1] << 8);
+        unsigned int code = grim_decode_msb_nbit(block_codes, 0, lane, n_bit);
+        acc += dY[row * N + j] * ((float)code * grim_f16_to_f32_hip(h) * ts);
+    }
+    dX[row * K + k] = acc;
 }
 "#;

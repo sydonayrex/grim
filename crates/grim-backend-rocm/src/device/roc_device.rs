@@ -3898,6 +3898,30 @@ impl BackendDevice for RocmDevice {
                     gi_off,
                 )?;
             }
+            DTypeStorage::Awq(cfg) => {
+                // AWQ fused dequant-GEMM: packed three-segment blob ([qweight][qzeros][scales(f16)]).
+                if !matches!(cfg.bits, 2 | 4 | 8) {
+                    return Err(Error::Backend(format!(
+                        "awq quantized_matmul: unsupported bit width {}",
+                        cfg.bits
+                    )));
+                }
+                let (qw_off, qz_off, sc_off) =
+                    Self::awq_segment_offsets(cfg.bits, cfg.group_size, k, n, b_storage.bytes())?;
+                self.launch_awq_dequant_gemm(
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    cfg.bits,
+                    cfg.group_size,
+                    qw_off,
+                    qz_off,
+                    sc_off,
+                )?;
+            }
             DTypeStorage::W4A16(w4) => {
                 // Quant workstream wiring: Marlin-style fused W4A16 GEMM over
                 // the resident blob ([codes u32][scales f32], B stored [N, K/8]).
@@ -4366,23 +4390,78 @@ impl BackendDevice for RocmDevice {
                     gi_off,
                 )?;
             }
-            DTypeStorage::W4A16(_) | DTypeStorage::WNA16 | DTypeStorage::EmbeddingWNA16Int => {
-                // Weight-only quantization is inference-only: there is no
-                // weight-gradient kernel for these formats. Fail loudly —
-                // the old `_ =>` fallback fed packed codes to the F16
-                // dequant-backward gemm (silent garbage dX).
+            DTypeStorage::Awq(cfg) => {
+                // AWQ fused dequant backward dX:
+                if !matches!(cfg.bits, 2 | 4 | 8) {
+                    return Err(Error::Backend(format!(
+                        "awq quantized_matmul_backward_dx: unsupported bit width {}",
+                        cfg.bits
+                    )));
+                }
+                let (qw_off, qz_off, sc_off) =
+                    Self::awq_segment_offsets(cfg.bits, cfg.group_size, k, n, b_storage.bytes())?;
+                self.launch_awq_dequant_backward_gemm(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    cfg.bits,
+                    cfg.group_size,
+                    qw_off,
+                    qz_off,
+                    sc_off,
+                )?;
+            }
+            DTypeStorage::W4A16(_) | DTypeStorage::EmbeddingWNA16Int => {
+                // Weight-only (W4A16) and embedding (EmbeddingWNA16Int) formats are
+                // inference-only: no weight-gradient kernel exists. Fail loudly.
                 return Err(Error::Backend(
-                    "quantized_matmul_backward_dx: weight-only formats (W4A16/WNA16/\
-                     EmbeddingWNA16Int) have no backward kernel; these are inference-only"
+                    "quantized_matmul_backward_dx: W4A16/EmbeddingWNA16Int have no backward \
+                     kernel; these are inference-only"
                         .into(),
                 ));
             }
-            DTypeStorage::CompressedTensorsW8A8Int8 | DTypeStorage::CompressedTensorsW8A8Fp8 => {
-                return Err(Error::Backend(
-                    "quantized_matmul_backward_dx: CompressedTensorsW8A8 backward kernel \
-                     not wired yet (compressed-tensors workstream)"
-                        .into(),
-                ));
+            DTypeStorage::WNA16 => {
+                // Fused dequant-GEMM backward: dX[M, K] = dY[M, N] @ deq(B)[N, K].
+                let hdr = Self::wna16_read_header(b_storage, self.ordinal)?;
+                let mut n_bit_v = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as i32;
+                let mut blocks_v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as i32;
+                self.launch_elementwise_dequant_gemm_backward(
+                    "grim_wna16_dequant_gemm_backward_dx",
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    &mut [arg(&mut n_bit_v), arg(&mut blocks_v)],
+                )?;
+            }
+            DTypeStorage::CompressedTensorsW8A8Int8 => {
+                self.launch_elementwise_dequant_gemm_backward(
+                    "grim_w8a8_int8_dequant_gemm_backward_dx",
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    &mut [],
+                )?;
+            }
+            DTypeStorage::CompressedTensorsW8A8Fp8 => {
+                self.launch_elementwise_dequant_gemm_backward(
+                    "grim_w8a8_fp8_dequant_gemm_backward_dx",
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    &mut [],
+                )?;
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(
@@ -6398,6 +6477,138 @@ impl RocmDevice {
         Ok((out_storage, RocmHandle::new(Some(stream))))
     }
 
+    /// Fused grouped MoE dispatch for CompressedTensors W8A8 INT8.
+    pub fn moe_fused_grouped_dispatch_w8a8_int8(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        a_scale_buf: &dyn BackendStorage,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+        let ascale_r = a_scale_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
+
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let stream = self.launch_charon_grouped_dispatch_w8a8_int8(
+            activations,
+            gate_r.device_ptr.unwrap(),
+            up_r.device_ptr.unwrap(),
+            down_r.device_ptr.unwrap(),
+            ascale_r.device_ptr.unwrap(),
+            sorted,
+            &out_storage,
+            hidden,
+            inter,
+            num_experts,
+            routed_scaling_factor,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
+    /// Fused grouped MoE dispatch for CompressedTensors W8A8 FP8.
+    pub fn moe_fused_grouped_dispatch_w8a8_fp8(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        a_scale_buf: &dyn BackendStorage,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+        let ascale_r = a_scale_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
+
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let stream = self.launch_charon_grouped_dispatch_w8a8_fp8(
+            activations,
+            gate_r.device_ptr.unwrap(),
+            up_r.device_ptr.unwrap(),
+            down_r.device_ptr.unwrap(),
+            ascale_r.device_ptr.unwrap(),
+            sorted,
+            &out_storage,
+            hidden,
+            inter,
+            num_experts,
+            routed_scaling_factor,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
+    /// Fused grouped MoE dispatch for AWQ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_fused_grouped_dispatch_awq(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        a_scale_buf: &dyn BackendStorage,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        bits: u8,
+        group_size: usize,
+        gate_qw_off: i64,
+        gate_qz_off: i64,
+        gate_sc_off: i64,
+        gate_stride: u64,
+        down_qw_off: i64,
+        down_qz_off: i64,
+        down_sc_off: i64,
+        down_stride: u64,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+        let ascale_r = a_scale_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("a_scale_buf downcast failed".into()))?;
+
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let stream = self.launch_charon_grouped_dispatch_awq(
+            activations,
+            gate_r.device_ptr.unwrap(),
+            up_r.device_ptr.unwrap(),
+            down_r.device_ptr.unwrap(),
+            ascale_r.device_ptr.unwrap(),
+            sorted,
+            &out_storage,
+            hidden,
+            inter,
+            num_experts,
+            bits,
+            group_size,
+            gate_qw_off,
+            gate_qz_off,
+            gate_sc_off,
+            gate_stride,
+            down_qw_off,
+            down_qz_off,
+            down_sc_off,
+            down_stride,
+            routed_scaling_factor,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
     /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
 
     ///
@@ -7106,6 +7317,342 @@ impl RocmDevice {
                     hipFree(w_ptr);
                     return Err(Error::Backend(format!(
                         "charon_grouped_iqk hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Launcher for CompressedTensors W8A8 INT8 grouped MoE kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_charon_grouped_dispatch_w8a8_int8(
+        &self,
+        act_storage: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        use crate::kernels::charon::plan_grouped_dispatch;
+        let _ = num_experts;
+
+        check_hip("charon_grouped_w8a8_int8 hipMemset(output, 0)", unsafe {
+            hipMemset(
+                out_storage.device_ptr.ok_or_else(|| {
+                    Error::Backend("charon_grouped_w8a8_int8: out has no device ptr".into())
+                })? as *mut c_void,
+                0,
+                out_storage.bytes(),
+            )
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
+
+        let mut a = act_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_w8a8_int8: activations has no device ptr".into())
+        })? as *mut c_void;
+        let mut gw = egate_w_ptr;
+        let mut uw = eup_w_ptr;
+        let mut dw = edown_w_ptr;
+        let mut ascale = a_scale_ptr;
+        let mut optr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_w8a8_int8: out has no device ptr".into()))?
+            as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_w8a8_int8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_w8a8_int8 hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Launcher for CompressedTensors W8A8 FP8 grouped MoE kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_charon_grouped_dispatch_w8a8_fp8(
+        &self,
+        act_storage: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        use crate::kernels::charon::plan_grouped_dispatch;
+        let _ = num_experts;
+
+        check_hip("charon_grouped_w8a8_fp8 hipMemset(output, 0)", unsafe {
+            hipMemset(
+                out_storage.device_ptr.ok_or_else(|| {
+                    Error::Backend("charon_grouped_w8a8_fp8: out has no device ptr".into())
+                })? as *mut c_void,
+                0,
+                out_storage.bytes(),
+            )
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
+
+        let mut a = act_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_w8a8_fp8: activations has no device ptr".into())
+        })? as *mut c_void;
+        let mut gw = egate_w_ptr;
+        let mut uw = eup_w_ptr;
+        let mut dw = edown_w_ptr;
+        let mut ascale = a_scale_ptr;
+        let mut optr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_w8a8_fp8: out has no device ptr".into()))?
+            as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_w8a8_fp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_w8a8_fp8 hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Launcher for AWQ grouped MoE kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_charon_grouped_dispatch_awq(
+        &self,
+        act_storage: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        bits: u8,
+        group_size: usize,
+        gate_qw_off: i64,
+        gate_qz_off: i64,
+        gate_sc_off: i64,
+        gate_stride: u64,
+        down_qw_off: i64,
+        down_qz_off: i64,
+        down_sc_off: i64,
+        down_stride: u64,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        use crate::kernels::charon::plan_grouped_dispatch;
+        let _ = num_experts;
+
+        check_hip("charon_grouped_awq hipMemset(output, 0)", unsafe {
+            hipMemset(
+                out_storage.device_ptr.ok_or_else(|| {
+                    Error::Backend("charon_grouped_awq: out has no device ptr".into())
+                })? as *mut c_void,
+                0,
+                out_storage.bytes(),
+            )
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
+
+        let mut a = act_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_awq: activations has no device ptr".into())
+        })? as *mut c_void;
+        let mut gw = egate_w_ptr;
+        let mut uw = eup_w_ptr;
+        let mut dw = edown_w_ptr;
+        let mut ascale = a_scale_ptr;
+        let mut optr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_awq: out has no device ptr".into()))?
+            as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut bits_i = bits as i32;
+        let mut group_size_i = group_size as i32;
+
+        let mut g_qw = gate_qw_off;
+        let mut g_qz = gate_qz_off;
+        let mut g_sc = gate_sc_off;
+        let mut g_str = gate_stride;
+
+        let mut d_qw = down_qw_off;
+        let mut d_qz = down_qz_off;
+        let mut d_sc = down_sc_off;
+        let mut d_str = down_stride;
+
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_awq",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut bits_i),
+                arg(&mut group_size_i),
+                arg(&mut g_qw),
+                arg(&mut g_qz),
+                arg(&mut g_sc),
+                arg(&mut g_str),
+                arg(&mut d_qw),
+                arg(&mut d_qz),
+                arg(&mut d_sc),
+                arg(&mut d_str),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_awq hipStreamSynchronize failed: {}",
                         sync
                     )));
                 }
@@ -11125,6 +11672,211 @@ impl RocmDevice {
         Ok((8, qz_data as i64, sc_data as i64, gi_data as i64, has_g_idx))
     }
 
+    /// Launch the AWQ fused dequant-GEMM (forward).
+    /// Computes `C[M, N] = A[M, K] @ dequant(B)^T` where B is packed in the
+    /// native AWQ 3-segment length-prefixed layout:
+    /// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales (f16)]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_awq_dequant_gemm(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u8,
+        group_size: usize,
+        qw_off: i64,
+        qz_off: i64,
+        sc_off: i64,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("awq gemm: A has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("awq gemm: B has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("awq gemm: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("awq gemm: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend("awq gemm: grid too large for u32".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let values_per_word: i32 = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "awq gemm: unsupported bit width {bits}"
+                )));
+            }
+        };
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut outptr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut bits_i = bits as i32;
+        let mut gs_i = group_size as i32;
+        let mut vpw = values_per_word;
+        let mut qw = qw_off;
+        let mut qz = qz_off;
+        let mut sc = sc_off;
+
+        self.launch_compute_kernel(
+            "grim_awq_dequant_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut outptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut bits_i),
+                arg(&mut gs_i),
+                arg(&mut vpw),
+                arg(&mut qw),
+                arg(&mut qz),
+                arg(&mut sc),
+            ],
+        )
+    }
+
+    /// Launch the AWQ fused dequant-GEMM (backward dX).
+    /// Computes `dX[M, K] = dY[M, N] @ dequant(B)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_awq_dequant_backward_gemm(
+        &self,
+        dy_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u8,
+        group_size: usize,
+        qw_off: i64,
+        qz_off: i64,
+        sc_off: i64,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("awq backward: dY has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("awq backward: b has no device ptr".into()))?;
+        let dx_ptr = dx_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("awq backward: dX has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| Error::Backend("awq backward: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend("awq backward: grid too large for u32".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let values_per_word: i32 = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "awq backward: unsupported bit width {bits}"
+                )));
+            }
+        };
+
+        let mut dyptr = dy_ptr;
+        let mut bptr = b_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut bits_i = bits as i32;
+        let mut gs_i = group_size as i32;
+        let mut vpw = values_per_word;
+        let mut qw = qw_off;
+        let mut qz = qz_off;
+        let mut sc = sc_off;
+
+        self.launch_compute_kernel(
+            "grim_awq_dequant_backward_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bptr),
+                arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut bits_i),
+                arg(&mut gs_i),
+                arg(&mut vpw),
+                arg(&mut qw),
+                arg(&mut qz),
+                arg(&mut sc),
+            ],
+        )
+    }
+
+    /// Compute the length-prefixed AWQ segment offsets for a packed
+    /// weight blob of `blob_bytes` bytes. Returns `(qw_off, qz_off, sc_off)`.
+    pub fn awq_segment_offsets(
+        bits: u8,
+        group_size: usize,
+        k: usize,
+        n: usize,
+        blob_bytes: usize,
+    ) -> Result<(i64, i64, i64)> {
+        let vpw: usize = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "awq gemm: unsupported bit width {bits}"
+                )));
+            }
+        };
+        let qw_len = k.div_ceil(vpw) * n * 4;
+        let groups = k.div_ceil(group_size);
+        let qz_len = groups * n.div_ceil(vpw) * 4;
+        let sc_len = groups * n * 2; // f16 scales = 2 bytes each
+
+        // Layout: [u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales (f16)]
+        let qz_data = 8 + qw_len + 8;
+        let sc_data = qz_data + qz_len + 8;
+        let total_expected = sc_data + sc_len;
+
+        if blob_bytes != total_expected {
+            return Err(Error::Backend(format!(
+                "awq gemm: packed blob size {blob_bytes} does not match expected {total_expected} \
+                 for bits={bits} group_size={group_size} k={k} n={n}"
+            )));
+        }
+
+        Ok((8, qz_data as i64, sc_data as i64))
+    }
+
     /// Audit-wiring (quant workstream): W4A16 blobs are a SINGLE packed
     /// segment pair — `[codes (N*K/8 u32)][scales (N*groups f32)]` per the
     /// `Storage::W4A16` layout contract — so the dense dispatch path needs a
@@ -11218,6 +11970,47 @@ impl RocmDevice {
             arg(&mut aptr),
             arg(&mut bptr),
             arg(&mut optr),
+            arg(&mut mm),
+            arg(&mut nn),
+            arg(&mut kk),
+        ];
+        args.extend_from_slice(extra_args);
+        self.launch_compute_kernel(
+            entry,
+            HipDim3::new(grid_x, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut args,
+        )?;
+        Ok(())
+    }
+
+    /// Elementwise dequant-GEMM backward launcher: dX[M, K] = dY[M, N] @ deq(B)[N, K].
+    /// Same 256-thread blocks, but grid covers M*K outputs (the dX dimension).
+    fn launch_elementwise_dequant_gemm_backward(
+        &self,
+        entry: &str,
+        dy: &RocmStorage,
+        blob: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        extra_args: &mut [*mut c_void],
+    ) -> Result<()> {
+        let mut dyptr = dy.device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm backward: dY has no device ptr".into()))? as *mut c_void;
+        let mut bptr = blob.device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm backward: blob has no device ptr".into()))? as *mut c_void;
+        let mut dxptr = dx.device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm backward: dX has no device ptr".into()))? as *mut c_void;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let grid_x = ((m * k + 255) / 256) as u32;
+        let mut args: Vec<*mut c_void> = vec![
+            arg(&mut dyptr),
+            arg(&mut bptr),
+            arg(&mut dxptr),
             arg(&mut mm),
             arg(&mut nn),
             arg(&mut kk),
@@ -11416,10 +12209,11 @@ impl RocmDevice {
         let mut kk = k as i32;
         let mut gs = group_size as i32;
 
-        let kernel_name = if out_storage.dtype.arith == grim_tensor::ArithType::F16 {
-            "grim_marlin_gemm_w4a16"
-        } else {
-            "grim_marlin_gemm_w4a16_f32"
+        // Select kernel based on scales dtype (what the kernel actually reads),
+        // not output dtype. Out can be F16 or F32 regardless of scale precision.
+        let kernel_name = match scales_storage.dtype.arith {
+            grim_tensor::ArithType::F16 => "grim_marlin_gemm_w4a16",
+            _ => "grim_marlin_gemm_w4a16_f32",
         };
 
         self.launch_compute_kernel(

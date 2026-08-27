@@ -82,6 +82,9 @@ pub struct GgufProvider { /* ... */ }
 /// Native .grim file container provider.
 pub struct GrimProvider { /* ... */ }
 
+/// Native AWQ provider (reads column-packed 3-segment AWQ blobs).
+pub struct AwqProvider { /* ... */ }
+
 /// Model footprint descriptor for pre-flight VRAM estimation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelFootprint {

@@ -4551,6 +4551,144 @@ async fn grim_pull(
         .unwrap()
 }
 
+/// POST /api/upload?filename=<name>.gguf — save an uploaded model file into the
+/// local catalog (`grim_models_dir()`), then write the JSON sidecar so
+/// `grim run <name>` / `/api/tags` resolve it like any pulled model.
+///
+/// The request body is the raw file bytes (the browser streams it with an
+/// XHR so the dashboard can show native upload-progress events).
+async fn grim_upload(
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
+    use grim_core::catalog::{ModelEntry, apply_gguf_enrichment};
+
+    let Some(filename) = query.get("filename") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing 'filename' query parameter" })),
+        )
+            .into_response();
+    };
+
+    // Only keep the basename — never let a client write outside the models dir.
+    let safe_name = std::path::Path::new(filename)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    if safe_name.is_empty()
+        || !(safe_name.to_ascii_lowercase().ends_with(".gguf")
+            || safe_name.to_ascii_lowercase().ends_with(".grim")
+            || safe_name.to_ascii_lowercase().ends_with(".safetensors"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!(
+                "invalid filename '{filename}': expected a bare .gguf, .grim, or .safetensors filename"
+            )})),
+        )
+            .into_response();
+    }
+
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "empty upload body" })),
+        )
+            .into_response();
+    }
+
+    let models_dir = grim_models_dir();
+    if let Err(e) = tokio::fs::create_dir_all(&models_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("cannot create models dir: {e}") })),
+        )
+            .into_response();
+    }
+    let dest_path = models_dir.join(safe_name);
+    if let Err(e) = tokio::fs::write(&dest_path, &body).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to write model file: {e}") })),
+        )
+            .into_response();
+    }
+
+    use sha2::Digest as _;
+    let mut sha = sha2::Sha256::new();
+    sha.update(&body);
+    let sha256_hex = format!("{:x}", sha.finalize());
+
+    let is_gguf = safe_name.to_ascii_lowercase().ends_with(".gguf");
+    let display_name = dest_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(safe_name)
+        .to_string();
+
+    let mut entry = ModelEntry {
+        name: display_name,
+        path: dest_path.display().to_string(),
+        arch: String::new(),
+        params: String::new(),
+        quant: String::new(),
+        context_length: 0,
+        size_bytes: body.len() as u64,
+        sha256: sha256_hex,
+        pulled_at: chrono_utc_now_rfc3339(),
+        source: "upload".to_string(),
+        preferred_dtype: String::new(),
+    };
+    if is_gguf {
+        apply_gguf_enrichment(&mut entry, &dest_path);
+    }
+    if let Err(e) = entry.save(&dest_path) {
+        eprintln!(
+            "[grim-server] WARNING: uploaded '{}' saved but sidecar write failed: {e}",
+            safe_name
+        );
+    }
+
+    eprintln!(
+        "[grim-server] Uploaded model '{}' ({:.2} MB) -> {}",
+        safe_name,
+        body.len() as f64 / 1_048_576.0,
+        dest_path.display()
+    );
+
+    Json(serde_json::json!({
+        "status": "success",
+        "name": entry.name,
+        "path": entry.path,
+        "size_bytes": entry.size_bytes,
+    }))
+    .into_response()
+}
+
+/// Current UTC time as RFC-3339, without pulling a full chrono dependency.
+fn chrono_utc_now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // days-from-civil inverse (Howard Hinnant's algorithm).
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 /// Build a new HTTP router with the given engine state.
 /// Paths reachable without a bearer key even when auth is enabled.
 const AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/healthz", "/readyz", "/metrics"];
@@ -4605,8 +4743,10 @@ pub fn build_router_with_auth(state: Arc<AppState>, api_keys: Vec<String>) -> Ro
         .route("/api/generate", post(grim_generate))
         .route("/api/tags", get(grim_tags))
         .route("/api/pull", post(grim_pull))
+        .route("/api/upload", post(grim_upload))
         // Dashboard:
         .route("/", get(dashboard_html))
+        .route("/logo.png", get(serve_logo_png))
         .route("/api/stats", get(stats_endpoint))
         // F-6: alias so `GET /adapters` returns the same JSON list as
         // `/v1/adapters` instead of an empty 200 from a missing route.
@@ -7787,11 +7927,53 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
     let mut total_vram_used: u64 = 0;
     let mut total_vram_max: u64 = 0;
     let mut gpus_json = Vec::new();
+    let mut global_idx: u32 = 0;
 
+    // 1. Probe AMD ROCm GPUs
     if rocm_gpu_count > 0 {
+        // Collect sysfs real vram total sizes to catch APU shared RAM reporting
+        let mut sysfs_vram_totals = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            let mut card_paths: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| {
+                            n.to_string_lossy().starts_with("card")
+                                && !n.to_string_lossy().contains('-')
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            card_paths.sort();
+
+            for path in card_paths {
+                let vendor_path = path.join("device/vendor");
+                if let Ok(v_str) = std::fs::read_to_string(&vendor_path) {
+                    if v_str.trim().eq_ignore_ascii_case("0x1002") {
+                        let total_path = path.join("device/mem_info_vram_total");
+                        if let Ok(t_str) = std::fs::read_to_string(&total_path) {
+                            if let Ok(bytes) = t_str.trim().parse::<u64>() {
+                                if bytes > 0 {
+                                    sysfs_vram_totals.push(bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for ord in 0..rocm_gpu_count {
-            let (free, total) = grim_backend_rocm::vram_info(ord);
-            let used = total.saturating_sub(free);
+            let (free, hip_total) = grim_backend_rocm::vram_info(ord);
+            let mut total = hip_total;
+            if let Some(&real_sysfs) = sysfs_vram_totals.get(ord) {
+                if real_sysfs < total {
+                    total = real_sysfs;
+                }
+            }
+            let used = total.saturating_sub(free).min(total);
             total_vram_used += used;
             total_vram_max += total;
             let memory_pct = if total > 0 {
@@ -7799,20 +7981,21 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
             } else {
                 0
             };
-            // WI-1: `compute` is now a real utilization probe (rsmi busy %).
-            // `null` when the backend has no utilization API — never a
-            // fabricated 0. See `compute_utilization` per backend.
             let compute = grim_backend_rocm::compute_utilization(ord);
             gpus_json.push(serde_json::json!({
-                "index": ord as u32,
+                "index": global_idx,
+                "backend": "ROCm",
                 "compute": compute,
                 "memory": memory_pct,
-                "name": format!("ROCm GPU {ord}"),
+                "vram_used": used,
+                "vram_total": total,
+                "name": format!("AMD ROCm GPU #{ord}"),
             }));
+            global_idx += 1;
         }
-        return (total_vram_used, total_vram_max, gpus_json);
     }
 
+    // 2. Probe NVIDIA CUDA GPUs
     #[cfg(feature = "cuda")]
     if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
         if !cuda_devs.is_empty() {
@@ -7830,60 +8013,79 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
                 };
                 let compute = grim_backend_cuda::compute_utilization(ord);
                 gpus_json.push(serde_json::json!({
-                    "index": ord as u32,
+                    "index": global_idx,
+                    "backend": "CUDA",
                     "compute": compute,
                     "memory": memory_pct,
-                    "name": format!("CUDA GPU {ord}"),
+                    "vram_used": used,
+                    "vram_total": total,
+                    "name": format!("NVIDIA CUDA GPU #{ord}"),
                 }));
+                global_idx += 1;
             }
-            return (total_vram_used, total_vram_max, gpus_json);
         }
     }
 
-    {
-        let Some((free, total)) = grim_backend_metal::vram_info(0) else {
-            return (0, 0, gpus_json);
-        };
-        if total > 0 {
-            let used = total.saturating_sub(free);
-            let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
-            let compute = grim_backend_metal::compute_utilization(0);
-            gpus_json.push(serde_json::json!({
-                "index": 0u32,
-                "compute": compute,
-                "memory": memory_pct,
-                "name": "Metal GPU",
-            }));
-            return (used, total, gpus_json);
+    // 3. Probe Apple Metal GPUs if no GPUs found yet
+    if gpus_json.is_empty() {
+        if let Some((free, total)) = grim_backend_metal::vram_info(0) {
+            if total > 0 {
+                let used = total.saturating_sub(free);
+                let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
+                let compute = grim_backend_metal::compute_utilization(0);
+                gpus_json.push(serde_json::json!({
+                    "index": global_idx,
+                    "backend": "Metal",
+                    "compute": compute,
+                    "memory": memory_pct,
+                    "vram_used": used,
+                    "vram_total": total,
+                    "name": "Apple Metal Unified GPU",
+                }));
+                total_vram_used += used;
+                total_vram_max += total;
+                global_idx += 1;
+            }
         }
     }
 
-    {
-        let Some((free, total)) = grim_backend_vulkan::vram_info(0) else {
-            return (0, 0, gpus_json);
-        };
-        if total > 0 {
-            let used = total.saturating_sub(free);
-            let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
-            let compute = grim_backend_vulkan::compute_utilization(0);
-            gpus_json.push(serde_json::json!({
-                "index": 0u32,
-                "compute": compute,
-                "memory": memory_pct,
-                "name": "Vulkan GPU",
-            }));
-            return (used, total, gpus_json);
+    // 4. Probe Vulkan GPUs if no GPUs found yet
+    if gpus_json.is_empty() {
+        if let Some((free, total)) = grim_backend_vulkan::vram_info(0) {
+            if total > 0 {
+                let used = total.saturating_sub(free);
+                let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
+                let compute = grim_backend_vulkan::compute_utilization(0);
+                gpus_json.push(serde_json::json!({
+                    "index": global_idx,
+                    "backend": "Vulkan",
+                    "compute": compute,
+                    "memory": memory_pct,
+                    "vram_used": used,
+                    "vram_total": total,
+                    "name": "Vulkan Discrete GPU",
+                }));
+                total_vram_used += used;
+                total_vram_max += total;
+                global_idx += 1;
+            }
         }
     }
 
-    gpus_json.push(serde_json::json!({
-        "index": 0u32,
-        "compute": serde_json::Value::Null,
-        "memory": 0u32,
-        "name": "CPU",
-    }));
+    // 5. Fallback if still empty
+    if gpus_json.is_empty() {
+        gpus_json.push(serde_json::json!({
+            "index": 0u32,
+            "backend": "CPU",
+            "compute": serde_json::Value::Null,
+            "memory": 0u32,
+            "vram_used": 0u64,
+            "vram_total": 0u64,
+            "name": "Host CPU",
+        }));
+    }
 
-    (0, 0, gpus_json)
+    (total_vram_used, total_vram_max, gpus_json)
 }
 
 /// Probe CUDA VRAM usage for N GPUs.
@@ -8076,164 +8278,977 @@ async fn dashboard_html() -> axum::response::Html<&'static str> {
     axum::response::Html(DASHBOARD_HTML)
 }
 
-/// Dashboard HTML (static, polls /api/stats via fetch).
-const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+/// Static embedded logo image from grim-garage.
+const GARAGE_LOGO_PNG: &[u8] = include_bytes!("../../grim-garage/web/logo.png");
+
+/// `GET /logo.png` — serves the small grim-garage logo.
+async fn serve_logo_png() -> axum::response::Response {
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "image/png")
+        .header(axum::http::header::CACHE_CONTROL, "public, max-age=86400")
+        .body(axum::body::Body::from(GARAGE_LOGO_PNG))
+        .unwrap()
+}
+
+/// Dashboard HTML (live multi-GPU dashboard with WCAG 2.2 accessibility, responsive grid, and live polling).
+const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Grim Server</title>
+<title>Grim Server — Live Telemetry & Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
-  body{margin:0;padding:24px;background:#0d1117;color:#c9d1d9}
-  h1{color:#00d4aa;margin:0 0 4px;font-size:28px}
-  .sub{color:#8b949e;margin-bottom:24px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:24px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px}
-  .card h3{margin:0 0 16px;color:#00d4aa;font-size:12px;text-transform:uppercase;letter-spacing:1px}
-  .row{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
-  .label{color:#8b949e;font-size:13px}
-  .val{font-weight:600;font-size:15px}
-  .val.green{color:#3fb950}.val.yellow{color:#d29922}.val.red{color:#f85149}
-  .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:6px}
-  .bar-fill{height:100%;background:linear-gradient(90deg,#00d4aa,#39d0d8);transition:width .5s}
-  .models-section h2{color:#8b949e;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin:24px 0 12px}
-  .model-list{list-style:none;padding:0;margin:0}
-  .model-row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #21262d}
-  .model-row:last-child{border-bottom:none}
-  .badge{font-size:10px;padding:2px 8px;border-radius:10px;text-transform:uppercase;font-weight:700}
-  .badge.grim{background:#1f6feb;color:#fff}
-  .badge.gguf{background:#6e7681;color:#fff}
-  .badge.other{background:#8b949e;color:#0d1117}
-  #status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
-  #status-dot.live{background:#3fb950;animation:pulse 2s infinite}
-  #status-dot.dead{background:#f85149}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-  .empty{color:#6e7681;font-style:italic}
+  :root {
+    --bg-base: #090d16;
+    --bg-surface: #0f172a;
+    --bg-card: #151e34;
+    --bg-card-hover: #1b2643;
+    --border-subtle: #1e293b;
+    --border-accent: #334155;
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+    --text-dim: #64748b;
+    --accent-emerald: #10b981;
+    --accent-cyan: #06b6d4;
+    --accent-indigo: #6366f1;
+    --accent-amber: #f59e0b;
+    --accent-rose: #f43f5e;
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'Fira Code', ui-monospace, monospace;
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --shadow-card: 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--bg-base);
+    color: var(--text-main);
+    padding: 24px 28px;
+    min-height: 100vh;
+    line-height: 1.5;
+  }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 20px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border-subtle);
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  .brand-group {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .brand-logo {
+    font-size: 28px;
+    filter: drop-shadow(0 0 12px rgba(16, 185, 129, 0.4));
+  }
+
+  .brand-titles h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    background: linear-gradient(135deg, #34d399 0%, #38bdf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .brand-titles .subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    padding: 6px 14px;
+    border-radius: 9999px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  .dot.online { background: var(--accent-emerald); box-shadow: 0 0 8px var(--accent-emerald); animation: pulse 2s infinite; }
+  .dot.offline { background: var(--accent-rose); box-shadow: 0 0 8px var(--accent-rose); }
+  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.9); } }
+
+  /* Hero KPI Cards */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .kpi-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    box-shadow: var(--shadow-card);
+    transition: transform 0.2s ease, border-color 0.2s ease;
+  }
+  .kpi-card:hover { border-color: var(--border-accent); }
+
+  .kpi-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+
+  .kpi-val {
+    font-size: 22px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--text-main);
+  }
+  .kpi-val.emerald { color: var(--accent-emerald); }
+  .kpi-val.cyan { color: var(--accent-cyan); }
+  .kpi-val.amber { color: var(--accent-amber); }
+  .kpi-val.indigo { color: var(--accent-indigo); }
+
+  .kpi-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    font-family: var(--font-mono);
+  }
+
+  /* Main Sections */
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 28px 0 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .main-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 20px;
+    margin-bottom: 24px;
+  }
+
+  .panel-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: 20px;
+    box-shadow: var(--shadow-card);
+  }
+
+  .panel-card h3 {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent-cyan);
+    margin-bottom: 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    font-size: 13px;
+  }
+  .stat-row:last-child { border-bottom: none; }
+
+  .stat-label { color: var(--text-muted); }
+  .stat-val { font-family: var(--font-mono); font-weight: 600; color: var(--text-main); }
+
+  .progress-wrap {
+    margin-top: 8px;
+    margin-bottom: 12px;
+  }
+  .progress-bar-bg {
+    height: 8px;
+    background: #090d16;
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+  .progress-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #10b981, #06b6d4);
+    transition: width 0.4s ease;
+  }
+  .progress-bar-fill.amber { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+
+  /* Acquire Models — Pull & Upload */
+  .registry-toggle {
+    display: inline-flex;
+    gap: 6px;
+    padding: 4px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    margin-bottom: 14px;
+  }
+  .registry-btn {
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 7px 14px;
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+  }
+  .registry-btn:hover { color: var(--text-main); background: var(--bg-card-hover); }
+  .registry-btn:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 2px; }
+  .registry-btn.active {
+    color: #fff;
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.25), rgba(6, 182, 212, 0.25));
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    padding: 6px 13px;
+  }
+
+  .field-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+  .text-field {
+    width: 100%;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-main);
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .text-field::placeholder { color: var(--text-dim); }
+  .text-field:hover { border-color: var(--border-accent); }
+  .text-field:focus {
+    outline: none;
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.2);
+  }
+  .field-hint {
+    font-size: 11.5px;
+    color: var(--text-dim);
+    margin-top: 8px;
+    line-height: 1.45;
+  }
+  .field-hint code {
+    font-family: var(--font-mono);
+    color: var(--accent-cyan);
+    background: rgba(6, 182, 212, 0.08);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+  }
+  .action-btn {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: 9px 18px;
+    cursor: pointer;
+    transition: transform 0.1s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+  }
+  .action-btn:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 2px; }
+  .action-btn:active:not(:disabled) { transform: translateY(1px); }
+  .action-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .action-btn.primary {
+    color: #06251c;
+    background: linear-gradient(135deg, var(--accent-emerald), var(--accent-cyan));
+    box-shadow: 0 2px 12px -2px rgba(16, 185, 129, 0.5);
+  }
+  .action-btn.primary:hover:not(:disabled) { box-shadow: 0 4px 18px -2px rgba(16, 185, 129, 0.65); }
+  .action-btn.secondary {
+    color: var(--text-main);
+    background: var(--bg-card);
+    border-color: var(--border-accent);
+  }
+  .action-btn.secondary:hover:not(:disabled) { border-color: var(--accent-cyan); background: var(--bg-card-hover); }
+
+  .pull-status {
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    min-width: 0;
+  }
+  .pull-status.ok { color: var(--accent-emerald); }
+  .pull-status.err { color: var(--accent-rose); }
+
+  .transfer-log {
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--text-dim);
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    max-height: 110px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .dropzone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    text-align: center;
+    padding: 28px 16px;
+    background: var(--bg-card);
+    border: 2px dashed var(--border-accent);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+  }
+  .dropzone:hover { border-color: var(--accent-cyan); background: var(--bg-card-hover); }
+  .dropzone:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 2px; }
+  .dropzone.dragover { border-color: var(--accent-emerald); background: rgba(16, 185, 129, 0.08); }
+  .dz-icon { font-size: 28px; }
+  .dz-title { font-size: 13px; font-weight: 600; color: var(--text-main); word-break: break-all; }
+  .dz-sub { font-size: 11.5px; color: var(--text-dim); font-family: var(--font-mono); }
+
+  /* Multi-GPU Container */
+  .gpu-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+  }
+
+  .gpu-device-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 14px;
+  }
+  .gpu-device-box:hover { border-color: var(--border-accent); }
+
+  .gpu-device-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .gpu-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-main);
+  }
+
+  .gpu-badge {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+    background: rgba(99, 102, 241, 0.15);
+    color: #818cf8;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+  }
+  .gpu-badge.rocm { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+  .gpu-badge.cuda { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3); }
+
+  /* Model Catalog */
+  .model-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .model-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+  }
+
+  .model-name-box {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .model-primary-name { font-weight: 600; color: var(--text-main); }
+  .model-details { font-size: 11px; color: var(--text-dim); font-family: var(--font-mono); }
+
+  .badge-tag {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .badge-tag.grim { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+  .badge-tag.gguf { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.4); }
+  .badge-tag.other { background: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }
+
+  .empty-state {
+    padding: 14px;
+    text-align: center;
+    color: var(--text-dim);
+    font-style: italic;
+    font-size: 12px;
+  }
 </style>
 </head>
 <body>
-<h1>🦇 Grim Server</h1>
-<div class="sub"><span id="status-dot" class="dead"></span><span id="conn-status">Connecting…</span></div>
 
-<div class="grid">
-  <div class="card">
-    <h3>Model Status</h3>
-    <div class="row"><span class="label">Name</span><span id="model-name" class="val">—</span></div>
-    <div class="row"><span class="label">Type</span><span id="model-type" class="val">—</span></div>
-    <div class="row"><span class="label">VRAM</span><span id="model-vram" class="val">—</span></div>
-    <div class="row"><span class="label">RAM</span><span id="model-ram" class="val">—</span></div>
-    <div class="row"><span class="label">GPU Util</span><span id="model-gpu" class="val">—</span></div>
-    <div class="row"><span class="label">KV Cache</span><span id="model-kv" class="val">—</span></div>
-    <div class="row"><span class="label">CTX Len</span><span id="model-ctx" class="val">—</span></div>
-    <div class="row"><span class="label">Adapters</span><span id="adapters" class="val">0</span></div>
-  </div>
-  <div class="card">
-    <h3>Perf & Speculation</h3>
-    <div class="row"><span class="label">Token/s</span><span id="tps" class="val">—</span></div>
-    <div class="row"><span class="label">ITL</span><span id="itl" class="val">—</span></div>
-    <div class="row"><span class="label">TTFT</span><span id="ttft" class="val">—</span></div>
-    <div class="row"><span class="label">Spec Strategy</span><span id="spec-strat" class="val">—</span></div>
-    <div class="row"><span class="label">Accept Rate</span><span id="spec-accept" class="val">—</span></div>
-    <div class="row"><span class="label">GPU</span><span id="gpu-name" class="val">—</span></div>
-    <div class="row"><span class="label">Mem</span><span id="gpu-mem" class="val">—</span></div>
-  </div>
-  <div class="card">
-    <h3>KV Cache</h3>
-    <div class="row"><span class="label">Usage</span><span id="kv" class="val">—</span></div>
-    <div class="bar"><div id="kv-bar" class="bar-fill" style="width:0%"></div></div>
-    <div class="row"><span class="label">Blocks</span><span id="kv-blocks" class="val">—</span></div>
-  </div>
-  <div class="card">
-    <h3>VRAM</h3>
-    <div class="row"><span class="label">Used</span><span id="vram" class="val">—</span></div>
-    <div class="bar"><div id="vram-bar" class="bar-fill" style="width:0%"></div></div>
-  </div>
-</div>
+  <!-- Top Header Bar -->
+  <header class="header">
+    <div class="brand-group">
+      <div class="brand-logo" style="display: flex; align-items: center;">
+        <img src="/logo.png" alt="Grim's Garage Logo" style="height: 34px; width: 34px; object-fit: contain; border-radius: 6px; filter: drop-shadow(0 0 10px rgba(16, 185, 129, 0.4));">
+      </div>
+      <div class="brand-titles">
+        <h1>GRIM ENGINE SERVER</h1>
+        <div class="subtitle" id="server-address-display">Daemon Telemetry & Multi-GPU Status</div>
+      </div>
+    </div>
+    <div class="status-pill" aria-live="polite">
+      <span class="dot offline" id="status-dot"></span>
+      <span id="conn-status">Connecting to engine...</span>
+    </div>
+  </header>
 
-<div class="models-section">
-  <h2>GRIM Models</h2>
-  <ul id="m-grim" class="model-list"><li class="empty">No .grim models cached</li></ul>
-  <h2>GGUF Models</h2>
-  <ul id="m-gguf" class="model-list"><li class="empty">No .gguf models cached</li></ul>
-  <h2>Other Models</h2>
-  <ul id="m-other" class="model-list"><li class="empty">No other models cached</li></ul>
-</div>
+  <!-- Hero KPI Grid -->
+  <section class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">Generation Speed</div>
+      <div class="kpi-val emerald" id="kpi-tps">—</div>
+      <div class="kpi-sub">Tokens / Sec</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Time to First Token</div>
+      <div class="kpi-val cyan" id="kpi-ttft">—</div>
+      <div class="kpi-sub">Latency (ms)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Inter-Token Latency</div>
+      <div class="kpi-val indigo" id="kpi-itl">—</div>
+      <div class="kpi-sub">Pacing (ms)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Speculative Accept</div>
+      <div class="kpi-val amber" id="kpi-spec-accept">—</div>
+      <div class="kpi-sub" id="kpi-spec-strat">Drafting Auto</div>
+    </div>
+  </section>
+
+  <!-- Section 1: Multi-GPU Hardware & Memory -->
+  <div class="section-title">⚡ Multi-GPU & Hardware Accelerators</div>
+  <div id="gpu-grid-container" class="gpu-cards-grid">
+    <div class="empty-state">Probing system accelerators...</div>
+  </div>
+
+  <!-- Section 2: Engine & Scheduler Queues -->
+  <div class="section-title">🧠 Inference Architecture & Memory</div>
+  <div class="main-grid">
+    <!-- Active Model State -->
+    <div class="panel-card">
+      <h3>Active Model Checkpoint</h3>
+      <div class="stat-row"><span class="stat-label">Model Name</span><span class="stat-val" id="model-name">—</span></div>
+      <div class="stat-row"><span class="stat-label">Format / Container</span><span class="stat-val" id="model-format">—</span></div>
+      <div class="stat-row"><span class="stat-label">Active Bolt-On Adapters</span><span class="stat-val" id="model-adapters">0</span></div>
+      <div class="stat-row"><span class="stat-label">Host System RAM</span><span class="stat-val" id="sys-ram-text">—</span></div>
+      <div class="progress-wrap">
+        <div class="progress-bar-bg">
+          <div id="sys-ram-bar" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- KV Cache Paged Allocation -->
+    <div class="panel-card">
+      <h3>Paged KV Cache Saturation</h3>
+      <div class="stat-row"><span class="stat-label">Allocated KV Memory</span><span class="stat-val" id="kv-mem-text">—</span></div>
+      <div class="progress-wrap">
+        <div class="progress-bar-bg">
+          <div id="kv-mem-bar" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+      <div class="stat-row"><span class="stat-label">Paged KV Blocks</span><span class="stat-val" id="kv-blocks-text">— / —</span></div>
+      <div class="stat-row"><span class="stat-label">XNACK Unified Memory</span><span class="stat-val" id="hardware-xnack">—</span></div>
+    </div>
+
+    <!-- Request Scheduler Telemetry -->
+    <div class="panel-card">
+      <h3>Request Admission Scheduler</h3>
+      <div class="stat-row"><span class="stat-label">Active Running Requests</span><span class="stat-val emerald" id="sched-active">0</span></div>
+      <div class="stat-row"><span class="stat-label">Waiting Queue Requests</span><span class="stat-val amber" id="sched-waiting">0</span></div>
+      <div class="stat-row"><span class="stat-label">Admitted Total</span><span class="stat-val" id="sched-admitted">0</span></div>
+      <div class="stat-row"><span class="stat-label">Paused Requests</span><span class="stat-val" id="sched-paused">0</span></div>
+    </div>
+  </div>
+
+  <!-- Section 3: Model Catalog Discovery -->
+  <div class="section-title">📦 Installed Model Catalog</div>
+  <div class="main-grid">
+    <div class="panel-card">
+      <h3>Native .grim Checkpoints</h3>
+      <ul class="model-list" id="list-grim-models"><li class="empty-state">No .grim models cached</li></ul>
+    </div>
+    <div class="panel-card">
+      <h3>Standard GGUF Models</h3>
+      <ul class="model-list" id="list-gguf-models"><li class="empty-state">No .gguf models cached</li></ul>
+    </div>
+  </div>
+
+  <!-- Section 4: Acquire Models — Pull from Registry / Upload Local File -->
+  <div class="section-title">⬇️ Acquire Models — Pull &amp; Upload</div>
+  <div class="main-grid">
+
+    <!-- Pull from Registry -->
+    <div class="panel-card">
+      <h3><span>Pull from Registry</span></h3>
+
+      <div class="registry-toggle" role="group" aria-label="Model registry source">
+        <button type="button" id="pull-src-ollama" class="registry-btn active" aria-pressed="true">🦙 Ollama</button>
+        <button type="button" id="pull-src-hf" class="registry-btn" aria-pressed="false">🤗 Hugging Face</button>
+      </div>
+
+      <label class="field-label" for="pull-model-input" id="pull-input-label">Model name</label>
+      <input type="text" id="pull-model-input" class="text-field"
+             placeholder="llama3.2:1b-q4_K_M" spellcheck="false" autocomplete="off">
+
+      <p class="field-hint" id="pull-hint">
+        Standard GGUF models from the Ollama registry — e.g. <code>llama3.2:1b-q4_K_M</code>.
+        Switch to Hugging Face to pull <code>org/repo/file.gguf</code>.
+      </p>
+
+      <div class="action-row">
+        <button type="button" id="pull-btn" class="action-btn primary">Pull Model</button>
+        <span class="pull-status" id="pull-status" role="status" aria-live="polite"></span>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-bar-bg"><div id="pull-progress-fill" class="progress-bar-fill" style="width:0%"></div></div>
+      </div>
+      <pre class="transfer-log" id="pull-log">Waiting for pull request…</pre>
+    </div>
+
+    <!-- Upload local file -->
+    <div class="panel-card">
+      <h3><span>Upload Model File</span></h3>
+
+      <label class="dropzone" id="upload-dropzone" for="upload-file-input">
+        <input type="file" id="upload-file-input" accept=".gguf,.grim,.safetensors" hidden>
+        <span class="dz-icon">📁</span>
+        <span class="dz-title" id="upload-filename">Drop a model here or click to browse</span>
+        <span class="dz-sub">Accepted formats: .gguf · .grim · .safetensors</span>
+      </label>
+
+      <div class="action-row">
+        <button type="button" id="upload-btn" class="action-btn secondary" disabled>Upload to Server</button>
+        <span class="pull-status" id="upload-status" role="status" aria-live="polite"></span>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-bar-bg"><div id="upload-progress-fill" class="progress-bar-fill amber" style="width:0%"></div></div>
+      </div>
+    </div>
+  </div>
 
 <script>
-function fmt(b){if(b===0)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toFixed(1)+' '+u[i]}
-function pct(used,total){return total>0?Math.round(used/total*100):0}
-function cls(p){return p>90?'red':p>70?'yellow':'green'}
+function fmtBytes(b) {
+  if (!b || b === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  let val = b;
+  while (val >= 1024 && i < units.length - 1) { val /= 1024; i++; }
+  return val.toFixed(1) + ' ' + units[i];
+}
 
-async function poll(){
-  try{
-    const r=await fetch('/api/stats');
-    if(!r.ok)throw 0;
-    const d=await r.json();
-    document.getElementById('status-dot').className='live';
-    document.getElementById('conn-status').textContent='Live — refreshing every 2s';
+async function pollServerStats() {
+  try {
+    const res = await fetch('/api/stats');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
 
-    const model=d.loaded_models && d.loaded_models[0];
+    // 1. Connection Status
+    const dot = document.getElementById('status-dot');
+    const statusText = document.getElementById('conn-status');
+    dot.className = 'dot online';
+    statusText.textContent = `Live · ${window.location.host || '127.0.0.1:8740'}`;
 
-    document.getElementById('model-name').textContent=model?.name || d.model_name ||'—';
-    document.getElementById('model-type').textContent=model?.format || '—';
-    document.getElementById('model-vram').textContent=model?.vram_gb ? model.vram_gb.toFixed(1)+' GB' : '—';
-    document.getElementById('model-ram').textContent=model?.sys_ram_gb ? model.sys_ram_gb.toFixed(1)+' GB' : '—';
-    document.getElementById('model-gpu').textContent=model?.gpu_util_pct ? (model.gpu_util_pct).toFixed(0)+'%' : '—';
-    document.getElementById('model-kv').textContent=model?.kv_used_gb ? model.kv_used_gb.toFixed(1)+' GB / '+(model.kv_total_gb?' '+model.kv_total_gb.toFixed(1)+' GB':'—') : '—';
-    document.getElementById('model-ctx').textContent=model?.ctx_limit || '—';
+    // 2. Hero KPIs
+    const tps = data.tokens_per_sec;
+    document.getElementById('kpi-tps').textContent = (typeof tps === 'number') ? tps.toFixed(1) : 'Idle';
+    
+    const ttft = data.ttft_ms;
+    document.getElementById('kpi-ttft').textContent = (typeof ttft === 'number') ? `${ttft.toFixed(1)} ms` : '—';
 
-    const tps=d.tokens_per_sec;
-    const tpsEl=document.getElementById('tps');
-    tpsEl.textContent=(tps!==null&&tps!==undefined)?tps.toFixed(1):'—';
-    tpsEl.className='val '+(tps>20?'green':tps>5?'yellow':'red');
+    const itl = data.itl_ms;
+    document.getElementById('kpi-itl').textContent = (typeof itl === 'number') ? `${itl.toFixed(1)} ms` : '—';
 
-    const itl=d.itl_ms;
-    document.getElementById('itl').textContent=(itl!==null&&itl!==undefined)?itl.toFixed(1)+' ms':'—';
-    const ttft=d.ttft_ms;
-    document.getElementById('ttft').textContent=(ttft!==null&&ttft!==undefined)?ttft.toFixed(1)+' ms':'—';
-    const spec=d.speculative;
-    document.getElementById('spec-strat').textContent=spec?.strategy || '—';
-    document.getElementById('spec-accept').textContent=(spec?.accept_rate_ema!==undefined&&spec?.accept_rate_ema!==null)?(spec.accept_rate_ema*100).toFixed(1)+'%':'—';
+    const spec = data.speculative;
+    if (spec && typeof spec.accept_rate_ema === 'number') {
+      document.getElementById('kpi-spec-accept').textContent = `${(spec.accept_rate_ema * 100).toFixed(1)}%`;
+      document.getElementById('kpi-spec-strat').textContent = spec.strategy || 'Auto';
+    } else if (spec && typeof spec.accepted_rate === 'number') {
+      document.getElementById('kpi-spec-accept').textContent = `${(spec.accepted_rate * 100).toFixed(1)}%`;
+      document.getElementById('kpi-spec-strat').textContent = spec.strategy || 'Auto';
+    } else {
+      document.getElementById('kpi-spec-accept').textContent = '—';
+      document.getElementById('kpi-spec-strat').textContent = 'Direct Exec';
+    }
 
-    document.getElementById('adapters').textContent=d.adapters_active??0;
+    // 3. Dynamic Multi-GPU Hardware Rendering
+    const gpuContainer = document.getElementById('gpu-grid-container');
+    const gpus = data.gpus || [];
+    if (gpus.length > 0) {
+      gpuContainer.innerHTML = '';
+      gpus.forEach((gpu) => {
+        const devBox = document.createElement('div');
+        devBox.className = 'gpu-device-box';
+        const backend = (gpu.backend || 'ROCm').toLowerCase();
+        const memPct = gpu.memory || 0;
+        const usedStr = fmtBytes(gpu.vram_used || 0);
+        const totalStr = fmtBytes(gpu.vram_total || (8 * 1024 * 1024 * 1024));
+        const computeVal = (gpu.compute !== null && gpu.compute !== undefined) ? `${gpu.compute}%` : 'N/A';
 
-    const kvPct=pct(d.kv_cache.used,d.kv_cache.total);
-    document.getElementById('kv').textContent=d.kv_cache.total>0?fmt(d.kv_cache.used)+' / '+fmt(d.kv_cache.total):'—';
-    document.getElementById('kv-bar').style.width=kvPct+'%';
-    document.getElementById('kv-blocks').textContent=(d.kv_cache.blocks_used??0)+' / '+(d.kv_cache.blocks_total??0);
+        devBox.innerHTML = `
+          <div class="gpu-device-header">
+            <span class="gpu-title">${gpu.name || `GPU #${gpu.index}`}</span>
+            <span class="gpu-badge ${backend}">${gpu.backend || 'GPU'}</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">VRAM Usage</span>
+            <span class="stat-val">${usedStr} / ${totalStr} (${memPct}%)</span>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill ${memPct > 85 ? 'amber' : ''}" style="width: ${Math.min(100, Math.max(0, memPct))}%;"></div>
+            </div>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Compute Core Load</span>
+            <span class="stat-val ${gpu.compute > 0 ? 'emerald' : ''}">${computeVal}</span>
+          </div>
+        `;
+        gpuContainer.appendChild(devBox);
+      });
+    } else {
+      gpuContainer.innerHTML = '<div class="empty-state">No discrete GPU accelerators attached (Host CPU Mode)</div>';
+    }
 
-    const vramPct=pct(d.vram.used,d.vram.total);
-    const vEl=document.getElementById('vram');
-    vEl.textContent=d.vram.total>0?fmt(d.vram.used)+' / '+fmt(d.vram.total):'—';
-    vEl.className='val '+cls(vramPct);
-    document.getElementById('vram-bar').style.width=vramPct+'%';
+    // 4. Active Model & RAM
+    document.getElementById('model-name').textContent = data.model_name || 'No model loaded';
+    document.getElementById('model-adapters').textContent = data.adapters_active ?? 0;
+    
+    if (data.sys_ram && data.sys_ram.total > 0) {
+      const ramUsed = data.sys_ram.used;
+      const ramTotal = data.sys_ram.total;
+      const ramPct = Math.round((ramUsed / ramTotal) * 100);
+      document.getElementById('sys-ram-text').textContent = `${fmtBytes(ramUsed)} / ${fmtBytes(ramTotal)} (${ramPct}%)`;
+      document.getElementById('sys-ram-bar').style.width = `${ramPct}%`;
+    }
 
-    const gpu=(d.gpus&&d.gpus[0])||{};
-    document.getElementById('gpu-name').textContent=gpu.name||'—';
-    document.getElementById('gpu-mem').textContent=(gpu.memory??0)+'%';
+    // 5. KV Cache
+    if (data.kv_cache) {
+      const kvUsed = data.kv_cache.used || 0;
+      const kvTotal = data.kv_cache.total || 0;
+      const kvPct = kvTotal > 0 ? Math.round((kvUsed / kvTotal) * 100) : 0;
+      document.getElementById('kv-mem-text').textContent = kvTotal > 0 ? `${fmtBytes(kvUsed)} / ${fmtBytes(kvTotal)} (${kvPct}%)` : 'Idle';
+      document.getElementById('kv-mem-bar').style.width = `${kvPct}%`;
+      document.getElementById('kv-blocks-text').textContent = `${data.kv_cache.blocks_used ?? 0} / ${data.kv_cache.blocks_total ?? 0}`;
+    }
 
-    if(d.models){
-      const render=(id,arr)=>{
-        const el=document.getElementById(id);
-        if(!arr||arr.length===0){el.innerHTML='<li class="empty">None</li>';return}
-        el.innerHTML=arr.map(m=>{
-          const sz=m.size?fmt(m.size):'';
-          const extra=[m.params,m.quant].filter(Boolean).join(' · ');
-          return '<li class="model-row"><span>'+m.name+(extra?' <span class="label">'+extra+'</span>':'')+'</span><span class="badge '+(m.format||'other')+'">'+m.format+' '+sz+'</span></li>';
+    if (data.hardware) {
+      document.getElementById('hardware-xnack').textContent = data.hardware.xnack_enabled ? 'Enabled (SVM)' : 'Disabled';
+    }
+
+    // 6. Scheduler Queues
+    if (data.scheduler) {
+      document.getElementById('sched-active').textContent = data.scheduler.active_requests ?? 0;
+      document.getElementById('sched-waiting').textContent = data.scheduler.waiting_requests ?? 0;
+      document.getElementById('sched-admitted').textContent = data.scheduler.admitted_requests ?? 0;
+      document.getElementById('sched-paused').textContent = data.scheduler.paused_requests ?? 0;
+    }
+
+    // 7. Models Catalog
+    if (data.models) {
+      const renderModels = (containerId, list, defaultExt) => {
+        const el = document.getElementById(containerId);
+        if (!list || list.length === 0) {
+          el.innerHTML = `<li class="empty-state">No .${defaultExt} models detected in catalog</li>`;
+          return;
+        }
+        el.innerHTML = list.map(m => {
+          const sz = fmtBytes(m.size || 0);
+          const meta = [m.arch, m.params, m.quant].filter(Boolean).join(' · ');
+          return `
+            <li class="model-item">
+              <div class="model-name-box">
+                <span class="model-primary-name">${m.name}</span>
+                <span class="model-details">${meta || sz}</span>
+              </div>
+              <span class="badge-tag ${m.format || 'other'}">${m.format || defaultExt} · ${sz}</span>
+            </li>
+          `;
         }).join('');
       };
-      render('m-grim',d.models.grim);
-      render('m-gguf',d.models.gguf);
-      render('m-other',d.models.other);
+
+      renderModels('list-grim-models', data.models.grim, 'grim');
+      renderModels('list-gguf-models', data.models.gguf, 'gguf');
     }
-  }catch(e){
-    document.getElementById('status-dot').className='dead';
-    document.getElementById('conn-status').textContent='Disconnected — retrying…';
+
+  } catch (err) {
+    const dot = document.getElementById('status-dot');
+    const statusText = document.getElementById('conn-status');
+    dot.className = 'dot offline';
+    statusText.textContent = 'Disconnected — Retrying...';
   }
 }
-poll();
-setInterval(poll,2000);
+
+// ---------------------------------------------------------------------------
+// Acquire Models — Pull from Registry
+// ---------------------------------------------------------------------------
+(function initAcquireModels() {
+  const srcBtns = { ollama: document.getElementById('pull-src-ollama'),
+                    hf:     document.getElementById('pull-src-hf') };
+  const input    = document.getElementById('pull-model-input');
+  const label    = document.getElementById('pull-input-label');
+  const hint     = document.getElementById('pull-hint');
+  const btn      = document.getElementById('pull-btn');
+  const status   = document.getElementById('pull-status');
+  const fillBar  = document.getElementById('pull-progress-fill');
+  const log      = document.getElementById('pull-log');
+  let source = 'ollama';
+
+  const COPY = {
+    ollama: { label: 'Model name',
+              ph: 'llama3.2:1b-q4_K_M',
+              hint: 'Standard GGUF models from the Ollama registry — e.g. <code>llama3.2:1b-q4_K_M</code>. Switch to Hugging Face to pull <code>org/repo/file.gguf</code>.' },
+    hf:     { label: 'Hugging Face reference',
+              ph: 'GnLOLot/MiniCPM5-1B-Claude-Opus-Fable5-Thinking-GGUF/…q4_k….gguf',
+              hint: 'Format <code>org/repo/file.gguf</code> or a direct huggingface.co URL. If the filename is omitted, the first GGUF in the repo is used.' },
+  };
+
+  function setSource(src) {
+    source = src;
+    for (const key of Object.keys(srcBtns)) {
+      const active = key === src;
+      srcBtns[key].classList.toggle('active', active);
+      srcBtns[key].setAttribute('aria-pressed', String(active));
+    }
+    label.textContent = COPY[src].label;
+    input.placeholder = COPY[src].ph;
+    hint.innerHTML = COPY[src].hint;
+  }
+
+  srcBtns.ollama.addEventListener('click', () => setSource('ollama'));
+  srcBtns.hf.addEventListener('click', () => setSource('hf'));
+
+  function buildModelRef(name) {
+    if (source === 'hf') {
+      // Accept bare org/repo[/file], hf:-prefixed refs, and full URLs as-is.
+      return name.startsWith('hf:') || name.startsWith('http') ? name : 'hf:' + name;
+    }
+    return name; // plain names resolve against the Ollama registry
+  }
+
+  function logLine(text) {
+    log.textContent += (log.textContent ? '\n' : '') + text;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function startPull() {
+    const name = input.value.trim();
+    if (!name) { status.textContent = 'Enter a model name first.'; status.className = 'pull-status err'; input.focus(); return; }
+    if (btn.disabled) return;
+
+    btn.disabled = true;
+    input.disabled = true;
+    status.className = 'pull-status';
+    status.textContent = 'Starting…';
+    fillBar.style.width = '0%';
+    fillBar.classList.remove('amber');
+    log.textContent = '';
+
+    try {
+      const res = await fetch('/api/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: buildModelRef(name) }),
+      });
+      if (!res.ok) throw new Error('Server returned HTTP ' + res.status);
+
+      // Response is NDJSON: one DownloadProgress JSON object per line.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let errored = false;
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (!line) continue;
+          let evt;
+          try { evt = JSON.parse(line); } catch { continue; }
+          if (evt.error) { errored = true; logLine('✖ ' + evt.error); continue; }
+          logLine(evt.status || JSON.stringify(evt));
+          if (evt.total > 0 && evt.completed != null) {
+            const pct = Math.min(100, Math.round(evt.completed * 100 / evt.total));
+            fillBar.style.width = pct + '%';
+            status.textContent = `${pct}% · ${fmtBytes(evt.completed)} / ${fmtBytes(evt.total)}`;
+          } else if (evt.completed != null) {
+            status.textContent = fmtBytes(evt.completed) + ' downloaded';
+          }
+          if (evt.status === 'success') { fillBar.style.width = '100%'; }
+        }
+      }
+
+      status.textContent = errored ? 'Pull failed.' : 'Pull complete ✓';
+      status.className = 'pull-status ' + (errored ? 'err' : 'ok');
+      if (!errored && typeof pollServerStats === 'function') pollServerStats();
+    } catch (err) {
+      status.textContent = 'Error: ' + err.message;
+      status.className = 'pull-status err';
+      logLine('✖ ' + err.message);
+    } finally {
+      btn.disabled = false;
+      input.disabled = false;
+    }
+  }
+
+  btn.addEventListener('click', startPull);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') startPull(); });
+
+  // ---------------------------------------------------------------------------
+  // Upload Model File
+  // ---------------------------------------------------------------------------
+  const dropzone  = document.getElementById('upload-dropzone');
+  const fileInput = document.getElementById('upload-file-input');
+  const fileLabel = document.getElementById('upload-filename');
+  const upBtn     = document.getElementById('upload-btn');
+  const upStatus  = document.getElementById('upload-status');
+  const upFill    = document.getElementById('upload-progress-fill');
+  let pendingFile = null;
+
+  function setPendingFile(file) {
+    if (!file) return;
+    if (!/\.(gguf|grim|safetensors)$/i.test(file.name)) {
+      upStatus.textContent = 'Unsupported file type.';
+      upStatus.className = 'pull-status err';
+      return;
+    }
+    pendingFile = file;
+    fileLabel.textContent = `${file.name} (${fmtBytes(file.size)})`;
+    upBtn.disabled = false;
+    upStatus.textContent = '';
+    upFill.style.width = '0%';
+  }
+
+  fileInput.addEventListener('change', () => setPendingFile(fileInput.files[0]));
+  ['dragenter', 'dragover'].forEach((ev) =>
+    dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); }));
+  ['dragleave', 'drop'].forEach((ev) =>
+    dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); }));
+  dropzone.addEventListener('drop', (e) => setPendingFile(e.dataTransfer.files[0]));
+
+  upBtn.addEventListener('click', () => {
+    if (!pendingFile || upBtn.disabled) return;
+    upBtn.disabled = true;
+    upStatus.className = 'pull-status';
+    upStatus.textContent = 'Uploading…';
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload?filename=' + encodeURIComponent(pendingFile.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round(e.loaded * 100 / e.total);
+        upFill.style.width = pct + '%';
+        upStatus.textContent = `${pct}% · ${fmtBytes(e.loaded)} / ${fmtBytes(e.total)}`;
+      }
+    };
+    xhr.onload = () => {
+      let msg = '';
+      try { msg = JSON.parse(xhr.responseText).error || ''; } catch {}
+      if (xhr.status === 200) {
+        upStatus.textContent = 'Upload complete ✓';
+        upStatus.className = 'pull-status ok';
+        upFill.style.width = '100%';
+        if (typeof pollServerStats === 'function') pollServerStats();
+      } else {
+        upStatus.textContent = msg || ('Upload failed (HTTP ' + xhr.status + ')');
+        upStatus.className = 'pull-status err';
+      }
+      upBtn.disabled = false;
+    };
+    xhr.onerror = () => {
+      upStatus.textContent = 'Network error during upload.';
+      upStatus.className = 'pull-status err';
+      upBtn.disabled = false;
+    };
+    xhr.send(pendingFile);
+  });
+})();
+
+pollServerStats();
+setInterval(pollServerStats, 2000);
 </script>
 </body>
-</html>"#;
+</html>"###;

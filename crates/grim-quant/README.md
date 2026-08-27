@@ -28,6 +28,8 @@ graph TD
   - `dequant_q80`, `dequant_q4k`, `dequant_q5k`, `dequant_q6k`, `dequant_q2k` (GGUF formats).
   - `dequant_iq4nl`, `dequant_iq4xs`, `dequant_iq3xxs`, `dequant_iq2xxs` (Importance Matrix formats).
   - `dequant_gptq_group_int` (GPTQ / EfficientQAT).
+  - `dequant_awq_group_int` (AWQ native column-packed weights with raw zero-points and f16 scales).
+  - `fp8_e4m3_to_f32` and `fp8_e5m2_to_f32` (FP8 CPU conversions).
 - **`TensorRewritePlan` & `RewrittenTensorData`**: Structs detailing how a tensor's physical layout should be reshaped or converted (e.g., adding `wavefront_tiled` hints) during quantization.
 - **`spqr::*`**: Utilities for SPQR salient weight identification (`spqr_identify_salient`, `SpqrSalientResidual`).
 - **`soul_eater::*`**: Specific logic for the SoulEater quantization format.

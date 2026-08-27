@@ -278,10 +278,67 @@ pub fn pack_awq_group_int(
     Ok(out)
 }
 
+/// Pack raw AWQ segments into native 3-segment format:
+/// `[u64 LE: qweight_len][qweight][u64 LE: qzeros_len][qzeros][u64 LE: scales_len][scales (f16)]`
+pub fn pack_awq_native(
+    info: &AwqTensorInfo,
+    qweight: &[u8],
+    qzeros: &[u8],
+    scales: &[u8],
+) -> Result<Vec<u8>> {
+    let in_features = *info
+        .shape
+        .first()
+        .ok_or_else(|| Error::Backend("AWQ: tensor info missing in_features".into()))?;
+    let out_features = *info
+        .shape
+        .get(1)
+        .ok_or_else(|| Error::Backend("AWQ: tensor info missing out_features".into()))?;
+    let bits = info.bits;
+    let vpw = match bits {
+        2 => 16,
+        4 => 8,
+        8 => 1,
+        _ => return Err(Error::Backend(format!("AWQ: unsupported bits {bits}"))),
+    };
+    let words_qw = in_features.div_ceil(vpw) * out_features;
+    if qweight.len() < words_qw * 4 {
+        return Err(Error::Backend(format!(
+            "AWQ {}: qweight truncated ({} bytes, need {})",
+            info.name,
+            qweight.len(),
+            words_qw * 4
+        )));
+    }
+
+    let groups = in_features.div_ceil(info.group_size);
+    let words_qz = groups * out_features.div_ceil(vpw);
+    if qzeros.len() < words_qz * 4 {
+        return Err(Error::Backend(format!(
+            "AWQ {}: qzeros truncated",
+            info.name
+        )));
+    }
+    let sc_bytes = groups * out_features * 2;
+    if scales.len() < sc_bytes {
+        return Err(Error::Backend(format!(
+            "AWQ {}: scales truncated",
+            info.name
+        )));
+    }
+
+    let mut out = Vec::with_capacity(24 + words_qw * 4 + words_qz * 4 + sc_bytes);
+    out.extend_from_slice(&( (words_qw * 4) as u64).to_le_bytes());
+    out.extend_from_slice(&qweight[..words_qw * 4]);
+    out.extend_from_slice(&( (words_qz * 4) as u64).to_le_bytes());
+    out.extend_from_slice(&qzeros[..words_qz * 4]);
+    out.extend_from_slice(&(sc_bytes as u64).to_le_bytes());
+    out.extend_from_slice(&scales[..sc_bytes]);
+    Ok(out)
+}
+
 impl TensorProvider for AwqProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
-        // Eager-dequant path: re-frame to the canonical blob, then decode via
-        // the shared GroupInt kernel.
         let info = self
             .tensors
             .get(name)
@@ -290,30 +347,19 @@ impl TensorProvider for AwqProvider {
         let qzeros = self.read_segment(info.qzeros_offset, info.qzeros_size)?;
         let scales = self.read_segment(info.scales_offset, info.scales_size)?;
 
-        // Decode with the shared GroupInt kernel after re-framing.
-        let blob = pack_awq_group_int(info, &qweight, &qzeros, &scales)?;
-        let mut cursor = 0usize;
-        let read_seg = |c: &mut usize| -> Result<Vec<u8>> {
-            let len = u64::from_le_bytes(blob[*c..*c + 8].try_into().unwrap()) as usize;
-            *c += 8;
-            let seg = blob[*c..*c + len].to_vec();
-            *c += len;
-            Ok(seg)
-        };
-        let qw = read_seg(&mut cursor)?;
-        let qz = read_seg(&mut cursor)?;
-        let sc = read_seg(&mut cursor)?;
-        let gi = read_seg(&mut cursor)?;
-        let f32s = grim_quant::dequant_gptq_group_int(
-            &qw,
-            &qz,
-            &sc,
-            if gi.is_empty() { None } else { Some(&gi[..]) },
+        let f32s = grim_quant::dequant_awq_group_int(
+            &qweight,
+            &qzeros,
+            &scales,
             &info.shape,
             info.bits,
             info.group_size,
         )?;
-        let bytes: Vec<u8> = f32s.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut bytes = Vec::with_capacity(f32s.len() * 4);
+        for f in f32s {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+
         Ok(RawTensor {
             bytes,
             shape: info.shape.clone(),
@@ -335,17 +381,15 @@ impl TensorProvider for AwqProvider {
         let qweight = self.read_segment(info.qweight_offset, info.qweight_size)?;
         let qzeros = self.read_segment(info.qzeros_offset, info.qzeros_size)?;
         let scales = self.read_segment(info.scales_offset, info.scales_size)?;
-        let bytes = pack_awq_group_int(info, &qweight, &qzeros, &scales)?;
+        let bytes = pack_awq_native(info, &qweight, &qzeros, &scales)?;
         Ok(RawTensor {
             bytes,
             shape: info.shape.clone(),
             dtype: DType {
                 arith: ArithType::F32,
-                storage: Storage::GroupInt(grim_tensor::dtype::GpuIntConfig {
+                storage: Storage::Awq(grim_tensor::dtype::AwqStorageConfig {
                     bits: info.bits as u8,
                     group_size: info.group_size,
-                    scheme: GroupQuantScheme::Asymmetric,
-                    desc_act: false,
                 }),
             },
             provenance: QuantProvenance::ExternalQat {
@@ -483,6 +527,98 @@ mod tests {
                 let got = decoded[ki * n + ni];
                 assert!(
                     (got - want).abs() < 1e-5,
+                    "mismatch at ({ki},{ni}): got {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_awq_native_roundtrips_through_awq_decoder() {
+        let (k, n, gs) = (4usize, 2usize, 2usize);
+        let vpw = 8usize;
+        let groups = k / gs;
+
+        let mut qweight = vec![0u8; k.div_ceil(vpw) * n * 4];
+        let mut codes = vec![0u32; k * n];
+        for ki in 0..k {
+            for ni in 0..n {
+                let code = ((ki * 5 + ni * 3) % 15) as u32;
+                codes[ki * n + ni] = code;
+                let off = ((ki % vpw) * 4) as usize;
+                let w = (ki / vpw) * n + ni;
+                let cur = u32::from_le_bytes([
+                    qweight[w * 4],
+                    qweight[w * 4 + 1],
+                    qweight[w * 4 + 2],
+                    qweight[w * 4 + 3],
+                ]);
+                qweight[w * 4..w * 4 + 4].copy_from_slice(&(cur | (code << off)).to_le_bytes());
+            }
+        }
+
+        let raw_zero = |g: usize, ni: usize| -> u32 { ((g + ni) % 8) as u32 };
+        let mut qzeros = vec![0u8; groups * n.div_ceil(vpw) * 4];
+        for g in 0..groups {
+            for ni in 0..n {
+                let w = g * n.div_ceil(vpw) + ni / vpw;
+                let off = (ni % vpw) * 4;
+                let cur = u32::from_le_bytes([
+                    qzeros[w * 4],
+                    qzeros[w * 4 + 1],
+                    qzeros[w * 4 + 2],
+                    qzeros[w * 4 + 3],
+                ]);
+                qzeros[w * 4..w * 4 + 4]
+                    .copy_from_slice(&(cur | (raw_zero(g, ni) << off)).to_le_bytes());
+            }
+        }
+
+        let scale_val = |g: usize, ni: usize| -> f32 { 0.5 + 0.25 * ((g + ni) % 3) as f32 };
+        let mut scales = vec![0u8; groups * n * 2];
+        for g in 0..groups {
+            for ni in 0..n {
+                let h = half::f16::from_f32(scale_val(g, ni)).to_bits();
+                scales[(g * n + ni) * 2..(g * n + ni) * 2 + 2].copy_from_slice(&h.to_le_bytes());
+            }
+        }
+
+        let info = AwqTensorInfo {
+            name: "test_native".into(),
+            shape: vec![k, n],
+            bits: 4,
+            group_size: gs,
+            qweight_offset: 0,
+            qweight_size: qweight.len() as u64,
+            qzeros_offset: 0,
+            qzeros_size: qzeros.len() as u64,
+            scales_offset: 0,
+            scales_size: scales.len() as u64,
+        };
+
+        let blob = pack_awq_native(&info, &qweight, &qzeros, &scales).unwrap();
+        let mut cursor = 0usize;
+        let read_seg = |c: &mut usize| -> Vec<u8> {
+            let len = u64::from_le_bytes(blob[*c..*c + 8].try_into().unwrap()) as usize;
+            *c += 8;
+            let seg = blob[*c..*c + len].to_vec();
+            *c += len;
+            seg
+        };
+        let qw = read_seg(&mut cursor);
+        let qz = read_seg(&mut cursor);
+        let sc = read_seg(&mut cursor);
+
+        let decoded =
+            grim_quant::dequant_awq_group_int(&qw, &qz, &sc, &[k, n], 4, gs).unwrap();
+
+        for ki in 0..k {
+            let g = ki / gs;
+            for ni in 0..n {
+                let want = (codes[ki * n + ni] as f32 - raw_zero(g, ni) as f32) * scale_val(g, ni);
+                let got = decoded[ki * n + ni];
+                assert!(
+                    (got - want).abs() < 1e-4,
                     "mismatch at ({ki},{ni}): got {got}, want {want}"
                 );
             }

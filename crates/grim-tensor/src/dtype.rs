@@ -140,6 +140,10 @@ pub enum Storage {
     /// [u32 embedding_dim][u32 num_rows][u8 packed_codes...]. Dequantized to
     /// F32 at load or on-the-fly in the CPU dequant path.
     EmbeddingWNA16Int,
+    /// AWQ: Activation-aware Weight Quantization format with column-packed
+    /// uint32 codes, raw stored zero-points, and f16 per-group scales.
+    /// Layout: [u64 LE qw_len][qweight][u64 LE qz_len][qzeros][u64 LE sc_len][scales (f16)].
+    Awq(AwqStorageConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,6 +282,22 @@ pub struct GpuIntConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct W4A16Config {
     /// Number of input features per group (`k % group_size == 0`).
+    pub group_size: usize,
+}
+
+/// Bitwidth and grouping configuration for `Storage::Awq`.
+///
+/// # Packed byte layout contract
+///
+/// The `RawTensor.bytes` blob for an `Awq` tensor is 3 length-prefixed segments:
+/// ```text
+/// [u64 LE: qweight_len] [qweight_bytes...]
+/// [u64 LE: qzeros_len]  [qzeros_bytes...]
+/// [u64 LE: scales_len]  [scales_bytes (f16)...]
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AwqStorageConfig {
+    pub bits: u8,
     pub group_size: usize,
 }
 

@@ -30,8 +30,8 @@ graph TD
 ## Public API Overview
 - `Tensor`: The main tensor struct, holding shape, dtype, and a boxed `BackendStorage`.
 - `Shape`: Represents multi-dimensional tensor geometries.
-- `DType`: Defines data types, including floating-point types and quantized formats.
-- `BackendDevice`: Trait for device capabilities, allocation, and kernel dispatch.
+- `DType`: Defines data types, combining arithmetic representation (`ArithType`) and storage representation (`Storage`, including native, KQuant, Block, FloatPack/MXFP4, W4A16, GroupInt/GPTQ, WNA16, CompressedTensors W8A8 Int8/Fp8, and AWQ via `AwqStorageConfig`).
+- `BackendDevice`: Trait for device capabilities, allocation, dense & quantized GEMM, fused MoE dispatch, and kernel dispatch.
 - `BackendStorage`: Trait for backend-specific tensor memory management.
 - `ComputeHandle`: Trait representing asynchronous computation progress and synchronization.
 - `SoftmaxPartial`: Utilities for distributed or split-k softmax reduction.
