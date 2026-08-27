@@ -248,3 +248,22 @@ fn test_layer_pipelined_kv_streamer_and_orchestrator() {
     let recv_k = guard.read_keys(0);
     assert_eq!(&recv_k[..32], &k_data[..]);
 }
+
+#[test]
+fn test_disagg_orchestrator_heartbeat_failover() {
+    use grim_disagg::{DisaggConfig, DisaggOrchestrator};
+
+    let decode_cfg = DisaggConfig {
+        role: PoolRole::Decode,
+        prefill_addr: "127.0.0.1:9001".into(),
+        decode_addr: "127.0.0.1:9002".into(),
+    };
+    let mut orch = DisaggOrchestrator::new(decode_cfg);
+
+    // Initial state with fresh heartbeat
+    orch.record_heartbeat(PoolRole::Prefill, 1000);
+    assert_eq!(orch.evaluate_failover(1200, 500), PoolRole::Decode);
+
+    // Time elapsed exceeds timeout -> failover to Colocated
+    assert_eq!(orch.evaluate_failover(2000, 500), PoolRole::Colocated);
+}

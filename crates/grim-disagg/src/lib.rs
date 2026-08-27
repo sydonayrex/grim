@@ -139,15 +139,61 @@ impl LayerPipelinedKvStreamer {
     }
 }
 
-/// Disaggregated serving cluster orchestrator managing prefill and decode worker roles.
+/// Disaggregated serving cluster orchestrator managing prefill and decode worker roles,
+/// worker heartbeats, and dynamic failover policies.
 #[derive(Debug, Clone)]
 pub struct DisaggOrchestrator {
     pub config: DisaggConfig,
+    prefill_healthy: bool,
+    decode_healthy: bool,
+    last_prefill_heartbeat_ms: u64,
+    last_decode_heartbeat_ms: u64,
 }
 
 impl DisaggOrchestrator {
     pub fn new(config: DisaggConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            prefill_healthy: true,
+            decode_healthy: true,
+            last_prefill_heartbeat_ms: 0,
+            last_decode_heartbeat_ms: 0,
+        }
+    }
+
+    /// Record a heartbeat timestamp for a node role.
+    pub fn record_heartbeat(&mut self, role: PoolRole, now_ms: u64) {
+        match role {
+            PoolRole::Prefill => {
+                self.prefill_healthy = true;
+                self.last_prefill_heartbeat_ms = now_ms;
+            }
+            PoolRole::Decode => {
+                self.decode_healthy = true;
+                self.last_decode_heartbeat_ms = now_ms;
+            }
+            PoolRole::Colocated => {
+                self.prefill_healthy = true;
+                self.decode_healthy = true;
+            }
+        }
+    }
+
+    /// Check health against a timeout window; fails over to colocated fallback if dead.
+    pub fn evaluate_failover(&mut self, now_ms: u64, timeout_ms: u64) -> PoolRole {
+        if self.config.role == PoolRole::Decode {
+            if now_ms.saturating_sub(self.last_prefill_heartbeat_ms) > timeout_ms && self.last_prefill_heartbeat_ms > 0 {
+                self.prefill_healthy = false;
+                // Fallback to local colocated execution if prefill remote is unreachable
+                return PoolRole::Colocated;
+            }
+        } else if self.config.role == PoolRole::Prefill {
+            if now_ms.saturating_sub(self.last_decode_heartbeat_ms) > timeout_ms && self.last_decode_heartbeat_ms > 0 {
+                self.decode_healthy = false;
+                return PoolRole::Colocated;
+            }
+        }
+        self.config.role
     }
 
     /// Whether this node instance should execute compute-heavy prefill passes.
