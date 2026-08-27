@@ -430,7 +430,11 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
         },
         Storage::GroupInt(cfg) => cfg.bits,
         Storage::ResidualPacked(cfg) => cfg.bpw,
+        Storage::CompressedTensorsW8A8Int8
+        | Storage::CompressedTensorsW8A8Fp8 => 8,
+        Storage::W4A16(_) => 4,
         Storage::Native => 32,
+        _ => (dtype.arith.byte_size() as u8) * 8,
     }
 }
 
@@ -489,15 +493,17 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 }
             },
             Storage::Native => &empty_scales,
+            _ => &empty_scales,
         };
 
-        // Audit fix (A3): this fused path serves the WEIGHT-STYLE contract
-        // C = A @ Bᵀ with B stored [n, k] — the layout every production
-        // caller (streaming_forward record_matmul, transpose_b = true) and
-        // the dx kernels themselves use. The previous gate also admitted the
-        // DOCUMENTED non-transposed contract (B [k, n]) whose grads are
-        // garbage through these kernels (both wrong on gfx1201 vs the CPU
-        // reference); that case now falls back to the verified host loops.
+        // Audit fix (grim-autograd A3): this fused path serves the
+        // WEIGHT-STYLE contract C = A @ Bᵀ with B stored [n, k] — the layout
+        // every production caller (streaming_forward record_matmul,
+        // transpose_b = true) and the dx kernels themselves use. The
+        // previous gate also admitted the DOCUMENTED non-transposed contract
+        // (B [k, n]) whose grads are garbage through these kernels (both
+        // wrong on gfx1201 vs the CPU reference); that case now falls back
+        // to the verified host loops.
         if !args.transpose_a && args.transpose_b
             && (b_on_rocm || b_on_cuda || b_on_vulkan || b_on_metal) {
             let bpw = bpw_from_dtype(&args.b.dtype());
@@ -521,10 +527,9 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 args.a.device().clone(),
             );
 
-            // Audit fix (grim-autograd A3): grad_b for the weight-style
-            // contract C = A @ Bᵀ (B stored [n, k]) is
-            // dB_stored[p][q] = sum_i G[i][p] * A[i][q]. The previous device
-            // call `matmul(A, G)` was neither of those.
+            // grad_b: dB_stored[p][q] = sum_i G[i][p] * A[i][q] — computed on
+            // host (B is the small trainable matrix; no device transpose
+            // primitive exists).
             let a_host = args.a.to_vec_f32()?;
             let g_host = args.out_grad.to_vec_f32()?;
             let (n_stored, k_stored) = (args.b.shape().dims()[0], args.b.shape().dims()[1]);

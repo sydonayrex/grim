@@ -2211,6 +2211,7 @@ dependencies = [
  "cubecl-hip",
  "cubecl-hip-sys",
  "cubecl-runtime",
+ "grim-autograd",
  "grim-backend-cpu",
  "grim-format",
  "grim-kvquant",
@@ -2299,6 +2300,10 @@ dependencies = [
  "windows-service",
  "zstd",
 ]
+
+[[package]]
+name = "grim-compressed-tensors"
+version = "0.1.0"
 
 [[package]]
 name = "grim-constrain"
@@ -2642,6 +2647,7 @@ name = "grim-tensor"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-compressed-tensors",
  "serde",
  "thiserror 1.0.69",
 ]

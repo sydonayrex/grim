@@ -662,6 +662,37 @@ fn materialize(
     provenance: QuantProvenance,
     device: &Device,
 ) -> Result<Tensor> {
+    // ROCm-only fast path for GPTQ/EfficientQAT `GroupInt` weights. Keeps the
+    // packed four-segment blob resident on-device so the engine's
+    // `Linear::forward` -> `quantized_matmul` reads it directly through the
+    // fused `grim_gptq_dequant_gemm` kernel (roc_device.rs GroupInt arm),
+    // instead of inflating every tensor to host f32 at load.
+    //
+    // Scoped to ROCm: the ROCm backend is the only one whose
+    // `quantized_matmul` has a `GroupInt` dispatch arm backed by a live GPU
+    // kernel. The CPU/Vulkan/Metal/CUDA backends lack that arm, so for them
+    // `GroupInt` intentionally falls through to the host-f32 dequant below.
+    // 3-bit GroupInt has no fused device kernel (segment-offset + kernel only
+    // support 2/4/8-bit), so it also falls through to host f32 here and is
+    // served by `dequant_gptq_group_int` at load.
+    #[cfg(feature = "rocm-mem")]
+    if let Device::Rocm(ordinal) = device {
+        if let Storage::GroupInt(cfg) = &dtype.storage {
+            if matches!(cfg.bits, 2 | 4 | 8) {
+                let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+                storage.set_provenance(provenance.clone());
+                return Ok(Tensor::new(
+                    std::sync::Arc::from(storage),
+                    shape,
+                    dtype,
+                    provenance,
+                    device.clone(),
+                ));
+            }
+        }
+    }
+
     if dtype.is_quantized()
         && !matches!(dtype.storage, Storage::ResidualPacked(_))
         && !matches!(dtype.storage, Storage::GroupInt(_))
@@ -856,6 +887,19 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
                 cfg.bits as u32,
                 cfg.group_size,
             )
+        }
+        _ => Err(Error::Unimplemented(format!(
+            "dequant_to_f32: storage {:?} has no host dequant path",
+            dtype.storage
+        ))),
+        Storage::CompressedTensorsW8A8Int8
+        | Storage::CompressedTensorsW8A8Fp8 => {
+            // These W8A8 formats are resident-capable on ROCm/CUDA and reach the
+            // fused dequant GEMM; host dequant isn't wired for them on the CPU fallback.
+            Err(Error::Unimplemented(format!(
+                "dequant_to_f32: storage {:?} requires resident GPU dequant path",
+                dtype.storage
+            )))
         }
     }
 }

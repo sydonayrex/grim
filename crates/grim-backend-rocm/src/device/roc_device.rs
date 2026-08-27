@@ -3916,23 +3916,59 @@ impl BackendDevice for RocmDevice {
                     w4.group_size,
                 )?;
             }
-            DTypeStorage::WNA16 | DTypeStorage::EmbeddingWNA16Int => {
-                // Weight-only N-bit: dequant-on-device service exists
-                // (launch_dequant_wna16) but no fused GEMM kernel is wired
-                // yet — fail loudly rather than feeding packed bytes to the
-                // f32 matmul fallback (silent garbage).
+            DTypeStorage::WNA16 => {
+                // Fused dequant-GEMM over the resident blob; the header
+                // carries n_bit/num_blocks.
+                let hdr = Self::wna16_read_header(b_storage, self.ordinal)?;
+                let mut n_bit_v =
+                    u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as i32;
+                let mut blocks_v =
+                    u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as i32;
+                self.launch_elementwise_dequant_gemm(
+                    "grim_wna16_dequant_gemm",
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    &mut [arg(&mut n_bit_v), arg(&mut blocks_v)],
+                )?;
+            }
+            DTypeStorage::EmbeddingWNA16Int => {
+                // Embedding tables ride the dequant-at-load service, not a
+                // GEMM — fail loudly if routed here.
                 return Err(Error::Backend(
-                    "quantized_matmul: WNA16/EmbeddingWNA16Int has no fused GPU GEMM yet;                      dequantize the weight at load (dequant_wna16_to_f32) and run F32"
+                    "quantized_matmul: EmbeddingWNA16Int is an embedding format; dequantize at load (dequant_embedding_wna16_int_to_f32)"
                         .into(),
                 ));
             }
-            DTypeStorage::CompressedTensorsW8A8Int8 | DTypeStorage::CompressedTensorsW8A8Fp8 => {
-                // No GPU kernel authored yet for compressed-tensors W8A8 —
-                // fail loudly instead of the packed-bytes-as-f32 fallback.
-                return Err(Error::Backend(
-                    "quantized_matmul: CompressedTensorsW8A8 Int8/Fp8 GPU kernel not wired yet;                      tracked in the compressed-tensors workstream"
-                        .into(),
-                ));
+            DTypeStorage::CompressedTensorsW8A8Int8 => {
+                // SmoothQuant-style W8 (int8 codes + per-output-channel f32
+                // scales); activations F32 on this path.
+                self.launch_elementwise_dequant_gemm(
+                    "grim_w8a8_int8_dequant_gemm",
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    &mut [],
+                )?;
+            }
+            DTypeStorage::CompressedTensorsW8A8Fp8 => {
+                // OCP E4M3 codes + per-tensor f32 scale; activations F32.
+                self.launch_elementwise_dequant_gemm(
+                    "grim_w8a8_fp8_dequant_gemm",
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    &mut [],
+                )?;
             }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
@@ -11155,6 +11191,71 @@ impl RocmDevice {
         )
     }
 
+    /// Elementwise dequant-GEMM launcher shared by the compressed-tensors
+    /// W8A8 kernels (256-thread blocks over M*N outputs).
+    fn launch_elementwise_dequant_gemm(
+        &self,
+        entry: &str,
+        a: &RocmStorage,
+        blob: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        extra_args: &mut [*mut c_void],
+    ) -> Result<()> {
+        let mut aptr = a.device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm: a has no device ptr".into()))? as *mut c_void;
+        let mut bptr = blob.device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm: blob has no device ptr".into()))? as *mut c_void;
+        let mut optr = out.device_ptr
+            .ok_or_else(|| Error::Backend("dequant gemm: out has no device ptr".into()))? as *mut c_void;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let grid_x = ((m * n + 255) / 256) as u32;
+        let mut args: Vec<*mut c_void> = vec![
+            arg(&mut aptr),
+            arg(&mut bptr),
+            arg(&mut optr),
+            arg(&mut mm),
+            arg(&mut nn),
+            arg(&mut kk),
+        ];
+        args.extend_from_slice(extra_args);
+        self.launch_compute_kernel(
+            entry,
+            HipDim3::new(grid_x, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut args,
+        )?;
+        Ok(())
+    }
+
+    /// Read the WNA16 blob header ([u32 n_bit][u32 num_blocks]) via pinned D2H.
+    fn wna16_read_header(blob: &RocmStorage, ordinal: usize) -> Result<[u8; 8]> {
+        let dev = RocmDevice::try_new(ordinal)?;
+        let mut pinned = RocmPinnedBuffer::<u8>::alloc(8)?;
+        let _g = crate::device::util::DeviceGuard::set(ordinal as i32);
+        let ptr = blob.device_ptr
+            .ok_or_else(|| Error::Backend("wna16 header: no device ptr".into()))?;
+        check_hip("wna16 header D2H", unsafe {
+            hipMemcpyAsync(
+                pinned.as_mut_ptr() as *mut c_void,
+                ptr as *const c_void,
+                8,
+                HipMemcpyKind::DeviceToHost,
+                dev.active_stream(),
+            )
+        })?;
+        check_hip("wna16 header sync", unsafe {
+            hipStreamSynchronize(dev.active_stream())
+        })?;
+        let mut out = [0u8; 8];
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(pinned.as_ptr(), 8) });
+        Ok(out)
+    }
+
     /// Public materialization service (quant workstream): dequantize a
     /// Marlin W4A16 packed expert blob to row-major F32 [k_dim? no —]
     ///
@@ -11216,9 +11317,9 @@ impl RocmDevice {
                 )));
             }
         };
-        let mut has_i: i32 = 0;
         let (qw, qz, sc, gi, has_g_idx) =
             Self::gptq_segment_offsets(bits, group_size, k_in, n_out, blob.bytes())?;
+        let mut has_i = if has_g_idx { 1 } else { 0 };
         // C = A @ D with A = I[K=k_in] gives C = D row-major [k_in, n_out]
         // (the CALLER transposes to weight layout [n_out, k_in]).
         let id: Vec<f32> = (0..k_in)
@@ -11277,18 +11378,6 @@ impl RocmDevice {
         Ok(Box::new(out))
     }
 
-    /// Raw-args GPTQ forward-dequant GEMM for identity-activation
-    /// materialization (grim-nn dequantizes packed experts through
-    /// C = I @ D with this entry). Grid: one 256-thread block per 256 outputs.
-    pub(crate) fn launch_gptq_dequant_gemm_raw(
-        &self,
-        args: &mut [*mut c_void],
-        grid_dim: HipDim3,
-        block_dim: HipDim3,
-    ) -> Result<()> {
-        self.launch_compute_kernel("grim_gptq_dequant_gemm", grid_dim, block_dim, args)?;
-        Ok(())
-    }
 
     /// Launch Marlin-style Interleaved W4A16 GEMM.
     pub fn launch_marlin_gemm_w4a16(
@@ -11965,7 +12054,6 @@ impl RocmDevice {
                     self.ordinal, entry, cache_key
                 );
             }
-            let (code, lowered) = jit_compile_hsaco(source, entry, &self.gpu_target)?;
             let (code, lowered) = jit_compile_hsaco(source, entry, &self.gpu_target)?;
             let p = self
                 .hsaco_cache

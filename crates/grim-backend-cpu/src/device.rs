@@ -1758,6 +1758,10 @@ impl BackendStorage for CpuStorage {
             Storage::GroupInt(_) => Err(Error::Unimplemented(
                 "to_cpu_vec_f32: GroupInt dequant not supported (load as native instead)".into(),
             )),
+            other => Err(Error::Unimplemented(format!(
+                "to_cpu_vec_f32: storage variant {:?} not supported on CPU",
+                other
+            ))),
         }
     }
 

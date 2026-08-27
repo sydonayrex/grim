@@ -105,6 +105,41 @@ pub enum Storage {
     /// `grim_fused_dequant_gemm_f16` (WI-C / WI-T8). Outlier/backup metadata
     /// rides in `QuantProvenance::WithResiduals`.
     ResidualPacked(ResidualPackedConfig),
+    /// W8A8MXFP8: weight+activation in MXFP8 (OCP E4M3) with per-block E8M0
+    /// shared exponent. Layout matches `FloatPackScheme::MxFp8`: two
+    /// length-prefixed segments [u64 codes_len][codes...][u64 exps_len][exps...].
+    /// The dequant path produces F32 weights and F8 (E4M3) activations.
+    W8A8Mxfp8,
+    /// CompressedTensors W8A8 with INT8 weights. Per SmoothQuant contract,
+    /// weights are packed int8 bytes with per-channel (per-column) u8/f32
+    /// scales and the activations are int8 with per-token scales applied
+    /// upstream. Layout in `RawTensor.bytes`: one length-prefixed segment
+    /// [u64 scales_len][u8 packed_w8 codes...][scale bytes...] where scales are
+    /// one per output channel (f32) and codes are the dense int8 matrix.
+    CompressedTensorsW8A8Int8,
+    /// CompressedTensors W8A8 with FP8 (OCP E4M3) weights. Weights are packed
+    /// fp8 bytes with a per-tensor (or per-block) fp8/f32 scale; activations are
+    /// fp8 (OCP E4M3). Layout: [u64 scale_len][u8 packed_fp8 codes...][scale
+    /// bytes...] — the scale is one fp8 value (or f32 per-block) reused as the
+    /// multiplicative factor for the dequantized weight tiles.
+    CompressedTensorsW8A8Fp8,
+    /// Marlin-style W4A16: 4-bit packed weights + per-group f32 scales.
+    /// Packed layout: `[codes (N*K/8 u32)][scales (N*K/group_size f32)]`.
+    /// Dequantized to F32 at load time on backends without the fused kernel;
+    /// on ROCm the blob stays resident and `launch_marlin_gemm_w4a16` reads
+    /// the two segments via computed byte offsets.
+    W4A16(W4A16Config),
+    /// WNA16: weight-only N-bit quantization with 16-bit (f16) per-block scale
+    /// and one f32 per-tensor scale. Layout: [u32 n_bit][u32 num_blocks]
+    /// [u8 packed_codes...][f16 per_block_scales...][f32 tensor_scale].
+    /// N is in {2,3,4,5,6,7,8}; codes are packed MSB-first within each byte,
+    /// crossing byte boundaries as needed.
+    WNA16,
+    /// EmbeddingWNA16Int: embedding matrix weights stored as N-bit integers
+    /// (row-major, flattening each embedding dimension). Layout: [u32 n_bit]
+    /// [u32 embedding_dim][u32 num_rows][u8 packed_codes...]. Dequantized to
+    /// F32 at load or on-the-fly in the CPU dequant path.
+    EmbeddingWNA16Int,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -223,6 +258,27 @@ pub struct GpuIntConfig {
     /// `false` for EfficientQAT (sequential `g_idx`), `true` for classic GPTQ
     /// with activation ordering.
     pub desc_act: bool,
+}
+
+/// Bitwidth configuration for `Storage::W4A16` (Marlin-style 4-bit weights).
+///
+/// # Packed layout contract
+///
+/// The `RawTensor.bytes` blob for a `Storage::W4A16` tensor is two contiguous
+/// segments, in that order, with no length prefixes (both lengths are derivable
+/// from `(group_size, k=in_features, n=out_features)`):
+///
+/// ```text
+/// [codes][scales]
+/// codes:  [N, K/8] uint32, row-major. 8 weights per uint32, nibble `i` in bits
+///          [i*4, i*4+4) of `codes[col * (K/8) + w]`. Nibble value is the unsigned
+///          4-bit code; the dequant centering is `(code - 8) * scale`.
+/// scales: [N, K/group_size] f32, row-major. One scale per (output column, group).
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct W4A16Config {
+    /// Number of input features per group (`k % group_size == 0`).
+    pub group_size: usize,
 }
 
 /// Bitwidth configuration for `Storage::ResidualPacked`.

@@ -31,6 +31,7 @@ members = [
     "crates/grim-autograd",
     "crates/grim-garage",
     "crates/grim-constrain",
+    "crates/grim-compressed-tensors",
     "crates/grim-backend-tests",
 ]
 
@@ -85,8 +86,9 @@ grim-plugin        = { path = "crates/grim-plugin" }
 grim-kvtransport   = { path = "crates/grim-kvtransport" }
     grim-disagg        = { path = "crates/grim-disagg" }
     grim-autograd      = { path = "crates/grim-autograd" }
-    grim-garage        = { path = "crates/grim-garage" }
-    grim-constrain     = { path = "crates/grim-constrain" }
+grim-garage        = { path = "crates/grim-garage" }
+grim-constrain     = { path = "crates/grim-constrain" }
+grim-compressed-tensors = { path = "crates/grim-compressed-tensors" }
 
 # External (only commonly-needed / safe defaults; backends add their own)
 thiserror = "1"

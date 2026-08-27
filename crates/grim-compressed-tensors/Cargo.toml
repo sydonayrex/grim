@@ -1,0 +1,12 @@
+[package]
+name = "grim-compressed-tensors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Grim Compact Tensor (.gcct) container format and type tags for compressed weight tensors (W8A8MXFP8, WNA16, CompressionTensors W8A8 Int8/Fp8, ...)."
+
+[dependencies]
+
+[lib]
+path = "src/lib.rs"

@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, Write};
 
 use crate::gguf::{
-    GGUF_MAGIC, GGUF_VERSION, GgufValue, GrimFusionOp, GrimRocmlProfile, read_gguf,
-    read_tensor_bytes,
+    read_gguf, read_tensor_bytes, GgufValue, GrimFusionOp, GrimRocmlProfile, GGUF_MAGIC,
+    GGUF_VERSION,
 };
 use grim_quant::evopress_search;
 use grim_tensor::error::{Error, Result};
@@ -401,10 +401,19 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
         grim_tensor::dtype::Storage::GroupInt(cfg) => {
             dequant_group_int_bytes(&raw.bytes, &raw.shape, cfg.bits as u32, cfg.group_size)
         }
+        grim_tensor::dtype::Storage::W8A8Mxfp8 => grim_quant::dequant_mxfp8(&raw.bytes, elem_count),
+        grim_tensor::dtype::Storage::WNA16 => grim_quant::dequant_wna16(&raw.bytes, elem_count),
+        grim_tensor::dtype::Storage::EmbeddingWNA16Int => {
+            grim_quant::dequant_embedding_wna16_int(&raw.bytes, elem_count)
+        }
         grim_tensor::dtype::Storage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(
             "ResidualPacked (bpw {}) host dequant not implemented: this layout is dequantized \
              on-the-fly on ROCm only (WI-T8 producer pending)",
             cfg.bpw
+        ))),
+        other => Err(Error::Unimplemented(format!(
+            "host dequant not implemented for storage variant {:?}",
+            other
         ))),
     }
 }
