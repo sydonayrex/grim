@@ -7,6 +7,13 @@
 //! descriptors.
 //!
 //! Device-gated: `GRIM_GPU_TEST=1`.
+//!
+//! HARDWARE VERIFICATION: all five tests in this file PASSED on real
+//! hardware — gfx1036 iGPU plus gfx1200 and gfx1201 dGPUs (ROCm), run
+//! 2026-08-27 with `GRIM_GPU_TEST=1`. The synthetic/host-reference
+//! scaffolding itself is not a hardware claim; every `#[test]` below
+//! executed its full enqueue → persistent-worker drain → device-memcpy
+//! compare path on each device.
 
 use grim_backend_rocm::RocmDevice;
 use grim_engine::scythe2::ScytheRingExec;
@@ -29,6 +36,7 @@ fn dev_ptr(storage: &dyn BackendStorage) -> u64 {
         .expect("rocml device pointer")
 }
 
+// PASSED: 2026-08-27 on gfx1036, gfx1200, gfx1201 (ROCm)
 #[test]
 fn ring_norm_then_gemm_chain_matches_host_reference() {
     if !gpu_ready() {
@@ -128,6 +136,7 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
 /// ONE worker launch survives idle gaps; two
 /// batches are submitted across separate flushes while it runs; shutdown
 /// exits via the stop flag.
+// PASSED: 2026-08-27 on gfx1036, gfx1200, gfx1201 (ROCm)
 #[test]
 fn ring_resident_wave_two_batches() {
     if !gpu_ready() {
@@ -335,6 +344,7 @@ fn ring_resident_wave_two_batches() {
 /// the kernel a HOST pointer in `weight_ptr` and a contiguous schedule
 /// contract no producer ever emitted; the hand-packed device test could
 /// not catch either because it bypassed this API entirely.
+// PASSED: 2026-08-27 on gfx1036, gfx1200, gfx1201 (ROCm)
 #[test]
 fn moe_opcode6_via_public_api_matches_host_reference() {
     if !gpu_ready() {
@@ -489,6 +499,7 @@ fn moe_opcode6_via_public_api_matches_host_reference() {
 /// `RocmDevice::matmul_op` itself must ride the persistent ring and produce
 /// byte-compatible results with the direct rocBLAS path. This is the seam
 /// real decode layers flow through when the flag is set.
+// PASSED: 2026-08-27 on gfx1036, gfx1200, gfx1201 (ROCm)
 #[test]
 fn production_ring_routing_matmul_parity() {
     if !gpu_ready() {
@@ -548,6 +559,7 @@ fn production_ring_routing_matmul_parity() {
 /// into resident ring-ordinal buffers; an opcode-7 ADD sums them. Every
 /// pointer is a resident-buffer reference — no host slices cross the ring.
 /// Parity vs monolithic matmul within fp tolerance.
+// PASSED: 2026-08-27 on gfx1036, gfx1200, gfx1201 (ROCm)
 #[test]
 fn ring_row_parallel_descriptor_fanin_parity() {
     if !gpu_ready() {
