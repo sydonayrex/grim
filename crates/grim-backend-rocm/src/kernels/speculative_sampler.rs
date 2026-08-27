@@ -250,6 +250,72 @@ __global__ void grim_sample_stochastic(
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU Fused Tree Speculation Verifier (Medusa / Eagle Tree Verification)
+// ---------------------------------------------------------------------------
+//
+// Evaluates tree candidates in parallel on-chip. Each warp/block evaluates
+// one candidate tree path against target logits, extracting the longest
+// accepted prefix without sequential host round-trips.
+// ---------------------------------------------------------------------------
+__global__ void grim_speculative_tree_verify(
+    const int* __restrict__ candidate_paths,      // [num_paths, max_path_len]
+    const float* __restrict__ target_logits,       // [max_path_len, vocab_size]
+    const int* __restrict__ path_lens,            // [num_paths]
+    int* __restrict__ best_path_idx,              // [1] - selected optimal path
+    int* __restrict__ best_accepted_len,          // [1] - number of accepted tokens
+    int num_paths,
+    int max_path_len,
+    int vocab_size
+) {
+    __shared__ int s_best_len;
+    __shared__ int s_best_idx;
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        s_best_len = 0;
+        s_best_idx = 0;
+    }
+    __syncthreads();
+
+    const int path_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (path_id >= num_paths) return;
+
+    const int cur_path_len = path_lens[path_id];
+    int accepted_len = 0;
+
+    for (int step = 0; step < cur_path_len && step < max_path_len; ++step) {
+        const int draft_tok = candidate_paths[path_id * max_path_len + step];
+        
+        // Find argmax token of target model at this step
+        float max_logit = -1e30f;
+        int target_argmax = 0;
+        const float* step_logits = &target_logits[step * vocab_size];
+
+        for (int v = 0; v < vocab_size; ++v) {
+            if (step_logits[v] > max_logit) {
+                max_logit = step_logits[v];
+                target_argmax = v;
+            }
+        }
+
+        if (draft_tok == target_argmax) {
+            accepted_len++;
+        } else {
+            // First mismatch rejects remainder of this tree path
+            break;
+        }
+    }
+
+    // Atomic reduction to find maximum accepted path length
+    atomicMax(&s_best_len, accepted_len);
+    __syncthreads();
+
+    if (accepted_len == s_best_len && threadIdx.x == 0) {
+        atomicExch(best_accepted_len, s_best_len);
+        atomicExch(best_path_idx, path_id);
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -262,5 +328,6 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_speculative_rejection_sample"));
         assert!(KERNEL_SOURCE.contains("grim_sample_logits_argmax"));
         assert!(KERNEL_SOURCE.contains("grim_sample_stochastic"));
+        assert!(KERNEL_SOURCE.contains("grim_speculative_tree_verify"));
     }
 }
