@@ -267,3 +267,26 @@ fn test_disagg_orchestrator_heartbeat_failover() {
     // Time elapsed exceeds timeout -> failover to Colocated
     assert_eq!(orch.evaluate_failover(2000, 500), PoolRole::Colocated);
 }
+
+#[test]
+fn test_disagg_p2p_direct_transfer() {
+    use grim_disagg::DisaggRouter;
+
+    let mut src_pool = KvBlockPool::new(4, 2, 4);
+    let mut dst_pool = KvBlockPool::new(4, 2, 4);
+
+    let k_data = vec![3.14f32; 32];
+    let v_data = vec![2.71f32; 32];
+    src_pool.write_layer_keys(0, 0, &k_data, 4);
+    src_pool.write_layer_values(0, 0, &v_data);
+
+    let router = DisaggRouter::new("127.0.0.1:9001", "127.0.0.1:9002", PoolRole::Colocated);
+    router
+        .transfer_kv_p2p_direct(&[0], &mut src_pool, &mut dst_pool)
+        .expect("P2P direct transfer must succeed");
+
+    let recv_k = dst_pool.read_layer_keys(0, 0).expect("read keys");
+    let recv_v = dst_pool.read_layer_values(0, 0).expect("read values");
+    assert_eq!(&recv_k[..32], &k_data[..]);
+    assert_eq!(&recv_v[..32], &v_data[..]);
+}

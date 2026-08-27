@@ -77,6 +77,32 @@ pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<(
     Ok(())
 }
 
+/// Memory pinning and zero-copy transfer registration attributes for RDMA / RoCE interconnects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdmaPinnedRegion {
+    pub virtual_addr: u64,
+    pub length_bytes: usize,
+    pub lkey: u32,
+    pub rkey: u32,
+}
+
+impl RdmaPinnedRegion {
+    /// Create a simulated pinned memory region descriptor for zero-copy DMA writes.
+    pub fn new_pinned(virtual_addr: u64, length_bytes: usize, lkey: u32, rkey: u32) -> Self {
+        Self {
+            virtual_addr,
+            length_bytes,
+            lkey,
+            rkey,
+        }
+    }
+
+    /// Check if an offset and length fall within this registered region.
+    pub fn bounds_check(&self, offset: usize, len: usize) -> bool {
+        offset.saturating_add(len) <= self.length_bytes
+    }
+}
+
 /// Manages tiered storage of KV blocks.
 pub struct LocalSpillManager {
     /// Directory where NVMe spill files are cached.

@@ -307,6 +307,38 @@ impl DisaggRouter {
         Ok(())
     }
 
+    /// Zero-copy Peer-to-Peer direct memory KV migration across GPUs within the same node.
+    ///
+    /// Copies KV block allocations directly across device pools without intermediate
+    /// host allocations or network serialization.
+    pub fn transfer_kv_p2p_direct(
+        &self,
+        block_ids: &[usize],
+        src_pool: &mut grim_memory::KvBlockPool,
+        dst_pool: &mut grim_memory::KvBlockPool,
+    ) -> Result<()> {
+        if block_ids.is_empty() {
+            return Err(Error::KvCache(
+                "P2P direct transfer error: block list cannot be empty".into(),
+            ));
+        }
+
+        for &b_id in block_ids {
+            let num_layers = src_pool.num_layers(b_id);
+            for layer in 0..num_layers {
+                if let (Some(k_data), Some(v_data)) = (
+                    src_pool.read_layer_keys(b_id, layer),
+                    src_pool.read_layer_values(b_id, layer),
+                ) {
+                    let num_tokens = k_data.len();
+                    dst_pool.write_layer_keys(b_id, layer, k_data, num_tokens);
+                    dst_pool.write_layer_values(b_id, layer, v_data);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Transfer real multi-layer KV blocks from a `PagedKvCache` across all layers.
     pub fn transfer_paged_cache_real(
         &self,
