@@ -25,9 +25,10 @@
 use serde::{Deserialize, Serialize};
 
 /// RoPE frequency scaling method (Phase 6.2).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum RopeScalingMethod {
     /// No scaling — use the model's native `rope_theta`.
+    #[default]
     None,
     /// Linear interpolation: `effective_base = base * factor^{1/head_dim}`.
     Linear { factor: f32 },
@@ -45,12 +46,6 @@ pub enum RopeScalingMethod {
     },
     /// Dynamic theta-shift placeholder.
     Dynamic { type_: String },
-}
-
-impl Default for RopeScalingMethod {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Compute the effective rotational frequency base for `method`.

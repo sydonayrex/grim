@@ -126,8 +126,8 @@ fn test_moe_aware_bandwidth_policy_to_hybrid_execution_integration() {
                 let mut mock_gpu = vec![0.0f32; hidden];
                 for &e in gpu_active {
                     let w = 0.25;
-                    for i in 0..hidden {
-                        mock_gpu[i] += w * (e + 1) as f32 * 0.1;
+                    for slot in mock_gpu.iter_mut() {
+                        *slot += w * (e + 1) as f32 * 0.1;
                     }
                 }
                 Ok(mock_gpu)

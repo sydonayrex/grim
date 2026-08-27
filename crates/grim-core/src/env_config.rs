@@ -10,20 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Parsed backend selector. `Auto` re-probes every time it is consulted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum Backend {
+    #[default]
     Auto,
     Rocm,
     Cuda,
     Vulkan,
     Metal,
     Cpu,
-}
-
-impl Default for Backend {
-    fn default() -> Self {
-        Backend::Auto
-    }
 }
 
 static WARNED_UNKNOWN: AtomicBool = AtomicBool::new(false);

@@ -248,6 +248,7 @@ impl Tape {
     ///
     /// `m`, `k`, `n` are the matmul dims before any transpose so that
     /// backward can reconstruct the gradient shapes.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_matmul(
         &mut self,
         a: TensorId,
@@ -320,6 +321,7 @@ impl Tape {
     }
 
     /// Record a fused LoRA application `output = base + scale * (x @ A^T) @ B^T`.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_lora_apply(
         &mut self,
         base: TensorId,
@@ -520,7 +522,7 @@ mod tests {
         assert_eq!(tape.len(), 1);
         let entry = &tape.entries()[0];
         assert_eq!(entry.kind, TapeKind::MatMul);
-        assert_eq!(entry.outputs_check(out), true);
+        assert!(entry.outputs_check(out));
     }
 
     #[test]

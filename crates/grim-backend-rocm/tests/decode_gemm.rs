@@ -45,12 +45,10 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(|| {
         RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
-    }) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    })
+    .ok()
 }
 
 /// Small host reference GEMM in f32, the independent oracle. `a`/`b`/`out`
@@ -155,12 +153,8 @@ fn gate_2_6_4_decode_gemm_matches_cpu_oracle() -> TestResult {
     };
 
     let (m, k, n) = (1usize, 128, 128);
-    let a_data: Vec<f32> = (0..m * k)
-        .map(|i| ((i as f32 * 0.01).sin() * 0.5) as f32)
-        .collect();
-    let b_data: Vec<f32> = (0..k * n)
-        .map(|i| ((i as f32 * 0.03).cos() * 0.5) as f32)
-        .collect();
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.03).cos() * 0.5).collect();
 
     let gpu = run_decode_kernel(&dev, &a_data, &b_data, m, k, n)?;
     let mut host = vec![0f32; m * n];
@@ -192,12 +186,8 @@ fn gate_2_6_4_decode_gemm_m8_matches_cpu_oracle() -> TestResult {
     };
 
     let (m, k, n) = (8usize, 128, 128);
-    let a_data: Vec<f32> = (0..m * k)
-        .map(|i| ((i as f32 * 0.01).sin() * 0.5) as f32)
-        .collect();
-    let b_data: Vec<f32> = (0..k * n)
-        .map(|i| ((i as f32 * 0.03).cos() * 0.5) as f32)
-        .collect();
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.03).cos() * 0.5).collect();
 
     let gpu = run_decode_kernel(&dev, &a_data, &b_data, m, k, n)?;
     let mut host = vec![0f32; m * n];
@@ -264,12 +254,8 @@ fn gate_2_6_2b_decode_gemm_aligned_and_irregular_n() -> TestResult {
     ];
 
     for &(m, k, n) in shapes {
-        let a_data: Vec<f32> = (0..m * k)
-            .map(|i| ((i as f32 * 0.01).sin() * 0.3) as f32)
-            .collect();
-        let b_data: Vec<f32> = (0..k * n)
-            .map(|i| ((i as f32 * 0.03).cos() * 0.3) as f32)
-            .collect();
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.03).cos() * 0.3).collect();
 
         let gpu = run_decode_kernel(&dev, &a_data, &b_data, m, k, n)?;
         let mut host = vec![0f32; m * n];
@@ -304,12 +290,8 @@ fn gate_2_6_2b_double_buffer_many_k_steps_no_race() -> TestResult {
 
     // k=256 → 256/16 = 16 K-step iterations, each triggering a buffer swap.
     let (m, k, n) = (8usize, 256, 64);
-    let a_data: Vec<f32> = (0..m * k)
-        .map(|i| ((i as f32 * 0.01).sin() * 0.3) as f32)
-        .collect();
-    let b_data: Vec<f32> = (0..k * n)
-        .map(|i| ((i as f32 * 0.02).cos() * 0.3) as f32)
-        .collect();
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.02).cos() * 0.3).collect();
 
     let mut prev: Option<Vec<f32>> = None;
     let tol = tolerance_for(k);
@@ -363,12 +345,8 @@ fn debug_decode_gemm_minimal() -> TestResult {
     };
 
     let (m, k, n) = (1usize, 16, 64);
-    let a_data: Vec<f32> = (0..m * k)
-        .map(|i| ((i as f32 * 0.1).sin() * 0.3) as f32)
-        .collect();
-    let b_data: Vec<f32> = (0..k * n)
-        .map(|i| ((i as f32 * 0.1).cos() * 0.3) as f32)
-        .collect();
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.1).sin() * 0.3).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.1).cos() * 0.3).collect();
 
     // First: verify F16 round-trip works (upload + download without compute).
     let a_shape = Shape::from_slice(&[m, k]);

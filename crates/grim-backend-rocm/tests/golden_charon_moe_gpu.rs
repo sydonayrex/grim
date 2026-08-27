@@ -42,12 +42,8 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| {
-        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
-    }) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +191,8 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 /// CPU reference mirroring `grim_moe_fused_grouped_fp8` math exactly:
 /// per-block-16 weight dequant (scale from the quant tensors), dot-product
 /// gate/up contraction, SiLU, down contraction, top-k accumulation with rsf.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_fp8_reference(
     gw_flat: &[f32],
     uw_flat: &[f32],
@@ -215,13 +213,12 @@ fn cpu_fp8_reference(
     let _ = (gw_flat, uw_flat, dw_flat); // fp32 weights unused; we dequant from bytes.
     let hidden = HIDDEN;
     let inter = INTER;
-    let h16 = (hidden + 15) / 16;
-    let i16 = (inter + 15) / 16;
+    let h16 = hidden.div_ceil(16);
+    let i16 = inter.div_ceil(16);
     let batch = x.len() / hidden;
     let mut out = vec![0.0f32; batch * hidden];
     for (t, (idx_row, w_row)) in indices.iter().zip(weights.iter()).enumerate() {
         for (&e, &wt) in idx_row.iter().zip(w_row.iter()) {
-            let e = e as usize;
             let a = &x[t * hidden..(t + 1) * hidden];
             let gw = &gw8[e * inter * hidden..];
             let uw = &uw8[e * inter * hidden..];
@@ -257,6 +254,8 @@ fn cpu_fp8_reference(
 /// CPU reference mirroring `grim_moe_fused_grouped_mxfp4` math exactly: packed
 /// E2M1 dequant with per-32-group E8M0 shared exponent, dot-product gate/up
 /// contraction, SiLU, down contraction, top-k accumulation with rsf.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_mxfp4_reference(
     _gw_flat: &[f32],
     _uw_flat: &[f32],
@@ -290,7 +289,6 @@ fn cpu_mxfp4_reference(
     };
     for (t, (idx_row, w_row)) in indices.iter().zip(weights.iter()).enumerate() {
         for (&e, &wt) in idx_row.iter().zip(w_row.iter()) {
-            let e = e as usize;
             let a = &x[t * hidden..(t + 1) * hidden];
             let gw = &gw_c[e * inter * hidden / 2..];
             let uw = &uw_c[e * inter * hidden / 2..];
@@ -303,11 +301,11 @@ fn cpu_mxfp4_reference(
                 for j in 0..inter {
                     let mut gate = 0.0f32;
                     let mut up = 0.0f32;
-                    for i in 0..hidden {
+                    for (i, &a_i) in a.iter().enumerate() {
                         let gidx = (j * hidden + i) / 32;
                         let uidx = (j * hidden + i) / 32;
-                        gate += mxfp4_e2m1_to_f32(code_at(gw, j * hidden + i), ge[gidx]) * a[i];
-                        up += mxfp4_e2m1_to_f32(code_at(uw, j * hidden + i), ue[uidx]) * a[i];
+                        gate += mxfp4_e2m1_to_f32(code_at(gw, j * hidden + i), ge[gidx]) * a_i;
+                        up += mxfp4_e2m1_to_f32(code_at(uw, j * hidden + i), ue[uidx]) * a_i;
                     }
                     let silu = gate / (1.0 + (-gate).exp());
                     let act = silu * up;
@@ -646,7 +644,7 @@ fn charon_grouped_dispatch_matches_sortless() {
 /// to how the activation scale is derived.
 fn quant_block16_cdim(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec<u8>, Vec<f32>) {
     use grim_quant::f32_to_fp8_e4m3;
-    let c16 = (c + 15) / 16;
+    let c16 = c.div_ceil(16);
     let mut bytes = Vec::with_capacity(num_experts * r * c);
     let mut scales = Vec::with_capacity(num_experts * r * c16);
     for e in 0..num_experts {
@@ -655,8 +653,8 @@ fn quant_block16_cdim(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec
                 let start = e * r * c + row * c + cb * 16;
                 let end = (start + 16).min(e * r * c + row * c + c);
                 let mut block_max = 0.0f32;
-                for k in start..end {
-                    block_max = block_max.max(w[k].abs());
+                for v in &w[start..end] {
+                    block_max = block_max.max(v.abs());
                 }
                 // Map block max -> 240 (E4M3 exp=14, ulp=16) rather than 448
                 // (exp=15, ulp=32). 240 sits one exponent band lower, halving the
@@ -671,18 +669,17 @@ fn quant_block16_cdim(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec
                 // so store the exact float scale — NOT the fp8-rounded value,
                 // which underflows to 0 for gate/down blocks and zeroes all weights.
                 scales.push(eff_scale);
-                for k in start..end {
+                for w_k in &w[start..end] {
                     let v = if eff_scale == 0.0 {
                         0.0
                     } else {
-                        w[k] / eff_scale
+                        w_k / eff_scale
                     };
                     bytes.push(f32_to_fp8_e4m3(v));
                 }
                 // Pad partial trailing block to 16.
-                for _ in end..(start + 16).min(e * r * c + row * c + c) {
-                    bytes.push(0);
-                }
+                let padded_end = (start + 16).min(e * r * c + row * c + c);
+                bytes.resize(bytes.len() + (padded_end - end), 0);
             }
         }
     }
@@ -820,7 +817,7 @@ fn quant_block32_e8m0(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec
     use grim_quant::f32_to_mxfp4_e2m1;
     let g = 32usize;
     let rc = r * c;
-    let ng = (rc + g - 1) / g; // groups per expert over the flat R*C block
+    let ng = rc.div_ceil(g); // groups per expert over the flat R*C block
     let mut codes = Vec::with_capacity(num_experts * rc.div_ceil(2));
     let mut exps = Vec::with_capacity(num_experts * ng);
     for e in 0..num_experts {
@@ -829,8 +826,8 @@ fn quant_block32_e8m0(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec
             let start = base + g_i * g;
             let end = (start + g).min(base + rc);
             let mut block_max = 0.0f32;
-            for k in start..end {
-                block_max = block_max.max(w[k].abs());
+            for v in &w[start..end] {
+                block_max = block_max.max(v.abs());
             }
             // E8M0 shared exponent: block scale s = 2^(exp - 127).
             // Map block max to 6.0 (max E2M1 magnitude, code 0b111), so the
@@ -853,10 +850,8 @@ fn quant_block32_e8m0(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec
                 codes.push((c0 & 0x0F) | ((c1 & 0x0F) << 4));
             }
             // Pad a trailing partial group to 16 code bytes (32 elements).
-            let packed = ((end - start) + 1) / 2;
-            for _ in packed..g / 2 {
-                codes.push(0);
-            }
+            let packed = (end - start).div_ceil(2);
+            codes.resize(codes.len() + (g / 2 - packed), 0);
         }
     }
     (codes, exps)
@@ -871,7 +866,7 @@ fn quant_block32_e8m0_fp8(w: &[f32], num_experts: usize, r: usize, c: usize) -> 
     use grim_quant::f32_to_fp8_e4m3;
     let g = 32usize;
     let rc = r * c;
-    let ng = (rc + g - 1) / g; // groups per expert over the flat R*C block
+    let ng = rc.div_ceil(g); // groups per expert over the flat R*C block
     let mut codes = Vec::with_capacity(num_experts * rc);
     let mut exps = Vec::with_capacity(num_experts * ng);
     for e in 0..num_experts {
@@ -880,8 +875,8 @@ fn quant_block32_e8m0_fp8(w: &[f32], num_experts: usize, r: usize, c: usize) -> 
             let start = base + g_i * g;
             let end = (start + g).min(base + rc);
             let mut block_max = 0.0f32;
-            for k in start..end {
-                block_max = block_max.max(w[k].abs());
+            for v in &w[start..end] {
+                block_max = block_max.max(v.abs());
             }
             // E8M0 shared exponent: block scale s = 2^(exp - 127).
             // Map block max to 240 (max E4M3 finite value) so the largest weight
@@ -894,14 +889,12 @@ fn quant_block32_e8m0_fp8(w: &[f32], num_experts: usize, r: usize, c: usize) -> 
             let exp = (127.0 + scale.log2()).round().clamp(0.0, 255.0) as u8;
             exps.push(exp);
             let rs = (2.0f32).powi(exp as i32 - 127);
-            for k in start..end {
-                let v = if rs == 0.0 { 0.0 } else { w[k] / rs };
+            for w_k in &w[start..end] {
+                let v = if rs == 0.0 { 0.0 } else { w_k / rs };
                 codes.push(f32_to_fp8_e4m3(v));
             }
             // Pad a trailing partial group to 32 code bytes.
-            for _ in (end - start)..g {
-                codes.push(0);
-            }
+            codes.resize(codes.len() + (g - (end - start)), 0);
         }
     }
     (codes, exps)
@@ -910,6 +903,8 @@ fn quant_block32_e8m0_fp8(w: &[f32], num_experts: usize, r: usize, c: usize) -> 
 /// CPU reference mirroring `grim_moe_fused_grouped_mxfp8` math exactly: E4M3
 /// codes with per-32-group E8M0 shared exponent, dot-product gate/up contraction,
 /// SiLU, down contraction, top-k accumulation with rsf.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_mxfp8_reference(
     _gw_flat: &[f32],
     _uw_flat: &[f32],
@@ -931,7 +926,7 @@ fn cpu_mxfp8_reference(
     let mut out = vec![0.0f32; out_len.max(x.len())];
     for (t, (idx_row, w_row)) in indices.iter().zip(weights.iter()).enumerate() {
         for (&e, &wt) in idx_row.iter().zip(w_row.iter()) {
-            assert!((e as usize) < num_experts, "expert {e} out of range");
+            assert!(e < num_experts, "expert {e} out of range");
             let a = &x[t * (x.len() / indices.len())..][..(x.len() / indices.len())];
             let hidden = a.len();
             let inter = gw_c.len() / num_experts / hidden;
@@ -943,26 +938,20 @@ fn cpu_mxfp8_reference(
                     for i in 0..hidden {
                         let gidx = (j * hidden + i) / 32;
                         let uidx = (j * hidden + i) / 32;
-                        let ge = (2.0f32)
-                            .powi(gw_e[e as usize * (inter * hidden / 32) + gidx] as i32 - 127);
-                        let ue = (2.0f32)
-                            .powi(uw_e[e as usize * (inter * hidden / 32) + uidx] as i32 - 127);
-                        gate +=
-                            fp8_e4m3_to_f32(gw_c[e as usize * (inter * hidden) + j * hidden + i])
-                                * ge
-                                * a[i];
-                        up += fp8_e4m3_to_f32(uw_c[e as usize * (inter * hidden) + j * hidden + i])
+                        let ge = (2.0f32).powi(gw_e[e * (inter * hidden / 32) + gidx] as i32 - 127);
+                        let ue = (2.0f32).powi(uw_e[e * (inter * hidden / 32) + uidx] as i32 - 127);
+                        gate += fp8_e4m3_to_f32(gw_c[e * (inter * hidden) + j * hidden + i])
+                            * ge
+                            * a[i];
+                        up += fp8_e4m3_to_f32(uw_c[e * (inter * hidden) + j * hidden + i])
                             * ue
                             * a[i];
                     }
                     let silu = gate / (1.0 + (-gate).exp());
                     let act = silu * up;
                     let didx = (h * inter + j) / 32;
-                    let de =
-                        (2.0f32).powi(dw_e[e as usize * (hidden * inter / 32) + didx] as i32 - 127);
-                    acc += fp8_e4m3_to_f32(dw_c[e as usize * (hidden * inter) + h * inter + j])
-                        * de
-                        * act;
+                    let de = (2.0f32).powi(dw_e[e * (hidden * inter / 32) + didx] as i32 - 127);
+                    acc += fp8_e4m3_to_f32(dw_c[e * (hidden * inter) + h * inter + j]) * de * act;
                 }
                 out[t * hidden + h] += rsf * wt * acc;
             }
@@ -1185,6 +1174,8 @@ fn charon_grouped_mxfp4_matches_fp32() {
 // public `dequant_q80` (authoritative f16 scale * i8 decode) to recover per-expert
 // fp32 weights, then runs the identical gate/up/SiLU/down contraction. This is
 // mathematically identical to the kernel's inline f16*i8 decode per element.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_q80_reference(
     gw_q80: &[u8],
     uw_q80: &[u8],
@@ -1207,16 +1198,16 @@ fn cpu_q80_reference(
     let mut out = vec![0.0f32; out_len.max(x.len())];
     for (t, (idx_row, w_row)) in indices.iter().zip(weights.iter()).enumerate() {
         for (&e, &wt) in idx_row.iter().zip(w_row.iter()) {
-            assert!((e as usize) < num_experts, "expert {e} out of range");
+            assert!(e < num_experts, "expert {e} out of range");
             let a = &x[t * (x.len() / indices.len())..][..(x.len() / indices.len())];
             let hidden = a.len();
             let per_g = w_g / num_experts;
             let per_u = w_u / num_experts;
             let per_d = w_d / num_experts;
             let inter = per_g / hidden;
-            let g_base = e as usize * per_g;
-            let u_base = e as usize * per_u;
-            let d_base = e as usize * per_d;
+            let g_base = e * per_g;
+            let u_base = e * per_u;
+            let d_base = e * per_d;
             for h in 0..hidden {
                 let mut acc = 0.0f32;
                 for j in 0..inter {
@@ -1596,6 +1587,8 @@ fn build_q3k_block(w: &[f32]) -> Vec<u8> {
     buf
 }
 
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_iqk_reference(
     fmt: usize,
     gw_q: &[u8],
@@ -1614,7 +1607,6 @@ fn cpu_iqk_reference(
     let mut out = vec![0.0f32; indices.len() * HIDDEN];
     for (t, (idx_row, w_row)) in indices.iter().zip(weights.iter()).enumerate() {
         for (&e, &wt) in idx_row.iter().zip(w_row.iter()) {
-            let e = e as usize;
             let a = &x[t * HIDDEN..t * HIDDEN + HIDDEN];
             let inter = wcount / HIDDEN;
             let g_base = e * wcount;

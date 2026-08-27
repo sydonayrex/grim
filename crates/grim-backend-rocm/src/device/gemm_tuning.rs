@@ -44,8 +44,6 @@ pub fn lookup_gemm_config_for_shape(
                     64
                 } else if n % 32 == 0 || small_dim == n {
                     32
-                } else if n % 16 == 0 {
-                    16
                 } else {
                     16
                 };
@@ -53,8 +51,6 @@ pub fn lookup_gemm_config_for_shape(
                     64
                 } else if k % 32 == 0 || small_dim == k {
                     32
-                } else if k % 16 == 0 {
-                    16
                 } else {
                     16
                 };
@@ -79,21 +75,8 @@ pub fn lookup_gemm_config_for_shape(
         }
         WavefrontSize::W32 => {
             if m <= 8 {
-                let small_dim = n.min(k);
-                let block_n = if n % 32 == 0 {
-                    32
-                } else if n % 16 == 0 || small_dim == n {
-                    16
-                } else {
-                    16
-                };
-                let block_k = if k % 32 == 0 {
-                    32
-                } else if k % 16 == 0 || small_dim == k {
-                    16
-                } else {
-                    16
-                };
+                let block_n = if n % 32 == 0 { 32 } else { 16 };
+                let block_k = if k % 32 == 0 { 32 } else { 16 };
 
                 let split_k = if k >= 4096 { 2 } else { 1 };
                 GemmTileConfig {

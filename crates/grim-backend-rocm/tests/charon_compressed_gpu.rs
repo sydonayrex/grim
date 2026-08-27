@@ -1,7 +1,7 @@
 //! Integration tests for Charon W8A8 and AWQ grouped MoE kernels.
 
-use grim_tensor::{BackendStorage, DType, Shape};
 use grim_backend_rocm::RocmDevice;
+use grim_tensor::{BackendStorage, DType, Shape};
 
 #[test]
 fn test_charon_w8a8_int8_grouped_moe_structure() {
@@ -26,9 +26,9 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
         let g_off = e * gate_stride;
         let d_off = e * down_stride;
         // set u64 length prefix
-        gate_blob[g_off..g_off + 8].copy_from_slice(&( (inter * hidden) as u64).to_le_bytes());
-        up_blob[g_off..g_off + 8].copy_from_slice(&( (inter * hidden) as u64).to_le_bytes());
-        down_blob[d_off..d_off + 8].copy_from_slice(&( (hidden * inter) as u64).to_le_bytes());
+        gate_blob[g_off..g_off + 8].copy_from_slice(&((inter * hidden) as u64).to_le_bytes());
+        up_blob[g_off..g_off + 8].copy_from_slice(&((inter * hidden) as u64).to_le_bytes());
+        down_blob[d_off..d_off + 8].copy_from_slice(&((hidden * inter) as u64).to_le_bytes());
 
         // Fill scales with 1.0f32
         for i in 0..inter {
@@ -55,7 +55,8 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let eup = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host_raw_bytes(
         &up_blob,
@@ -63,7 +64,8 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let edown = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host_raw_bytes(
         &down_blob,
@@ -71,7 +73,8 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let act_data = vec![0.5f32; batch * hidden];
     let act = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
@@ -80,7 +83,8 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let a_scale_data = vec![1.0f32; batch];
     let a_scale = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
@@ -89,14 +93,16 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let out = grim_backend_rocm::memory::storage::RocmStorage::alloc_gpu(
         &Shape::new(vec![batch, hidden]),
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let sorted = grim_backend_rocm::kernels::charon::SortedRouting {
         sorted_token_ids: vec![0, 1],
@@ -145,15 +151,18 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
     for e in 0..num_experts {
         let g_off = e * gate_stride;
         let d_off = e * down_stride;
-        gate_blob[g_off..g_off + 8].copy_from_slice(&( (inter * hidden) as u64).to_le_bytes());
-        up_blob[g_off..g_off + 8].copy_from_slice(&( (inter * hidden) as u64).to_le_bytes());
-        down_blob[d_off..d_off + 8].copy_from_slice(&( (hidden * inter) as u64).to_le_bytes());
+        gate_blob[g_off..g_off + 8].copy_from_slice(&((inter * hidden) as u64).to_le_bytes());
+        up_blob[g_off..g_off + 8].copy_from_slice(&((inter * hidden) as u64).to_le_bytes());
+        down_blob[d_off..d_off + 8].copy_from_slice(&((hidden * inter) as u64).to_le_bytes());
 
         // per-tensor scale f32 = 1.0
         let sc_bytes = 1.0f32.to_le_bytes();
-        gate_blob[g_off + 8 + inter * hidden..g_off + 8 + inter * hidden + 4].copy_from_slice(&sc_bytes);
-        up_blob[g_off + 8 + inter * hidden..g_off + 8 + inter * hidden + 4].copy_from_slice(&sc_bytes);
-        down_blob[d_off + 8 + hidden * inter..d_off + 8 + hidden * inter + 4].copy_from_slice(&sc_bytes);
+        gate_blob[g_off + 8 + inter * hidden..g_off + 8 + inter * hidden + 4]
+            .copy_from_slice(&sc_bytes);
+        up_blob[g_off + 8 + inter * hidden..g_off + 8 + inter * hidden + 4]
+            .copy_from_slice(&sc_bytes);
+        down_blob[d_off + 8 + hidden * inter..d_off + 8 + hidden * inter + 4]
+            .copy_from_slice(&sc_bytes);
     }
 
     let alloc = std::sync::Arc::new(
@@ -166,7 +175,8 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let eup = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host_raw_bytes(
         &up_blob,
@@ -174,7 +184,8 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let edown = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host_raw_bytes(
         &down_blob,
@@ -182,7 +193,8 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let act_data = vec![0.5f32; batch * hidden];
     let act = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
@@ -191,7 +203,8 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let a_scale_data = vec![1.0f32; batch];
     let a_scale = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
@@ -200,14 +213,16 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let out = grim_backend_rocm::memory::storage::RocmStorage::alloc_gpu(
         &Shape::new(vec![batch, hidden]),
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let sorted = grim_backend_rocm::kernels::charon::SortedRouting {
         sorted_token_ids: vec![0, 1],
@@ -271,16 +286,25 @@ fn test_charon_awq_grouped_moe_structure() {
         let g_off = e * gate_stride;
         let d_off = e * down_stride;
         gate_blob[g_off..g_off + 8].copy_from_slice(&(gate_qw_len as u64).to_le_bytes());
-        gate_blob[g_off + 8 + gate_qw_len..g_off + 8 + gate_qw_len + 8].copy_from_slice(&(gate_qz_len as u64).to_le_bytes());
-        gate_blob[g_off + 8 + gate_qw_len + 8 + gate_qz_len..g_off + 8 + gate_qw_len + 8 + gate_qz_len + 8].copy_from_slice(&(gate_sc_len as u64).to_le_bytes());
+        gate_blob[g_off + 8 + gate_qw_len..g_off + 8 + gate_qw_len + 8]
+            .copy_from_slice(&(gate_qz_len as u64).to_le_bytes());
+        gate_blob[g_off + 8 + gate_qw_len + 8 + gate_qz_len
+            ..g_off + 8 + gate_qw_len + 8 + gate_qz_len + 8]
+            .copy_from_slice(&(gate_sc_len as u64).to_le_bytes());
 
         up_blob[g_off..g_off + 8].copy_from_slice(&(gate_qw_len as u64).to_le_bytes());
-        up_blob[g_off + 8 + gate_qw_len..g_off + 8 + gate_qw_len + 8].copy_from_slice(&(gate_qz_len as u64).to_le_bytes());
-        up_blob[g_off + 8 + gate_qw_len + 8 + gate_qz_len..g_off + 8 + gate_qw_len + 8 + gate_qz_len + 8].copy_from_slice(&(gate_sc_len as u64).to_le_bytes());
+        up_blob[g_off + 8 + gate_qw_len..g_off + 8 + gate_qw_len + 8]
+            .copy_from_slice(&(gate_qz_len as u64).to_le_bytes());
+        up_blob[g_off + 8 + gate_qw_len + 8 + gate_qz_len
+            ..g_off + 8 + gate_qw_len + 8 + gate_qz_len + 8]
+            .copy_from_slice(&(gate_sc_len as u64).to_le_bytes());
 
         down_blob[d_off..d_off + 8].copy_from_slice(&(down_qw_len as u64).to_le_bytes());
-        down_blob[d_off + 8 + down_qw_len..d_off + 8 + down_qw_len + 8].copy_from_slice(&(down_qz_len as u64).to_le_bytes());
-        down_blob[d_off + 8 + down_qw_len + 8 + down_qz_len..d_off + 8 + down_qw_len + 8 + down_qz_len + 8].copy_from_slice(&(down_sc_len as u64).to_le_bytes());
+        down_blob[d_off + 8 + down_qw_len..d_off + 8 + down_qw_len + 8]
+            .copy_from_slice(&(down_qz_len as u64).to_le_bytes());
+        down_blob[d_off + 8 + down_qw_len + 8 + down_qz_len
+            ..d_off + 8 + down_qw_len + 8 + down_qz_len + 8]
+            .copy_from_slice(&(down_sc_len as u64).to_le_bytes());
     }
 
     let alloc = std::sync::Arc::new(
@@ -293,7 +317,8 @@ fn test_charon_awq_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let eup = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host_raw_bytes(
         &up_blob,
@@ -301,7 +326,8 @@ fn test_charon_awq_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let edown = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host_raw_bytes(
         &down_blob,
@@ -309,7 +335,8 @@ fn test_charon_awq_grouped_moe_structure() {
         DType::U8,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let act_data = vec![0.5f32; batch * hidden];
     let act = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
@@ -318,7 +345,8 @@ fn test_charon_awq_grouped_moe_structure() {
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let a_scale_data = vec![1.0f32; batch];
     let a_scale = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
@@ -327,14 +355,16 @@ fn test_charon_awq_grouped_moe_structure() {
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let out = grim_backend_rocm::memory::storage::RocmStorage::alloc_gpu(
         &Shape::new(vec![batch, hidden]),
         DType::F32,
         &alloc,
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let sorted = grim_backend_rocm::kernels::charon::SortedRouting {
         sorted_token_ids: vec![0, 1],
@@ -344,33 +374,43 @@ fn test_charon_awq_grouped_moe_structure() {
         block_size: 64,
     };
 
-    let (g_qw, g_qz, g_sc) = (8i64, (8 + gate_qw_len + 8) as i64, (8 + gate_qw_len + 8 + gate_qz_len + 8) as i64);
-    let (d_qw, d_qz, d_sc) = (8i64, (8 + down_qw_len + 8) as i64, (8 + down_qw_len + 8 + down_qz_len + 8) as i64);
+    let (g_qw, g_qz, g_sc) = (
+        8i64,
+        (8 + gate_qw_len + 8) as i64,
+        (8 + gate_qw_len + 8 + gate_qz_len + 8) as i64,
+    );
+    let (d_qw, d_qz, d_sc) = (
+        8i64,
+        (8 + down_qw_len + 8) as i64,
+        (8 + down_qw_len + 8 + down_qz_len + 8) as i64,
+    );
 
-    let stream = grim_backend_rocm::device::gptq_test_shim::launch_charon_grouped_dispatch_awq_for_test(
-        &dev,
-        &act,
-        egate.device_ptr().unwrap(),
-        eup.device_ptr().unwrap(),
-        edown.device_ptr().unwrap(),
-        a_scale.device_ptr().unwrap(),
-        &sorted,
-        &out,
-        hidden,
-        inter,
-        num_experts,
-        bits,
-        group_size,
-        g_qw,
-        g_qz,
-        g_sc,
-        gate_stride as u64,
-        d_qw,
-        d_qz,
-        d_sc,
-        down_stride as u64,
-        1.0,
-    ).expect("launch charon awq");
+    let stream =
+        grim_backend_rocm::device::gptq_test_shim::launch_charon_grouped_dispatch_awq_for_test(
+            &dev,
+            &act,
+            egate.device_ptr().unwrap(),
+            eup.device_ptr().unwrap(),
+            edown.device_ptr().unwrap(),
+            a_scale.device_ptr().unwrap(),
+            &sorted,
+            &out,
+            hidden,
+            inter,
+            num_experts,
+            bits,
+            group_size,
+            g_qw,
+            g_qz,
+            g_sc,
+            gate_stride as u64,
+            d_qw,
+            d_qz,
+            d_sc,
+            down_stride as u64,
+            1.0,
+        )
+        .expect("launch charon awq");
 
     assert!(!stream.is_null());
 }

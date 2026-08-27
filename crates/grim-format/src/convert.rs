@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, Write};
 
 use crate::gguf::{
-    read_gguf, read_tensor_bytes, GgufValue, GrimFusionOp, GrimRocmlProfile, GGUF_MAGIC,
-    GGUF_VERSION,
+    GGUF_MAGIC, GGUF_VERSION, GgufValue, GrimFusionOp, GrimRocmlProfile, read_gguf,
+    read_tensor_bytes,
 };
 use grim_quant::evopress_search;
 use grim_tensor::error::{Error, Result};
@@ -418,6 +418,8 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn convert_to_grim(
     input_path: &str,
     output_path: &str,
@@ -464,6 +466,8 @@ pub fn convert_to_grim(
 /// Same as [`convert_to_grim`], but dequantizes tensors through the
 /// supplied [`GpuDequant`] hook when the storage scheme is supported.
 /// Schemes the hook does not handle fall back to the CPU path.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn convert_to_grim_with_dequant(
     input_path: &str,
     output_path: &str,
@@ -496,6 +500,8 @@ pub fn convert_to_grim_with_dequant(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn convert_to_grim_inner(
     input_path: &str,
     output_path: &str,
@@ -547,12 +553,10 @@ fn convert_to_grim_inner(
         for name in &tensor_names {
             let raw = provider.get(name)?;
             let meta = provider.meta(name)?;
-            let rows = meta.shape.get(0).copied().unwrap_or(1);
+            let rows = meta.shape.first().copied().unwrap_or(1);
             let cols = meta.shape.get(1).copied().unwrap_or(1);
             // Use the raw f32 values if available, otherwise dequantize
-            let data: Vec<f32> = match &raw.dtype.storage {
-                _ => dequant_tensor_data(&raw, rows * cols)?,
-            };
+            let data: Vec<f32> = dequant_tensor_data(&raw, rows * cols)?;
             tensor_data.push((name.clone(), data, rows, cols));
         }
         let importance_scores = grim_quant::compute_importance_scores(&tensor_data);
@@ -703,6 +707,8 @@ fn convert_to_grim_inner(
 
 /// Route by file extension to the appropriate reader, enumerate tensors,
 /// and pack each into a native `.grim` registry entry + normals payload (spec §5).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn build_entries_from_source(
     input_path: &str,
     target_bpw: f32,
@@ -752,6 +758,8 @@ fn build_entries_from_source(
 ///
 /// Also returns per-tensor `GrimTensorExt` entries containing SpQR
 /// salient indices/values so the caller can populate `metadata.ext_entries`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn pack_tensors(
     provider: &(dyn grim_tensor::provider::TensorProvider + Sync),
     names: &[String],

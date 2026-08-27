@@ -35,18 +35,13 @@ pub const WAVE32_SEGMENT_BYTES: usize = 128;
 /// unknown / "all" → [`WaveSize::W32`]). The file is written (padding,
 /// offsets) against that segment. Most callers get W32 by default; a Wave64
 /// build is only reached via an explicit override or a CDNA GCN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WaveSize {
     /// 64-lane wavefront (CDNA), 256-byte coalesced segment. Opt-in.
     W64,
     /// 32-lane wavefront (RDNA / default), 128-byte coalesced segment.
+    #[default]
     W32,
-}
-
-impl Default for WaveSize {
-    fn default() -> Self {
-        WaveSize::W32
-    }
 }
 
 impl WaveSize {
@@ -94,7 +89,7 @@ impl WaveSize {
 
 /// Round `n` up to the next multiple of `segment`.
 fn align_to_segment(n: u64, segment: usize) -> u64 {
-    (n + segment as u64 - 1) / segment as u64 * segment as u64
+    n.div_ceil(segment as u64) * segment as u64
 }
 
 /// Header of `.grim` model format.
@@ -154,7 +149,7 @@ impl GrimHeader {
 }
 
 /// Registry entry for a single tensor inside `.grim` file format.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GrimTensorEntry {
     pub name: String,
     pub shape: Vec<usize>,
@@ -175,30 +170,6 @@ pub struct GrimTensorEntry {
     pub kv_sink_fp16: u8,
     pub kv_compressed_offset: u64,
     pub kv_compressed_size: u64,
-}
-
-impl Default for GrimTensorEntry {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            shape: Vec::new(),
-            base_bitwidth: 0,
-            payload_offset: 0,
-            payload_size: 0,
-            outlier_count: 0,
-            outlier_offset: 0,
-            kv_present: 0,
-            kv_rotated: 0,
-            kv_bits_k: 0,
-            kv_bits_v: 0,
-            kv_head_bits_table_offset: 0,
-            kv_eviction_map_offset: 0,
-            kv_eviction_map_size: 0,
-            kv_sink_fp16: 0,
-            kv_compressed_offset: 0,
-            kv_compressed_size: 0,
-        }
-    }
 }
 
 impl GrimTensorEntry {
@@ -599,11 +570,10 @@ impl NormalsLayout {
             outlier_count,
             base_bitwidth,
             row_count,
-            row_stride: if row_count > 0 {
-                total_elements as u64 / row_count
-            } else {
-                0
-            },
+            row_stride: u64::try_from(total_elements)
+                .ok()
+                .and_then(|t| t.checked_div(row_count))
+                .unwrap_or(0),
             row_bpw_table: Vec::new(),
             wave: WaveSize::W64,
         }
@@ -1115,6 +1085,7 @@ impl GrimTensorEntry {
     /// producer's serialized blob length via `compressed_size` so the reader
     /// can fetch the right number of bytes; the `*_offset` is filled in by
     /// `GrimFile::write`.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_kv_layout(
         &mut self,
         present: bool,
@@ -1828,7 +1799,6 @@ mod tests {
 
         // Grow the metadata (longer than the original) so offsets must shift.
         grim_test_rewrite(&path);
-        let path = path;
 
         let mut f = std::fs::File::open(&path).unwrap();
         let restored = GrimFile::read(&mut f).unwrap();
@@ -2026,8 +1996,8 @@ mod tests {
             (100, -0.0f32),
             (1024, 1.0f32),
             (4096, -1.0f32),
-            (65535, 65504.0f32),           // Max finite F16
-            (100000, 0.00006103515625f32), // Min positive normalized F16 (2^-14)
+            (65535, 65504.0f32),             // Max finite F16
+            (100000, 0.000_061_035_156_f32), // Min positive normalized F16 (2^-14)
         ];
 
         for (index, val) in test_cases {

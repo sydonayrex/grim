@@ -684,7 +684,7 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
             Arc::from(storage),
             shape,
             DType::F32,
-            grim_tensor::QuantProvenance::GrimNative.into(),
+            grim_tensor::QuantProvenance::GrimNative,
             device.clone(),
         ))
     }
@@ -714,8 +714,8 @@ pub(crate) fn apply_rope_neox(
     let half = head_dim / 2;
     let seq_len = positions.len();
 
-    for t in 0..seq_len {
-        let pos = positions[t] as f32;
+    for (t, &pos_raw) in positions.iter().enumerate().take(seq_len) {
+        let pos = pos_raw as f32;
         for h in 0..num_heads {
             let base = (t * num_heads + h) * head_dim;
             for i in 0..half {

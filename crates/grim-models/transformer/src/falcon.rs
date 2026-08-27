@@ -287,7 +287,7 @@ impl FalconBlock {
         let gelu_v: Vec<f32> = mlp_mid_v
             .iter()
             .map(|&v| {
-                let c = 0.7978845608 * (v + 0.044715 * v * v * v);
+                let c = 0.797_884_6 * (v + 0.044715 * v * v * v);
                 0.5 * v * (1.0 + c.tanh())
             })
             .collect();

@@ -23,12 +23,8 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| {
-        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
-    }) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
+        .ok()
 }
 
 /// Compute max absolute difference between two float slices.

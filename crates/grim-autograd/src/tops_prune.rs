@@ -138,7 +138,7 @@ pub fn compute_entropy(attention_weights: &[f32], seq_len: usize, num_heads: usi
 
     for head in 0..num_heads {
         let head_offset = head * seq_len * seq_len;
-        for token_idx in 0..seq_len {
+        for (token_idx, ent_slot) in entropy_per_token.iter_mut().enumerate() {
             let row_start = head_offset + token_idx * row_stride;
             let row = &attention_weights[row_start..row_start + row_stride];
 
@@ -149,7 +149,7 @@ pub fn compute_entropy(attention_weights: &[f32], seq_len: usize, num_heads: usi
                     ent -= w * w.ln();
                 }
             }
-            entropy_per_token[token_idx] += ent;
+            *ent_slot += ent;
         }
     }
 

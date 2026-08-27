@@ -228,7 +228,7 @@ impl MelFrontend {
     fn compute_frame_power_spectrum(&self, frame: &[f32], n_bins: usize) -> Vec<f32> {
         let n = self.n_fft;
         let mut power = vec![0.0f32; n_bins];
-        for k in 0..n_bins {
+        for (k, power_k) in power.iter_mut().enumerate() {
             let omega = 2.0 * PI * (k as f32) / (n as f32);
             let mut re = 0.0f32;
             let mut im = 0.0f32;
@@ -243,7 +243,7 @@ impl MelFrontend {
                 re += v * angle.cos();
                 im -= v * angle.sin();
             }
-            power[k] = re * re + im * im;
+            *power_k = re * re + im * im;
         }
         power
     }
@@ -345,14 +345,14 @@ mod tests {
 
         // Fixture 1: 440 Hz pure sine tone (A4 note)
         let mut tone_440 = vec![0.0f32; 16000];
-        for i in 0..16000 {
-            tone_440[i] = (2.0 * PI * 440.0 * (i as f32) / 16000.0).sin();
+        for (i, t) in tone_440.iter_mut().enumerate() {
+            *t = (2.0 * PI * 440.0 * (i as f32) / 16000.0).sin();
         }
 
         // Fixture 2: 2500 Hz high frequency harmonic tone
         let mut tone_2500 = vec![0.0f32; 16000];
-        for i in 0..16000 {
-            tone_2500[i] = (2.0 * PI * 2500.0 * (i as f32) / 16000.0).sin();
+        for (i, t) in tone_2500.iter_mut().enumerate() {
+            *t = (2.0 * PI * 2500.0 * (i as f32) / 16000.0).sin();
         }
 
         let (mel_1, frames_1) = frontend.extract_mel(&tone_440);

@@ -45,7 +45,7 @@ fn test_paged_attention_gpu_matches_reference() {
     let mut out_storage = dev.zeros(&out_shape, DType::F32).unwrap();
 
     // Create block table
-    let table_entries = vec![
+    let table_entries = [
         BlockTableEntry {
             block_id: 0,
             page_size: 4,
@@ -127,7 +127,7 @@ fn test_paged_attention_gpu_matches_reference() {
     }
 
     // CPU reference attention logic
-    let mut want_out = vec![0.0f32; 16];
+    let mut want_out = [0.0f32; 16];
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
 
     for h in 0..num_heads as usize {

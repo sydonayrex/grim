@@ -648,6 +648,10 @@ pub trait BackendDevice: Send + Sync {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
 
     /// Copy a slice of F32 values from host memory to the device storage.
+    // `from_cpu` is the established workspace-wide device-API name ("construct
+    // this backend's storage from host data"); renaming it would churn every
+    // backend and call site for no semantic gain.
+    #[allow(clippy::wrong_self_convention)]
     fn from_cpu(
         &self,
         data: &[f32],
@@ -656,6 +660,7 @@ pub trait BackendDevice: Send + Sync {
     ) -> Result<Box<dyn BackendStorage>>;
 
     /// Copy raw byte slice (for packed quantized representations) from host memory to device storage.
+    #[allow(clippy::wrong_self_convention)]
     fn from_cpu_bytes(
         &self,
         data: &[u8],
@@ -2138,7 +2143,7 @@ impl QuantizedMatmulBackwardResiduals {
 
     /// Extract residual and outlier metadata from a tensor's `QuantProvenance`.
     pub fn from_tensor(tensor: &crate::tensor::Tensor) -> Self {
-        Self::from_provenance(&tensor.provenance())
+        Self::from_provenance(tensor.provenance())
     }
 }
 

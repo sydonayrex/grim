@@ -49,7 +49,7 @@ fn acceptor_full_match_accepts_all_drafts_and_emits_target_tail() -> TestResult 
     match result {
         AcceptanceResult::AcceptAll { accepted, tail } => {
             assert_eq!(accepted.len(), 3, "all 3 drafts accepted");
-            assert!(tail >= 0.0 && tail <= 1.0, "tail is a prob in [0,1]");
+            assert!((0.0..=1.0).contains(&tail), "tail is a prob in [0,1]");
         }
         other => return Err(format!("expected AcceptAll, got {:?}", other).into()),
     }

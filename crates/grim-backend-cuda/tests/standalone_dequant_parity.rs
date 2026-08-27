@@ -224,6 +224,7 @@ fn mxfp8_kernel_matches_cpu_oracle() {
     assert_bit_exact("mxfp8", &got, &expected);
 }
 
+#[allow(clippy::type_complexity)]
 fn run_iq(
     name: &str,
     block_bytes: usize,

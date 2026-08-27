@@ -136,6 +136,7 @@ impl Scythe1Optimizer {
     /// 1) accumulate diagonal FIM from raw gradients,
     /// 2) precondition U, V, Σ gradients with inverse-FIM diagonal,
     /// 3) delegate to `SoulEaterOptimizer::step` for the actual update.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         name: &str,

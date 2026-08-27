@@ -418,10 +418,7 @@ impl SafetensorsProvider {
         // keeps the historical GPTQ path. If no quantize_config.json exists
         // at all, GptqProvider::open errors and we surface its message.
         let awq = if has_qweight {
-            match crate::awq::AwqProvider::open(path) {
-                Ok(p) => Some(p),
-                Err(_) => None,
-            }
+            crate::awq::AwqProvider::open(path).ok()
         } else {
             None
         };
@@ -839,6 +836,67 @@ fn dtype_from_bitwidth(base_bitwidth: u8) -> DType {
     }
 }
 
+// ---------- Remapping Tensor Provider ----------
+/// Wraps a `TensorProvider` and remaps tensor names using a provided
+/// mapping function. Useful for loading checkpoints with different naming
+/// conventions (e.g., Hugging Face → GGUF).
+pub struct RemappingTensorProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    remap: Box<dyn Fn(&str) -> String + Send + Sync + 'a>,
+}
+
+impl<'a> RemappingTensorProvider<'a> {
+    pub fn new(
+        inner: &'a dyn TensorProvider,
+        remap: impl Fn(&str) -> String + Send + Sync + 'a,
+    ) -> Self {
+        Self {
+            inner,
+            remap: Box::new(remap),
+        }
+    }
+}
+
+impl<'a> TensorProvider for RemappingTensorProvider<'a> {
+    fn get(&self, name: &str) -> Result<RawTensor> {
+        let mapped = (self.remap)(name);
+        self.inner.get(&mapped)
+    }
+
+    fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        let mapped = (self.remap)(name);
+        self.inner.get_packed(&mapped)
+    }
+
+    fn get_packed_sharded(
+        &self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<RawTensor> {
+        let mapped = (self.remap)(name);
+        self.inner
+            .get_packed_sharded(&mapped, dim, rank, world_size)
+    }
+
+    fn meta(&self, name: &str) -> Result<TensorMeta> {
+        let mapped = (self.remap)(name);
+        self.inner.meta(&mapped)
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        // Enumerate under the remapped (loader-side) names so a
+        // `WeightSource` prefetch keyed by those names lines up with the
+        // `full_name` keys the loader actually requests.
+        self.inner
+            .tensor_names()
+            .into_iter()
+            .map(|n| (self.remap)(&n))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,66 +1231,5 @@ mod tests {
             .get("blk.0.attn_q.weight")
             .expect("mapped get lookup");
         assert_eq!(raw.bytes.len(), 16);
-    }
-}
-
-// ---------- Remapping Tensor Provider ----------
-/// Wraps a `TensorProvider` and remaps tensor names using a provided
-/// mapping function. Useful for loading checkpoints with different naming
-/// conventions (e.g., Hugging Face → GGUF).
-pub struct RemappingTensorProvider<'a> {
-    inner: &'a dyn TensorProvider,
-    remap: Box<dyn Fn(&str) -> String + Send + Sync + 'a>,
-}
-
-impl<'a> RemappingTensorProvider<'a> {
-    pub fn new(
-        inner: &'a dyn TensorProvider,
-        remap: impl Fn(&str) -> String + Send + Sync + 'a,
-    ) -> Self {
-        Self {
-            inner,
-            remap: Box::new(remap),
-        }
-    }
-}
-
-impl<'a> TensorProvider for RemappingTensorProvider<'a> {
-    fn get(&self, name: &str) -> Result<RawTensor> {
-        let mapped = (self.remap)(name);
-        self.inner.get(&mapped)
-    }
-
-    fn get_packed(&self, name: &str) -> Result<RawTensor> {
-        let mapped = (self.remap)(name);
-        self.inner.get_packed(&mapped)
-    }
-
-    fn get_packed_sharded(
-        &self,
-        name: &str,
-        dim: usize,
-        rank: usize,
-        world_size: usize,
-    ) -> Result<RawTensor> {
-        let mapped = (self.remap)(name);
-        self.inner
-            .get_packed_sharded(&mapped, dim, rank, world_size)
-    }
-
-    fn meta(&self, name: &str) -> Result<TensorMeta> {
-        let mapped = (self.remap)(name);
-        self.inner.meta(&mapped)
-    }
-
-    fn tensor_names(&self) -> Vec<String> {
-        // Enumerate under the remapped (loader-side) names so a
-        // `WeightSource` prefetch keyed by those names lines up with the
-        // `full_name` keys the loader actually requests.
-        self.inner
-            .tensor_names()
-            .into_iter()
-            .map(|n| (self.remap)(&n))
-            .collect()
     }
 }

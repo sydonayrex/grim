@@ -253,6 +253,8 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
     }
 
     // CPU reference: causal attention, one (i, h) head (proven in spike phase3).
+    // Argument list deliberately mirrors the GPU kernel's launch parameters.
+    #[allow(clippy::too_many_arguments)]
     fn ref_causal(
         q: &[f32],
         k: &[f32],
@@ -288,8 +290,8 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
                     let w = (s - m).exp();
                     if s > m {
                         let corr = (m - s).exp();
-                        for d in 0..hd {
-                            acc[d] *= corr;
+                        for a in acc.iter_mut() {
+                            *a *= corr;
                         }
                         l *= corr;
                         m = s;
@@ -338,7 +340,7 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
             let group_idx = (flat % cols) / group_size;
             let h = h_diag[group_idx];
             let mut corrected = approx + correction_rate * (orig - approx) / h;
-            corrected = corrected.max(-65504.0f32).min(65504.0f32);
+            corrected = corrected.clamp(-65504.0f32, 65504.0f32);
             corrected
         })
         .collect();

@@ -71,10 +71,10 @@ impl DownBlock {
         }
     }
 
-    fn forward(&self, x_data: &mut Vec<f32>, hw: usize) -> Result<()> {
+    fn forward(&self, x_data: &mut [f32], hw: usize) -> Result<()> {
         let h = self.hidden;
         let _pool = self.pool;
-        let prev = x_data.clone();
+        let prev = x_data.to_vec();
         let weights = &self.conv_w;
         let bias = &self.conv_b;
         for elem in 0..hw {
@@ -172,7 +172,7 @@ impl Unet2D {
         let half = h / 2;
         let mut emb = vec![0.0f32; h];
         for i in 0..half {
-            let f = (t as f32) * 0.01 * (-((i as f32) * 2.0 / half as f32).exp()) as f32;
+            let f = (t as f32) * 0.01 * (-((i as f32) * 2.0 / half as f32).exp());
             emb[i] = f.sin();
             emb[i + half] = f.cos();
         }
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn unet_denoise_step_shape_4d() {
         let u = Unet2D::random(Device::Cpu, cfg());
-        let lat = cpu_tensor(vec![1.0f32; 1 * 4 * 8 * 8], Shape::new(vec![1, 4, 8, 8]));
+        let lat = cpu_tensor(vec![1.0f32; 4 * 8 * 8], Shape::new(vec![1, 4, 8, 8]));
         let t = cpu_tensor(vec![500.0f32], Shape::new(vec![1]));
         let cond = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![8]));
         let out = u.denoise_step(&lat, &t, &cond).unwrap();
@@ -346,24 +346,23 @@ mod tests {
         let mut c = cfg();
         c.out_channels = 6;
         let u = Unet2D::random(Device::Cpu, c);
-        let lat = cpu_tensor(vec![1.0f32; 1 * 4 * 8 * 8], Shape::new(vec![1, 4, 8, 8]));
+        let lat = cpu_tensor(vec![1.0f32; 4 * 8 * 8], Shape::new(vec![1, 4, 8, 8]));
         let t = cpu_tensor(vec![500.0f32], Shape::new(vec![1]));
         let cond = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![8]));
         let out = u.denoise_step(&lat, &t, &cond).unwrap();
         assert_eq!(out.shape().dims(), &[1, 6, 8, 8]);
-        assert_eq!(out.to_vec_f32().unwrap().len(), 1 * 6 * 8 * 8);
+        assert_eq!(out.to_vec_f32().unwrap().len(), 6 * 8 * 8);
     }
 
     #[test]
     fn unet_rejects_bad_channels() {
         let u = Unet2D::random(Device::Cpu, cfg());
-        let lat = cpu_tensor(vec![1.0f32; 1 * 3 * 8 * 8], Shape::new(vec![1, 3, 8, 8]));
+        let lat = cpu_tensor(vec![1.0f32; 3 * 8 * 8], Shape::new(vec![1, 3, 8, 8]));
         let t = cpu_tensor(vec![0.0f32], Shape::new(vec![1]));
         let cond = cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4]));
         let err = u
             .denoise_step(&lat, &t, &cond)
-            .err()
-            .expect("denoise_step should fail on bad channels");
+            .expect_err("denoise_step should fail on bad channels");
         match err {
             Error::Shape(_) => {}
             other => panic!("expected Shape error, got {:?}", other),

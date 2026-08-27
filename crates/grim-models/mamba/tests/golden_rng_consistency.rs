@@ -12,7 +12,13 @@ fn golden_rng_deterministic_seed_identity() {
     // Seed = 0x0000_0000_DEAD_BEEF.
     // Changes here should ONLY happen if the algorithm changes deliberately.
     let expected = [
-        0.21785907, 0.08779941, 0.66758688, 0.89803026, 0.24182903, 0.55162399, 0.93937888,
+        0.21785907,
+        0.08779941,
+        0.66758688,
+        0.898_030_3,
+        0.24182903,
+        0.551_624,
+        0.93937888,
         0.38869425,
     ];
 

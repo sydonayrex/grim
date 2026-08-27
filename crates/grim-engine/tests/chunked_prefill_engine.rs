@@ -10,7 +10,6 @@
 //! pressure, not just wasted compute.
 
 use grim_core::model::CausalLm;
-use grim_core::session::SessionT;
 use grim_engine::{Engine, EngineConfig};
 use grim_models_transformer::{Llama, LlamaConfig};
 use grim_tensor::Device;
@@ -41,8 +40,10 @@ fn chunked_prefill_processes_each_token_exactly_once() {
     // every pass, so the 120-token prompt drains in 50/50/20 chunks.
     // `tick()` re-applies the self-tuner's knobs every pass, so pin them
     // there (floor = ceiling = initial), not on the scheduler.
-    let mut cfg = EngineConfig::default();
-    cfg.max_batched_tokens = 100;
+    let cfg = EngineConfig {
+        max_batched_tokens: 100,
+        ..EngineConfig::default()
+    };
     let mut engine = Engine::new(cfg);
     engine.register_model("small", small_llama());
     engine.scheduler.chunked_prefill_size = 50; // first pass, before the tuner applies

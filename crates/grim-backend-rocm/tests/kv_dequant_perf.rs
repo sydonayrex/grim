@@ -64,6 +64,8 @@ fn dense_attn_1tok(
     out
 }
 
+// Argument list mirrors the kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn main_config(
     dev: &RocmDevice,
     cache_len: usize,
@@ -132,7 +134,7 @@ fn main_config(
     let v_bytes = k_bytes;
     let scales_bytes = 2.0 * (cache_len * num_kv_heads * 4) as f32; // k + v scales, f32
     let gpu_pack_bytes = k_bytes + v_bytes + scales_bytes;
-    let gpu_ratio = dense_bytes as f32 / gpu_pack_bytes as f32;
+    let gpu_ratio = dense_bytes as f32 / gpu_pack_bytes;
 
     // --- GPU decode loop (fused dequant attention) ---
     let q_shape = Shape::new(vec![1, num_heads, head_dim]);
@@ -209,7 +211,7 @@ fn main_config(
         dense_bytes as f32 / 1e6,
         compressed_bytes as f32 / 1e6,
         host_ratio,
-        gpu_pack_bytes as f32 / 1e6,
+        gpu_pack_bytes / 1e6,
         gpu_ratio,
         gpu_tok_s,
         cpu_tok_s,

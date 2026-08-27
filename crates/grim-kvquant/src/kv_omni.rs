@@ -275,7 +275,7 @@ impl OmniKvCompressor {
         let mut key_bits: Vec<u8> = Vec::new();
         {
             let total = k_proj.len();
-            for gi in 0..((total + group_size - 1) / group_size) {
+            for gi in 0..total.div_ceil(group_size) {
                 let start = gi * group_size;
                 let end = (start + group_size).min(total);
                 let slice = &k_proj[start..end];
@@ -379,10 +379,10 @@ impl OmniKvCompressor {
                 1.0
             };
             let group_end = ((meta_idx + 1) * group_size).min(total_proj);
-            for j in elem_pos..group_end.min(total_proj) {
-                if byte_pos < block.key_bits.len() {
-                    let q = block.key_bits[byte_pos] as f32;
-                    k_proj[j] = (q - 128.0) / 127.0 * scale;
+            for slot in k_proj[elem_pos..group_end.min(total_proj)].iter_mut() {
+                if let Some(&q) = block.key_bits.get(byte_pos) {
+                    let q = q as f32;
+                    *slot = (q - 128.0) / 127.0 * scale;
                     byte_pos += 1;
                 }
             }
@@ -395,7 +395,7 @@ impl OmniKvCompressor {
         let mut v_proj = vec![0.0f32; v_total];
         let bytes_needed = v_total * 4;
         if block.value_bits.len() >= bytes_needed {
-            for i in 0..v_total {
+            for (i, slot) in v_proj.iter_mut().enumerate() {
                 let offset = i * 4;
                 let bytes = [
                     block.value_bits[offset],
@@ -403,7 +403,7 @@ impl OmniKvCompressor {
                     block.value_bits[offset + 2],
                     block.value_bits[offset + 3],
                 ];
-                v_proj[i] = f32::from_le_bytes(bytes);
+                *slot = f32::from_le_bytes(bytes);
             }
         }
 
@@ -521,7 +521,7 @@ impl KvCompressor for OmniKvCompressor {
                 let mut scores = vec![0.0f32; block.num_tokens];
                 let mut max_score = f32::NEG_INFINITY;
 
-                for kt in 0..block.num_tokens {
+                for (kt, score_slot) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
@@ -531,29 +531,29 @@ impl KvCompressor for OmniKvCompressor {
                         }
                     }
                     let score = dot * scale;
-                    scores[kt] = score;
+                    *score_slot = score;
                     if score > max_score {
                         max_score = score;
                     }
                 }
 
                 let mut sum_exp = 0.0f32;
-                for kt in 0..block.num_tokens {
-                    scores[kt] = f32::exp(scores[kt] - max_score);
-                    sum_exp += scores[kt];
+                for score in &mut scores {
+                    *score = f32::exp(*score - max_score);
+                    sum_exp += *score;
                 }
                 if sum_exp > 0.0 {
-                    for kt in 0..block.num_tokens {
-                        scores[kt] /= sum_exp;
+                    for score in &mut scores {
+                        *score /= sum_exp;
                     }
                 }
 
                 for d in 0..head_dim {
                     let mut val = 0.0f32;
-                    for kt in 0..block.num_tokens {
+                    for (kt, &score) in scores.iter().enumerate() {
                         let v_idx = (kt * block.num_kv_heads + kv_head) * head_dim + d;
                         if v_idx < v_data.len() {
-                            val += scores[kt] * v_data[v_idx];
+                            val += score * v_data[v_idx];
                         }
                     }
                     let out_idx = (t * num_heads + h) * head_dim + d;
@@ -714,11 +714,7 @@ impl KvOmniEvictor {
             modality_ids,
         );
 
-        let mut indexed: Vec<(usize, f32)> = salience
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| (i, s))
-            .collect();
+        let mut indexed: Vec<(usize, f32)> = salience.into_iter().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let keep_count = total_budget.min(indexed.len());
@@ -775,8 +771,7 @@ impl KvOmniEvictor {
         // Preserve all sub-block meta, prefixed with boundary info.
         // value_meta = [n_subblocks=3, text_value_meta_len, audio_value_meta_len,
         //               visual_value_meta_len, text_value_meta | audio_value_meta | visual_value_meta]
-        let mut value_meta = Vec::new();
-        value_meta.push(3.0); // n_subblocks
+        let mut value_meta = vec![3.0]; // n_subblocks
         value_meta.push(text_kv.value_meta.len() as f32);
         value_meta.push(audio_kv.value_meta.len() as f32);
         value_meta.push(visual_kv.value_meta.len() as f32);
@@ -1164,8 +1159,8 @@ mod tests {
         assert_eq!(merged.num_tokens, 6);
         assert_eq!(merged.num_kv_heads, 2);
         assert_eq!(merged.head_dim, 4);
-        assert_eq!(merged.key_bits.len(), 2 * 2 * 4 + 3 * 2 * 4 + 1 * 2 * 4);
-        assert_eq!(merged.value_bits.len(), 2 * 2 * 4 + 3 * 2 * 4 + 1 * 2 * 4);
+        assert_eq!(merged.key_bits.len(), 2 * 2 * 4 + 3 * 2 * 4 + 2 * 4);
+        assert_eq!(merged.value_bits.len(), 2 * 2 * 4 + 3 * 2 * 4 + 2 * 4);
         // value_meta should have the boundary header.
         assert!(!merged.value_meta.is_empty());
         assert_eq!(merged.value_meta[0], 3.0); // n_subblocks

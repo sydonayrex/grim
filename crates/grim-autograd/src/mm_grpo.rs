@@ -75,7 +75,7 @@ impl MmGrpoRewardNormalizer {
             return Vec::new();
         }
         if rewards.len() != modality_tags.len() {
-            return rewards.iter().copied().collect();
+            return rewards.to_vec();
         }
 
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -133,7 +133,7 @@ impl MmGrpoRewardNormalizer {
             return Vec::new();
         }
         if rewards.len() != modality_tags.len() {
-            return rewards.iter().copied().collect();
+            return rewards.to_vec();
         }
 
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();

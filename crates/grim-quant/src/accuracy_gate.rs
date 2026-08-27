@@ -173,6 +173,12 @@ pub struct AccuracyGate {
     custom_tolerances: HashMap<QuantFormat, AccuracyTolerance>,
 }
 
+impl Default for AccuracyGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AccuracyGate {
     pub fn new() -> Self {
         Self {

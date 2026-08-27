@@ -131,11 +131,11 @@ fn real_model_q4k_matches_reference() {
     eprintln!("[kat] max_abs_diff={max_abs:.6} first_mismatch={first_mismatch:?}",);
     eprintln!(
         "[kat] grim first8={:?}",
-        &grim.iter().take(8).collect::<Vec<_>>()
+        grim.iter().take(8).collect::<Vec<_>>()
     );
     eprintln!(
         "[kat] ref  first8={:?}",
-        &refr.iter().take(8).collect::<Vec<_>>()
+        refr.iter().take(8).collect::<Vec<_>>()
     );
     assert!(
         max_abs < 1e-2,

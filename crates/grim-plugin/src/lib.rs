@@ -89,17 +89,13 @@ pub struct GrimPluginVTable {
     pub teardown: extern "C" fn(),
 }
 /// Detection of plugin loading strategy from the manifest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PluginKind {
     Dylib,
+    #[default]
     Wasm,
 }
 
-impl Default for PluginKind {
-    fn default() -> Self {
-        PluginKind::Wasm
-    }
-}
 /// Capability grants for a plugin (§6.4, deny-by-default: all fields off).
 ///
 /// Two manifest forms feed this struct:

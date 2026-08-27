@@ -5,12 +5,12 @@
 //!
 //! Device-gated: `GRIM_GPU_TEST=1`.
 
+use grim_backend_rocm::RocmDevice;
 use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_nn::{Linear, WeightSource};
 use grim_tensor::dtype::QuantProvenance;
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 use grim_tensor::{ArithType, BackendDevice, DType, Device, Shape, Storage, Tensor};
-use grim_backend_rocm::RocmDevice;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,6 +21,8 @@ const GROUP: usize = 8;
 
 #[derive(Clone)]
 struct MemProvider {
+    // Mirrors the on-disk tensor-record tuple verbatim.
+    #[allow(clippy::type_complexity)]
     tensors: Arc<HashMap<String, (Vec<u8>, Vec<usize>, DType, QuantProvenance)>>,
 }
 
@@ -57,7 +59,11 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn native(name: &str, shape: Vec<usize>, v: &[f32]) -> (String, Vec<u8>, Vec<usize>, DType, QuantProvenance) {
+fn native(
+    name: &str,
+    shape: Vec<usize>,
+    v: &[f32],
+) -> (String, Vec<u8>, Vec<usize>, DType, QuantProvenance) {
     (
         name.to_string(),
         f32_bytes(v),
@@ -87,7 +93,9 @@ fn w4a16_quantize_rowmajor(
         for g in 0..groups_per_row {
             let lo = g * group_size;
             let hi = (lo + group_size).min(k);
-            let max_abs = (lo..hi).map(|c| w[row * k + c].abs()).fold(0.0f32, f32::max);
+            let max_abs = (lo..hi)
+                .map(|c| w[row * k + c].abs())
+                .fold(0.0f32, f32::max);
             let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 7.0 };
             scales[row * groups_per_row + g] = scale;
             for c in lo..hi {
@@ -131,14 +139,19 @@ fn gptq_quantize_bank(
         for g in 0..groups {
             let lo = g * group_size;
             let hi = (lo + group_size).min(k);
-            let max_abs = (lo..hi).map(|kk| w[kk * n_total + col].abs()).fold(0.0f32, f32::max);
-            let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 15.0 * 2.0 };
+            let max_abs = (lo..hi)
+                .map(|kk| w[kk * n_total + col].abs())
+                .fold(0.0f32, f32::max);
+            let scale = if max_abs == 0.0 {
+                1e-12
+            } else {
+                max_abs / 15.0 * 2.0
+            };
             scales[g * n_total + col] = scale;
             let zero_code = (rand() * 15.0) as u32;
             for kk in lo..hi {
                 let code = rand() as u32 & 0xF;
-                qzeros[g * n_total.div_ceil(vpw) + col / vpw] |=
-                    zero_code << ((col % vpw) * 4);
+                qzeros[g * n_total.div_ceil(vpw) + col / vpw] |= zero_code << ((col % vpw) * 4);
                 let true_zero = zero_code as f32 + 1.0;
                 let val = (code as f32 - true_zero) * scale;
                 deq[kk * n_total + col] = val;
@@ -309,8 +322,7 @@ fn build_gptq_fixture() -> MoEFixture {
     }
 
     let router: Vec<f32> = vec![
-        2.0, 0.2, -2.8, 0.1, 3.0, 0.05, -1.5, 0.4,
-        -3.0, 0.3, 2.2, 0.12, -2.0, 2.6, 0.08, 0.9,
+        2.0, 0.2, -2.8, 0.1, 3.0, 0.05, -1.5, 0.4, -3.0, 0.3, 2.2, 0.12, -2.0, 2.6, 0.08, 0.9,
     ];
     let (n, b, s, d, p) = native("ffn_gate_inp.weight", vec![E, HIDDEN], &router);
     provider_map.insert(n, (b, s, d, p));
@@ -328,7 +340,9 @@ fn build_gptq_fixture() -> MoEFixture {
 fn run_moe_forward(fixture: &MoEFixture, device: Device, x_host: &[f32]) -> Vec<f32> {
     let ws = WeightSource::root(&fixture.provider, device.clone());
     let bank = ExpertBank::load(&ws, E, HIDDEN, INTER, false).expect("expert bank load");
-    let router_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+    let router_w = ws
+        .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+        .unwrap();
     let router = MoeRouter::new(
         Linear::from_tensor(router_w, None),
         RouterKind::SoftmaxTopK,
@@ -376,10 +390,15 @@ impl MoEFixture {
             }
             map.insert(
                 name.to_string(),
-                (f32_bytes(&flat), vec![E, *out, *k], DType {
-                    arith: ArithType::F32,
-                    storage: Storage::Native,
-                }, grim_tensor::QuantProvenance::GrimNative),
+                (
+                    f32_bytes(&flat),
+                    vec![E, *out, *k],
+                    DType {
+                        arith: ArithType::F32,
+                        storage: Storage::Native,
+                    },
+                    grim_tensor::QuantProvenance::GrimNative,
+                ),
             );
         }
         let router = native("ffn_gate_inp.weight", vec![E, HIDDEN], &{
@@ -392,7 +411,9 @@ impl MoEFixture {
         });
         map.insert(router.0, (router.1, router.2, router.3, router.4));
         MoEFixture {
-            provider: MemProvider { tensors: Arc::new(map) },
+            provider: MemProvider {
+                tensors: Arc::new(map),
+            },
             ref_gate: self.ref_gate.clone(),
             ref_up: self.ref_up.clone(),
             ref_down: self.ref_down.clone(),
@@ -496,12 +517,7 @@ fn w4a16_expert_bank_moe_forward_matches_reference() {
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
                     .unwrap();
                 let out_box = dev
-                    .dequant_w4a16_blob_to_f32(
-                        blob_rocm,
-                        INTER,
-                        HIDDEN,
-                        GROUP,
-                    )
+                    .dequant_w4a16_blob_to_f32(blob_rocm, INTER, HIDDEN, GROUP)
                     .unwrap();
                 let c_t = Tensor::new(
                     std::sync::Arc::from(out_box),

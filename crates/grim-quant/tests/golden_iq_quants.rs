@@ -51,7 +51,7 @@ fn iq4xs_golden_scale_sign_and_codebook() {
     // IQ4_NL_CODEBOOK[3] = 0.39743365; scale 0.25.
     close(
         out[0],
-        0.39743365_f32 * 0.25 * -1.0,
+        -(0.39743365_f32 * 0.25),
         "iq4xs w0 (sign -, code 3)",
     );
     close(
@@ -76,7 +76,7 @@ fn iq3xxs_golden_grid_sign_and_offset() {
 
     let out = dequant_iq3xxs(&data, 256).expect("iq3xxs dequant");
     assert_eq!(out.len(), 256);
-    close(out[0], 1.0 * 2.0 * 0.25 * -1.0, "iq3xxs w0");
+    close(out[0], -(1.0 * 2.0 * 0.25), "iq3xxs w0");
     close(out[1], 1.0 * (-2.0) * 0.25 * 1.0, "iq3xxs w1");
 }
 
@@ -163,25 +163,10 @@ fn iq2s_golden_nibble_scale_and_grid() {
 #[test]
 fn iq_quants_reject_truncated_buffers() {
     // Each needs a full super-block for 256 weights; a short buffer must error.
-    assert!(
-        dequant_iq4xs(&vec![0u8; 135], 256).is_err(),
-        "iq4xs truncated"
-    );
-    assert!(
-        dequant_iq3xxs(&vec![0u8; 95], 256).is_err(),
-        "iq3xxs truncated"
-    );
-    assert!(
-        dequant_iq3s(&vec![0u8; 109], 256).is_err(),
-        "iq3s truncated"
-    );
-    assert!(
-        dequant_iq2xxs(&vec![0u8; 65], 256).is_err(),
-        "iq2xxs truncated"
-    );
-    assert!(
-        dequant_iq2xs(&vec![0u8; 73], 256).is_err(),
-        "iq2xs truncated"
-    );
-    assert!(dequant_iq2s(&vec![0u8; 81], 256).is_err(), "iq2s truncated");
+    assert!(dequant_iq4xs(&[0u8; 135], 256).is_err(), "iq4xs truncated");
+    assert!(dequant_iq3xxs(&[0u8; 95], 256).is_err(), "iq3xxs truncated");
+    assert!(dequant_iq3s(&[0u8; 109], 256).is_err(), "iq3s truncated");
+    assert!(dequant_iq2xxs(&[0u8; 65], 256).is_err(), "iq2xxs truncated");
+    assert!(dequant_iq2xs(&[0u8; 73], 256).is_err(), "iq2xs truncated");
+    assert!(dequant_iq2s(&[0u8; 81], 256).is_err(), "iq2s truncated");
 }

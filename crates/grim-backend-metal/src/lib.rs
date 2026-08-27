@@ -970,6 +970,7 @@ impl MetalDevice {
 
     /// Fused Add + RMSNorm kernel for Metal.
     /// Computes `y = x + residual` and `norm_out = RMSNorm(y, weight, eps)` in a single Metal GPU pass.
+    #[allow(clippy::type_complexity)]
     pub fn fused_add_rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -1279,6 +1280,7 @@ impl MetalDevice {
     /// f32-backed (Metal has no integer buffer storage in this crate) and are
     /// cast to `int` inside the shader.
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_fused_dispatch(
         &self,
         x: &dyn BackendStorage,
@@ -3204,8 +3206,8 @@ impl BackendDevice for MetalDevice {
         let half_dim = dim / 2;
 
         let mut res = x_vec.clone();
-        for t in 0..num_tokens {
-            let p = positions[t] as f32;
+        for (t, &pos) in positions.iter().enumerate() {
+            let p = pos as f32;
             for h in 0..num_heads {
                 for i in 0..half_dim {
                     let freq = 1.0f32 / base.powf((2 * i) as f32 / dim as f32);
@@ -3324,7 +3326,7 @@ impl BackendDevice for MetalDevice {
                     let x_t = x_v[x_idx];
                     let mut y_t = d_val * x_t;
 
-                    for s in 0..dim_dstate {
+                    for (s, h_s) in h.iter_mut().enumerate() {
                         let a_idx = d_idx * dim_dstate + s;
                         let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
                         let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
@@ -3341,8 +3343,8 @@ impl BackendDevice for MetalDevice {
                             1.0
                         };
 
-                        h[s] = a_val * h[s] + x_t * b_val;
-                        y_t += c_val * h[s];
+                        *h_s = a_val * *h_s + x_t * b_val;
+                        y_t += c_val * *h_s;
                     }
                     out[x_idx] = y_t;
                 }
@@ -3781,7 +3783,7 @@ impl BackendDevice for MetalDevice {
         let blocks_per_col = k / 32;
 
         #[cfg(target_vendor = "apple")]
-        let b_bytes = if let Some(ref m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
+        let b_bytes = if let Some(m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
             if let Some(ref buf) = m_s.buffer {
                 let ptr = buf.contents() as *const u8;
                 let len = m_s.shape.elem_count();
@@ -3796,7 +3798,7 @@ impl BackendDevice for MetalDevice {
         };
 
         #[cfg(not(target_vendor = "apple"))]
-        let b_bytes = if let Some(ref m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
+        let b_bytes = if let Some(m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
             m_s.data.lock().unwrap().clone()
         } else {
             vec![0u8; k * n]
@@ -4574,14 +4576,14 @@ impl MetalDevice {
                         }
                     }
 
-                    for j in 0..range_len {
-                        running_sum += (scores[j] - running_max).exp();
+                    for &score in scores.iter() {
+                        running_sum += (score - running_max).exp();
                     }
 
                     for d in 0..head_dim {
                         let mut acc = 0.0_f32;
-                        for j in 0..range_len {
-                            let weight = (scores[j] - running_max).exp()
+                        for (j, &score_j) in scores.iter().enumerate() {
+                            let weight = (score_j - running_max).exp()
                                 / (if running_sum > 0.0_f32 {
                                     running_sum
                                 } else {
@@ -4895,6 +4897,12 @@ fn dtype_byte_size(dtype: &DType) -> Result<usize> {
 
 pub struct MlxBridge;
 
+impl Default for MlxBridge {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl MlxBridge {
     pub fn new() -> Self {
         Self
@@ -4912,8 +4920,60 @@ impl MlxBridge {
     }
 }
 
+pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use objc2_metal::MTLCreateSystemDefaultDevice;
+        if let Some(dev) = MTLCreateSystemDefaultDevice() {
+            let max_bytes = dev.recommendedMaxWorkingSetSize();
+            let used_bytes = dev.currentAllocatedSize();
+            let free_bytes = max_bytes.saturating_sub(used_bytes);
+            return Some((free_bytes as u64, max_bytes as u64));
+        }
+    }
+    None
+}
+
+/// WI-1: live compute utilization for `ordinal`.
+///
+/// Scope note (per WI-1): Metal has no cross-vendor utilization API. Returns
+/// `None` rather than fabricating a value from indirect signals — `null` on the
+/// wire is the honest answer.
+pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
+    None
+}
+
+impl grim_format::convert::GpuDequant for MetalDevice {
+    fn dequantize(
+        &self,
+        storage: &grim_tensor::dtype::Storage,
+        bytes: &[u8],
+        elem_count: usize,
+    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        match storage {
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
+            }
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn close(got: f32, want: f32, ctx: &str) {
+        let abs = (got - want).abs();
+        let denom = want.abs().max(1e-7);
+        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
+        assert!(
+            abs == 0.0 || (abs / denom) < 1e-4,
+            "{ctx}: got {got:?} want {want:?} (abs={abs})"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -5181,16 +5241,6 @@ mod tests {
 
     // ===== Golden Mutation-Resistant Op Tests =====
 
-    fn close(got: f32, want: f32, ctx: &str) {
-        let abs = (got - want).abs();
-        let denom = want.abs().max(1e-7);
-        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
-        assert!(
-            abs == 0.0 || (abs / denom) < 1e-4,
-            "{ctx}: got {got:?} want {want:?} (abs={abs})"
-        );
-    }
-
     #[test]
     fn test_metal_add_golden_exact() {
         let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
@@ -5208,6 +5258,7 @@ mod tests {
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res.len(), 4);
+
         close(res[0], 4.0, "add w0");
         close(res[1], 1.0, "add w1");
         close(res[2], -1.0, "add w2");
@@ -5258,7 +5309,7 @@ mod tests {
         let expected_0 = sig_1 * 1.0 * 2.0;
 
         let sig_neg1 = 1.0f32 / (1.0f32 + (1.0f32).exp());
-        let expected_1 = (-1.0f32 * sig_neg1) * 3.0;
+        let expected_1 = (-sig_neg1) * 3.0;
 
         close(res[0], expected_0, "silu_mul w0");
         close(res[1], expected_1, "silu_mul w1");
@@ -5319,47 +5370,5 @@ mod tests {
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
-    }
-}
-
-pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
-    #[cfg(target_vendor = "apple")]
-    {
-        use objc2_metal::MTLCreateSystemDefaultDevice;
-        if let Some(dev) = MTLCreateSystemDefaultDevice() {
-            let max_bytes = dev.recommendedMaxWorkingSetSize();
-            let used_bytes = dev.currentAllocatedSize();
-            let free_bytes = max_bytes.saturating_sub(used_bytes);
-            return Some((free_bytes as u64, max_bytes as u64));
-        }
-    }
-    None
-}
-
-/// WI-1: live compute utilization for `ordinal`.
-///
-/// Scope note (per WI-1): Metal has no cross-vendor utilization API. Returns
-/// `None` rather than fabricating a value from indirect signals — `null` on the
-/// wire is the honest answer.
-pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
-    None
-}
-
-impl grim_format::convert::GpuDequant for MetalDevice {
-    fn dequantize(
-        &self,
-        storage: &grim_tensor::dtype::Storage,
-        bytes: &[u8],
-        elem_count: usize,
-    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
-        match storage {
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
-                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
-            }
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
-                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
-            }
-            _ => Ok(None),
-        }
     }
 }

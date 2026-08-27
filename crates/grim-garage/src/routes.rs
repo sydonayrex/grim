@@ -1505,7 +1505,7 @@ async fn chat_handler(
 /// Helper: encode raw bytes to standard Base64 string without external dependencies.
 fn base64_encode(data: &[u8]) -> String {
     const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut chunks = data.chunks_exact(3);
     for chunk in &mut chunks {
         let b0 = chunk[0] as u32;
@@ -1584,9 +1584,7 @@ fn encode_bmp_rgb(rgb_bytes: &[u8], width: usize, height: usize) -> Vec<u8> {
             bmp.push(g);
             bmp.push(r);
         }
-        for _ in 0..padding {
-            bmp.push(0);
-        }
+        bmp.resize(bmp.len() + padding, 0);
     }
     bmp
 }
@@ -1771,7 +1769,7 @@ async fn diffusion_generate_handler(
     })?;
 
     // Encode text prompt into synthetic embedding tensor for the pipeline: [prompt_len, 128]
-    let prompt_len = req.prompt.len().max(1).min(256);
+    let prompt_len = req.prompt.len().clamp(1, 256);
     let mut prompt_vec = vec![0.0f32; prompt_len * 128];
     let mut prompt_rng = grim_core::rng::SimpleRng::new(actual_seed);
     for (i, byte) in req.prompt.bytes().enumerate().take(prompt_len) {
@@ -2039,11 +2037,12 @@ mod tests {
     fn dashboard_offers_soul_eater_training_mode() {
         let html = WebAssets::get("index.html").expect("index.html embedded");
         let html = std::str::from_utf8(&html.data).expect("index.html is utf-8");
-        // Assert the tag TAIL so the option's value attribute must terminate
-        // it — this fails if SoulEater disappears AND if someone appends
-        // attributes that would shadow/misorder the value.
+        // Assert the exact `value="SoulEater"` attribute — this fails if
+        // SoulEater disappears from the Training Mode dropdown. (The option
+        // now also carries a `title` attribute after `value`, so we cannot
+        // assert the tag tail.)
         assert!(
-            html.contains(r#"value="SoulEater">"#),
+            html.contains(r#"value="SoulEater""#),
             "embedded dashboard is missing the SoulEater training-mode option"
         );
     }

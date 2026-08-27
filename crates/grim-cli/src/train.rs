@@ -991,7 +991,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let mut epoch_loss = 0.0f32;
         let mut num_batches = 0u32;
 
-        for (_batch_idx, (tokens, labels)) in dataset.iter().enumerate() {
+        for (tokens, labels) in dataset.iter() {
             // F8 note: single-replica process — dropping batches here would
             // train on 1/N of the data for zero benefit, so every batch runs.
             // Per-GPU replicas remain garage-side until in-process fanout lands.
@@ -1034,8 +1034,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                     // Run streaming forward through all layers with autograd tape recording.
                     for layer_idx in 0..num_layers {
                         if opts.checkpoint_segs > 1 {
-                            let seg = layer_idx
-                                / ((num_layers + opts.checkpoint_segs - 1) / opts.checkpoint_segs);
+                            let seg = layer_idx / num_layers.div_ceil(opts.checkpoint_segs);
                             tape.mark_segment_boundary(seg, x_id);
                         }
                         let (next_id, next_h) = streaming
@@ -1797,7 +1796,7 @@ mod tests {
         // debug-assertion catches it immediately now.
         let seq_len = 4usize;
         let hidden = 8usize;
-        let ids = vec![1u32, 2, 3, 4];
+        let ids = [1u32, 2, 3, 4];
         let x_data: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
         let _ = cpu_tensor(x_data, Shape::new(vec![seq_len, hidden]));
     }

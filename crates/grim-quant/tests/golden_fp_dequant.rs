@@ -76,18 +76,16 @@ fn fp4_golden_empty_buffer_pads_to_num_values() {
 fn fp8_block16_golden_one_block_identity_scale() {
     let mut buf = Vec::new();
     buf.extend_from_slice(&1.0f32.to_le_bytes()); // global_scale = 1.0
-    buf.push(0b0_0111_000); // block_scale e4m3 = 1.0
+    buf.push(0b00111000); // block_scale e4m3 = 1.0
     // codes: 1.0, 2.0, 0.75, -1.0, 1/512, -3/512, NaN placeholder
-    buf.push(0b0_0111_000); //  1.0
-    buf.push(0b0_1000_000); //  2.0
-    buf.push(0b0_0110_100); //  0.75
-    buf.push(0b1_0111_000); // -1.0
-    buf.push(0b0_0000_001); //  1/512
-    buf.push(0b1_0000_011); // -3/512
+    buf.push(0b00111000); //  1.0
+    buf.push(0b01000000); //  2.0
+    buf.push(0b00110100); //  0.75
+    buf.push(0b10111000); // -1.0
+    buf.push(0b00000001); //  1/512
+    buf.push(0b10000011); // -3/512
     // pad to 16 values
-    for _ in 6..16 {
-        buf.push(0);
-    }
+    buf.extend(std::iter::repeat_n(0u8, 10));
 
     let out = dequant_fp8_block16(&buf, 16).expect("fp8 block16");
     assert_eq!(out.len(), 16);
@@ -98,8 +96,8 @@ fn fp8_block16_golden_one_block_identity_scale() {
     close(out[3], -1.0, "fp8b16[3] = -1.0");
     close(out[4], 1.0 / 512.0, "fp8b16[4] = 1/512");
     close(out[5], -3.0 / 512.0, "fp8b16[5] = -3/512");
-    for i in 6..16 {
-        close(out[i], 0.0, &format!("fp8b16[{i}] = 0.0"));
+    for (i, &v) in out[6..16].iter().enumerate() {
+        close(v, 0.0, &format!("fp8b16[{}] = 0.0", i + 6));
     }
 }
 
@@ -109,19 +107,17 @@ fn fp8_block16_golden_two_blocks_with_non_trivial_scales() {
     let mut buf = Vec::new();
     buf.extend_from_slice(&global_scale.to_le_bytes());
 
-    // Block 0: block_scale = 2.0 (E4M3 0b0_1000_000), codes = [1.0, 1.0, ...]
-    buf.push(0b0_1000_000); // block_scale = 2.0
-    for _ in 0..16 {
-        buf.push(0b0_0111_000); // code = 1.0
-    }
+    // Block 0: block_scale = 2.0 (E4M3 0b01000000), codes = [1.0, 1.0, ...]
+    buf.push(0b01000000); // block_scale = 2.0
+    buf.extend(std::iter::repeat_n(0b00111000u8, 16)); // code = 1.0
 
-    // Block 1: block_scale = 0.5 (E4M3 0b0_0110_000), codes = [1.0, -1.0, ...]
-    buf.push(0b0_0110_000); // block_scale = 0.5 (exp=6, mant=0 → (0/8+1)*2^-1 = 0.5)
+    // Block 1: block_scale = 0.5 (E4M3 0b00110000), codes = [1.0, -1.0, ...]
+    buf.push(0b00110000); // block_scale = 0.5 (exp=6, mant=0 → (0/8+1)*2^-1 = 0.5)
     for i in 0..16 {
         if i % 2 == 0 {
-            buf.push(0b0_0111_000); //  1.0
+            buf.push(0b00111000); //  1.0
         } else {
-            buf.push(0b1_0111_000); // -1.0
+            buf.push(0b10111000); // -1.0
         }
     }
 
@@ -129,14 +125,14 @@ fn fp8_block16_golden_two_blocks_with_non_trivial_scales() {
     assert_eq!(out.len(), 32);
 
     // Block 0: global_scale=0.5, block_scale=2.0, code=1.0 → 0.5 * 2.0 * 1.0 = 1.0
-    for i in 0..16 {
-        close(out[i], 1.0, &format!("fp8b16 block0[{i}]"));
+    for (i, &v) in out[..16].iter().enumerate() {
+        close(v, 1.0, &format!("fp8b16 block0[{i}]"));
     }
 
     // Block 1: global_scale=0.5, block_scale=0.5, code=±1.0 → 0.5 * 0.5 * ±1.0 = ±0.25
-    for i in 16..32 {
-        let want = if (i - 16) % 2 == 0 { 0.25 } else { -0.25 };
-        close(out[i], want, &format!("fp8b16 block1[{i}]"));
+    for (i, &v) in out[16..32].iter().enumerate() {
+        let want = if i % 2 == 0 { 0.25 } else { -0.25 };
+        close(v, want, &format!("fp8b16 block1[{}]", i + 16));
     }
 }
 
@@ -163,8 +159,8 @@ fn fp4_block16_golden_one_block_all_codes() {
     let mut buf = Vec::new();
     buf.extend_from_slice(&global_scale.to_le_bytes());
 
-    // block_scale = 2.0 (E4M3 0b0_1000_000)
-    buf.push(0b0_1000_000);
+    // block_scale = 2.0 (E4M3 0b01000000)
+    buf.push(0b01000000);
 
     // 8 bytes packed: 0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87
     // Each nibble maps to FP4_UNIFORM_LUT at that index.
@@ -180,7 +176,7 @@ fn fp4_block16_golden_one_block_all_codes() {
     let out = dequant_fp4_block16(&buf, 16).expect("fp4 block16");
     assert_eq!(out.len(), 16);
 
-    let scale = global_scale * fp8_e4m3_to_f32(0b0_1000_000); // = 1.0 * 2.0 = 2.0
+    let scale = global_scale * fp8_e4m3_to_f32(0b01000000); // = 1.0 * 2.0 = 2.0
     for i in 0..16 {
         let nibble = [
             0xF, 0x0, 0xE, 0x1, 0xD, 0x2, 0xC, 0x3, 0xB, 0x4, 0xA, 0x5, 0x9, 0x6, 0x8, 0x7,
@@ -197,28 +193,26 @@ fn fp4_block16_golden_two_blocks_partial_last_block() {
     buf.extend_from_slice(&global_scale.to_le_bytes());
 
     // Block 0: block_scale = 1.0, 16 values (8 bytes)
-    buf.push(0b0_0111_000); // block_scale E4M3 = 1.0
-    for _ in 0..8 {
-        buf.push(0x00);
-    } // all nibbles = 0 (FP4[0] = -1.0)
+    buf.push(0b00111000); // block_scale E4M3 = 1.0
+    buf.extend(std::iter::repeat_n(0x00u8, 8)); // all nibbles = 0 (FP4[0] = -1.0)
     // Block 1: block_scale = 1.0, 8 values only (partial, 4 bytes = 8 nibbles)
-    buf.push(0b0_0111_000);
+    buf.push(0b00111000);
     buf.push(0xF0); // hi=0xF, lo=0x0 → out[16]=(-1.0), out[17]=(0.0 after scale...)
 
     let out = dequant_fp4_block16(&buf, 24).expect("fp4 block16 partial");
     assert_eq!(out.len(), 24);
 
     // Block 0: scale = 3.0 * 1.0 = 3.0, all codes = 0 → -1.0 * 3.0 = -3.0
-    for i in 0..16 {
-        close(out[i], -3.0, &format!("fp4b16 block0[{i}]"));
+    for (i, &v) in out[..16].iter().enumerate() {
+        close(v, -3.0, &format!("fp4b16 block0[{i}]"));
     }
     // Block 1: scale = 3.0 * 1.0 = 3.0, first nibble = 0xF → 0.875 * 3.0 = 2.625
     close(out[16], 0.875 * 3.0, "fp4b16 block1[16]");
     // second nibble = 0x0 → -1.0 * 3.0 = -3.0
     close(out[17], -3.0, "fp4b16 block1[17]");
     // remaining should be pad
-    for i in 18..24 {
-        close(out[i], 0.0, &format!("fp4b16 block1 pad[{i}]"));
+    for (i, &v) in out[18..24].iter().enumerate() {
+        close(v, 0.0, &format!("fp4b16 block1 pad[{}]", i + 18));
     }
 }
 
@@ -263,7 +257,7 @@ fn mxfp4_gguf_golden_split_nibble_order() {
     let out = grim_quant::dequant_mxfp4(&framed, 64).expect("mxfp4 gguf dequant");
     assert_eq!(out.len(), 64);
 
-    for i in 0..64 {
+    for (i, &got) in out.iter().enumerate() {
         let (block, e, code) = if i < 32 {
             let j = i % 16;
             let code = if i < 16 {
@@ -283,7 +277,7 @@ fn mxfp4_gguf_golden_split_nibble_order() {
         };
         let want = grim_quant::mxfp4_e2m1_to_f32(code, e);
         close(
-            out[i],
+            got,
             want,
             &format!("mxfp4 gguf block{block}[{i}] code={code:#x}"),
         );

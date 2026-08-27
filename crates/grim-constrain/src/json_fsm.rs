@@ -250,10 +250,8 @@ impl JsonState {
                         };
                     }
                     true
-                } else if c.is_control() {
-                    false
                 } else {
-                    true
+                    !c.is_control()
                 }
             }
 
@@ -335,10 +333,7 @@ impl JsonState {
                 }
             }
 
-            Mode::Done => match c {
-                ' ' | '\t' | '\n' | '\r' => true,
-                _ => false,
-            },
+            Mode::Done => matches!(c, ' ' | '\t' | '\n' | '\r'),
         }
     }
 
@@ -421,16 +416,9 @@ pub fn apply_mask(logits: &mut [f32], mask: &[bool]) {
     }
 }
 
+#[derive(Default)]
 pub struct TokenMaskCache {
     inner: HashMap<JsonState, Arc<[bool]>>,
-}
-
-impl Default for TokenMaskCache {
-    fn default() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
-    }
 }
 
 impl TokenMaskCache {
@@ -450,6 +438,10 @@ impl TokenMaskCache {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
@@ -495,7 +487,7 @@ mod tests {
         assert!(s.advance('{'));
         assert!(matches!(s.mode, Mode::ExpectKey));
         assert!(s.advance('"'));
-        assert_eq!(s.is_key, true);
+        assert!(s.is_key);
         assert!(matches!(s.mode, Mode::StringKey));
         assert!(s.advance('a'));
         assert!(s.advance('"'));
@@ -532,9 +524,9 @@ mod tests {
         let mut s = state();
         assert!(s.advance('"'));
         assert!(s.advance('\\'));
-        assert_eq!(s.escaped, true);
+        assert!(s.escaped);
         assert!(s.advance('"'));
-        assert_eq!(s.escaped, false);
+        assert!(!s.escaped);
         assert!(matches!(s.mode, Mode::StringValue));
         assert!(s.advance('"'));
         assert!(matches!(s.mode, Mode::Done));
@@ -553,7 +545,7 @@ mod tests {
         assert!(s.advance('{'));
         assert_eq!(s.stack_depth(), 1);
         assert!(s.advance('"'));
-        assert_eq!(s.is_key, true);
+        assert!(s.is_key);
         assert!(s.advance('a'));
         assert!(s.advance('"'));
         assert!(matches!(s.mode, Mode::ExpectColon));

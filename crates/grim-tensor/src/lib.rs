@@ -24,10 +24,10 @@ pub use dtype::{
     ArithType, BlockDtype, DType, Device, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
     KQuantScheme, QuantFormat, QuantProvenance, Storage,
 };
+pub use error::{Error, Result};
 /// Re-export the `.gcct` compressed-tensor type tags so `Storage`'s compressed
 /// variants expose a single, backend-agnostic enum.
 pub use grim_compressed_tensors::CompressedTensorType;
-pub use error::{Error, Result};
 pub use provider::{RawTensor, TensorMeta, TensorProvider};
 pub use shape::Shape;
 pub use softmax_merge::{SoftmaxPartial, merge_all, merge_partials};

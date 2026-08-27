@@ -347,7 +347,11 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
         || arch_lower.starts_with("gfx103")
         || arch_lower.contains("1036")
     {
-        let arch = if gcn_arch.is_empty() || gcn_arch.starts_with("gfx12") { "gfx1036" } else { gcn_arch };
+        let arch = if gcn_arch.is_empty() || gcn_arch.starts_with("gfx12") {
+            "gfx1036"
+        } else {
+            gcn_arch
+        };
         format!("{arch} (RDNA2)")
     } else if arch_lower.starts_with("gfx94") || name_lower.contains("mi300") {
         format!("{gcn_arch} (CDNA3)")
@@ -410,9 +414,7 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
         || arch_lower.contains("1036")
     {
         "RDNA 2"
-    } else if arch_lower.contains("gfx13")
-        || name_lower.contains("rdna5")
-    {
+    } else if arch_lower.contains("gfx13") || name_lower.contains("rdna5") {
         "RDNA 5"
     } else if arch_lower.contains("gfx12")
         || name_lower.contains("rdna4")
@@ -542,12 +544,6 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
                 dev.ordinal = ordinal;
                 dev.name = friendly;
                 dev.gcn_arch = full_arch;
-                let sysfs_total = query_amd_vram_total(ordinal);
-                if sysfs_total > 0 {
-                    dev.vram_bytes = sysfs_total;
-                }
-                dev.vram_used_bytes = query_amd_vram_used(ordinal);
-                dev.gpu_busy_percent = query_amd_gpu_busy(ordinal);
                 dev.wmma_supported = is_w32 || is_cdna;
                 dev.mfma_supported = is_w64 || is_cdna;
                 dev.xnack_enabled = is_cdna;
@@ -635,12 +631,6 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
         dev.ordinal = ordinal;
         dev.name = friendly;
         dev.gcn_arch = full_arch;
-        let sysfs_total = query_amd_vram_total(ordinal);
-        if sysfs_total > 0 {
-            dev.vram_bytes = sysfs_total;
-        }
-        dev.vram_used_bytes = query_amd_vram_used(ordinal);
-        dev.gpu_busy_percent = query_amd_gpu_busy(ordinal);
         dev.wmma_supported = is_w32 || is_cdna;
         dev.mfma_supported = is_w64 || is_cdna;
         dev.xnack_enabled = is_cdna;
@@ -650,11 +640,27 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
     devices
 }
 
+/// Overlay live sysfs telemetry (exact VRAM size/usage, busy %) onto
+/// rocminfo-parsed devices. Kept out of [`parse_rocminfo_text`] so the
+/// parser stays a pure function of its input (unit-testable on fixtures).
+fn enrich_with_live_sysfs(devices: &mut [RocmDeviceInfo]) {
+    for dev in devices.iter_mut() {
+        let sysfs_total = query_amd_vram_total(dev.ordinal);
+        if sysfs_total > 0 {
+            dev.vram_bytes = sysfs_total;
+        }
+        dev.vram_used_bytes = query_amd_vram_used(dev.ordinal);
+        dev.gpu_busy_percent = query_amd_gpu_busy(dev.ordinal);
+    }
+}
+
 pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
     if let Ok(output) = Command::new("rocminfo").output() {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
-            return parse_rocminfo_text(&text);
+            let mut devices = parse_rocminfo_text(&text);
+            enrich_with_live_sysfs(&mut devices);
+            return devices;
         }
     }
     warn!("rocminfo not found or failed; ROCm device probe returned empty");
@@ -712,8 +718,12 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
     if let Ok(output) = Command::new("lspci").arg("-nn").output() {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
-            let has_nvidia = devices.iter().any(|d| d.vendor == "NVIDIA" || d.backend == "CUDA");
-            let has_amd = devices.iter().any(|d| d.vendor == "AMD" && d.is_rocm_compliant);
+            let has_nvidia = devices
+                .iter()
+                .any(|d| d.vendor == "NVIDIA" || d.backend == "CUDA");
+            let has_amd = devices
+                .iter()
+                .any(|d| d.vendor == "AMD" && d.is_rocm_compliant);
 
             for line in text.lines() {
                 if line.contains("VGA compatible controller")

@@ -47,26 +47,14 @@ pub const NCCL_BFLOAT16: NcclDataType = 9;
 pub type NcclRedOp = i32;
 pub const NCCL_SUM: NcclRedOp = 0;
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct CollectiveConfig {
     pub enabled: bool,
 }
 
-impl Default for CollectiveConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct CommComputeOverlapConfig {
     pub enabled: bool,
-}
-
-impl Default for CommComputeOverlapConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[cfg(feature = "rccl")]

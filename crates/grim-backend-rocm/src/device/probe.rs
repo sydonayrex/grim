@@ -138,8 +138,8 @@ pub fn probe_system_rocm() -> Result<SystemRocmInfo> {
         Some("/usr/local/rocm".to_string()),
     ];
 
-    for path_opt in &paths_to_check {
-        if let Some(path_str) = path_opt {
+    for path_str in paths_to_check.iter().flatten() {
+        {
             let path = PathBuf::from(path_str);
             if path.exists() {
                 // Try reading .info/version file

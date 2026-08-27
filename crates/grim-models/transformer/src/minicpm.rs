@@ -1,5 +1,7 @@
 //! Dedicated MiniCPM model implementation — supports scale_emb, scale_depth, and custom RoPE theta.
 
+/// Decode outputs: `(hidden_after_blocks, logits, per-layer (key, value) KV pairs)`.
+type DecodeOutputs = (Tensor, Tensor, Vec<(Tensor, Tensor)>);
 use std::sync::Arc;
 
 use grim_core::error::Result;
@@ -234,12 +236,7 @@ impl MiniCpmBlock {
                         (sess.block_table(), sess.paged_kv_handles(layer))
                     {
                         self.paged_self_attention(
-                            &q_rot,
-                            bt,
-                            &k_pages,
-                            &v_pages,
-                            page_size,
-                            positions,
+                            &q_rot, bt, &k_pages, &v_pages, page_size, positions,
                         )
                         .ok()
                     } else {
@@ -262,10 +259,7 @@ impl MiniCpmBlock {
 
         let attn_out_2d = if attn_out.shape().dims().len() == 3 {
             let dims = attn_out.shape().dims();
-            crate::block::reshaped_view(
-                &attn_out,
-                &Shape::new(vec![dims[0] * dims[1], dims[2]]),
-            )?
+            crate::block::reshaped_view(&attn_out, &Shape::new(vec![dims[0] * dims[1], dims[2]]))?
         } else {
             attn_out
         };
@@ -446,7 +440,7 @@ impl MiniCpmBlock {
                     let q_vec = &q_data[q_offset..q_offset + head_dim];
 
                     let mut scores = vec![0.0f32; s];
-                    for j in 0..=i {
+                    for (j, score) in scores.iter_mut().enumerate().take(i + 1) {
                         let k_offset =
                             (bi * s + j) * num_kv_heads * head_dim + k_head_idx * head_dim;
                         let k_vec = &k_data[k_offset..k_offset + head_dim];
@@ -454,7 +448,7 @@ impl MiniCpmBlock {
                         for d in 0..head_dim {
                             dot += q_vec[d] * k_vec[d];
                         }
-                        scores[j] = dot * scale;
+                        *score = dot * scale;
                     }
 
                     let max_score = scores[0..=i]
@@ -462,15 +456,15 @@ impl MiniCpmBlock {
                         .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                     let mut sum_exp = 0.0f32;
                     let mut exp_scores = vec![0.0f32; i + 1];
-                    for j in 0..=i {
+                    for (j, e) in exp_scores.iter_mut().enumerate().take(i + 1) {
                         let exp_v = (scores[j] - max_score).exp();
-                        exp_scores[j] = exp_v;
+                        *e = exp_v;
                         sum_exp += exp_v;
                     }
 
                     let out_offset = (bi * s + i) * num_heads * head_dim + hi * head_dim;
-                    for j in 0..=i {
-                        let weight = exp_scores[j] / sum_exp;
+                    for (j, &e) in exp_scores.iter().enumerate().take(i + 1) {
+                        let weight = e / sum_exp;
                         let v_offset =
                             (bi * s + j) * num_kv_heads * head_dim + k_head_idx * head_dim;
                         let v_vec = &v_data[v_offset..v_offset + head_dim];
@@ -536,23 +530,17 @@ impl MiniCpmBlock {
         let k_flat = k_pages.to_vec_f32()?;
         let v_flat = v_pages.to_vec_f32()?;
         let k_hist = crate::shared_attention::gather_paged_history(
-            &k_flat,
-            &bt,
-            page_size,
-            kv_stride,
-            kv_seq_len,
+            &k_flat, &bt, page_size, kv_stride, kv_seq_len,
         )?;
         let v_hist = crate::shared_attention::gather_paged_history(
-            &v_flat,
-            &bt,
-            page_size,
-            kv_stride,
-            kv_seq_len,
+            &v_flat, &bt, page_size, kv_stride, kv_seq_len,
         )?;
 
         let q_data = q.to_vec_f32()?;
         let row_elems = num_heads * head_dim;
-        let kv_head: Vec<usize> = (0..num_heads).map(|h| h * num_kv_heads / num_heads).collect();
+        let kv_head: Vec<usize> = (0..num_heads)
+            .map(|h| h * num_kv_heads / num_heads)
+            .collect();
         let mut out_total = Vec::with_capacity(b * s * row_elems);
         for bi in 0..b {
             let q_slice = &q_data[bi * s * row_elems..(bi + 1) * s * row_elems];
@@ -573,11 +561,7 @@ impl MiniCpmBlock {
         }
 
         let dev = pick_device_for_storage_device(&self.dev);
-        let storage = dev.from_cpu(
-            &out_total,
-            &Shape::new(vec![b, s, row_elems]),
-            DType::F32,
-        )?;
+        let storage = dev.from_cpu(&out_total, &Shape::new(vec![b, s, row_elems]), DType::F32)?;
         Ok(Tensor::new(
             Arc::from(storage),
             Shape::new(vec![b, s, row_elems]),
@@ -637,7 +621,7 @@ impl MiniCpmModel {
         session: &mut dyn SessionT,
         _caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
         _layer: usize,
-    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+    ) -> Result<DecodeOutputs> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
@@ -823,9 +807,9 @@ mod audit_tests {
     use super::*;
     use grim_core::session::{Inner, SessionT};
     use grim_nn::WeightSource;
+    use grim_tensor::Shape;
     use grim_tensor::dtype::{Device as TDevice, QuantProvenance};
     use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
-    use grim_tensor::Shape;
 
     /// In-memory provider so MiniCpmModel::load can run without a GGUF
     /// (mirrors moe_block's FullProvider pattern).
@@ -859,34 +843,89 @@ mod audit_tests {
         let (heads, kv_heads, head_dim) = (2usize, 1usize, 8usize);
         let mut t = std::collections::HashMap::new();
         let mut put = |name: String, shape: Vec<usize>, data: Vec<f32>| {
-            t.insert(name, RawTensor { bytes: f32_bytes(&data), shape, dtype: DType::F32, provenance: QuantProvenance::GrimNative });
+            t.insert(
+                name,
+                RawTensor {
+                    bytes: f32_bytes(&data),
+                    shape,
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+            );
         };
-        let rnd: Vec<f32> = (0..vocab * hidden).map(|i| ((i % 37) as f32 * 0.02) - 0.35).collect();
+        let rnd: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i % 37) as f32 * 0.02) - 0.35)
+            .collect();
         put("tok_embeddings.weight".into(), vec![vocab, hidden], rnd);
         let layer_names = [
-            ("attn_norm.weight".to_string(), vec![hidden], vec![1.0f32; hidden]),
-            ("ffn_norm.weight".to_string(), vec![hidden], vec![1.0f32; hidden]),
-            ("attn.wq.weight".to_string(), vec![heads * head_dim, hidden],
-                (0..heads * head_dim * hidden).map(|i| ((i % 11) as f32 * 0.01) - 0.05).collect()),
-            ("attn.wk.weight".to_string(), vec![kv_heads * head_dim, hidden],
-                (0..kv_heads * head_dim * hidden).map(|i| ((i % 7) as f32 * 0.01) - 0.03).collect()),
-            ("attn.wv.weight".to_string(), vec![kv_heads * head_dim, hidden],
-                (0..kv_heads * head_dim * hidden).map(|i| ((i % 13) as f32 * 0.01) - 0.06).collect()),
-            ("attn.wo.weight".to_string(), vec![hidden, heads * head_dim],
-                (0..hidden * heads * head_dim).map(|i| ((i % 17) as f32 * 0.01) - 0.08).collect()),
-            ("ffn.w_gate.weight".to_string(), vec![inter, hidden],
-                (0..inter * hidden).map(|i| ((i % 5) as f32 * 0.01) - 0.02).collect()),
-            ("ffn.w_up.weight".to_string(), vec![inter, hidden],
-                (0..inter * hidden).map(|i| ((i % 9) as f32 * 0.01) - 0.04).collect()),
-            ("ffn.w_down.weight".to_string(), vec![hidden, inter],
-                (0..hidden * inter).map(|i| ((i % 15) as f32 * 0.01) - 0.07).collect()),
+            (
+                "attn_norm.weight".to_string(),
+                vec![hidden],
+                vec![1.0f32; hidden],
+            ),
+            (
+                "ffn_norm.weight".to_string(),
+                vec![hidden],
+                vec![1.0f32; hidden],
+            ),
+            (
+                "attn.wq.weight".to_string(),
+                vec![heads * head_dim, hidden],
+                (0..heads * head_dim * hidden)
+                    .map(|i| ((i % 11) as f32 * 0.01) - 0.05)
+                    .collect(),
+            ),
+            (
+                "attn.wk.weight".to_string(),
+                vec![kv_heads * head_dim, hidden],
+                (0..kv_heads * head_dim * hidden)
+                    .map(|i| ((i % 7) as f32 * 0.01) - 0.03)
+                    .collect(),
+            ),
+            (
+                "attn.wv.weight".to_string(),
+                vec![kv_heads * head_dim, hidden],
+                (0..kv_heads * head_dim * hidden)
+                    .map(|i| ((i % 13) as f32 * 0.01) - 0.06)
+                    .collect(),
+            ),
+            (
+                "attn.wo.weight".to_string(),
+                vec![hidden, heads * head_dim],
+                (0..hidden * heads * head_dim)
+                    .map(|i| ((i % 17) as f32 * 0.01) - 0.08)
+                    .collect(),
+            ),
+            (
+                "ffn.w_gate.weight".to_string(),
+                vec![inter, hidden],
+                (0..inter * hidden)
+                    .map(|i| ((i % 5) as f32 * 0.01) - 0.02)
+                    .collect(),
+            ),
+            (
+                "ffn.w_up.weight".to_string(),
+                vec![inter, hidden],
+                (0..inter * hidden)
+                    .map(|i| ((i % 9) as f32 * 0.01) - 0.04)
+                    .collect(),
+            ),
+            (
+                "ffn.w_down.weight".to_string(),
+                vec![hidden, inter],
+                (0..hidden * inter)
+                    .map(|i| ((i % 15) as f32 * 0.01) - 0.07)
+                    .collect(),
+            ),
         ];
         for (name, shape, data) in layer_names {
             put(format!("layers.0.{name}"), shape, data);
         }
         // norm.weight is legitimately ALL ONES (audit: must not be rejected).
         put("norm.weight".into(), vec![hidden], vec![1.0f32; hidden]);
-        let out_w: Vec<f32> = (0..vocab * hidden).map(|i| ((i % 23) as f32 * 0.01) - 0.1).collect();
+        let out_w: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i % 23) as f32 * 0.01) - 0.1)
+            .collect();
         put("output.weight".into(), vec![vocab, hidden], out_w);
 
         let provider = FullProvider { tensors: t };
@@ -922,8 +961,14 @@ mod audit_tests {
         let model = tiny_model();
         let mut sess = Inner::new(model.device.clone());
         let adapters: [grim_core::model::AdapterHandle; 0] = [];
-        grim_core::CausalLm::forward(&model, &mut sess, &cpu_ids(&[3, 9]), &cpu_ids(&[0, 1]), &adapters)
-            .expect("forward");
+        grim_core::CausalLm::forward(
+            &model,
+            &mut sess,
+            &cpu_ids(&[3, 9]),
+            &cpu_ids(&[0, 1]),
+            &adapters,
+        )
+        .expect("forward");
         assert_eq!(sess.current_pos(), 2, "session pos must advance by seq_len");
     }
 
@@ -961,21 +1006,31 @@ mod audit_tests {
 
         // Classic path (per-layer cache in model_state).
         let mut classic = Inner::new(model.device.clone());
-        let logits_classic =
-            grim_core::CausalLm::forward(&model, &mut classic, &cpu_ids(&ids), &cpu_ids(&pos), &adapters)
-                .expect("classic forward");
+        let logits_classic = grim_core::CausalLm::forward(
+            &model,
+            &mut classic,
+            &cpu_ids(&ids),
+            &cpu_ids(&pos),
+            &adapters,
+        )
+        .expect("classic forward");
 
         // Paged path (PagedKvCache-backed session).
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(
-            grim_memory::KvBlockPool::new(64, 1, 8),
-        ));
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
+            64, 1, 8,
+        )));
         let mut kv = grim_memory::PagedKvCache::new(pool, 1, 8, grim_memory::BLOCK_SIZE);
         let backend = grim_nn::pick_device_for_storage_device(&model.device);
         kv.set_device(model.device.clone(), backend);
         let mut paged = Inner::with_kv(model.device.clone(), Box::new(kv));
-        let logits_paged =
-            grim_core::CausalLm::forward(&model, &mut paged, &cpu_ids(&ids), &cpu_ids(&pos), &adapters)
-                .expect("paged forward");
+        let logits_paged = grim_core::CausalLm::forward(
+            &model,
+            &mut paged,
+            &cpu_ids(&ids),
+            &cpu_ids(&pos),
+            &adapters,
+        )
+        .expect("paged forward");
 
         let a = logits_classic.to_vec_f32().unwrap();
         let b = logits_paged.to_vec_f32().unwrap();

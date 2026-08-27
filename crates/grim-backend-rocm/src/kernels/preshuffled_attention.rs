@@ -3,6 +3,7 @@
 //! Organizes KV cache into vector-tiled 128-bit memory segments (float4 stride):
 //! - K_cache: [num_blocks, num_heads, head_dim / 4, block_size, 4]
 //! - V_cache: [num_blocks, num_heads, block_size / 4, head_dim, 4]
+//!
 //! Enabling zero-conversion, maximum-bandwidth vector loads across AMD CDNA & RDNA.
 
 pub const KERNEL_SOURCE: &str = r#"

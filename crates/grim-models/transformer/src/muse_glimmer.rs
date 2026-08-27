@@ -12,6 +12,8 @@
 //! feeding a `GlimmerProjector` (Linear `vision_hidden → text_hidden`) whose
 //! token embeddings may be merged into the text sequence.
 
+/// Decode outputs: `(hidden_after_blocks, logits, per-layer (key, value) KV pairs)`.
+type DecodeOutputs = (Tensor, Tensor, Vec<(Tensor, Tensor)>);
 use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
@@ -171,10 +173,8 @@ impl MuseGlimmerConfig {
         // to a minimum of 1 so the value is always a valid, non-zero stride.
         let head_dim = if raw_head_dim > 0 {
             raw_head_dim
-        } else if num_heads > 0 {
-            hidden_size / num_heads
         } else {
-            64
+            hidden_size.checked_div(num_heads).unwrap_or(64)
         };
         let head_dim = head_dim.max(1);
 
@@ -789,11 +789,7 @@ impl MuseGlimmer {
             .forward(&[token], 1, self.cfg.hidden_size)?)
     }
 
-    pub fn decode(
-        &self,
-        hidden: &Tensor,
-        positions: &[u32],
-    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+    pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<DecodeOutputs> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
@@ -1085,7 +1081,7 @@ mod tests {
     fn decode_kv_cache_grows() {
         let cfg = tiny_cfg();
         let model = MuseGlimmer::random(Device::Cpu, cfg);
-        let hidden = grim_backend_cpu::cpu_tensor(vec![0.1f32; 1 * 32], Shape::new(vec![1, 32]));
+        let hidden = grim_backend_cpu::cpu_tensor(vec![0.1f32; 32], Shape::new(vec![1, 32]));
         let (logits, _, kv) = model.decode(&hidden, &[0]).unwrap();
         assert_eq!(logits.shape().dims(), &[1, 64]);
         assert_eq!(kv.len(), 2);

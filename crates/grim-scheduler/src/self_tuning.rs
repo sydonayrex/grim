@@ -438,7 +438,7 @@ mod tests {
             controller.record_ttft(300.0);
         }
         let cp = controller.tune_one(KnobKind::ChunkedPrefillSize);
-        assert!(cp >= 64.0 && cp <= 4096.0);
+        assert!((64.0..=4096.0).contains(&cp));
     }
 
     #[test]

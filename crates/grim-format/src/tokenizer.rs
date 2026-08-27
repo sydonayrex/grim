@@ -123,7 +123,7 @@ impl GgufTokenizer {
         }
 
         // Trim trailing empty entries
-        while id_to_token.last().map_or(false, |s| s.is_empty()) {
+        while id_to_token.last().is_some_and(|s| s.is_empty()) {
             id_to_token.pop();
         }
 
@@ -933,7 +933,6 @@ pub fn sanitize_jinja_template(template: &str) -> String {
             let name = inner
                 .trim()
                 .trim_start_matches('-')
-                .trim()
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
@@ -1028,9 +1027,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
 
     // In Jinja, `+` fails on string + undefined. `~` is Jinja's string concatenation
     // operator which automatically coerces undefined variables to empty strings.
-    let result = result.replace(" + ", " ~ ");
 
-    result
+    result.replace(" + ", " ~ ")
 }
 
 /// Renders an OpenAI-style `messages` array through a model's Jinja chat
@@ -1592,7 +1590,7 @@ mod wi_e3_tests {
         );
     }
 
-    fn split_lines_for_test<'a>(text: &'a str, target: usize) -> Vec<&'a str> {
+    fn split_lines_for_test(text: &str, target: usize) -> Vec<&str> {
         let mut out = Vec::new();
         let mut start = 0;
         for (end, _) in text

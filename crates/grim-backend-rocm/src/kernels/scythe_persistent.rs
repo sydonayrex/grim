@@ -724,7 +724,6 @@ mod tests {
         /// Bit-pattern D2H for the u32 control scalars (to_cpu_vec_f32
         /// memcpys integer storage verbatim into f32 lanes).
         fn read_u32_bits(s: &dyn grim_tensor::backend::BackendStorage) -> u32 {
-            use grim_tensor::backend::BackendStorage;
             s.to_cpu_vec_f32().unwrap()[0].to_bits()
         }
 

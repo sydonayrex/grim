@@ -331,7 +331,7 @@ pub fn cmd_oxidizer_convert(
     grim_meta.magic = Some("grim-v1".into());
     grim_meta.quant_version = Some(OXIDIZER_VERSION);
     grim_meta.rocml_profile = rocml_profile
-        .map(GrimRocmlProfile::from_str)
+        .map(GrimRocmlProfile::parse)
         .unwrap_or(grim_meta.rocml_profile);
     grim_meta.wavefront_size = grim_meta.rocml_profile.wavefront_size();
     grim_meta.lds_size = Some(grim_meta.rocml_profile.lds_size());
@@ -445,13 +445,13 @@ pub fn cmd_oxidizer_prepare(
     grim.magic = Some("grim-v1".into());
     grim.quant_version = Some(OXIDIZER_VERSION);
     if let Some(profile) = profile {
-        grim.rocml_profile = GrimRocmlProfile::from_str(profile);
+        grim.rocml_profile = GrimRocmlProfile::parse(profile);
         grim.wavefront_size = grim.rocml_profile.wavefront_size();
         grim.lds_size = Some(grim.rocml_profile.lds_size());
     }
     grim.calibration_dataset = dataset;
     if train {
-        grim.train_quant_mode = GrimTrainQuantMode::from_str(format);
+        grim.train_quant_mode = GrimTrainQuantMode::parse(format);
         grim.train_fusion_ops = inferred_fusion_ops(&names);
         grim.quant_method
             .get_or_insert_with(|| "train-prepare".into());
@@ -469,7 +469,7 @@ pub fn cmd_oxidizer_fuse(
     grim.magic = Some("grim-v1".into());
     grim.quant_version = Some(OXIDIZER_VERSION);
     if let Some(profile) = profile {
-        grim.rocml_profile = GrimRocmlProfile::from_str(profile);
+        grim.rocml_profile = GrimRocmlProfile::parse(profile);
     }
     grim.wavefront_size = grim.rocml_profile.wavefront_size();
     grim.lds_size = Some(grim.rocml_profile.lds_size());
@@ -1085,7 +1085,7 @@ mod tests {
 
         let mut rewritten_tensors = HashMap::new();
         let rewritten = rewrite_tensor_data(
-            &vec![1.0f32; 32],
+            &[1.0f32; 32],
             &TensorRewritePlan {
                 target: QuantFormat::Q8_0,
                 shape: vec![32, 1],

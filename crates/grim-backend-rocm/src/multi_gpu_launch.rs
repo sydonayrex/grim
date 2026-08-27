@@ -73,8 +73,8 @@ pub fn launch_multi_gpu_kernel(
 
         let (_hsaco, _lowered) = device.jit_compile_or_cache(&source, entry, Some(spec))?;
 
-        let grid_m = (shard_m + tiles.grid_stride_m - 1) / tiles.grid_stride_m;
-        let grid_n = (full_dims.n + tiles.grid_stride_n - 1) / tiles.grid_stride_n;
+        let grid_m = shard_m.div_ceil(tiles.grid_stride_m);
+        let grid_n = full_dims.n.div_ceil(tiles.grid_stride_n);
 
         let mut args = out_ptrs[i..i + 1].to_vec();
         let grid = crate::HipDim3::new(grid_m, grid_n, 1);

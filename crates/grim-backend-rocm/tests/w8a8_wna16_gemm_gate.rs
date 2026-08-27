@@ -35,9 +35,7 @@ fn run_quantized_matmul(
     let b_shape = Shape::new(vec![n, k]);
     let out_shape = Shape::new(vec![m, n]);
     let a_gpu = dev.from_cpu(a, &a_shape, DType::F32).unwrap();
-    let blob_gpu = dev
-        .from_cpu_bytes(blob, &b_shape, blob_dtype)
-        .unwrap();
+    let blob_gpu = dev.from_cpu_bytes(blob, &b_shape, blob_dtype).unwrap();
     let (out, handle) = dev
         .quantized_matmul(
             a_gpu.as_ref(),
@@ -84,7 +82,9 @@ fn w8a8_int8_gemm_matches_golden_reference() {
         return;
     }
     let dims = (2usize, 6usize, 8usize); // m, n, k
-    let a: Vec<f32> = (0..dims.0 * dims.2).map(|i| ((i % 9) as f32 * 0.3) - 1.2).collect();
+    let a: Vec<f32> = (0..dims.0 * dims.2)
+        .map(|i| ((i % 9) as f32 * 0.3) - 1.2)
+        .collect();
 
     // int8 codes [n, k] row-major, per-output-channel f32 scales; weights
     // exactly representable → golden reference is exact.
@@ -157,7 +157,9 @@ fn w8a8_fp8_gemm_matches_golden_reference() {
         return;
     }
     let dims = (2usize, 6usize, 8usize);
-    let a: Vec<f32> = (0..dims.0 * dims.2).map(|i| ((i % 7) as f32 * 0.4) - 1.0).collect();
+    let a: Vec<f32> = (0..dims.0 * dims.2)
+        .map(|i| ((i % 7) as f32 * 0.4) - 1.0)
+        .collect();
 
     // Finite E4M3 codes (exclude 0x7F/0xFF NaN and infinities) + per-tensor
     // f32 scale; golden weights exact by construction.
@@ -240,7 +242,9 @@ fn wna16_fused_gemm_matches_golden_reference() {
     }
     let dims = (2usize, 4usize, 8usize); // m, n, k — 32 weights total, 1 block if 256-blocks... need blocks covering n*k=32 → ceil(32/256)=1
     let n_bit = 4u8;
-    let a: Vec<f32> = (0..dims.0 * dims.2).map(|i| ((i % 5) as f32 * 0.5) - 1.0).collect();
+    let a: Vec<f32> = (0..dims.0 * dims.2)
+        .map(|i| ((i % 5) as f32 * 0.5) - 1.0)
+        .collect();
 
     let total = dims.1 * dims.2; // 32
     let blocks = total.div_ceil(256); // 1

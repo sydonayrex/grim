@@ -48,7 +48,8 @@ fn build_awq_blob(k: usize, n: usize, bits: u8, group_size: usize) -> (Vec<u8>, 
             let code = (rnd() % (mask as u64)) as u32;
             let w = (ki / vpw) * n + ni;
             qweight[w] |= code << ((ki % vpw) * bits_us);
-            let zero = ((qzeros[g * n.div_ceil(vpw) + ni / vpw] >> ((ni % vpw) * bits_us)) & mask) as f32;
+            let zero =
+                ((qzeros[g * n.div_ceil(vpw) + ni / vpw] >> ((ni % vpw) * bits_us)) & mask) as f32;
             let scale = half::f16::from_bits(scales_f16[g * n + ni]).to_f32();
             oracle_w[ki * n + ni] = (code as f32 - zero) * scale;
         }
@@ -128,14 +129,8 @@ fn gpu_awq_dequant_gemm_forward_backward_parity() {
 
     // 1) Forward test
     let (qw_off, qz_off, sc_off) =
-        grim_backend_rocm::device::gptq_test_shim::awq_offsets_for_test(
-            BITS,
-            GS,
-            K,
-            N,
-            blob.len(),
-        )
-        .expect("awq offsets");
+        grim_backend_rocm::device::gptq_test_shim::awq_offsets_for_test(BITS, GS, K, N, blob.len())
+            .expect("awq offsets");
 
     grim_backend_rocm::device::gptq_test_shim::launch_awq_dequant_gemm_for_test(
         &dev,
@@ -178,9 +173,7 @@ fn gpu_awq_dequant_gemm_forward_backward_parity() {
     }
 
     // 2) Backward test: dX[M, K] = dY[M, N] @ dequant(B)
-    let dy_data: Vec<f32> = (0..M * N)
-        .map(|i| ((i % 7) as f32) * 0.25 - 0.75)
-        .collect();
+    let dy_data: Vec<f32> = (0..M * N).map(|i| ((i % 7) as f32) * 0.25 - 0.75).collect();
 
     let dy_storage = grim_backend_rocm::memory::storage::RocmStorage::copy_from_host(
         &dy_data,

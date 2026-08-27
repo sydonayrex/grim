@@ -71,10 +71,10 @@ pub struct TemplateConfig {
 impl GrimToml {
     pub fn from_path(path: &str) -> Result<Self, std::io::Error> {
         let text = std::fs::read_to_string(path)?;
-        Ok(Self::from_str(&text).unwrap_or_default())
+        Ok(Self::parse(&text).unwrap_or_default())
     }
 
-    pub fn from_str(text: &str) -> Result<Self, toml::de::Error> {
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }
 }
@@ -106,7 +106,7 @@ eval_every_steps = 50
 family = "chatml"
 override_path = ""
 "#;
-        let cfg = GrimToml::from_str(toml_text).unwrap();
+        let cfg = GrimToml::parse(toml_text).unwrap();
         assert_eq!(cfg.server.default_model.as_deref(), Some("my-model.grim"));
         assert_eq!(cfg.server.max_batched_tokens, 4096);
         assert_eq!(cfg.train.dataset.len(), 2);

@@ -51,7 +51,7 @@ fn prefetch_block_weights(block: &LlamaBlock) -> Result<()> {
         tensor
             .storage()
             .prefetch_to_device()
-            .map_err(|e| Error::Tensor(e))?;
+            .map_err(Error::Tensor)?;
     }
     Ok(())
 }
@@ -421,6 +421,7 @@ impl StreamingBlockForward {
     /// Loads block weights lazily from `provider`, executes pre-norm attention and SwiGLU FFN,
     /// applies enabled LoRA adapters via `apply_and_record_lora`, and records `LoRAApply` and `Add`
     /// entries on `tape`. Returns `(output_tensor_id, output_tensor)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_block_with_autograd(
         &mut self,
         provider: &dyn TensorProvider,
@@ -685,7 +686,7 @@ impl StreamingBlockForward {
         )?;
 
         // Residual addition 1
-        let dev = grim_autograd::pick_device_for_tensor(&x);
+        let dev = grim_autograd::pick_device_for_tensor(x);
         let (res1_storage, _) =
             dev.add(x.storage().as_ref(), wo_out.storage().as_ref(), x.shape())?;
         let res1 = Tensor::new(

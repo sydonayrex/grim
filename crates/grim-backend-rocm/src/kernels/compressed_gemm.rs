@@ -14,7 +14,12 @@
 /// path.
 #[inline]
 #[allow(dead_code)]
-fn decode_msb_nbit(code_bytes: &[u8], block_offset_bytes: usize, lane_in_block: usize, n_bit: u8) -> u32 {
+fn decode_msb_nbit(
+    code_bytes: &[u8],
+    block_offset_bytes: usize,
+    lane_in_block: usize,
+    n_bit: u8,
+) -> u32 {
     let n = n_bit as usize;
     let start_bit = lane_in_block * n;
     let mut code: u32 = 0;
@@ -27,7 +32,6 @@ fn decode_msb_nbit(code_bytes: &[u8], block_offset_bytes: usize, lane_in_block: 
     }
     code
 }
-
 
 /// Simple variant used for embedding (row-major, one row at a time): same MSB-first
 /// across the row's packed bytes.
@@ -46,7 +50,6 @@ fn decode_msb_nbit_row(code_bytes: &[u8], row_byte_offset: usize, col: usize, n_
     }
     code
 }
-
 
 pub const WEIGHT_NA16_KERNEL: &str = r#"
 // Device helpers must precede first use in a single TU (audit fix: the

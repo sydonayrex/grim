@@ -112,7 +112,7 @@ impl Glm52Expert {
         let hv = h.to_vec_f32()?;
         let gelu_v: Vec<f32> = hv
             .iter()
-            .map(|&v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v.powi(3))).tanh()))
+            .map(|&v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v.powi(3))).tanh()))
             .collect();
         let gelu_t = cpu_tensor(gelu_v, h.shape().clone());
         Ok(self.dense_4h_to_h.forward(&gelu_t)?)

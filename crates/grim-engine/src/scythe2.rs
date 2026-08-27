@@ -101,7 +101,11 @@ impl PlacementCache {
     pub fn get(&self, layer_id: u32, shape_bucket: u16) -> Option<&ScythePlacement> {
         // Fast path: array index by layer_id; valid only when this layer's
         // own stored bucket matches the requested one.
-        if let Some((bucket, p)) = self.fast.get(layer_id as usize).and_then(|opt| opt.as_ref()) {
+        if let Some((bucket, p)) = self
+            .fast
+            .get(layer_id as usize)
+            .and_then(|opt| opt.as_ref())
+        {
             if *bucket == shape_bucket {
                 return Some(p);
             }
@@ -145,9 +149,7 @@ impl PlacementCache {
     /// dispatching to the gone GPU.
     pub fn bump_epoch(&mut self) {
         self.current_epoch = self.current_epoch.wrapping_add(1);
-        for slot in &mut self.fast {
-            *slot = None;
-        }
+        self.fast.fill(None);
     }
 
     /// Synchronise `current_epoch` from the global atomic without bumping.
@@ -156,9 +158,7 @@ impl PlacementCache {
         if epoch != self.current_epoch {
             self.current_epoch = epoch;
             // Clear fast path so we re-decide with the new epoch.
-            for slot in &mut self.fast {
-                *slot = None;
-            }
+            self.fast.fill(None);
         }
     }
 
@@ -167,9 +167,7 @@ impl PlacementCache {
     pub fn on_gpu_leave(&mut self) {
         // Increment epoch and clear fast path synchronously.
         self.current_epoch = self.current_epoch.wrapping_add(1);
-        for slot in &mut self.fast {
-            *slot = None;
-        }
+        self.fast.fill(None);
         self.full.clear(); // Also evict slow-path entries that reference the gone GPU.
     }
 }
@@ -317,7 +315,7 @@ impl C2plrController {
         // ── WaveTune bilinear latency eval (§3.4 Table-A) ──────────────────
         // For each GPU, estimate GEMM latency from TFLOPS and shape.
         // This is the offline structural-coefficient lookup (one division per GPU).
-        let m = shape.get(0).copied().unwrap_or(1);
+        let m = shape.first().copied().unwrap_or(1);
         let n = shape.get(1).copied().unwrap_or(1);
         let k_dim = shape.get(2).copied().unwrap_or(1);
         let flops = 2.0 * m as f64 * n as f64 * k_dim as f64;
@@ -547,7 +545,7 @@ impl C2plrController {
 /// generation window, making the fast-path cache-stable (scythe2.md §3.4).
 pub fn bucketize(shape: &[usize]) -> u16 {
     let seq = shape.get(1).copied().unwrap_or(1).max(1);
-    (seq.next_power_of_two().trailing_zeros() as u16).min(u16::MAX)
+    seq.next_power_of_two().trailing_zeros() as u16
 }
 
 // ── MLP helpers ───────────────────────────────────────────────────────────────
@@ -557,27 +555,27 @@ fn mlp_forward(w1: &[f32], w2: &[f32], x: &[f32], hidden: usize, out: usize) -> 
     let input_dim = x.len();
     // Hidden layer: h = ReLU(x @ W1)
     let mut h = vec![0.0f32; hidden];
-    for hi in 0..hidden {
+    for (hi, slot) in h.iter_mut().enumerate() {
         let mut acc = 0.0f32;
-        for xi in 0..input_dim {
+        for (xi, &xv) in x.iter().enumerate() {
             let wi = hi * input_dim + xi;
             if wi < w1.len() {
-                acc += x[xi] * w1[wi];
+                acc += xv * w1[wi];
             }
         }
-        h[hi] = acc.max(0.0); // ReLU
+        *slot = acc.max(0.0); // ReLU
     }
     // Output layer: y = h @ W2
     let mut y = vec![0.0f32; out];
-    for oi in 0..out {
+    for (oi, slot) in y.iter_mut().enumerate() {
         let mut acc = 0.0f32;
-        for hi in 0..hidden {
+        for (hi, &hv) in h.iter().enumerate() {
             let wi = oi * hidden + hi;
             if wi < w2.len() {
-                acc += h[hi] * w2[wi];
+                acc += hv * w2[wi];
             }
         }
-        y[oi] = acc;
+        *slot = acc;
     }
     y
 }
@@ -599,11 +597,11 @@ fn mlp_forward(w1: &[f32], w2: &[f32], x: &[f32], hidden: usize, out: usize) -> 
 /// - 4 = norm (RMSNorm / RoPE — replicated)
 /// - 5 = CommFuse reduce (fan-in)
 /// - 6 = MoE dispatch (WI-Charon-3): `weight_ptr` points to a
-///       device-resident [`MoETaskDescriptor`] carrying the MoE-specific
-///       geometry (hidden/inter/num_experts/top_k/quant_mode/schedule).
-///       The persistent kernel casts `weight_ptr` to `MoETaskDescriptor*`
-///       and calls the Charon forward kernel inline — no separate
-///       `hipLaunchKernel`, matching how opcodes 0–5 already work.
+///   device-resident [`MoETaskDescriptor`] carrying the MoE-specific
+///   geometry (hidden/inter/num_experts/top_k/quant_mode/schedule).
+///   The persistent kernel casts `weight_ptr` to `MoETaskDescriptor*`
+///   and calls the Charon forward kernel inline — no separate
+///   `hipLaunchKernel`, matching how opcodes 0–5 already work.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScytheTaskDescriptor {
@@ -1217,6 +1215,7 @@ impl ScytheRing {
     }
 
     /// Enqueue a GEMM operation (opcode 1=ColGEMM, 2=RowGEMM).
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_gemm(
         &self,
         opcode: u32,
@@ -1243,6 +1242,7 @@ impl ScytheRing {
     }
 
     /// Enqueue a fused QKV attention operation (opcode 3).
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_attention(
         &self,
         seq_len: u32,
@@ -1368,14 +1368,14 @@ impl ScytheRingExec {
         let head = scalar(0)?;
         let stop = scalar(0)?;
         let worker_stream = std::sync::atomic::AtomicPtr::new(
-            device.create_non_blocking_stream().map_err(|e| {
-                grim_backend_rocm::Error::Backend(format!("worker stream: {e}"))
-            })?,
+            device
+                .create_non_blocking_stream()
+                .map_err(|e| grim_backend_rocm::Error::Backend(format!("worker stream: {e}")))?,
         );
         let control_stream = std::sync::atomic::AtomicPtr::new(
-            device.create_non_blocking_stream().map_err(|e| {
-                grim_backend_rocm::Error::Backend(format!("control stream: {e}"))
-            })?,
+            device
+                .create_non_blocking_stream()
+                .map_err(|e| grim_backend_rocm::Error::Backend(format!("control stream: {e}")))?,
         );
         ring.set_upload_stream(control_stream.load(Ordering::Acquire) as u64);
         let control_cell = Mutex::new(RocmPinnedBuffer::alloc(4)?);
@@ -1421,7 +1421,9 @@ impl ScytheRingExec {
         // against outstanding device work — i.e., it deadlocks behind the
         // resident wave (the exact hang observed 2026-08-24).
         let t0 = std::time::Instant::now();
-        if diag { eprintln!("[cc-diag] enter to_dev={to_device}"); }
+        if diag {
+            eprintln!("[cc-diag] enter to_dev={to_device}");
+        }
         // Direction matters: to_device writes dev<-cell; from_device reads
         // dev->cell (the pinned cell is a legal D2H destination).
         let (dst, src) = if to_device {
@@ -1432,7 +1434,9 @@ impl ScytheRingExec {
         let rc = unsafe {
             grim_backend_rocm::hipMemcpyAsync(dst, src, 4, kind, self.control_stream_ptr())
         };
-        if diag { eprintln!("[cc-diag] async rc={rc} t={}us", t0.elapsed().as_micros()); }
+        if diag {
+            eprintln!("[cc-diag] async rc={rc} t={}us", t0.elapsed().as_micros());
+        }
         if rc == 0 {
             let rs = grim_backend_rocm::hip_stream_synchronize(self.control_stream_ptr());
             if diag {
@@ -1463,8 +1467,7 @@ impl ScytheRingExec {
             .and_then(|rs| rs.device_ptr_u64())
             .ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ring head storage has no device ptr".into())
-            })?
-            as *mut c_void;
+            })? as *mut c_void;
         let mut bytes = value.to_ne_bytes();
         self.control_copy_u32(ptr, &mut bytes, true);
         Ok(())
@@ -1482,13 +1485,17 @@ impl ScytheRingExec {
         output_ptr: u64,
     ) -> grim_backend_rocm::Result<()> {
         if self.ring.is_full() {
-            return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
+            return Err(grim_backend_rocm::Error::Backend(
+                "ScytheRingExec: ring full".into(),
+            ));
         }
         let peer = 0u64;
         self.ring
             .enqueue_gemm(1, m, n, k, input_ptr, weight_ptr, output_ptr, peer)
             .map_err(|_d| {
-                grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_gemm rejected descriptor".into())
+                grim_backend_rocm::Error::Backend(
+                    "ScytheRingExec: enqueue_gemm rejected descriptor".into(),
+                )
             })?;
         Ok(())
     }
@@ -1504,14 +1511,14 @@ impl ScytheRingExec {
     ) -> grim_backend_rocm::Result<()> {
         eprintln!("[diag] submit_norm enter");
         if self.ring.is_full() {
-            return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
+            return Err(grim_backend_rocm::Error::Backend(
+                "ScytheRingExec: ring full".into(),
+            ));
         }
         self.ring
             .enqueue_norm(num_tokens, hidden_dim, input_ptr, weight_ptr, output_ptr)
             .map_err(|_| {
-                grim_backend_rocm::Error::Backend(
-                    "ScytheRingExec: enqueue_norm rejected".into(),
-                )
+                grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_norm rejected".into())
             })
             .map(|_| ())
     }
@@ -1527,11 +1534,15 @@ impl ScytheRingExec {
         output_ptr: u64,
     ) -> grim_backend_rocm::Result<()> {
         if self.ring.is_full() {
-            return Err(grim_backend_rocm::Error::Backend("ScytheRingExec: ring full".into()));
+            return Err(grim_backend_rocm::Error::Backend(
+                "ScytheRingExec: ring full".into(),
+            ));
         }
-        self.ring.enqueue_add(rows, cols, a_ptr, b_ptr, output_ptr).map_err(|_| {
-            grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_add rejected".into())
-        })?;
+        self.ring
+            .enqueue_add(rows, cols, a_ptr, b_ptr, output_ptr)
+            .map_err(|_| {
+                grim_backend_rocm::Error::Backend("ScytheRingExec: enqueue_add rejected".into())
+            })?;
         Ok(())
     }
 
@@ -1556,7 +1567,9 @@ impl ScytheRingExec {
         self.publish_head()?;
         let handle = self.device.launch_scythe_persistent_dispatch(
             self.ring.slots_storage().ok_or_else(|| {
-                grim_backend_rocm::Error::Backend("ScytheRingExec: ring has no device storage".into())
+                grim_backend_rocm::Error::Backend(
+                    "ScytheRingExec: ring has no device storage".into(),
+                )
             })?,
             self.ring.capacity,
             self.tail.as_ref(),
@@ -1611,8 +1624,7 @@ impl ScytheRingExec {
             .and_then(|rs| rs.device_ptr_u64())
             .ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ring tail has no device ptr".into())
-            })?
-            as *mut c_void;
+            })? as *mut c_void;
         let mut buf = 0u32.to_ne_bytes();
         self.control_copy_u32(ptr, &mut buf, false);
         Ok(u32::from_ne_bytes(buf))
@@ -1624,9 +1636,7 @@ impl ScytheRingExec {
         let base = self
             .ring
             .slots_storage()
-            .ok_or_else(|| {
-                grim_backend_rocm::Error::Backend("ring has no device storage".into())
-            })?
+            .ok_or_else(|| grim_backend_rocm::Error::Backend("ring has no device storage".into()))?
             .device_ptr_u64()
             .ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ring slots have no device ptr".into())
@@ -1648,7 +1658,8 @@ impl ScytheRingExec {
         let mut pin = grim_backend_rocm::RocmPinnedBuffer::<u8>::alloc(4)
             .map_err(|e| grim_backend_rocm::Error::Backend(format!("pin: {e}")))?;
         let kind = grim_backend_rocm::HipMemcpyKind::DeviceToHost;
-        let _guard = grim_backend_rocm::device::util::DeviceGuard::set(self.device.ordinal() as i32);
+        let _guard =
+            grim_backend_rocm::device::util::DeviceGuard::set(self.device.ordinal() as i32);
         let rc = unsafe {
             grim_backend_rocm::hipMemcpyAsync(
                 pin.as_mut_ptr() as *mut c_void,
@@ -1664,9 +1675,7 @@ impl ScytheRingExec {
             )));
         }
         grim_backend_rocm::hip_stream_synchronize(self.control_stream_ptr())?;
-        out.copy_from_slice(unsafe {
-            std::slice::from_raw_parts(pin.as_ptr(), 4)
-        });
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(pin.as_ptr(), 4) });
         Ok(())
     }
 
@@ -1704,8 +1713,7 @@ impl ScytheRingExec {
             .and_then(|rs| rs.device_ptr_u64())
             .ok_or_else(|| {
                 grim_backend_rocm::Error::Backend("ring stop has no device ptr".into())
-            })?
-            as *mut c_void;
+            })? as *mut c_void;
         let mut flag = 1u32.to_ne_bytes();
         self.control_copy_u32(ptr, &mut flag, true);
         // Join the worker on its OWN non-blocking stream: the wave exits at
@@ -1791,7 +1799,7 @@ pub fn absorb_short_runs(per_layer: &[usize], min_run: usize) -> Vec<usize> {
     // Expand back to full length.
     let mut out = Vec::with_capacity(per_layer.len());
     for (rank, len) in kept {
-        out.extend(std::iter::repeat(rank).take(len));
+        out.extend(std::iter::repeat_n(rank, len));
     }
     out.resize(per_layer.len(), *out.last().unwrap_or(&0));
     out
@@ -2031,9 +2039,8 @@ mod tests {
         let shape = [1usize, 2048, 4096, 128];
 
         let mut ctrl = C2plrController::new(num_layers, 2, 150.0);
-        assert_eq!(
+        assert!(
             ctrl.theta_w1.iter().all(|&w| w == 0.0),
-            true,
             "fresh controller weights must be zero for this gate"
         );
         for layer_id in 0..num_layers as u32 {
@@ -3199,10 +3206,10 @@ mod tests {
                 let mut participating_ranks: Vec<usize> = vec![owner_rank];
 
                 for batch in &self.remote {
-                    if batch.pairs.iter().any(|p| p.expert as usize == expert) {
-                        if !participating_ranks.contains(&batch.dest_rank) {
-                            participating_ranks.push(batch.dest_rank);
-                        }
+                    if batch.pairs.iter().any(|p| p.expert as usize == expert)
+                        && !participating_ranks.contains(&batch.dest_rank)
+                    {
+                        participating_ranks.push(batch.dest_rank);
                     }
                 }
 

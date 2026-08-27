@@ -40,7 +40,7 @@ fn resolves_via_rcc_path_when_so_present() -> TestResult {
         std::env::remove_var("ROCM_PATH");
     }
 
-    let got = resolve_rocm_lib_dir(&std::path::Path::new("/nonexistent-workspace"));
+    let got = resolve_rocm_lib_dir(std::path::Path::new("/nonexistent-workspace"));
     unsafe {
         std::env::remove_var("RCCL_PATH");
     }
@@ -72,7 +72,7 @@ fn resolves_via_rocm_rcc_path_alias() -> TestResult {
         std::env::remove_var("ROCM_PATH");
     }
 
-    let got = resolve_rocm_lib_dir(&std::path::Path::new("/nonexistent-workspace"));
+    let got = resolve_rocm_lib_dir(std::path::Path::new("/nonexistent-workspace"));
     unsafe {
         std::env::remove_var("ROCM_RCCL_PATH");
     }
@@ -125,7 +125,7 @@ fn skips_dir_without_rccl_so() -> TestResult {
         std::env::remove_var("ROCM_PATH");
     }
 
-    let got = resolve_rocm_lib_dir(&std::path::Path::new("/nonexistent-workspace"));
+    let got = resolve_rocm_lib_dir(std::path::Path::new("/nonexistent-workspace"));
     unsafe {
         std::env::remove_var("RCCL_PATH");
     }

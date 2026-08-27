@@ -214,10 +214,10 @@ impl ConvNeXtBlock {
             let bias_val = dw_b.as_ref().map(|b| b[c]).unwrap_or(0.0);
             for t in 0..t_dim {
                 let mut sum = bias_val;
-                for k in 0..self.kernel_size {
+                for (k, &w) in kernel.iter().enumerate().take(self.kernel_size) {
                     let in_idx = t as isize + k as isize - pad as isize;
                     if in_idx >= 0 && (in_idx as usize) < t_dim {
-                        sum += xv[c * t_dim + in_idx as usize] * kernel[k];
+                        sum += xv[c * t_dim + in_idx as usize] * w;
                     }
                 }
                 conv_out[c * t_dim + t] = sum;
@@ -241,7 +241,7 @@ impl ConvNeXtBlock {
         let mid_v = mid.to_vec_f32()?;
         let gelu_v: Vec<f32> = mid_v
             .iter()
-            .map(|&v| 0.5 * v * (1.0 + (0.79788456 * (v + 0.044715 * v.powi(3))).tanh()))
+            .map(|&v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v.powi(3))).tanh()))
             .collect();
         let gelu_t = cpu_tensor(gelu_v, mid.shape().clone());
         let out_dense = self.pwconv2.forward(&gelu_t)?;
@@ -308,7 +308,7 @@ impl ISTFTHead {
 
             // Compute IDFT for frame t
             let mut frame = vec![0.0f32; self.n_fft];
-            for n in 0..self.n_fft {
+            for (n, f) in frame.iter_mut().enumerate().take(self.n_fft) {
                 let mut real_sum = 0.0f32;
                 for k in 0..n_freq {
                     let m = mag[k].exp();
@@ -316,7 +316,7 @@ impl ISTFTHead {
                     let angle = 2.0 * PI * (k as f32) * (n as f32) / (self.n_fft as f32) + p;
                     real_sum += m * angle.cos();
                 }
-                frame[n] = (real_sum / self.n_fft as f32) * self.window[n];
+                *f = (real_sum / self.n_fft as f32) * self.window[n];
             }
 
             // Overlap-add

@@ -227,10 +227,7 @@ fn resolve_arch_compat_spec(arch_str: &str, config_raw: Option<&str>) -> Option<
 /// Helper function to get metadata as string from GGUF provider
 fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
     let v: Option<&GgufValue> = provider.metadata(key);
-    let v: &GgufValue = match v {
-        Some(val) => val,
-        None => return None,
-    };
+    let v: &GgufValue = v?;
     if let Some(s) = v.as_str() {
         return Some(s.to_string());
     }
@@ -332,7 +329,7 @@ pub fn load_model_from_grim(path: &str, device: Device) -> Result<Box<dyn Causal
                 "[grim] .grim wavefront_size={grim_wf} incompatible with host GPU wavefront_size={host_wf} \
                  (RDNA2/Wave32 host); falling back to GGUF sibling '{gguf_path_str}'"
             );
-            return load_model_from_gguf(&gguf_path_str, device);
+            return load_model_from_gguf(gguf_path_str, device);
         }
     }
 
@@ -634,13 +631,9 @@ fn load_model_from_config(
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
     let num_heads = config.num_attention_heads.unwrap_or(32);
     let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
-    let head_dim = config.head_dim.unwrap_or_else(|| {
-        if num_heads > 0 {
-            hidden_size / num_heads
-        } else {
-            128
-        }
-    });
+    let head_dim = config
+        .head_dim
+        .unwrap_or_else(|| hidden_size.checked_div(num_heads).unwrap_or(128));
     let intermediate_size = config.intermediate_size.unwrap_or(hidden_size * 4);
     let max_seq_len = config.max_position_embeddings.unwrap_or(2048);
     let rope_theta = config.rope_theta.unwrap_or(10000.0);
@@ -928,7 +921,7 @@ fn load_model_from_config(
                     original_max_pos: 8192,
                     beta_fast: 32.0,
                     beta_slow: 1.0,
-                    attention_factor: 1.2772588722239782,
+                    attention_factor: 1.277_258_9,
                 }),
             };
             eprintln!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -2074,9 +2067,10 @@ fn load_model_with_providers(
     );
     // Extract architecture from GGUF metadata
     let arch_str = provider.architecture().ok_or_else(|| {
-        Error::Config(format!(
+        Error::Config(
             "GGUF file has no 'general.architecture' metadata; cannot determine model family"
-        ))
+                .to_string(),
+        )
     })?;
 
     let lookup = GgufMetadataLookup(provider);
@@ -2447,7 +2441,7 @@ fn load_model_with_providers(
                     original_max_pos: 8192,
                     beta_fast: 32.0,
                     beta_slow: 1.0,
-                    attention_factor: 1.2772588722239782,
+                    attention_factor: 1.277_258_9,
                 }),
             };
             eprintln!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -3674,10 +3668,10 @@ fn load_model_with_providers(
                 }
             }
 
-            return Err(Error::Config(format!(
+            Err(Error::Config(format!(
                 "Unsupported GGUF architecture '{}': no plugin compat spec and no native loader",
                 arch_str
-            )));
+            )))
         }
     }
 }
@@ -3987,25 +3981,23 @@ pub fn load_audio_model_from_path(
         .unwrap_or(path)
         .to_ascii_lowercase();
 
-    if filename.contains("whisper") || path.ends_with(".gguf") {
-        if path.ends_with(".gguf") {
-            let provider = GgufProvider::open(path)?;
-            let ws = WeightSource::root(&provider, device.clone());
-            let cfg = grim_models_audio::WhisperConfig {
-                vocab_size: 51865,
-                n_mels: 80,
-                d_model: 384,
-                num_enc_layers: 4,
-                num_dec_layers: 4,
-                num_heads: 6,
-                ffn_dim: 1536,
-                max_audio_len: 3000,
-                max_text_len: 448,
-                rms_norm_eps: 1e-5,
-            };
-            let whisper = grim_models_audio::Whisper::load(device, &ws, cfg)?;
-            return Ok(std::sync::Arc::new(whisper));
-        }
+    if (filename.contains("whisper") || path.ends_with(".gguf")) && path.ends_with(".gguf") {
+        let provider = GgufProvider::open(path)?;
+        let ws = WeightSource::root(&provider, device.clone());
+        let cfg = grim_models_audio::WhisperConfig {
+            vocab_size: 51865,
+            n_mels: 80,
+            d_model: 384,
+            num_enc_layers: 4,
+            num_dec_layers: 4,
+            num_heads: 6,
+            ffn_dim: 1536,
+            max_audio_len: 3000,
+            max_text_len: 448,
+            rms_norm_eps: 1e-5,
+        };
+        let whisper = grim_models_audio::Whisper::load(device, &ws, cfg)?;
+        return Ok(std::sync::Arc::new(whisper));
     }
 
     if filename.contains("kokoro") || path.ends_with(".pth") {

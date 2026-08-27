@@ -42,7 +42,7 @@ fn test_lora_accumulate_golden_mutation_resistant() {
         .expect("lora_accumulate");
 
     let out_data = out_st.to_cpu_vec_f32().expect("to_cpu_vec_f32");
-    let expected = vec![1.5f32, 2.5, 3.5, 4.5];
+    let expected = [1.5f32, 2.5, 3.5, 4.5];
 
     assert_eq!(out_data.len(), expected.len());
     for (i, (&act, &exp)) in out_data.iter().zip(expected.iter()).enumerate() {

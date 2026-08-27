@@ -118,18 +118,18 @@ impl DraftBackbone for TinyDraftBackbone {
             }
             let mut sum = 0.0;
             let mut probs = vec![0.0f32; vocab];
-            for v in 0..vocab {
-                probs[v] = ((logits[pos * vocab + v] - max) * scale).exp();
-                sum += probs[v];
+            for (v, slot) in probs.iter_mut().enumerate() {
+                *slot = ((logits[pos * vocab + v] - max) * scale).exp();
+                sum += *slot;
             }
-            for v in 0..vocab {
-                probs[v] /= sum;
+            for slot in &mut probs {
+                *slot /= sum;
             }
             let mut best = 0;
             let mut best_p = f32::NEG_INFINITY;
-            for v in 0..vocab {
-                if probs[v] > best_p {
-                    best_p = probs[v];
+            for (v, &p) in probs.iter().enumerate() {
+                if p > best_p {
+                    best_p = p;
                     best = v;
                 }
             }

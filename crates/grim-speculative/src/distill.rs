@@ -226,10 +226,7 @@ pub fn train_speculative_draft(
 
         // Real target probabilities P and draft probabilities Q
         let target_probs: Vec<f32> = (0..vocab_size)
-            .map(|i| {
-                let p = (i as f32 + 1.0) / (vocab_size as f32 * (vocab_size as f32 + 1.0) / 2.0);
-                p
-            })
+            .map(|i| (i as f32 + 1.0) / (vocab_size as f32 * (vocab_size as f32 + 1.0) / 2.0))
             .collect();
 
         // Draft probabilities initially uniform-ish with decay

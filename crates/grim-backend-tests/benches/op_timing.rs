@@ -11,8 +11,8 @@ fn main() {
 
     for &k in &[512usize, 2048, 4096, 8192] {
         let mut weights = vec![0.0f32; k];
-        for i in 0..k {
-            weights[i] = ((i % 100) as f32 - 50.0) * 0.02;
+        for (i, slot) in weights.iter_mut().enumerate() {
+            *slot = ((i % 100) as f32 - 50.0) * 0.02;
         }
 
         // Q8_0 dequant timing

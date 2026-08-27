@@ -470,7 +470,7 @@ impl Default for TuningMode {
 /// Tuning-mode + per-slot occupancy tuning + tuning solution storage.
 /// [salamander.md §3.6: tuning modes, block-size presets, occupancy fields,
 /// tuning solution storage]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AutotunerConfig {
     /// Which autotuning mode governs launch-config selection for this tuner.
     #[serde(default)]
@@ -485,16 +485,6 @@ pub struct AutotunerConfig {
     /// load_tuning_solution` write/read.
     #[serde(default)]
     pub tuning_solutions: Vec<TuningSolution>,
-}
-
-impl Default for AutotunerConfig {
-    fn default() -> Self {
-        Self {
-            tuning_mode: TuningMode::default(),
-            occupancy: OccupancyTuning::default(),
-            tuning_solutions: Vec::new(),
-        }
-    }
 }
 
 /// A single stored tuning solution for one `(kernel, arch)` slot.
@@ -608,6 +598,11 @@ impl Autotuner {
     /// Number of cached entries (in-memory).
     pub fn len(&self) -> usize {
         self.cache.len() + self.moe_cache.len()
+    }
+
+    /// True when no cached entries are present (in-memory).
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty() && self.moe_cache.is_empty()
     }
 
     /// Look up a recorded config. Returns `None` if absent.
@@ -755,9 +750,9 @@ impl Autotuner {
                 })
                 .collect(),
         };
-        Ok(serde_json::to_vec_pretty(&snap).map_err(|e| {
+        serde_json::to_vec_pretty(&snap).map_err(|e| {
             Error::Backend(format!("Autotuner::to_json_bytes: serde_json error: {}", e))
-        })?)
+        })
     }
 
     /// Save the JSON snapshot to a file path.
@@ -893,7 +888,7 @@ mod tests {
         assert_eq!(wp, 4, "default waves_per_cu_target");
         assert_eq!(mr, 64, "default max_registers");
         assert_eq!(vw, 8, "default vector_width");
-        assert_eq!(db, true, "default lds_double_buffer");
+        assert!(db, "default lds_double_buffer");
     }
 
     #[test]

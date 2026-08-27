@@ -232,8 +232,7 @@ pub struct Engine {
 /// How long a finished request's rank stays counted as loaded (WI-SB1
 /// load-spreading). Long enough to bridge back-to-back admissions of short
 /// requests; short enough not to skew placement when the farm genuinely idles.
-pub(crate) const SCYTHE_PIN_COOLDOWN: std::time::Duration =
-    std::time::Duration::from_millis(1000);
+pub(crate) const SCYTHE_PIN_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// External (non-farm) GPU utilization converts to equivalent pinned
 /// requests at this weight: a card maxed out by a desktop/game workload
@@ -597,7 +596,7 @@ impl Engine {
     /// the world size. Returns `None` when `GRIM_TP_SIZE` is unset or 1
     /// (single-device).
     pub fn tp_config(&self) -> Option<grim_nn::TensorParallelConfig> {
-        self.tp_config.clone()
+        self.tp_config
     }
 
     /// Access the disaggregated KV receiver server instance if running in disaggregated decode role.
@@ -646,7 +645,7 @@ impl Engine {
             caps: Vec::new(),
             links: Vec::new(),
             caps_epoch: u32::MAX, // force first-use refresh from the profiler
-            device_for_rank: Arc::new(|rank| grim_tensor::Device::Rocm(rank)),
+            device_for_rank: Arc::new(grim_tensor::Device::Rocm),
         });
         true
     }
@@ -820,7 +819,7 @@ impl Engine {
         self.scythe_pin_cooldown
             .retain(|(_, t)| t.elapsed() < SCYTHE_PIN_COOLDOWN);
         let external_busy: Vec<Option<u32>> =
-            (0..n).map(|r| grim_backend_rocm::compute_utilization(r)).collect();
+            (0..n).map(grim_backend_rocm::compute_utilization).collect();
         let effective_loads = scythe_effective_loads(
             self.scythe_pin.values().copied(),
             &self.scythe_pin_cooldown,
@@ -884,8 +883,9 @@ impl Engine {
         // served cleanly, GPU1 sampled at 88–93 % under sustained load,
         // 18/17 rank split over 35 live requests). Opt out with
         // GRIM_SCYTHE_SPREAD=0.
-        let spread_enabled =
-            std::env::var("GRIM_SCYTHE_SPREAD").map(|v| v != "0").unwrap_or(true);
+        let spread_enabled = std::env::var("GRIM_SCYTHE_SPREAD")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let chosen = match chosen {
             Some(r) if r != 0 && !spread_enabled => {
                 eprintln!(
@@ -1192,9 +1192,9 @@ impl Engine {
     pub fn resolve_adapters(&self, ids: &[u32]) -> Option<Vec<AdapterHandle>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            match self.adapters.get(id) {
-                Some(a) => out.push(a.handle.clone()),
-                None => return None,
+            {
+                let a = self.adapters.get(id)?;
+                out.push(a.handle.clone())
             }
         }
         Some(out)
@@ -1222,10 +1222,8 @@ impl Engine {
     ) -> Result<usize> {
         let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
         let block_bytes = pool.block_bytes();
-        if block_bytes > 0 {
-            let target_blocks = new_kv_envelope_bytes / block_bytes;
-            pool.resize_capacity(target_blocks);
-        }
+        let target_blocks = new_kv_envelope_bytes.checked_div(block_bytes).unwrap_or(0);
+        pool.resize_capacity(target_blocks);
         Ok(new_expert_envelope_bytes)
     }
 
@@ -1674,10 +1672,7 @@ impl Engine {
             .get(&request_id)
             .cloned()
             .unwrap_or_default();
-        let adapters = {
-            let resolved = self.resolve_adapters(&adapter_ids).unwrap_or_default();
-            resolved
-        };
+        let adapters = { self.resolve_adapters(&adapter_ids).unwrap_or_default() };
         let was_speculative_path = match self.models.get(model_id) {
             Some(m) => m.model.strategy() != Strategy::Plain,
             None => return Err(Error::Config(format!("unknown model {model_id}"))),
@@ -2450,7 +2445,7 @@ mod tests {
             .map(|s| s.current_pos())
             .unwrap_or(0);
         assert_eq!(running_pos, paused_pos, "pause must not change session pos");
-        assert_eq!(engine.is_paused(1), true);
+        assert!(engine.is_paused(1));
 
         // Resume: same position. Tick again.
         engine.resume_request(1);
@@ -2539,8 +2534,8 @@ mod tests {
         // place for Strategy::Plain (with a real DSpark bundle attached
         // the field flips to true).
         let outcome = engine.last_outcome(1).unwrap();
-        assert_eq!(
-            outcome.speculative, false,
+        assert!(
+            !outcome.speculative,
             "without a bundled drafter, the wrapper falls back to plain decode"
         );
     }
@@ -2602,8 +2597,10 @@ mod tests {
     fn engine_per_request_rng_seeded_in_strict_mode() {
         // §5.8: per-request-seeded Speculation RNG. Each request gets
         // its own deterministic stream from `request.id`.
-        let mut config = EngineConfig::default();
-        config.determinism_mode = DeterminismMode::Strict;
+        let config = EngineConfig {
+            determinism_mode: DeterminismMode::Strict,
+            ..EngineConfig::default()
+        };
         let mut engine = Engine::new(config);
         engine.register_model("small", small_llama());
         engine.enqueue_request(Request {
@@ -3123,7 +3120,7 @@ mod tests {
         let mut engine = Engine::new(EngineConfig::default());
         engine.scythe_pin.insert(7, 1);
         engine.finish_request(7);
-        assert!(engine.scythe_pin.get(&7).is_none(), "active pin released");
+        assert!(!engine.scythe_pin.contains_key(&7), "active pin released");
         assert_eq!(engine.scythe_pin_cooldown.len(), 1);
         assert_eq!(engine.scythe_pin_cooldown[0].0, 1);
 
@@ -3245,10 +3242,22 @@ mod tests {
         // decide_forced must re-evaluate under the adjusted caps instead.
         let mut ctrl = crate::scythe2::C2plrController::new(1, 2, 150.0);
         let cached_rank = ctrl
-            .decide(0, &shape, &load_adjusted_caps(&caps, 2, &[0.0, 0.0]), &links, 0)
+            .decide(
+                0,
+                &shape,
+                &load_adjusted_caps(&caps, 2, &[0.0, 0.0]),
+                &links,
+                0,
+            )
             .ranks[0];
         let sticky_rank = ctrl
-            .decide(0, &shape, &load_adjusted_caps(&caps, 2, &[2.0, 0.0]), &links, 0)
+            .decide(
+                0,
+                &shape,
+                &load_adjusted_caps(&caps, 2, &[2.0, 0.0]),
+                &links,
+                0,
+            )
             .ranks[0];
         assert_eq!(cached_rank, 0);
         assert_eq!(
@@ -3256,7 +3265,13 @@ mod tests {
             "expected the load-blind cache hit being fixed here"
         );
         let forced_rank = ctrl
-            .decide_forced(0, &shape, &load_adjusted_caps(&caps, 2, &[2.0, 0.0]), &links, 0)
+            .decide_forced(
+                0,
+                &shape,
+                &load_adjusted_caps(&caps, 2, &[2.0, 0.0]),
+                &links,
+                0,
+            )
             .ranks[0];
         assert_eq!(forced_rank, 1);
     }

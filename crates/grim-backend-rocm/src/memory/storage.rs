@@ -669,14 +669,13 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
     // this, a legitimate ~10-minute load is silent between `[alias]` log lines
     // and is indistinguishable from a true hang. Borrowed from the `[grim]` log
     // convention used elsewhere in the load path.
-    match &result {
-        Ok(out) => eprintln!(
+    if let Ok(out) = &result {
+        eprintln!(
             "[grim] Host dequantized {:?} ({} elements) in {:.2}s",
             dtype.storage,
             out.len(),
             start.elapsed().as_secs_f64()
-        ),
-        Err(_) => {}
+        );
     }
     result
 }

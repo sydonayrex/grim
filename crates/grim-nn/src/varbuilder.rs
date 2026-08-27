@@ -888,12 +888,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
                 cfg.group_size,
             )
         }
-        _ => Err(Error::Unimplemented(format!(
-            "dequant_to_f32: storage {:?} has no host dequant path",
-            dtype.storage
-        ))),
-        Storage::CompressedTensorsW8A8Int8
-        | Storage::CompressedTensorsW8A8Fp8 => {
+        Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
             // These W8A8 formats are resident-capable on ROCm/CUDA and reach the
             // fused dequant GEMM; host dequant isn't wired for them on the CPU fallback.
             Err(Error::Unimplemented(format!(
@@ -901,6 +896,10 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
                 dtype.storage
             )))
         }
+        _ => Err(Error::Unimplemented(format!(
+            "dequant_to_f32: storage {:?} has no host dequant path",
+            dtype.storage
+        ))),
     }
 }
 
@@ -1321,8 +1320,8 @@ mod tests {
         let r = raw(bytes, vec![8, 1], dtype.clone());
         let out = dequant_to_f32(&r, &dtype).expect("group-int dequant");
         assert_eq!(out.len(), 8);
-        for i in 0..8 {
-            close(out[i], (i as f32 - 8.0) * 0.5, &format!("groupint[{i}]"));
+        for (i, &v) in out.iter().enumerate() {
+            close(v, (i as f32 - 8.0) * 0.5, &format!("groupint[{i}]"));
         }
     }
 }

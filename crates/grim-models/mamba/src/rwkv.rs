@@ -76,10 +76,7 @@ impl RwkvState {
     }
 
     /// Mutable split of one layer's five slots (bounds-checked).
-    fn layer_slots_mut(
-        &mut self,
-        layer: usize,
-    ) -> Result<[&mut [f32]; 5]> {
+    fn layer_slots_mut(&mut self, layer: usize) -> Result<[&mut [f32]; 5]> {
         let hidden = self.hidden;
         let base = self.layer_offset(layer);
         let end = base + RWKV_SLOTS_PER_LAYER * hidden;
@@ -223,7 +220,10 @@ impl RwkvBlock {
         // a mild decay/first pair — so the state threading still exercises.
         let vec_param = |name: &str, default: f32| -> Vec<f32> {
             ws.get(Shape::new(vec![cfg.hidden_size]), name)
-                .map(|t| t.to_vec_f32().unwrap_or_else(|_| vec![default; cfg.hidden_size]))
+                .map(|t| {
+                    t.to_vec_f32()
+                        .unwrap_or_else(|_| vec![default; cfg.hidden_size])
+                })
                 .unwrap_or_else(|_| vec![default; cfg.hidden_size])
         };
         let tm_mix_k = vec_param("att.time_mix_k", 0.5);
@@ -239,7 +239,10 @@ impl RwkvBlock {
         let ffn_tm_mix_r = vec_param("ffn.time_mix_r", 0.5);
         let norm2 = RmsNorm::load(&ws.pp("ln_2"), cfg.hidden_size, cfg.rms_norm_eps as f32)
             .unwrap_or(RmsNorm {
-                weight: cpu_tensor(vec![1.0f32; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: cpu_tensor(
+                    vec![1.0f32; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps as f32,
             });
 
@@ -284,12 +287,7 @@ impl RwkvBlock {
     /// bypassed: its signature has no state I/O, so it can never implement
     /// this recurrence — using it produced silently context-free output. The
     /// kernels remain in the backend for future state-aware wiring.
-    pub fn step(
-        &self,
-        x: &Tensor,
-        layer_idx: usize,
-        state: &mut RwkvState,
-    ) -> Result<Tensor> {
+    pub fn step(&self, x: &Tensor, layer_idx: usize, state: &mut RwkvState) -> Result<Tensor> {
         let dim = self.cfg_hidden();
         let x_vec = x.to_vec_f32()?;
         if x_vec.len() != dim {
@@ -319,16 +317,21 @@ impl RwkvBlock {
         let flat = |t: &Tensor, off: usize| -> Result<Vec<f32>> {
             Ok(t.to_vec_f32()?[off..off + dim].to_vec())
         };
-        let k_t = self.time_mix_key.forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
-        let v_t = self.time_mix_value.forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
-        let r_t = self.time_mix_receptance.forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
+        let k_t = self
+            .time_mix_key
+            .forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
+        let v_t = self
+            .time_mix_value
+            .forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
+        let r_t = self
+            .time_mix_receptance
+            .forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
 
         // One-token WKV update (see doc comment) + sigmoid(r) gate.
         let k_vec = k_t.to_vec_f32()?;
         let v_vec = v_t.to_vec_f32()?;
         let r_vec = r_t.to_vec_f32()?;
         let mut attn_y = vec![0.0f32; dim];
-        const MIN_VALUE: f32 = -1e38f32;
         for i in 0..dim {
             let k_ch = k_vec[i];
             let ww = self.time_first[i] + k_ch;
@@ -346,9 +349,9 @@ impl RwkvBlock {
             pp[i] = p + self.time_decay[i];
         }
 
-        let att_out =
-            self.time_mix_output
-                .forward(&cpu_tensor(attn_y, Shape::new(vec![1, dim])))?;
+        let att_out = self
+            .time_mix_output
+            .forward(&cpu_tensor(attn_y, Shape::new(vec![1, dim])))?;
         let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
 
         // ── Channel mix (FFN) ────────────────────────────────────────────
@@ -570,9 +573,9 @@ impl CausalLm for Rwkv {
         if session.model_state().is_none() {
             session.set_model_state(Box::new(self.init_state(1)));
         }
-        let cell = session.model_state_mut().ok_or_else(|| {
-            Error::Session("rwkv: session model_state vanished".into())
-        })?;
+        let cell = session
+            .model_state_mut()
+            .ok_or_else(|| Error::Session("rwkv: session model_state vanished".into()))?;
         let boxed_state = cell.downcast_mut::<Box<dyn SsmState>>().ok_or_else(|| {
             Error::Session("rwkv: session model_state holds another model's state".into())
         })?;
@@ -615,7 +618,10 @@ mod audit_tests {
             )
         };
         let norm = |eps: f32| RmsNorm {
-            weight: cpu_tensor(vec![1.0f32; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0f32; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps,
         };
         let layers = (0..cfg.num_layers)
@@ -640,7 +646,10 @@ mod audit_tests {
             })
             .collect();
         let ln_out = RmsNorm {
-            weight: cpu_tensor(vec![1.0f32; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0f32; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps as f32,
         };
         let head_data: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
@@ -679,11 +688,10 @@ mod audit_tests {
         let model = tiny_rwkv();
         let mut sess = Inner::new(model.device.clone());
         let _a = CausalLm::forward(&model, &mut sess, &tok(1.0), &tok(0.0), &[]).unwrap();
-        let b_session =
-            CausalLm::forward(&model, &mut sess, &tok(2.0), &tok(0.0), &[])
-                .unwrap()
-                .to_vec_f32()
-                .unwrap();
+        let b_session = CausalLm::forward(&model, &mut sess, &tok(2.0), &tok(0.0), &[])
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         assert_eq!(sess.current_pos(), 2, "pos advances per call");
 
         // Explicit state-threading reference.
@@ -709,9 +717,11 @@ mod audit_tests {
         let mut s1 = Inner::new(model.device.clone());
         let mut s2 = Inner::new(model.device.clone());
         let adapters: [AdapterHandle; 0] = [];
-        for t in [1.0f32] {
+        {
+            let t = 1.0f32;
             let _ = CausalLm::forward(&model, &mut s1, &tok(t), &tok(0.0), &adapters).unwrap();
-            let _ = CausalLm::forward(&model, &mut s2, &tok(t + 40.0), &tok(0.0), &adapters).unwrap();
+            let _ =
+                CausalLm::forward(&model, &mut s2, &tok(t + 40.0), &tok(0.0), &adapters).unwrap();
         }
         let l1 = CausalLm::forward(&model, &mut s1, &tok(7.0), &tok(0.0), &adapters)
             .unwrap()

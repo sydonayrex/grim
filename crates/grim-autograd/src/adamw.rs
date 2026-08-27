@@ -16,9 +16,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Learning rate scheduler type.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum LRScheduler {
     /// Cosine annealing with warmup: lr = base_lr * 0.5 * (1 + cos(pi * t / T))
+    #[default]
     Cosine,
     /// Linear decay: lr = base_lr * (1 - t / T)
     Linear,
@@ -34,12 +35,6 @@ pub enum LRScheduler {
     OneCycle { max_lr: f32, pct_start: f32 },
     /// Reduce on plateau: reduces LR when metric stops improving
     ReduceOnPlateau { factor: f32, patience: u32 },
-}
-
-impl Default for LRScheduler {
-    fn default() -> Self {
-        Self::Cosine
-    }
 }
 
 impl LRScheduler {
@@ -149,9 +144,10 @@ impl std::fmt::Display for LRScheduler {
 /// this crate. The remaining variants (AdamWBnb and up) are declared to keep
 /// the CLI surface stable and are rejected with `Error::Unimplemented` by
 /// `Optimizer::new` until their implementations land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OptimizerKind {
     /// Standard AdamW with FP32 moment buffers.
+    #[default]
     AdamW,
     /// AdamW with 8-bit quantised moment buffers (FP16 storage).
     AdamW8Bit,
@@ -188,12 +184,6 @@ pub enum OptimizerKind {
     MAdam,
     /// LionVote — Per-layer adaptive voting for sign-momentum updates.
     LionVote,
-}
-
-impl Default for OptimizerKind {
-    fn default() -> Self {
-        Self::AdamW
-    }
 }
 
 impl std::str::FromStr for OptimizerKind {
@@ -252,8 +242,8 @@ impl std::fmt::Display for OptimizerKind {
     }
 }
 
-/// Boxed optimizer wrapper used by the garage worker to dispatch
-/// optimizer construction and stepping uniformly via the `Optimizer` enum.
+// Boxed optimizer wrapper used by the garage worker to dispatch
+// optimizer construction and stepping uniformly via the `Optimizer` enum.
 
 /// F2b: sidecar slot names now embed the injection point so base-weight
 /// entries (`adapter_id == 0`) for different points stop colliding.
@@ -474,9 +464,8 @@ impl Optimizer {
 
     /// Reset momentum buffers for specified parameter IDs.
     pub fn reset_momentum_for(&mut self, ids: &[ParamId]) {
-        match self {
-            Optimizer::AdamW(o) => o.reset_momentum_for(ids),
-            _ => {}
+        if let Optimizer::AdamW(o) = self {
+            o.reset_momentum_for(ids)
         }
     }
 
@@ -726,13 +715,13 @@ impl AdamW {
         let elem_count = shape.elem_count();
 
         // Seed moment buffers on first encounter (device-resident).
-        if !self.m.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.m.entry(id) {
             let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-            self.m.insert(id, zero_m);
+            e.insert(zero_m);
         }
-        if !self.v.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.v.entry(id) {
             let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-            self.v.insert(id, zero_v);
+            e.insert(zero_v);
         }
 
         let m_st_old = self.m.get_mut(&id).unwrap();
@@ -1040,9 +1029,9 @@ impl Lion {
         let elem_count = shape.elem_count();
 
         // Initialize momentum buffer on first encounter
-        if !self.m.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.m.entry(id) {
             let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-            self.m.insert(id, zero_m);
+            e.insert(zero_m);
         }
 
         let m_st = self.m.get_mut(&id).unwrap();
@@ -1197,7 +1186,7 @@ impl AdamW8Bit {
         let lr = self.config.lr;
         let weight_decay = self.config.weight_decay;
 
-                // Audit fix (A1): per-param correction — see AdamW.param_steps.
+        // Audit fix (A1): per-param correction — see AdamW.param_steps.
         let sc = {
             let t = self.param_steps.entry(id).or_insert(0);
             *t += 1;
@@ -1438,7 +1427,7 @@ impl PagedAdamW {
         let weight_decay = self.config.weight_decay;
         let page_size = self.config.page_size.max(1);
 
-                // Audit fix (A1): per-param correction — see AdamW.param_steps.
+        // Audit fix (A1): per-param correction — see AdamW.param_steps.
         let sc = {
             let t = self.param_steps.entry(id).or_insert(0);
             *t += 1;
@@ -1456,7 +1445,7 @@ impl PagedAdamW {
         let mut new_data = vec![0.0f32; elem_count];
 
         let cpu_offload = self.config.cpu_offload;
-        let num_pages = (elem_count + page_size - 1) / page_size;
+        let num_pages = elem_count.div_ceil(page_size);
         for page_idx in 0..num_pages {
             let offset = page_idx * page_size;
             let current_len = (elem_count - offset).min(page_size);
@@ -1541,7 +1530,7 @@ impl PagedAdamW {
         for (id, param) in params.iter() {
             let elem_count = param.data.shape().elem_count();
             let page_size = self.config.page_size.max(1);
-            let num_pages = (elem_count + page_size - 1) / page_size;
+            let num_pages = elem_count.div_ceil(page_size);
             for p in 0..num_pages {
                 let m_key = format!(
                     "paged_m_{}_{}_{}_p{}",
@@ -1859,10 +1848,10 @@ pub fn randomized_svd(
     }
 
     let mut omega = vec![0.0f32; n * k];
-    for i in 0..n * k {
+    for (i, slot) in omega.iter_mut().enumerate() {
         let u1 = ((i as f32 + 1.0) * 0.017).fract().max(1e-7);
         let u2 = ((i as f32 + 1.0) * 0.031).fract();
-        omega[i] = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        *slot = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
     }
 
     let mut y = vec![0.0f32; m * k];
@@ -2648,10 +2637,10 @@ impl MAdam {
         let shape = param.data.shape().clone();
         let elem_count = shape.elem_count();
 
-        if !self.m.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.m.entry(id) {
             let m_init = dev.from_cpu(&vec![0.0f32; elem_count], &shape, DType::F32)?;
             let v_init = dev.from_cpu(&vec![0.0f32; elem_count], &shape, DType::F32)?;
-            self.m.insert(id, m_init);
+            e.insert(m_init);
             self.v.insert(id, v_init);
         }
 
@@ -2887,9 +2876,9 @@ impl LionVote {
         let shape = param.data.shape();
         let dev = crate::pick_device_for_tensor(&param.data);
 
-        if !self.exp_avg.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.exp_avg.entry(id) {
             let init_buf = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-            self.exp_avg.insert(id, init_buf);
+            e.insert(init_buf);
         }
 
         let exp_st = self.exp_avg.get_mut(&id).unwrap();
@@ -3538,7 +3527,8 @@ mod tests {
 
     #[test]
     fn test_unimplemented_optimizers_rejected_honestly() {
-        for kind in [OptimizerKind::AdamWBnb] {
+        {
+            let kind = OptimizerKind::AdamWBnb;
             let res = Optimizer::new(kind, 1e-3);
             assert!(
                 matches!(res, Err(Error::Unimplemented(_))),
@@ -3577,7 +3567,7 @@ mod tests {
             for (_, p) in params.iter_mut() {
                 let g = vec![0.1f32, -0.2, 0.4, -0.1];
                 let gt = grim_backend_cpu::cpu_tensor(g, Shape::new(vec![2, 2]));
-                p.accumulate_grad(&gt);
+                let _ = p.accumulate_grad(&gt);
             }
             for _ in 0..3 {
                 opt.step(&mut params).expect("step must succeed");
@@ -3590,7 +3580,6 @@ mod tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod audit_tests {
@@ -3623,9 +3612,11 @@ mod audit_tests {
             lora_plus_ratio: 1.0,
         }));
         let pid = ParamId::a(0, 1, crate::injection::LoRAInjectionPoint::QProj);
-        let mut param =
-            crate::param::TrainableParam::new(pid, cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4])))
-                .unwrap();
+        let mut param = crate::param::TrainableParam::new(
+            pid,
+            cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4])),
+        )
+        .unwrap();
 
         // t=1 with g=1 → exactly -lr.
         param
@@ -3634,7 +3625,10 @@ mod audit_tests {
         opt.step_param(pid, &mut param).unwrap();
         let p1 = param.data.to_vec_f32().unwrap();
         for &d in &p1 {
-            assert!((d - (-0.1)).abs() < 1e-4, "t=1 must be exactly -lr, got {d}");
+            assert!(
+                (d - (-0.1)).abs() < 1e-4,
+                "t=1 must be exactly -lr, got {d}"
+            );
         }
 
         // t=2 with g=0 → momentum-only continuation under the t=2 correction.

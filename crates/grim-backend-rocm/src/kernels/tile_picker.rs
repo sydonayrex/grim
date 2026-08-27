@@ -64,8 +64,8 @@ impl TileConfig {
     pub fn with_block_geometry(mut self, spec: &HardwareSpec, shape_class: ShapeClass) -> Self {
         let wave = spec.wavefront_size;
         let (bm, bn) = raw_block_mn(shape_class);
-        self.block_m = ((bm + wave - 1) / wave) * wave;
-        self.block_n = ((bn + wave - 1) / wave) * wave;
+        self.block_m = (bm.div_ceil(wave)) * wave;
+        self.block_n = (bn.div_ceil(wave)) * wave;
         let lds_per_tile = 2
             * (self.block_m * self.block_k
                 + self.block_k * self.block_n
@@ -84,8 +84,8 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass, dims: ShapeDims)
 
     let (block_m, block_n) = raw_block_mn(shape_class);
 
-    let block_m = ((block_m + wave - 1) / wave) * wave;
-    let block_n = ((block_n + wave - 1) / wave) * wave;
+    let block_m = (block_m.div_ceil(wave)) * wave;
+    let block_n = (block_n.div_ceil(wave)) * wave;
 
     let block_k = match shape_class {
         ShapeClass::Decode => 32,
@@ -103,16 +103,15 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass, dims: ShapeDims)
     let vgpr_per_thread = estimate_vgpr_per_thread(block_m, block_n, block_k);
     let vgpr_file: u32 = 512;
     let waves_vgpr = vgpr_file / (vgpr_per_thread * wave).max(1);
-    let waves_lds = (lds_per_cu
-        / (lds_per_tile + if lds_double_buffer { lds_per_tile } else { 0 }).max(1))
-        as u32;
+    let waves_lds =
+        lds_per_cu / (lds_per_tile + if lds_double_buffer { lds_per_tile } else { 0 }).max(1);
     let waves_thread = max_threads / wave;
     let target_waves = waves_vgpr.min(waves_lds).min(waves_thread).clamp(1, 4);
     let threads = target_waves * wave;
     assert!(threads <= max_threads && threads % wave == 0);
 
     let split_k = if dims.k > block_k * 4 {
-        ((dims.k + block_k * 4 - 1) / (block_k * 4)).clamp(1, 16)
+        (dims.k.div_ceil(block_k * 4)).clamp(1, 16)
     } else {
         1
     };
@@ -240,12 +239,12 @@ pub fn fcp_fallback_tile_search(
             Err(_) => continue,
         };
         let t_ms = device.time_kernel_ms(&hsaco, &lowered, dims, cand);
-        if best.as_ref().map_or(true, |(_, bt)| t_ms < *bt) {
+        if best.as_ref().is_none_or(|(_, bt)| t_ms < *bt) {
             best = Some((cand.clone(), t_ms));
         }
     }
 
-    let (winner, winner_ms) = best.map(|(c, t)| (c, t)).unwrap_or((base.clone(), 0.0));
+    let (winner, winner_ms) = best.unwrap_or((base.clone(), 0.0));
     device.store_tune_cache(entry, spec, dims, &winner, winner_ms);
     winner
 }

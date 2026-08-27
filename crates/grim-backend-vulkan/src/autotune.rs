@@ -46,8 +46,11 @@ pub struct VulkanTileConfig {
     pub split_k: u32,
 }
 
+type AutotuneCache =
+    Mutex<HashMap<(u64, usize, usize, usize, ShapeClass), (VulkanTileConfig, f64)>>;
+
 pub struct VulkanAutotuner {
-    cache: Mutex<HashMap<(u64, usize, usize, usize, ShapeClass), (VulkanTileConfig, f64)>>,
+    cache: AutotuneCache,
 }
 
 impl std::fmt::Debug for VulkanAutotuner {
@@ -73,6 +76,12 @@ struct TuneEntryOwned {
     block_k: u32,
     split_k: u32,
     elapsed_ms: f64,
+}
+
+impl Default for VulkanAutotuner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VulkanAutotuner {

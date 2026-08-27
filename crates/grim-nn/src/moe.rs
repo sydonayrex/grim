@@ -103,6 +103,7 @@ impl MoeRouter {
     /// `SigmoidTopKWithBias` adds the correction bias to the sigmoid scores
     /// *only* for ranking; the returned combine weights are the unbiased
     /// sigmoid values of the selected experts.
+    #[allow(clippy::type_complexity)]
     pub fn route(
         &self,
         x: &Tensor,
@@ -520,8 +521,7 @@ pub(crate) fn wna16_split_or_dequant(
             "wna16 bank: blob shorter than header+scales+tail".into(),
         ));
     }
-    let tensor_scale =
-        f32::from_le_bytes(bytes[ts_off..ts_off + 4].try_into().unwrap());
+    let tensor_scale = f32::from_le_bytes(bytes[ts_off..ts_off + 4].try_into().unwrap());
 
     let decode = |lane: usize| -> u32 {
         let start_bit = lane * n_bit;
@@ -535,13 +535,13 @@ pub(crate) fn wna16_split_or_dequant(
     };
 
     let mut weights = vec![0.0f32; total_weights];
-    for i in 0..total_weights {
+    for (i, slot) in weights.iter_mut().enumerate() {
         let blk = i / 256;
         let h = u16::from_le_bytes([
             bytes[scales_start + blk * 2],
             bytes[scales_start + blk * 2 + 1],
         ]);
-        weights[i] = decode(i) as f32 * f16_bits_to_f32(h) * tensor_scale;
+        *slot = decode(i) as f32 * f16_bits_to_f32(h) * tensor_scale;
     }
 
     let stride = out * k;
@@ -573,7 +573,6 @@ fn f16_bits_to_f32(h: u16) -> f32 {
         e => f32::from_bits(sign | ((e - 15 + 127) << 23) | (mant << 13)),
     }
 }
-
 
 impl ExpertBank {
     /// Construct directly from per-expert `Linear`s (used by tests and
@@ -717,51 +716,41 @@ impl ExpertBank {
             // WNA16 has no packed GEMM yet, so its experts are dequantized on
             // host here (load-time strategy; a device dequant service exists
             // for resident-blob use in grim-backend-rocm).
-            let per_expert_blobs: Option<Vec<Vec<u8>>> =
-                match &raw.dtype.storage {
-                    Storage::W4A16(w4) => Some(w4a16_split_bank(
-                        &raw.bytes,
-                        num_experts,
-                        *out,
-                        *in_,
-                        w4.group_size,
-                    )?),
-                    Storage::GroupInt(gi) => Some(gptq_split_bank(
-                        &raw.bytes,
-                        gi.bits,
-                        gi.group_size,
-                        num_experts,
-                        *out,
-                        *in_,
-                    )?),
-                    Storage::WNA16 => Some(wna16_split_or_dequant(
-                        &raw.bytes,
-                        num_experts,
-                        *out,
-                        *in_,
-                    )?),
-                    Storage::Awq(awq) => Some(awq_split_bank(
-                        &raw.bytes,
-                        awq.bits,
-                        awq.group_size,
-                        num_experts,
-                        *out,
-                        *in_,
-                    )?),
-                    Storage::CompressedTensorsW8A8Int8 => Some(w8a8_int8_split_bank(
-                        &raw.bytes,
-                        num_experts,
-                        *out,
-                        *in_,
-                    )?),
-                    Storage::CompressedTensorsW8A8Fp8 => Some(w8a8_fp8_split_bank(
-                        &raw.bytes,
-                        num_experts,
-                        *out,
-                        *in_,
-                    )?),
-                    _ => None,
-                };
+            let per_expert_blobs: Option<Vec<Vec<u8>>> = match &raw.dtype.storage {
+                Storage::W4A16(w4) => Some(w4a16_split_bank(
+                    &raw.bytes,
+                    num_experts,
+                    *out,
+                    *in_,
+                    w4.group_size,
+                )?),
+                Storage::GroupInt(gi) => Some(gptq_split_bank(
+                    &raw.bytes,
+                    gi.bits,
+                    gi.group_size,
+                    num_experts,
+                    *out,
+                    *in_,
+                )?),
+                Storage::WNA16 => {
+                    Some(wna16_split_or_dequant(&raw.bytes, num_experts, *out, *in_)?)
+                }
+                Storage::Awq(awq) => Some(awq_split_bank(
+                    &raw.bytes,
+                    awq.bits,
+                    awq.group_size,
+                    num_experts,
+                    *out,
+                    *in_,
+                )?),
+                Storage::CompressedTensorsW8A8Int8 => {
+                    Some(w8a8_int8_split_bank(&raw.bytes, num_experts, *out, *in_)?)
+                }
+                Storage::CompressedTensorsW8A8Fp8 => {
+                    Some(w8a8_fp8_split_bank(&raw.bytes, num_experts, *out, *in_)?)
+                }
+                _ => None,
+            };
 
             for e in 0..num_experts {
                 let per_expert = elem_count / num_experts;
@@ -803,9 +792,9 @@ impl ExpertBank {
                     let x = &exps[e * exps_per..(e + 1) * exps_per];
                     let mut framed = Vec::with_capacity(16 + c.len() + x.len());
                     framed.extend_from_slice(&(c.len() as u64).to_le_bytes());
-                    framed.extend_from_slice(&c);
+                    framed.extend_from_slice(c);
                     framed.extend_from_slice(&(x.len() as u64).to_le_bytes());
-                    framed.extend_from_slice(&x);
+                    framed.extend_from_slice(x);
                     let mxfp4_dtype = grim_tensor::dtype::DType {
                         arith: grim_tensor::ArithType::F32,
                         storage: grim_tensor::dtype::Storage::FloatPack(
@@ -849,7 +838,6 @@ impl ExpertBank {
         }
         Ok(Self { gate, up, down })
     }
-
 
     /// Native (F32/F16/BF16) path: dequantize on host as before.
     #[allow(clippy::too_many_arguments)]
@@ -937,24 +925,28 @@ pub(crate) fn rocm_dequant_expert_weight(
     weight: &Tensor,
     ordinal: usize,
 ) -> Result<Vec<f32>, grim_tensor::error::Error> {
-    
     let dev = RocmDevice::try_new(ordinal)?;
     let dims = weight.shape().dims();
     let (n_rows, k_dim) = (dims[0], dims[1]);
     let out_box = match weight.dtype().storage {
         Storage::W4A16(w4) => {
             let c_box = dev.dequant_w4a16_blob_to_f32(
-                weight.storage().as_any()
+                weight
+                    .storage()
+                    .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::error::Error::Backend(
-                        "w4a16 expert not rocm".into(),
-                    ))?,
+                    .ok_or_else(|| {
+                        grim_tensor::error::Error::Backend("w4a16 expert not rocm".into())
+                    })?,
                 n_rows,
                 k_dim,
                 w4.group_size,
             )?;
             if std::env::var_os("GRIM_MOE_DIAG").is_some() {
-                eprintln!("[moe-diag] w4a16 materialized shape={:?}", weight.shape().dims());
+                eprintln!(
+                    "[moe-diag] w4a16 materialized shape={:?}",
+                    weight.shape().dims()
+                );
             }
             // Service returns Dᵀ row-major [k_dim, n_rows]; transpose to
             // the weight layout [n_rows, k_dim].
@@ -976,11 +968,13 @@ pub(crate) fn rocm_dequant_expert_weight(
         }
         Storage::GroupInt(gi) => {
             let c_box = dev.gptq_dequant_identity_to_f32(
-                weight.storage().as_any()
+                weight
+                    .storage()
+                    .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .ok_or_else(|| grim_tensor::error::Error::Backend(
-                        "gptq expert not rocm".into(),
-                    ))?,
+                    .ok_or_else(|| {
+                        grim_tensor::error::Error::Backend("gptq expert not rocm".into())
+                    })?,
                 n_rows,
                 k_dim,
                 gi.bits,
@@ -1004,19 +998,23 @@ pub(crate) fn rocm_dequant_expert_weight(
             return Ok(d);
         }
         Storage::WNA16 => {
-            let b_rocm = weight.storage().as_any()
+            let b_rocm = weight
+                .storage()
+                .as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                .ok_or_else(|| grim_tensor::error::Error::Backend(
-                    "wna16 expert not rocm".into(),
-                ))?;
+                .ok_or_else(|| {
+                    grim_tensor::error::Error::Backend("wna16 expert not rocm".into())
+                })?;
             dev.dequant_wna16_blob_to_f32(b_rocm, n_rows * k_dim)?
         }
         Storage::CompressedTensorsW8A8Int8 => {
-            let b_rocm = weight.storage().as_any()
+            let b_rocm = weight
+                .storage()
+                .as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                .ok_or_else(|| grim_tensor::error::Error::Backend(
-                    "w8a8_int8 expert not rocm".into(),
-                ))?;
+                .ok_or_else(|| {
+                    grim_tensor::error::Error::Backend("w8a8_int8 expert not rocm".into())
+                })?;
             let raw_bytes = b_rocm.copy_to_host()?;
             let codes = &raw_bytes[8..8 + n_rows * k_dim];
             let scales = &raw_bytes[8 + n_rows * k_dim..];
@@ -1036,11 +1034,13 @@ pub(crate) fn rocm_dequant_expert_weight(
             return Ok(d);
         }
         Storage::CompressedTensorsW8A8Fp8 => {
-            let b_rocm = weight.storage().as_any()
+            let b_rocm = weight
+                .storage()
+                .as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                .ok_or_else(|| grim_tensor::error::Error::Backend(
-                    "w8a8_fp8 expert not rocm".into(),
-                ))?;
+                .ok_or_else(|| {
+                    grim_tensor::error::Error::Backend("w8a8_fp8 expert not rocm".into())
+                })?;
             let raw_bytes = b_rocm.copy_to_host()?;
             let codes = &raw_bytes[8..8 + n_rows * k_dim];
             let sc = f32::from_le_bytes([
@@ -1060,11 +1060,11 @@ pub(crate) fn rocm_dequant_expert_weight(
             return Ok(d);
         }
         Storage::Awq(awq) => {
-            let b_rocm = weight.storage().as_any()
+            let b_rocm = weight
+                .storage()
+                .as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                .ok_or_else(|| grim_tensor::error::Error::Backend(
-                    "awq expert not rocm".into(),
-                ))?;
+                .ok_or_else(|| grim_tensor::error::Error::Backend("awq expert not rocm".into()))?;
             let raw_bytes = b_rocm.copy_to_host()?;
             let (qw_off, qz_off, sc_off) = grim_backend_rocm::RocmDevice::awq_segment_offsets(
                 awq.bits,
@@ -1093,7 +1093,7 @@ pub(crate) fn rocm_dequant_expert_weight(
             }
             return Ok(d);
         }
-        _ => return Ok(weight.to_vec_f32()?),
+        _ => return weight.to_vec_f32(),
     };
     let t = Tensor::new(
         std::sync::Arc::from(out_box),
@@ -1102,9 +1102,8 @@ pub(crate) fn rocm_dequant_expert_weight(
         grim_tensor::QuantProvenance::default(),
         Device::Rocm(ordinal),
     );
-    Ok(t.to_vec_f32()?)
+    t.to_vec_f32()
 }
-
 
 impl RocmResidentWeights {
     fn build(
@@ -1241,7 +1240,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 _ => 32, // fallback: treat as fp32
             };
             // Round up: ceil(elem_count * bits / 8)
-            (elem_count * bits_per_element + 7) / 8
+            (elem_count * bits_per_element).div_ceil(8)
         }
         // K-quant / block-quant / IQ formats: packed bytes, typically
         // bits_per_weight per element. Use the quant scheme's bit width.
@@ -1261,7 +1260,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 KQuantScheme::IQ2XS => 2,
                 KQuantScheme::IQ2S => 2,
             };
-            (elem_count * bits + 7) / 8
+            (elem_count * bits).div_ceil(8)
         }
         // Block-quantized formats (IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, etc.)
         Storage::Block(bdtype) => {
@@ -1274,22 +1273,20 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 BlockDtype::Fp4Block16 => 4,
                 BlockDtype::Fp8Block16 => 8,
             };
-            (elem_count * bits + 7) / 8
+            (elem_count * bits).div_ceil(8)
         }
         // GroupInt: variable, approximate as 1 byte per element
         Storage::GroupInt(_) => elem_count,
         // CompressedTensors W8A8 Int8/Fp8: 1 byte per element (int8 / fp8).
-        Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
-            elem_count
-        }
+        Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => elem_count,
         // AWQ: packed bits (e.g. 4-bit = 0.5 byte/elem, 2-bit = 0.25 byte/elem)
-        Storage::Awq(awq) => (elem_count * awq.bits as usize + 7) / 8,
+        Storage::Awq(awq) => (elem_count * awq.bits as usize).div_ceil(8),
         // W4A16: 4-bit packed codes (~0.5 byte/elem); per-group f32 scales are
         // small relative to weights, so this is a conservative lower bound.
         Storage::W4A16(_) => elem_count / 2,
         // ResidualPacked: packed residual format with per-block scales.
         // Use bpw (bits per weight) to compute byte size.
-        Storage::ResidualPacked(config) => (elem_count * config.bpw as usize + 7) / 8,
+        Storage::ResidualPacked(config) => (elem_count * config.bpw as usize).div_ceil(8),
         // Native: fp16/f32/bf16
         Storage::Native => {
             match dtype.arith {
@@ -1953,7 +1950,7 @@ impl MoeFfn {
 
         let out_shape = Shape::new(vec![batch, hidden]);
         let (out_storage, _handle) = dev.moe_fused_dispatch(
-            &*x_storage,
+            x_storage,
             &*gate_buf,
             &*up_buf,
             &*down_buf,
@@ -2038,7 +2035,7 @@ impl MoeFfn {
         // is cached for the resident-set rebuild (cache-miss path below).
         let plan = self
             .plan_builder
-            .build(&*self.hotness.lock().unwrap(), false);
+            .build(&self.hotness.lock().unwrap(), false);
         *self.cached_plan.lock().unwrap() = Some(plan.clone());
 
         // Resident expert-weight fast path: the flattened gate/up/down banks
@@ -2279,12 +2276,12 @@ impl LookaheadPredictor {
         }
         // predicted_next_logits[j] = sum_i current_logits[i] * W[i, j]
         let mut pred = vec![0.0f32; self.num_experts];
-        for j in 0..self.num_experts {
+        for (j, slot) in pred.iter_mut().enumerate() {
             let mut acc = 0.0f32;
-            for i in 0..self.num_experts {
-                acc += current_logits[i] * self.distill[i * self.num_experts + j];
+            for (i, &logit) in current_logits.iter().enumerate() {
+                acc += logit * self.distill[i * self.num_experts + j];
             }
-            pred[j] = acc;
+            *slot = acc;
         }
         self.top_k_from_logits(&pred)
     }
@@ -2320,10 +2317,10 @@ impl LookaheadPredictor {
         }
         // Hebbian: W[i,j] += lr * (target - W[i,j]*current[i]) * current[i]
         // — a one-step ridge pull toward the observed co-activation.
-        for i in 0..self.num_experts {
-            for j in 0..self.num_experts {
-                let pred_ij = current_logits[i] * self.distill[i * self.num_experts + j];
-                let target_ij = current_logits[i] * next_onehot[j];
+        for (i, &cur_i) in current_logits.iter().enumerate() {
+            for (j, &onehot_j) in next_onehot.iter().enumerate() {
+                let pred_ij = cur_i * self.distill[i * self.num_experts + j];
+                let target_ij = cur_i * onehot_j;
                 self.distill[i * self.num_experts + j] += lr * (target_ij - pred_ij);
             }
         }
@@ -2538,11 +2535,12 @@ use grim_tensor::GpuCapability;
 
 /// Capacity metric used to weight rank assignments in the
 /// capacity-proportional policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CapacityMetric {
     /// Free VRAM in bytes (`GpuCapability::vram_free_bytes`). The default —
     /// VRAM is the hard ceiling on expert count per rank, so weighting by
     /// VRAM avoids OOM on the small-VRAM rank.
+    #[default]
     VramBytes,
     /// Effective FP16 TFLOPS (`GpuCapability::tflops_fp16`). Better
     /// throughput-optimal than VRAM when all ranks have enough VRAM but
@@ -2552,16 +2550,6 @@ pub enum CapacityMetric {
     /// current thermal throttle fraction. The reactive metric; the right
     /// choice under sustained load where throttle is the real bottleneck.
     ThrottledTflops,
-}
-
-impl Default for CapacityMetric {
-    fn default() -> Self {
-        // VRAM is the safest default: it's the hard capacity ceiling, and a
-        // VRAM-weighted split never OOMs the small-VRAM rank. TFLOPS-based
-        // metrics are an opt-in for throughput tuning once the operator
-        // confirms all ranks have headroom.
-        CapacityMetric::VramBytes
-    }
 }
 
 /// Per-expert → rank assignment for one MoE layer (WI-EP1).
@@ -2611,7 +2599,7 @@ impl ExpertPlacementMap {
         let mut assigned_load = vec![0.0f64; num_ranks];
         let mut rank_of_expert = vec![0usize; num_experts];
         let mut count_on_rank = vec![0usize; num_ranks];
-        for e in 0..num_experts {
+        for rank_slot in rank_of_expert.iter_mut() {
             // Per-expert capacity cost = 1 unit of "expert load"; we measure
             // each rank's load as `assigned_load / capacity`, so the rank
             // with the lowest normalized load has the most headroom.
@@ -2631,7 +2619,7 @@ impl ExpertPlacementMap {
                         .then(oa.cmp(&ob))
                 })
                 .expect("num_ranks > 0");
-            rank_of_expert[e] = best_rank;
+            *rank_slot = best_rank;
             assigned_load[best_rank] += 1.0;
             count_on_rank[best_rank] += 1;
         }

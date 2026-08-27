@@ -162,19 +162,15 @@ pub enum JobError {
 /// `status_label` seam used by `/api/train/jobs` and `/api/train/status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum JobStatus {
+    #[default]
     Pending,
     Running,
     Completed,
     Failed,
     /// User requested cancellation via `POST /api/train/cancel/{id}`.
     Cancelled,
-}
-
-impl Default for JobStatus {
-    fn default() -> Self {
-        JobStatus::Pending
-    }
 }
 
 /// Training mode the UI's "Training Mode" dropdown drives.
@@ -700,27 +696,6 @@ fn olora_penalty_for_registry(reg: &grim_autograd::registry::AutogradRegistry) -
     }
     total
 }
-
-/// Execute a training job inside a Tokio background task.
-///
-/// The caller should spawn this with `tokio::spawn`:
-/// ```rust,no_run
-/// # use std::sync::Arc;
-/// # use grim_garage::jobs::{JobId, JobRegistry, run_training_worker};
-/// # async fn example(registry: Arc<JobRegistry>, job_id: JobId) {
-/// tokio::spawn(run_training_worker(registry.clone(), job_id));
-/// # }
-/// ```
-///
-/// Contract:
-/// - Transitions `Pending → Running` immediately.
-/// - Emits one `Metric` event per training step.
-/// - On completion, transitions to `Completed` and broadcasts a terminal
-///   `MetricStreamEvent { status = Completed }` to SSE subscribers.
-/// - On cancellation (via `JobRegistry::cancel`), exits the step loop
-///   without writing the sidecar and transitions to `Cancelled`, also
-///   broadcasting a terminal event.
-/// - On any registry error, transitions to `Failed` + broadcasts and logs.
 
 /// Read model hyperparameters from a GGUF file via `HyperparameterExtractor`.
 ///
@@ -1690,6 +1665,26 @@ fn run_multi_rank_preference(
     Ok((losses, replicas, rank_metrics))
 }
 
+/// Execute a training job inside a Tokio background task.
+///
+/// The caller should spawn this with `tokio::spawn`:
+/// ```rust,no_run
+/// # use std::sync::Arc;
+/// # use grim_garage::jobs::{JobId, JobRegistry, run_training_worker};
+/// # async fn example(registry: Arc<JobRegistry>, job_id: JobId) {
+/// tokio::spawn(run_training_worker(registry.clone(), job_id));
+/// # }
+/// ```
+///
+/// Contract:
+/// - Transitions `Pending → Running` immediately.
+/// - Emits one `Metric` event per training step.
+/// - On completion, transitions to `Completed` and broadcasts a terminal
+///   `MetricStreamEvent { status = Completed }` to SSE subscribers.
+/// - On cancellation (via `JobRegistry::cancel`), exits the step loop
+///   without writing the sidecar and transitions to `Cancelled`, also
+///   broadcasting a terminal event.
+/// - On any registry error, transitions to `Failed` + broadcasts and logs.
 pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Retrieve the job configuration.
     let job = match registry.get(&id).await {

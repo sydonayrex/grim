@@ -1737,7 +1737,7 @@ mod tests {
         let q_shape = Shape::new(vec![batch as usize, num_heads as usize, head_dim as usize]);
         let q_storage = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
 
-        let block_tables_data = vec![
+        let block_tables_data = [
             BlockTableEntry {
                 block_id: 0,
                 page_size,

@@ -75,10 +75,12 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
         }
     }
     fn read_layer_keys(&self, id: BlockId, layer_idx: u32) -> Option<Vec<f32>> {
-        self.read_layer_keys(id, layer_idx as usize).map(|s| s.to_vec())
+        self.read_layer_keys(id, layer_idx as usize)
+            .map(|s| s.to_vec())
     }
     fn read_layer_values(&self, id: BlockId, layer_idx: u32) -> Option<Vec<f32>> {
-        self.read_layer_values(id, layer_idx as usize).map(|s| s.to_vec())
+        self.read_layer_values(id, layer_idx as usize)
+            .map(|s| s.to_vec())
     }
     fn write_layer_keys(&mut self, id: BlockId, layer_idx: u32, keys: &[f32], num_tokens: usize) {
         self.write_layer_keys(id, layer_idx as usize, keys, num_tokens);
@@ -320,10 +322,10 @@ impl KvBlockPool {
         let (matched, n) = self.prefix_tree.match_prefix(tokens);
         let mut promoted = false;
         for &bid in &matched {
-            if self.blocks[bid].location != CacheTier::Gpu {
-                if self.promote_to_gpu(bid).ok().flatten().is_some() {
-                    promoted = true;
-                }
+            if self.blocks[bid].location != CacheTier::Gpu
+                && self.promote_to_gpu(bid).ok().flatten().is_some()
+            {
+                promoted = true;
             }
         }
         (matched, n, promoted)
@@ -811,6 +813,12 @@ pub struct BlockTable {
     _pool_id: usize,
 }
 
+impl Default for BlockTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlockTable {
     pub fn new() -> Self {
         Self {
@@ -821,6 +829,10 @@ impl BlockTable {
 
     pub fn len(&self) -> usize {
         self.logical_to_physical.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.logical_to_physical.is_empty()
     }
 
     pub fn num_tokens(&self, pool: &KvBlockPool) -> usize {
@@ -910,16 +922,18 @@ pub struct PagedKvCache {
 /// immutable, so each (layer, physical block) uploads to the device exactly
 /// once — dirty re-staging only ever touches the ACTIVE tail block, instead
 /// of re-pushing the full layer on every append.
+pub type DeviceKvMirrorBlocks = HashMap<
+    (usize, usize),
+    (
+        Arc<dyn grim_tensor::BackendStorage>,
+        Arc<dyn grim_tensor::BackendStorage>,
+    ),
+>;
+
 #[derive(Default)]
 pub struct DeviceKvMirror {
     /// (layer, physical block) → device-resident (K, V) storage.
-    pub blocks: HashMap<
-        (usize, usize),
-        (
-            Arc<dyn grim_tensor::BackendStorage>,
-            Arc<dyn grim_tensor::BackendStorage>,
-        ),
-    >,
+    pub blocks: DeviceKvMirrorBlocks,
     /// Blocks whose host pages changed since their last device upload.
     pub dirty: std::collections::BTreeSet<(usize, usize)>,
     /// Total host→device block uploads performed (ITL gate metric).
@@ -1765,7 +1779,6 @@ mod tests {
 mod f10_mirror_tests {
     use super::*;
     use grim_backend_cpu::CpuDevice;
-    
 
     /// F10 ITL gate (deterministic proxy): with the dirty-block mirror, a
     /// decode/prefill sequence uploads each physical block exactly once plus

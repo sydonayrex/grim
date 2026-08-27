@@ -328,9 +328,9 @@ pub fn pack_awq_native(
     }
 
     let mut out = Vec::with_capacity(24 + words_qw * 4 + words_qz * 4 + sc_bytes);
-    out.extend_from_slice(&( (words_qw * 4) as u64).to_le_bytes());
+    out.extend_from_slice(&((words_qw * 4) as u64).to_le_bytes());
     out.extend_from_slice(&qweight[..words_qw * 4]);
-    out.extend_from_slice(&( (words_qz * 4) as u64).to_le_bytes());
+    out.extend_from_slice(&((words_qz * 4) as u64).to_le_bytes());
     out.extend_from_slice(&qzeros[..words_qz * 4]);
     out.extend_from_slice(&(sc_bytes as u64).to_le_bytes());
     out.extend_from_slice(&scales[..sc_bytes]);
@@ -442,8 +442,8 @@ mod tests {
                 let code = ((ki * 5 + ni * 3) % 15) as u32;
                 codes[ki * n + ni] = code;
                 let word_idx = ki * n + ni; // in/vpw rows of n words each
-                let off = ((ki % vpw) * 4) as usize;
-                let cur_off = word_idx / (vpw / 1); // words are per (in-block, out)
+                let off = (ki % vpw) * 4;
+                let cur_off = word_idx / vpw; // words are per (in-block, out)
                 let _ = cur_off;
                 let w = (ki / vpw) * n + ni;
                 let cur = u32::from_le_bytes([
@@ -545,7 +545,7 @@ mod tests {
             for ni in 0..n {
                 let code = ((ki * 5 + ni * 3) % 15) as u32;
                 codes[ki * n + ni] = code;
-                let off = ((ki % vpw) * 4) as usize;
+                let off = (ki % vpw) * 4;
                 let w = (ki / vpw) * n + ni;
                 let cur = u32::from_le_bytes([
                     qweight[w * 4],
@@ -609,8 +609,7 @@ mod tests {
         let qz = read_seg(&mut cursor);
         let sc = read_seg(&mut cursor);
 
-        let decoded =
-            grim_quant::dequant_awq_group_int(&qw, &qz, &sc, &[k, n], 4, gs).unwrap();
+        let decoded = grim_quant::dequant_awq_group_int(&qw, &qz, &sc, &[k, n], 4, gs).unwrap();
 
         for ki in 0..k {
             let g = ki / gs;

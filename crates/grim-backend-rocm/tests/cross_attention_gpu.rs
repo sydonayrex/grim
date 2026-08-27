@@ -39,6 +39,8 @@ fn build_test_data(
 /// CPU cross-attention reference with contiguous GQA grouping:
 /// query head `h` attends with KV head `h / (num_heads / num_heads_k)`,
 /// matching `grim_cross_attention` and `grim_qkv_attention`. [P1-13]
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_cross_attention(
     q: &[f32],
     k: &[f32],
@@ -101,6 +103,8 @@ fn cpu_cross_attention(
 /// Interleaved-GQA variant used ONLY to prove the reference above implements
 /// the contiguous convention (and that the two conventions disagree for
 /// num_heads_k < num_heads). Never used as the kernel contract.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn cpu_cross_attention_interleaved(
     q: &[f32],
     k: &[f32],

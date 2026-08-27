@@ -12,7 +12,7 @@ fn test_flux2_vae_pack_and_unpack() {
 
     // Create [batch=1, channels=32, height=16, width=16] spatial latents
     let spatial_latents = cpu_tensor(
-        (0..1 * 32 * 16 * 16).map(|i| (i as f32) * 0.001).collect(),
+        (0..32 * 16 * 16).map(|i| (i as f32) * 0.001).collect(),
         Shape::new(vec![1, 32, 16, 16]),
     );
 
@@ -38,7 +38,7 @@ fn test_flux2_vae_decode_to_rgb() {
     let vae = Flux2VAE::random(Device::Cpu, cfg);
 
     // Latents [1, 32, 8, 8] -> RGB [1, 3, 64, 64]
-    let latents = cpu_tensor(vec![0.5f32; 1 * 32 * 8 * 8], Shape::new(vec![1, 32, 8, 8]));
+    let latents = cpu_tensor(vec![0.5f32; 32 * 8 * 8], Shape::new(vec![1, 32, 8, 8]));
     let rgb = vae.decode(&latents).expect("decode to RGB");
     assert_eq!(rgb.shape().dims(), &[1, 3, 64, 64]);
 }

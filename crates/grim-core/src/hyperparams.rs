@@ -147,7 +147,7 @@ impl HyperparameterExtractor {
             .map(|v| v as usize)
             .unwrap_or_else(|| {
                 if num_heads > 0 {
-                    hidden_size / num_heads
+                    hidden_size.checked_div(num_heads).unwrap_or(hidden_size)
                 } else {
                     128
                 }

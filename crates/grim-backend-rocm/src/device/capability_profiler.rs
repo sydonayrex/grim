@@ -59,13 +59,17 @@ struct ProfilerState {
     prev_throttle: Vec<f32>,
 }
 
+impl Default for CapabilityProfiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CapabilityProfiler {
     /// Create a new profiler. Blocks for one initial sweep (~5 ms per GPU).
     pub fn new() -> Self {
         let num_gpus = enumerate_devices().unwrap_or(0);
-        let caps = (0..num_gpus)
-            .map(|ord| measure_capability(ord))
-            .collect::<Vec<_>>();
+        let caps = (0..num_gpus).map(measure_capability).collect::<Vec<_>>();
         let prev_throttle = caps.iter().map(|c| c.throttle_pct).collect();
         Self {
             inner: Arc::new(Mutex::new(ProfilerState {
@@ -348,10 +352,10 @@ fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32
             rocblas_datatype::f16_r,
             n_dim,
             &beta as *const f32 as *const core::ffi::c_void,
-            d_d as *const core::ffi::c_void,
+            d_d,
             rocblas_datatype::f32_r,
             n_dim,
-            d_d as *mut core::ffi::c_void,
+            d_d,
             rocblas_datatype::f32_r,
             n_dim,
             rocblas_datatype::f32_r,
@@ -687,7 +691,7 @@ mod tests {
         }
         let profiler = CapabilityProfiler::new();
         let caps = profiler.capabilities();
-        assert!(caps.len() >= 1);
+        assert!(!caps.is_empty());
         for cap in &caps {
             assert!(
                 cap.tflops_fp16 > 0.0,
@@ -755,12 +759,12 @@ mod tests {
             return;
         }
         for ord in 0..n {
-            match compute_utilization(ord) {
-                Some(pct) => assert!(
+            // rsmi absent on this device — honest absence.
+            if let Some(pct) = compute_utilization(ord) {
+                assert!(
                     pct <= 100,
                     "compute_utilization({ord}) returned {pct}, expected 0..=100"
-                ),
-                None => {} // rsmi absent on this device — honest absence.
+                );
             }
         }
     }

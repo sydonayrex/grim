@@ -2,9 +2,9 @@
 //!
 //! Two tasks:
 //! - `ppl`   — windowed perplexity over the committed wikitext2 sample corpus.
-//!             Runs the model directly (no server). Deterministic.
+//!   Runs the model directly (no server). Deterministic.
 //! - `gsm8k` — exact-match grade of 100 committed questions against a running
-//!             server's `/v1/chat/completions` (temperature 0).
+//!   server's `/v1/chat/completions` (temperature 0).
 
 use grim_core::error::{Error, Result};
 use grim_core::model::CausalLm;
@@ -452,7 +452,9 @@ mod tests {
     fn window_size_constant_sane() {
         // Guard: the sliding window must exceed a single block so the
         // last-token prediction has real context.
-        assert!(PPL_WINDOW >= 512);
+        const {
+            assert!(PPL_WINDOW >= 512);
+        }
         assert!(PPL_WINDOW.is_power_of_two());
     }
 

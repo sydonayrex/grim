@@ -211,6 +211,9 @@ impl GraphCaptureManager {
             )));
         }
 
+        // DecodeGraph holds raw HIP graph handles; access is serialized by the cache mutex,
+        // so the Arc is deliberately shared despite the non-Send handle types.
+        #[allow(clippy::arc_with_non_send_sync)]
         let g = Arc::new(DecodeGraph { graph, exec });
 
         // Insert + LRU bookkeeping + optional eviction.

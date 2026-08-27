@@ -355,8 +355,10 @@ mod tests {
         assert!(!loader.grants.request_metadata);
 
         // Explicit grants — only what's specified.
-        let mut grants = PluginGrants::default();
-        grants.network = true;
+        let grants = PluginGrants {
+            network: true,
+            ..PluginGrants::default()
+        };
         let loader2 = WasmPluginLoader::with_grants("net-plugin", limits, grants);
         assert!(loader2.grants.network);
         assert!(loader2.grants.filesystem.is_empty()); // still denied

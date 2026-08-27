@@ -1468,6 +1468,7 @@ impl VulkanDevice {
     /// dispatched with a host-computed `window_lo = max(0, cache_offset - w + 1)`
     /// lower bound (matching the ROCm/CUDA convention); otherwise the plain
     /// full-causal `QkvAttention` kernel runs.
+    #[allow(clippy::too_many_arguments)]
     pub fn qkv_attention_inner(
         &self,
         q: &dyn BackendStorage,
@@ -1517,7 +1518,7 @@ impl VulkanDevice {
 
         let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
         let total_work = (seq_len * num_heads) as u32;
-        let grid_x = (total_work + 255) / 256;
+        let grid_x = total_work.div_ceil(256);
 
         let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
 
@@ -1709,7 +1710,7 @@ fn run_compute_shader(
             });
         }
         let mut writes = Vec::with_capacity(buffers.len());
-        for i in 0..buffers.len() {
+        for (i, buf_info) in buf_infos.iter().enumerate() {
             writes.push(VkWriteDescriptorSet {
                 s_type: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 p_next: std::ptr::null(),
@@ -1718,7 +1719,7 @@ fn run_compute_shader(
                 dst_array_element: 0,
                 descriptor_count: 1,
                 descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                p_buffer_info: &buf_infos[i],
+                p_buffer_info: buf_info,
                 p_image_info: std::ptr::null(),
                 p_texel_buffer_view: std::ptr::null(),
             });
@@ -1930,6 +1931,7 @@ fn push_params(size: u32, dim: u32, k: u32, n: u32, m: u32, eps: f32) -> [u32; 6
 /// backup2_bpw, backup2_codes_offset, backup2_scale_offset  // 3 u32
 /// grad_scale                        // 1 f32
 /// ```
+#[allow(clippy::too_many_arguments)]
 fn push_params_backward(
     k: u32,
     n: u32,
@@ -1998,7 +2000,7 @@ impl VulkanDevice {
         let total = x.shape().elem_count();
         let (kernel, out_bytes, output_dtype) = match format {
             QuantFormat::Q8_0 => {
-                let n_blocks = (total + 31) / 32;
+                let n_blocks = total.div_ceil(32);
                 (
                     VulkanKernel::QuantQ80,
                     n_blocks * 34,
@@ -2056,8 +2058,8 @@ impl VulkanDevice {
         let buffers = [x_s.buffer, out_storage.buffer];
         let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
         let grid_x = match kernel {
-            VulkanKernel::QuantQ80 => ((total + 31) / 32) as u32,
-            VulkanKernel::QuantFp8 => ((total + 255) / 256) as u32,
+            VulkanKernel::QuantQ80 => total.div_ceil(32) as u32,
+            VulkanKernel::QuantFp8 => total.div_ceil(256) as u32,
             _ => unreachable!(),
         };
 
@@ -2078,6 +2080,7 @@ impl VulkanDevice {
     /// Weights are row-major per expert: `gate_w`/`up_w` are
     /// `[num_experts, inter, hidden]`, `down_w` is `[num_experts, hidden, inter]`.
     /// `x` is `[batch, hidden]`. `out` is `[batch, hidden]` on this device.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_fused_dispatch(
         &self,
         x: &dyn BackendStorage,
@@ -2292,7 +2295,7 @@ impl VulkanDevice {
                 got: b_dims.to_vec(),
             });
         }
-        if out_shape.dims() != &[m, n] {
+        if out_shape.dims() != [m, n] {
             return Err(Error::Shape(format!(
                 "expected out [{m},{n}], got {out_shape:?}"
             )));
@@ -2340,8 +2343,8 @@ impl VulkanDevice {
 
         // Try GPU dispatch first
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-        let grid_x = ((n + tile_config.block_n as usize - 1) / tile_config.block_n as usize) as u32;
-        let grid_y = ((m + tile_config.block_m as usize - 1) / tile_config.block_m as usize) as u32;
+        let grid_x = n.div_ceil(tile_config.block_n as usize) as u32;
+        let grid_y = m.div_ceil(tile_config.block_m as usize) as u32;
 
         let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
 
@@ -2442,7 +2445,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Add).to_vec();
 
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
 
@@ -2485,7 +2488,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Mul).to_vec();
 
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
 
@@ -2529,7 +2532,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::SiluMul).to_vec();
 
         let buffers = [gate_s.buffer, up_s.buffer, out_storage.buffer];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
 
@@ -2584,7 +2587,7 @@ impl BackendDevice for VulkanDevice {
             ctx,
             spirv_for(VulkanKernel::SiluMulBackward),
             &buffers,
-            ((out_shape.elem_count() + 255) / 256) as u32,
+            out_shape.elem_count().div_ceil(256) as u32,
             1,
             1,
             Some(&push),
@@ -2631,7 +2634,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::RmsNorm).to_vec();
 
         let buffers = [x_s.buffer, w_s.buffer, out_storage.buffer];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
 
@@ -2706,7 +2709,7 @@ impl BackendDevice for VulkanDevice {
             y_storage.buffer,
             norm_storage.buffer,
         ];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
 
@@ -2754,7 +2757,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Softmax).to_vec();
 
         let buffers = [x_s.buffer, out_storage.buffer];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, 0.0);
 
@@ -2867,7 +2870,7 @@ impl BackendDevice for VulkanDevice {
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         let buffers = [p_s.buffer, g_s.buffer, m_s.buffer, v_s.buffer];
-        let grid_x = ((total + 255) / 256) as u32;
+        let grid_x = total.div_ceil(256) as u32;
 
         let push = [
             total as u32,
@@ -2926,7 +2929,7 @@ impl BackendDevice for VulkanDevice {
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         let buffers = [p_s.buffer, g_s.buffer, m_s.buffer];
-        let grid_x = ((total + 255) / 256) as u32;
+        let grid_x = total.div_ceil(256) as u32;
 
         let push = [
             total as u32,
@@ -3016,7 +3019,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Embedding).to_vec();
 
         let buffers = [w_s.buffer, idx_storage.buffer, out_storage.buffer];
-        let grid_x = ((size + 255) / 256) as u32;
+        let grid_x = size.div_ceil(256) as u32;
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, 0.0);
 
@@ -3194,7 +3197,7 @@ impl BackendDevice for VulkanDevice {
             num_heads as u32,
             num_kv_heads as f32,
         );
-        let grid_x = ((head_dim + 31) / 32) as u32;
+        let grid_x = head_dim.div_ceil(32) as u32;
 
         if let Some(w) = window {
             // Sliding-window paged: dispatch QkvAttentionPagedSwa. window_lo is
@@ -3396,7 +3399,7 @@ impl BackendDevice for VulkanDevice {
             dims[1] as u32,
             0.0,
         );
-        let grid_x = ((dims[2] + 31) / 32) as u32;
+        let grid_x = dims[2].div_ceil(32) as u32;
         run_compute_shader(
             ctx,
             spirv_for(VulkanKernel::KvDequantAttention),
@@ -3436,7 +3439,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::MulScalar).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
         let n = out_shape.elem_count();
-        let grid_x = ((n + 255) / 256) as u32;
+        let grid_x = n.div_ceil(256) as u32;
 
         let push = push_params(n as u32, 0, 0, 0, 0, scalar);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
@@ -3470,7 +3473,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Sqrt).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
         let n = out_shape.elem_count();
-        let grid_x = ((n + 255) / 256) as u32;
+        let grid_x = n.div_ceil(256) as u32;
 
         let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
@@ -3504,7 +3507,7 @@ impl BackendDevice for VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Recip).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
         let n = out_shape.elem_count();
-        let grid_x = ((n + 255) / 256) as u32;
+        let grid_x = n.div_ceil(256) as u32;
 
         let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
@@ -3618,7 +3621,7 @@ impl BackendDevice for VulkanDevice {
                 * rotary_half
                     .max(if copy_len > 0 { copy_len } else { 0 })
                     .max(1)) as u32;
-            let grid_x = (total + 255) / 256;
+            let grid_x = total.div_ceil(256);
             run_compute_shader_kernel(
                 ctx,
                 VulkanKernel::RopeYarn,
@@ -3631,7 +3634,7 @@ impl BackendDevice for VulkanDevice {
         } else {
             // Plain full-rotary RoPE.
             let total_pairs = (num_tokens * num_heads * (dim / 2)) as u32;
-            let grid_x = (total_pairs + 255) / 256;
+            let grid_x = total_pairs.div_ceil(256);
             let push = push_params(num_tokens as u32, dim as u32, num_heads as u32, 0, 0, base);
             run_compute_shader_kernel(
                 ctx,
@@ -3721,7 +3724,7 @@ impl BackendDevice for VulkanDevice {
                     let x_t = x_v[x_idx];
                     let mut y_t = d_val * x_t;
 
-                    for s in 0..dim_dstate {
+                    for (s, h_s) in h.iter_mut().enumerate() {
                         let a_idx = d_idx * dim_dstate + s;
                         let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
                         let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
@@ -3738,8 +3741,8 @@ impl BackendDevice for VulkanDevice {
                             1.0
                         };
 
-                        h[s] = a_val * h[s] + x_t * b_val;
-                        y_t += c_val * h[s];
+                        *h_s = a_val * *h_s + x_t * b_val;
+                        y_t += c_val * *h_s;
                     }
                     out[x_idx] = y_t;
                 }
@@ -3998,8 +4001,8 @@ impl BackendDevice for VulkanDevice {
                         ctx.physical_device,
                     ) {
                         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-                        let grid_x = ((n + 15) / 16) as u32;
-                        let grid_y = ((m + 15) / 16) as u32;
+                        let grid_x = n.div_ceil(16) as u32;
+                        let grid_y = m.div_ceil(16) as u32;
                         let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
 
                         match run_compute_shader_kernel(
@@ -4195,8 +4198,8 @@ impl BackendDevice for VulkanDevice {
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-        let grid_x = ((n + 15) / 16) as u32;
-        let grid_y = ((m + 15) / 16) as u32;
+        let grid_x = n.div_ceil(16) as u32;
+        let grid_y = m.div_ceil(16) as u32;
         let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
 
         run_compute_shader_kernel(ctx, kernel, &buffers, grid_x, grid_y, 1, Some(&push))?;
@@ -4266,8 +4269,7 @@ impl BackendDevice for VulkanDevice {
                     .collect();
                 let values: Vec<u8> = outlier_values_bits
                     .iter()
-                    .map(|v| f32::from_bits(*v).to_ne_bytes())
-                    .flatten()
+                    .flat_map(|v| f32::from_bits(*v).to_ne_bytes())
                     .collect();
                 (indices, values)
             }
@@ -4411,8 +4413,8 @@ impl BackendDevice for VulkanDevice {
             ctx,
             &spirv,
             &buffers,
-            ((k + 15) / 16) as u32,
-            ((m + 15) / 16) as u32,
+            k.div_ceil(16) as u32,
+            m.div_ceil(16) as u32,
             1,
             Some(&push),
         )?;
@@ -4487,7 +4489,7 @@ impl BackendDevice for VulkanDevice {
                         };
                         if zeroed {
                             let spirv = spirv_for(VulkanKernel::AllReduce).to_vec();
-                            let grid_x = ((total + 255) / 256) as u32;
+                            let grid_x = total.div_ceil(256) as u32;
                             let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
                             let mut ok = true;
                             for input in inputs {
@@ -4601,8 +4603,8 @@ impl BackendDevice for VulkanDevice {
                                 let s = storage.as_any().downcast_ref::<VulkanStorage>().unwrap();
                                 let n_src = s.shape().dims().get(1).copied().unwrap_or(0);
                                 let buffers = [s.buffer, out_storage.buffer];
-                                let grid_x = ((n_src + 15) / 16) as u32;
-                                let grid_y = ((m + 15) / 16) as u32;
+                                let grid_x = n_src.div_ceil(16) as u32;
+                                let grid_y = m.div_ceil(16) as u32;
                                 let push = push_params(
                                     n_src as u32,
                                     col_offset as u32,
@@ -4948,6 +4950,53 @@ fn f32_to_bf16_to_f32(val: f32) -> f32 {
         let f32_bits = sign | (exp << 23) | (bf16_mant << 16);
         f32::from_bits(f32_bits)
     }
+}
+
+/// Query `(free_bytes, total_bytes)` memory on Vulkan device `ordinal`.
+pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
+    if let Ok(guard) = GLOBAL_CONTEXT.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            unsafe {
+                let mut props = VkPhysicalDeviceMemoryProperties {
+                    memory_type_count: 0,
+                    memory_types: [VkMemoryType {
+                        property_flags: 0,
+                        heap_index: 0,
+                    }; 32],
+                    memory_heap_count: 0,
+                    memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
+                };
+                vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut props);
+
+                // Sum all device-local heaps (VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1).
+                let mut total_device_local: u64 = 0;
+                for i in 0..(props.memory_heap_count as usize) {
+                    if (props.memory_heaps[i].flags & 1) != 0 {
+                        total_device_local += props.memory_heaps[i].size;
+                    }
+                }
+
+                if total_device_local == 0 {
+                    return None;
+                }
+
+                // Without VK_EXT_memory_budget, live free memory is unavailable.
+                // Return None so callers know free memory querying is unsupported.
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+/// WI-1: live compute utilization for `ordinal`.
+///
+/// Scope note (per WI-1): Vulkan has no core-spec utilization query (vendor
+/// extensions only). Returns `None` rather than fabricating a value from
+/// indirect signals — `null` on the wire is the honest answer.
+pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -5369,7 +5418,7 @@ mod tests {
         let expected_0 = sig_1 * 1.0 * 2.0;
 
         let sig_neg1 = 1.0f32 / (1.0f32 + (1.0f32).exp());
-        let expected_1 = (-1.0f32 * sig_neg1) * 3.0;
+        let expected_1 = -sig_neg1 * 3.0;
 
         close_vulkan(res[0], expected_0, "vulkan_silu_mul w0");
         close_vulkan(res[1], expected_1, "vulkan_silu_mul w1");
@@ -5521,18 +5570,10 @@ mod tests {
         let q_shape = Shape::new(vec![1, 2, 2]);
         let page_shape = Shape::new(vec![1, 2, 1, 2]);
         let table_shape = Shape::new(vec![1, 1]);
-        let q = dev
-            .from_cpu(&vec![1.0f32; 4], &q_shape, DType::F32)
-            .unwrap();
-        let k = dev
-            .from_cpu(&vec![1.0f32; 4], &page_shape, DType::F32)
-            .unwrap();
-        let v = dev
-            .from_cpu(&vec![2.0f32; 4], &page_shape, DType::F32)
-            .unwrap();
-        let table = dev
-            .from_cpu(&vec![0.0f32], &table_shape, DType::F32)
-            .unwrap();
+        let q = dev.from_cpu(&[1.0f32; 4], &q_shape, DType::F32).unwrap();
+        let k = dev.from_cpu(&[1.0f32; 4], &page_shape, DType::F32).unwrap();
+        let v = dev.from_cpu(&[2.0f32; 4], &page_shape, DType::F32).unwrap();
+        let table = dev.from_cpu(&[0.0f32], &table_shape, DType::F32).unwrap();
         let (out, _) = dev
             .qkv_attention_paged(
                 q.as_ref(),
@@ -5562,17 +5603,11 @@ mod tests {
         let q_shape = Shape::new(vec![1, 2, 2, 2]);
         let kv_shape = Shape::new(vec![2, 1, 2]);
         let parent_shape = Shape::new(vec![2]);
-        let q = dev
-            .from_cpu(&vec![1.0f32; 8], &q_shape, DType::F32)
-            .unwrap();
-        let k = dev
-            .from_cpu(&vec![1.0f32; 4], &kv_shape, DType::F32)
-            .unwrap();
-        let v = dev
-            .from_cpu(&vec![2.0f32; 4], &kv_shape, DType::F32)
-            .unwrap();
+        let q = dev.from_cpu(&[1.0f32; 8], &q_shape, DType::F32).unwrap();
+        let k = dev.from_cpu(&[1.0f32; 4], &kv_shape, DType::F32).unwrap();
+        let v = dev.from_cpu(&[2.0f32; 4], &kv_shape, DType::F32).unwrap();
         let parents = dev
-            .from_cpu(&vec![0.0f32, 0.0], &parent_shape, DType::F32)
+            .from_cpu(&[0.0f32, 0.0], &parent_shape, DType::F32)
             .unwrap();
         let (out, _) = dev
             .tree_attention(
@@ -5590,51 +5625,4 @@ mod tests {
             close_vulkan(value, 2.0, "tree GQA");
         }
     }
-}
-
-/// Query `(free_bytes, total_bytes)` memory on Vulkan device `ordinal`.
-pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
-    if let Ok(guard) = GLOBAL_CONTEXT.lock() {
-        if let Some(ctx) = guard.as_ref() {
-            unsafe {
-                let mut props = VkPhysicalDeviceMemoryProperties {
-                    memory_type_count: 0,
-                    memory_types: [VkMemoryType {
-                        property_flags: 0,
-                        heap_index: 0,
-                    }; 32],
-                    memory_heap_count: 0,
-                    memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
-                };
-                vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut props);
-
-                // Sum all device-local heaps (VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1).
-                let mut total_device_local: u64 = 0;
-                for i in 0..(props.memory_heap_count as usize) {
-                    if (props.memory_heaps[i].flags & 1) != 0 {
-                        total_device_local += props.memory_heaps[i].size;
-                    }
-                }
-
-                if total_device_local == 0 {
-                    return None;
-                }
-
-                // Without VK_EXT_memory_budget, live free memory is unavailable.
-                // Return None so callers know free memory querying is unsupported.
-                return None;
-            }
-        }
-    }
-
-    None
-}
-
-/// WI-1: live compute utilization for `ordinal`.
-///
-/// Scope note (per WI-1): Vulkan has no core-spec utilization query (vendor
-/// extensions only). Returns `None` rather than fabricating a value from
-/// indirect signals — `null` on the wire is the honest answer.
-pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
-    None
 }

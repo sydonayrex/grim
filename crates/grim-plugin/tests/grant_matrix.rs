@@ -4,6 +4,7 @@
 //!   1. default manifest → all grants denied (empty linker; WASI imports trap)
 //!   2. filesystem grant without scopes → clear error at plugin-load time
 //!   3. filesystem grant with scopes → manifest parses, scopes recorded
+//!
 //! plus loader-level enforcement of grants this build cannot link.
 
 use grim_plugin::{PluginGrants, PluginLimits, WasmPluginLoader, parse_manifest};
@@ -157,8 +158,10 @@ fn default_grants_load_but_wasi_imports_trap() {
 fn network_grant_is_rejected_at_load() {
     // A network grant cannot be linked in this build — it must error loudly
     // at plugin-load time, not degrade to a silent trap.
-    let mut grants = PluginGrants::default();
-    grants.network = true;
+    let grants = PluginGrants {
+        network: true,
+        ..PluginGrants::default()
+    };
     let loader = WasmPluginLoader::with_grants("net-granted", limits(), grants);
     let err = match loader.create_sampler(&minimal_wasm()) {
         Err(e) => e,
@@ -172,8 +175,10 @@ fn network_grant_is_rejected_at_load() {
 fn filesystem_grant_is_rejected_at_load() {
     // Scoped or not, a filesystem grant cannot be linked in this build —
     // clear error at load time instead of an unhonored grant.
-    let mut grants = PluginGrants::default();
-    grants.filesystem = vec!["testdata".to_string()];
+    let grants = PluginGrants {
+        filesystem: vec!["testdata".to_string()],
+        ..PluginGrants::default()
+    };
     let loader = WasmPluginLoader::with_grants("fs-granted", limits(), grants);
     let err = match loader.create_sampler(&minimal_wasm()) {
         Err(e) => e,

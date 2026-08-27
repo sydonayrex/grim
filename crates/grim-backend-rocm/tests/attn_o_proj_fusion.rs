@@ -17,7 +17,7 @@ fn gpu_device() -> Option<RocmDevice> {
 
 fn fill(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
-        .map(|i| ((seed + i as f32 * 0.61).sin() * 0.5 - 0.1) as f32)
+        .map(|i| (seed + i as f32 * 0.61).sin() * 0.5 - 0.1)
         .collect()
 }
 

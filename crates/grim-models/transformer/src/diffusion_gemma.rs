@@ -264,7 +264,7 @@ impl DiffusionGemmaBlock {
             .iter()
             .zip(u_v.iter())
             .map(|(&g, &u)| {
-                let gelu = 0.5 * g * (1.0 + ((0.7978845608 * (g + 0.044715 * g * g * g)).tanh()));
+                let gelu = 0.5 * g * (1.0 + ((0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()));
                 gelu * u
             })
             .collect();

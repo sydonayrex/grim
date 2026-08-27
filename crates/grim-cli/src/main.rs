@@ -856,7 +856,7 @@ fn offer_rocml_conversion(model_ref: &str, preferred: Option<&str>) {
     let profile = match preferred {
         Some("auto") | None => detect_host_rocml_profile(),
         Some(p) => {
-            // Validate against known profile names (convert re-parses via GrimRocmlProfile::from_str).
+            // Validate against known profile names (convert re-parses via GrimRocmlProfile::parse).
             let valid = matches!(
                 p.to_lowercase().as_str(),
                 "cdna2" | "cdna3" | "rdna2" | "rdna3" | "rdna4" | "all"
@@ -1629,7 +1629,7 @@ async fn main() -> Result<()> {
                 seed,
                 train_dtype,
                 use_spectral_qlora: false,
-                qat_mxfp4: qat_mxfp4,
+                qat_mxfp4,
                 checkpoint_segs,
                 lora_plus_ratio: effective_lora_plus,
                 relora_reset_steps: effective_relora_steps,

@@ -54,7 +54,7 @@ fn float_reference(
             let kv_head = h / q_per_kv;
             let mut scores = vec![0.0f32; num_tokens];
             let mut max_score = f32::NEG_INFINITY;
-            for kt in 0..num_tokens {
+            for (kt, score) in scores.iter_mut().enumerate() {
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     let q_idx = (t * num_heads + h) * head_dim + d;
@@ -62,7 +62,7 @@ fn float_reference(
                     dot += q[q_idx] * k[k_idx];
                 }
                 let s = dot * scale;
-                scores[kt] = s;
+                *score = s;
                 if s > max_score {
                     max_score = s;
                 }
@@ -74,9 +74,9 @@ fn float_reference(
             }
             for d in 0..head_dim {
                 let mut val = 0.0f32;
-                for kt in 0..num_tokens {
+                for (kt, &score) in scores.iter().enumerate() {
                     let v_idx = (kt * num_kv_heads + kv_head) * head_dim + d;
-                    val += scores[kt] * v[v_idx];
+                    val += score * v[v_idx];
                 }
                 let o_idx = (t * num_heads + h) * head_dim + d;
                 out[o_idx] = val / sum;

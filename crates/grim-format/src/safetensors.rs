@@ -49,6 +49,7 @@ impl SafetensorInfo {
 
 /// Parse the safetensors header JSON and return tensor index entries and header metadata.
 /// Does NOT read tensor data — call `read_safetensor_bytes` per tensor.
+#[allow(clippy::type_complexity)]
 pub fn read_safetensors_header<R: Read + Seek>(
     mut reader: R,
 ) -> Result<(
@@ -133,7 +134,7 @@ pub fn read_safetensors_header<R: Read + Seek>(
             .ok_or_else(|| Error::Backend(format!("missing data_offsets for '{key}'")))?;
 
         let data_start = data_offsets
-            .get(0)
+            .first()
             .and_then(|v| v.as_u64())
             .ok_or_else(|| Error::Backend(format!("invalid data_offsets[0] for '{key}'")))?;
         let data_end = data_offsets

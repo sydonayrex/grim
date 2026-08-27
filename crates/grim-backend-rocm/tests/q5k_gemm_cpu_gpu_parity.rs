@@ -23,10 +23,7 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    match panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")) {
-        Ok(d) => Some(d),
-        Err(_) => None,
-    }
+    panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")).ok()
 }
 
 fn f16_to_f32(b0: u8, b1: u8) -> f32 {
@@ -38,7 +35,7 @@ fn f16_to_f32(b0: u8, b1: u8) -> f32 {
         if mant == 0 {
             return if sign == 1 { -0.0 } else { 0.0 };
         }
-        let res = (mant as f32) / 1024.0 * 0.000061_0351_5625;
+        let res = (mant as f32) / 1024.0 * 0.000_061_035_156;
         return if sign == 1 { -res } else { res };
     }
     if exp == 31 {
@@ -89,22 +86,22 @@ fn dequant_q5k_element_host(block: &[u8; 176], in_sb: usize) -> f32 {
 
 fn build_block(seed: u32) -> [u8; 176] {
     let mut b = [0u8; 176];
-    for i in 0..2usize {
-        b[i] = (i.wrapping_mul(7).wrapping_add(seed as usize)) as u8;
+    for (i, v) in b[..2].iter_mut().enumerate() {
+        *v = (i.wrapping_mul(7).wrapping_add(seed as usize)) as u8;
     }
     // d = 1.0 fp16 (00 3C), dmin = 0.0 fp16 (00 00)
     b[0] = 0x00;
     b[1] = 0x3C;
     b[2] = 0x00;
     b[3] = 0x00;
-    for i in 4..16usize {
-        b[i] = (i.wrapping_mul(11).wrapping_add(seed as usize)) as u8;
+    for (i, v) in b[4..16].iter_mut().enumerate() {
+        *v = ((i + 4).wrapping_mul(11).wrapping_add(seed as usize)) as u8;
     }
-    for i in 16..48usize {
-        b[i] = (i.wrapping_mul(13).wrapping_add(seed as usize) ^ 0x55) as u8;
+    for (i, v) in b[16..48].iter_mut().enumerate() {
+        *v = ((i + 16).wrapping_mul(13).wrapping_add(seed as usize) ^ 0x55) as u8;
     }
-    for i in 48..176usize {
-        b[i] = (i.wrapping_mul(17).wrapping_add(seed as usize)) as u8;
+    for (i, v) in b[48..176].iter_mut().enumerate() {
+        *v = ((i + 48).wrapping_mul(17).wrapping_add(seed as usize)) as u8;
     }
     b
 }
@@ -115,9 +112,9 @@ fn test_q5k_element_matches_cpu_reference_across_seeds() {
         let block = build_block(seed);
         let cpu_all = dequant_q5k(&block, 256).expect("dequant_q5k");
         let mut max_err: f32 = 0.0;
-        for i in 0..256usize {
+        for (i, &cpu_ref) in cpu_all.iter().enumerate() {
             let elem = dequant_q5k_element_host(&block, i);
-            let err = (elem - cpu_all[i]).abs();
+            let err = (elem - cpu_ref).abs();
             if err > max_err {
                 max_err = err;
             }

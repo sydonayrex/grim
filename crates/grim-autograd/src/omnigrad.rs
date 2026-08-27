@@ -78,9 +78,11 @@ mod tests {
 
     #[test]
     fn test_omnigrad_route_scales_grad() {
-        let mut config = OmniGradConfig::default();
-        config.per_layer_lr = vec![0.5, 2.0];
-        config.noise_threshold = 100.0; // disable clipping for this test
+        let config = OmniGradConfig {
+            per_layer_lr: vec![0.5, 2.0],
+            noise_threshold: 100.0, // disable clipping for this test
+            ..OmniGradConfig::default()
+        };
         let mut router = OmniGradRouter::new(config.clone(), HashMap::new());
         router.advance_phase(10, 10);
 

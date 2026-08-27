@@ -614,12 +614,32 @@ mod tests {
         let a_id = tape.register_param(pid_a, a_data.clone());
         let b1_id = tape.register_param(pid_b, b1_data.clone());
         let base1 = tape.register(cpu_tensor(vec![0.0, 0.0], Shape::new(vec![1, 2])));
-        let out1 = tape.record_lora_apply(base1, x, a_id, b1_id, cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])), 1.0, 1, pid_a, pid_b);
+        let out1 = tape.record_lora_apply(
+            base1,
+            x,
+            a_id,
+            b1_id,
+            cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])),
+            1.0,
+            1,
+            pid_a,
+            pid_b,
+        );
 
         let b2_pid = ParamId::b(0, 2, LoRAInjectionPoint::VProj);
         let b2_id = tape.register_param(b2_pid, b2_data.clone());
         let base2 = tape.register(cpu_tensor(vec![0.0, 0.0], Shape::new(vec![1, 2])));
-        let out2 = tape.record_lora_apply(base2, out1, a_id, b2_id, cpu_tensor(vec![2.0, 2.0], Shape::new(vec![1, 2])), 1.0, 1, pid_a, b2_pid);
+        let out2 = tape.record_lora_apply(
+            base2,
+            out1,
+            a_id,
+            b2_id,
+            cpu_tensor(vec![2.0, 2.0], Shape::new(vec![1, 2])),
+            1.0,
+            1,
+            pid_a,
+            b2_pid,
+        );
 
         params.insert(crate::param::TrainableParam::new(pid_a, a_data.clone()).unwrap());
         params.insert(crate::param::TrainableParam::new(pid_b, b1_data).unwrap());
@@ -628,7 +648,8 @@ mod tests {
         let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
         let mut optimizer =
             crate::adamw::Optimizer::new(crate::adamw::OptimizerKind::AdamW, 1e-3).unwrap();
-        let res = crate::backward::backward_step(&tape, loss_grad, out2, &mut params, &mut optimizer);
+        let res =
+            crate::backward::backward_step(&tape, loss_grad, out2, &mut params, &mut optimizer);
         let err = match res {
             Err(e) => e,
             Ok(_) => panic!("backward_step must refuse a multi-entry parameter"),

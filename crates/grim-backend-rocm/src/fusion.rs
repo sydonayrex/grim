@@ -54,7 +54,7 @@ impl Default for QkvAttentionFusionConfig {
 impl RmsNormMatMulFusionConfig {
     pub fn hip_launch_params(&self) -> HipKernelLaunch {
         let block_dim_x = if self.wavefront_size == 32 { 128 } else { 256 };
-        let grid_x = (self.intermediate_size + block_dim_x - 1) / block_dim_x;
+        let grid_x = self.intermediate_size.div_ceil(block_dim_x);
         HipKernelLaunch {
             grid_dim: hipDim3::new(grid_x as u32, 1, 1),
             block_dim: hipDim3::new(block_dim_x as u32, 1, 1),

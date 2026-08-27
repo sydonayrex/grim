@@ -11,7 +11,7 @@
 //! Device-gated: `GRIM_GPU_TEST=1`.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::{BackendDevice, BackendStorage};
+use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Shape};
 
 fn gpu_ready() -> bool {

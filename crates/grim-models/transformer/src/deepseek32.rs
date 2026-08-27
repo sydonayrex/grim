@@ -364,7 +364,7 @@ impl DeepSeek32Mla {
                 let q_rp = &q_rope_v[(s * nh + h) * rope_d..(s * nh + h + 1) * rope_d];
 
                 let mut scores = vec![0.0f32; causal_limit + 1];
-                for t in 0..=causal_limit {
+                for (t, score) in scores.iter_mut().enumerate().take(causal_limit + 1) {
                     let lb = t * row;
                     let dot_c: f32 = q_abs
                         .iter()
@@ -376,7 +376,7 @@ impl DeepSeek32Mla {
                         .zip(&latent_all_v[lb + rank..lb + row])
                         .map(|(a, b)| a * b)
                         .sum();
-                    scores[t] = (dot_c + dot_r) * scale;
+                    *score = (dot_c + dot_r) * scale;
                 }
 
                 let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -424,6 +424,8 @@ impl DeepSeek32Mla {
     /// full multi-head `w_uv` would repeat one head's rows for all heads.
     /// Instead the softmax-normalized latent is read back and projected per
     /// head through `w_vc` here.
+    // Kept as a cohesive internal decode step; splitting would obscure the attention math.
+    #[allow(clippy::too_many_arguments)]
     fn gpu_absorbed_decode(
         &self,
         q_absorbed: &[f32],

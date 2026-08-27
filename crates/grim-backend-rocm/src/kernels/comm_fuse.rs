@@ -173,7 +173,7 @@ mod tests {
         let result = comm_fuse_fan_in(&[(&shard0, 2), (&shard1, 2)], m, n_total, &p).unwrap();
 
         // Reference: assembled = [[1,2,5,6],[3,4,7,8]]
-        let expected = vec![1.0f32, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0];
+        let expected = [1.0f32, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0];
         let max_diff = result
             .data
             .iter()

@@ -47,7 +47,9 @@ const K: usize = 128;
 const OUT: usize = 256;
 
 fn build_layer() -> Scythe2Linear {
-    let w_data: Vec<f32> = (0..OUT * K).map(|i| ((i % 31) as f32) * 0.02 - 0.3).collect();
+    let w_data: Vec<f32> = (0..OUT * K)
+        .map(|i| ((i % 31) as f32) * 0.02 - 0.3)
+        .collect();
     // Full weight lives on rank 0; shards are sliced from it host-side and
     // pinned to their rank devices by the residency cache.
     let full_weight = make_rocm_tensor(&w_data, &[OUT, K], 0);
@@ -65,11 +67,7 @@ fn make_x() -> Tensor {
 }
 
 fn two_rank_placement(row: bool) -> ScythePlacement {
-    let part = if row {
-        vec![0.5, 0.5]
-    } else {
-        vec![0.6, 0.4]
-    };
+    let part = if row { vec![0.5, 0.5] } else { vec![0.6, 0.4] };
     ScythePlacement {
         ranks: vec![0, 1],
         partition: part,
@@ -100,10 +98,18 @@ fn reference(x: &Tensor, w_flat_host: &[f32], m: usize, k: usize, n_out: usize) 
         )
         .expect("a");
     let b = dev
-        .from_cpu(&w_t, &grim_tensor::Shape::from_slice(&[k, n_out]), DType::F32)
+        .from_cpu(
+            &w_t,
+            &grim_tensor::Shape::from_slice(&[k, n_out]),
+            DType::F32,
+        )
         .expect("b");
     let (out, h) = dev
-        .matmul(a.as_ref(), b.as_ref(), &grim_tensor::Shape::from_slice(&[m, n_out]))
+        .matmul(
+            a.as_ref(),
+            b.as_ref(),
+            &grim_tensor::Shape::from_slice(&[m, n_out]),
+        )
         .expect("ref matmul");
     h.synchronize().expect("sync");
     out.to_cpu_vec_f32().expect("ref readback")
@@ -121,12 +127,16 @@ fn sb5_two_rank_col_and_row_parity_on_rocm() {
     if !gpu_ready() {
         return;
     }
-    let w_host: Vec<f32> = (0..OUT * K).map(|i| ((i % 31) as f32) * 0.02 - 0.3).collect();
+    let w_host: Vec<f32> = (0..OUT * K)
+        .map(|i| ((i % 31) as f32) * 0.02 - 0.3)
+        .collect();
     let layer = build_layer();
     let x = make_x();
 
     // Column-parallel [0.6, 0.4].
-    let y_col = layer.forward_placed(&x, &two_rank_placement(false), false).unwrap();
+    let y_col = layer
+        .forward_placed(&x, &two_rank_placement(false), false)
+        .unwrap();
     let yv = y_col.storage().to_cpu_vec_f32().unwrap();
     let refr = reference(&x, &w_host, M, K, OUT);
     let d_col = max_abs_diff(&yv, &refr);
@@ -134,14 +144,18 @@ fn sb5_two_rank_col_and_row_parity_on_rocm() {
     assert!(d_col < 1e-3, "col-parallel parity broken: {d_col:.3e}");
 
     // Row-parallel [0.5, 0.5].
-    let y_row = layer.forward_placed(&x, &two_rank_placement(true), true).unwrap();
+    let y_row = layer
+        .forward_placed(&x, &two_rank_placement(true), true)
+        .unwrap();
     let yvr = y_row.storage().to_cpu_vec_f32().unwrap();
     let d_row = max_abs_diff(&yvr, &refr);
     println!("[sb5] row-parallel max_abs_diff={d_row:.3e}");
     assert!(d_row < 1e-3, "row-parallel parity broken: {d_row:.3e}");
 
     // Residency-cache reuse: a second forward must reproduce the first.
-    let y_col2 = layer.forward_placed(&x, &two_rank_placement(false), false).unwrap();
+    let y_col2 = layer
+        .forward_placed(&x, &two_rank_placement(false), false)
+        .unwrap();
     let d_re = max_abs_diff(&y_col2.storage().to_cpu_vec_f32().unwrap(), &refr);
     println!("[sb5] cached-reuse max_abs_diff={d_re:.3e}");
     assert!(d_re < 1e-3, "cached second pass diverged: {d_re:.3e}");

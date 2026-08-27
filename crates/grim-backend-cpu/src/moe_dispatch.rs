@@ -6,6 +6,7 @@ use crate::device::gemm_dispatch;
 
 /// Fused CPU MoE grouped dispatch: Top-K routing, expert token gather, grouped GEMM,
 /// SwiGLU gating, and weighted scatter reduction.
+#[allow(clippy::too_many_arguments)]
 pub fn moe_fused_dispatch(
     tokens: &[f32],
     gate_logits: &[f32],
@@ -152,6 +153,8 @@ impl PersistentMoeWorkerPool {
     }
 
     /// Dispatch partial MoE computation across the worker pool.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_partial(
         &self,
         tokens: &[f32],
@@ -193,6 +196,7 @@ impl PersistentMoeWorkerPool {
 /// computes ONLY the experts specified in `assigned_expert_ids` (Set $\mathcal{C}$ from
 /// the $q^*$ bandwidth-adaptive policy) and returns the weighted partial output vector.
 /// Evaluates tokens and assigned experts in parallel using physical core threads and SIMD.
+#[allow(clippy::too_many_arguments)]
 pub fn moe_cpu_partial_dispatch(
     tokens: &[f32],
     routed_expert_indices: &[usize],

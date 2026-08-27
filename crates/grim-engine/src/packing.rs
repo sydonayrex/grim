@@ -92,11 +92,11 @@ impl PackedBatch {
         }
         let mut seq_of = vec![0usize; t];
         let mut cur = 0usize;
-        for pos in 0..t {
+        for (pos, slot) in seq_of.iter_mut().enumerate() {
             while cur + 1 < self.seqlen_offsets.len() && pos >= self.seqlen_offsets[cur + 1] {
                 cur += 1;
             }
-            seq_of[pos] = cur;
+            *slot = cur;
         }
         for i in 0..t {
             for j in 0..=i {
@@ -111,7 +111,7 @@ impl PackedBatch {
     /// Set the first target token of each packed sequence to `ignore_index`,
     /// because its prediction depends on the previous sequence's last token
     /// (cross-boundary). Mirrors Unsloth `mask_packed_sequence_boundaries`.
-    pub fn boundary_loss_mask(&self, targets: &mut Vec<u32>, ignore_index: u32) {
+    pub fn boundary_loss_mask(&self, targets: &mut [u32], ignore_index: u32) {
         for &start in &self.seqlen_offsets {
             if start < targets.len() {
                 targets[start] = ignore_index;

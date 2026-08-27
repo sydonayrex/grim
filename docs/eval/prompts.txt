@@ -1,0 +1,20 @@
+Explain the difference between TCP and UDP, and when each is appropriate.
+Write a short story about a lighthouse keeper who discovers a message in a bottle.
+Summarize the causes and consequences of the Industrial Revolution in three paragraphs.
+Given a list of daily temperatures, describe an efficient algorithm to find how many days until warmer weather for each day.
+Compare and contrast supervised, unsupervised, and reinforcement learning with concrete examples.
+Draft a polite email declining a meeting invitation while proposing an alternative time.
+Explain how a transformer's self-attention mechanism works, step by step.
+What are the tradeoffs between a hash table and a balanced binary search tree?
+Describe the water cycle from evaporation to precipitation in detail.
+Write a Python function that merges two sorted lists without using built-in sort.
+Explain why the sky is blue during the day and red at sunset.
+Outline a training plan for a beginner preparing for a 10K run in eight weeks.
+Describe how modern compilers optimize loops, including vectorization.
+What were the main artistic movements of the twentieth century and their defining traits?
+Explain the CAP theorem and its practical implications for distributed databases.
+Write a product description for a stainless steel water bottle, 100 words.
+How does public-key cryptography work? Explain RSA at a high level.
+Describe the process of photosynthesis including the light and dark reactions.
+What is technical debt, how does it accumulate, and how should teams manage it?
+Explain the difference between latency and bandwidth with real-world analogies.

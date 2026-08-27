@@ -205,12 +205,12 @@ impl GlimmerVisionBlock {
                     }
                 }
                 let mut sum_exp = 0.0f32;
-                for j in 0..seq {
-                    scores[j] = (scores[j] - max_score).exp();
-                    sum_exp += scores[j];
+                for score in &mut scores {
+                    *score = (*score - max_score).exp();
+                    sum_exp += *score;
                 }
-                for j in 0..seq {
-                    scores[j] /= sum_exp;
+                for score in &mut scores {
+                    *score /= sum_exp;
                 }
                 for d in 0..hd {
                     let mut val = 0.0f32;
@@ -482,8 +482,8 @@ impl GlimmerVision {
                     let proj_offset = patch_idx * hidden;
                     for o in 0..hidden {
                         let mut acc = self.patch_proj_b[o];
-                        for i in 0..patch_dim {
-                            acc += self.patch_proj_w[o * patch_dim + i] * patch_vec[i];
+                        for (i, &pv) in patch_vec.iter().enumerate() {
+                            acc += self.patch_proj_w[o * patch_dim + i] * pv;
                         }
                         tokens[proj_offset + o] = acc;
                     }
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn rejects_wrong_temporal() {
         let vision = make_glimmer_vision();
-        let img = cpu_tensor(vec![0.0f32; 3 * 1 * 8 * 8], Shape::new(vec![3, 1, 8, 8]));
+        let img = cpu_tensor(vec![0.0f32; 3 * 8 * 8], Shape::new(vec![3, 1, 8, 8]));
         match vision.encode_image(&img) {
             Ok(_) => panic!("expected shape error, got Ok"),
             Err(Error::Shape(_)) => {}

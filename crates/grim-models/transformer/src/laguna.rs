@@ -286,15 +286,17 @@ mod tests {
 
     #[test]
     fn test_laguna_s_2_1_layer_attention_specs() {
-        let mut cfg = LagunaConfig::default();
         // Match Laguna-S-2.1 `rope_parameters.full_attention` (YaRN).
-        cfg.full_yarn = Some(grim_tensor::YaRNParams {
-            factor: 128.0,
-            original_max_pos: 8192,
-            beta_fast: 32.0,
-            beta_slow: 1.0,
-            attention_factor: 1.4852030263919618,
-        });
+        let cfg = LagunaConfig {
+            full_yarn: Some(grim_tensor::YaRNParams {
+                factor: 128.0,
+                original_max_pos: 8192,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                attention_factor: 1.485_203,
+            }),
+            ..Default::default()
+        };
         let num_layers = cfg.num_layers;
         assert_eq!(num_layers, 48);
 

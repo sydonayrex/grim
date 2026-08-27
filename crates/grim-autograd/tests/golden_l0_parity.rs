@@ -35,7 +35,7 @@ fn run_overfit_test_for_device(device: Device) -> (f32, f32) {
         ..AdamWConfig::default()
     });
 
-    let input_ids = vec![0u32, 1, 2, 3];
+    let input_ids = [0u32, 1, 2, 3];
     let targets = vec![1usize, 2, 3, 4];
     let batch = input_ids.len();
 

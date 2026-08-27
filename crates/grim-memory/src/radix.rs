@@ -70,8 +70,8 @@ impl RadixTree {
     fn block_key(tokens: &[u32], offset: usize, block_size: usize) -> TokenKey {
         let mut h: TokenKey = 0xcbf2_9ce4_8422_2325;
         let end = (offset + block_size).min(tokens.len());
-        for i in offset..end {
-            h ^= tokens[i] as TokenKey;
+        for &token in &tokens[offset..end] {
+            h ^= token as TokenKey;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
         h
@@ -328,7 +328,7 @@ mod tests {
         tree.insert(&a, &[10, 11, 12]);
         // Two sequences share the prefix; insert b which diverges at block 3.
         let mut b = a[..32].to_vec();
-        b.extend(std::iter::repeat(999u32).take(16));
+        b.extend(std::iter::repeat_n(999u32, 16));
         tree.insert(&b, &[10, 11, 20]);
 
         // Remove sequence a. Its prefix is now unreferenced but still cached.
@@ -344,7 +344,7 @@ mod tests {
         tree.insert(&a, &[10, 11, 12]);
         // b shares the first two blocks, diverges at block 3.
         let mut b = a[..32].to_vec();
-        b.extend(std::iter::repeat(777u32).take(16));
+        b.extend(std::iter::repeat_n(777u32, 16));
         tree.insert(&b, &[10, 11, 20]);
 
         // Remove sequence a → its unique tail block 12 is now unreferenced.

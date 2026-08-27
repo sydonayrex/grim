@@ -4035,6 +4035,196 @@ fn cuda_dequant_quantized_storage(
     }
 }
 
+impl CudaDevice {
+    /// Dequantize Q8_0 packed bytes to an f32 host Vec via host / GPU.
+    pub fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        let mut out = Vec::with_capacity(elem_count);
+        for blk in bytes.chunks_exact(34) {
+            let d_bits = u16::from_le_bytes([blk[0], blk[1]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            for &q in &blk[2..34] {
+                out.push(d * (q as i8 as f32));
+            }
+        }
+        out.truncate(elem_count);
+        Ok(out)
+    }
+
+    /// Dequantize Q4_K packed bytes to an f32 host Vec via host / GPU.
+    pub fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::KQuant(KQuantScheme::Q4K),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_q4k(bytes, elem_count)
+    }
+
+    fn dequantize_iq_host(
+        &self,
+        bytes: &[u8],
+        elem_count: usize,
+        scheme: KQuantScheme,
+    ) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::KQuant(scheme),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        match scheme {
+            KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(bytes, elem_count),
+            KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(bytes, elem_count),
+            KQuantScheme::IQ2S => grim_quant::dequant_iq2s(bytes, elem_count),
+            KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(bytes, elem_count),
+            KQuantScheme::IQ3S => grim_quant::dequant_iq3s(bytes, elem_count),
+            KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(bytes, elem_count),
+            KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(bytes, elem_count),
+            _ => Err(Error::Backend(format!("Unknown iq scheme {:?}", scheme))),
+        }
+    }
+
+    pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2XXS)
+    }
+    pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2XS)
+    }
+    pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2S)
+    }
+    pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ3XXS)
+    }
+    pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ3S)
+    }
+    pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ4NL)
+    }
+    pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ4XS)
+    }
+
+    /// Dequantize FP8 packed bytes.
+    pub fn dequantize_fp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_fp8(bytes, elem_count)
+    }
+
+    /// Dequantize MXFP4 packed bytes.
+    pub fn dequantize_mxfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp4),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_mxfp4(bytes, elem_count)
+    }
+
+    /// Dequantize MXFP8 packed bytes.
+    pub fn dequantize_mxfp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp8),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_mxfp8(bytes, elem_count)
+    }
+}
+
+impl grim_format::convert::GpuDequant for CudaDevice {
+    fn dequantize(
+        &self,
+        storage: &grim_tensor::dtype::Storage,
+        bytes: &[u8],
+        elem_count: usize,
+    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        match storage {
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
+            }
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Returns (free_bytes, total_bytes) VRAM via cudaMemGetInfo.
+pub fn vram_info(ordinal: usize) -> Option<(u64, u64)> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    unsafe {
+        let _ = cudaSetDevice(ordinal as i32);
+        let status = cudaMemGetInfo(&mut free, &mut total);
+        if status != 0 {
+            return None;
+        }
+    }
+    Some((free as u64, total as u64))
+}
+
+/// WI-1: live compute utilization for `ordinal`.
+///
+/// Scope note (per WI-1): `grim-backend-cuda` does not link NVML, and adding
+/// NVML is out of scope for this WI. Returns `None` rather than fabricating a
+/// value from indirect signals — `null` on the wire is the honest answer.
+pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4174,9 +4364,9 @@ mod tests {
             .collect();
 
         // top-1 routing: token0 -> expert0, token1 -> expert1
-        let rtok = vec![0u32, 1u32];
-        let rexp = vec![0u32, 1u32];
-        let rw = vec![1.0f32, 1.0f32];
+        let rtok = [0u32, 1u32];
+        let rexp = [0u32, 1u32];
+        let rw = [1.0f32, 1.0f32];
         let num_pairs = rtok.len();
 
         let gate_buf = dev
@@ -5356,194 +5546,4 @@ mod tests {
         let actual = out.to_cpu_vec_f32().expect("readback mxfp4");
         assert_dequant_close("mxfp4", &actual, &expected);
     }
-}
-
-impl CudaDevice {
-    /// Dequantize Q8_0 packed bytes to an f32 host Vec via host / GPU.
-    pub fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        let packed = CudaStorage::copy_from_host_raw_bytes(
-            bytes,
-            &Shape::new(vec![elem_count]),
-            DType {
-                arith: ArithType::U8,
-                storage: DTypeStorage::KQuant(KQuantScheme::Q80),
-            },
-            self.ordinal,
-        )?;
-        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
-            return f32_storage.to_cpu_vec_f32();
-        }
-        let mut out = Vec::with_capacity(elem_count);
-        for blk in bytes.chunks_exact(34) {
-            let d_bits = u16::from_le_bytes([blk[0], blk[1]]);
-            let d = half::f16::from_bits(d_bits).to_f32();
-            for &q in &blk[2..34] {
-                out.push(d * (q as i8 as f32));
-            }
-        }
-        out.truncate(elem_count);
-        Ok(out)
-    }
-
-    /// Dequantize Q4_K packed bytes to an f32 host Vec via host / GPU.
-    pub fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        let packed = CudaStorage::copy_from_host_raw_bytes(
-            bytes,
-            &Shape::new(vec![elem_count]),
-            DType {
-                arith: ArithType::U8,
-                storage: DTypeStorage::KQuant(KQuantScheme::Q4K),
-            },
-            self.ordinal,
-        )?;
-        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
-            return f32_storage.to_cpu_vec_f32();
-        }
-        grim_quant::dequant_q4k(bytes, elem_count)
-    }
-
-    fn dequantize_iq_host(
-        &self,
-        bytes: &[u8],
-        elem_count: usize,
-        scheme: KQuantScheme,
-    ) -> Result<Vec<f32>> {
-        let packed = CudaStorage::copy_from_host_raw_bytes(
-            bytes,
-            &Shape::new(vec![elem_count]),
-            DType {
-                arith: ArithType::U8,
-                storage: DTypeStorage::KQuant(scheme),
-            },
-            self.ordinal,
-        )?;
-        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
-            return f32_storage.to_cpu_vec_f32();
-        }
-        match scheme {
-            KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(bytes, elem_count),
-            KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(bytes, elem_count),
-            KQuantScheme::IQ2S => grim_quant::dequant_iq2s(bytes, elem_count),
-            KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(bytes, elem_count),
-            KQuantScheme::IQ3S => grim_quant::dequant_iq3s(bytes, elem_count),
-            KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(bytes, elem_count),
-            KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(bytes, elem_count),
-            _ => Err(Error::Backend(format!("Unknown iq scheme {:?}", scheme))),
-        }
-    }
-
-    pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2XXS)
-    }
-    pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2XS)
-    }
-    pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2S)
-    }
-    pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ3XXS)
-    }
-    pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ3S)
-    }
-    pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ4NL)
-    }
-    pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ4XS)
-    }
-
-    /// Dequantize FP8 packed bytes.
-    pub fn dequantize_fp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        let packed = CudaStorage::copy_from_host_raw_bytes(
-            bytes,
-            &Shape::new(vec![elem_count]),
-            DType {
-                arith: ArithType::U8,
-                storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
-            },
-            self.ordinal,
-        )?;
-        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
-            return f32_storage.to_cpu_vec_f32();
-        }
-        grim_quant::dequant_fp8(bytes, elem_count)
-    }
-
-    /// Dequantize MXFP4 packed bytes.
-    pub fn dequantize_mxfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        let packed = CudaStorage::copy_from_host_raw_bytes(
-            bytes,
-            &Shape::new(vec![elem_count]),
-            DType {
-                arith: ArithType::U8,
-                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp4),
-            },
-            self.ordinal,
-        )?;
-        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
-            return f32_storage.to_cpu_vec_f32();
-        }
-        grim_quant::dequant_mxfp4(bytes, elem_count)
-    }
-
-    /// Dequantize MXFP8 packed bytes.
-    pub fn dequantize_mxfp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        let packed = CudaStorage::copy_from_host_raw_bytes(
-            bytes,
-            &Shape::new(vec![elem_count]),
-            DType {
-                arith: ArithType::U8,
-                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp8),
-            },
-            self.ordinal,
-        )?;
-        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
-            return f32_storage.to_cpu_vec_f32();
-        }
-        grim_quant::dequant_mxfp8(bytes, elem_count)
-    }
-}
-
-impl grim_format::convert::GpuDequant for CudaDevice {
-    fn dequantize(
-        &self,
-        storage: &grim_tensor::dtype::Storage,
-        bytes: &[u8],
-        elem_count: usize,
-    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
-        match storage {
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
-                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
-            }
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
-                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-/// Returns (free_bytes, total_bytes) VRAM via cudaMemGetInfo.
-pub fn vram_info(ordinal: usize) -> Option<(u64, u64)> {
-    let mut free: usize = 0;
-    let mut total: usize = 0;
-    unsafe {
-        let _ = cudaSetDevice(ordinal as i32);
-        let status = cudaMemGetInfo(&mut free, &mut total);
-        if status != 0 {
-            return None;
-        }
-    }
-    Some((free as u64, total as u64))
-}
-
-/// WI-1: live compute utilization for `ordinal`.
-///
-/// Scope note (per WI-1): `grim-backend-cuda` does not link NVML, and adding
-/// NVML is out of scope for this WI. Returns `None` rather than fabricating a
-/// value from indirect signals — `null` on the wire is the honest answer.
-pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
-    None
 }

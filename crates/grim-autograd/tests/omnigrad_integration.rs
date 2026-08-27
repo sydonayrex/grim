@@ -4,10 +4,11 @@ use grim_autograd::omnigrad::{OmniGradConfig, OmniGradRouter};
 
 #[test]
 fn omnigrad_routes_synthetic_3_layer_network() {
-    let mut config = OmniGradConfig::default();
-    config.per_layer_lr = vec![0.1, 0.2, 0.3];
-    config.noise_threshold = 2.0;
-    config.phase_gate_threshold = 0.5;
+    let config = OmniGradConfig {
+        per_layer_lr: vec![0.1, 0.2, 0.3],
+        noise_threshold: 2.0,
+        phase_gate_threshold: 0.5,
+    };
     let mut tags = HashMap::new();
     tags.insert(0, "text".into());
     tags.insert(1, "audio".into());

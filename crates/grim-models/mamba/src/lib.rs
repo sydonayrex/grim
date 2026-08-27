@@ -303,8 +303,7 @@ impl MambaBlock {
         //   h_new = A[n,s] * h + B[n,s] * x_n
         // where A = a_log, B = b_param, and x_n is the input to channel `n`
         // (mirroring the GPU kernel `h_new = a * h_prev + x_n * b_row[s]`).
-        for n in 0..state.d_inner {
-            let x_n = x_flat[n];
+        for (n, &x_n) in x_flat.iter().take(state.d_inner).enumerate() {
             for s in 0..state.d_state {
                 let a = self.a_log[n * state.d_state + s];
                 let b = self
@@ -537,14 +536,12 @@ impl CausalLm for Mamba {
         if session.model_state().is_none() {
             session.set_model_state(Box::new(self.init_state(1)));
         }
-        let cell = session.model_state_mut().ok_or_else(|| {
-            Error::Session("mamba: session model_state vanished".into())
+        let cell = session
+            .model_state_mut()
+            .ok_or_else(|| Error::Session("mamba: session model_state vanished".into()))?;
+        let boxed_state = cell.downcast_mut::<Box<dyn SsmState>>().ok_or_else(|| {
+            Error::Session("mamba: session model_state holds another model's state".into())
         })?;
-        let boxed_state = cell
-            .downcast_mut::<Box<dyn SsmState>>()
-            .ok_or_else(|| {
-                Error::Session("mamba: session model_state holds another model's state".into())
-            })?;
         let logits = self.step(boxed_state.as_mut(), input_ids)?;
         let seq_len = input_ids.shape().elem_count();
         session.advance_pos(seq_len);
@@ -577,16 +574,14 @@ mod audit_tests {
             rms_norm_eps: 1e-5,
         };
         let model = Mamba::random(Device::Cpu, cfg);
-        let tok =
-            |v: f32| cpu_tensor(vec![v], Shape::new(vec![1]));
+        let tok = |v: f32| cpu_tensor(vec![v], Shape::new(vec![1]));
 
         let mut sess = Inner::new(Device::Cpu);
         let _first = CausalLm::forward(&model, &mut sess, &tok(1.0), &tok(0.0), &[]).unwrap();
-        let second_with_state =
-            CausalLm::forward(&model, &mut sess, &tok(2.0), &tok(0.0), &[])
-                .unwrap()
-                .to_vec_f32()
-                .unwrap();
+        let second_with_state = CausalLm::forward(&model, &mut sess, &tok(2.0), &tok(0.0), &[])
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         assert_eq!(
             sess.current_pos(),
             2,

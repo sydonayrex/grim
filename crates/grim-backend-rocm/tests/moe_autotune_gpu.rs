@@ -137,7 +137,7 @@ fn benchmark_moe_shape(
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
                 .unwrap();
 
-            let iters = num_iters.max(1).min(2);
+            let iters = num_iters.clamp(1, 2);
             let t0 = Instant::now();
             for _ in 0..iters {
                 let _ = dev.moe_fused_dispatch(
@@ -174,7 +174,7 @@ fn benchmark_moe_shape(
 
         let t0 = Instant::now();
         for _ in 0..num_iters {
-            let _grid = (total_pairs as u32 + bd - 1) / bd;
+            let _grid = (total_pairs as u32).div_ceil(bd);
             let _bytes = (num_experts * inter * hidden * 2 + num_experts * hidden * inter) * 4;
             let _ = std::hint::black_box(_grid + _bytes as u32);
         }
@@ -456,7 +456,7 @@ fn quantize_routing_skew_boundary_correctness() {
     // Midpoint ≈ 0.5 → bucket 3.
     let mid = quantize_routing_skew(0.5);
     assert!(
-        mid >= 3 && mid <= 4,
+        (3..=4).contains(&mid),
         "mid skew should map to bucket 3 or 4, got {mid}"
     );
     // Monotonically non-decreasing.

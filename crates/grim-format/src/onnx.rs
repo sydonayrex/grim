@@ -44,7 +44,7 @@ pub enum OnnxDType {
 }
 
 impl OnnxDType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "float32" | "float" => Some(OnnxDType::F32),
             "float64" | "double" => Some(OnnxDType::F64),
@@ -126,9 +126,9 @@ mod tests {
 
     #[test]
     fn test_onnx_dtype_parsing() {
-        assert_eq!(OnnxDType::from_str("float32"), Some(OnnxDType::F32));
-        assert_eq!(OnnxDType::from_str("float16"), Some(OnnxDType::F16));
-        assert_eq!(OnnxDType::from_str("unknown"), None);
+        assert_eq!(OnnxDType::parse("float32"), Some(OnnxDType::F32));
+        assert_eq!(OnnxDType::parse("float16"), Some(OnnxDType::F16));
+        assert_eq!(OnnxDType::parse("unknown"), None);
     }
 
     #[test]

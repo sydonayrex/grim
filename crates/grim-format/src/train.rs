@@ -101,7 +101,7 @@ fn bytes_to_f32s(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
             if data.len() % 2 != 0 {
                 return None;
             }
-            Some(data.chunks_exact(2).map(|c| f16_to_f32_le(c)).collect())
+            Some(data.chunks_exact(2).map(f16_to_f32_le).collect())
         }
         TrainFpFormat::Fp8E4M3 | TrainFpFormat::Fp8E5M2 | TrainFpFormat::Fp4 => None,
     }
@@ -110,7 +110,7 @@ fn bytes_to_f32s(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
 /// Round-to-nearest-even F32 -> little-endian BF16 bytes.
 pub fn f32_to_bf16_bytes(v: f32) -> [u8; 2] {
     let bits = f32::to_bits(v);
-    let discard = (bits & 0xFFFF) as u32;
+    let discard = bits & 0xFFFF;
     let mut bf16 = (bits >> 16) as u16;
     if discard > 0x8000 || (discard == 0x8000 && (bf16 & 1) == 1) {
         bf16 = bf16.wrapping_add(1);
@@ -122,7 +122,7 @@ pub fn f32_to_bf16_bytes(v: f32) -> [u8; 2] {
 pub fn f32_to_f16_bytes(v: f32) -> [u8; 2] {
     let bits = f32::to_bits(v);
     let sign = (bits >> 31) as u16;
-    let exp = ((bits >> 23) & 0xFF) as u32;
+    let exp = (bits >> 23) & 0xFF;
     let mant = bits & 0x7FFFFF;
 
     if exp == 0xFF {
@@ -342,6 +342,7 @@ impl TrainState {
     ///
     /// Expects blobs named `{tensor_name}.lora_A.weight` and `{tensor_name}.lora_B.weight`.
     /// Returns `(a_data, a_shape, b_data, b_shape)` or `None` if either blob is missing.
+    #[allow(clippy::type_complexity)]
     pub fn lora_weights_for(
         &self,
         tensor_name: &str,

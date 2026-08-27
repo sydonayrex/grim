@@ -13,6 +13,8 @@ use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
 
 /// CPU reference: causal GQA attention for arbitrary head_dim.
+// Argument list mirrors the GPU kernel's launch parameters one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn reference_attention(
     q: &[f32],
     k: &[f32],

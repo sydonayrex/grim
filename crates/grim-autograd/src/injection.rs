@@ -303,6 +303,7 @@ impl LoRAInjectionRegistry {
 
     /// Build the standard 7-point-per-layer QLoRA registry, propagating
     /// the PiSSA / OLoRA / SPECTRAL-QLORA adapter flags to every injection config.
+    #[allow(clippy::too_many_arguments)]
     pub fn standard_qlora_with_flags(
         num_layers: usize,
         rank: usize,
@@ -505,9 +506,7 @@ pub fn loftq_initialize(
         }
 
         // Update W_current for next iteration (use quantized residual)
-        for i in 0..rows * cols {
-            w_current[i] = q_dequant[i];
-        }
+        w_current[..rows * cols].copy_from_slice(&q_dequant[..rows * cols]);
     }
 
     // Final quantized base: Q = W0 - B @ A
@@ -679,17 +678,17 @@ fn compute_truncated_svd(
 
     // Use deterministic "random" initialization
     let mut seed: u64 = 0x9E3779B97F4A7C15;
-    for i in 0..(rows * rank) {
+    for slot in u_vectors.iter_mut() {
         seed = seed.wrapping_add(0x9E3779B97F4A7C15);
         let u1 = ((seed >> 40) as u32 as f32) / 16777216.0;
         let u2 = (((seed & 0xFFFFFFFF) >> 8) as u32 as f32) / 16777216.0;
-        u_vectors[i] = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        *slot = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
     }
-    for i in 0..(cols * rank) {
+    for slot in v_vectors.iter_mut() {
         seed = seed.wrapping_add(0x9E3779B9);
         let u1 = ((seed >> 40) as u32 as f32) / 16777216.0;
         let u2 = (((seed & 0xFFFFFFFF) >> 8) as u32 as f32) / 16777216.0;
-        v_vectors[i] = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        *slot = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
     }
 
     // Power iteration to find dominant singular vectors
@@ -926,7 +925,7 @@ mod tests {
         assert_eq!(q_base.len(), 9);
 
         // Reconstruct BA = B @ A and verify it reproduces W0 in the top-2 dims.
-        let mut ba = vec![0.0f32; 9];
+        let mut ba = [0.0f32; 9];
         for r in 0..3 {
             for c in 0..3 {
                 let mut sum = 0.0f32;
@@ -950,7 +949,7 @@ mod tests {
         let w = vec![1.0, 2.0, 3.0, 4.0];
         assert!(pissa_initialize(&w, 2, 2, 0).is_err());
         assert!(pissa_initialize(&w, 2, 2, 3).is_err());
-        assert!(pissa_initialize(&vec![1.0], 2, 2, 1).is_err());
+        assert!(pissa_initialize(&[1.0], 2, 2, 1).is_err());
     }
 
     #[test]

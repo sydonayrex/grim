@@ -186,7 +186,7 @@ impl SessionT for Inner {
         self.kv.as_deref_mut()
     }
     fn has_paged_kv(&self) -> bool {
-        self.kv.as_deref().map_or(false, |kv| kv.has_paged_kv())
+        self.kv.as_deref().is_some_and(|kv| kv.has_paged_kv())
     }
     fn block_table(&self) -> Option<&[u32]> {
         self.kv.as_deref().and_then(|kv| kv.block_table())
@@ -258,6 +258,12 @@ pub struct Graph {
     pub outputs: Vec<usize>,
 }
 
+impl Default for Graph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Graph {
     pub fn new() -> Self {
         Self {
@@ -326,9 +332,16 @@ impl Inner {
 }
 
 /// Public alias used everywhere `Session` is named as a concrete type.
+///
+// The `Session::new` name is kept stable for call sites even though the
+// runtime handle lives in `Inner`; returning `Inner` there is intentional.
 pub struct Session;
 
 impl Session {
+    // Deliberate alias design: `Session` is a stable name and `new` returns the
+    // `Inner` handle type on purpose, so silence new_ret_no_self here.
+    #[allow(clippy::should_implement_trait)]
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(device: Device) -> Inner {
         Inner::new(device)
     }

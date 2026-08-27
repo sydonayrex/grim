@@ -29,7 +29,7 @@ pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<(
     {
         use std::os::raw::c_void;
         let ptr = data.as_ptr() as *mut c_void;
-        let len = data.len() * std::mem::size_of::<f32>();
+        let len = std::mem::size_of_val(data);
 
         let raw_advice = match advice {
             grim_tensor::MemAdvice::Sequential => libc::MADV_SEQUENTIAL,
@@ -756,11 +756,10 @@ where
                                 header.block_id
                             );
                         }
-                        let num_tokens = if elem_per_token > 0 {
-                            (num_elems / elem_per_token).min(guard.block_size())
-                        } else {
-                            num_elems
-                        };
+                        let num_tokens = num_elems
+                            .checked_div(elem_per_token)
+                            .unwrap_or(num_elems)
+                            .min(guard.block_size());
                         guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
                         guard.write_layer_values(block_id, header.layer_idx, &v_data);
                     } else {
@@ -928,11 +927,9 @@ impl NvmeWeightStreamer {
 
         if !cache.contains_key(&layer_id) {
             // Evict LRU if capacity exceeded
-            if cache.len() >= self.lru_capacity_layers {
-                if !order.is_empty() {
-                    let evicted = order.remove(0);
-                    cache.remove(&evicted);
-                }
+            if cache.len() >= self.lru_capacity_layers && !order.is_empty() {
+                let evicted = order.remove(0);
+                cache.remove(&evicted);
             }
 
             cache.insert(layer_id, weights.clone());
@@ -1140,7 +1137,7 @@ mod tests {
             let v = vec![0.25f32; size];
             let block_id = 42 + size;
             client
-                .send_block_remote(block_id as usize, 0, &k, &v, &addr)
+                .send_block_remote(block_id, 0, &k, &v, &addr)
                 .unwrap_or_else(|e| panic!("send_block_remote(size={size}) failed: {e}"));
 
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1384,7 +1381,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let weights_path = dir.path().join("short.bin");
         // Only 100 bytes — far too short for layer 0 (4096 bytes).
-        std::fs::write(&weights_path, &[0u8; 100]).unwrap();
+        std::fs::write(&weights_path, [0u8; 100]).unwrap();
         let streamer = NvmeWeightStreamer::new(weights_path, 4);
 
         let res = streamer.prefetch_layer_async(0);

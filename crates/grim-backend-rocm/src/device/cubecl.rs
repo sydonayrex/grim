@@ -64,21 +64,21 @@ const WARMUP_MAX_RETRIES: u32 = 3;
 fn warmup_every_kernel(c: &Client) {
     let warm0 = [0.0f32; 1];
     let warm1 = [1.0f32; 1];
-    let _ = add(&c, &warm0, &warm1);
-    let _ = mul(&c, &warm0, &warm1);
-    let _ = silu_mul(&c, &warm0, &warm1);
-    let _ = embedding(&c, &warm1, &[0i32], 1);
-    let _ = rms_norm(&c, &warm1, 1, 1);
-    let _ = softmax(&c, &warm1, 1, 1);
+    let _ = add(c, &warm0, &warm1);
+    let _ = mul(c, &warm0, &warm1);
+    let _ = silu_mul(c, &warm0, &warm1);
+    let _ = embedding(c, &warm1, &[0i32], 1);
+    let _ = rms_norm(c, &warm1, 1, 1);
+    let _ = softmax(c, &warm1, 1, 1);
     let tiny_k = [1.0f32; 1];
     let tiny_bt = [0.0f32, 1.0f32];
     let tiny_tp = [0.0f32];
-    let _ = qkv_attention(&c, &warm1, &tiny_k, &tiny_k, 1, 1, 1, 1, 1, 0);
-    let _ = paged_attention(&c, &warm1, &tiny_k, &tiny_k, &tiny_bt, 1, 1, 1, 1, 1, 1, 0);
-    let _ = tree_attention(&c, &warm1, &tiny_k, &tiny_k, &tiny_tp, 1, 1, 1, 1, 1, 0);
-    let _ = gptq_correction(&c, &warm1, &warm1, &warm1, 0.5f32, 1, 1, 1);
+    let _ = qkv_attention(c, &warm1, &tiny_k, &tiny_k, 1, 1, 1, 1, 1, 0);
+    let _ = paged_attention(c, &warm1, &tiny_k, &tiny_k, &tiny_bt, 1, 1, 1, 1, 1, 1, 0);
+    let _ = tree_attention(c, &warm1, &tiny_k, &tiny_k, &tiny_tp, 1, 1, 1, 1, 1, 0);
+    let _ = gptq_correction(c, &warm1, &warm1, &warm1, 0.5f32, 1, 1, 1);
     // Final hard sync: forces the stream to drain so the just-warmed modules
-    let _ = c.sync();
+    drop(c.sync());
 }
 
 /// Verify the warmup actually executed (not the first-launch all-zeros fault). [see: `add([0],[1])`, `[1]`]
@@ -97,7 +97,7 @@ fn configure_compilation_cache() {
 }
 
 fn launch_elems(len: usize) -> (CubeCount, CubeDim) {
-    let cubes = ((len as u32) + 255) / 256;
+    let cubes = (len as u32).div_ceil(256);
     (CubeCount::Static(cubes, 1, 1), CubeDim::new_1d(256))
 }
 
@@ -119,7 +119,7 @@ pub fn add(client: &Client, a: &[f32], b: &[f32]) -> Vec<f32> {
     add_kernel::launch::<HipRuntime>(
         client,
         count.clone(),
-        dim.clone(),
+        dim,
         unsafe { ArrayArg::from_raw_parts(oh.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(ah.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(bh.clone(), len) },
@@ -143,7 +143,7 @@ pub fn mul(client: &Client, a: &[f32], b: &[f32]) -> Vec<f32> {
     mul_kernel::launch::<HipRuntime>(
         client,
         count.clone(),
-        dim.clone(),
+        dim,
         unsafe { ArrayArg::from_raw_parts(oh.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(ah.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(bh.clone(), len) },
@@ -169,7 +169,7 @@ pub fn silu_mul(client: &Client, x: &[f32], gate: &[f32]) -> Vec<f32> {
     silu_mul_kernel::launch::<HipRuntime>(
         client,
         count.clone(),
-        dim.clone(),
+        dim,
         unsafe { ArrayArg::from_raw_parts(oh.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(xh.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(gh.clone(), len) },
@@ -204,7 +204,7 @@ pub fn embedding(client: &Client, weight: &[f32], indices: &[i32], dim: usize) -
     embedding_kernel::launch::<HipRuntime>(
         client,
         count.clone(),
-        d.clone(),
+        d,
         unsafe { ArrayArg::from_raw_parts(oh.clone(), out_len) },
         unsafe { ArrayArg::from_raw_parts(wh.clone(), weight.len()) },
         unsafe { ArrayArg::from_raw_parts(ih.clone(), indices.len()) },
@@ -215,6 +215,8 @@ pub fn embedding(client: &Client, weight: &[f32], indices: &[i32], dim: usize) -
 
 // ---------------- row reductions (dim <= 64, single wavefront) ----------------
 
+// cube macro requires NativeExpand::into() here; clippy cannot see through the expansion.
+#[allow(clippy::useless_conversion)]
 #[cube(launch)]
 fn rms_norm_kernel(output: &mut Array<f32>, input: &Array<f32>, rows: usize, dim: usize) {
     let row = ABSOLUTE_POS / 64usize;
@@ -298,6 +300,8 @@ pub fn softmax(client: &Client, input: &[f32], rows: usize, dim: usize) -> Vec<f
 
 // ======================== Phase 3: causal GQA attention (head_dim up to 256) ======================== [see: `tid`]
 
+// cube dialect has no integer div_ceil intrinsic; keep explicit ceiling math.
+#[allow(clippy::manual_div_ceil)]
 #[cube(launch)]
 fn qkv_attention_kernel(
     output: &mut Array<f32>,
@@ -337,18 +341,18 @@ fn qkv_attention_kernel(
                 let dim = c * 64usize + lane;
                 if dim < head_dim {
                     let term = q[q_base + dim] * k[kv_base + dim];
-                    dot = dot + plane_sum(term);
+                    dot += plane_sum(term);
                 }
             }
             let s = dot * inv_sqrt_d;
 
             if s > m {
                 let corr = (m - s).exp();
-                a0 = a0 * corr;
-                a1 = a1 * corr;
-                a2 = a2 * corr;
-                a3 = a3 * corr;
-                l = l * corr;
+                a0 *= corr;
+                a1 *= corr;
+                a2 *= corr;
+                a3 *= corr;
+                l *= corr;
                 m = s;
                 let w = 1.0f32;
                 for c in 0..chunks {
@@ -356,17 +360,17 @@ fn qkv_attention_kernel(
                     if dim < head_dim {
                         let add = w * v[kv_base + dim];
                         if c == 0 {
-                            a0 = a0 + add;
+                            a0 += add;
                         } else if c == 1 {
-                            a1 = a1 + add;
+                            a1 += add;
                         } else if c == 2 {
-                            a2 = a2 + add;
+                            a2 += add;
                         } else {
-                            a3 = a3 + add;
+                            a3 += add;
                         }
                     }
                 }
-                l = l + w;
+                l += w;
             } else {
                 let w = (s - m).exp();
                 for c in 0..chunks {
@@ -374,17 +378,17 @@ fn qkv_attention_kernel(
                     if dim < head_dim {
                         let add = w * v[kv_base + dim];
                         if c == 0 {
-                            a0 = a0 + add;
+                            a0 += add;
                         } else if c == 1 {
-                            a1 = a1 + add;
+                            a1 += add;
                         } else if c == 2 {
-                            a2 = a2 + add;
+                            a2 += add;
                         } else {
-                            a3 = a3 + add;
+                            a3 += add;
                         }
                     }
                 }
-                l = l + w;
+                l += w;
             }
         }
     }
@@ -443,6 +447,8 @@ pub fn qkv_attention(
 }
 
 // ---------------- paged QKV attention (same online softmax; paged K/V) ---------------- [see: `block_tables`]
+// cube dialect has no integer div_ceil intrinsic; keep explicit ceiling math.
+#[allow(clippy::manual_div_ceil)]
 #[cube(launch)]
 fn paged_attention_kernel(
     output: &mut Array<f32>,
@@ -492,17 +498,17 @@ fn paged_attention_kernel(
                 for c in 0..chunks {
                     let dim = c * 64usize + lane;
                     if dim < head_dim {
-                        dot = dot + plane_sum(q[q_base + dim] * k_pages[kv_base + dim]);
+                        dot += plane_sum(q[q_base + dim] * k_pages[kv_base + dim]);
                     }
                 }
                 let s = dot * inv_sqrt_d;
                 if s > m {
                     let corr = (m - s).exp();
-                    a0 = a0 * corr;
-                    a1 = a1 * corr;
-                    a2 = a2 * corr;
-                    a3 = a3 * corr;
-                    l = l * corr;
+                    a0 *= corr;
+                    a1 *= corr;
+                    a2 *= corr;
+                    a3 *= corr;
+                    l *= corr;
                     m = s;
                     let w = 1.0f32;
                     for c in 0..chunks {
@@ -510,17 +516,17 @@ fn paged_attention_kernel(
                         if dim < head_dim {
                             let add = w * v_pages[kv_base + dim];
                             if c == 0 {
-                                a0 = a0 + add;
+                                a0 += add;
                             } else if c == 1 {
-                                a1 = a1 + add;
+                                a1 += add;
                             } else if c == 2 {
-                                a2 = a2 + add;
+                                a2 += add;
                             } else {
-                                a3 = a3 + add;
+                                a3 += add;
                             }
                         }
                     }
-                    l = l + w;
+                    l += w;
                 } else {
                     let w = (s - m).exp();
                     for c in 0..chunks {
@@ -528,17 +534,17 @@ fn paged_attention_kernel(
                         if dim < head_dim {
                             let add = w * v_pages[kv_base + dim];
                             if c == 0 {
-                                a0 = a0 + add;
+                                a0 += add;
                             } else if c == 1 {
-                                a1 = a1 + add;
+                                a1 += add;
                             } else if c == 2 {
-                                a2 = a2 + add;
+                                a2 += add;
                             } else {
-                                a3 = a3 + add;
+                                a3 += add;
                             }
                         }
                     }
-                    l = l + w;
+                    l += w;
                 }
             }
             t += 1;
@@ -583,7 +589,7 @@ pub fn paged_attention(
     let vh = client.create_from_slice(f32::as_bytes(v_pages));
     let bh = client.create_from_slice(f32::as_bytes(block_tables));
     let oh = client.empty(out_len * 4);
-    let blocks = 1usize * num_heads;
+    let blocks = num_heads;
     paged_attention_kernel::launch::<HipRuntime>(
         client,
         CubeCount::Static(blocks as u32, 1, 1),
@@ -605,6 +611,8 @@ pub fn paged_attention(
 }
 
 // ---------------- tree attention (same online softmax; tree-structured mask) ---------------- [see: `tree_parents`]
+// cube dialect has no integer div_ceil intrinsic; keep explicit ceiling math.
+#[allow(clippy::manual_div_ceil)]
 #[cube(launch)]
 fn tree_attention_kernel(
     output: &mut Array<f32>,
@@ -658,17 +666,17 @@ fn tree_attention_kernel(
             for c in 0..chunks {
                 let dim = c * 64usize + lane;
                 if dim < head_dim {
-                    dot = dot + plane_sum(q[q_base + dim] * k[kv_base + dim]);
+                    dot += plane_sum(q[q_base + dim] * k[kv_base + dim]);
                 }
             }
             let s = dot * inv_sqrt_d;
             if s > m {
                 let corr = (m - s).exp();
-                a0 = a0 * corr;
-                a1 = a1 * corr;
-                a2 = a2 * corr;
-                a3 = a3 * corr;
-                l = l * corr;
+                a0 *= corr;
+                a1 *= corr;
+                a2 *= corr;
+                a3 *= corr;
+                l *= corr;
                 m = s;
                 let w = 1.0f32;
                 for c in 0..chunks {
@@ -676,17 +684,17 @@ fn tree_attention_kernel(
                     if dim < head_dim {
                         let add = w * v[kv_base + dim];
                         if c == 0 {
-                            a0 = a0 + add;
+                            a0 += add;
                         } else if c == 1 {
-                            a1 = a1 + add;
+                            a1 += add;
                         } else if c == 2 {
-                            a2 = a2 + add;
+                            a2 += add;
                         } else {
-                            a3 = a3 + add;
+                            a3 += add;
                         }
                     }
                 }
-                l = l + w;
+                l += w;
             } else {
                 let w = (s - m).exp();
                 for c in 0..chunks {
@@ -694,17 +702,17 @@ fn tree_attention_kernel(
                     if dim < head_dim {
                         let add = w * v[kv_base + dim];
                         if c == 0 {
-                            a0 = a0 + add;
+                            a0 += add;
                         } else if c == 1 {
-                            a1 = a1 + add;
+                            a1 += add;
                         } else if c == 2 {
-                            a2 = a2 + add;
+                            a2 += add;
                         } else {
-                            a3 = a3 + add;
+                            a3 += add;
                         }
                     }
                 }
-                l = l + w;
+                l += w;
             }
         }
         j += 1;
@@ -811,7 +819,7 @@ pub fn gptq_correction(
     let hh = client.create_from_slice(f32::as_bytes(h_diag));
     gptq_correction_kernel::launch::<HipRuntime>(
         client,
-        CubeCount::Static(((n as u32) + 255) / 256, 1, 1),
+        CubeCount::Static((n as u32).div_ceil(256), 1, 1),
         CubeDim::new_1d(256),
         unsafe { ArrayArg::from_raw_parts(ah.clone(), n) },
         unsafe { ArrayArg::from_raw_parts(oh.clone(), n) },
