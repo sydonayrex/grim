@@ -87,9 +87,9 @@ pub fn launch_multi_gpu_kernel(
     if let Some(rccl) = comm {
         for (i, &out_ptr) in out_ptrs.iter().enumerate() {
             if !out_ptr.is_null() {
-                let shard_count = ((i as u32 + 1) * full_dims.m / (n as u32)
+                let shard_count = (((i as u32 + 1) * full_dims.m / (n as u32)
                     - i as u32 * full_dims.m / (n as u32))
-                    * full_dims.n as u32 as usize;
+                    * full_dims.n) as usize;
                 let ptr_val = out_ptr as u64;
                 let _ = rccl.sum_gradients_device(ptr_val, ptr_val, shard_count, 0, i);
             }

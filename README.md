@@ -31,22 +31,22 @@ cargo test --workspace
 
 | Crate | Scope |
 |---|---|
-| [`grim-tensor`](crates/grim-tensor/README.md) | Core tensor structures, shape handling, data types, and device storage traits. |
+| [`grim-tensor`](crates/grim-tensor/README.md) | Core tensor structures, shape handling, data types (including AWQ, CompressedTensors W8A8 Int8/Fp8, W4A16, GPTQ, MXFP4), and device storage traits. |
 | [`grim-tensor-graph`](crates/grim-tensor-graph/README.md) | Computation graph representation and subgraph optimization passes. |
 | [`grim-backend-cpu`](crates/grim-backend-cpu/README.md) | CPU compute backend using SIMD vector primitives and scalar execution fallback. |
-| [`grim-backend-rocm`](crates/grim-backend-rocm/README.md) | AMD ROCm/HIP primary GPU backend with JIT kernel compilation and rocBLAS integration. |
+| [`grim-backend-rocm`](crates/grim-backend-rocm/README.md) | AMD ROCm/HIP primary GPU backend with JIT kernel compilation, rocBLAS integration, Charon grouped fused MoE kernels (AWQ, W8A8, MXFP4, IQK), and fused dequant-GEMMs. |
 | [`grim-backend-cuda`](crates/grim-backend-cuda/README.md) | NVIDIA CUDA compatibility backend using cuBLAS and CUDA runtime APIs. |
 | [`grim-backend-vulkan`](crates/grim-backend-vulkan/README.md) | Vulkan compute backend executing SPIR-V compute pipelines. |
 | [`grim-backend-metal`](crates/grim-backend-metal/README.md) | Apple Metal compute backend using Metal Performance Shaders and MSL shaders. |
-| [`grim-nn`](crates/grim-nn/README.md) | Neural network layer building blocks and weight loader traits. |
+| [`grim-nn`](crates/grim-nn/README.md) | Neural network layer building blocks, expert bank partitioning, and weight loader traits. |
 | [`grim-core`](crates/grim-core/README.md) | Core model traits, session execution, error definitions, and sampler interfaces. |
 | [`grim-models/transformer`](crates/grim-models/transformer/README.md) | Dense transformer model family implementations (LLaMA, Mistral, Qwen). |
 | [`grim-models/mamba`](crates/grim-models/mamba/README.md) | Mamba and Mamba2 state-space model architecture implementations. |
 | [`grim-models/vision`](crates/grim-models/vision/README.md) | Vision transformer and CLIP patch encoder architecture implementations. |
 | [`grim-models/audio`](crates/grim-models/audio/README.md) | Whisper audio encoder and decoder model architecture implementations. |
 | [`grim-models/diffusion`](crates/grim-models/diffusion/README.md) | UNet and DDIM/Euler diffusion sampling pipeline implementations. |
-| [`grim-format`](crates/grim-format/README.md) | GGUF reader and writer, safetensors parser, and native `.grim` metadata I/O. |
-| [`grim-quant`](crates/grim-quant/README.md) | Weight quantization schemes (Q8_0, Q4_K, Q5_K, NF4, FP8, MXFP) and calibration routines. |
+| [`grim-format`](crates/grim-format/README.md) | GGUF reader and writer, safetensors parser, native AWQ provider, and native `.grim` metadata I/O. |
+| [`grim-quant`](crates/grim-quant/README.md) | Weight quantization schemes (AWQ, Q8_0, Q4_K, Q5_K, NF4, FP8, MXFP, W8A8, WNA16) and calibration routines. |
 | [`grim-memory`](crates/grim-memory/README.md) | Paged KV cache allocator, prefix caching index, and SSM state pools. |
 | [`grim-scheduler`](crates/grim-scheduler/README.md) | Continuous batching scheduler with admission control and priority queues. |
 | [`grim-engine`](crates/grim-engine/README.md) | Top-level execution orchestrator linking model, memory, scheduler, and backends. |

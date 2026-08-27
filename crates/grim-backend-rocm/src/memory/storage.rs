@@ -375,6 +375,27 @@ impl RocmStorage {
             managed: false,
         })
     }
+
+    /// Read the raw device buffer bytes back to host.
+    pub fn copy_to_host(&self) -> Result<Vec<u8>> {
+        if !self.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "RocmStorage has no valid device pointer".into(),
+            ));
+        }
+        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut raw = vec![0u8; self.bytes];
+        check_hip("hipMemcpyDtoH raw bytes", unsafe {
+            hipMemcpy(
+                raw.as_mut_ptr() as *mut c_void,
+                dev_ptr_void,
+                self.bytes,
+                HipMemcpyKind::DeviceToHost,
+            )
+        })?;
+        Ok(raw)
+    }
 }
 
 impl Drop for RocmStorage {

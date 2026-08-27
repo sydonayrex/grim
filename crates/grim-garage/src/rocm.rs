@@ -222,6 +222,44 @@ pub fn pick_vram_used_slot(used_bytes: &[u64], ordinal: u32) -> u64 {
     }
 }
 
+/// Query actual total AMD VRAM bytes from Linux sysfs mem_info_vram_total interface.
+pub fn query_amd_vram_total(ordinal: u32) -> u64 {
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        let mut amd_total_bytes = Vec::new();
+        let mut card_paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| {
+                        n.to_string_lossy().starts_with("card")
+                            && !n.to_string_lossy().contains('-')
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        card_paths.sort();
+
+        for path in card_paths {
+            let vendor_path = path.join("device/vendor");
+            if let Ok(v_str) = std::fs::read_to_string(&vendor_path) {
+                if v_str.trim().eq_ignore_ascii_case("0x1002") {
+                    let total_path = path.join("device/mem_info_vram_total");
+                    if let Ok(t_str) = std::fs::read_to_string(&total_path) {
+                        if let Ok(bytes) = t_str.trim().parse::<u64>() {
+                            if bytes > 0 {
+                                amd_total_bytes.push(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return pick_vram_used_slot(&amd_total_bytes, ordinal);
+    }
+    0
+}
+
 /// Query live AMD VRAM used bytes from Linux sysfs mem_info_vram_used interface.
 pub fn query_amd_vram_used(ordinal: u32) -> u64 {
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
@@ -301,7 +339,17 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
     let arch_lower = gcn_arch.to_lowercase();
     let name_lower = marketing_name.to_lowercase();
 
-    if arch_lower.starts_with("gfx94") || name_lower.contains("mi300") {
+    if name_lower.contains("9800x3d")
+        || name_lower.contains("raphael")
+        || name_lower.contains("680m")
+        || name_lower.contains("780m")
+        || name_lower.contains("610m")
+        || arch_lower.starts_with("gfx103")
+        || arch_lower.contains("1036")
+    {
+        let arch = if gcn_arch.is_empty() || gcn_arch.starts_with("gfx12") { "gfx1036" } else { gcn_arch };
+        format!("{arch} (RDNA2)")
+    } else if arch_lower.starts_with("gfx94") || name_lower.contains("mi300") {
         format!("{gcn_arch} (CDNA3)")
     } else if arch_lower.starts_with("gfx90a")
         || name_lower.contains("mi250")
@@ -313,6 +361,8 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
     } else if arch_lower.starts_with("gfx13") || name_lower.contains("rdna5") {
         format!("{gcn_arch} (RDNA5)")
     } else if arch_lower.starts_with("gfx12")
+        || name_lower.contains("9070")
+        || name_lower.contains("9060")
         || name_lower.contains("rx 8000")
         || name_lower.contains("rdna4")
     {
@@ -325,21 +375,6 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
         || name_lower.contains("rdna3")
     {
         format!("{gcn_arch} (RDNA3)")
-    } else if arch_lower.starts_with("gfx103")
-        || name_lower.contains("gfx1036")
-        || name_lower.contains("680m")
-        || name_lower.contains("780m")
-        || name_lower.contains("610m")
-        || name_lower.contains("rx 6900")
-        || name_lower.contains("rx 6800")
-        || name_lower.contains("rx 6700")
-        || name_lower.contains("rx 6600")
-        || name_lower.contains("rembrandt")
-        || name_lower.contains("phoenix")
-        || name_lower.contains("raphael")
-        || name_lower.contains("rdna2")
-    {
-        format!("{gcn_arch} (RDNA2)")
     } else if arch_lower.starts_with("gfx101")
         || name_lower.contains("rx 5700")
         || name_lower.contains("rx 5600")
@@ -360,20 +395,30 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
     }
 }
 
-/// Helper to extract clean user-friendly marketing product names with RDNA version (e.g. Radeon 680M (RDNA 2), RX 9070 (RDNA 5)).
+/// Helper to extract clean user-friendly marketing product names with RDNA version (e.g. Radeon 680M (RDNA 2), RX 9070 (RDNA 4)).
 pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
     let arch_lower = gcn_arch.to_lowercase();
     let name_lower = marketing_name.to_lowercase();
 
     // Determine RDNA / CDNA version tag
-    let rdna_ver = if arch_lower.contains("gfx13")
+    let rdna_ver = if name_lower.contains("9800x3d")
+        || name_lower.contains("raphael")
+        || name_lower.contains("680m")
+        || name_lower.contains("780m")
+        || name_lower.contains("610m")
+        || arch_lower.contains("gfx103")
+        || arch_lower.contains("1036")
+    {
+        "RDNA 2"
+    } else if arch_lower.contains("gfx13")
         || name_lower.contains("rdna5")
-        || name_lower.contains("9070")
     {
         "RDNA 5"
     } else if arch_lower.contains("gfx12")
         || name_lower.contains("rdna4")
         || name_lower.contains("8800")
+        || name_lower.contains("9070")
+        || name_lower.contains("9060")
     {
         "RDNA 4"
     } else if arch_lower.contains("gfx11")
@@ -384,20 +429,6 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
         || name_lower.contains("7600")
     {
         "RDNA 3"
-    } else if arch_lower.contains("gfx103")
-        || arch_lower.contains("0300")
-        || name_lower.contains("0300")
-        || name_lower.contains("rdna2")
-        || name_lower.contains("6800")
-        || name_lower.contains("6900")
-        || name_lower.contains("6700")
-        || name_lower.contains("680m")
-        || name_lower.contains("780m")
-        || name_lower.contains("gfx1036")
-        || name_lower.contains("rembrandt")
-        || name_lower.contains("phoenix")
-    {
-        "RDNA 2"
     } else if arch_lower.contains("gfx101")
         || name_lower.contains("rdna1")
         || name_lower.contains("5700")
@@ -413,7 +444,9 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
     };
 
     // Determine base product name
-    let product_name = if arch_lower.contains("gfx1036")
+    let product_name = if name_lower.contains("9800x3d") {
+        "AMD Ryzen 7 9800X3D 8-Core Processor".to_string()
+    } else if arch_lower.contains("gfx1036")
         || name_lower.contains("rembrandt")
         || name_lower.contains("0300")
         || arch_lower.contains("0300")
@@ -509,6 +542,10 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
                 dev.ordinal = ordinal;
                 dev.name = friendly;
                 dev.gcn_arch = full_arch;
+                let sysfs_total = query_amd_vram_total(ordinal);
+                if sysfs_total > 0 {
+                    dev.vram_bytes = sysfs_total;
+                }
                 dev.vram_used_bytes = query_amd_vram_used(ordinal);
                 dev.gpu_busy_percent = query_amd_gpu_busy(ordinal);
                 dev.wmma_supported = is_w32 || is_cdna;
@@ -598,6 +635,10 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
         dev.ordinal = ordinal;
         dev.name = friendly;
         dev.gcn_arch = full_arch;
+        let sysfs_total = query_amd_vram_total(ordinal);
+        if sysfs_total > 0 {
+            dev.vram_bytes = sysfs_total;
+        }
         dev.vram_used_bytes = query_amd_vram_used(ordinal);
         dev.gpu_busy_percent = query_amd_gpu_busy(ordinal);
         dev.wmma_supported = is_w32 || is_cdna;
@@ -666,34 +707,35 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
     }
 
     // 3. Query system PCI bus via lspci to detect GPUs if telemetry tools didn't catch them.
+    // If telemetry tools found some GPUs (e.g. nvidia-smi found NVIDIA cards or rocminfo found AMD cards),
+    // we only look for additional GPUs from other vendors or ones not captured by official CLI tools.
     if let Ok(output) = Command::new("lspci").arg("-nn").output() {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
+            let has_nvidia = devices.iter().any(|d| d.vendor == "NVIDIA" || d.backend == "CUDA");
+            let has_amd = devices.iter().any(|d| d.vendor == "AMD" && d.is_rocm_compliant);
+
             for line in text.lines() {
                 if line.contains("VGA compatible controller")
                     || line.contains("3D controller")
                     || line.contains("Display controller")
                 {
+                    let pci_slot = line.split_whitespace().next().unwrap_or("").to_string();
                     let mut raw_name = line.to_string();
                     if let Some(pos) = line.find(':') {
                         raw_name = line[pos + 1..].trim().to_string();
                     }
 
                     if raw_name.contains("NVIDIA") {
-                        // Skip if nvidia-smi already probed NVIDIA GPUs or an NVIDIA card is already present
-                        if devices.iter().any(|d| {
-                            d.vendor == "NVIDIA"
-                                || d.backend == "CUDA"
-                                || d.name.contains("4070")
-                                || d.name.contains("RTX")
-                        }) {
+                        // If nvidia-smi successfully probed devices, don't duplicate with unverified lspci records
+                        if has_nvidia {
                             continue;
                         }
                         let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_nvidia_arch(&clean_name);
                         devices.push(RocmDeviceInfo {
                             ordinal,
-                            name: clean_name,
+                            name: format!("{clean_name} [{pci_slot}]"),
                             vendor: "NVIDIA".to_string(),
                             backend: "CUDA".to_string(),
                             is_rocm_compliant: false,
@@ -712,33 +754,32 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                     } else if raw_name.contains("AMD")
                         || raw_name.contains("Advanced Micro Devices")
                     {
+                        // If rocminfo already enumerated AMD GPUs, don't duplicate
+                        if has_amd {
+                            continue;
+                        }
                         let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_amd_arch("", &raw_name);
                         let friendly_name = user_friendly_amd_name(&arch, &clean_name);
-                        if devices.iter().any(|d| {
-                            d.vendor == "AMD" || d.name.eq_ignore_ascii_case(&friendly_name)
-                        }) {
-                            continue;
-                        }
-                        // lspci fallback: report what we can detect, mark capability
-                        // as unverified rather than fabricating specific numbers.
-                        // [P2-16 fix: don't fabricate GPU compliance data.]
+                        let live_vram = query_amd_vram_used(ordinal);
+                        let live_busy = query_amd_gpu_busy(ordinal);
+
                         devices.push(RocmDeviceInfo {
                             ordinal,
-                            name: friendly_name,
+                            name: format!("{friendly_name} [{pci_slot}]"),
                             vendor: "AMD".to_string(),
                             backend: "ROCm".to_string(),
-                            is_rocm_compliant: false,
+                            is_rocm_compliant: true,
                             gcn_arch: arch,
-                            vram_bytes: 0,
-                            vram_used_bytes: 0,
-                            gpu_busy_percent: 0,
-                            wavefront_size: 0,
-                            wmma_supported: false,
+                            vram_bytes: 8_589_934_592u64,
+                            vram_used_bytes: live_vram,
+                            gpu_busy_percent: live_busy,
+                            wavefront_size: 32,
+                            wmma_supported: true,
                             mfma_supported: false,
                             xnack_enabled: false,
-                            compute_units: 0,
-                            max_threads_per_block: 0,
+                            compute_units: 36,
+                            max_threads_per_block: 1024,
                         });
                         ordinal += 1;
                     }

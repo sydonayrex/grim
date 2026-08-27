@@ -1004,6 +1004,300 @@ extern "C" __global__ void grim_moe_fused_grouped_iqk(
     }
 }
 
+// --- #7 CompressedTensors W8A8 INT8 grouped kernel -------------------------
+extern "C" __global__ void grim_moe_fused_grouped_w8a8_int8(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+    // Per-expert stride: 8 (u64 prefix) + (rows*cols) codes + (rows*4) scales
+    const unsigned long long gate_stride = 8 + (unsigned long long)inter * hidden + (unsigned long long)inter * 4;
+    const unsigned long long down_stride = 8 + (unsigned long long)hidden * inter + (unsigned long long)hidden * 4;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue;
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * gate_stride;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * gate_stride;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * down_stride;
+
+        const unsigned char* g_codes = gw + 8;
+        const float* g_scales = (const float*)(gw + 8 + (unsigned long long)inter * hidden);
+
+        const unsigned char* u_codes = uw + 8;
+        const float* u_scales = (const float*)(uw + 8 + (unsigned long long)inter * hidden);
+
+        const unsigned char* d_codes = dw + 8;
+        const float* d_scales = (const float*)(dw + 8 + (unsigned long long)hidden * inter);
+
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    signed char gc = (signed char)g_codes[(unsigned long long)j * hidden + i];
+                    signed char uc = (signed char)u_codes[(unsigned long long)j * hidden + i];
+                    gate += (float)gc * g_scales[j] * a[i];
+                    up   += (float)uc * u_scales[j] * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                signed char dc = (signed char)d_codes[(unsigned long long)h * inter + j];
+                acc += (float)dc * d_scales[h] * act;
+            }
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
+        }
+    }
+}
+
+// --- #8 CompressedTensors W8A8 FP8 grouped kernel --------------------------
+__device__ __forceinline__ float grim_charon_fp8_e4m3_to_f32(unsigned char val) {
+    int sign = (val >> 7) & 1;
+    int exp = (val >> 3) & 0x0F;
+    int mant = val & 0x07;
+    if (exp == 0xF) {
+        if (mant == 7) return 0.0f / 0.0f;
+        float v = 448.0f;
+        return sign ? -v : v;
+    }
+    float res;
+    if (exp != 0) {
+        res = (1.0f + (float)mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
+    } else {
+        res = (float)mant / 512.0f;
+    }
+    return sign ? -res : res;
+}
+
+extern "C" __global__ void grim_moe_fused_grouped_w8a8_fp8(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+    const unsigned long long gate_stride = 8 + (unsigned long long)inter * hidden + 4;
+    const unsigned long long down_stride = 8 + (unsigned long long)hidden * inter + 4;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue;
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * gate_stride;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * gate_stride;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * down_stride;
+
+        const unsigned char* g_codes = gw + 8;
+        const float g_scale = *(const float*)(gw + 8 + (unsigned long long)inter * hidden);
+
+        const unsigned char* u_codes = uw + 8;
+        const float u_scale = *(const float*)(uw + 8 + (unsigned long long)inter * hidden);
+
+        const unsigned char* d_codes = dw + 8;
+        const float d_scale = *(const float*)(dw + 8 + (unsigned long long)hidden * inter);
+
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    float gw_f = grim_charon_fp8_e4m3_to_f32(g_codes[(unsigned long long)j * hidden + i]) * g_scale;
+                    float uw_f = grim_charon_fp8_e4m3_to_f32(u_codes[(unsigned long long)j * hidden + i]) * u_scale;
+                    gate += gw_f * a[i];
+                    up   += uw_f * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                float dw_f = grim_charon_fp8_e4m3_to_f32(d_codes[(unsigned long long)h * inter + j]) * d_scale;
+                acc += dw_f * act;
+            }
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
+        }
+    }
+}
+
+// --- #9 AWQ grouped kernel -------------------------------------------------
+static inline __device__ unsigned int grim_charon_awq_read_u32(
+    const unsigned char* __restrict__ base, long long word_idx)
+{
+    return *(const unsigned int*)(base + word_idx * 4);
+}
+
+static inline __device__ unsigned int grim_charon_awq_read_code(
+    const unsigned char* qweight, int in_idx, int col, int N,
+    int bits, int values_per_word)
+{
+    long long word_idx = (long long)(in_idx / values_per_word) * N + col;
+    unsigned int word = grim_charon_awq_read_u32(qweight, word_idx);
+    return (word >> ((in_idx % values_per_word) * bits)) & ((1u << bits) - 1u);
+}
+
+static inline __device__ float grim_charon_awq_read_zero(
+    const unsigned char* qzeros, int group, int col,
+    int bits, int values_per_word, int zeros_words_per_row)
+{
+    long long word_idx = (long long)group * zeros_words_per_row + col / values_per_word;
+    unsigned int word = grim_charon_awq_read_u32(qzeros, word_idx);
+    return (float)((word >> ((col % values_per_word) * bits)) & ((1u << bits) - 1u));
+}
+
+extern "C" __global__ void grim_moe_fused_grouped_awq(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    int bits, int group_size,
+    long long gate_qw_off, long long gate_qz_off, long long gate_sc_off, unsigned long long gate_stride,
+    long long down_qw_off, long long down_qz_off, long long down_sc_off, unsigned long long down_stride,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+    const int vpw = (bits == 4) ? 8 : (bits == 2 ? 16 : 1);
+    const int g_zero_words_per_row = (inter + vpw - 1) / vpw;
+    const int d_zero_words_per_row = (hidden + vpw - 1) / vpw;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue;
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * gate_stride;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * gate_stride;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * down_stride;
+
+        const unsigned char* g_qw = gw + gate_qw_off;
+        const unsigned char* g_qz = gw + gate_qz_off;
+        const unsigned char* g_sc = gw + gate_sc_off;
+
+        const unsigned char* u_qw = uw + gate_qw_off;
+        const unsigned char* u_qz = uw + gate_qz_off;
+        const unsigned char* u_sc = uw + gate_sc_off;
+
+        const unsigned char* d_qw = dw + down_qw_off;
+        const unsigned char* d_qz = dw + down_qz_off;
+        const unsigned char* d_sc = dw + down_sc_off;
+
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    int grp = i / group_size;
+
+                    // Gate weight: col=j, in=i, N=inter
+                    unsigned int g_code = grim_charon_awq_read_code(g_qw, i, j, inter, bits, vpw);
+                    float g_zero = grim_charon_awq_read_zero(g_qz, grp, j, bits, vpw, g_zero_words_per_row);
+                    unsigned short g_sch = *(const unsigned short*)(g_sc + ((long long)grp * inter + j) * 2);
+                    float g_scale = f16_to_f32(g_sch);
+                    float gw_f = ((float)g_code - g_zero) * g_scale;
+
+                    // Up weight: col=j, in=i, N=inter
+                    unsigned int u_code = grim_charon_awq_read_code(u_qw, i, j, inter, bits, vpw);
+                    float u_zero = grim_charon_awq_read_zero(u_qz, grp, j, bits, vpw, g_zero_words_per_row);
+                    unsigned short u_sch = *(const unsigned short*)(u_sc + ((long long)grp * inter + j) * 2);
+                    float u_scale = f16_to_f32(u_sch);
+                    float uw_f = ((float)u_code - u_zero) * u_scale;
+
+                    gate += gw_f * a[i];
+                    up   += uw_f * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+
+                // Down weight: col=h, in=j, N=hidden
+                int d_grp = j / group_size;
+                unsigned int d_code = grim_charon_awq_read_code(d_qw, j, h, hidden, bits, vpw);
+                float d_zero = grim_charon_awq_read_zero(d_qz, d_grp, h, bits, vpw, d_zero_words_per_row);
+                unsigned short d_sch = *(const unsigned short*)(d_sc + ((long long)d_grp * hidden + h) * 2);
+                float d_scale = f16_to_f32(d_sch);
+                float dw_f = ((float)d_code - d_zero) * d_scale;
+
+                acc += dw_f * act;
+            }
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
+        }
+    }
+}
+
 "#;
 
 // ---------------------------------------------------------------------------

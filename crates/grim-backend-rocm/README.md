@@ -131,6 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Use Cases
 
 - Primary GPU compute target for training and high-throughput inference on AMD Radeon and Instinct GPUs.
+- Native token-sorted grouped fused Charon MoE kernels for AWQ, CompressedTensors W8A8 (Int8/FP8), MXFP4, and IQ-family quantized expert banks.
+- Native AWQ dequant-GEMM forward and backward operations (`grim_awq_dequant_gemm`, `grim_awq_dequant_backward_gemm`).
 - Fused token embedding backward gradient aggregation (`grim_embedding_backward`).
 - Hardware-adaptive kernel selection tuning for Wave32 (RDNA) and Wave64 (CDNA) architectures.
 

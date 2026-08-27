@@ -263,9 +263,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const label = document.createElement('label');
             label.style.cssText = 'display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: var(--text-main); margin-bottom: 4px;';
             const rawArch = (d.gcn_arch || '').split(' ')[0];
+            const archStr = rawArch ? ` [${rawArch}]` : '';
             label.innerHTML = `
               <input type="checkbox" class="gpu-select-checkbox" data-ordinal="${d.ordinal}" data-vram="${d.vram_bytes}" data-arch="${rawArch}" ${idx === 0 ? 'checked' : ''}>
-              <span>GPU ${d.ordinal}: ${d.name} (${d.gcn_arch})</span>
+              <span>GPU ${d.ordinal}: ${d.name}${archStr}</span>
               <span class="text-muted" style="margin-left: auto;">${(d.vram_bytes / (1024*1024*1024)).toFixed(1)} GB</span>
             `;
             gpuContainer.appendChild(label);

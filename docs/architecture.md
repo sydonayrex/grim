@@ -6,9 +6,9 @@ Grim is a pure-Rust neural network inference and fine-tuning engine supporting a
 
 The workspace is organized into five functional layers:
 
-- **Foundation Layer** (`grim-tensor`, `grim-tensor-graph`, `grim-quant`, `grim-format`): Tensors, quantization codecs (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, FP8, MXFP4), and container file I/O (GGUF, SafeTensors, `.grim`).
-- **Backend Layer** (`grim-backend-cpu`, `grim-backend-rocm`, `grim-backend-cuda`, `grim-backend-vulkan`, `grim-backend-metal`): Hardware execution engines and vendor runtime bindings.
-- **Model Layer** (`grim-nn`, `grim-models-transformer`, `grim-models-mamba`, `grim-models-vision`, `grim-models-audio`, `grim-models-diffusion`): Neural network building blocks, weight loaders, and architecture implementations.
+- **Foundation Layer** (`grim-tensor`, `grim-tensor-graph`, `grim-quant`, `grim-format`): Tensors, quantization codecs (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, FP8, MXFP4, AWQ, W8A8 Int8/FP8, WNA16, W4A16), and container file I/O (GGUF, SafeTensors, `.grim`, native AWQ).
+- **Backend Layer** (`grim-backend-cpu`, `grim-backend-rocm`, `grim-backend-cuda`, `grim-backend-vulkan`, `grim-backend-metal`): Hardware execution engines, vendor runtime bindings, Charon fused grouped MoE kernels, and dequant GEMMs.
+- **Model Layer** (`grim-nn`, `grim-models-transformer`, `grim-models-mamba`, `grim-models-vision`, `grim-models-audio`, `grim-models-diffusion`): Neural network building blocks, expert bank partitioning, weight loaders, and architecture implementations.
 - **Runtime Layer** (`grim-core`, `grim-engine`, `grim-scheduler`, `grim-memory`, `grim-kvquant`, `grim-kvtransport`, `grim-autograd`, `grim-speculative`, `grim-constrain`): Inference orchestration, continuous batching, paged memory management, speculative execution, grammar-constrained decoding, and adapter autograd.
 - **Service Layer** (`grim-server`, `grim-cli`, `grim-plugin`, `grim-disagg`, `grim-garage`): HTTP/REST API endpoints, command-line interface, WASM plugin sandbox, disaggregated serving, and training telemetry dashboard.
 

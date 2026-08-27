@@ -225,6 +225,183 @@ pub(crate) fn w4a16_split_bank(
     Ok(blobs)
 }
 
+/// Split an AWQ bank into per-expert three-segment prefixed blobs:
+/// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales (f16)]`.
+///
+/// AWQ weights are packed column-major over `[K, N]` where `N = num_experts * out`.
+/// Each expert owns column range `[e * out, (e + 1) * out)`.
+pub(crate) fn awq_split_bank(
+    bytes: &[u8],
+    bits: u8,
+    group_size: usize,
+    num_experts: usize,
+    out: usize,
+    k: usize,
+) -> Result<Vec<Vec<u8>>, grim_tensor::error::Error> {
+    let vpw: usize = match bits {
+        2 => 16,
+        4 => 8,
+        8 => 1,
+        _ => {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "awq bank split: unsupported bit width {bits}"
+            )));
+        }
+    };
+    let n = num_experts * out;
+    let groups = k.div_ceil(group_size);
+
+    // Segment table
+    let qw_len = k.div_ceil(vpw) * n * 4;
+    let qz_len = groups * n.div_ceil(vpw) * 4;
+    let sc_len = groups * n * 2; // f16 scales
+    let total_expected = 8 + qw_len + 8 + qz_len + 8 + sc_len;
+
+    // Check if the bank is already formatted as concatenated per-expert blobs
+    let per_exp_qw_len = k.div_ceil(vpw) * out * 4;
+    let per_exp_qz_len = groups * out.div_ceil(vpw) * 4;
+    let per_exp_sc_len = groups * out * 2;
+    let per_exp_blob_len = 8 + per_exp_qw_len + 8 + per_exp_qz_len + 8 + per_exp_sc_len;
+
+    if bytes.len() == num_experts * per_exp_blob_len {
+        let mut blobs = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let start = e * per_exp_blob_len;
+            blobs.push(bytes[start..start + per_exp_blob_len].to_vec());
+        }
+        return Ok(blobs);
+    }
+
+    if bytes.len() < total_expected {
+        return Err(grim_tensor::error::Error::Backend(format!(
+            "awq bank split: {} bytes < expected {total_expected}",
+            bytes.len()
+        )));
+    }
+
+    let qw_data = 8usize;
+    let qz_data = qw_data + qw_len + 8;
+    let sc_data = qz_data + qz_len + 8;
+
+    let u64le = |v: usize| (v as u64).to_le_bytes().to_vec();
+
+    let mut blobs = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let c0 = e * out;
+        let mut blob = Vec::new();
+
+        // qweight
+        blob.extend_from_slice(&u64le(per_exp_qw_len));
+        for chunk in 0..k.div_ceil(vpw) {
+            let src = qw_data + chunk * n * 4 + c0 * 4;
+            blob.extend_from_slice(&bytes[src..src + out * 4]);
+        }
+
+        // qzeros
+        blob.extend_from_slice(&u64le(per_exp_qz_len));
+        for g in 0..groups {
+            let src = qz_data + g * n.div_ceil(vpw) * 4 + (c0 / vpw) * 4;
+            blob.extend_from_slice(&bytes[src..src + out.div_ceil(vpw) * 4]);
+        }
+
+        // scales (f16)
+        blob.extend_from_slice(&u64le(per_exp_sc_len));
+        for g in 0..groups {
+            let src = sc_data + g * n * 2 + c0 * 2;
+            blob.extend_from_slice(&bytes[src..src + out * 2]);
+        }
+
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
+/// Split a CompressedTensors W8A8 INT8 bank into per-expert blobs:
+/// `[u64 prefix][int8 codes [out, in]][f32 scales [out]]`.
+pub(crate) fn w8a8_int8_split_bank(
+    bytes: &[u8],
+    num_experts: usize,
+    out: usize,
+    k: usize,
+) -> Result<Vec<Vec<u8>>, grim_tensor::error::Error> {
+    let per_exp_codes = out * k;
+    let per_exp_scales = out * 4;
+    let per_exp_len = 8 + per_exp_codes + per_exp_scales;
+
+    if bytes.len() == num_experts * per_exp_len {
+        let mut blobs = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let start = e * per_exp_len;
+            blobs.push(bytes[start..start + per_exp_len].to_vec());
+        }
+        return Ok(blobs);
+    }
+
+    // Unified bank: [u64 prefix][int8 codes [num_experts*out, k]][f32 scales [num_experts*out]]
+    let codes_start = 8usize;
+    let scales_start = codes_start + num_experts * out * k;
+    if bytes.len() < scales_start + num_experts * out * 4 {
+        return Err(grim_tensor::error::Error::Backend(format!(
+            "w8a8_int8 bank split: buffer too short (len={})",
+            bytes.len()
+        )));
+    }
+
+    let mut blobs = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let mut blob = Vec::with_capacity(per_exp_len);
+        blob.extend_from_slice(&(per_exp_codes as u64).to_le_bytes());
+        let c_src = codes_start + e * per_exp_codes;
+        blob.extend_from_slice(&bytes[c_src..c_src + per_exp_codes]);
+        let s_src = scales_start + e * per_exp_scales;
+        blob.extend_from_slice(&bytes[s_src..s_src + per_exp_scales]);
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
+/// Split a CompressedTensors W8A8 FP8 bank into per-expert blobs:
+/// `[u64 prefix][fp8 codes [out, in]][f32 scale]`.
+pub(crate) fn w8a8_fp8_split_bank(
+    bytes: &[u8],
+    num_experts: usize,
+    out: usize,
+    k: usize,
+) -> Result<Vec<Vec<u8>>, grim_tensor::error::Error> {
+    let per_exp_codes = out * k;
+    let per_exp_len = 8 + per_exp_codes + 4;
+
+    if bytes.len() == num_experts * per_exp_len {
+        let mut blobs = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let start = e * per_exp_len;
+            blobs.push(bytes[start..start + per_exp_len].to_vec());
+        }
+        return Ok(blobs);
+    }
+
+    let codes_start = 8usize;
+    let scale_start = codes_start + num_experts * out * k;
+    if bytes.len() < scale_start + 4 {
+        return Err(grim_tensor::error::Error::Backend(format!(
+            "w8a8_fp8 bank split: buffer too short (len={})",
+            bytes.len()
+        )));
+    }
+    let tensor_scale = &bytes[scale_start..scale_start + 4];
+
+    let mut blobs = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let mut blob = Vec::with_capacity(per_exp_len);
+        blob.extend_from_slice(&(per_exp_codes as u64).to_le_bytes());
+        let c_src = codes_start + e * per_exp_codes;
+        blob.extend_from_slice(&bytes[c_src..c_src + per_exp_codes]);
+        blob.extend_from_slice(tensor_scale);
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
 /// Split a GPTQ/GroupInt bank into per-expert four-segment prefixed blobs
 /// matching `roc_device::gptq_segment_offsets`:
 /// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx]`.
@@ -563,6 +740,26 @@ impl ExpertBank {
                         *out,
                         *in_,
                     )?),
+                    Storage::Awq(awq) => Some(awq_split_bank(
+                        &raw.bytes,
+                        awq.bits,
+                        awq.group_size,
+                        num_experts,
+                        *out,
+                        *in_,
+                    )?),
+                    Storage::CompressedTensorsW8A8Int8 => Some(w8a8_int8_split_bank(
+                        &raw.bytes,
+                        num_experts,
+                        *out,
+                        *in_,
+                    )?),
+                    Storage::CompressedTensorsW8A8Fp8 => Some(w8a8_fp8_split_bank(
+                        &raw.bytes,
+                        num_experts,
+                        *out,
+                        *in_,
+                    )?),
                     _ => None,
                 };
 
@@ -814,6 +1011,88 @@ pub(crate) fn rocm_dequant_expert_weight(
                 ))?;
             dev.dequant_wna16_blob_to_f32(b_rocm, n_rows * k_dim)?
         }
+        Storage::CompressedTensorsW8A8Int8 => {
+            let b_rocm = weight.storage().as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| grim_tensor::error::Error::Backend(
+                    "w8a8_int8 expert not rocm".into(),
+                ))?;
+            let raw_bytes = b_rocm.copy_to_host()?;
+            let codes = &raw_bytes[8..8 + n_rows * k_dim];
+            let scales = &raw_bytes[8 + n_rows * k_dim..];
+            let mut d = vec![0.0f32; n_rows * k_dim];
+            for r in 0..n_rows {
+                let sc = f32::from_le_bytes([
+                    scales[r * 4],
+                    scales[r * 4 + 1],
+                    scales[r * 4 + 2],
+                    scales[r * 4 + 3],
+                ]);
+                for c in 0..k_dim {
+                    let code = codes[r * k_dim + c] as i8 as f32;
+                    d[r * k_dim + c] = code * sc;
+                }
+            }
+            return Ok(d);
+        }
+        Storage::CompressedTensorsW8A8Fp8 => {
+            let b_rocm = weight.storage().as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| grim_tensor::error::Error::Backend(
+                    "w8a8_fp8 expert not rocm".into(),
+                ))?;
+            let raw_bytes = b_rocm.copy_to_host()?;
+            let codes = &raw_bytes[8..8 + n_rows * k_dim];
+            let sc = f32::from_le_bytes([
+                raw_bytes[8 + n_rows * k_dim],
+                raw_bytes[8 + n_rows * k_dim + 1],
+                raw_bytes[8 + n_rows * k_dim + 2],
+                raw_bytes[8 + n_rows * k_dim + 3],
+            ]);
+            let mut d = vec![0.0f32; n_rows * k_dim];
+            for r in 0..n_rows {
+                for c in 0..k_dim {
+                    let byte = codes[r * k_dim + c];
+                    let val = grim_quant::fp8_e4m3_to_f32(byte);
+                    d[r * k_dim + c] = val * sc;
+                }
+            }
+            return Ok(d);
+        }
+        Storage::Awq(awq) => {
+            let b_rocm = weight.storage().as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| grim_tensor::error::Error::Backend(
+                    "awq expert not rocm".into(),
+                ))?;
+            let raw_bytes = b_rocm.copy_to_host()?;
+            let (qw_off, qz_off, sc_off) = grim_backend_rocm::RocmDevice::awq_segment_offsets(
+                awq.bits,
+                awq.group_size,
+                k_dim,
+                n_rows,
+                raw_bytes.len(),
+            )?;
+            let qw = &raw_bytes[qw_off as usize..qz_off as usize - 8];
+            let qz = &raw_bytes[qz_off as usize..sc_off as usize - 8];
+            let sc = &raw_bytes[sc_off as usize..];
+            let deq = grim_quant::dequant_awq_group_int(
+                qw,
+                qz,
+                sc,
+                &[k_dim, n_rows],
+                awq.bits as u32,
+                awq.group_size,
+            )?;
+            // deq is [k_dim, n_rows]; transpose to [n_rows, k_dim]
+            let mut d = vec![0.0f32; n_rows * k_dim];
+            for r in 0..n_rows {
+                for c in 0..k_dim {
+                    d[r * k_dim + c] = deq[c * n_rows + r];
+                }
+            }
+            return Ok(d);
+        }
         _ => return Ok(weight.to_vec_f32()?),
     };
     let t = Tensor::new(
@@ -1003,6 +1282,8 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
         Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
             elem_count
         }
+        // AWQ: packed bits (e.g. 4-bit = 0.5 byte/elem, 2-bit = 0.25 byte/elem)
+        Storage::Awq(awq) => (elem_count * awq.bits as usize + 7) / 8,
         // W4A16: 4-bit packed codes (~0.5 byte/elem); per-group f32 scales are
         // small relative to weights, so this is a conservative lower bound.
         Storage::W4A16(_) => elem_count / 2,

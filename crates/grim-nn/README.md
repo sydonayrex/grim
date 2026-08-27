@@ -34,8 +34,8 @@ graph TD
 
 ## Public API Overview
 - **Modules:** `Linear`, `Embedding`, `RmsNorm`, `Rope`, `ColumnParallelLinear`, `RowParallelLinear`, `Scythe2Linear`.
-- **Weight Loading:** `WeightSource`.
-- **Specialized Blocks:** `moe` (mixture of experts), `scythe2` (capacity-calibrated sharded linears).
+- **Weight Loading:** `WeightSource`, `VarBuilder`.
+- **Specialized Blocks:** `moe` (Mixture-of-Experts routing, `ExpertBank`, bank splitters for AWQ/W8A8/GPTQ/W4A16/MXFP4, Charon grouped fused dispatch), `scythe2` (capacity-calibrated sharded linears).
 
 ## Usage Example
 ```rust

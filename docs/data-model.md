@@ -110,24 +110,23 @@ pub struct Tensor {
     storage: Box<dyn BackendStorage>,
 }
 
-pub enum DType {
-    F32,
-    F16,
-    BF16,
-    I32,
-    U32,
-    U8,
-    Quantized(QuantFormat),
+pub struct DType {
+    pub arith: ArithType,
+    pub storage: Storage,
 }
 
-pub enum QuantFormat {
-    Q8_0,
-    Q4K,
-    Q5K,
-    Q6K,
-    Iq4Nl,
-    Fp8,
-    MxFp4,
+pub enum Storage {
+    Native,
+    KQuant(KQuantScheme),
+    Block(BlockDtype),
+    FloatPack(FloatPackScheme),
+    W4A16(W4A16StorageConfig),
+    GroupInt(GroupIntStorageConfig),
+    WNA16,
+    CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Fp8,
+    Awq(AwqStorageConfig),
+    ResidualPacked(ResidualPackedConfig),
 }
 ```
 

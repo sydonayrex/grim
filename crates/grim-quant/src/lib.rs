@@ -187,6 +187,85 @@ pub fn dequant_gptq_group_int(
     Ok(out)
 }
 
+/// Dequantize AWQ format group-quantized weights to f32.
+///
+/// Layout conventions for AWQ:
+/// - `qweight`: `[in_features / values_per_word, out_features]` uint32 words
+/// - `qzeros`: `[in_features / group_size, out_features / values_per_word]` uint32 words (raw stored zeros, no `+1` offset)
+/// - `scales`: `[in_features / group_size, out_features]` f16 (little-endian half floats)
+/// - `shape`: `[in_features, out_features]`
+pub fn dequant_awq_group_int(
+    qweight: &[u8],
+    qzeros: &[u8],
+    scales: &[u8],
+    shape: &[usize],
+    bits: u32,
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    let in_features = *shape.get(0).ok_or_else(|| {
+        Error::Backend("dequant_awq_group_int: shape missing in_features".into())
+    })?;
+    let out_features = *shape.get(1).ok_or_else(|| {
+        Error::Backend("dequant_awq_group_int: shape missing out_features".into())
+    })?;
+
+    let mut out = vec![0.0f32; in_features * out_features];
+
+    let values_per_word = match bits {
+        2 => 16,
+        4 => 8,
+        8 => 1,
+        _ => return Err(Error::Backend(format!("unsupported AWQ bits: {bits}"))),
+    };
+
+    let read_u32 = |bytes: &[u8], word_idx: usize| -> u32 {
+        let offset = word_idx * 4;
+        if offset + 4 <= bytes.len() {
+            u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ])
+        } else {
+            0
+        }
+    };
+
+    let words_per_row_zeros = (out_features + values_per_word - 1) / values_per_word;
+
+    for in_idx in 0..in_features {
+        let g = in_idx / group_size;
+
+        for out_idx in 0..out_features {
+            // Read scale (f16 -> f32)
+            let scale_idx = g * out_features + out_idx;
+            let scale = if scale_idx * 2 + 2 <= scales.len() {
+                f16_to_f32(scales[scale_idx * 2], scales[scale_idx * 2 + 1])
+            } else {
+                1.0f32
+            };
+
+            // Read raw zero-point (AWQ convention: no +1)
+            let zero_word_idx = g * words_per_row_zeros + out_idx / values_per_word;
+            let zero_word = read_u32(qzeros, zero_word_idx);
+            let bit_offset = (out_idx % values_per_word) * bits as usize;
+            let zero_val = (zero_word >> bit_offset) & ((1 << bits) - 1);
+            let zero = zero_val as f32;
+
+            // Read quantized code
+            let word_idx = (in_idx / values_per_word) * out_features + out_idx;
+            let word = read_u32(qweight, word_idx);
+            let bit_offset = (in_idx % values_per_word) * bits as usize;
+            let quantized_code = (word >> bit_offset) & ((1 << bits) - 1);
+
+            out[in_idx * out_features + out_idx] = (quantized_code as f32 - zero) * scale;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Dequantize Q8_0 bytes to f32.
 /// Q8_0 layout: for every 32 weights, a `f16` scale followed by 32 `i8` values.
 pub fn dequant_q80(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
