@@ -205,3 +205,46 @@ fn test_receptor_server_write_and_read() {
     assert_eq!(&recv_k[..k_data.len()], &k_data[..]);
     assert_eq!(&recv_v[..v_data.len()], &v_data[..]);
 }
+
+#[test]
+fn test_layer_pipelined_kv_streamer_and_orchestrator() {
+    use grim_disagg::{DisaggConfig, DisaggOrchestrator, LayerPipelinedKvStreamer};
+
+    let prefill_cfg = DisaggConfig {
+        role: PoolRole::Prefill,
+        prefill_addr: "127.0.0.1:9001".into(),
+        decode_addr: "127.0.0.1:9002".into(),
+    };
+    let prefill_orch = DisaggOrchestrator::new(prefill_cfg);
+    assert!(prefill_orch.handles_prefill());
+    assert!(!prefill_orch.handles_decode());
+
+    let decode_cfg = DisaggConfig {
+        role: PoolRole::Decode,
+        prefill_addr: "127.0.0.1:9001".into(),
+        decode_addr: "127.0.0.1:9002".into(),
+    };
+    let decode_orch = DisaggOrchestrator::new(decode_cfg);
+    assert!(!decode_orch.handles_prefill());
+    assert!(decode_orch.handles_decode());
+
+    // Test live streaming of layer blocks
+    let pool = KvBlockPool::new(4, 2, 4);
+    let shared = Arc::new(Mutex::new(pool));
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let _receiver = KvReceiverServer::new(&addr, shared.clone()).unwrap();
+
+    let streamer = LayerPipelinedKvStreamer::new(addr.clone());
+    let k_data = vec![1.23f32; 32];
+    let v_data = vec![4.56f32; 32];
+
+    streamer
+        .stream_layer_block(0, 0, &k_data, &v_data)
+        .expect("streaming layer block must succeed");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let guard = shared.lock().unwrap();
+    let recv_k = guard.read_keys(0);
+    assert_eq!(&recv_k[..32], &k_data[..]);
+}
