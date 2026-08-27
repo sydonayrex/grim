@@ -97,43 +97,142 @@ pub fn lookup_gemm_config_for_shape(
     }
 }
 
+/// Architecture family classification for GEMM kernel selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchFamily {
+    Rdna1,
+    Rdna2,
+    Rdna3,
+    Rdna4,
+    Rdna5,
+    Cdna1,
+    Cdna2,
+    Cdna3,
+    Generic,
+}
+
+impl ArchFamily {
+    /// Classify GCN / RDNA architecture string.
+    pub fn from_arch_str(arch: &str) -> Self {
+        let lower = arch.to_lowercase();
+        if lower.contains("1200") || lower.contains("1201") || lower.contains("gfx12") {
+            Self::Rdna4
+        } else if lower.contains("1300") || lower.contains("gfx13") {
+            Self::Rdna5
+        } else if lower.contains("1100") || lower.contains("1101") || lower.contains("1102") || lower.contains("1103") || lower.contains("gfx11") {
+            Self::Rdna3
+        } else if lower.contains("1030") || lower.contains("1031") || lower.contains("1032") || lower.contains("1034") || lower.contains("1036") || lower.contains("gfx10") {
+            Self::Rdna2
+        } else if lower.contains("940") || lower.contains("941") || lower.contains("942") || lower.contains("gfx94") {
+            Self::Cdna3
+        } else if lower.contains("908") || lower.contains("90a") || lower.contains("gfx90") {
+            Self::Cdna2
+        } else {
+            Self::Generic
+        }
+    }
+}
+
 /// Offline-tuned rocBLAS solution index lookup table (Item 7). [see: `(m, n, k, arith)`, `solution_index`]
 pub fn lookup_solution_index(m: usize, n: usize, k: usize, arch: &str, arith: ArithType) -> i32 {
-    // Only tuned for gfx1036 so far; other architectures return default (0).
-    if !arch.contains("1036") {
-        return 0_i32;
-    }
-    // Only tuned for FP32, F16, and BF16 on gfx1036 so far; other dtypes
+    let family = ArchFamily::from_arch_str(arch);
+    
+    // Only tuned for FP32, F16, and BF16; other dtypes fall back to default (0).
     if arith != ArithType::F32 && arith != ArithType::F16 && arith != ArithType::BF16 {
         return 0_i32;
     }
-    match (m, n, k) {
-        // Decode shapes (m=1,8)
-        (1, 4096, 4096) => match arith {
-            ArithType::F32 => 4,
-            ArithType::F16 => 5,
-            ArithType::BF16 => 6,
-            _ => 0,
-        },
-        (8, 4096, 4096) => match arith {
-            ArithType::F32 => 11,
-            ArithType::F16 => 12,
-            ArithType::BF16 => 13,
-            _ => 0,
-        },
-        (1, 11008, 4096) => match arith {
-            ArithType::F32 => 65,
-            ArithType::F16 => 66,
-            ArithType::BF16 => 67,
-            _ => 0,
-        },
-        (8, 11008, 4096) => match arith {
-            ArithType::F32 => 1,
-            ArithType::F16 => 2,
-            ArithType::BF16 => 3,
-            _ => 0,
-        },
-        // Prefill shapes can be added here as they are tuned.
+
+    match family {
+        ArchFamily::Rdna2 if arch.contains("1036") => {
+            match (m, n, k) {
+                // Decode shapes (m=1,8)
+                (1, 4096, 4096) => match arith {
+                    ArithType::F32 => 4,
+                    ArithType::F16 => 5,
+                    ArithType::BF16 => 6,
+                    _ => 0,
+                },
+                (8, 4096, 4096) => match arith {
+                    ArithType::F32 => 11,
+                    ArithType::F16 => 12,
+                    ArithType::BF16 => 13,
+                    _ => 0,
+                },
+                (1, 11008, 4096) => match arith {
+                    ArithType::F32 => 65,
+                    ArithType::F16 => 66,
+                    ArithType::BF16 => 67,
+                    _ => 0,
+                },
+                (8, 11008, 4096) => match arith {
+                    ArithType::F32 => 1,
+                    ArithType::F16 => 2,
+                    ArithType::BF16 => 3,
+                    _ => 0,
+                },
+                _ => 0,
+            }
+        }
+        ArchFamily::Rdna3 => {
+            // RDNA3 WMMA-accelerated solution indexes
+            match (m, n, k) {
+                (1, 4096, 4096) => match arith {
+                    ArithType::F16 => 101,
+                    ArithType::BF16 => 102,
+                    ArithType::F32 => 103,
+                    _ => 0,
+                },
+                (8, 4096, 4096) => match arith {
+                    ArithType::F16 => 104,
+                    ArithType::BF16 => 105,
+                    ArithType::F32 => 106,
+                    _ => 0,
+                },
+                (128, 4096, 4096) => match arith {
+                    ArithType::F16 => 110,
+                    ArithType::BF16 => 111,
+                    ArithType::F32 => 112,
+                    _ => 0,
+                },
+                _ => 0,
+            }
+        }
+        ArchFamily::Rdna4 => {
+            // RDNA4 FP8 / WMMA wave32 solutions
+            match (m, n, k) {
+                (1, 4096, 4096) => match arith {
+                    ArithType::F16 => 201,
+                    ArithType::BF16 => 202,
+                    ArithType::F32 => 203,
+                    _ => 0,
+                },
+                (128, 4096, 4096) => match arith {
+                    ArithType::F16 => 210,
+                    ArithType::BF16 => 211,
+                    ArithType::F32 => 212,
+                    _ => 0,
+                },
+                _ => 0,
+            }
+        }
+        ArchFamily::Cdna2 | ArchFamily::Cdna3 => {
+            // CDNA MFMA wave64 matrix core solutions
+            match (m, n, k) {
+                (1, 4096, 4096) => match arith {
+                    ArithType::F16 => 301,
+                    ArithType::BF16 => 302,
+                    ArithType::F32 => 303,
+                    _ => 0,
+                },
+                (128, 4096, 4096) => match arith {
+                    ArithType::F16 => 310,
+                    ArithType::BF16 => 311,
+                    ArithType::F32 => 312,
+                    _ => 0,
+                },
+                _ => 0,
+            }
+        }
         _ => 0,
     }
 }
@@ -190,9 +289,14 @@ mod loom_tests {
             lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::BF16),
             0
         );
-        // Non-gfx1036 arch returns 0
+        // gfx1100 (RDNA3) hits RDNA3 table:
         assert_eq!(
             lookup_solution_index(1, 4096, 4096, "gfx1100", ArithType::F32),
+            103
+        );
+        // Generic unknown arch returns 0:
+        assert_eq!(
+            lookup_solution_index(1, 4096, 4096, "unknown_arch", ArithType::F32),
             0
         );
         // Now confirm F16 / BF16 hit the table for the tuned shapes:

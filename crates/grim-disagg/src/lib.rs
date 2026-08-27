@@ -109,6 +109,60 @@ impl Default for DisaggConfig {
     }
 }
 
+/// Layer-pipelined asynchronous KV transfer manager.
+///
+/// Overlaps compute with communication by transmitting KV blocks layer-by-layer
+/// as soon as each transformer layer completes prompt prefill.
+pub struct LayerPipelinedKvStreamer {
+    decode_node_addr: String,
+    kv_client: NetworkKvClient,
+}
+
+impl LayerPipelinedKvStreamer {
+    pub fn new(decode_node_addr: String) -> Self {
+        Self {
+            decode_node_addr: decode_node_addr.clone(),
+            kv_client: NetworkKvClient::new(decode_node_addr),
+        }
+    }
+
+    /// Stream a single layer's KV block slice asynchronously across the wire.
+    pub fn stream_layer_block(
+        &self,
+        block_id: usize,
+        layer_idx: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<()> {
+        self.kv_client
+            .send_block_remote(block_id, layer_idx, k, v, &self.decode_node_addr)
+    }
+}
+
+/// Disaggregated serving cluster orchestrator managing prefill and decode worker roles.
+#[derive(Debug, Clone)]
+pub struct DisaggOrchestrator {
+    pub config: DisaggConfig,
+}
+
+impl DisaggOrchestrator {
+    pub fn new(config: DisaggConfig) -> Self {
+        Self { config }
+    }
+
+    /// Whether this node instance should execute compute-heavy prefill passes.
+    #[inline]
+    pub fn handles_prefill(&self) -> bool {
+        matches!(self.config.role, PoolRole::Colocated | PoolRole::Prefill)
+    }
+
+    /// Whether this node instance should execute bandwidth-heavy autoregressive decode passes.
+    #[inline]
+    pub fn handles_decode(&self) -> bool {
+        matches!(self.config.role, PoolRole::Colocated | PoolRole::Decode)
+    }
+}
+
 /// Router for cross-pool dispatch and network KV transfers.
 ///
 /// When `pool` is set, the router extracts **real** KV block data from the
