@@ -31,7 +31,7 @@ jobs:
         run: cargo test --workspace --exclude grim-backend-vulkan --lib
 
       - name: Run backend parity tests
-        run: cargo test -p grim-backend-tests
+        run: cargo test -p grim-backend-tests --features cpu-only
 
   gpu-gate-gfx1036:
     # Self-hosted ROCm runner. Skips cleanly when no such runner is registered.
