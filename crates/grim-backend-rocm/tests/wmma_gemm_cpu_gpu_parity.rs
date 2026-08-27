@@ -163,7 +163,7 @@ fn test_wmma_gemm_cpu_gpu_parity_all_shapes() -> TestResult {
 ///
 /// This guards against a regression where `should_use_wmma_path` is consulted
 /// but its enabled flag has no effect on the actual dispatch branch.
-// PASSED: 2026-08-27 on gfx1036, gfx1100, gfx1200, gfx1201 (ROCm)
+// PASSED: 2026-08-27 on gfx1036 (ROCm)
 #[test]
 fn test_wmma_gemm_enable_disable_output_consistency() -> TestResult {
     let dev = match gpu_device() {
