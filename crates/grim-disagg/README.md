@@ -23,7 +23,9 @@ graph TD
 ## Public API Overview
 - `DisaggRouter`: Core router for cross-pool dispatch and network KV transfers.
 - `DisaggRouterT`: Trait abstracting dispatch functionality.
-- `PoolRole`: Node deployment role (Colocated, Prefill, Decode).
+- `DisaggOrchestrator`: Cluster orchestrator managing prefill/decode roles, heartbeats, and dynamic colocated failover policies.
+- `LayerPipelinedKvStreamer`: Asynchronous layer-by-layer KV streamer overlapping prompt prefill compute with network migration.
+- `PoolRole`: Node deployment role (`Colocated`, `Prefill`, `Decode`).
 - `ReMPMigrationBatch`: Struct managing 2D block-major data transfers.
 - `KvReceiverServer`: Wrapping server for ingesting V2 protocol network blocks.
 - `DisaggConfig`: Struct describing the cluster node map.
