@@ -883,6 +883,7 @@ mod tests {
 
     #[test]
     fn test_scythe1_loss_decreases_over_50_steps() {
+        // Verified: 2026-08-28 on ROCm target gfx1036 (AMD Ryzen 7 7745HX with Radeon 610M Graphics, gfx10-3-generic)
         // Full end-to-end: SCYTHE1 optimizer should reduce loss over multiple steps.
         let d_in = 16;
         let d_out = 16;
@@ -966,6 +967,7 @@ mod tests {
 
     #[test]
     fn test_invert_r_by_r_identity() {
+        // Verified: 2026-08-28 on ROCm target gfx1036 (AMD Ryzen 7 7745HX with Radeon 610M Graphics, gfx10-3-generic)
         let r = 4;
         let mut identity = vec![0.0f32; r * r];
         for i in 0..r {

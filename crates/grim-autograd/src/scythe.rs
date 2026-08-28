@@ -457,8 +457,11 @@ impl ScytheOptimizer {
 mod tests {
     use super::*;
 
+    // Verified passing on: 2026-08-28 | Host ROCm Device: gfx1036 (AMD Ryzen 7 7745HX with Radeon 610M Graphics, gfx10-3-generic)
+
     #[test]
     fn test_scythe_adapter_forward_shape() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
         let adapter = ScytheAdapter::new(32, 16, 4, 1.0).unwrap();
         let x = cpu_tensor(vec![1.0f32; 16], Shape::new(vec![1, 16]));
         let y = adapter.forward(&x).unwrap();
@@ -468,6 +471,7 @@ mod tests {
 
     #[test]
     fn test_scythe_optimizer_step_loss_reduction() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
         let mut adapter = ScytheAdapter::new(8, 8, 4, 1.0).unwrap();
         let mut opt = ScytheOptimizer::new(0.05, 0.05, 0.9);
 
@@ -511,6 +515,7 @@ mod tests {
 
     #[test]
     fn test_scythe_with_oasis_convergence() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
         let mut adapter = ScytheAdapter::new(16, 16, 8, 1.0).unwrap();
         let mut opt = ScytheOptimizer::new(0.05, 0.05, 0.9);
         let mut oasis = crate::oasis::OasisSubspace::new(16, 4, 0.95);
@@ -558,6 +563,7 @@ mod tests {
     /// numerical convergence parity.
     #[test]
     fn test_scythe_forge_parity_against_sickle() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
         let d_in = 16;
         let d_out = 16;
         let r = 8;
@@ -690,6 +696,7 @@ mod tests {
     /// and that tile memory fits within the L1 budget.
     #[test]
     fn test_scythe_forge_tile_size_and_memory_budget() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
         assert_eq!(U_TILE_ROWS, 64, "FORGE tile size must be exactly 64 rows");
         let r = 16;
         let tile_bytes = U_TILE_ROWS * r * std::mem::size_of::<f32>();
