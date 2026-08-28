@@ -228,7 +228,7 @@ pub use mistral4::{Mistral4, Mistral4Config};
 pub use model::{Llama, LlamaConfig};
 pub use mpt::{Mpt, MptConfig};
 pub use multimodal::*;
-pub use native_mtp::{LlamaMtp, MtpDepthProvider};
+pub use native_mtp::{LlamaMtp, MtpDepthProvider, Qwen38FlashNextMtp};
 pub use nemotron::{Nemotron, NemotronConfig};
 pub use nemotron_hmoe::{NemotronHMoe, NemotronHMoeConfig};
 pub use olmo::{Olmo, OlmoConfig};
