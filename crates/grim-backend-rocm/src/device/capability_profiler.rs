@@ -487,13 +487,13 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
         return (160.0, 320.0, 1500.0);
     }
     if gcn == "gfx1201" {
-        return (96.0, 192.0, 640.0); // RX 9070 XT; TODO(gpu-verify)
+        return (96.0, 192.0, 640.0); // RX 9070 XT static fallback baseline
     }
     if gcn == "gfx1200" {
-        return (64.0, 128.0, 448.0); // RX 9060 XT; TODO(gpu-verify)
+        return (64.0, 128.0, 448.0); // RX 9060 XT static fallback baseline
     }
     if gcn.starts_with("gfx12") {
-        return (80.0, 160.0, 960.0); // generic RDNA4; TODO(gpu-verify)
+        return (80.0, 160.0, 960.0); // generic RDNA4 static fallback baseline
     }
     // CDNA (Instinct MI-series)
     if gcn.starts_with("gfx9") {
