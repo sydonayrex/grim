@@ -122,11 +122,27 @@ impl ScytheAdapter {
     }
 }
 
-/// Fused memory-efficient SCYTHE optimizer.
-pub struct ScytheOptimizer {
+/// Hyperparameters for SCYTHE optimizer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScytheConfig {
     pub lr_basis: f32,
     pub lr_sigma: f32,
     pub beta: f32,
+}
+
+impl Default for ScytheConfig {
+    fn default() -> Self {
+        Self {
+            lr_basis: 2e-4,
+            lr_sigma: 1e-3,
+            beta: 0.9,
+        }
+    }
+}
+
+/// Fused memory-efficient SCYTHE optimizer.
+pub struct ScytheOptimizer {
+    pub config: ScytheConfig,
     pub m_u: HashMap<String, Vec<f32>>,
     pub m_v: HashMap<String, Vec<f32>>,
 }
@@ -134,12 +150,84 @@ pub struct ScytheOptimizer {
 impl ScytheOptimizer {
     pub fn new(lr_basis: f32, lr_sigma: f32, beta: f32) -> Self {
         Self {
-            lr_basis,
-            lr_sigma,
-            beta,
+            config: ScytheConfig {
+                lr_basis,
+                lr_sigma,
+                beta,
+            },
             m_u: HashMap::new(),
             m_v: HashMap::new(),
         }
+    }
+
+    pub fn with_config(config: ScytheConfig) -> Self {
+        Self {
+            config,
+            m_u: HashMap::new(),
+            m_v: HashMap::new(),
+        }
+    }
+
+    /// Step parameter registry (dispatches column RMS updates and momentum step across trainable params).
+    pub fn step(&mut self, params: &mut crate::param::TrainableParams) -> Result<()> {
+        for (&id, param) in params.iter_mut() {
+            self.step_param(id, param)?;
+        }
+        Ok(())
+    }
+
+    pub fn step_param(
+        &mut self,
+        id: crate::param::ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let g_vec = param.grad().to_vec_f32()?;
+        let mut d_vec = param.data.to_vec_f32()?;
+        let d = d_vec.len();
+        let norms = column_rms(&g_vec, 1, d, 1e-8);
+
+        let m_entry = self
+            .m_u
+            .entry(format!("{:?}", id))
+            .or_insert_with(|| vec![0.0f32; d]);
+
+        for i in 0..d {
+            let update_dir = g_vec[i] / norms[i];
+            m_entry[i] = self.config.beta * m_entry[i] + (1.0 - self.config.beta) * update_dir;
+            d_vec[i] -= self.config.lr_basis * m_entry[i];
+        }
+
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let new_storage = dev.from_cpu(&d_vec, &shape, grim_tensor::DType::F32)?;
+        param.data = grim_tensor::Tensor::new(
+            std::sync::Arc::from(new_storage),
+            shape,
+            grim_tensor::DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        param.zero_grad()?;
+        Ok(())
+    }
+
+    pub fn save_to_train_state(
+        &self,
+        params: &crate::param::TrainableParams,
+    ) -> grim_format::train::TrainState {
+        crate::adamw::save_param_data_only(params, 0)
+    }
+
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut crate::param::TrainableParams,
+        state: &grim_format::train::TrainState,
+    ) -> Result<()> {
+        crate::adamw::load_param_data_only(params, state)
     }
 
     /// Fused tile-wise backward + parameter update step (FORGE + SCALE).
@@ -250,8 +338,9 @@ impl ScytheOptimizer {
                 for k in 0..r {
                     let idx = global_i * r + k;
                     let grad = g_u_tile[local_i * r + k];
-                    m_u_entry[idx] = self.beta * m_u_entry[idx] + (1.0 - self.beta) * grad;
-                    updated_u[idx] -= self.lr_basis * m_u_entry[idx];
+                    m_u_entry[idx] =
+                        self.config.beta * m_u_entry[idx] + (1.0 - self.config.beta) * grad;
+                    updated_u[idx] -= self.config.lr_basis * m_u_entry[idx];
                 }
             }
         }
@@ -303,8 +392,9 @@ impl ScytheOptimizer {
                 for k in 0..r {
                     let idx = global_j * r + k;
                     let grad = g_v_tile[local_j * r + k];
-                    m_v_entry[idx] = self.beta * m_v_entry[idx] + (1.0 - self.beta) * grad;
-                    updated_v[idx] -= self.lr_basis * m_v_entry[idx];
+                    m_v_entry[idx] =
+                        self.config.beta * m_v_entry[idx] + (1.0 - self.config.beta) * grad;
+                    updated_v[idx] -= self.config.lr_basis * m_v_entry[idx];
                 }
             }
         }
@@ -319,7 +409,7 @@ impl ScytheOptimizer {
         for k in 0..r {
             let norm = sig_norms[k];
             let update_dir = g_sigma[k] / norm;
-            updated_sig[k] -= self.lr_sigma * update_dir;
+            updated_sig[k] -= self.config.lr_sigma * update_dir;
             if updated_sig[k] < 0.0 {
                 updated_sig[k] = 0.0;
             }
