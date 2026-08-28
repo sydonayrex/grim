@@ -177,6 +177,9 @@ impl Drop for RequestCleanupGuard {
         // Remove the cancel token we registered so a stray reference doesn't
         // linger in the global registry after the request is done.
         let _ = take_cancel_token(self.request_id);
+        // Remove per-request sampler params so the map cannot grow with
+        // every served request.
+        let _ = take_request_sampler_params(self.request_id);
         LIVE_CLEANUP_GUARDS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -386,6 +389,59 @@ static REQUEST_HISTORIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Client-supplied sampler overrides for one request. `None` fields fall
+/// back to the corresponding `GRIM_SAMPLE_*` env default (the env vars are
+/// no longer the primary path — explicit request params win when present).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SamplerParams {
+    pub temperature: Option<f32>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub seed: Option<u64>,
+}
+
+/// Per-request sampler params, keyed by request id. Filled at request
+/// ingestion (chat and completions — OpenAI and Ollama shapes both funnel
+/// through those), read by `sample_next_token`/`sample_on_device`, removed
+/// by [`RequestCleanupGuard`].
+static REQUEST_SAMPLER_PARAMS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, SamplerParams>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Extract OpenAI-style sampling overrides from a request body object and
+/// register them under `request_id` for the device-side sampler.
+fn register_request_sampler_params(
+    request_id: u64,
+    body_obj: &serde_json::Map<String, serde_json::Value>,
+) {
+    let params = SamplerParams {
+        temperature: body_obj
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+        top_k: body_obj
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as i32),
+        top_p: body_obj
+            .get("top_p")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+        seed: body_obj.get("seed").and_then(|v| v.as_u64()),
+    };
+    if let Ok(mut reg) = REQUEST_SAMPLER_PARAMS.lock() {
+        reg.insert(request_id, params);
+    }
+}
+
+fn take_request_sampler_params(request_id: u64) -> SamplerParams {
+    REQUEST_SAMPLER_PARAMS
+        .lock()
+        .ok()
+        .and_then(|mut reg| reg.remove(&request_id))
+        .unwrap_or_default()
+}
+
 /// Historical CPU sampling path (WI-X3 fallback): D2H the full logits row,
 /// slice to vocab, run the trait-object sampler on a CPU tensor.
 fn cpu_sample_fallback(
@@ -413,14 +469,16 @@ fn cpu_sample_fallback(
 
 /// WI-X3 device-side stochastic sampling: launch the Gumbel-max kernel on the
 /// resident ROCm logits (temperature/top-k/top-p on device) and copy back only
-/// the 4-byte token id. Sampling params come from the request-scoped env
-/// overrides `GRIM_SAMPLE_TEMPERATURE` (default 0.7) and `GRIM_SAMPLE_TOP_K`
-/// (0 = off) until the full param plumbing lands; `GRIM_CPU_SAMPLER=1` at the
-/// call site disables this path entirely.
+/// the 4-byte token id. Sampling params come from the request registry
+/// (`register_request_sampler_params`); the `GRIM_SAMPLE_TEMPERATURE` /
+/// `GRIM_SAMPLE_TOP_K` / `GRIM_SAMPLE_SEED` env vars remain as fallbacks for
+/// fields the client did not set. `GRIM_CPU_SAMPLER=1` at the call site
+/// disables this path entirely.
 fn sample_on_device(
     t: &grim_tensor::Tensor,
     vocab_size: usize,
     step: u64,
+    params: SamplerParams,
 ) -> std::result::Result<Option<u32>, String> {
     use grim_backend_rocm::{RocmDevice, as_rocm, sample_logits_on_device_at};
 
@@ -433,18 +491,30 @@ fn sample_on_device(
 
     let dev = RocmDevice::try_new(ordinal)
         .map_err(|e| format!("sample_on_device: RocmDevice::try_new: {e}"))?;
-    let temperature: f32 = std::env::var("GRIM_SAMPLE_TEMPERATURE")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let temperature: f32 = params
+        .temperature
+        .or_else(|| {
+            std::env::var("GRIM_SAMPLE_TEMPERATURE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(0.7);
-    let top_k: i32 = std::env::var("GRIM_SAMPLE_TOP_K")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let top_k: i32 = params
+        .top_k
+        .or_else(|| {
+            std::env::var("GRIM_SAMPLE_TOP_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(0);
     // Per-step reproducible stream: low bits = base seed, high bits = step.
-    let base_seed: u64 = std::env::var("GRIM_SAMPLE_SEED")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let base_seed: u64 = params
+        .seed
+        .or_else(|| {
+            std::env::var("GRIM_SAMPLE_SEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(0x9E37_79B9_7F4A_7C15);
     let seed = (step << 32) | (base_seed & 0xffff_ffff);
 
@@ -554,7 +624,12 @@ fn sample_next_token(
             let has_active_constraint = sampler.name() == "constrained";
             let device_token =
                 if t.device().is_rocm() && !cpu_sampler_forced && !has_active_constraint {
-                    match sample_on_device(&t, vocab_size, step) {
+                    let params = REQUEST_SAMPLER_PARAMS
+                        .lock()
+                        .ok()
+                        .and_then(|reg| reg.get(&request_id).copied())
+                        .unwrap_or_default();
+                    match sample_on_device(&t, vocab_size, step, params) {
                         Ok(Some(tok)) => Some(tok.min((vocab_size as u32).saturating_sub(1))),
                         // Ok(None): unsupported shape/vocab -> CPU fallback contract.
                         Ok(None) => None,
@@ -1642,6 +1717,8 @@ async fn chat_completions(
         // engine.last_outcome() returned None and the token fell back to the
         // step index (not a real sampled token).
         let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        // T1.3: request params feed the device-side sampler for this stream.
+        register_request_sampler_params(session_request_id, &body_obj);
 
         // WI-CANCEL-1: register a CancellationToken so /v1/requests/:id/cancel
         // can signal this specific stream to stop.
@@ -1927,6 +2004,8 @@ async fn chat_completions(
     } else {
         let mut content = String::new();
         let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        // T1.3: request params feed the device-side sampler for this request.
+        register_request_sampler_params(request_id, &body_obj);
         let _adapter_ids: Vec<u32> = {
             let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             adapter_names
@@ -1973,6 +2052,7 @@ async fn chat_completions(
                         Err(poisoned) => poisoned.into_inner(),
                     };
                     engine.finish_request(request_id);
+                    take_request_sampler_params(request_id);
                     drop(engine);
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2031,6 +2111,7 @@ async fn chat_completions(
             let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.finish_request(request_id);
         }
+        take_request_sampler_params(request_id);
 
         // WI-TOOLS-4/5/4b: when tool calling is active, run the completion
         // through the per-family output parser. Before constructing the
@@ -2131,6 +2212,7 @@ async fn chat_completions(
             let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.finish_request(request_id);
         }
+        take_request_sampler_params(request_id);
         // WI-2: echo back exactly the model name the client requested, per
         // OpenAI API semantics. The previous hardcoded "grim" broke any client
         // that validates `response.model` against what it sent.
@@ -3483,15 +3565,17 @@ struct CompletionRequest {
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
-    _temperature: Option<f32>,
+    temperature: Option<f32>,
     #[serde(default)]
-    _top_p: Option<f32>,
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<i32>,
     #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
     _stop: Option<serde_json::Value>,
     #[serde(default)]
-    _seed: Option<u64>,
+    seed: Option<u64>,
 }
 
 /// OpenAI-compatible text completions endpoint (POST /v1/completions).
@@ -3527,6 +3611,19 @@ async fn completions(
         .unwrap_or_else(|| "default".to_string());
     let req_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
+    // T1.3 param plumbing: honor per-request temperature/top_p/top_k/seed on
+    // BOTH sampling paths — the CPU sampler below and the device-side
+    // sampler (via the request registry).
+    let request_params = SamplerParams {
+        temperature: payload.temperature,
+        top_k: payload.top_k,
+        top_p: payload.top_p,
+        seed: payload.seed,
+    };
+    if let Ok(mut reg) = REQUEST_SAMPLER_PARAMS.lock() {
+        reg.insert(req_id, request_params);
+    }
+
     let (vocab_size, eos_token_id) = {
         let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
         let vs = tok.as_ref().map(|t| t.tokens.len()).unwrap_or(32000);
@@ -3534,9 +3631,14 @@ async fn completions(
         (vs, eos)
     };
 
-    let sampling = grim_core::sampler::SamplingParams::default();
+    let sampling = grim_core::sampler::SamplingParams {
+        temperature: payload.temperature.unwrap_or(1.0),
+        top_p: payload.top_p.unwrap_or(1.0),
+        top_k: payload.top_k.unwrap_or(0).max(0) as u32,
+        ..grim_core::sampler::SamplingParams::default()
+    };
     let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
-        std::sync::Arc::from(sampling.into_sampler(payload._seed.unwrap_or(0)));
+        std::sync::Arc::from(sampling.into_sampler(payload.seed.unwrap_or(0)));
 
     if stream_requested {
         let state_clone = state.clone();
@@ -3605,6 +3707,7 @@ async fn completions(
                 Err(poisoned) => poisoned.into_inner(),
             };
             engine.finish_request(req_id);
+            take_request_sampler_params(req_id);
             drop(engine);
             let final_chunk = serde_json::json!({
                 "id": format!("cmpl-{req_id}"),
@@ -3671,6 +3774,7 @@ async fn completions(
                         Err(poisoned) => poisoned.into_inner(),
                     };
                     engine.finish_request(req_id);
+                    take_request_sampler_params(req_id);
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({
@@ -3686,6 +3790,7 @@ async fn completions(
             Err(poisoned) => poisoned.into_inner(),
         };
         engine.finish_request(req_id);
+        take_request_sampler_params(req_id);
         drop(engine);
 
         let gen_text = {

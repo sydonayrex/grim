@@ -12,6 +12,9 @@ use std::sync::Mutex;
 
 use grim_core::error::{Error, Result};
 
+pub mod bitmask_index;
+pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};
+
 pub type BlockId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,18 +335,24 @@ impl KvBlockHeader {
     }
 }
 
-/// FNV-1a 32-bit checksum over the raw bytes of the key and value float slices.
-/// A simple non-cryptographic checksum sufficient to detect truncation or
-/// bit-corruption on the wire.
-fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
+/// FNV-1a 32-bit checksum over raw bytes.  A simple non-cryptographic
+/// checksum sufficient to detect truncation or bit-corruption on the wire.
+fn compute_checksum_bytes(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9275; // FNV offset basis
-    for f in k.iter().chain(v.iter()) {
-        for &b in f.to_le_bytes().iter() {
-            hash ^= b as u32;
-            hash = hash.wrapping_mul(0x01000193); // FNV prime
-        }
+    for &b in bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x01000193); // FNV prime
     }
     hash
+}
+
+/// FNV-1a 32-bit checksum over the raw bytes of the key and value float slices.
+fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
+    let mut buf = Vec::with_capacity((k.len() + v.len()) * 4);
+    for f in k.iter().chain(v.iter()) {
+        buf.extend_from_slice(&f.to_le_bytes());
+    }
+    compute_checksum_bytes(&buf)
 }
 
 /// Trait abstracting the operations a network KV receiver needs from a block
@@ -591,11 +600,102 @@ impl NetworkKvClient {
 
         Ok((k_vec, v_vec))
     }
+
+    /// Send a prompt-token control message to a remote node (push model).
+    ///
+    /// This is the real control channel for disaggregated handoff: the
+    /// prefill→decode (or decode→prefill) side learns WHICH tokens a request
+    /// carries without smuggling them through a fake KV block. Payload is the
+    /// raw token IDs as little-endian u32; `request_id` rides in `block_id`.
+    pub fn send_prompt_tokens(
+        &self,
+        request_id: u64,
+        tokens: &[u32],
+        target_ip: &str,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::KvCache(
+                "send_prompt_tokens: token list cannot be empty".into(),
+            ));
+        }
+        let addr = Self::resolve_addr(target_ip);
+        let mut payload = Vec::with_capacity(tokens.len() * 4);
+        for &t in tokens {
+            payload.extend_from_slice(&t.to_le_bytes());
+        }
+        let header = KvBlockHeader {
+            magic: KV_MAGIC,
+            version: KV_PROTOCOL_VERSION,
+            block_id: request_id,
+            layer_idx: PROMPT_FLAG,
+            num_elements: tokens.len() as u32,
+            checksum: compute_checksum_bytes(&payload),
+        };
+        let mut buf = header.serialize().to_vec();
+        buf.extend_from_slice(&payload);
+
+        let socket_addr = addr
+            .parse()
+            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &socket_addr,
+            std::time::Duration::from_millis(500),
+        )
+        .map_err(|e| Error::KvCache(format!("TCP prompt send connection failed to {addr}: {e}")))?;
+        stream
+            .write_all(&buf)
+            .map_err(|e| Error::KvCache(format!("TCP prompt send error: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Bit flag embedded in `layer_idx` of a fetch-request header to signal
 /// "this is a fetch request, reply with data" rather than a push transfer.
 const FETCH_REQUEST_FLAG: u32 = 0x8000_0000;
+
+/// Bit flag embedded in `layer_idx` marking a prompt-token control message:
+/// the payload is raw u32 token IDs, `block_id` carries the request id, and
+/// the receiver stores it in the shared [`PromptChannel`] instead of the KV
+/// block store.
+const PROMPT_FLAG: u32 = 0x4000_0000;
+
+/// Shared store for prompt-token control messages received over the wire
+/// (see [`NetworkKvClient::send_prompt_tokens`]). Cloneable handle; `take`
+/// consumes the stored prompt for a request id.
+#[derive(Default, Clone)]
+pub struct PromptChannel {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>>,
+}
+
+impl PromptChannel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store (or overwrite) the prompt tokens for a request id.
+    pub fn store(&self, request_id: u64, tokens: Vec<u32>) {
+        self.inner
+            .lock()
+            .expect("prompt channel mutex poisoned")
+            .insert(request_id, tokens);
+    }
+
+    /// Consume the stored prompt tokens for a request id, if any.
+    pub fn take(&self, request_id: u64) -> Option<Vec<u32>> {
+        self.inner
+            .lock()
+            .expect("prompt channel mutex poisoned")
+            .remove(&request_id)
+    }
+
+    /// Whether a prompt is waiting for `request_id` (without consuming).
+    pub fn contains(&self, request_id: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("prompt channel mutex poisoned")
+            .contains_key(&request_id)
+    }
+}
 
 /// Reinterpret a byte slice as f32 values (little-endian).  Safe parse — no
 /// unsafe pointer casts, avoids alignment UB on Vec<u8> buffers.
@@ -623,6 +723,20 @@ fn parse_f32_slice(bytes: &[u8]) -> Vec<f32> {
 pub fn start_kv_receiver_server<T>(
     listen_addr: &str,
     pool: std::sync::Arc<std::sync::Mutex<T>>,
+) -> Result<std::thread::JoinHandle<()>>
+where
+    T: KvBlockStore + 'static,
+{
+    start_kv_receiver_server_with_prompts(listen_addr, pool, PromptChannel::new())
+}
+
+/// Like [`start_kv_receiver_server`], but prompt-token control messages
+/// ([`NetworkKvClient::send_prompt_tokens`]) are stored into the supplied
+/// [`PromptChannel`] instead of being dropped.
+pub fn start_kv_receiver_server_with_prompts<T>(
+    listen_addr: &str,
+    pool: std::sync::Arc<std::sync::Mutex<T>>,
+    prompts: PromptChannel,
 ) -> Result<std::thread::JoinHandle<()>>
 where
     T: KvBlockStore + 'static,
@@ -710,6 +824,36 @@ where
                                 header.block_id
                             );
                         }
+                        continue;
+                    }
+
+                    // Prompt-token control message: payload is raw u32 token
+                    // IDs (request id rides in block_id). Store into the
+                    // prompt channel — never into the KV block store.
+                    if header.layer_idx & PROMPT_FLAG != 0 {
+                        let num_tokens = header.num_elements as usize;
+                        let mut payload = vec![0u8; num_tokens.saturating_mul(4)];
+                        if stream.read_exact(&mut payload).is_err() {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: short read on prompt message \
+                                 for request {}",
+                                header.block_id
+                            );
+                            continue;
+                        }
+                        if compute_checksum_bytes(&payload) != header.checksum {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: checksum mismatch on prompt \
+                                 message for request {}",
+                                header.block_id
+                            );
+                            continue;
+                        }
+                        let tokens: Vec<u32> = payload
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        prompts.store(header.block_id, tokens);
                         continue;
                     }
 

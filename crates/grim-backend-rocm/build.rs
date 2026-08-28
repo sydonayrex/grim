@@ -14,13 +14,6 @@ fn workspace_root() -> std::path::PathBuf {
 }
 
 fn main() {
-    // Base system ROCm (may or may not carry MIOpen/RCCL).
-    println!("cargo:rustc-link-search=native=/opt/rocm/lib");
-
-    // Side-by-side per-arch ROCm runtimes live in the workspace (grim's
-    // .rocm-2/3/4 trees). They DO carry libMIOpen.so / librccl.so, so the
-    // F9/F11 dylib links resolve against whichever runtime is active.
-    // ROCM_PATH overrides; otherwise probe the local .rocm-N/lib dirs.
     let workspace = workspace_root();
 
     if let Ok(rocm_path) = std::env::var("ROCM_PATH") {

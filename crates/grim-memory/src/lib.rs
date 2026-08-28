@@ -32,6 +32,13 @@ pub mod kv_mirror;
 
 pub use kv_mirror::{KvDeviceMirror, KvDeviceMirrorConfig, MirrorSyncState};
 
+/// Chunk-aligned intermediate hidden-state cache on host pinned memory.
+pub mod hidden_state_store;
+
+pub use hidden_state_store::{
+    HiddenStateChunk, HiddenStateKey, HiddenStateStore, SharedHiddenStateStore,
+};
+
 pub const BLOCK_SIZE: usize = 16;
 
 pub type BlockId = usize;

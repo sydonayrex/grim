@@ -1,5 +1,5 @@
-//! Top-level inference engine runtime orchestrating models, schedulers, paged KV pools, and LoRA adapters.
-
+/// Non-prefix KV chunk stitching and attention recalibration (repurposed from LMCache).
+pub mod cache_blend;
 pub mod model_loader;
 pub mod packing;
 pub mod pipelines;
@@ -13,6 +13,7 @@ pub mod streaming_forward;
 /// P2: packed-step training driver (varlen grouping + one optimizer step per group).
 pub mod train_packed;
 
+pub use cache_blend::{CacheBlendEngine, CachedSegment, StitchedPromptLayout};
 pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
 
 use std::collections::HashMap;
@@ -91,6 +92,14 @@ pub struct EngineConfig {
     /// Disaggregation configuration (role, addrs). When set, the engine
     /// starts a background KV receiver server and wires disagg routing.
     pub disagg_config: Option<grim_disagg::DisaggConfig>,
+    /// Externally-constructed cluster orchestrator (§5.6 failover). When
+    /// `None` but `disagg_config` is set, the engine constructs one
+    /// automatically from that config.
+    pub disagg_orchestrator: Option<Arc<std::sync::Mutex<grim_disagg::DisaggOrchestrator>>>,
+    /// Heartbeat timeout for disagg failover evaluation: a peer whose last
+    /// observed heartbeat is older than this is presumed dead and the node
+    /// fails over to colocated execution (default 5000 ms).
+    pub disagg_heartbeat_timeout_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -121,6 +130,8 @@ impl Default for EngineConfig {
             max_messages_per_request: 200,
             disagg_router: None,
             disagg_config: None,
+            disagg_orchestrator: None,
+            disagg_heartbeat_timeout_ms: 5000,
         }
     }
 }
@@ -196,6 +207,11 @@ pub struct Engine {
     /// Background KV receiver server handle (started in Engine::new when
     /// disagg_config is Some and role is Decode or Colocated).
     kv_receiver: Option<grim_disagg::KvReceiverServer>,
+    /// Cluster orchestrator (§5.6): tracks peer heartbeats and failover.
+    disagg_orchestrator: Option<Arc<std::sync::Mutex<grim_disagg::DisaggOrchestrator>>>,
+    /// Last evaluated effective role (refreshed each tick). `Colocated`
+    /// after failover means the remote peer is presumed dead.
+    disagg_effective_role: std::sync::Mutex<grim_disagg::PoolRole>,
     /// Live GPU capability profiler and epoch manager.
     /// Only constructed when world_size > 1 or `GRIM_SCYTHE_INFERENCE=1` (WI-INF1).
     pub capability_profiler: Option<Arc<grim_backend_rocm::CapabilityProfiler>>,
@@ -494,6 +510,23 @@ impl Engine {
             None
         };
 
+        // Disaggregation cluster orchestrator (§5.6): use the caller's, or
+        // auto-construct from disagg_config, or none.
+        let disagg_orchestrator = match (&config.disagg_orchestrator, &config.disagg_config) {
+            (Some(o), _) => Some(o.clone()),
+            (None, Some(dc)) => Some(Arc::new(std::sync::Mutex::new(
+                grim_disagg::DisaggOrchestrator::new(dc.clone()),
+            ))),
+            (None, None) => None,
+        };
+        let disagg_effective_role = std::sync::Mutex::new(
+            config
+                .disagg_config
+                .as_ref()
+                .map(|dc| dc.role)
+                .unwrap_or(grim_disagg::PoolRole::Colocated),
+        );
+
         let admission =
             grim_scheduler::AdmissionController::new(config.target_ttft_ms, config.target_itl_ms);
         let mut scheduler = grim_scheduler::Scheduler::new(
@@ -579,6 +612,8 @@ impl Engine {
             last_itl_ms: None,
             tp_config,
             kv_receiver,
+            disagg_orchestrator,
+            disagg_effective_role,
             capability_profiler,
             scythe_ctrl,
             scythe_replicas: HashMap::new(),
@@ -602,6 +637,36 @@ impl Engine {
     /// Access the disaggregated KV receiver server instance if running in disaggregated decode role.
     pub fn kv_receiver(&self) -> Option<&grim_disagg::KvReceiverServer> {
         self.kv_receiver.as_ref()
+    }
+
+    /// Record an observed peer heartbeat (§5.6): call when traffic proves the
+    /// peer role is alive (a successful KV transfer to the decode node, an
+    /// ingested block from the prefill node, or a server-layer health probe).
+    /// `tick()` evaluates these timestamps against
+    /// [`EngineConfig::disagg_heartbeat_timeout_ms`].
+    pub fn disagg_record_peer_heartbeat(&self, role: grim_disagg::PoolRole, now_ms: u64) {
+        if let Some(orch) = &self.disagg_orchestrator {
+            orch.lock().unwrap().record_heartbeat(role, now_ms);
+        }
+    }
+
+    /// Evaluate failover against `now_ms` and cache the effective role.
+    /// Returns the role this node should execute as.
+    pub fn disagg_evaluate_failover(&self, now_ms: u64) -> grim_disagg::PoolRole {
+        if let Some(orch) = &self.disagg_orchestrator {
+            let effective = orch
+                .lock()
+                .unwrap()
+                .evaluate_failover(now_ms, self.config.disagg_heartbeat_timeout_ms);
+            *self.disagg_effective_role.lock().unwrap() = effective;
+        }
+        *self.disagg_effective_role.lock().unwrap()
+    }
+
+    /// The effective role after failover evaluation: `Colocated` means the
+    /// remote peer is presumed dead and remote handoff is gated off.
+    pub fn disagg_effective_role(&self) -> grim_disagg::PoolRole {
+        *self.disagg_effective_role.lock().unwrap()
     }
 
     /// Return live snapshot of visible GPU capabilities if profiler is active.
@@ -1292,6 +1357,17 @@ impl Engine {
         // admission, so freed VRAM is picked up in the same tick.
         self.retry_scythe_vram_waitlist();
 
+        // Disagg failover (§5.6): refresh the effective role each tick from
+        // observed peer heartbeats. A silent peer fails the node over to
+        // colocated execution, which gates the remote KV handoff below.
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.disagg_evaluate_failover(now_ms);
+        }
+
         let output = self.scheduler.schedule();
         let schedule_elapsed = tick_start.elapsed();
 
@@ -1511,8 +1587,13 @@ impl Engine {
 
             // Disaggregation handoff: if disagg_router is configured for Prefill role,
             // stream real KV blocks generated during prefill over the network to the decode node.
+            // Failover gate (§5.6): once the orchestrator fails this node over
+            // to Colocated (decode peer silent past the heartbeat timeout),
+            // stop streaming into a dead peer.
             if let Some(router) = &self.config.disagg_router {
-                if router.pool_role == grim_disagg::PoolRole::Prefill {
+                if router.pool_role == grim_disagg::PoolRole::Prefill
+                    && self.disagg_effective_role() == grim_disagg::PoolRole::Prefill
+                {
                     // The pool is shared across concurrent requests, so the
                     // handoff must carry only this request's physical blocks —
                     // a full-pool scan would leak other requests' KV cache.
@@ -1539,6 +1620,15 @@ impl Engine {
                                             ) {
                                                 eprintln!(
                                                     "[grim-engine] Disagg prefill KV transfer failed for req {id}, layer {layer}, block {b_id}: {e}"
+                                                );
+                                            } else {
+                                                // A landed transfer proves the decode peer is alive (§5.6).
+                                                self.disagg_record_peer_heartbeat(
+                                                    grim_disagg::PoolRole::Decode,
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_millis() as u64)
+                                                        .unwrap_or(0),
                                                 );
                                             }
                                         }

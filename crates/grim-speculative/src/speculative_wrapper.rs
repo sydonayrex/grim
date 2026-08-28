@@ -20,6 +20,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::confidence_head::ConfidenceHead;
 use crate::confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, ThroughputProfile};
+use crate::depth_tuner::SpeculativeDepthPidController;
 use crate::draft_backbone::DraftBackbone;
 use crate::markov_head::MarkovHead;
 use crate::native_mtp::NativeMtp;
@@ -52,6 +53,10 @@ pub struct SpeculativeTelemetry {
     pub min_accept_rate: f64,
     /// Whether acceptance rate has drifted below the threshold warranting draft refresh.
     pub should_adapt: bool,
+    /// Current PID-tuned draft depth for the DSpark path (None on other
+    /// strategies). T2-4 follow-up: the depth tuner now drives the draft
+    /// block length instead of the old hardcoded K=3.
+    pub draft_depth_k: Option<u64>,
 }
 
 /// The wrapper: holds a target + the chosen strategy + bundle handles.
@@ -66,6 +71,9 @@ pub struct SpeculativeCausalLm {
     confidence: Option<Arc<dyn ConfidenceHead>>,
     /// Confidence scheduler shared across DSpark sessions.
     scheduler: Mutex<ConfidenceScheduler>,
+    /// PID depth controller driving the DSpark draft block length K.
+    /// Fed by observed (accepted, proposed) counts each DSpark step.
+    depth_tuner: Mutex<SpeculativeDepthPidController>,
 }
 
 impl SpeculativeCausalLm {
@@ -82,6 +90,7 @@ impl SpeculativeCausalLm {
                 ThroughputProfile::default(),
                 SpeculationConfig::default(),
             )),
+            depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
         }
     }
 
@@ -93,6 +102,26 @@ impl SpeculativeCausalLm {
         confidence: Arc<dyn ConfidenceHead>,
         scheduler: ConfidenceScheduler,
     ) -> Self {
+        Self::with_dspark_and_tuner(
+            target,
+            draft,
+            markov,
+            confidence,
+            scheduler,
+            SpeculativeDepthPidController::with_default_config(),
+        )
+    }
+
+    /// Construct wrapped around the DSpark strategy with an explicit depth
+    /// tuner (e.g. seeded from a saved `SpeculativeDepthPidConfig`).
+    pub fn with_dspark_and_tuner(
+        target: Box<dyn CausalLm>,
+        draft: Arc<dyn DraftBackbone>,
+        markov: Arc<dyn MarkovHead>,
+        confidence: Arc<dyn ConfidenceHead>,
+        scheduler: ConfidenceScheduler,
+        depth_tuner: SpeculativeDepthPidController,
+    ) -> Self {
         Self {
             target,
             strategy: Strategy::DSpark,
@@ -101,6 +130,7 @@ impl SpeculativeCausalLm {
             markov: Some(markov),
             confidence: Some(confidence),
             scheduler: Mutex::new(scheduler),
+            depth_tuner: Mutex::new(depth_tuner),
         }
     }
 
@@ -117,6 +147,7 @@ impl SpeculativeCausalLm {
                 ThroughputProfile::default(),
                 SpeculationConfig::default(),
             )),
+            depth_tuner: Mutex::new(SpeculativeDepthPidController::with_default_config()),
         }
     }
 
@@ -210,6 +241,11 @@ impl SpeculativeCausalLm {
             total_accepted_tokens: state.total_accepted_tokens,
             min_accept_rate: config.min_accept_rate,
             should_adapt,
+            draft_depth_k: if self.strategy == Strategy::DSpark {
+                Some(self.depth_tuner.lock().unwrap().current_depth() as u64)
+            } else {
+                None
+            },
         }
     }
 
@@ -228,13 +264,14 @@ impl SpeculativeCausalLm {
             Strategy::Plain => self.target.forward(session, input_ids, positions, adapters),
             Strategy::NativeMtp => self.decode_native_mtp(session, input_ids, positions, adapters),
             Strategy::DSpark => {
-                // T2-4: Implement the actual draft step loop (K=3 draft tokens)
                 let draft = self.draft.as_ref().unwrap();
                 let markov = self.markov.as_ref().unwrap();
                 let confidence = self.confidence.as_ref().unwrap();
 
-                // Phase 1: Run K=3 draft steps
-                let draft_block = draft.draft_block(session, input_ids, 3)?;
+                // T2-4 (closed): the draft block length K is PID-tuned online
+                // from observed acceptance — not the old hardcoded 3.
+                let draft_depth_k = self.depth_tuner.lock().unwrap().current_depth();
+                let draft_block = draft.draft_block(session, input_ids, draft_depth_k)?;
                 if draft_block.tokens.is_empty() {
                     return self.target.forward(session, input_ids, positions, adapters);
                 }
@@ -355,6 +392,13 @@ impl SpeculativeCausalLm {
                             crate::distill::refresh_draft(&signal, &refresh_input, draft.as_ref())?;
                     }
                 }
+
+                // Feed the PID depth controller: next step's draft block
+                // length follows observed acceptance.
+                self.depth_tuner
+                    .lock()
+                    .unwrap()
+                    .update(accepted_count, verify_len);
 
                 // Return logits for the accepted tokens. Accepted token rows start at
                 // context_len (the original input length) since target forward returned
@@ -585,6 +629,7 @@ fn softmax_f32_row(logits: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DraftBlock;
     use grim_core::session::Inner;
     use grim_tensor::Shape;
 
@@ -731,5 +776,158 @@ mod tests {
             w.w_head.clone()
         };
         assert_ne!(w_head_before, w_head_after);
+    }
+
+    /// T2-4 (closed): the DSpark draft depth K is PID-tuned, not hardcoded 3.
+    /// With a target that accepts every draft (uniform logits ⇒ ratio 1), the
+    /// tuner ramps K to its max and the drafted block grows accordingly.
+    #[test]
+    fn test_dspark_depth_ramps_up_with_full_acceptance() {
+        let cfg = grim_models_transformer::LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 16,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            intermediate_size: 32,
+            num_layers: 2,
+            rope_theta: 10000.0,
+            max_seq_len: 2048,
+            rms_norm_eps: 1e-5,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+        let target = Box::new(MockCausalLm {
+            cfg: cfg.clone(),
+            device: Device::Cpu,
+        });
+
+        let draft = Arc::new(crate::tiny_draft_backbone::TinyDraftBackbone::new(
+            100, 16, 5, 42,
+        ));
+        let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(
+            100, 5, 42,
+        ));
+        let confidence = Arc::new(crate::entropy_confidence_head::EntropyConfidenceHead);
+        let scheduler =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
+        let spec_lm =
+            SpeculativeCausalLm::with_dspark(target, draft, markov, confidence, scheduler);
+
+        let mut session = spec_lm.new_session();
+        let input_ids = grim_backend_cpu::cpu_tensor(vec![1f32], Shape::new(vec![1]));
+        let positions = grim_backend_cpu::cpu_tensor(vec![0f32], Shape::new(vec![1]));
+
+        // PID starts at (min+max)/2 = 3; full acceptance drives it to max 5.
+        for _ in 0..4 {
+            let _ = spec_lm
+                .decode_one(session.as_mut(), &input_ids, &positions, 0.0, 0, &[])
+                .unwrap();
+        }
+        let tel = spec_lm.telemetry();
+        assert_eq!(tel.strategy, "dspark");
+        assert_eq!(
+            tel.draft_depth_k,
+            Some(5),
+            "full acceptance must ramp PID depth to max"
+        );
+    }
+
+    /// A drafter whose base logits are one-hot on its drafted token against a
+    /// uniform target gives p_target/p_draft ≈ 0 — every draft rejected, so
+    /// the tuner must collapse K to its minimum instead of staying at 3.
+    struct AlwaysRejectedDraft;
+
+    impl DraftBackbone for AlwaysRejectedDraft {
+        fn draft_block(
+            &self,
+            _session: &mut dyn grim_core::session::SessionT,
+            _context: &Tensor,
+            block_len: usize,
+        ) -> Result<DraftBlock> {
+            let vocab = 100usize;
+            let mut logits = vec![0.0f32; block_len * vocab];
+            for row in 0..block_len {
+                logits[row * vocab + 7] = 10.0; // one-hot on the drafted token
+            }
+            Ok(DraftBlock {
+                tokens: vec![7u32; block_len],
+                base_logits: grim_backend_cpu::cpu_tensor(
+                    logits,
+                    Shape::new(vec![block_len, vocab]),
+                ),
+                confidence: vec![1.0; block_len],
+            })
+        }
+        fn estimated_footprint_bytes(&self) -> usize {
+            0
+        }
+        fn update_weights(
+            &self,
+            _target_hidden_states: &[f32],
+            _draft_tokens: &[u32],
+            _accepted_mask: &[bool],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_dspark_depth_collapses_under_total_rejection() {
+        let cfg = grim_models_transformer::LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 16,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            intermediate_size: 32,
+            num_layers: 2,
+            rope_theta: 10000.0,
+            max_seq_len: 2048,
+            rms_norm_eps: 1e-5,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+        let target = Box::new(MockCausalLm {
+            cfg: cfg.clone(),
+            device: Device::Cpu,
+        });
+
+        let draft: Arc<dyn DraftBackbone> = Arc::new(AlwaysRejectedDraft);
+        let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(
+            100, 5, 42,
+        ));
+        let confidence = Arc::new(crate::entropy_confidence_head::EntropyConfidenceHead);
+        let scheduler =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
+        let spec_lm =
+            SpeculativeCausalLm::with_dspark(target, draft, markov, confidence, scheduler);
+
+        let mut session = spec_lm.new_session();
+        let input_ids = grim_backend_cpu::cpu_tensor(vec![1f32], Shape::new(vec![1]));
+        let positions = grim_backend_cpu::cpu_tensor(vec![0f32], Shape::new(vec![1]));
+
+        for _ in 0..20 {
+            let _ = spec_lm
+                .decode_one(session.as_mut(), &input_ids, &positions, 0.0, 0, &[])
+                .unwrap();
+        }
+        let tel = spec_lm.telemetry();
+        assert_eq!(
+            tel.draft_depth_k,
+            Some(1),
+            "total rejection must collapse PID depth to min, got {:?}",
+            tel.draft_depth_k
+        );
+        assert!(
+            spec_lm
+                .scheduler
+                .lock()
+                .unwrap()
+                .adaptation_state
+                .accept_rate_ema
+                < 0.1,
+            "EMA acceptance must reflect the rejections"
+        );
     }
 }
