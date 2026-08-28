@@ -114,9 +114,9 @@ pub fn parse_samples(jsonl: &str) -> Vec<StoredMetric> {
 }
 
 /// Like [`parse_samples`], but keeps only rows stamped `>= since_ts` (unix
-/// seconds). `since_ts == 0` keeps everything. Rows without a `ts` field
-/// (legacy, stamped 0) are kept only when `since_ts == 0` so a filtered
-/// verdict can never silently include unstaleable data.
+/// seconds). `since_ts == 0` keeps everything (same as [`parse_samples`]).
+/// Rows without a `ts` field (legacy, stamped 0) never survive a nonzero
+/// cutoff so a filtered verdict can never silently include unstaleable data.
 pub fn parse_samples_since(jsonl: &str, since_ts: u64) -> Vec<StoredMetric> {
     parse_samples_impl(jsonl, Some(since_ts))
 }
@@ -130,7 +130,10 @@ fn parse_samples_impl(jsonl: &str, since_ts: Option<u64>) -> Vec<StoredMetric> {
             let value = v.get("value")?.as_f64()?;
             let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
             if let Some(cutoff) = since_ts {
-                if ts == 0 || ts < cutoff {
+                // cutoff == 0 disables filtering entirely (the unfiltered
+                // `parse_samples` view); a nonzero cutoff also drops
+                // unstamped (ts == 0) rows.
+                if cutoff > 0 && (ts == 0 || ts < cutoff) {
                     return None;
                 }
             }

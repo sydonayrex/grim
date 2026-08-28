@@ -27,8 +27,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run workspace tests (excluding vulkan)
-        run: cargo test --workspace --exclude grim-backend-vulkan --lib
+      - name: Run workspace tests (excluding GPU backend hardware targets)
+        run: cargo test --workspace --exclude grim-backend-vulkan --exclude grim-backend-metal --exclude grim-backend-cuda --exclude grim-backend-rocm --lib
 
       - name: Run backend parity tests
         run: cargo test -p grim-backend-tests --features cpu-only

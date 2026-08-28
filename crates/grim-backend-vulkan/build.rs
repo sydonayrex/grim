@@ -144,8 +144,25 @@ fn kernels() -> Vec<(&'static str, String)> {
     ]
 }
 
+fn vulkan_available() -> bool {
+    for p in [
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so",
+        "/usr/lib64/libvulkan.so.1",
+        "/usr/local/lib/libvulkan.so",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return true;
+        }
+    }
+    false
+}
+
 fn main() {
-    println!("cargo:rustc-link-lib=dylib=vulkan");
+    if vulkan_available() {
+        println!("cargo:rustc-link-lib=dylib=vulkan");
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=kernels/add.comp");
     println!("cargo:rerun-if-changed=kernels/mul.comp");
