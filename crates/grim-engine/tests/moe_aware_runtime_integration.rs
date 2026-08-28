@@ -2,7 +2,7 @@
 //!
 //! Tests the cross-crate coordination of:
 //! 1. Semantic-aware prefix state caching (grim-memory + grim-engine).
-//! 2. Bandwidth-adaptive q* miss partitioning (grim-scheduler + grim-backend-rocm).
+//! 2. Bandwidth-adaptive q* miss partitioning + hybrid CPU/GPU execution (grim-backend-rocm).
 //! 3. Multithreaded persistent CPU worker pool + GPU flag handshake (grim-backend-cpu + grim-backend-rocm).
 //! 4. Dynamic VRAM elastic budget reconfiguration at scheduler safe points (grim-memory + grim-engine).
 //! 5. Double-buffered full-layer prefill streaming pipeline (grim-engine).
@@ -12,7 +12,6 @@ use grim_backend_cpu::PersistentMoeWorkerPool;
 use grim_backend_rocm::{MoeGraphSyncFlag, MoeHybridExecutor};
 use grim_format::{FtwDirectLoader, FtwHeader, FtwQuantFormat};
 use grim_memory::{ElasticMoEAllocation, KvBlockPool, RecurrentLayerState, SemanticAnchorRegistry};
-use grim_scheduler::BandwidthProfile;
 
 #[test]
 fn test_moe_aware_semantic_anchor_and_prefix_caching_integration() {
@@ -59,15 +58,13 @@ fn test_moe_aware_semantic_anchor_and_prefix_caching_integration() {
 
 #[test]
 fn test_moe_aware_bandwidth_policy_to_hybrid_execution_integration() {
-    // 1. Measured PCIe (25 GB/s) and Host DRAM (50 GB/s) -> ratio 0.5
-    let profile = BandwidthProfile::new(25_000.0, 50_000.0);
-    assert_eq!(profile.compute_q_star(4), 2);
-    let (fills, comps) = profile.partition_misses(&[0, 1, 2, 3]);
-    assert_eq!(fills, vec![0, 1]);
-    assert_eq!(comps, vec![2, 3]);
+    // 1. FreeToken q* partitioning lives at the execution layer
+    // (`MoeHybridExecutor::plan_step`); measured PCIe (25 GB/s) and Host
+    // DRAM (50 GB/s) -> ratio 0.5. Misses (m = 3, expert 0 resident)
+    // split 2 fills / 1 CPU-compute, asserted via the plan below.
 
     // 2. Hybrid executor planning
-    let executor = MoeHybridExecutor::new(profile.pcie_bandwidth_mbps, profile.host_bandwidth_mbps);
+    let executor = MoeHybridExecutor::new(25_000.0, 50_000.0);
     let routed = vec![0, 1, 2, 3]; // 4 active experts
     // Simulate: expert 0 is resident on GPU, experts 1, 2, 3 are misses (m = 3)
     let plan = executor.plan_step(0, &routed, |e| e == 0);

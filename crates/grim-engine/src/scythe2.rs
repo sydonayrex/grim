@@ -8,11 +8,14 @@
 //! capability-epoch refresh); decode-path cache hits are ~50 ns/layer array
 //! lookups.
 //!
-//! Budget reconciliation (scythe2.md §3.4):
+//! Budget reconciliation (scythe2.md §3.4, retuned to the measured SB3
+//! figures — `benches/scythe2_decide_miss.rs`, release host-side):
 //! - **Decode cache-hit path**: ~50 ns/layer × N_layers ≤ 4 µs (32-layer 7B),
 //!   0.04% of the 10 ms ITL budget.
-//! - **Prefill cache-miss path**: ~10 µs/layer × N_layers ≤ 320 µs (32-layer),
-//!   0.21% of the 150 ms prefill budget.
+//! - **Prefill cache-miss path**: ~2 µs/layer × N_layers ≤ 64 µs (32-layer),
+//!   0.04% of the 150 ms prefill budget. The end-to-end WI-INF4 A/B
+//!   (2026-08-23c) confirmed the decision cost is invisible in TTFT
+//!   (−0.09 %/−0.00 % overhead, F/S).
 //!
 //! ## Staleness safety (scythe2.md §3.5)
 //! - Mode A (stale `partition`): suboptimal, never incorrect.
@@ -72,7 +75,7 @@ pub struct PlacementCache {
     /// Cleared by `bump_epoch`. F7 (audit): the bucket is tracked PER LAYER
     /// — the old single global `last_bucket` made interleaved buckets across
     /// layers (farm/pipeline concurrency) spuriously miss valid entries and
-    /// pay the ~10 µs `decide_miss` instead of the ~50 ns hit.
+    /// pay the ~2 µs `decide_miss` instead of the ~50 ns hit.
     fast: Vec<Option<(u16, ScythePlacement)>>,
     /// Slow path: arbitrary `(layer_id, bucket, epoch)` → placement.
     full: HashMap<PlacementKey, ScythePlacement>,
@@ -193,7 +196,16 @@ pub type LayerFingerprint = [f32; 16];
 /// ## Cache semantics
 /// `decide()` is the public entry point. It checks `cache` first; only on a
 /// miss does it run the expensive `decide_miss()` (WaveTune bilinear eval +
-/// MLP forward + Gumbel sample, ~10 µs/layer).
+/// MLP forward + Gumbel sample, measured ~2 µs/layer host-side in release —
+/// `benches/scythe2_decide_miss.rs`, SB3 campaign).
+///
+/// Measured end-to-end cost (WI-INF4 A/B verdict, 2026-08-23c, release,
+/// 30 samples/arm/order on the syd-beasty pair): mean TTFT overhead
+/// −0.09 %/−0.00 % (F/S — the per-decision cost is invisible in TTFT) and
+/// p95 ITL overhead −18.56 %/+2.43 % (F/S) — the ITL budget (≤2 %) is
+/// exceeded only in the S-first ordinal order's decode tail, which is why
+/// `GRIM_SCYTHE_INFERENCE` stays opt-in. Retune placement against that tail
+/// before revisiting the default.
 pub struct C2plrController {
     /// Layer fingerprints indexed by `layer_id`.
     pub layer_fps: Vec<LayerFingerprint>,
@@ -243,9 +255,9 @@ impl C2plrController {
     /// Per-forward entry point (scythe2.md §5.3).
     ///
     /// Hits the cache first; calls `decide_miss()` only on a miss.
-    /// Aggregate per-forward overhead:
+    /// Aggregate per-forward overhead (measured, release host-side):
     /// - Decode (cache hit): ~50 ns/layer × N_layers.
-    /// - Prefill/refresh (miss): ~10 µs/layer × N_layers.
+    /// - Prefill/refresh (miss): ~2 µs/layer × N_layers.
     pub fn decide(
         &mut self,
         layer_id: u32,
@@ -292,7 +304,9 @@ impl C2plrController {
 
     /// Expensive path: WaveTune bilinear eval + MLP forward + Gumbel sample.
     ///
-    /// At ~10 µs/layer (scythe2.md §3.4 corrected figure). This is a
+    /// Measured at ~2 µs/layer host-side in release (`benches/
+    /// scythe2_decide_miss.rs`); the ~10 µs figure in scythe2.md §3.4 was
+    /// the pre-implementation estimate. This is a
     /// *deterministic table lookup*, not a candidate loop — the WaveTune
     /// `2604.10187` §4.4–4.5 mechanism is one bilinear eval + one anchor
     /// retrieval, not an iterative search.
@@ -1923,7 +1937,7 @@ mod tests {
     /// F7 (audit): interleaving two shape buckets across layers must not
     /// invalidate either layer's fast-path entry. The pre-fix global
     /// `last_bucket` made layer 0's still-valid entry miss whenever layer 1
-    /// decided at a different bucket — silently paying ~10 µs/layer
+    /// decided at a different bucket — silently paying ~2 µs/layer
     /// `decide_miss` on every hit.
     #[test]
     fn test_interleaved_buckets_keep_per_layer_fast_path() {
