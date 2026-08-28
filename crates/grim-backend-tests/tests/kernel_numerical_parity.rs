@@ -193,12 +193,12 @@ fn test_cpu_cross_entropy_perfect_prediction_approaches_zero() {
 
 #[test]
 fn test_gpu_rocm_rmsnorm_parity() {
-    if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
-        return;
-    }
-
     #[cfg(feature = "rocm")]
     {
+        if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
+            return;
+        }
+
         use grim_backend_rocm::RocmDevice;
         use grim_tensor::{BackendDevice, DType, Shape};
 
