@@ -10,17 +10,19 @@ publish = false
 grim-tensor = { workspace = true }
 grim-quant = { workspace = true }
 grim-backend-cpu = { workspace = true }
-grim-backend-vulkan = { workspace = true }
-grim-backend-metal = { workspace = true }
+grim-backend-vulkan = { workspace = true, optional = true }
+grim-backend-metal = { workspace = true, optional = true }
 grim-backend-rocm = { workspace = true, optional = true }
 grim-backend-cuda = { workspace = true, optional = true }
 rand = { workspace = true }
 
 [features]
-default = ["rocm"]
+default = ["rocm", "vulkan", "metal"]
 cpu-only = []
 rocm = ["dep:grim-backend-rocm"]
 cuda = ["dep:grim-backend-cuda"]
+vulkan = ["dep:grim-backend-vulkan"]
+metal = ["dep:grim-backend-metal"]
 
 [[bench]]
 name = "op_timing"

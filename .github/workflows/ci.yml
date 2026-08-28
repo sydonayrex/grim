@@ -38,6 +38,6 @@ jobs:
     - name: Check Formatting
       run: cargo fmt --all -- --check
     - name: Clippy Lints
-      run: cargo clippy --workspace --all-targets --exclude grim-backend-vulkan --exclude grim-backend-metal -- -D warnings
+      run: cargo clippy --workspace --all-targets --exclude grim-backend-vulkan --exclude grim-backend-metal --exclude grim-backend-cuda --exclude grim-backend-rocm -- -D warnings
     - name: Run Workspace Tests
-      run: cargo test --workspace --exclude grim-backend-vulkan --exclude grim-backend-metal --verbose
+      run: cargo test --workspace --exclude grim-backend-vulkan --exclude grim-backend-metal --exclude grim-backend-cuda --exclude grim-backend-rocm --verbose

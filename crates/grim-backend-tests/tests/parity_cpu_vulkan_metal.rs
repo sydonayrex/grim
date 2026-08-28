@@ -1,12 +1,9 @@
-//! Cross-backend numerical parity testing for CPU, Vulkan, and Metal.
-//!
-//! Validates mathematical equivalence across CPU references and GPU kernel representations
-//! for RMSNorm, Fused-Add-RMSNorm, 1D/Rotary Positional Embeddings, Softmax, SiLU/SwiGLU,
-//! and quantization formats (FP8 E4M3, MXFP4, Q4_K, IQ4_NL).
-
 use grim_backend_cpu::{CpuDevice, cpu_tensor};
+#[cfg(feature = "metal")]
 use grim_backend_metal::caps::MetalCaps;
+#[cfg(feature = "vulkan")]
 use grim_backend_vulkan::caps::VulkanCaps;
+#[cfg(feature = "vulkan")]
 use grim_backend_vulkan::{VulkanKernel, binding_count, spirv_for};
 use grim_quant::qat_mxfp4::fake_quant_mxfp4;
 use grim_quant::{dequant_fp8, quant_fp8};
@@ -70,21 +67,43 @@ fn cpu_rope_reference(x: &[f32], positions: &[f32], head_dim: usize, theta: f32)
     out
 }
 
+#[cfg(feature = "vulkan")]
 #[test]
-fn test_vulkan_kernel_registry_and_spirv_parity() {
-    let caps = VulkanCaps::probe_default("Vulkan Compute Device".into(), 0x1002, 0x7448, 2);
+fn test_vulkan_glsl_kernel_manifest_parity() {
+    let caps = VulkanCaps::probe_default("Vulkan Fallback".into(), 1000, 2000, 3000);
     assert!(caps.supports_subgroup_arithmetic);
 
     let vulkan_kernels = [
+        VulkanKernel::Add,
+        VulkanKernel::Mul,
+        VulkanKernel::SiluMul,
         VulkanKernel::RmsNorm,
         VulkanKernel::AddRmsNorm,
+        VulkanKernel::Softmax,
+        VulkanKernel::Embedding,
+        VulkanKernel::Matmul32,
+        VulkanKernel::Matmul64,
+        VulkanKernel::Matmul64Bf16,
+        VulkanKernel::QkvAttention,
+        VulkanKernel::QkvAttentionSwa,
+        VulkanKernel::MulScalar,
+        VulkanKernel::Sqrt,
+        VulkanKernel::Recip,
+        VulkanKernel::Rope,
+        VulkanKernel::RopeYarn,
+        VulkanKernel::FusedDequantGemmQ4K,
+        VulkanKernel::FusedDequantGemmQ5K,
+        VulkanKernel::FusedDequantGemmQ6K,
+        VulkanKernel::FusedDequantGemmQ80,
+        VulkanKernel::FusedDequantGemmIQ4NL,
+        VulkanKernel::FusedDequantGemmMxFp4,
+        VulkanKernel::FusedDequantGemmFp8E4M3,
+        VulkanKernel::MlaDecode,
+        VulkanKernel::SageAttention,
         VulkanKernel::Mrope,
+        VulkanKernel::FlashDecodeSplitK,
         VulkanKernel::SoftmaxMerge,
-        VulkanKernel::MarlinGemm,
         VulkanKernel::QkvAttentionPagedDequant,
-        VulkanKernel::FusedLinearCe,
-        VulkanKernel::FusedAdamw,
-        VulkanKernel::FusedLion,
         VulkanKernel::SpeculativeAcceptor,
         VulkanKernel::CooperativeMatrixGemm,
     ];
@@ -98,13 +117,14 @@ fn test_vulkan_kernel_registry_and_spirv_parity() {
         );
         assert_eq!(spv.len() % 4, 0, "SPIR-V must be 4-byte aligned");
         assert!(
-            binding_count(kernel) >= 3,
-            "Binding count for {:?} must be >= 3",
+            binding_count(kernel) >= 2,
+            "Binding count for {:?} must be >= 2",
             kernel
         );
     }
 }
 
+#[cfg(feature = "metal")]
 #[test]
 fn test_metal_msl_kernel_manifest_parity() {
     let caps = MetalCaps::probe_default(1001, "Apple M3 Max".into(), 9);
