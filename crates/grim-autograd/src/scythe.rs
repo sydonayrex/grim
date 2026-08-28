@@ -565,8 +565,9 @@ mod tests {
     /// curvature step while SCYTHE computes a stateless column-RMS scaled momentum step to eliminate gradient buffers).
     /// This test verifies:
     ///   1. Both optimizers monotonically reduce loss on the identical synthetic regression problem.
-    ///   2. The parameter update trajectories maintain positive cosine alignment (> 0.70) throughout training.
-    ///   3. Neither optimizer explodes, produces NaNs, or diverges from the optimization objective.
+    ///   2. The parameter displacement vectors ΔU and ΔV maintain positive directional alignment (cos > 0.0).
+    ///   3. The singular spectrum displacement ΔΣ maintains strong positive alignment (cos >= 0.50).
+    ///   4. Neither optimizer explodes, produces NaNs, or diverges from the optimization objective.
     #[test]
     fn test_scythe_trajectory_alignment_and_convergence_against_sickle() {
         // Verified: 2026-08-28 on ROCm target gfx1036
@@ -588,6 +589,8 @@ mod tests {
         scythe_adapter.sigma = sickle_adapter.sigma.clone();
 
         let initial_u = sickle_adapter.u.to_vec_f32().unwrap();
+        let initial_v = sickle_adapter.v.to_vec_f32().unwrap();
+        let initial_sig = sickle_adapter.sigma.to_vec_f32().unwrap();
 
         let x = cpu_tensor(vec![0.5f32; d_in], Shape::new(vec![1, d_in]));
         let target = vec![1.0f32; d_out];
@@ -699,42 +702,51 @@ mod tests {
             "SCYTHE must converge: init {scythe_initial_loss}, final {scythe_final_loss}"
         );
 
-        // 2. Trajectory alignment: verify displacement vectors ΔU and ΔΣ are positively aligned
+        // 2. Trajectory alignment: verify displacement vectors ΔU, ΔV, and ΔΣ are positively aligned
         let final_u_sickle = sickle_adapter.u.to_vec_f32().unwrap();
         let final_u_scythe = scythe_adapter.u.to_vec_f32().unwrap();
+        let final_v_sickle = sickle_adapter.v.to_vec_f32().unwrap();
+        let final_v_scythe = scythe_adapter.v.to_vec_f32().unwrap();
         let final_sig_sickle = sickle_adapter.sigma.to_vec_f32().unwrap();
         let final_sig_scythe = scythe_adapter.sigma.to_vec_f32().unwrap();
 
-        let mut dot = 0.0f32;
-        let mut norm_sickle_sq = 0.0f32;
-        let mut norm_scythe_sq = 0.0f32;
-        for i in 0..(d_out * r) {
-            let du_sickle = final_u_sickle[i] - initial_u[i];
-            let du_scythe = final_u_scythe[i] - initial_u[i];
-            dot += du_sickle * du_scythe;
-            norm_sickle_sq += du_sickle * du_sickle;
-            norm_scythe_sq += du_scythe * du_scythe;
-        }
-
-        let denom = (norm_sickle_sq.sqrt() * norm_scythe_sq.sqrt()).max(1e-8);
-        let cos_sim = if norm_sickle_sq > 1e-12 && norm_scythe_sq > 1e-12 {
-            dot / denom
-        } else {
-            1.0 // If orthogonalization snaps displacement, fallback to 1.0
+        // Cosine similarity helper
+        let compute_cos_sim = |v1: &[f32], v2: &[f32], init: &[f32]| -> f32 {
+            let mut dot = 0.0f32;
+            let mut n1 = 0.0f32;
+            let mut n2 = 0.0f32;
+            for i in 0..v1.len() {
+                let d1 = v1[i] - init[i];
+                let d2 = v2[i] - init[i];
+                dot += d1 * d2;
+                n1 += d1 * d1;
+                n2 += d2 * d2;
+            }
+            let denom = (n1.sqrt() * n2.sqrt()).max(1e-8);
+            if n1 > 1e-12 && n2 > 1e-12 {
+                dot / denom
+            } else {
+                1.0
+            }
         };
 
-        // Also assert Σ singular component alignment
-        let mut sig_dot = 0.0f32;
-        for k in 0..r {
-            sig_dot += final_sig_sickle[k] * final_sig_scythe[k];
-        }
+        let cos_u = compute_cos_sim(&final_u_sickle, &final_u_scythe, &initial_u);
+        let cos_v = compute_cos_sim(&final_v_sickle, &final_v_scythe, &initial_v);
+        let cos_sig = compute_cos_sim(&final_sig_sickle, &final_sig_scythe, &initial_sig);
+
+        // Verify that across all three parameter subspaces (U, V, Σ), the displacement trajectories
+        // stay strictly positive and directional without anti-correlation or orthogonal divergence.
         assert!(
-            sig_dot > 0.0,
-            "Singular spectrum values must remain positively aligned"
+            cos_u > 0.0,
+            "U basis displacement cosine similarity must be strictly positive, got {cos_u}"
         );
         assert!(
-            cos_sim >= 0.0,
-            "SICKLE and SCYTHE parameter displacement vectors must have non-negative cosine alignment, got {cos_sim}"
+            cos_v > 0.0,
+            "V basis displacement cosine similarity must be strictly positive, got {cos_v}"
+        );
+        assert!(
+            cos_sig >= 0.50,
+            "Σ singular values displacement must have strong positive alignment (>= 0.50), got {cos_sig}"
         );
     }
 
