@@ -1095,26 +1095,40 @@ impl Lion {
             return Ok(());
         }
 
-        // Lion: τ = β1 * m + (1-β1) * g
-        let (m_beta1, _) = dev.mul_scalar(m_st.as_ref(), beta1, shape)?;
-        let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
-        let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
-
-        // Apply weight decay: step = τ + weight_decay * w
-        let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
-        let (step, _) = dev.add(m_new.as_ref(), wd_w.as_ref(), shape)?;
-
-        // Update: w = w - lr * step
-        let (lr_step, _) = dev.mul_scalar(step.as_ref(), lr, shape)?;
-        let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
-        let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
-
-        // Write back
-        *m_st = m_new;
+        // CPU fallback — REFERENCE Lion (Chen et al. 2023, NeurIPS):
+        //   τ_t = β1·m_{t-1} + (1-β1)·g         (fast/slow interpolation)
+        //   w_t = w_{t-1} − lr·(sign(τ_t) + wd·w_{t-1})   (sign step, decoupled decay)
+        //   m_t = β2·m_{t-1} + (1-β2)·g         (slow momentum, updated AFTER τ is taken)
+        // The previous fallback stored τ as m (no sign, β2 unused) — a
+        // sign-free SGDM, not Lion — and diverged from what the fused
+        // `fused_lion_step` kernel (beta1/beta2/sign) actually computes.
+        let m_old: Vec<f32> = m_st.to_cpu_vec_f32()?;
+        let grad_vec: Vec<f32> = param.grad().to_vec_f32()?;
+        let data_vec: Vec<f32> = param.data.to_vec_f32()?;
+        let mut new_m = vec![0.0f32; elem_count];
+        let mut new_data = vec![0.0f32; elem_count];
+        for i in 0..elem_count {
+            let tau = beta1 * m_old[i] + (1.0 - beta1) * grad_vec[i];
+            let s = if tau > 0.0 {
+                1.0
+            } else if tau < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            new_data[i] = data_vec[i] - lr * (s + weight_decay * data_vec[i]);
+            new_m[i] = beta2 * m_old[i] + (1.0 - beta2) * grad_vec[i];
+        }
+        *m_st = dev
+            .from_cpu(&new_m, shape, DType::F32)
+            .map_err(|e| Error::Backend(format!("lion m write-back: {e}")))?;
+        let new_storage = dev
+            .from_cpu(&new_data, shape, param.data.dtype())
+            .map_err(|e| Error::Backend(format!("lion w write-back: {e}")))?;
         param.data = Tensor::new(
-            Arc::from(updated_st),
+            Arc::from(new_storage),
             shape.clone(),
-            DType::F32,
+            param.data.dtype(),
             param.data.provenance().clone(),
             param.data.device().clone(),
         );

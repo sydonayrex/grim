@@ -249,7 +249,7 @@ impl ScytheOptimizer {
         adapter: &mut ScytheAdapter,
         out_grad: &Tensor,
         x: &Tensor,
-        mut oasis: Option<&mut crate::oasis::OasisSubspace>,
+        oasis: Option<&mut crate::oasis::OasisSubspace>,
     ) -> Result<()> {
         let d_out = adapter.u.shape().dims()[0];
         let d_in = adapter.v.shape().dims()[0];
@@ -266,7 +266,7 @@ impl ScytheOptimizer {
         };
 
         // If OASIS is enabled, update basis and reconstruct through low-rank coordinates
-        let x_slice = if let Some(subspace) = oasis.as_deref_mut() {
+        let x_slice = if let Some(subspace) = oasis {
             subspace.update_basis(&x_raw, batch_tokens);
             let proj = subspace.project(&x_raw, batch_tokens);
             subspace.reconstruct(&proj, batch_tokens)
@@ -439,7 +439,7 @@ mod tests {
         let mut opt = ScytheOptimizer::new(0.05, 0.05, 0.9);
 
         let x = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![1, 8]));
-        let target = vec![1.0f32; 8];
+        let target = [1.0f32; 8];
 
         let mut initial_loss = 0.0f32;
         let mut final_loss = 0.0f32;
@@ -483,7 +483,7 @@ mod tests {
         let mut oasis = crate::oasis::OasisSubspace::new(16, 4, 0.95);
 
         let x = cpu_tensor(vec![0.5f32; 16], Shape::new(vec![1, 16]));
-        let target = vec![1.0f32; 16];
+        let target = [1.0f32; 16];
 
         let mut initial_loss = 0.0f32;
         let mut final_loss = 0.0f32;

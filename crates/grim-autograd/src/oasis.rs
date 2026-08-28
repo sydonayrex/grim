@@ -50,8 +50,8 @@ impl OasisSubspace {
             let act_row = &act[row * d..(row + 1) * d];
             for j in 0..p {
                 let mut sum = 0.0f32;
-                for k in 0..d {
-                    sum += act_row[k] * self.basis[k * p + j];
+                for (k, &act_k) in act_row.iter().enumerate() {
+                    sum += act_k * self.basis[k * p + j];
                 }
                 out[row * p + j] = sum;
             }
@@ -70,8 +70,8 @@ impl OasisSubspace {
             let proj_row = &proj[row * p..(row + 1) * p];
             for k in 0..d {
                 let mut sum = 0.0f32;
-                for j in 0..p {
-                    sum += proj_row[j] * self.basis[k * p + j];
+                for (j, &proj_j) in proj_row.iter().enumerate() {
+                    sum += proj_j * self.basis[k * p + j];
                 }
                 out[row * d + k] = sum;
             }
@@ -131,8 +131,8 @@ mod tests {
         //   [0, 0],
         //   [0, 0] ]
         let mut basis = vec![0.0f32; 4 * 2];
-        basis[0 * 2 + 0] = 1.0;
-        basis[1 * 2 + 1] = 1.0;
+        basis[0] = 1.0;
+        basis[3] = 1.0;
 
         let subspace = OasisSubspace {
             basis,
