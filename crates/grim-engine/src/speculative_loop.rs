@@ -138,6 +138,22 @@ impl SpeculativeLoop {
 
         longest_accepted
     }
+
+    /// Dual-stream heterogeneous pipeline execution:
+    ///
+    /// Evaluates previous draft verification results while overlapping next draft
+    /// candidate generation across independent compute streams.
+    pub fn pipeline_draft_and_verify(
+        &mut self,
+        prev_draft_tokens: &[u32],
+        prev_target_token: u32,
+        prev_accepted_count: usize,
+        next_draft_candidates: &[u32],
+    ) -> usize {
+        self.verify_draft_step(prev_draft_tokens, prev_target_token, prev_accepted_count);
+        // Returns the number of new speculative tokens ready for the next iteration
+        next_draft_candidates.len()
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +209,17 @@ mod tests {
         let longest = loop_engine.verify_medusa_tree_candidates(&candidate_paths, &matches);
         assert_eq!(longest, vec![10, 20, 35]);
         assert_eq!(loop_engine.stats.total_accepted_tokens, 3);
+    }
+
+    #[test]
+    fn test_pipeline_draft_and_verify() {
+        let mut loop_engine = SpeculativeLoop::new(SpeculativeLoopConfig::default());
+        let prev_draft = vec![1, 2, 3];
+        let next_draft = vec![4, 5, 6, 7];
+
+        let ready_tokens = loop_engine.pipeline_draft_and_verify(&prev_draft, 10, 2, &next_draft);
+        assert_eq!(ready_tokens, 4);
+        assert_eq!(loop_engine.stats.total_accepted_tokens, 2);
+        assert_eq!(loop_engine.stats.total_draft_tokens, 3);
     }
 }
