@@ -139,11 +139,20 @@ impl SpeculativeLoop {
         longest_accepted
     }
 
-    /// Dual-stream heterogeneous pipeline execution:
+    /// Host-side bookkeeping for one draft round: records the previous
+    /// round's verification stats and returns how many next-round draft
+    /// candidates are staged.
     ///
-    /// Evaluates previous draft verification results while overlapping next draft
-    /// candidate generation across independent compute streams.
-    pub fn pipeline_draft_and_verify(
+    /// **This is sequential accounting, not pipelining.** No second stream
+    /// is created and nothing overlaps: `verify_draft_step` runs to
+    /// completion before the candidate count is read. The commit that
+    /// introduced this function called it "dual-stream overlapping
+    /// execution"; that mechanism does not exist yet — real draft/verify
+    /// overlap would require device-side scheduling of the drafter and
+    /// verifier on independent streams (a rocm-backend work item, not a
+    /// host loop). Named for what it does so telemetry built on it makes
+    /// no overlap claims.
+    pub fn settle_draft_round(
         &mut self,
         prev_draft_tokens: &[u32],
         prev_target_token: u32,
@@ -212,12 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pipeline_draft_and_verify() {
+    fn test_settle_draft_round_records_stats() {
         let mut loop_engine = SpeculativeLoop::new(SpeculativeLoopConfig::default());
         let prev_draft = vec![1, 2, 3];
         let next_draft = vec![4, 5, 6, 7];
 
-        let ready_tokens = loop_engine.pipeline_draft_and_verify(&prev_draft, 10, 2, &next_draft);
+        let ready_tokens =
+            loop_engine.settle_draft_round(&prev_draft, 10, 2, &next_draft);
         assert_eq!(ready_tokens, 4);
         assert_eq!(loop_engine.stats.total_accepted_tokens, 2);
         assert_eq!(loop_engine.stats.total_draft_tokens, 3);

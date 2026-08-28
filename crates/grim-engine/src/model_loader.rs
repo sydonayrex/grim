@@ -24,7 +24,8 @@ use grim_models_transformer::{
     KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, Mellum,
     MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen,
     Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig,
-    Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, QwenConfig, SmolLm2,
+    Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext,
+    Qwen38FlashNextConfig, QwenConfig, SmolLm2,
     SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec,
     WavTokenizerDecConfig,
 };
@@ -895,6 +896,41 @@ fn load_model_from_config(
                 qwen35_moe_cfg
             );
             let m = Qwen35Moe::load_tp(device.clone(), &ws, qwen35_moe_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen38FlashNext => {
+            let qwen38_cfg = Qwen38FlashNextConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                num_experts: expert_count.max(512),
+                num_experts_per_tok: expert_used_count.max(10),
+                shared_expert_intermediate_size: Some(intermediate_size),
+                routed_scaling_factor,
+                layer_types: vec![],
+                linear_key_head_dim: 128,
+                linear_num_key_heads: 8,
+                linear_value_head_dim: 128,
+                linear_num_value_heads: 8,
+                ngram_vocab_size: Some(20_000_000),
+                ngram_dim: Some(512),
+                gated_residual_branches: 4,
+                mrope_section: [11, 11, 10],
+                partial_rotary_factor: config.partial_rotary_factor.unwrap_or(1.0),
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                full_yarn: parse_yarn_scaling(&config.rope_scaling),
+            };
+            eprintln!(
+                "[grim] Loading Qwen3.8-Flash-Next model with config: {:?}",
+                qwen38_cfg
+            );
+            let m = Qwen38FlashNext::load_tp(device.clone(), &ws, qwen38_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mellum => {
@@ -2415,6 +2451,41 @@ fn load_model_with_providers(
                 qwen35_moe_cfg
             );
             let m = Qwen35Moe::load_tp(device.clone(), &ws, qwen35_moe_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen38FlashNext => {
+            let qwen38_cfg = Qwen38FlashNextConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                num_experts: hparams.expert_count.unwrap_or(512).max(512),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(10).max(10),
+                shared_expert_intermediate_size: Some(hparams.intermediate_size),
+                routed_scaling_factor: hparams.routed_scaling_factor,
+                layer_types: vec![],
+                linear_key_head_dim: 128,
+                linear_num_key_heads: 8,
+                linear_value_head_dim: 128,
+                linear_num_value_heads: 8,
+                ngram_vocab_size: Some(20_000_000),
+                ngram_dim: Some(512),
+                gated_residual_branches: 4,
+                mrope_section: [11, 11, 10],
+                partial_rotary_factor: 1.0,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                full_yarn: parse_yarn_scaling_gguf(&lookup),
+            };
+            eprintln!(
+                "[grim] Loading Qwen3.8-Flash-Next model from GGUF with config: {:?}",
+                qwen38_cfg
+            );
+            let m = Qwen38FlashNext::load_tp(device.clone(), &ws, qwen38_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mellum => {

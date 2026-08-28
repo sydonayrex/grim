@@ -8,7 +8,7 @@
 //! `GRIM_SCYTHE_INFERENCE` default).
 use grim_backend_rocm::CapabilityProfiler;
 use grim_engine::scythe_ab::{
-    ScytheAbSample, default_results_path, format_ab_report, parse_samples,
+    ScytheAbSample, default_results_path, format_ab_report, parse_samples_since,
 };
 use grim_engine::{Engine, EngineConfig, Request};
 use std::{
@@ -79,6 +79,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = arg("--out")
         .map(PathBuf::from)
         .unwrap_or_else(default_results_path);
+    // WI-INF4 measurement-defect fix: the results file accumulates rows
+    // across campaigns; a cumulative verdict that ignores timestamps mixes
+    // stale fault-era rows into the computation. Pass the campaign's start
+    // stamp (`--since-ts <unix-seconds>`) to compute the verdict over only
+    // this campaign's rows; default 0 keeps the historical whole-file view.
+    let since_ts: u64 = arg("--since-ts").unwrap_or_else(|| "0".into()).parse()?;
     let armed = arm == "on";
     if armed {
         unsafe { env::set_var("GRIM_SCYTHE_INFERENCE", "1") };
@@ -176,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verdict pass: needs both arms in the results file; a single leg prints
     // an INCOMPLETE report instead of inventing a comparison.
-    let stored = parse_samples(&fs::read_to_string(&out)?);
+    let stored = parse_samples_since(&fs::read_to_string(&out)?, since_ts);
     let on: Vec<_> = stored.iter().filter(|m| m.arm_on).cloned().collect();
     let off: Vec<_> = stored.iter().filter(|m| !m.arm_on).cloned().collect();
     print!("{}", format_ab_report(&on, &off));

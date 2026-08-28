@@ -43,6 +43,7 @@ pub enum ModelArchitecture {
     Qwen3VlMoe,
     Qwen35,
     Qwen35Moe,
+    Qwen38FlashNext,
     Phi2,
     Phi3,
     PhiMoe,
@@ -206,6 +207,9 @@ impl ModelArchitecture {
             "qwen3vlmoe" => Self::Qwen3VlMoe,
             "qwen35" | "qwen3.5" | "qwen3_5" => Self::Qwen35,
             "qwen35moe" | "qwen3_5_moe" | "qwen3_5_moe_text" => Self::Qwen35Moe,
+            "qwen38flashnext" | "qwen3_8_flash_next" | "qwen3.8-flash-next" | "qwen4_exp" => {
+                Self::Qwen38FlashNext
+            }
             "phi" | "phi2" | "phi-2" => Self::Phi2,
             "phi3" | "phi-3" | "phishort" => Self::Phi3,
             "phimoe" => Self::PhiMoe,
@@ -366,6 +370,7 @@ impl ModelArchitecture {
             Self::Qwen3VlMoe => "qwen3vlmoe",
             Self::Qwen35 => "qwen35",
             Self::Qwen35Moe => "qwen35moe",
+            Self::Qwen38FlashNext => "qwen3_8_flash_next",
             Self::Phi2 => "phi2",
             Self::Phi3 => "phi3",
             Self::PhiMoe => "phimoe",

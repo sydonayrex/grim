@@ -4,9 +4,11 @@
 //! every hardware sample appends one JSON line
 //! `{wi, order, metric, value, commit, ts}` to
 //! `docs/benchmarks/scythe2_syd_beasty_results.jsonl`, and the WI-INF4
-//! verdict rule (mean TTFT overhead ≤ 5 %, p95 ITL overhead ≤ 2 %, both
-//! ordinal orders pooled) is computed here so the example driver stays a
-//! thin loop and the math is unit-testable off-box.
+//! verdict rule (mean TTFT overhead ≤ 5 %, p95 ITL overhead ≤ 2 %) is
+//! computed here so the example driver stays a thin loop and the math is
+//! unit-testable off-box. The gate is evaluated PER ordinal order
+//! (`format_ab_report` prints one line per order) — the pooled verdict is
+//! reported alongside, but a per-order FAIL must not hide under pooling.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -266,6 +268,37 @@ pub fn format_ab_report(on: &[StoredMetric], off: &[StoredMetric]) -> String {
         .ok();
     }
 
+    // Per-order verdict lines (the WI-INF4 gate is evaluated per ordinal
+    // order — the 2026-08-23c campaign failed S-first while F-first passed;
+    // a pooled-only verdict hides exactly that asymmetry).
+    let mut orders: Vec<&str> = on
+        .iter()
+        .chain(off.iter())
+        .map(|s| s.order.as_str())
+        .filter(|o| *o != "unknown")
+        .collect();
+    orders.sort_unstable();
+    orders.dedup();
+    for order in orders {
+        let on_order: Vec<_> = on.iter().filter(|s| s.order == order).cloned().collect();
+        let off_order: Vec<_> = off.iter().filter(|s| s.order == order).cloned().collect();
+        match scythe_ab_verdict(&on_order, &off_order) {
+            Some(v) => writeln!(
+                &mut report,
+                "  [{order}] TTFT Δ={:.2}% (≤5%), ITL p95 Δ={:.2}% (≤2%) ⇒ {}",
+                v.ttft_overhead_pct,
+                v.itl_p95_overhead_pct,
+                if v.eligible { "PASS" } else { "FAIL" }
+            )
+            .ok(),
+            None => writeln!(
+                &mut report,
+                "  [{order}] INCOMPLETE — both arms need samples for this order"
+            )
+            .ok(),
+        };
+    }
+
     match scythe_ab_verdict(on, off) {
         Some(v) => writeln!(
             &mut report,
@@ -375,6 +408,7 @@ mod tests {
                     metric: "ttft_ms".into(),
                     value: *t,
                     prompt_tokens: 200 + i,
+                    ts: 0,
                 });
                 out.push(StoredMetric {
                     arm_on: arm,
@@ -382,6 +416,7 @@ mod tests {
                     metric: "itl_ms".into(),
                     value: *l,
                     prompt_tokens: 200 + i,
+                    ts: 0,
                 });
             }
             out
@@ -413,5 +448,75 @@ mod tests {
 
         // Half an experiment ⇒ no verdict.
         assert!(scythe_ab_verdict(&at_budget, &[]).is_none());
+    }
+
+    /// WI-INF4 measurement-defect fix: `parse_samples` once returned every
+    /// row in the file, so a cumulative verdict mixed stale fault-era rows
+    /// into the computation (the plan's validation log documents the
+    /// 28.5 %-vs-2.4 % ITL discrepancy this caused). `parse_samples_since`
+    /// drops unstamped and pre-cutoff rows so a filtered verdict can never
+    /// include unstampable data.
+    #[test]
+    fn test_parse_samples_since_filters_stale_campaign_rows() {
+        let current = sample(true, 2048, 120.0, 9.5).to_json_lines("fresh01", 1_700_500);
+        let stale = sample(false, 2048, 500.0, 28.0).to_json_lines("stale99", 1_700_000);
+        let mut all = stale;
+        all.extend(current);
+        let jsonl = all
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(parse_samples(&jsonl).len(), 8, "unfiltered keeps both campaigns");
+        let fresh = parse_samples_since(&jsonl, 1_700_400);
+        assert_eq!(fresh.len(), 4, "cutoff keeps only the current campaign");
+        assert!(fresh.iter().all(|m| m.arm_on), "stale off-arm rows dropped");
+
+        // Legacy rows without a ts stamp (ts == 0) never survive a filter;
+        // both stamped campaigns do at cutoff 1.
+        let legacy = r#"{"wi":"SB3","order":"F-first","metric":"ttft_ms","value":1.0,"commit":"old","arm":"on","prompt_tokens":10}"#;
+        let mixed = format!("{legacy}\n{jsonl}");
+        assert_eq!(parse_samples_since(&mixed, 1).len(), 8);
+        assert_eq!(parse_samples(&mixed).len(), 9, "unfiltered keeps legacy rows");
+    }
+
+    /// The WI-INF4 gate is per ordinal order: the 2026-08-23c campaign
+    /// passed F-first and failed S-first on ITL. A pooled-only report would
+    /// hide that; the report must print one verdict line per order.
+    #[test]
+    fn test_report_prints_per_order_verdicts() {
+        let mk_arm = |arm_on: bool, order: &str, itl: f64| -> Vec<StoredMetric> {
+            vec![
+                StoredMetric {
+                    arm_on,
+                    order: order.into(),
+                    metric: "ttft_ms".into(),
+                    value: 100.0,
+                    prompt_tokens: 2048,
+                    ts: 0,
+                },
+                StoredMetric {
+                    arm_on,
+                    order: order.into(),
+                    metric: "itl_ms".into(),
+                    value: itl,
+                    prompt_tokens: 2048,
+                    ts: 0,
+                },
+            ]
+        };
+        // Baseline ITL 10.0 everywhere. F-first on-arm 10.1 (PASS ≤2%);
+        // S-first on-arm 11.0 (FAIL >2%).
+        let mut on = mk_arm(true, "F-first", 10.1);
+        on.extend(mk_arm(true, "S-first", 11.0));
+        let mut off = mk_arm(false, "F-first", 10.0);
+        off.extend(mk_arm(false, "S-first", 10.0));
+
+        let report = format_ab_report(&on, &off);
+        assert!(report.contains("[F-first]") && report.contains("PASS"), "{report}");
+        assert!(report.contains("[S-first]") && report.contains("FAIL"), "{report}");
+        // Pooled verdict still present alongside.
+        assert!(report.contains("WI-INF4 verdict"), "{report}");
     }
 }
