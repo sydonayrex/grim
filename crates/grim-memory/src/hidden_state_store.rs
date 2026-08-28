@@ -1,6 +1,5 @@
 //! Standalone chunk-aligned hidden-state cache on pinned host memory pool.
 //!
-//! Repurposed from LMCache's `HiddenStateStore` architecture.
 //! Caches intermediate layer hidden states tied to KV cache chunk hashes,
 //! allowing instant priming of speculative draft models (e.g. Eagle-3, MTP)
 //! without recomputing bottom transformer layers.

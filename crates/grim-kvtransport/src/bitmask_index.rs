@@ -1,7 +1,6 @@
 //! High-performance bitmap-backed chunk presence index for multi-tier cache lookups.
 //!
-//! Inspired by LMCache's token database radix index, this module tracks cache
-//! block presence across L1 (VRAM/GPU), L2 (Host RAM), and L3 (NVMe / Remote Storage)
+//! Tracks cache block presence across L1 (VRAM/GPU), L2 (Host RAM), and L3 (NVMe / Remote Storage)
 //! using compact bitmasks and hash tables for O(1) admission checks.
 
 use crate::CacheTier;

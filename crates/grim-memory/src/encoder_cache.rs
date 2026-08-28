@@ -1,6 +1,5 @@
 //! Encoder Cache (EC) for multimodal vision and audio embedding deduplication.
 //!
-//! Repurposed from LMCache's `ECCacheEngine`.
 //! Caches dense output embeddings from vision (ViT/CLIP/SigLIP) and audio encoders
 //! keyed by content hashes, bypassing heavy encoder forward passes on repeated
 //! image tokens, multi-turn visual conversations, and video streams.
