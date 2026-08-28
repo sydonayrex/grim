@@ -394,6 +394,35 @@ impl Qwen38FlashNext {
             output,
         })
     }
+
+    pub fn random(device: Device, cfg: Qwen38FlashNextConfig) -> Self {
+        let tok_embeddings = Linear::from_tensor(
+            cpu_tensor(
+                vec![0.01f32; cfg.vocab_size * cfg.hidden_size],
+                grim_tensor::Shape::new(vec![cfg.vocab_size, cfg.hidden_size]),
+            ),
+            None,
+        );
+        let norm = RmsNorm {
+            weight: cpu_tensor(vec![1.0; cfg.hidden_size], grim_tensor::Shape::new(vec![cfg.hidden_size])),
+            eps: cfg.rms_norm_eps,
+        };
+        let output = Linear::from_tensor(
+            cpu_tensor(
+                vec![0.01f32; cfg.vocab_size * cfg.hidden_size],
+                grim_tensor::Shape::new(vec![cfg.hidden_size, cfg.vocab_size]),
+            ),
+            None,
+        );
+        Self {
+            cfg,
+            device,
+            tok_embeddings,
+            layers: vec![],
+            norm,
+            output,
+        }
+    }
 }
 
 impl Model for Qwen38FlashNext {
