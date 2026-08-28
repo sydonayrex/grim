@@ -100,8 +100,10 @@ pub fn backward(
         }
 
         // Leaving segment S downward: release its replayed outputs.
-        if active_segment.is_some_and(|s| s != entry.segment_idx) {
-            evict_segment_overlay(tape, active_segment.unwrap(), &mut overlay);
+        if let Some(prev_seg) = active_segment {
+            if prev_seg != entry.segment_idx {
+                evict_segment_overlay(tape, prev_seg, &mut overlay);
+            }
         }
         ensure_entry_resolved(tape, entry, &mut overlay)?;
         active_segment = Some(entry.segment_idx);
