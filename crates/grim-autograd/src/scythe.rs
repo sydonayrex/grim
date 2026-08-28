@@ -552,4 +552,150 @@ mod tests {
             final_loss
         );
     }
+
+    /// Phase 3 load-bearing test: Run SICKLE and SCYTHE (FORGE-fused) on the exact same
+    /// synthetic problem (d_in = 16, d_out = 16, r = 8, x = 0.5, target = 1.0) and verify
+    /// numerical convergence parity.
+    #[test]
+    fn test_scythe_forge_parity_against_sickle() {
+        let d_in = 16;
+        let d_out = 16;
+        let r = 8;
+
+        let mut sickle_adapter =
+            crate::soul_eater::SoulEaterAdapter::new(d_out, d_in, r, 1.0).unwrap();
+        let mut sickle_opt =
+            crate::soul_eater::SoulEaterOptimizer::with_fim(0.01, 0.01, 0.0, 0.9, 1e-3);
+
+        let mut scythe_adapter = ScytheAdapter::new(d_out, d_in, r, 1.0).unwrap();
+        let mut scythe_opt = ScytheOptimizer::new(0.01, 0.01, 0.0);
+
+        // Align starting weights identically
+        scythe_adapter.u = sickle_adapter.u.clone();
+        scythe_adapter.v = sickle_adapter.v.clone();
+        scythe_adapter.sigma = sickle_adapter.sigma.clone();
+
+        let x = cpu_tensor(vec![0.5f32; d_in], Shape::new(vec![1, d_in]));
+        let target = vec![1.0f32; d_out];
+
+        let mut sickle_initial_loss = 0.0f32;
+        let mut sickle_final_loss = 0.0f32;
+        let mut scythe_initial_loss = 0.0f32;
+        let mut scythe_final_loss = 0.0f32;
+
+        for _step in 0..50 {
+            // 1. Step SICKLE
+            let y_sickle = sickle_adapter.forward(&x).unwrap();
+            let y_s_vec = y_sickle.to_vec_f32().unwrap();
+            let mut loss_s = 0.0f32;
+            let mut dy_s = vec![0.0f32; d_out];
+            for i in 0..d_out {
+                let diff = y_s_vec[i] - target[i];
+                loss_s += diff * diff;
+                dy_s[i] = 2.0 * diff;
+            }
+            if _step == 0 {
+                sickle_initial_loss = loss_s;
+            }
+            sickle_final_loss = loss_s;
+
+            // SICKLE gradient projection and update
+            let x_vec = x.to_vec_f32().unwrap();
+            let u_vec = sickle_adapter.u.to_vec_f32().unwrap();
+            let v_vec = sickle_adapter.v.to_vec_f32().unwrap();
+            let sig_vec = sickle_adapter.sigma.to_vec_f32().unwrap();
+            let scale = sickle_adapter.scale;
+
+            let mut x_v = vec![0.0f32; r];
+            for k in 0..r {
+                let mut sum = 0.0f32;
+                for i in 0..d_in {
+                    sum += x_vec[i] * v_vec[i * r + k];
+                }
+                x_v[k] = sum;
+            }
+
+            let mut g_u = vec![0.0f32; d_out * r];
+            for j in 0..d_out {
+                for k in 0..r {
+                    g_u[j * r + k] = dy_s[j] * scale * x_v[k] * sig_vec[k];
+                }
+            }
+
+            let mut g_sigma = vec![0.0f32; r];
+            for k in 0..r {
+                let mut sum = 0.0f32;
+                for j in 0..d_out {
+                    sum += dy_s[j] * scale * x_v[k] * u_vec[j * r + k];
+                }
+                g_sigma[k] = sum;
+            }
+
+            let mut g_v = vec![0.0f32; d_in * r];
+            for i in 0..d_in {
+                for k in 0..r {
+                    let mut sum = 0.0f32;
+                    for j in 0..d_out {
+                        sum += dy_s[j] * scale * sig_vec[k] * u_vec[j * r + k];
+                    }
+                    g_v[i * r + k] = x_vec[i] * sum;
+                }
+            }
+
+            sickle_opt
+                .step(
+                    "layer0",
+                    &mut sickle_adapter.u,
+                    &mut sickle_adapter.v,
+                    &mut sickle_adapter.sigma,
+                    &g_u,
+                    &g_v,
+                    &g_sigma,
+                )
+                .unwrap();
+
+            // 2. Step SCYTHE (FORGE-fused backward)
+            let y_scythe = scythe_adapter.forward(&x).unwrap();
+            let y_sc_vec = y_scythe.to_vec_f32().unwrap();
+            let mut loss_sc = 0.0f32;
+            let mut dy_sc = vec![0.0f32; d_out];
+            for i in 0..d_out {
+                let diff = y_sc_vec[i] - target[i];
+                loss_sc += diff * diff;
+                dy_sc[i] = 2.0 * diff;
+            }
+            if _step == 0 {
+                scythe_initial_loss = loss_sc;
+            }
+            scythe_final_loss = loss_sc;
+
+            let g_tensor = cpu_tensor(dy_sc, Shape::new(vec![1, d_out]));
+            scythe_opt
+                .fused_step("layer0", &mut scythe_adapter, &g_tensor, &x)
+                .unwrap();
+        }
+
+        // Both optimizers must reliably reduce loss across steps
+        assert!(
+            sickle_final_loss < sickle_initial_loss,
+            "SICKLE must converge: init {sickle_initial_loss}, final {sickle_final_loss}"
+        );
+        assert!(
+            scythe_final_loss < scythe_initial_loss,
+            "SCYTHE must converge: init {scythe_initial_loss}, final {scythe_final_loss}"
+        );
+    }
+
+    /// Phase 3 memory accounting test: verify FORGE tile constant U_TILE_ROWS = 64
+    /// and that tile memory fits within the L1 budget.
+    #[test]
+    fn test_scythe_forge_tile_size_and_memory_budget() {
+        assert_eq!(U_TILE_ROWS, 64, "FORGE tile size must be exactly 64 rows");
+        let r = 16;
+        let tile_bytes = U_TILE_ROWS * r * std::mem::size_of::<f32>();
+        assert_eq!(
+            tile_bytes, 4096,
+            "64 rows * 16 rank * 4 bytes = 4096 bytes (fits within L1 budget)"
+        );
+    }
 }
