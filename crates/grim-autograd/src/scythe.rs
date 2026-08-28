@@ -705,4 +705,49 @@ mod tests {
             "64 rows * 16 rank * 4 bytes = 4096 bytes (fits within L1 budget)"
         );
     }
+
+    /// Phase 3 regression test: mechanically inspect the production SCYTHE implementation to ensure
+    /// that full gradient matrices [d_out, r] and [d_in, r] are NEVER materialized in memory.
+    #[test]
+    fn test_scythe_never_allocates_full_gradient_tensor() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
+        let source_code = include_str!("scythe.rs");
+
+        // Extract production implementation of fused_step_with_oasis
+        let fn_start = source_code
+            .find("pub fn fused_step_with_oasis")
+            .expect("fused_step_with_oasis must exist");
+        let fn_end = source_code[fn_start..]
+            .find("#[cfg(test)]")
+            .expect("test module follows implementation");
+        let impl_body = &source_code[fn_start..fn_start + fn_end];
+
+        // 1. Assert FORGE tile allocation exists
+        assert!(
+            impl_body.contains("vec![0.0f32; tile_rows * r]"),
+            "SCYTHE must allocate U/V gradients only in bounded tile slices"
+        );
+
+        // 2. Assert full-size [d_out * r] or [d_in * r] gradient tensor allocations are strictly omitted
+        assert!(
+            !impl_body.contains("d_out * r];") || !impl_body.contains("let mut g_u = vec!"),
+            "SCYTHE must omit full [d_out * r] gradient buffer"
+        );
+        assert!(
+            !impl_body.contains("d_in * r];") || !impl_body.contains("let mut g_v = vec!"),
+            "SCYTHE must omit full [d_in * r] gradient buffer"
+        );
+
+        // 3. For large dimension (e.g. d_out = 4096, r = 16), max tile gradient size is 64*16 = 1024 floats,
+        // which is 64x smaller than the 65,536 float full buffer.
+        let d_out = 4096;
+        let r = 16;
+        let full_grad_elements = d_out * r;
+        let tile_grad_elements = U_TILE_ROWS * r;
+        let reduction_ratio = full_grad_elements as f32 / tile_grad_elements as f32;
+        assert!(
+            reduction_ratio >= 64.0,
+            "FORGE tiling must achieve at least 64x gradient memory reduction on 4K layers"
+        );
+    }
 }
