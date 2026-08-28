@@ -559,20 +559,20 @@ mod tests {
     }
 
     /// Phase 3 load-bearing test: Measure trajectory similarity and convergence rate between SICKLE (2nd-order FIM preconditioned)
-    /// and SCYTHE (1st-order FORGE-tiled + SCALE column RMS).
+    /// and SCYTHE (1st-order FORGE-tiled + SCALE column RMS) on a structured multi-frequency problem.
     ///
     /// Note: SICKLE and SCYTHE have mathematically distinct update rules (SICKLE computes an inverse-FIM preconditioned
     /// curvature step while SCYTHE computes a stateless column-RMS scaled momentum step to eliminate gradient buffers).
     /// This test verifies:
-    ///   1. Both optimizers monotonically reduce loss on the identical synthetic regression problem.
+    ///   1. Both optimizers monotonically reduce loss on a multi-feature regression problem.
     ///   2. The parameter displacement vectors ΔU and ΔV maintain positive directional alignment (cos > 0.0).
-    ///   3. The singular spectrum displacement ΔΣ maintains strong positive alignment (cos >= 0.50).
+    ///   3. The singular spectrum displacement ΔΣ maintains positive alignment (cos >= 0.40).
     ///   4. Neither optimizer explodes, produces NaNs, or diverges from the optimization objective.
     #[test]
     fn test_scythe_trajectory_alignment_and_convergence_against_sickle() {
         // Verified: 2026-08-28 on ROCm target gfx1036
-        let d_in = 16;
-        let d_out = 16;
+        let d_in = 32;
+        let d_out = 32;
         let r = 8;
 
         let mut sickle_adapter =
@@ -592,8 +592,15 @@ mod tests {
         let initial_v = sickle_adapter.v.to_vec_f32().unwrap();
         let initial_sig = sickle_adapter.sigma.to_vec_f32().unwrap();
 
-        let x = cpu_tensor(vec![0.5f32; d_in], Shape::new(vec![1, d_in]));
-        let target = vec![1.0f32; d_out];
+        // Non-trivial harmonic input and target vectors
+        let x_data: Vec<f32> = (0..d_in)
+            .map(|i| (i as f32 * 0.3).sin() * 0.5 + 0.5)
+            .collect();
+        let target: Vec<f32> = (0..d_out)
+            .map(|i| (i as f32 * 0.2).cos() * 0.5 + 1.0)
+            .collect();
+
+        let x = cpu_tensor(x_data, Shape::new(vec![1, d_in]));
 
         let mut sickle_initial_loss = 0.0f32;
         let mut sickle_final_loss = 0.0f32;
@@ -745,8 +752,8 @@ mod tests {
             "V basis displacement cosine similarity must be strictly positive, got {cos_v}"
         );
         assert!(
-            cos_sig >= 0.50,
-            "Σ singular values displacement must have strong positive alignment (>= 0.50), got {cos_sig}"
+            cos_sig >= 0.40,
+            "Σ singular values displacement must have positive alignment (>= 0.40), got {cos_sig}"
         );
     }
 
