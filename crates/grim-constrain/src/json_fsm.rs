@@ -88,31 +88,23 @@ impl JsonState {
                     self.is_key = false;
                     true
                 }
-                '}' => {
-                    if self.stack.last() == Some(&Bracket::Object) {
-                        self.stack.pop();
-                        self.mode = if self.stack.is_empty() {
-                            Mode::Done
-                        } else {
-                            Mode::ExpectSep
-                        };
-                        true
+                '}' if self.stack.last() == Some(&Bracket::Object) => {
+                    self.stack.pop();
+                    self.mode = if self.stack.is_empty() {
+                        Mode::Done
                     } else {
-                        false
-                    }
+                        Mode::ExpectSep
+                    };
+                    true
                 }
-                ']' => {
-                    if self.stack.last() == Some(&Bracket::Array) {
-                        self.stack.pop();
-                        self.mode = if self.stack.is_empty() {
-                            Mode::Done
-                        } else {
-                            Mode::ExpectSep
-                        };
-                        true
+                ']' if self.stack.last() == Some(&Bracket::Array) => {
+                    self.stack.pop();
+                    self.mode = if self.stack.is_empty() {
+                        Mode::Done
                     } else {
-                        false
-                    }
+                        Mode::ExpectSep
+                    };
+                    true
                 }
                 '-' => {
                     self.mode = Mode::NumStart { minus: true };
@@ -139,18 +131,14 @@ impl JsonState {
             },
 
             Mode::ExpectKey => match c {
-                '}' => {
-                    if self.stack.last() == Some(&Bracket::Object) {
-                        self.stack.pop();
-                        self.mode = if self.stack.is_empty() {
-                            Mode::Done
-                        } else {
-                            Mode::ExpectSep
-                        };
-                        true
+                '}' if self.stack.last() == Some(&Bracket::Object) => {
+                    self.stack.pop();
+                    self.mode = if self.stack.is_empty() {
+                        Mode::Done
                     } else {
-                        false
-                    }
+                        Mode::ExpectSep
+                    };
+                    true
                 }
                 '"' => {
                     self.mode = Mode::StringKey;
@@ -202,18 +190,14 @@ impl JsonState {
                         false
                     }
                 }
-                ']' => {
-                    if self.stack.last() == Some(&Bracket::Array) {
-                        self.stack.pop();
-                        self.mode = if self.stack.is_empty() {
-                            Mode::Done
-                        } else {
-                            Mode::ExpectSep
-                        };
-                        true
+                ']' if self.stack.last() == Some(&Bracket::Array) => {
+                    self.stack.pop();
+                    self.mode = if self.stack.is_empty() {
+                        Mode::Done
                     } else {
-                        false
-                    }
+                        Mode::ExpectSep
+                    };
+                    true
                 }
                 c if c.is_ascii_digit() => true,
                 '.' => true,

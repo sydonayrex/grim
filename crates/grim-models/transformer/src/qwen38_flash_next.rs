@@ -265,11 +265,7 @@ impl Qwen38FlashNextBlock {
         })
     }
 
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        positions: &[u32],
-    ) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.attn_norm.forward(x)?;
 
@@ -404,7 +400,10 @@ impl Qwen38FlashNext {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], grim_tensor::Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                grim_tensor::Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(

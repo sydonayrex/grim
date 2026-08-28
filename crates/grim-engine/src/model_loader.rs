@@ -25,9 +25,8 @@ use grim_models_transformer::{
     MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen,
     Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig,
     Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext,
-    Qwen38FlashNextConfig, QwenConfig, SmolLm2,
-    SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec,
-    WavTokenizerDecConfig,
+    Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5,
+    T5Config, WavTokenizerDec, WavTokenizerDecConfig,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};

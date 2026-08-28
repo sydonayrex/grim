@@ -8860,8 +8860,8 @@ mod tests {
         let three_prior = &messages[..4]; // user + assistant + tool = 1 prior call...
         let _ = three_prior; // placeholder; hard guard fires below 4 only
         assert!(
-            !check_repeated_call_hard_guard(&messages[..6], "get_weather", "{\"city\":\"NYC\"}")
-                .is_some(),
+            check_repeated_call_hard_guard(&messages[..6], "get_weather", "{\"city\":\"NYC\"}")
+                .is_none(),
             "only 1 prior call (index 6) must not trigger hard guard"
         );
         // A genuinely different argument must never trigger.

@@ -119,11 +119,26 @@ impl ArchFamily {
             Self::Rdna4
         } else if lower.contains("1300") || lower.contains("gfx13") {
             Self::Rdna5
-        } else if lower.contains("1100") || lower.contains("1101") || lower.contains("1102") || lower.contains("1103") || lower.contains("gfx11") {
+        } else if lower.contains("1100")
+            || lower.contains("1101")
+            || lower.contains("1102")
+            || lower.contains("1103")
+            || lower.contains("gfx11")
+        {
             Self::Rdna3
-        } else if lower.contains("1030") || lower.contains("1031") || lower.contains("1032") || lower.contains("1034") || lower.contains("1036") || lower.contains("gfx10") {
+        } else if lower.contains("1030")
+            || lower.contains("1031")
+            || lower.contains("1032")
+            || lower.contains("1034")
+            || lower.contains("1036")
+            || lower.contains("gfx10")
+        {
             Self::Rdna2
-        } else if lower.contains("940") || lower.contains("941") || lower.contains("942") || lower.contains("gfx94") {
+        } else if lower.contains("940")
+            || lower.contains("941")
+            || lower.contains("942")
+            || lower.contains("gfx94")
+        {
             Self::Cdna3
         } else if lower.contains("908") || lower.contains("90a") || lower.contains("gfx90") {
             Self::Cdna2
@@ -136,7 +151,7 @@ impl ArchFamily {
 /// Offline-tuned rocBLAS solution index lookup table (Item 7). [see: `(m, n, k, arith)`, `solution_index`]
 pub fn lookup_solution_index(m: usize, n: usize, k: usize, arch: &str, arith: ArithType) -> i32 {
     let family = ArchFamily::from_arch_str(arch);
-    
+
     // Only tuned for FP32, F16, and BF16; other dtypes fall back to default (0).
     if arith != ArithType::F32 && arith != ArithType::F16 && arith != ArithType::BF16 {
         return 0_i32;

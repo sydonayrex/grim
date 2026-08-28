@@ -233,10 +233,12 @@ mod tests {
 
     #[test]
     fn test_qwen38_flash_next_mtp_creation() {
-        let mut cfg = crate::qwen38_flash_next::Qwen38FlashNextConfig::default();
-        cfg.vocab_size = 128;
-        cfg.hidden_size = 64;
-        cfg.num_layers = 1;
+        let cfg = crate::qwen38_flash_next::Qwen38FlashNextConfig {
+            vocab_size: 128,
+            hidden_size: 64,
+            num_layers: 1,
+            ..Default::default()
+        };
         let base = crate::qwen38_flash_next::Qwen38FlashNext::random(Device::Cpu, cfg);
         let mtp = Qwen38FlashNextMtp::new(base, 3);
         assert_eq!(mtp.depth, 3);

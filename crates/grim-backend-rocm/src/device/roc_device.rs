@@ -14373,8 +14373,7 @@ impl RocmDevice {
         let mut res = resident;
         if std::env::var_os("GRIM_RING_DIAG").is_some() {
             eprintln!(
-                "[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}",
-                !true
+                "[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull=false"
             );
         }
         self.launch_compute_kernel(
@@ -14420,7 +14419,7 @@ impl RocmDevice {
         if std::env::var_os("GRIM_RING_DIAG").is_some() {
             eprintln!(
                 "[launch-diag] persistent wave: cap={cap} max_tasks={max_tasks} resident={res} stream_nonnull={}",
-                !true
+                !stream.is_null()
             );
         }
         self.launch_compute_kernel(

@@ -57,7 +57,7 @@ fn test_moe_aware_semantic_anchor_and_prefix_caching_integration() {
 }
 
 #[test]
-fn test_moe_aware_bandwidth_policy_to_hybrid_execution_integration() {
+fn test_moe_aware_qstar_partitioning_to_hybrid_execution_integration() {
     // 1. FreeToken q* partitioning lives at the execution layer
     // (`MoeHybridExecutor::plan_step`); measured PCIe (25 GB/s) and Host
     // DRAM (50 GB/s) -> ratio 0.5. Misses (m = 3, expert 0 resident)

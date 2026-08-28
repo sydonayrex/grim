@@ -261,7 +261,7 @@ fn main() {
                     "build.rs: glslangValidator failed for kernel `{name}` (status {s}); emitting empty fallback blob"
                 );
                 // Create an empty dummy .spv so include_bytes! succeeds during headless/compilerless builds.
-                let _ = std::fs::write(&spv_path, &[]);
+                let _ = std::fs::write(&spv_path, []);
                 gen_code.push_str(&format!(
                     "pub const SPIRV_{}: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{}.spv\"));\n",
                     sanitize(name),
@@ -273,7 +273,7 @@ fn main() {
                     "build.rs: could not invoke glslangValidator for kernel `{name}`: {e}; emitting empty fallback blob"
                 );
                 // Create an empty dummy .spv so include_bytes! succeeds during headless/compilerless builds.
-                let _ = std::fs::write(&spv_path, &[]);
+                let _ = std::fs::write(&spv_path, []);
                 gen_code.push_str(&format!(
                     "pub const SPIRV_{}: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{}.spv\"));\n",
                     sanitize(name),

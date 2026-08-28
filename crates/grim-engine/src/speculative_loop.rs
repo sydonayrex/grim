@@ -119,7 +119,8 @@ impl SpeculativeLoop {
             let mut current_accepted = Vec::new();
             for (token_idx, &token) in path.iter().enumerate() {
                 let match_idx = path_idx * path.len() + token_idx;
-                let is_match = match_idx < target_token_matches.len() && target_token_matches[match_idx];
+                let is_match =
+                    match_idx < target_token_matches.len() && target_token_matches[match_idx];
                 if is_match {
                     current_accepted.push(token);
                 } else {
@@ -202,18 +203,10 @@ mod tests {
     #[test]
     fn test_medusa_tree_candidates_verification() {
         let mut loop_engine = SpeculativeLoop::new(SpeculativeLoopConfig::default());
-        let candidate_paths = vec![
-            vec![10, 20, 30],
-            vec![10, 20, 35],
-            vec![10, 25, 40],
-        ];
+        let candidate_paths = vec![vec![10, 20, 30], vec![10, 20, 35], vec![10, 25, 40]];
         // 1st path: 10 (ok), 20 (ok), 30 (mismatch) -> len 2
         // 2nd path: 10 (ok), 20 (ok), 35 (ok) -> len 3
-        let matches = vec![
-            true, true, false,
-            true, true, true,
-            true, false, false,
-        ];
+        let matches = vec![true, true, false, true, true, true, true, false, false];
 
         let longest = loop_engine.verify_medusa_tree_candidates(&candidate_paths, &matches);
         assert_eq!(longest, vec![10, 20, 35]);
@@ -226,8 +219,7 @@ mod tests {
         let prev_draft = vec![1, 2, 3];
         let next_draft = vec![4, 5, 6, 7];
 
-        let ready_tokens =
-            loop_engine.settle_draft_round(&prev_draft, 10, 2, &next_draft);
+        let ready_tokens = loop_engine.settle_draft_round(&prev_draft, 10, 2, &next_draft);
         assert_eq!(ready_tokens, 4);
         assert_eq!(loop_engine.stats.total_accepted_tokens, 2);
         assert_eq!(loop_engine.stats.total_draft_tokens, 3);
