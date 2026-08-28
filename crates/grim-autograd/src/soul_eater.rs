@@ -37,16 +37,19 @@ impl SoulEaterAdapter {
     pub fn new(d_out: usize, d_in: usize, r: usize, alpha: f32) -> Result<Self> {
         let mut u_data = vec![0.0f32; d_out * r];
         let mut v_data = vec![0.0f32; d_in * r];
+        let u_std = (2.0f32 / (d_out + r) as f32).sqrt();
+        let v_std = (2.0f32 / (d_in + r) as f32).sqrt();
 
-        // Initialize U and V with normalized well-conditioned values
         for i in 0..d_out {
             for j in 0..r {
-                u_data[i * r + j] = (((i + 1) * 17 + (j + 1) * 31) % 100) as f32 / 100.0 - 0.5;
+                let pseudo_norm = (((i + 1) * 17 + (j + 1) * 31) % 997) as f32 / 997.0 - 0.5;
+                u_data[i * r + j] = pseudo_norm * u_std * 2.0;
             }
         }
         for i in 0..d_in {
             for j in 0..r {
-                v_data[i * r + j] = (((i + 1) * 13 + (j + 1) * 29) % 100) as f32 / 100.0 - 0.5;
+                let pseudo_norm = (((i + 1) * 13 + (j + 1) * 29) % 997) as f32 / 997.0 - 0.5;
+                v_data[i * r + j] = pseudo_norm * v_std * 2.0;
             }
         }
 
@@ -512,55 +515,75 @@ fn matmul_transpose_left(m: &[f32], b: &[f32], d: usize, r: usize) -> Vec<f32> {
     result
 }
 
-/// Invert a small r×r symmetric positive-definite matrix via Gaussian elimination.
-/// Used for FIM inversion (r ≤ 16, so O(r³) is negligible).
+/// Invert an r×r symmetric positive semi-definite matrix (FIM) with adaptive ridge regularization.
+/// Attempts exact inversion first (λ = 0.0); on near-singular pivots, adds progressive ridge damping (F + λI)⁻¹.
 fn invert_r_by_r(mat: &[f32], r: usize) -> Vec<f32> {
-    let mut a = mat.to_vec();
-    let mut inv = vec![0.0f32; r * r];
-    for i in 0..r {
-        inv[i * r + i] = 1.0;
-    }
-    for col in 0..r {
-        // Partial pivoting
-        let mut pivot = col;
-        let mut max_val = a[col * r + col].abs();
-        for row in (col + 1)..r {
-            if a[row * r + col].abs() > max_val {
-                max_val = a[row * r + col].abs();
-                pivot = row;
+    let lambdas = [0.0f32, 1e-5, 1e-4, 1e-3, 1e-2];
+    for &lambda in &lambdas {
+        let mut a = mat.to_vec();
+        if lambda > 0.0 {
+            for i in 0..r {
+                a[i * r + i] += lambda;
             }
         }
-        if pivot != col {
-            for j in 0..r {
-                a.swap(col * r + j, pivot * r + j);
-                inv.swap(col * r + j, pivot * r + j);
-            }
+
+        let mut inv = vec![0.0f32; r * r];
+        for i in 0..r {
+            inv[i * r + i] = 1.0;
         }
-        let pivot_val = a[col * r + col];
-        if pivot_val.abs() < 1e-12 {
-            // Singular — add damping and retry
-            a[col * r + col] = 1e-6;
-        } else {
-            let inv_pivot = 1.0 / a[col * r + col];
+
+        let mut failed = false;
+        for col in 0..r {
+            let mut pivot = col;
+            let mut max_val = a[col * r + col].abs();
+            for row in (col + 1)..r {
+                if a[row * r + col].abs() > max_val {
+                    max_val = a[row * r + col].abs();
+                    pivot = row;
+                }
+            }
+            if max_val < 1e-7 {
+                failed = true;
+                break;
+            }
+            if pivot != col {
+                for j in 0..r {
+                    a.swap(col * r + j, pivot * r + j);
+                    inv.swap(col * r + j, pivot * r + j);
+                }
+            }
+            let pivot_val = a[col * r + col];
+            let inv_pivot = 1.0 / pivot_val;
             for j in 0..r {
                 a[col * r + j] *= inv_pivot;
                 inv[col * r + j] *= inv_pivot;
             }
-        }
-        for row in 0..r {
-            if row == col {
-                continue;
-            }
-            let factor = a[row * r + col];
-            if factor.abs() > 1e-12 {
-                for j in 0..r {
-                    a[row * r + j] -= factor * a[col * r + j];
-                    inv[row * r + j] -= factor * inv[col * r + j];
+            for row in 0..r {
+                if row == col {
+                    continue;
+                }
+                let factor = a[row * r + col];
+                if factor.abs() > 1e-12 {
+                    for j in 0..r {
+                        a[row * r + j] -= factor * a[col * r + j];
+                        inv[row * r + j] -= factor * inv[col * r + j];
+                    }
                 }
             }
         }
+
+        if !failed {
+            return inv;
+        }
     }
-    inv
+
+    // Fallback: damped diagonal inverse if complete decomposition fails
+    let mut fallback = vec![0.0f32; r * r];
+    for i in 0..r {
+        let d = mat[i * r + i].max(1e-4);
+        fallback[i * r + i] = 1.0 / d;
+    }
+    fallback
 }
 
 /// Apply FIM inverse to a projected gradient: result = F_inv @ g_proj  [r × r]

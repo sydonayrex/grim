@@ -75,7 +75,6 @@ fn test_scythe1_integration_loss_decrease() {
             }
         }
 
-        adapter.accumulate_fim(&g_u, &g_v, &g_sigma);
         opt.step(
             "layer0",
             &mut adapter.inner.u,

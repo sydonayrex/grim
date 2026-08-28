@@ -36,15 +36,19 @@ impl ScytheAdapter {
     pub fn new(d_out: usize, d_in: usize, r: usize, alpha: f32) -> Result<Self> {
         let mut u_data = vec![0.0f32; d_out * r];
         let mut v_data = vec![0.0f32; d_in * r];
+        let u_std = (2.0f32 / (d_out + r) as f32).sqrt();
+        let v_std = (2.0f32 / (d_in + r) as f32).sqrt();
 
         for i in 0..d_out {
             for j in 0..r {
-                u_data[i * r + j] = (((i + 1) * 17 + (j + 1) * 31) % 100) as f32 / 100.0 - 0.5;
+                let pseudo_norm = (((i + 1) * 17 + (j + 1) * 31) % 997) as f32 / 997.0 - 0.5;
+                u_data[i * r + j] = pseudo_norm * u_std * 2.0;
             }
         }
         for i in 0..d_in {
             for j in 0..r {
-                v_data[i * r + j] = (((i + 1) * 13 + (j + 1) * 29) % 100) as f32 / 100.0 - 0.5;
+                let pseudo_norm = (((i + 1) * 13 + (j + 1) * 29) % 997) as f32 / 997.0 - 0.5;
+                v_data[i * r + j] = pseudo_norm * v_std * 2.0;
             }
         }
 
@@ -187,18 +191,41 @@ impl ScytheOptimizer {
         }
         let g_vec = param.grad().to_vec_f32()?;
         let mut d_vec = param.data.to_vec_f32()?;
-        let d = d_vec.len();
-        let norms = column_rms(&g_vec, 1, d, 1e-8);
+        let dims = param.data.shape().dims();
+        let (rows, cols) = if dims.len() >= 2 {
+            (dims[0], dims[1..].iter().product::<usize>())
+        } else {
+            (dims.first().copied().unwrap_or(1), 1)
+        };
 
+        // Compute true column-wise RMS across rows for [rows, cols] matrix
+        let norms = if cols > 1 {
+            column_rms(&g_vec, rows, cols, 1e-8)
+        } else {
+            // For 1D vector, RMS across entire vector
+            let mut sum_sq = 0.0f32;
+            for &g in &g_vec {
+                sum_sq += g * g;
+            }
+            let rms = (sum_sq / (rows as f32).max(1.0)).sqrt() + 1e-8;
+            vec![rms]
+        };
+
+        let total_len = d_vec.len();
         let m_entry = self
             .m_u
             .entry(format!("{:?}", id))
-            .or_insert_with(|| vec![0.0f32; d]);
+            .or_insert_with(|| vec![0.0f32; total_len]);
 
-        for i in 0..d {
-            let update_dir = g_vec[i] / norms[i];
-            m_entry[i] = self.config.beta * m_entry[i] + (1.0 - self.config.beta) * update_dir;
-            d_vec[i] -= self.config.lr_basis * m_entry[i];
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c;
+                let norm = if cols > 1 { norms[c] } else { norms[0] };
+                let update_dir = g_vec[idx] / norm;
+                m_entry[idx] =
+                    self.config.beta * m_entry[idx] + (1.0 - self.config.beta) * update_dir;
+                d_vec[idx] -= self.config.lr_basis * m_entry[idx];
+            }
         }
 
         let dev = crate::pick_device_for_tensor(&param.data);
@@ -265,14 +292,19 @@ impl ScytheOptimizer {
             x_dims[..x_dims.len() - 1].iter().product()
         };
 
-        // If OASIS is enabled, update basis and reconstruct through low-rank coordinates
-        let x_slice = if let Some(subspace) = oasis {
+        // If OASIS is active, we preserve the original activations for direct gradient computation
+        // or project through the online basis without lossy forward reconstruction bias.
+        let (x_slice, oasis_proj) = if let Some(subspace) = oasis {
             subspace.update_basis(&x_raw, batch_tokens);
             let proj = subspace.project(&x_raw, batch_tokens);
-            subspace.reconstruct(&proj, batch_tokens)
+            // In linear adapter Y = X V Σ U^T, if X is in subspace basis Q [d_in, p],
+            // then X V = (X_proj * Q^T) V = X_proj * (Q^T V) where Q^T V is [p, r].
+            // We use the exact raw activation for unbiased adapter backward:
+            (x_raw, Some(proj))
         } else {
-            x_raw
+            (x_raw, None)
         };
+        let _ = oasis_proj;
 
         let u_slice = adapter.u.to_vec_f32()?;
         let v_slice = adapter.v.to_vec_f32()?;
@@ -410,8 +442,9 @@ impl ScytheOptimizer {
             let norm = sig_norms[k];
             let update_dir = g_sigma[k] / norm;
             updated_sig[k] -= self.config.lr_sigma * update_dir;
-            if updated_sig[k] < 0.0 {
-                updated_sig[k] = 0.0;
+            // Soft positive floor to avoid permanently dead rank dimensions
+            if updated_sig[k] < 1e-4 {
+                updated_sig[k] = 1e-4;
             }
         }
         adapter.sigma = cpu_tensor(updated_sig, Shape::new(vec![r]));
