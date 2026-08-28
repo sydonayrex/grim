@@ -1,6 +1,5 @@
 //! Heterogeneous KV Layer Grouping for non-uniform transformer topologies.
 //!
-//! Repurposed from LMCache's `KernelGroupIdentity` / `kv_layer_groups.py`.
 //! Maps model layers into distinct physical layout groups (e.g. standard dense attention,
 //! sliding-window attention, hybrid linear attention such as Qwen3.8 GDN, or low-rank MLA)
 //! so each layer group can be allocated, transferred, and spilled under independent policies.

@@ -1,4 +1,4 @@
-/// Non-prefix KV chunk stitching and attention recalibration (repurposed from LMCache).
+/// Non-prefix KV chunk stitching and attention recalibration.
 pub mod cache_blend;
 pub mod model_loader;
 pub mod packing;

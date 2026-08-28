@@ -1,6 +1,5 @@
 //! Pinned Buffer Lease and Stale Lock Monitor.
 //!
-//! Repurposed from LMCache's `PinMonitor`.
 //! Tracks active host-pinned / device-pinned buffer leases during asynchronous
 //! cross-node transfers and device copies. Automatically reclaims abandoned leases
 //! on worker timeouts or connection drops to prevent permanent memory deadlocks.

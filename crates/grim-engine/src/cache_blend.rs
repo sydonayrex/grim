@@ -1,6 +1,5 @@
 //! CacheBlend non-prefix KV cache stitching and selective attention recalibration.
 //!
-//! Repurposed from LMCache's CacheBlend mechanism.
 //! Allows reusing cached KV blocks from non-prefix positions (e.g. multi-document RAG,
 //! injected context, and tool responses) by stitching block ranges and computing
 //! cross-boundary attention adjustments.
