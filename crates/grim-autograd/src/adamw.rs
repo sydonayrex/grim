@@ -184,6 +184,10 @@ pub enum OptimizerKind {
     MAdam,
     /// LionVote — Per-layer adaptive voting for sign-momentum updates.
     LionVote,
+    /// SCYTHE: Fused tile-wise backward (FORGE) + stateless column-norm (SCALE) + low-rank activation subspace (OASIS).
+    Scythe,
+    /// SICKLE: Legacy SOUL EATER adapter + Natural GaLore inverse-FIM preconditioning.
+    Sickle,
 }
 
 impl std::str::FromStr for OptimizerKind {
@@ -209,8 +213,10 @@ impl std::str::FromStr for OptimizerKind {
             "muon" => Ok(Self::Muon),
             "madam" | "m-adam" => Ok(Self::MAdam),
             "lionvote" | "lion-vote" => Ok(Self::LionVote),
+            "scythe" => Ok(Self::Scythe),
+            "sickle" | "scythe1" | "soul-eater" => Ok(Self::Sickle),
             other => Err(format!(
-                "unknown optimizer '{other}' (expected adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit, lomo, adalomo, came, sophia, muon, madam, lionvote)"
+                "unknown optimizer '{other}' (expected adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit, lomo, adalomo, came, sophia, muon, madam, lionvote, scythe, sickle)"
             )),
         }
     }
@@ -237,6 +243,8 @@ impl std::fmt::Display for OptimizerKind {
             Self::Muon => "muon",
             Self::MAdam => "madam",
             Self::LionVote => "lionvote",
+            Self::Scythe => "scythe",
+            Self::Sickle => "sickle",
         };
         f.write_str(s)
     }
@@ -416,6 +424,10 @@ impl Optimizer {
                     lr,
                     ..Default::default()
                 },
+            ))),
+            OptimizerKind::Scythe | OptimizerKind::Sickle => Err(grim_tensor::Error::Unimplemented(format!(
+                "Optimizer {:?} operates directly on low-rank structural adapters via its dedicated API",
+                kind
             ))),
         }
     }
