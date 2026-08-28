@@ -71,18 +71,24 @@ pub use sophia::{Sophia, SophiaConfig, SophiaState};
 pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
 pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
 pub use preference_trainer::{PreferenceKind, PreferenceStepConfig, PreferenceTrainer};
+pub mod oasis;
 pub mod omnilo_prune;
 pub mod registry;
 pub mod relora;
 pub mod replay;
+pub mod scale;
+pub mod scythe;
 pub mod scythe1;
 pub mod soul_eater;
 pub mod tape;
 pub mod tops_prune;
 pub mod turbo_finetune;
 
+pub use oasis::OasisSubspace;
+pub use scale::column_rms;
+pub use scythe::{ScytheAdapter, ScytheOptimizer, U_TILE_ROWS};
 pub use scythe1::{Scythe1Adapter, Scythe1Optimizer};
-pub use soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
+pub use soul_eater::{SickleAdapter, SickleOptimizer, SoulEaterAdapter, SoulEaterOptimizer};
 pub use turbo_finetune::{TrainingMode, TurboFinetuneConfig, TurboFinetuneScheduler};
 
 pub use adamw::{
