@@ -15,6 +15,9 @@ use grim_core::error::{Error, Result};
 pub mod bitmask_index;
 pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};
 
+pub mod pin_lease;
+pub use pin_lease::{LeaseStatus, PinLeaseMonitor, PinnedLease, SharedPinLeaseMonitor};
+
 pub type BlockId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

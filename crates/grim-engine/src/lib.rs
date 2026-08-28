@@ -396,7 +396,7 @@ impl Engine {
                             qk_compute_bits: 8,
                         };
                         compressor = Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
-                        eprintln!(
+                        log::info!(
                             "[grim-engine] kv-int8: attached LloydMaxCompressor (key_bits=3, value_bits=8, group=64)"
                         );
                     }
@@ -408,7 +408,7 @@ impl Engine {
                             qk_compute_bits: 8,
                         };
                         compressor = Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
-                        eprintln!(
+                        log::info!(
                             "[grim-engine] kv-int8: attached LloydMaxCompressor (key_bits=2, value_bits=4, group=64)"
                         );
                     }
@@ -451,7 +451,7 @@ impl Engine {
                 // operator sees the mismatch immediately instead of silently
                 // loading the wrong shard. Engine::new returns Self (not Result),
                 // so we panic; this is an unrecoverable config error.
-                eprintln!(
+                log::info!(
                     "[grim-engine] INVALID TP config (GRIM_TP_SIZE={}): {msg}",
                     config.tp_size
                 );
@@ -470,9 +470,11 @@ impl Engine {
                 })
                 .unwrap_or_default();
             let my_ordinal = gpus.get(tp.rank).copied().unwrap_or(tp.rank);
-            eprintln!(
+            log::info!(
                 "[grim-engine] TP rank {}/{} on ordinal {} (device built in model_loader)",
-                tp.rank, tp.world_size, my_ordinal
+                tp.rank,
+                tp.world_size,
+                my_ordinal
             );
             Some(tp)
         } else {
@@ -492,7 +494,7 @@ impl Engine {
             };
             match grim_disagg::KvReceiverServer::new(listen_addr, block_pool.clone()) {
                 Ok(srv) => {
-                    eprintln!(
+                    log::info!(
                         "[grim-engine] disagg: KV receiver server started on {} (role={:?})",
                         srv.listen_addr(),
                         role
@@ -500,7 +502,7 @@ impl Engine {
                     Some(srv)
                 }
                 Err(e) => {
-                    eprintln!(
+                    log::warn!(
                         "[grim-engine] disagg: failed to start KV receiver on {listen_addr}: {e}"
                     );
                     None
@@ -535,6 +537,16 @@ impl Engine {
             admission,
         );
         scheduler.determinism_mode = config.determinism_mode;
+        // §5.2 real KV pressure: pool occupancy feeds the scheduler's
+        // pressure signal so preemption/chunked draining react to actual
+        // KV exhaustion, not just prompt-token sums.
+        scheduler.set_kv_pressure(Arc::new(grim_scheduler::PoolKvPressure::new({
+            let block_pool = block_pool.clone();
+            move || {
+                let guard = block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                guard.used_count() as f32 / guard.capacity().max(1) as f32
+            }
+        })));
         let target_ttft = config.target_ttft_ms as f64;
         let target_itl = config.target_itl_ms as f64;
 
@@ -572,7 +584,7 @@ impl Engine {
             .map(|p| p.capabilities().len())
             .unwrap_or(0);
         let scythe_ctrl = if scythe_inference_flag && visible_gpus > 1 {
-            eprintln!(
+            log::info!(
                 "[scythe2] inference routing armed over {visible_gpus} visible GPUs \
                  (GRIM_SCYTHE_INFERENCE=1)"
             );
@@ -802,7 +814,7 @@ impl Engine {
                 Err(e) => {
                     // A failed replica must not silently shrink the farm below
                     // what the controller was told to route over — fail loudly.
-                    eprintln!(
+                    log::warn!(
                         "[scythe2] farm replica {rid} on {dev:?} failed to load: {e}; \
                          removing partial farm",
                         rid = Self::scythe_replica_id(id, rank)
@@ -824,7 +836,7 @@ impl Engine {
                 *ctrl = crate::scythe2::C2plrController::new(num_layers, n, budget);
             }
         }
-        eprintln!(
+        log::info!(
             "[scythe2] farm armed: {} replica(s) of {id} across GPUs {:?}",
             replica_ids.len(),
             ordered
@@ -876,7 +888,7 @@ impl Engine {
             return ScytheAdmission::Bypass;
         }
         if caps_raw.is_empty() {
-            eprintln!("[scythe2] farm present but profiler sees no GPUs; leaving request queued");
+            log::info!("[scythe2] farm present but profiler sees no GPUs; leaving request queued");
             return ScytheAdmission::WaitVram;
         }
         // Active pins plus pins released inside the cooldown window, plus
@@ -921,7 +933,7 @@ impl Engine {
             }
         }
         if feasible.iter().all(|&ok| !ok) {
-            eprintln!(
+            log::info!(
                 "[scythe2] no farm rank holds ~{} MiB; leaving request queued",
                 footprint / (1024 * 1024)
             );
@@ -953,7 +965,7 @@ impl Engine {
             .unwrap_or(true);
         let chosen = match chosen {
             Some(r) if r != 0 && !spread_enabled => {
-                eprintln!(
+                log::info!(
                     "[scythe2] load favored rank {r} but spreading is disabled \
                      (GRIM_SCYTHE_SPREAD=0); clamping to rank 0"
                 );
@@ -962,9 +974,11 @@ impl Engine {
             other => other,
         };
         if let Some(r) = chosen {
-            eprintln!(
+            log::info!(
                 "[scythe2] admission loads {:?} (external busy {:?}) -> rank {}",
-                effective_loads, external_busy, r
+                effective_loads,
+                external_busy,
+                r
             );
         }
         chosen
@@ -1528,14 +1542,14 @@ impl Engine {
             };
             if !matched_blocks.is_empty() {
                 if let Some(cp) = anchor_state {
-                    eprintln!(
+                    log::info!(
                         "[grim-engine] req {id} radix hit: {}/{} tokens with semantic recurrent checkpoint #{}",
                         matched_tokens,
                         full_input.len(),
                         cp.id
                     );
                 } else {
-                    eprintln!(
+                    log::info!(
                         "[grim-engine] req {id} radix hit: {}/{} tokens",
                         matched_tokens,
                         full_input.len()
@@ -1618,7 +1632,7 @@ impl Engine {
                                                 k_slice,
                                                 v_slice,
                                             ) {
-                                                eprintln!(
+                                                log::warn!(
                                                     "[grim-engine] Disagg prefill KV transfer failed for req {id}, layer {layer}, block {b_id}: {e}"
                                                 );
                                             } else {
@@ -1708,7 +1722,7 @@ impl Engine {
                                 // received (write_keys auto-marks on layer 0), or that
                                 // block would attend stale pages forever.
                                 fetch_ok = false;
-                                eprintln!(
+                                log::warn!(
                                     "[grim-engine] Disagg decode KV fetch failed for req {id}, layer {layer}, block {block_id}: {e}"
                                 );
                             }
@@ -1864,9 +1878,10 @@ impl Engine {
                 ) {
                     ScytheAdmission::Pin(rank) => {
                         self.scythe_pin.insert(request.id, rank);
-                        eprintln!(
+                        log::info!(
                             "[scythe2] request {} ({} tok) pinned to farm rank {rank}",
-                            request.id, request.prompt_tokens
+                            request.id,
+                            request.prompt_tokens
                         );
                         pin_rank = Some(rank);
                     }
@@ -1874,7 +1889,7 @@ impl Engine {
                         // Hold the request out of the scheduler entirely: no
                         // session, no pin, no admission — a rank must be able
                         // to hold it before it enters the queue.
-                        eprintln!(
+                        log::info!(
                             "[scythe2] request {} parked on VRAM waitlist (WI-SB2)",
                             request.id
                         );
@@ -1988,14 +2003,14 @@ impl Engine {
             match decision {
                 ScytheAdmission::Pin(rank) => {
                     self.scythe_pin.insert(id, rank);
-                    eprintln!("[scythe2] waitlisted request {id} admitted on farm rank {rank}");
+                    log::info!("[scythe2] waitlisted request {id} admitted on farm rank {rank}");
                     if let Err(e) = self.admit_placed_request(request, Some(rank)) {
-                        eprintln!("[scythe2] waitlisted request {id} failed to admit: {e}");
+                        log::warn!("[scythe2] waitlisted request {id} failed to admit: {e}");
                     }
                 }
                 ScytheAdmission::Bypass => {
                     if let Err(e) = self.admit_placed_request(request, None) {
-                        eprintln!("[scythe2] waitlisted request {id} failed to admit: {e}");
+                        log::warn!("[scythe2] waitlisted request {id} failed to admit: {e}");
                     }
                 }
                 ScytheAdmission::WaitVram => self.scythe_vram_waitlist.push(request),

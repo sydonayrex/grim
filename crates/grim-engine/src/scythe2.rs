@@ -538,7 +538,7 @@ impl C2plrController {
     /// Must be called from the ROCm device-lost path *before* the next
     /// `decide()` so that no cached placement dispatches to the gone GPU.
     pub fn on_gpu_leave(&mut self, ordinal: usize) {
-        eprintln!("[scythe2] GPU {ordinal} left — clearing PlacementCache (mode-B safety)");
+        log::info!("[scythe2] GPU {ordinal} left — clearing PlacementCache (mode-B safety)");
         self.cache.on_gpu_leave();
     }
 
@@ -1436,7 +1436,7 @@ impl ScytheRingExec {
         // resident wave (the exact hang observed 2026-08-24).
         let t0 = std::time::Instant::now();
         if diag {
-            eprintln!("[cc-diag] enter to_dev={to_device}");
+            log::info!("[cc-diag] enter to_dev={to_device}");
         }
         // Direction matters: to_device writes dev<-cell; from_device reads
         // dev->cell (the pinned cell is a legal D2H destination).
@@ -1449,7 +1449,7 @@ impl ScytheRingExec {
             grim_backend_rocm::hipMemcpyAsync(dst, src, 4, kind, self.control_stream_ptr())
         };
         if diag {
-            eprintln!("[cc-diag] async rc={rc} t={}us", t0.elapsed().as_micros());
+            log::info!("[cc-diag] async rc={rc} t={}us", t0.elapsed().as_micros());
         }
         if rc == 0 {
             let rs = grim_backend_rocm::hip_stream_synchronize(self.control_stream_ptr());
@@ -1523,7 +1523,7 @@ impl ScytheRingExec {
         weight_ptr: u64,
         output_ptr: u64,
     ) -> grim_backend_rocm::Result<()> {
-        eprintln!("[diag] submit_norm enter");
+        log::info!("[diag] submit_norm enter");
         if self.ring.is_full() {
             return Err(grim_backend_rocm::Error::Backend(
                 "ScytheRingExec: ring full".into(),
