@@ -11,9 +11,11 @@ use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 pub mod configs;
+pub mod mamba2;
 pub mod rwkv;
 
 pub use configs::*;
+pub use mamba2::{Mamba2, Mamba2Block, Mamba2State};
 pub use rwkv::{Rwkv, RwkvConfig};
 
 #[derive(Debug, Clone)]

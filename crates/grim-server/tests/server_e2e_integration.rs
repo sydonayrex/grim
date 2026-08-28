@@ -330,3 +330,96 @@ async fn test_server_request_control_endpoints() {
         .unwrap();
     assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::NOT_FOUND);
 }
+
+/// T1.3 endpoint-coverage gate: `GET /v1/adapters` lists adapters with a
+/// well-formed response even with none loaded.
+#[tokio::test]
+async fn test_server_adapters_list_endpoint() {
+    let state = create_test_state();
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/adapters")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        val.get("data").map(|d| d.is_array()).unwrap_or(false),
+        "adapters list must return an object list shape: {val}"
+    );
+}
+
+/// T1.3 endpoint-coverage gate: `POST /v1/rerank` without a ranker model
+/// must fail with a clean JSON error (4xx), never a panic/500-with-crash.
+#[tokio::test]
+async fn test_server_rerank_without_ranker_model_is_clean_error() {
+    let state = create_test_state();
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "default",
+        "query": "what is grim",
+        "documents": ["grim is a rust inference engine", "unrelated text"]
+    });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/rerank")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error() || resp.status() == StatusCode::OK,
+        "rerank without a ranker must be a clean 4xx (or documented OK), got {}",
+        resp.status()
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(val.is_object(), "error body must be a JSON object: {val}");
+}
+
+/// T1.3 endpoint-coverage gate: `POST /v1/embeddings` without an encoder
+/// model must fail with a clean JSON error (4xx), never a panic/500-crash.
+#[tokio::test]
+async fn test_server_embeddings_without_encoder_is_clean_error() {
+    let state = create_test_state();
+    let app = build_router(state);
+
+    let body = json!({ "model": "default", "input": "hello world" });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error() || resp.status() == StatusCode::NOT_IMPLEMENTED,
+        "embeddings without an encoder must be a clean 4xx/501, got {}",
+        resp.status()
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(val.is_object(), "error body must be a JSON object: {val}");
+}

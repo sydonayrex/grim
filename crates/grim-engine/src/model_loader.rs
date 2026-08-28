@@ -469,6 +469,68 @@ fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNPa
     })
 }
 
+/// Effective RoPE theta for a checkpoint whose HF `rope_scaling` block uses a
+/// non-YaRN method (`linear`, `llama3`, `longrope`, `dynamic`). These methods
+/// previously fell through `parse_yarn_scaling` as "plain RoPE" — silently
+/// loading a scaled checkpoint with its unscaled native theta and corrupting
+/// long-context positions. YaRN keeps the native theta here (full
+/// NTK-by-parts + magnitude correction ride on `YaRNParams`); absence keeps
+/// the native theta.
+pub fn effective_rope_theta(
+    rope_scaling: &Option<serde_json::Value>,
+    theta: f32,
+    head_dim: usize,
+) -> f32 {
+    use crate::rope_scaling::{RopeScalingMethod, scaling_base};
+    let Some(rs) = rope_scaling.as_ref() else {
+        return theta;
+    };
+    let rope_type = rs
+        .get("rope_type")
+        .or_else(|| rs.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let factor = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let method = match rope_type.as_str() {
+        "linear" => RopeScalingMethod::Linear { factor },
+        "llama3" => RopeScalingMethod::Llama3 { factor },
+        "longrope" => RopeScalingMethod::LongRoPE { factor },
+        "dynamic" => RopeScalingMethod::Dynamic {
+            type_: rope_type.clone(),
+        },
+        "yarn" | "" => return theta,
+        other => {
+            eprintln!(
+                "[grim] unknown rope_scaling.rope_type '{other}' — loading with native theta"
+            );
+            return theta;
+        }
+    };
+    scaling_base(&method, theta, head_dim)
+}
+
+/// GGUF variant of [`effective_rope_theta`]: reads the dotted metadata keys
+/// (`rope_scaling.rope_type`, `rope_scaling.factor`) that llama.cpp-style
+/// converters write, mirroring `parse_yarn_scaling_gguf`.
+pub fn effective_rope_theta_gguf(lookup: &dyn MetadataLookup, theta: f32, head_dim: usize) -> f32 {
+    for key in ["rope_scaling", "rope.scaling"] {
+        if let Some(json_str) = lookup.get_str(key) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                return effective_rope_theta(&Some(value), theta, head_dim);
+            }
+        }
+    }
+    let rope_type = lookup
+        .get_str("rope_scaling.rope_type")
+        .or_else(|| lookup.get_str("rope_scaling.type"));
+    let Some(rope_type) = rope_type else {
+        return theta;
+    };
+    let block = serde_json::json!({ "rope_type": rope_type, "factor": lookup.get_f32("rope_scaling.factor").unwrap_or(1.0) });
+    effective_rope_theta(&Some(block), theta, head_dim)
+}
+
 /// Parse YaRN params from a HuggingFace-standard `rope_scaling` block
 /// `{rope_type: "yarn", factor, original_max_position_embeddings, beta_fast,
 /// beta_slow, attention_factor}`. Used by Qwen3.5-MoE and other HF-exported
@@ -648,6 +710,9 @@ fn load_model_from_config(
         .as_ref()
         .map(|s| s.rope_theta)
         .unwrap_or(rope_theta);
+    // Non-YaRN rope scaling (linear/llama3/longrope) folds into an effective
+    // theta at load; YaRN rides the YaRNParams path with the native theta.
+    let rope_theta = effective_rope_theta(&config.rope_scaling, rope_theta, head_dim);
     let max_seq_len = compat_spec
         .as_ref()
         .map(|s| s.max_seq_len)
@@ -2146,7 +2211,10 @@ fn load_model_with_providers(
             model_arch = ModelArchitecture::SmolLm2;
         }
     }
-    let hparams = HyperparameterExtractor::extract(model_arch, &lookup);
+    let mut hparams = HyperparameterExtractor::extract(model_arch, &lookup);
+    // Non-YaRN rope scaling folds into an effective theta (see
+    // `effective_rope_theta`); YaRN rides `parse_yarn_scaling_gguf` unchanged.
+    hparams.rope_theta = effective_rope_theta_gguf(&lookup, hparams.rope_theta, hparams.head_dim);
 
     eprintln!(
         "[grim] Loading config: architecture={:?}, layers={}, hidden={}, vocab={}",
@@ -4269,6 +4337,47 @@ mod tests {
             );
         }
         assert!(parse_yarn_scaling(&None).is_none());
+    }
+
+    /// T2.5: non-YaRN scaling methods fold into an EFFECTIVE theta at load —
+    /// previously `linear`/`llama3`/`longrope` blocks fell through
+    /// `parse_yarn_scaling` as "plain RoPE" and a scaled checkpoint loaded
+    /// with its unscaled native theta, corrupting long-context positions.
+    #[test]
+    fn effective_rope_theta_scales_non_yarn_methods() {
+        let block = |rt: &str, factor: f64| -> serde_json::Value {
+            serde_json::json!({ "rope_type": rt, "factor": factor })
+        };
+        // linear: base * factor^(1/head_dim) — interpolates frequencies.
+        let linear = effective_rope_theta(&Some(block("linear", 4.0)), 10000.0, 128);
+        let expected = 10000.0 * 4.0f32.powf(1.0 / 128.0);
+        assert!((linear - expected).abs() < 1e-3, "{linear} vs {expected}");
+        assert!(linear > 10000.0);
+
+        // llama3: effective base = base * factor.
+        let llama3 = effective_rope_theta(&Some(block("llama3", 8.0)), 10000.0, 128);
+        assert!((llama3 - 80000.0).abs() < 1e-3);
+
+        // longrope: NTK-aware exponent dim/(dim-2) grows faster than linear.
+        let ntk = effective_rope_theta(&Some(block("longrope", 2.0)), 10000.0, 128);
+        assert!(ntk > linear, "NTK-aware must exceed linear interpolation");
+
+        // factor absent → 1.0 ⇒ theta unchanged.
+        let no_factor: serde_json::Value = serde_json::json!({ "rope_type": "linear" });
+        assert!((effective_rope_theta(&Some(no_factor), 10000.0, 128) - 10000.0).abs() < 1e-4);
+    }
+
+    /// YaRN blocks and absence keep the NATIVE theta — YaRN's full NTK-by-parts
+    /// + magnitude correction ride `YaRNParams`, not the scalar base.
+    #[test]
+    fn effective_rope_theta_preserves_theta_for_yarn_and_absence() {
+        let yarn = serde_json::json!({ "rope_type": "yarn", "factor": 4.0 });
+        assert!((effective_rope_theta(&Some(yarn), 500000.0, 128) - 500000.0).abs() < 1e-4);
+        assert!((effective_rope_theta(&None, 500000.0, 128) - 500000.0).abs() < 1e-4);
+        // `type` alias (some exports use `type` instead of `rope_type`).
+        let alias = serde_json::json!({ "type": "linear", "factor": 4.0 });
+        let via_alias = effective_rope_theta(&Some(alias), 10000.0, 128);
+        assert!(via_alias > 10000.0, "type-alias block must still scale");
     }
 
     /// A yarn block missing optional sub-fields must still parse, applying the

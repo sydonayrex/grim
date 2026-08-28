@@ -75,6 +75,8 @@ fn make_config(
         max_messages_per_request: 200,
         disagg_router,
         disagg_config,
+        disagg_orchestrator: None,
+        disagg_heartbeat_timeout_ms: 5000,
     }
 }
 

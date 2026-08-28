@@ -5,8 +5,52 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use grim_core::error::{Error, Result};
-use grim_kvtransport::NetworkKvClient;
+use grim_kvtransport::{NetworkKvClient, PromptChannel};
 use grim_memory::KvBlockPool;
+
+/// Bounded exponential-backoff retry policy for cross-node KV transfers.
+///
+/// Transfers are one-shot TCP; a node that is briefly busy (receiver thread
+/// saturated, restart in progress) previously failed the whole handoff on the
+/// first refused connection. Transient connection-level failures are retried
+/// with exponential backoff; protocol-level failures (checksum, "not
+/// available", bad address) fail fast — retrying those can never succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total attempts including the first (default 3).
+    pub max_attempts: u32,
+    /// Backoff before the second attempt, in ms (default 50).
+    pub initial_backoff_ms: u64,
+    /// Backoff ceiling, in ms (default 800).
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 800,
+        }
+    }
+}
+
+/// Whether a transfer error is worth retrying: connection-level failures
+/// only. Server-authored answers ("not available"), protocol mismatches,
+/// checksum errors, and caller bugs (empty payload, bad address) are final.
+fn is_transient_transfer_error(e: &Error) -> bool {
+    let msg = e.to_string();
+    // io::Error display strings for connect/read/write failures:
+    // "Connection refused (os error 111)", "Connection reset by peer",
+    // "timed out", plus the crate's own "connection failed"/"read error"
+    // wrappers around them.
+    msg.contains("connection failed")
+        || msg.contains("Connection refused")
+        || msg.contains("reset by peer")
+        || msg.contains("timed out")
+        || msg.contains("read error")
+        || msg.contains("write error")
+}
 
 // ── ReMP KV migration types (WI-8) ────────────────────────────────────────────
 
@@ -116,6 +160,7 @@ impl Default for DisaggConfig {
 pub struct LayerPipelinedKvStreamer {
     decode_node_addr: String,
     kv_client: NetworkKvClient,
+    retry: RetryPolicy,
 }
 
 impl LayerPipelinedKvStreamer {
@@ -123,10 +168,12 @@ impl LayerPipelinedKvStreamer {
         Self {
             decode_node_addr: decode_node_addr.clone(),
             kv_client: NetworkKvClient::new(decode_node_addr),
+            retry: RetryPolicy::default(),
         }
     }
 
     /// Stream a single layer's KV block slice asynchronously across the wire.
+    /// Transient connection failures retry per the default [`RetryPolicy`].
     pub fn stream_layer_block(
         &self,
         block_id: usize,
@@ -134,8 +181,28 @@ impl LayerPipelinedKvStreamer {
         k: &[f32],
         v: &[f32],
     ) -> Result<()> {
-        self.kv_client
-            .send_block_remote(block_id, layer_idx, k, v, &self.decode_node_addr)
+        let mut attempt: u32 = 1;
+        let mut backoff_ms = self.retry.initial_backoff_ms;
+        loop {
+            match self.kv_client.send_block_remote(
+                block_id,
+                layer_idx,
+                k,
+                v,
+                &self.decode_node_addr,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt >= self.retry.max_attempts.max(1) || !is_transient_transfer_error(&e)
+                    {
+                        return Err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms.saturating_mul(2)).min(self.retry.max_backoff_ms);
+                    attempt += 1;
+                }
+            }
+        }
     }
 }
 
@@ -238,7 +305,7 @@ pub struct DisaggRouter {
     pub decode_node_addr: String,
     pub pool_role: PoolRole,
     kv_client: NetworkKvClient,
-    use_rdma: bool,
+    retry: RetryPolicy,
     /// Reference to the engine's KvBlockPool for real KV extraction.
     /// When `None`, methods that require real KV data return an error.
     pub pool: Option<Arc<Mutex<KvBlockPool>>>,
@@ -251,8 +318,7 @@ impl DisaggRouter {
             decode_node_addr: decode_node_addr.to_string(),
             pool_role,
             kv_client: NetworkKvClient::new(prefill_node_addr.to_string()),
-            // Use TCP by default; enable RDMA fallback with enable_rdma().
-            use_rdma: false,
+            retry: RetryPolicy::default(),
             pool: None,
         }
     }
@@ -265,9 +331,38 @@ impl DisaggRouter {
         self
     }
 
-    /// Enable or disable RDMA network transport.
-    pub fn enable_rdma(&mut self, enabled: bool) {
-        self.use_rdma = enabled;
+    /// Override the transfer retry policy (default: 3 attempts, 50 ms→800 ms
+    /// exponential backoff on transient connection failures).
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Run `f` with the router's bounded exponential-backoff retry. Only
+    /// transient connection-level failures retry; everything else fails on
+    /// the first attempt.
+    fn retrying<T>(&self, op: &str, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+        let mut attempt: u32 = 1;
+        let mut backoff_ms = self.retry.initial_backoff_ms;
+        loop {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if attempt >= self.retry.max_attempts.max(1) || !is_transient_transfer_error(&e)
+                    {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "[grim-disagg] {op}: transient failure (attempt {attempt}/{}), \
+                         retrying in {backoff_ms}ms: {e}",
+                        self.retry.max_attempts
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms.saturating_mul(2)).min(self.retry.max_backoff_ms);
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// Transfer real KV blocks extracted from a physical KvBlockPool to the
@@ -295,13 +390,15 @@ impl DisaggRouter {
                     pool.read_layer_values(b_id, layer),
                 ) {
                     if !k_data.is_empty() && !v_data.is_empty() {
-                        self.kv_client.send_block_remote(
-                            b_id,
-                            layer as u32,
-                            k_data,
-                            v_data,
-                            &self.decode_node_addr,
-                        )?;
+                        self.retrying("transfer_kv_cache_real", || {
+                            self.kv_client.send_block_remote(
+                                b_id,
+                                layer as u32,
+                                k_data,
+                                v_data,
+                                &self.decode_node_addr,
+                            )
+                        })?;
                     }
                 }
             }
@@ -357,13 +454,15 @@ impl DisaggRouter {
         for layer in 0..num_layers {
             for &b_id in block_ids {
                 if let Some((k_slice, v_slice)) = cache.layer_block_slice(layer, b_id) {
-                    self.kv_client.send_block_remote(
-                        b_id,
-                        layer as u32,
-                        k_slice,
-                        v_slice,
-                        &self.decode_node_addr,
-                    )?;
+                    self.retrying("transfer_paged_cache_real", || {
+                        self.kv_client.send_block_remote(
+                            b_id,
+                            layer as u32,
+                            k_slice,
+                            v_slice,
+                            &self.decode_node_addr,
+                        )
+                    })?;
                 }
             }
         }
@@ -378,7 +477,7 @@ impl DisaggRouter {
     /// requests' KV cache over the wire.
     fn extract_and_send_prefill(
         &self,
-        _request_id: u64,
+        request_id: u64,
         tokens: &[u32],
         block_ids: &[usize],
     ) -> Result<()> {
@@ -394,26 +493,25 @@ impl DisaggRouter {
         for &block_id in block_ids {
             let k_data = guard.read_keys(block_id);
             let v_data = guard.read_values(block_id);
-            self.kv_client.send_block_remote(
-                block_id,
-                0,
-                k_data,
-                v_data,
-                &self.prefill_node_addr,
-            )?;
+            self.retrying("extract_and_send_prefill", || {
+                self.kv_client.send_block_remote(
+                    block_id,
+                    0,
+                    k_data,
+                    v_data,
+                    &self.prefill_node_addr,
+                )
+            })?;
         }
-        // Also forward the prompt token IDs as a meta-block so the prefill
-        // node knows which tokens to decode next.
-        let k_buf = tokens.iter().map(|&t| t as f32).collect::<Vec<_>>();
-        let v_buf = vec![0.0f32; tokens.len()];
-        self.kv_client.send_block_remote(
-            guard.num_blocks(),
-            0,
-            &k_buf,
-            &v_buf,
-            &self.prefill_node_addr,
-        )?;
-        Ok(())
+        // Forward the prompt token IDs over the real control channel
+        // (PROMPT_FLAG protocol message stored in the receiver's
+        // PromptChannel). The previous mechanism smuggled them through as a
+        // fake KV "meta-block" at id = pool.num_blocks() that no receiver
+        // ever decoded.
+        self.retrying("extract_and_send_prefill(prompt)", || {
+            self.kv_client
+                .send_prompt_tokens(request_id, tokens, &self.prefill_node_addr)
+        })
     }
 
     /// Extract real KV blocks for `block_ids` from the stored pool and send
@@ -433,28 +531,46 @@ impl DisaggRouter {
         for &block_id in block_ids {
             let k_data = guard.read_keys(block_id);
             let v_data = guard.read_values(block_id);
-            self.kv_client.send_block_remote(
-                block_id,
-                0,
-                k_data,
-                v_data,
-                &self.decode_node_addr,
-            )?;
+            self.retrying("extract_and_send_decode", || {
+                self.kv_client.send_block_remote(
+                    block_id,
+                    0,
+                    k_data,
+                    v_data,
+                    &self.decode_node_addr,
+                )
+            })?;
         }
         Ok(())
     }
 
     /// Fetch a single KV block from the prefill node (decode → prefill pull).
-    /// Returns the raw key/value float slices.  Errors on connection failure
-    /// — never fabricates data.
+    /// Returns the raw key/value float slices. Transient connection failures
+    /// retry per the router's [`RetryPolicy`]; a server "not available"
+    /// answer is final. Errors otherwise — never fabricates data.
     pub fn fetch_kv_block(
         &self,
         block_id: usize,
         layer_idx: u32,
         block_elems: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        self.kv_client
-            .fetch_block_remote(block_id, layer_idx, &self.prefill_node_addr, block_elems)
+        self.retrying("fetch_kv_block", || {
+            self.kv_client.fetch_block_remote(
+                block_id,
+                layer_idx,
+                &self.prefill_node_addr,
+                block_elems,
+            )
+        })
+    }
+
+    /// Send a prompt-token control message to the prefill node (push model,
+    /// retry-backed). The receiver stores it in its `PromptChannel`.
+    pub fn send_prompt_tokens(&self, request_id: u64, tokens: &[u32]) -> Result<()> {
+        self.retrying("send_prompt_tokens", || {
+            self.kv_client
+                .send_prompt_tokens(request_id, tokens, &self.prefill_node_addr)
+        })
     }
 
     /// Dispatches a single layer's KV block key/value slice to the decode node address.
@@ -465,8 +581,10 @@ impl DisaggRouter {
         k: &[f32],
         v: &[f32],
     ) -> Result<()> {
-        self.kv_client
-            .send_block_remote(block_id, layer_idx, k, v, &self.decode_node_addr)
+        self.retrying("send_layer_block_remote", || {
+            self.kv_client
+                .send_block_remote(block_id, layer_idx, k, v, &self.decode_node_addr)
+        })
     }
 }
 
@@ -547,17 +665,28 @@ impl DisaggRouter {
 pub struct KvReceiverServer {
     listen_addr: String,
     pool: Arc<Mutex<KvBlockPool>>,
+    /// Store for prompt-token control messages arriving over the wire
+    /// (`NetworkKvClient::send_prompt_tokens` → `PROMPT_FLAG` protocol).
+    prompts: PromptChannel,
     #[allow(dead_code)]
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl KvReceiverServer {
     /// Start a KV receiver server on `listen_addr` that writes into `pool`.
+    /// Prompt-token control messages are collected in an internal
+    /// [`PromptChannel`] — read them via [`KvReceiverServer::prompt_channel`].
     pub fn new(listen_addr: &str, pool: Arc<Mutex<KvBlockPool>>) -> Result<Self> {
-        let handle = grim_kvtransport::start_kv_receiver_server(listen_addr, pool.clone())?;
+        let prompts = PromptChannel::new();
+        let handle = grim_kvtransport::start_kv_receiver_server_with_prompts(
+            listen_addr,
+            pool.clone(),
+            prompts.clone(),
+        )?;
         Ok(Self {
             listen_addr: listen_addr.to_string(),
             pool,
+            prompts,
             handle: Some(handle),
         })
     }
@@ -568,6 +697,12 @@ impl KvReceiverServer {
 
     pub fn pool(&self) -> &Arc<Mutex<KvBlockPool>> {
         &self.pool
+    }
+
+    /// Consume prompt tokens received for `request_id` over the control
+    /// channel. `None` when no prompt message has arrived (yet).
+    pub fn take_prompt_tokens(&self, request_id: u64) -> Option<Vec<u32>> {
+        self.prompts.take(request_id)
     }
 }
 
@@ -633,14 +768,115 @@ mod tests {
         );
     }
 
+    /// Retry policy: transient connection failures retry with backoff and
+    /// eventually succeed once the receiver comes up. A listener binds only
+    /// after a delay, so the first attempts are refused; with enough attempts
+    /// the transfer lands and the data round-trips.
     #[test]
-    fn test_rdma_toggle() {
-        let mut router = DisaggRouter::new("127.0.0.1:0", "127.0.0.1:0", PoolRole::Prefill);
-        assert!(!router.use_rdma);
-        router.enable_rdma(true);
-        assert!(router.use_rdma);
-        router.enable_rdma(false);
-        assert!(!router.use_rdma);
+    fn test_retry_recovers_from_refused_connection() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        // Destination pool + receiver that only starts after a delay —
+        // early attempts hit "Connection refused".
+        let dest_pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
+        let late_addr = addr.clone();
+        let late_pool = dest_pool.clone();
+        let listener_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            crate::KvReceiverServer::new(&late_addr, late_pool).unwrap()
+        });
+
+        // Source pool with one known block.
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        let k_data: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        let v_data: Vec<f32> = (0..128).map(|i| -i as f32).collect();
+        pool.write_keys(0, &k_data, 16);
+        pool.write_values(0, &v_data);
+        let shared_pool = Arc::new(Mutex::new(pool));
+
+        // Generous retry budget so the delayed listener is reached.
+        let router = DisaggRouter::new(&addr, &addr, PoolRole::Prefill)
+            .with_retry_policy(RetryPolicy {
+                max_attempts: 40,
+                initial_backoff_ms: 20,
+                max_backoff_ms: 100,
+            })
+            .with_pool(shared_pool.clone());
+
+        router
+            .transfer_kv_cache_real(1, &[0], &shared_pool.lock().unwrap())
+            .expect("transfer must succeed after retries");
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let dest_guard = dest_pool.lock().unwrap();
+        assert_eq!(
+            &dest_guard.read_keys(0)[..k_data.len()],
+            &k_data[..],
+            "data must round-trip once the receiver is up"
+        );
+        listener_thread.join().unwrap();
+    }
+
+    /// A server-authored "not available" answer is final: the fetch must
+    /// fail fast (one attempt), not burn the full retry budget.
+    #[test]
+    fn test_fetch_not_available_fails_fast_without_retry() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let _receiver =
+            crate::KvReceiverServer::new(&addr, Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4))))
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // max_attempts huge + huge backoff: if the router retried "not
+        // available" the test would take ≥1.5s. Fail-fast finishes in ms.
+        let router =
+            DisaggRouter::new(&addr, &addr, PoolRole::Decode).with_retry_policy(RetryPolicy {
+                max_attempts: 100,
+                initial_backoff_ms: 500,
+                max_backoff_ms: 1_000,
+            });
+        let start = std::time::Instant::now();
+        let res = router.fetch_kv_block(3, 0, 128);
+        let elapsed = start.elapsed();
+        let err = res.expect_err("unwritten block must error");
+        assert!(err.to_string().contains("not available"), "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "'not available' must not be retried (took {elapsed:?})"
+        );
+    }
+
+    /// Real control channel: prompt tokens ride the PROMPT_FLAG protocol
+    /// message and are consumable at the receiver via `take_prompt_tokens`.
+    #[test]
+    fn test_prompt_control_channel_roundtrip() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let receiver =
+            crate::KvReceiverServer::new(&addr, Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4))))
+                .unwrap();
+
+        let sender = DisaggRouter::new(&addr, &addr, PoolRole::Prefill);
+        sender
+            .send_prompt_tokens(77, &[11, 22, 33, 44])
+            .expect("prompt control send must succeed");
+
+        // Receiver thread commits asynchronously; poll the channel.
+        let mut got = None;
+        for _ in 0..50 {
+            if let Some(t) = receiver.take_prompt_tokens(77) {
+                got = Some(t);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(got, Some(vec![11, 22, 33, 44]));
+        assert!(
+            receiver.take_prompt_tokens(77).is_none(),
+            "take must consume the prompt"
+        );
     }
 
     #[test]
