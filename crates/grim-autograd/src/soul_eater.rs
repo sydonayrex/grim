@@ -29,6 +29,9 @@ pub struct SoulEaterAdapter {
     pub rank: usize,
 }
 
+/// SICKLE alias for legacy SOUL EATER adapter.
+pub type SickleAdapter = SoulEaterAdapter;
+
 impl SoulEaterAdapter {
     /// Instantiate a new SOUL EATER adapter for linear layer dimensions [d_out, d_in] and rank `r`.
     pub fn new(d_out: usize, d_in: usize, r: usize, alpha: f32) -> Result<Self> {
@@ -259,6 +262,9 @@ pub struct SoulEaterOptimizer {
     /// SCYTHE1: diagonal damping ε added to FIM before inversion.
     pub fim_damping: f32,
 }
+
+/// SICKLE alias for legacy SOUL EATER optimizer.
+pub type SickleOptimizer = SoulEaterOptimizer;
 
 impl SoulEaterOptimizer {
     pub fn new(lr_basis: f32, lr_sigma: f32, beta: f32) -> Self {

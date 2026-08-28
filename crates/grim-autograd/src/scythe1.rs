@@ -15,6 +15,11 @@ use grim_tensor::{Result, Tensor};
 
 use crate::soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
 
+pub use crate::soul_eater::{
+    SickleAdapter, SickleAdapter as Scythe1AdapterAlias, SickleOptimizer,
+    SickleOptimizer as Scythe1OptimizerAlias,
+};
+
 const FIM_BETA: f32 = 0.99;
 const FIM_EPS: f32 = 1e-8;
 
