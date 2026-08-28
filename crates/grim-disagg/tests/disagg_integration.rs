@@ -275,8 +275,8 @@ fn test_disagg_p2p_direct_transfer() {
     let mut src_pool = KvBlockPool::new(4, 2, 4);
     let mut dst_pool = KvBlockPool::new(4, 2, 4);
 
-    let k_data = vec![3.14f32; 32];
-    let v_data = vec![2.71f32; 32];
+    let k_data = vec![3.5f32; 32];
+    let v_data = vec![2.5f32; 32];
     src_pool.write_layer_keys(0, 0, &k_data, 4);
     src_pool.write_layer_values(0, 0, &v_data);
 

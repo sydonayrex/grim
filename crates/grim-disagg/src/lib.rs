@@ -181,17 +181,19 @@ impl DisaggOrchestrator {
 
     /// Check health against a timeout window; fails over to colocated fallback if dead.
     pub fn evaluate_failover(&mut self, now_ms: u64, timeout_ms: u64) -> PoolRole {
-        if self.config.role == PoolRole::Decode {
-            if now_ms.saturating_sub(self.last_prefill_heartbeat_ms) > timeout_ms && self.last_prefill_heartbeat_ms > 0 {
-                self.prefill_healthy = false;
-                // Fallback to local colocated execution if prefill remote is unreachable
-                return PoolRole::Colocated;
-            }
-        } else if self.config.role == PoolRole::Prefill {
-            if now_ms.saturating_sub(self.last_decode_heartbeat_ms) > timeout_ms && self.last_decode_heartbeat_ms > 0 {
-                self.decode_healthy = false;
-                return PoolRole::Colocated;
-            }
+        if self.config.role == PoolRole::Decode
+            && now_ms.saturating_sub(self.last_prefill_heartbeat_ms) > timeout_ms
+            && self.last_prefill_heartbeat_ms > 0
+        {
+            self.prefill_healthy = false;
+            // Fallback to local colocated execution if prefill remote is unreachable
+            return PoolRole::Colocated;
+        } else if self.config.role == PoolRole::Prefill
+            && now_ms.saturating_sub(self.last_decode_heartbeat_ms) > timeout_ms
+            && self.last_decode_heartbeat_ms > 0
+        {
+            self.decode_healthy = false;
+            return PoolRole::Colocated;
         }
         self.config.role
     }

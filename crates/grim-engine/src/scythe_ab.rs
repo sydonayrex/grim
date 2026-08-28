@@ -471,7 +471,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(parse_samples(&jsonl).len(), 8, "unfiltered keeps both campaigns");
+        assert_eq!(
+            parse_samples(&jsonl).len(),
+            8,
+            "unfiltered keeps both campaigns"
+        );
         let fresh = parse_samples_since(&jsonl, 1_700_400);
         assert_eq!(fresh.len(), 4, "cutoff keeps only the current campaign");
         assert!(fresh.iter().all(|m| m.arm_on), "stale off-arm rows dropped");
@@ -481,7 +485,11 @@ mod tests {
         let legacy = r#"{"wi":"SB3","order":"F-first","metric":"ttft_ms","value":1.0,"commit":"old","arm":"on","prompt_tokens":10}"#;
         let mixed = format!("{legacy}\n{jsonl}");
         assert_eq!(parse_samples_since(&mixed, 1).len(), 8);
-        assert_eq!(parse_samples(&mixed).len(), 9, "unfiltered keeps legacy rows");
+        assert_eq!(
+            parse_samples(&mixed).len(),
+            9,
+            "unfiltered keeps legacy rows"
+        );
     }
 
     /// The WI-INF4 gate is per ordinal order: the 2026-08-23c campaign
@@ -517,8 +525,14 @@ mod tests {
         off.extend(mk_arm(false, "S-first", 10.0));
 
         let report = format_ab_report(&on, &off);
-        assert!(report.contains("[F-first]") && report.contains("PASS"), "{report}");
-        assert!(report.contains("[S-first]") && report.contains("FAIL"), "{report}");
+        assert!(
+            report.contains("[F-first]") && report.contains("PASS"),
+            "{report}"
+        );
+        assert!(
+            report.contains("[S-first]") && report.contains("FAIL"),
+            "{report}"
+        );
         // Pooled verdict still present alongside.
         assert!(report.contains("WI-INF4 verdict"), "{report}");
     }

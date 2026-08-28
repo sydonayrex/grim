@@ -1019,7 +1019,10 @@ mod tests {
         sched.waiting.clear();
         let out = sched.schedule();
         assert!(sched.swapped.is_empty());
-        assert!(out.decode_ids.contains(&9), "swap-in decodes after re-entry");
+        assert!(
+            out.decode_ids.contains(&9),
+            "swap-in decodes after re-entry"
+        );
     }
 
     /// `admitted_requests` is a real cumulative counter, not a hardcoded 0:
