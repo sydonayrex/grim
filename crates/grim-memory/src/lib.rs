@@ -39,6 +39,16 @@ pub use hidden_state_store::{
     HiddenStateChunk, HiddenStateKey, HiddenStateStore, SharedHiddenStateStore,
 };
 
+/// Multimodal vision and audio dense embedding cache.
+pub mod encoder_cache;
+
+pub use encoder_cache::{EncoderCache, EncoderEmbedding, EncoderKey, SharedEncoderCache};
+
+/// Heterogeneous KV layer grouping and layout metadata.
+pub mod layer_groups;
+
+pub use layer_groups::{LayerGroupIdentity, LayerGroupRegistry};
+
 pub const BLOCK_SIZE: usize = 16;
 
 pub type BlockId = usize;

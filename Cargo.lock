@@ -2369,6 +2369,7 @@ dependencies = [
  "grim-scheduler",
  "grim-speculative",
  "grim-tensor",
+ "log",
  "serde",
  "serde_json",
  "tempfile",

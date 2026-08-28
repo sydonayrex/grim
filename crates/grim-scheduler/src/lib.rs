@@ -1,13 +1,46 @@
 //! Continuous-batching request scheduler, chunked prefill tracking, and latency-aware admission control.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use grim_core::DeterminismMode;
 
 pub mod self_tuning;
 pub use self_tuning::{SelfTuningController, TunableKnob};
+
+/// Real KV-memory pressure source (§5.2): reports current KV pool occupancy
+/// in `[0.0, 1.0]`. The engine wires this to the live `KvBlockPool`; tests
+/// supply synthetic values. `None` on the scheduler keeps the legacy
+/// token-arithmetic-only pressure signal.
+pub trait KvPressureSource: Send + Sync {
+    fn kv_occupancy(&self) -> f32;
+}
+
+/// Adapts a shared KV block pool into a [`KvPressureSource`] via an occupancy
+/// closure (e.g. `used_count() / capacity()` over the pool guard). Defined
+/// over a closure so the scheduler keeps no grim-memory dependency.
+pub struct PoolKvPressure {
+    occupancy: Box<dyn Fn() -> f32 + Send + Sync>,
+}
+
+impl PoolKvPressure {
+    pub fn new(f: impl Fn() -> f32 + Send + Sync + 'static) -> Self {
+        Self {
+            occupancy: Box::new(f),
+        }
+    }
+}
+
+impl KvPressureSource for PoolKvPressure {
+    fn kv_occupancy(&self) -> f32 {
+        (self.occupancy)().clamp(0.0, 1.0)
+    }
+}
+
+/// KV occupancy above which the scheduler treats memory as under real
+/// pressure regardless of token arithmetic (default 0.9).
+pub const KV_PRESSURE_THRESHOLD: f32 = 0.9;
 
 /// A request in the scheduler system.
 #[derive(Debug, Clone, Default)]
@@ -145,6 +178,10 @@ pub struct Scheduler {
     /// once on first admission; a preempted request that is swapped back in
     /// counts again (it is a fresh admission into the batch).
     admitted_total: usize,
+    /// Live KV occupancy source wired by the engine (see
+    /// [`Scheduler::set_kv_pressure`]). `None` = legacy token-arithmetic-only
+    /// pressure.
+    kv_pressure: Option<Arc<dyn KvPressureSource>>,
 }
 
 /// Result of one `schedule()` call — the engine uses this to run the batch.
@@ -203,7 +240,25 @@ impl Scheduler {
             admission,
             determinism_mode: DeterminismMode::Relaxed,
             admitted_total: 0,
+            kv_pressure: None,
         }
+    }
+
+    /// Wire a live KV occupancy source (§5.2): when occupancy exceeds
+    /// [`KV_PRESSURE_THRESHOLD`], the scheduler enters memory pressure
+    /// regardless of token arithmetic — preemption and chunked draining
+    /// then react to actual pool exhaustion, not just prompt-token sums.
+    pub fn set_kv_pressure(&mut self, source: Arc<dyn KvPressureSource>) {
+        self.kv_pressure = Some(source);
+    }
+
+    /// Current effective pressure signal: `true` when token arithmetic OR
+    /// wired KV occupancy indicates pressure.
+    fn kv_memory_pressure(&self) -> bool {
+        self.kv_pressure
+            .as_ref()
+            .map(|s| s.kv_occupancy() >= KV_PRESSURE_THRESHOLD)
+            .unwrap_or(false)
     }
 
     pub fn enqueue(&mut self, request: Request) {
@@ -250,7 +305,8 @@ impl Scheduler {
             .sum();
         let pressure_active = backlog.total > self.max_batched_tokens
             || self.waiting.len() > 10
-            || total_running_tokens > self.max_batched_tokens;
+            || total_running_tokens > self.max_batched_tokens
+            || self.kv_memory_pressure();
 
         // Swap-in (§5.2): once pressure lifts, preempted requests re-enter
         // admission from the FRONT of `waiting` (older than new arrivals).
@@ -1087,6 +1143,62 @@ mod tests {
             out.prefill_ids,
             vec![2, 1, 3],
             "priority 5 first; arrival order 1-before-3 within priority 0"
+        );
+    }
+
+    struct FixedKvPressure(f32);
+    impl KvPressureSource for FixedKvPressure {
+        fn kv_occupancy(&self) -> f32 {
+            self.0
+        }
+    }
+
+    /// A wired KV source above [`KV_PRESSURE_THRESHOLD`] puts the scheduler
+    /// under memory pressure even with a small token backlog: chunked
+    /// draining engages. Below the threshold (or unwired), the same request
+    /// prefills in a single pass.
+    #[test]
+    fn test_kv_memory_pressure_drives_scheduling() {
+        // 120-token prompt, chunk 50, huge token budget → token arithmetic
+        // says no pressure; only the KV signal can force chunked draining.
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.chunked_prefill_size = 50;
+        sched.set_kv_pressure(Arc::new(FixedKvPressure(0.95)));
+        sched.enqueue(Request {
+            id: 1,
+            prompt_tokens: 120,
+            ..Default::default()
+        });
+
+        let out = sched.schedule();
+        assert_eq!(out.prefill_ids, vec![1]);
+        let remainder = sched
+            .waiting
+            .iter()
+            .find(|r| r.id == 1)
+            .expect("KV pressure must chunk-drain: remainder stays in waiting");
+        assert_eq!(
+            remainder.consumed_tokens, 50,
+            "first chunk = 50 despite tiny backlog — KV occupancy drives pressure"
+        );
+    }
+
+    #[test]
+    fn test_low_kv_occupancy_keeps_legacy_pressure_only() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.set_kv_pressure(Arc::new(FixedKvPressure(0.1)));
+        sched.enqueue(Request {
+            id: 1,
+            prompt_tokens: 120,
+            ..Default::default()
+        });
+        let out = sched.schedule();
+        assert_eq!(out.prefill_ids, vec![1], "fully prefilled in one pass");
+        assert!(
+            sched.waiting.iter().all(|r| r.id != 1),
+            "no remainder without pressure"
         );
     }
 
