@@ -330,8 +330,13 @@ impl TrainableParams {
                         // alias the same buffer so ncclAllReduce reduces into
                         // the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
-                        // ordinal: extract from device name — BackendDevice doesn't expose ordinal directly
-                        let ordinal = 0usize; // default to rank 0; multi-GPU paths should thread real ordinal
+                        // ordinal: the gradient tensor's owning device. The old
+                        // code hardcoded rank 0 — on a non-zero rank the
+                        // collective would run on the WRONG GPU, silently
+                        // reducing/writing grads on a device that isn't this
+                        // rank's (the same class the scythe context-pinning
+                        // discipline exists to prevent).
+                        let ordinal = param.grad.device().ordinal().unwrap_or(0);
                         rccl_handle.sum_gradients_device(ptr, ptr, count, stream, ordinal)?;
                         // Synchronize after the all-reduce on the default stream —
                         // without this, param.grad may be read before the NCCL

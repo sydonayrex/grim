@@ -318,6 +318,8 @@ pub enum Optimizer {
     Came(crate::came::Came),
     Sophia(crate::sophia::Sophia),
     GaloreAdamW(crate::galore::GaLoreOptimizer),
+    Scythe(crate::scythe::ScytheOptimizer),
+    Sickle(crate::soul_eater::SickleOptimizer),
 }
 
 impl Optimizer {
@@ -425,9 +427,17 @@ impl Optimizer {
                     ..Default::default()
                 },
             ))),
-            OptimizerKind::Scythe | OptimizerKind::Sickle => Err(grim_tensor::Error::Unimplemented(format!(
-                "Optimizer {:?} operates directly on low-rank structural adapters via its dedicated API",
-                kind
+            OptimizerKind::Scythe => Ok(Optimizer::Scythe(crate::scythe::ScytheOptimizer::with_config(
+                crate::scythe::ScytheConfig {
+                    lr_basis: lr,
+                    lr_sigma: lr * 5.0,
+                    beta: 0.9,
+                },
+            ))),
+            OptimizerKind::Sickle => Ok(Optimizer::Sickle(crate::soul_eater::SickleOptimizer::new(
+                lr,
+                lr * 5.0,
+                0.9,
             ))),
         }
     }
@@ -450,6 +460,8 @@ impl Optimizer {
             Optimizer::Came(_) => OptimizerKind::CAME,
             Optimizer::Sophia(_) => OptimizerKind::Sophia,
             Optimizer::GaloreAdamW(_) => OptimizerKind::GaloreAdamW,
+            Optimizer::Scythe(_) => OptimizerKind::Scythe,
+            Optimizer::Sickle(_) => OptimizerKind::Sickle,
         }
     }
 
@@ -471,6 +483,8 @@ impl Optimizer {
             Optimizer::Came(o) => o.config.lr,
             Optimizer::Sophia(o) => o.config.lr,
             Optimizer::GaloreAdamW(o) => o.config.lr,
+            Optimizer::Scythe(s) => s.config.lr_basis,
+            Optimizer::Sickle(s) => s.lr_basis,
         }
     }
 
@@ -512,6 +526,8 @@ impl Optimizer {
             Optimizer::Came(o) => o.step(params),
             Optimizer::Sophia(o) => o.step(params),
             Optimizer::GaloreAdamW(o) => o.step(params),
+            Optimizer::Scythe(s) => s.step(params),
+            Optimizer::Sickle(s) => s.step_params(params),
         }
     }
 
@@ -531,6 +547,8 @@ impl Optimizer {
             Optimizer::Came(o) => o.step_param(id, param),
             Optimizer::Sophia(o) => o.step_param(id, param),
             Optimizer::GaloreAdamW(o) => o.step_param(id, param),
+            Optimizer::Scythe(s) => s.step_param(id, param),
+            Optimizer::Sickle(s) => s.step_param(id, param),
             _ => {
                 let mut temp_params = TrainableParams::new();
                 let param_clone = param.clone();
@@ -562,6 +580,14 @@ impl Optimizer {
             Optimizer::Came(o) => o.config.lr = lr,
             Optimizer::Sophia(o) => o.config.lr = lr,
             Optimizer::GaloreAdamW(o) => o.config.lr = lr,
+            Optimizer::Scythe(s) => {
+                s.config.lr_basis = lr;
+                s.config.lr_sigma = lr * 5.0;
+            }
+            Optimizer::Sickle(s) => {
+                s.lr_basis = lr;
+                s.lr_sigma = lr * 5.0;
+            }
         }
     }
 
@@ -582,6 +608,8 @@ impl Optimizer {
             Optimizer::Came(o) => o.save_to_train_state(params),
             Optimizer::Sophia(o) => o.save_to_train_state(params),
             Optimizer::GaloreAdamW(o) => o.save_to_train_state(params),
+            Optimizer::Scythe(s) => s.save_to_train_state(params),
+            Optimizer::Sickle(s) => s.save_to_train_state(params),
         }
     }
 
@@ -606,6 +634,8 @@ impl Optimizer {
             Optimizer::Came(o) => o.load_from_train_state(params, state),
             Optimizer::Sophia(o) => o.load_from_train_state(params, state),
             Optimizer::GaloreAdamW(o) => o.load_from_train_state(params, state),
+            Optimizer::Scythe(s) => s.load_from_train_state(params, state),
+            Optimizer::Sickle(s) => s.load_from_train_state(params, state),
         }
     }
 }
@@ -3663,5 +3693,50 @@ mod audit_tests {
                 "t=2 position matches the FROZEN t=1 correction — regression"
             );
         }
+    }
+
+    #[test]
+    fn test_optimizer_scythe_and_sickle_dispatch() {
+        use grim_backend_cpu::cpu_tensor;
+        use grim_tensor::Shape;
+
+        let mut params = TrainableParams::new();
+        let pid = ParamId::a(0, 1, crate::injection::LoRAInjectionPoint::QProj);
+        let param = crate::param::TrainableParam::new(
+            pid,
+            cpu_tensor(vec![1.0f32; 4], Shape::new(vec![4])),
+        )
+        .unwrap();
+        params.insert(param);
+
+        // Accumulate grad = [2.0; 4]
+        params
+            .get_mut(pid)
+            .unwrap()
+            .accumulate_grad(&cpu_tensor(vec![2.0f32; 4], Shape::new(vec![4])))
+            .unwrap();
+
+        // 1. Test Scythe step
+        let mut scythe_opt = Optimizer::new(OptimizerKind::Scythe, 0.1).unwrap();
+        scythe_opt.step(&mut params).unwrap();
+        let data = params.get(pid).unwrap().data.to_vec_f32().unwrap();
+        assert!(
+            data[0] < 1.0,
+            "Scythe step should update parameters downward with positive grad"
+        );
+
+        // 2. Test Sickle step
+        params
+            .get_mut(pid)
+            .unwrap()
+            .accumulate_grad(&cpu_tensor(vec![2.0f32; 4], Shape::new(vec![4])))
+            .unwrap();
+        let mut sickle_opt = Optimizer::new(OptimizerKind::Sickle, 0.1).unwrap();
+        sickle_opt.step(&mut params).unwrap();
+        let data2 = params.get(pid).unwrap().data.to_vec_f32().unwrap();
+        assert!(
+            data2[0] < data[0],
+            "Sickle step should further update parameters downward"
+        );
     }
 }

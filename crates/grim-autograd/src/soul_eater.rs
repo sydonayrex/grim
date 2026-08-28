@@ -424,6 +424,76 @@ impl SoulEaterOptimizer {
 
         Ok(())
     }
+
+    /// Step over standard `TrainableParams` registry (generic LoRA training mode).
+    pub fn step_params(&mut self, params: &mut crate::param::TrainableParams) -> Result<()> {
+        for (&id, param) in params.iter_mut() {
+            self.step_param(id, param)?;
+        }
+        Ok(())
+    }
+
+    /// Perform a preconditioned FIM update on a single `TrainableParam`.
+    pub fn step_param(
+        &mut self,
+        id: crate::param::ParamId,
+        param: &mut crate::param::TrainableParam,
+    ) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let g_vec = param.grad().to_vec_f32()?;
+        let mut d_vec = param.data.to_vec_f32()?;
+        let d = d_vec.len();
+
+        let key = format!("{:?}", id);
+        let fim_entry = self
+            .fim_u
+            .entry(key.clone())
+            .or_insert_with(|| vec![self.fim_damping; d]);
+
+        let m_entry = self.m_u.entry(key).or_insert_with(|| vec![0.0f32; d]);
+
+        let decay = self.fim_ema_decay;
+        for i in 0..d {
+            let g = g_vec[i];
+            fim_entry[i] = decay * fim_entry[i] + (1.0 - decay) * (g * g);
+            let damped_fim = fim_entry[i].max(self.fim_damping);
+            let precond_g = g / damped_fim;
+
+            m_entry[i] = self.beta * m_entry[i] + (1.0 - self.beta) * precond_g;
+            d_vec[i] -= self.lr_basis * m_entry[i];
+        }
+
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape().clone();
+        let new_storage = dev.from_cpu(&d_vec, &shape, grim_tensor::DType::F32)?;
+        param.data = grim_tensor::Tensor::new(
+            std::sync::Arc::from(new_storage),
+            shape,
+            grim_tensor::DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        param.zero_grad()?;
+        Ok(())
+    }
+
+    pub fn save_to_train_state(
+        &self,
+        params: &crate::param::TrainableParams,
+    ) -> grim_format::train::TrainState {
+        crate::adamw::save_param_data_only(params, 0)
+    }
+
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut crate::param::TrainableParams,
+        state: &grim_format::train::TrainState,
+    ) -> Result<()> {
+        crate::adamw::load_param_data_only(params, state)
+    }
 }
 
 /// Compute A = M^T @ B where M is [d × r] (row-major flat), B is [d × r], result [r × r].
