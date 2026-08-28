@@ -97,17 +97,41 @@ pub struct StoredMetric {
     pub metric: String,
     pub value: f64,
     pub prompt_tokens: usize,
+    /// Unix-seconds stamp from the §setup-4 line; 0 for legacy rows without
+    /// one. Verdict computations filter on this — see `parse_samples_since`
+    /// and the WI-INF4 measurement-defect note (a cumulative report that
+    /// mixes rows from different campaigns mixes fault-era data into the
+    /// verdict; the ts-filtered computation is authoritative).
+    pub ts: u64,
 }
 
 /// Parse previously-appended JSONL content, skipping malformed lines so a
 /// torn final write never poisons a verdict run.
 pub fn parse_samples(jsonl: &str) -> Vec<StoredMetric> {
+    parse_samples_since(jsonl, 0)
+}
+
+/// Like [`parse_samples`], but keeps only rows stamped `>= since_ts` (unix
+/// seconds). `since_ts == 0` keeps everything. Rows without a `ts` field
+/// (legacy, stamped 0) are kept only when `since_ts == 0` so a filtered
+/// verdict can never silently include unstaleable data.
+pub fn parse_samples_since(jsonl: &str, since_ts: u64) -> Vec<StoredMetric> {
+    parse_samples_impl(jsonl, Some(since_ts))
+}
+
+fn parse_samples_impl(jsonl: &str, since_ts: Option<u64>) -> Vec<StoredMetric> {
     jsonl
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter_map(|v| {
             let metric = v.get("metric")?.as_str()?.to_string();
             let value = v.get("value")?.as_f64()?;
+            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            if let Some(cutoff) = since_ts {
+                if ts == 0 || ts < cutoff {
+                    return None;
+                }
+            }
             Some(StoredMetric {
                 arm_on: v.get("arm").and_then(|a| a.as_str()) == Some("on"),
                 order: v
@@ -119,6 +143,7 @@ pub fn parse_samples(jsonl: &str) -> Vec<StoredMetric> {
                 value,
                 prompt_tokens: v.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0)
                     as usize,
+                ts,
             })
         })
         .collect()

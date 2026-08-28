@@ -3,17 +3,17 @@
 //! Measures the host-side cost of `C2plrController::decide` across realistic
 //! layer counts and prefill/decode shapes:
 //! - cache-miss path (`decide_miss`: WaveTune bilinear eval + MLP + Gumbel),
-//!   budgeted at ~10 µs/layer in scythe2.md §3.4 / `scythe2.rs` doc comments;
-//! - cache-hit path (decode steady state), budgeted at ~50 ns/layer.
+//!   measured at ~2 µs/layer (SB3 campaign, release host-side; the ~10 µs
+//!   figure in scythe2.md §3.4 was the pre-implementation estimate);
+//! - cache-hit path (decode steady state), measured at ~50 ns/layer.
 //!
 //! These are host-side numbers — pure Rust, no GPU needed — so they bound the
 //! CPU overhead the decode/prefill hot path pays for routing. The end-to-end
-//! TTFT comparison (route on vs off) still requires the real asymmetric pair:
-//!
-//! TODO(gpu-verify): run `cargo bench -p grim-engine --bench scythe2_decide_miss`
-//! on syd-beasty (RX 9070 XT / RX 9060 XT) AND an end-to-end prefill TTFT
-//! A/B there before this ships default-on (WI-INF4 gate). Until then
-//! `GRIM_SCYTHE_INFERENCE` stays opt-in.
+//! A/B has since RUN on syd-beasty (WI-INF4 verdict, 2026-08-23c): mean TTFT
+//! overhead −0.09 %/−0.00 % (F/S) and p95 ITL overhead −18.56 %/+2.43 % —
+//! the S-first ITL tail exceeds the 2 % budget, so `GRIM_SCYTHE_INFERENCE`
+//! stays opt-in and the placement cost model is retuned against that tail.
+//! Re-run this bench after placement changes that target the ITL path.
 
 use std::time::Instant;
 
@@ -123,31 +123,32 @@ fn main() {
         }
     }
 
-    // Generous CI gates — the claimed budgets are ~10 µs miss / ~50 ns hit.
-    // We fail only on a >5× overrun of the miss claim (the absolute claim is
-    // hardware-dependent; the end-to-end gate is WI-INF4's syd-beasty run).
+    // Retuned CI gates (SB3): the measured budgets are ~2 µs miss / ~50 ns
+    // hit in release. We fail only on a >5× overrun of the measured claim
+    // (the absolute numbers are hardware-dependent; the end-to-end gate is
+    // the WI-INF4 A/B, already run — verdict recorded 2026-08-23c).
     let mut failed = false;
-    if worst_miss_us > 50.0 {
+    if worst_miss_us > 10.0 {
         eprintln!(
-            "FAIL: worst decide_miss {worst_miss_us:.1} µs/layer exceeds the 50 µs CI bound \
-             (>5× the claimed ~10 µs/layer budget)"
+            "FAIL: worst decide_miss {worst_miss_us:.1} µs/layer exceeds the 10 µs CI bound \
+             (>5× the measured ~2 µs/layer budget)"
         );
         failed = true;
     }
     if worst_hit_ns > 250.0 {
         eprintln!(
             "FAIL: worst cache-hit {worst_hit_ns:.1} ns/layer exceeds the 250 ns CI bound \
-             (>5× the claimed ~50 ns/layer)"
+             (>5× the measured ~50 ns/layer)"
         );
         failed = true;
     }
     if !failed {
         println!(
-            "PASS: worst miss {worst_miss_us:.2} µs/layer (<50), worst hit {worst_hit_ns:.1} ns/layer (<250)."
+            "PASS: worst miss {worst_miss_us:.2} µs/layer (<10), worst hit {worst_hit_ns:.1} ns/layer (<250)."
         );
         println!(
-            "NOTE: host-side only. End-to-end prefill TTFT on/off A/B still pending on \
-             syd-beasty — GRIM_SCYTHE_INFERENCE stays default-off until then (WI-INF4)."
+            "NOTE: host-side only. WI-INF4 end-to-end verdict (2026-08-23c): STAYS OPT-IN — \
+             S-first p95 ITL +2.43% exceeds the 2% budget."
         );
     }
     std::process::exit(if failed { 1 } else { 0 });

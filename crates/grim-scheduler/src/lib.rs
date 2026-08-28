@@ -9,9 +9,6 @@ use grim_core::DeterminismMode;
 pub mod self_tuning;
 pub use self_tuning::{SelfTuningController, TunableKnob};
 
-pub mod bandwidth_policy;
-pub use bandwidth_policy::BandwidthProfile;
-
 /// A request in the scheduler system.
 #[derive(Debug, Clone, Default)]
 pub struct Request {
@@ -20,6 +17,11 @@ pub struct Request {
     /// Maximum number of tokens this request may generate, used by admission
     /// guards that reserve KV capacity before selecting a device.
     pub max_new_tokens: usize,
+    /// Scheduling priority. One policy governs both consumers: admission
+    /// ordering (higher priority first, arrival order breaking ties) and
+    /// preemption victim selection (lowest priority, earliest-arrived first).
+    /// A request is never starved by admission deferral or rescued by
+    /// priority alone — the swap-in path below guarantees re-entry.
     pub priority: i32,
     /// Tokens consumed so far in the current prefill pass (chunked prefill tracking).
     pub consumed_tokens: usize,
@@ -139,6 +141,10 @@ pub struct Scheduler {
     pub chunked_prefill_size: usize,
     pub admission: AdmissionController,
     pub determinism_mode: DeterminismMode,
+    /// Cumulative admission events since scheduler creation. A request counts
+    /// once on first admission; a preempted request that is swapped back in
+    /// counts again (it is a fresh admission into the batch).
+    admitted_total: usize,
 }
 
 /// Result of one `schedule()` call — the engine uses this to run the batch.
@@ -156,6 +162,9 @@ pub struct SchedulerOutput {
 pub struct SchedulerSnapshot {
     pub active_requests: usize,
     pub waiting_requests: usize,
+    /// Cumulative admissions since scheduler creation (`Scheduler::
+    /// admitted_total`) — matches the `grim_scheduler_admitted_requests`
+    /// counter semantics on the serve surface.
     pub admitted_requests: usize,
     pub paused_requests: usize,
 }
@@ -168,15 +177,12 @@ impl SchedulerOutput {
 
 impl Scheduler {
     /// Return queue counts without exposing the scheduler's collections to
-    /// status consumers. `admitted_requests` is the number currently eligible
-    /// to enter the next batch; this scheduler stores admitted work in
-    /// `waiting` until `schedule()` moves it into `running`, so it is zero
-    /// between scheduling passes.
+    /// status consumers.
     pub fn snapshot(&self) -> SchedulerSnapshot {
         SchedulerSnapshot {
             active_requests: self.running.len(),
             waiting_requests: self.waiting.len(),
-            admitted_requests: 0,
+            admitted_requests: self.admitted_total,
             paused_requests: self.paused.len(),
         }
     }
@@ -196,6 +202,7 @@ impl Scheduler {
             chunked_prefill_size: 512,
             admission,
             determinism_mode: DeterminismMode::Relaxed,
+            admitted_total: 0,
         }
     }
 
@@ -221,6 +228,18 @@ impl Scheduler {
 
             // Sort running list deterministically by request ID
             self.running.sort_by_key(|r| r.id);
+        } else {
+            // Admission policy (see `Request::priority`): higher priority
+            // first, arrival order breaking ties (stable sort). Checked
+            // before sorting so the common already-ordered case stays
+            // allocation-free.
+            let has_inversion = (1..self.waiting.len())
+                .any(|i| self.waiting[i - 1].priority < self.waiting[i].priority);
+            if has_inversion {
+                let mut temp: Vec<Request> = self.waiting.drain(..).collect();
+                temp.sort_by_key(|r| std::cmp::Reverse(r.priority));
+                self.waiting = temp.into();
+            }
         }
 
         let backlog = self.compute_token_backlog();
@@ -232,6 +251,32 @@ impl Scheduler {
         let pressure_active = backlog.total > self.max_batched_tokens
             || self.waiting.len() > 10
             || total_running_tokens > self.max_batched_tokens;
+
+        // Swap-in (§5.2): once pressure lifts, preempted requests re-enter
+        // admission from the FRONT of `waiting` (older than new arrivals).
+        // `consumed_tokens` is preserved across the swap, so chunked prefill
+        // resumes at the true offset, and a fully-prefilled swap-in skips
+        // straight to decode (handled in the admission loop below). Before
+        // this path existed, `finish()` was the only remover of `swapped` —
+        // a preempted request was stranded until it was aborted.
+        //
+        // Entries already tracked elsewhere (a preempted mid-prefill request
+        // whose chunk remainder is still in `waiting`) are dropped: the
+        // remaining copy is the live one, and keeping both would schedule
+        // the same id twice per pass.
+        if !pressure_active {
+            let mut swap_back = Vec::new();
+            while let Some(r) = self.swapped.pop_front() {
+                let already_tracked = self.waiting.iter().any(|w| w.id == r.id)
+                    || self.running.iter().any(|w| w.id == r.id);
+                if !already_tracked {
+                    swap_back.push(r);
+                }
+            }
+            for r in swap_back.into_iter().rev() {
+                self.waiting.push_front(r);
+            }
+        }
 
         // 0. Admission control: defer requests that would bust the TTFT budget.
         // Push deferred requests to the back of the queue so they don't
@@ -248,13 +293,16 @@ impl Scheduler {
 
         let mut output = SchedulerOutput::default();
 
-        // Preemption check (§5.2): swap lowest-priority running sequences to swapped queue under pressure
-        // (Simulate memory/token pressure when total running tokens exceed batch limits)
+        // Preemption check (§5.2): swap the lowest-priority, earliest-arrived
+        // running sequence to `swapped` under token pressure. Victims return
+        // via the swap-in path above once pressure lifts (see
+        // `Request::priority` for the single ordering policy).
         if pressure_active
             && total_running_tokens > self.max_batched_tokens
             && !self.running.is_empty()
         {
-            // Sort running sequences by priority ascending (lowest first)
+            // Sort running sequences by priority ascending (lowest first;
+            // stable sort keeps earliest-arrived first within a priority).
             self.running.sort_by_key(|r| r.priority);
             let preempted = self.running.remove(0);
             output.preempted_ids.push(preempted.id);
@@ -282,6 +330,20 @@ impl Scheduler {
             // consumed count reset backward and reprocessed the entire prompt
             // from offset 0.
             let remaining_before = r.prompt_tokens.saturating_sub(r.consumed_tokens);
+            if remaining_before == 0 {
+                // Fully prefilled before leaving the batch (a swap-in): no
+                // prefill work remains, so it re-enters `running` directly
+                // and becomes decode-eligible this pass instead of paying a
+                // zero-token prefill pass.
+                match self.running.iter().position(|e| e.id == r.id) {
+                    Some(pos) => self.running[pos] = r,
+                    None => {
+                        self.admitted_total += 1;
+                        self.running.push(r);
+                    }
+                }
+                continue;
+            }
             let chunk_size = if pressure_active {
                 remaining_before.min(self.chunked_prefill_size)
             } else {
@@ -306,7 +368,10 @@ impl Scheduler {
             // the prior entry instead of appending.
             match self.running.iter().position(|e| e.id == r.id) {
                 Some(pos) => self.running[pos] = running_req,
-                None => self.running.push(running_req),
+                None => {
+                    self.admitted_total += 1;
+                    self.running.push(running_req);
+                }
             }
 
             if pressure_active {
@@ -864,6 +929,162 @@ mod tests {
         // Total active tokens (120) > max (100) -> lowest priority (id=2) preempted
         assert_eq!(out.preempted_ids, vec![2]);
         assert_eq!(sched.swapped[0].id, 2);
+    }
+
+    /// Swap-in round trip: a preempted request must re-enter the batch once
+    /// pressure lifts — `swapped` may not be a terminal state (before the
+    /// swap-in path existed, `finish()` was the only remover, so preemption
+    /// stranded the request until it was aborted).
+    #[test]
+    fn test_preempted_request_reenters_after_pressure_lifts() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(100, 8, ctrl);
+
+        // Preempted mid-decode: prompt fully consumed, KV state warm.
+        sched.swapped.push_back(Request {
+            id: 2,
+            prompt_tokens: 60,
+            priority: 1,
+            consumed_tokens: 60,
+            ..Default::default()
+        });
+
+        // No pressure (waiting empty, running idle) → swap-in this pass.
+        let out = sched.schedule();
+        assert!(
+            sched.swapped.is_empty(),
+            "swapped must drain once pressure lifts"
+        );
+        assert!(
+            sched.running.iter().any(|r| r.id == 2),
+            "swap-in must re-enter running"
+        );
+        // Fully-prefilled swap-in skips the prefill pass and decodes.
+        assert!(
+            out.decode_ids.contains(&2),
+            "fully-prefilled swap-in decodes without a 0-token prefill pass"
+        );
+    }
+
+    /// A preempted request whose chunked-prefill remainder is still in
+    /// `waiting` must not be duplicated by the swap-in: the remainder copy
+    /// is the live one, and keeping both would schedule the id twice.
+    #[test]
+    fn test_swap_in_dedups_against_live_remainder() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+
+        sched.swapped.push_back(Request {
+            id: 5,
+            prompt_tokens: 120,
+            consumed_tokens: 50,
+            ..Default::default()
+        });
+        sched.waiting.push_back(Request {
+            id: 5,
+            prompt_tokens: 120,
+            consumed_tokens: 50,
+            ..Default::default()
+        });
+
+        let out = sched.schedule();
+        let prefilled = out.prefill_ids.iter().filter(|&&id| id == 5).count();
+        assert_eq!(prefilled, 1, "request 5 must be scheduled at most once");
+    }
+
+    /// Under pressure, `swapped` holds; only when the pressure signal lifts
+    /// do swapped requests come back.
+    #[test]
+    fn test_swapped_holds_until_pressure_lifts() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(100, 8, ctrl);
+
+        sched.swapped.push_back(Request {
+            id: 9,
+            prompt_tokens: 500,
+            consumed_tokens: 500,
+            ..Default::default()
+        });
+        // Backlog 600 > max_batched_tokens 100 → pressure active.
+        sched.enqueue(Request {
+            id: 10,
+            prompt_tokens: 600,
+            ..Default::default()
+        });
+
+        let _ = sched.schedule();
+        assert_eq!(sched.swapped.len(), 1, "pressure active → swap-in holds");
+
+        // Drain the backlog → pressure lifts → swap-in fires.
+        sched.waiting.clear();
+        let out = sched.schedule();
+        assert!(sched.swapped.is_empty());
+        assert!(out.decode_ids.contains(&9), "swap-in decodes after re-entry");
+    }
+
+    /// `admitted_requests` is a real cumulative counter, not a hardcoded 0:
+    /// first admission counts once, chunked re-passes don't recount,
+    /// swap-in re-entry counts as a fresh admission.
+    #[test]
+    fn test_snapshot_admitted_requests_counts_admissions() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        assert_eq!(sched.snapshot().admitted_requests, 0);
+
+        sched.enqueue(Request {
+            id: 1,
+            prompt_tokens: 128,
+            ..Default::default()
+        });
+        sched.enqueue(Request {
+            id: 2,
+            prompt_tokens: 128,
+            ..Default::default()
+        });
+        let _ = sched.schedule();
+        assert_eq!(sched.snapshot().admitted_requests, 2);
+
+        // Chunked re-admission of an already-running request must not
+        // inflate the counter (one running entry per request is replaced).
+        let out = sched.schedule();
+        let _ = out;
+        assert_eq!(sched.snapshot().admitted_requests, 2);
+
+        // Swap-in re-entry is a fresh admission event.
+        sched.swapped.push_back(Request {
+            id: 3,
+            prompt_tokens: 64,
+            consumed_tokens: 64,
+            ..Default::default()
+        });
+        let _ = sched.schedule();
+        assert_eq!(sched.snapshot().admitted_requests, 3);
+    }
+
+    /// Single priority policy: admission order is priority-descending with
+    /// arrival order breaking ties (stable), while victim selection evicts
+    /// the lowest priority. High-priority work is admitted before older
+    /// low-priority work.
+    #[test]
+    fn test_priority_orders_admission_arrival_breaks_ties() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+
+        // Arrival order 1(p0), 2(p5), 3(p0).
+        for (id, priority) in [(1u64, 0i32), (2, 5), (3, 0)] {
+            sched.enqueue(Request {
+                id,
+                prompt_tokens: 128,
+                priority,
+                ..Default::default()
+            });
+        }
+        let out = sched.schedule();
+        assert_eq!(
+            out.prefill_ids,
+            vec![2, 1, 3],
+            "priority 5 first; arrival order 1-before-3 within priority 0"
+        );
     }
 
     #[test]
