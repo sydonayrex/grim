@@ -59,10 +59,11 @@ fn resolve_tp_config() -> Result<TensorParallelConfig> {
         )));
     }
     if tp.world_size > 1 {
-        eprintln!(
+        log::info!(
             "[grim-engine] TP rank {}/{} (from GRIM_TP_*); \
              loading only this rank's shard",
-            tp.rank, tp.world_size
+            tp.rank,
+            tp.world_size
         );
     }
     Ok(tp)
@@ -325,7 +326,7 @@ pub fn load_model_from_grim(path: &str, device: Device) -> Result<Box<dyn Causal
     let grim_wf = grim_provider.wavefront_size();
     if let Some(host_wf) = probe_host_wavefront_size(&device) {
         if grim_wf != 0 && host_wf != 0 && grim_wf != host_wf {
-            eprintln!(
+            log::info!(
                 "[grim] .grim wavefront_size={grim_wf} incompatible with host GPU wavefront_size={host_wf} \
                  (RDNA2/Wave32 host); falling back to GGUF sibling '{gguf_path_str}'"
             );
@@ -501,7 +502,7 @@ pub fn effective_rope_theta(
         },
         "yarn" | "" => return theta,
         other => {
-            eprintln!(
+            log::info!(
                 "[grim] unknown rope_scaling.rope_type '{other}' — loading with native theta"
             );
             return theta;
@@ -780,7 +781,7 @@ fn load_model_from_config(
                 new_decoder_architecture: true,
                 multi_query: true,
             };
-            eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
+            log::info!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
             let m = Falcon::load_tp(device.clone(), &ws, falcon_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -797,7 +798,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
+            log::info!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -868,7 +869,7 @@ fn load_model_from_config(
                 full_yarn,
             };
 
-            eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
+            log::info!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -886,7 +887,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
+            log::info!("[grim] Loading Phi model with config: {:?}", phi_cfg);
             let m = Phi2::load_tp(device.clone(), &ws, phi_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -903,7 +904,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
+            log::info!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -927,7 +928,7 @@ fn load_model_from_config(
                 ssm_n_group: 16,
                 devices: resolve_discrete_rocm_devices(&device),
             };
-            eprintln!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
+            log::info!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
             let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -955,7 +956,7 @@ fn load_model_from_config(
                 max_seq_len,
                 full_yarn: parse_yarn_scaling(&config.rope_scaling),
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen3.5/3.8 MoE model with config: {:?}",
                 qwen35_moe_cfg
             );
@@ -990,7 +991,7 @@ fn load_model_from_config(
                 max_seq_len,
                 full_yarn: parse_yarn_scaling(&config.rope_scaling),
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen3.8-Flash-Next model with config: {:?}",
                 qwen38_cfg
             );
@@ -1024,7 +1025,7 @@ fn load_model_from_config(
                     attention_factor: 1.277_258_9,
                 }),
             };
-            eprintln!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
+            log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
             let m = Mellum::load_tp(device.clone(), &ws, mellum_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1054,7 +1055,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen-MoE model with config: {:?}",
                 qwen_moe_cfg
             );
@@ -1077,7 +1078,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading MoE model with config: {:?}", moe_cfg);
+            log::info!("[grim] Loading MoE model with config: {:?}", moe_cfg);
             let m = Qwen3Moe::load_tp(device.clone(), &ws, moe_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1092,7 +1093,7 @@ fn load_model_from_config(
                 num_layers,
                 rms_norm_eps,
             };
-            eprintln!("[grim] Loading Mamba2 model with config: {:?}", mamba2_cfg);
+            log::info!("[grim] Loading Mamba2 model with config: {:?}", mamba2_cfg);
             let mamba_cfg = MambaConfig {
                 vocab_size,
                 hidden_size,
@@ -1120,7 +1121,7 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading Jamba model with config: {:?}", jamba_cfg);
+            log::info!("[grim] Loading Jamba model with config: {:?}", jamba_cfg);
             let mamba_cfg = MambaConfig {
                 vocab_size,
                 hidden_size,
@@ -1145,7 +1146,7 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading NemotronH model with config: {:?}",
                 nemotron_cfg
             );
@@ -1173,7 +1174,7 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading GraniteHybrid model with config: {:?}",
                 granite_cfg
             );
@@ -1200,7 +1201,7 @@ fn load_model_from_config(
                 layer_norm_eps: rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading ModernBERT model with config: {:?}",
                 modern_bert_cfg
             );
@@ -1229,7 +1230,7 @@ fn load_model_from_config(
                 layer_norm_eps: rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading NomicBERT model with config: {:?}",
                 nomic_bert_cfg
             );
@@ -1254,7 +1255,7 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading T5Encoder model with config: {:?}",
                 t5_enc_cfg
             );
@@ -1277,7 +1278,7 @@ fn load_model_from_config(
                 head_dim,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
+            log::info!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
             let rwkv_cfg = RwkvConfig {
                 vocab_size,
                 hidden_size,
@@ -1295,7 +1296,7 @@ fn load_model_from_config(
                 head_dim,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
+            log::info!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
             let rwkv_cfg = RwkvConfig {
                 vocab_size,
                 hidden_size,
@@ -1350,7 +1351,7 @@ fn load_model_from_config(
             }
             is_recr.resize(num_layers, false);
 
-            eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
+            log::info!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
 
             let cfg = Lfm2Config {
                 vocab_size,
@@ -1544,7 +1545,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading CommandR model with config: {:?}",
                 commandr_cfg
             );
@@ -1573,7 +1574,7 @@ fn load_model_from_config(
                     | ModelArchitecture::Jais
                     | ModelArchitecture::Jais2
             ) {
-                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
+                log::info!("[grim] enabling ALiBi on {} blocks", m.layers.len());
                 for layer in m.layers.iter_mut() {
                     *layer = std::mem::replace(layer, layer.clone()).with_alibi();
                 }
@@ -1594,7 +1595,7 @@ fn load_model_from_config(
                 max_seq_len,
                 swin_norm: true,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Chameleon model with config: {:?}",
                 chameleon_cfg
             );
@@ -1613,7 +1614,7 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading DeltaNetBase model with config: {:?}",
                 delta_cfg
             );
@@ -2043,9 +2044,10 @@ fn load_model_from_config(
                 partial_rotary_factor: 1.0,
                 yarn: None,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
-                model_arch, llama_cfg
+                model_arch,
+                llama_cfg
             );
             let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
@@ -2057,7 +2059,7 @@ fn load_model_from_config(
                     | ModelArchitecture::Jais
                     | ModelArchitecture::Jais2
             ) {
-                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
+                log::info!("[grim] enabling ALiBi on {} blocks", m.layers.len());
                 for layer in m.layers.iter_mut() {
                     *layer = std::mem::replace(layer, layer.clone()).with_alibi();
                 }
@@ -2066,9 +2068,11 @@ fn load_model_from_config(
         }
         _ => {
             if let Some(spec) = resolve_arch_compat_spec(&arch_str, raw_config_str) {
-                eprintln!(
+                log::info!(
                     "[grim] Resolved unknown architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
-                    arch_str, spec.base_architecture, spec.is_moe
+                    arch_str,
+                    spec.base_architecture,
+                    spec.is_moe
                 );
                 let spec_clone = spec.clone();
                 let remapped_provider =
@@ -2130,7 +2134,7 @@ fn load_model_from_config(
                 }
             }
 
-            eprintln!(
+            log::info!(
                 "[grim] Unknown architecture '{}' with no plugin compat spec found; using default Llama loader",
                 arch_str
             );
@@ -2161,7 +2165,7 @@ fn load_model_with_providers(
     device: Device,
     path: &str,
 ) -> Result<Box<dyn CausalLm>> {
-    eprintln!(
+    log::info!(
         "[alias] load_model_with_providers called, arch={:?}",
         provider.architecture()
     );
@@ -2191,7 +2195,7 @@ fn load_model_with_providers(
         if (name_lower.contains("minicpm") || path_lower.contains("minicpm"))
             && has_minicpm_metadata
         {
-            eprintln!(
+            log::info!(
                 "[grim] Detected MiniCPM model variant from metadata/path, promoting architecture to MiniCpm"
             );
             model_arch = ModelArchitecture::MiniCpm;
@@ -2205,7 +2209,7 @@ fn load_model_with_providers(
             && weight_provider_has_tensor(weight_provider, "output_norm.weight")
             && !weight_provider_has_tensor(weight_provider, "output.weight");
         if has_output_norm {
-            eprintln!(
+            log::info!(
                 "[grim] Detected SmolLM2 tensor signature (output_norm present, no output.weight); promoting architecture to SmolLm2"
             );
             model_arch = ModelArchitecture::SmolLm2;
@@ -2216,13 +2220,16 @@ fn load_model_with_providers(
     // `effective_rope_theta`); YaRN rides `parse_yarn_scaling_gguf` unchanged.
     hparams.rope_theta = effective_rope_theta_gguf(&lookup, hparams.rope_theta, hparams.head_dim);
 
-    eprintln!(
+    log::info!(
         "[grim] Loading config: architecture={:?}, layers={}, hidden={}, vocab={}",
-        model_arch, hparams.num_layers, hparams.hidden_size, hparams.vocab_size
+        model_arch,
+        hparams.num_layers,
+        hparams.hidden_size,
+        hparams.vocab_size
     );
 
     let hf_gguf_map = TensorNamingRegistry::remap_hf_to_gguf(model_arch, hparams.num_layers);
-    eprintln!(
+    log::info!(
         "[alias] remap map has {} entries, sample: {:?}",
         hf_gguf_map.len(),
         hf_gguf_map.get("tok_embeddings.weight")
@@ -2231,7 +2238,7 @@ fn load_model_with_providers(
         let hf_gguf_map = hf_gguf_map.clone();
         move |name| {
             if let Some(mapped) = hf_gguf_map.get(name) {
-                eprintln!("[alias] {} -> {}", name, mapped);
+                log::info!("[alias] {} -> {}", name, mapped);
                 mapped.clone()
             } else {
                 name.to_string()
@@ -2259,7 +2266,7 @@ fn load_model_with_providers(
                 new_decoder_architecture: true,
                 multi_query: true,
             };
-            eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
+            log::info!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
             let m = Falcon::load_tp(device.clone(), &ws, falcon_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2276,7 +2283,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
+            log::info!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2322,7 +2329,7 @@ fn load_model_with_providers(
                 gating: "per-head".into(),
                 full_yarn,
             };
-            eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
+            log::info!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2340,7 +2347,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
+            log::info!("[grim] Loading Phi model with config: {:?}", phi_cfg);
             let m = Phi2::load_tp(device.clone(), &ws, phi_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2369,7 +2376,7 @@ fn load_model_with_providers(
                 scale_depth,
                 dim_model_base,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading MiniCPM model with config: {:?}",
                 minicpm_cfg
             );
@@ -2389,7 +2396,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading SmolLM2 model with config: {:?}",
                 smollm2_cfg
             );
@@ -2409,7 +2416,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
+            log::info!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2447,7 +2454,7 @@ fn load_model_with_providers(
                         let max_safe = (avail / kv_bytes_per_tok) as usize;
                         if max_safe < hparams.max_seq_len {
                             let clamped = max_safe.max(1024);
-                            eprintln!(
+                            log::info!(
                                 "[grim] VRAM budget: free={}MB/GPU, dynamically capping context length to {} tokens to ensure zero host spillage",
                                 min_free / (1024 * 1024),
                                 clamped
@@ -2468,7 +2475,7 @@ fn load_model_with_providers(
                 ssm_n_group: hparams.ssm_n_group.unwrap_or(16),
                 devices: resolve_discrete_rocm_devices(&device),
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen3.5/3.8 model with config: {:?}",
                 qwen35_cfg
             );
@@ -2513,7 +2520,7 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
                 full_yarn: parse_yarn_scaling_gguf(&lookup),
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen3.5/3.8 MoE model with config: {:?}",
                 qwen35_moe_cfg
             );
@@ -2548,7 +2555,7 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
                 full_yarn: parse_yarn_scaling_gguf(&lookup),
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen3.8-Flash-Next model from GGUF with config: {:?}",
                 qwen38_cfg
             );
@@ -2582,7 +2589,7 @@ fn load_model_with_providers(
                     attention_factor: 1.277_258_9,
                 }),
             };
-            eprintln!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
+            log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
             let m = Mellum::load_tp(device.clone(), &ws, mellum_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2604,7 +2611,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Qwen-MoE model with config: {:?}",
                 qwen_moe_cfg
             );
@@ -2627,7 +2634,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading MoE model with config: {:?}", moe_cfg);
+            log::info!("[grim] Loading MoE model with config: {:?}", moe_cfg);
             let m = Qwen3Moe::load_tp(device.clone(), &ws, moe_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2642,7 +2649,7 @@ fn load_model_with_providers(
                 num_layers: hparams.num_layers,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            eprintln!("[grim] Loading Mamba2 model with config: {:?}", mamba2_cfg);
+            log::info!("[grim] Loading Mamba2 model with config: {:?}", mamba2_cfg);
             let mamba_cfg = MambaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2676,7 +2683,7 @@ fn load_model_with_providers(
                 ),
                 ssm_n_group: hparams.ssm_n_group.unwrap_or(1),
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Falcon-H1 model with config: {:?}",
                 falcon_h1_cfg
             );
@@ -2697,7 +2704,7 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading Jamba model with config: {:?}", jamba_cfg);
+            log::info!("[grim] Loading Jamba model with config: {:?}", jamba_cfg);
             let mamba_cfg = MambaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2722,7 +2729,7 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading NemotronH model with config: {:?}",
                 nemotron_cfg
             );
@@ -2750,7 +2757,7 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading GraniteHybrid model with config: {:?}",
                 granite_cfg
             );
@@ -2777,7 +2784,7 @@ fn load_model_with_providers(
                 layer_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading ModernBERT model with config: {:?}",
                 modern_bert_cfg
             );
@@ -2806,7 +2813,7 @@ fn load_model_with_providers(
                 layer_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading NomicBERT model with config: {:?}",
                 nomic_bert_cfg
             );
@@ -2831,7 +2838,7 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading T5Encoder model with config: {:?}",
                 t5_enc_cfg
             );
@@ -2854,7 +2861,7 @@ fn load_model_with_providers(
                 head_dim: hparams.head_dim,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
+            log::info!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
             let rwkv_eps = lookup
                 .get_f32("rwkv.epsilon")
                 .or_else(|| lookup.get_f32("rms_norm_epsilon"))
@@ -2878,7 +2885,7 @@ fn load_model_with_providers(
                 head_dim: hparams.head_dim,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
+            log::info!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
             let rwkv_eps = lookup
                 .get_f32("rwkv.epsilon")
                 .or_else(|| lookup.get_f32("rms_norm_epsilon"))
@@ -2927,7 +2934,7 @@ fn load_model_with_providers(
             }
             head_count_kv_vec.resize(hparams.num_layers, 0);
             let is_recr: Vec<bool> = head_count_kv_vec.iter().map(|&n| n == 0).collect();
-            eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
+            log::info!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
             let n_shortconv_l_cache = 3usize;
             let num_kv_heads = head_count_kv_vec
                 .iter()
@@ -3028,7 +3035,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading CommandR model with config: {:?}",
                 commandr_cfg
             );
@@ -3055,7 +3062,7 @@ fn load_model_with_providers(
                 .or_else(|| lookup.get_f32("alibi.bias_max"))
                 .is_some()
             {
-                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
+                log::info!("[grim] enabling ALiBi on {} blocks", m.layers.len());
                 for layer in m.layers.iter_mut() {
                     *layer = std::mem::replace(layer, layer.clone()).with_alibi();
                 }
@@ -3421,7 +3428,7 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
                 swin_norm: true,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Chameleon model with config: {:?}",
                 chameleon_cfg
             );
@@ -3598,7 +3605,7 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading DeltaNetBase model with config: {:?}",
                 delta_cfg
             );
@@ -3710,9 +3717,10 @@ fn load_model_with_providers(
                 partial_rotary_factor: 1.0,
                 yarn: None,
             };
-            eprintln!(
+            log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
-                model_arch, llama_cfg
+                model_arch,
+                llama_cfg
             );
             let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
@@ -3722,7 +3730,7 @@ fn load_model_with_providers(
                 .or_else(|| lookup.get_f32("alibi.bias_max"))
                 .is_some()
             {
-                eprintln!("[grim] enabling ALiBi on {} blocks", m.layers.len());
+                log::info!("[grim] enabling ALiBi on {} blocks", m.layers.len());
                 for layer in m.layers.iter_mut() {
                     *layer = std::mem::replace(layer, layer.clone()).with_alibi();
                 }
@@ -3739,9 +3747,11 @@ fn load_model_with_providers(
             let config_raw = read_sibling_config_json(path);
 
             if let Some(spec) = resolve_arch_compat_spec(arch_str, config_raw.as_deref()) {
-                eprintln!(
+                log::info!(
                     "[grim] Resolved unknown GGUF architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
-                    arch_str, spec.base_architecture, spec.is_moe
+                    arch_str,
+                    spec.base_architecture,
+                    spec.is_moe
                 );
                 let spec_clone = spec.clone();
                 let remapped_provider =
@@ -3872,7 +3882,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
             "cuda" => {
                 if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
                     if let Some(first) = cuda_devices.first() {
-                        eprintln!(
+                        log::info!(
                             "[model_loader] Using CUDA device {} (forced)",
                             first.ordinal()
                         );
@@ -3910,14 +3920,14 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                                         n = rocm_devices.len()
                                     ))
                                 })?;
-                            eprintln!(
+                            log::info!(
                                 "[model_loader] Using ROCm device {ord} (forced, TP rank {rank})"
                             );
                             d.ordinal()
                         }
                         None => {
                             let first = rocm_devices.first().expect("checked above");
-                            eprintln!(
+                            log::info!(
                                 "[model_loader] Using ROCm device {} (forced)",
                                 first.ordinal()
                             );
@@ -3935,7 +3945,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                 }
             }
             "cpu" => {
-                eprintln!("[model_loader] Using CPU (forced)");
+                log::info!("[model_loader] Using CPU (forced)");
                 let dev = Device::Cpu;
                 return if is_grim {
                     load_model_from_grim(path, dev)
@@ -3967,7 +3977,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                         n = rocm_devices.len()
                     )));
                 };
-                eprintln!("[model_loader] Using ROCm device {ord} (TP rank {rank})");
+                log::info!("[model_loader] Using ROCm device {ord} (TP rank {rank})");
                 d.ordinal()
             }
             None => {
@@ -3978,7 +3988,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                             .into(),
                     ));
                 };
-                eprintln!("[model_loader] Using ROCm device {}", first.ordinal());
+                log::info!("[model_loader] Using ROCm device {}", first.ordinal());
                 first.ordinal()
             }
         };
@@ -3995,7 +4005,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     #[cfg(feature = "cuda")]
     if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
         if let Some(first) = cuda_devices.first() {
-            eprintln!("[model_loader] Using CUDA device {}", first.ordinal());
+            log::info!("[model_loader] Using CUDA device {}", first.ordinal());
             let dev = Device::Cuda(first.ordinal());
             return if is_grim {
                 load_model_from_grim(path, dev)
@@ -4009,7 +4019,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     // Fall back to Metal.
     if let Ok(metal_devices) = grim_backend_metal::MetalDevice::probe() {
         if let Some(first) = metal_devices.first() {
-            eprintln!("[model_loader] Using Metal device {}", first.ordinal());
+            log::info!("[model_loader] Using Metal device {}", first.ordinal());
             let dev = Device::Metal(first.ordinal());
             return if is_grim {
                 load_model_from_grim(path, dev)
@@ -4021,7 +4031,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
         }
     }
     // CPU fallback.
-    eprintln!("[model_loader] No GPU detected; using CPU.");
+    log::info!("[model_loader] No GPU detected; using CPU.");
     let dev = Device::Cpu;
     if is_grim {
         load_model_from_grim(path, dev)

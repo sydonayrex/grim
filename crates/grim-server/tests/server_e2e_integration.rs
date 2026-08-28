@@ -423,3 +423,87 @@ async fn test_server_embeddings_without_encoder_is_clean_error() {
     let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(val.is_object(), "error body must be a JSON object: {val}");
 }
+
+/// T2 tool-call path e2e: a chat request bearing a `tools` array and
+/// `tool_choice` must not 400 and must produce a well-formed completion —
+/// the mechanism (typed tool parsing + choose suppression) wires end-to-end.
+#[tokio::test]
+async fn test_server_tool_calls_accept_tools_and_choice() {
+    let state = create_test_state();
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "default",
+        "messages": [
+            { "role": "user", "content": "what is the weather?" }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "look up weather",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 4,
+        "temperature": 0.0
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "tools request must succeed, got {}",
+        resp.status()
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(val.get("choices").is_some(), "completion must have choices");
+
+    // tool_choice: "none" suppresses tool use — must still be a valid request.
+    let body_none = json!({
+        "model": "default",
+        "messages": [ { "role": "user", "content": "hi" } ],
+        "tools": [ { "type": "function", "function": { "name": "f", "parameters": {} } } ],
+        "tool_choice": "none",
+        "max_tokens": 4,
+        "temperature": 0.0
+    });
+    let resp2 = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&body_none).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp2.status().is_success(),
+        "tool_choice:none request must succeed, got {}",
+        resp2.status()
+    );
+    let bytes2 = axum::body::to_bytes(resp2.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let val2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+    assert!(val2.get("choices").is_some());
+}

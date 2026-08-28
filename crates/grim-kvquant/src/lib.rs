@@ -1322,6 +1322,128 @@ mod tests {
     use super::*;
     use grim_tensor::{ArithType, DType, Device, Shape, Storage};
 
+    /// Round-trip bound gate (T2.6 audit follow-up): compress → dequantize
+    /// must bound the reconstruction error. The identity compressor must be
+    /// EXACT (0 diff); the Lloyd-Max compressor over a known-spread tensor
+    /// must stay within the quantizer's granularity (never corrupt the KV
+    /// cache beyond the documented error floor).
+    fn cpu_tensor_from(
+        device: &grim_backend_cpu::CpuDevice,
+        data: &[f32],
+        shape: &Shape,
+    ) -> Tensor {
+        use grim_tensor::dtype::Storage as DS;
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: DS::Native,
+        };
+        let storage = Arc::from(device.from_cpu(data, shape, dtype.clone()).unwrap());
+        Tensor::new(
+            storage,
+            shape.clone(),
+            dtype,
+            grim_tensor::QuantProvenance::GrimNative,
+            Device::Cpu,
+        )
+    }
+
+    #[test]
+    fn identity_compressor_round_trip_is_exact() {
+        let device = grim_backend_cpu::CpuDevice::new();
+        let shape = Shape::new(vec![2, 1, 4]); // 2 tokens x 1 head x 4
+        let k_data: Vec<f32> = vec![0.0, 0.25, -0.5, 1.0, -1.0, 0.75, 0.5, -0.25];
+        let v_data: Vec<f32> = vec![-2.0, 1.5, 0.5, -1.0, 3.0, -3.0, 2.0, 0.0];
+        let keys = cpu_tensor_from(&device, &k_data, &shape);
+        let values = cpu_tensor_from(&device, &v_data, &shape);
+
+        let compressor = IdentityCompressor;
+        let block = compressor.compress(&keys, &values).unwrap();
+        let (kq, vq) = compressor
+            .dequantize_for_attention(&block, &device, Device::Cpu)
+            .unwrap();
+        let max_k = kq
+            .to_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(&k_data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_v = vq
+            .to_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(&v_data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_k < 1e-5 && max_v < 1e-5,
+            "identity round-trip must be exact, got k={max_k} v={max_v}"
+        );
+    }
+
+    /// Lloyd-Max 4-bit value / 3-bit key round-trip over a known data spread
+    /// must reconstruct within the quantizer's granularity — bounded, not
+    /// catastrophic. This catches scale/zero-point sign errors and bit-packing
+    /// corruption that a happy-path smoke would miss.
+    #[test]
+    fn lloydmax_round_trip_error_is_bounded() {
+        use grim_tensor::dtype::Storage as DS;
+        let device = grim_backend_cpu::CpuDevice::new();
+        let shape = Shape::new(vec![4, 1, 4]); // 4 tokens x 1 head x 4 = 16 elems
+        let k_data: Vec<f32> = (0..16).map(|i| ((i % 7) as f32) * 0.25 - 0.75).collect(); // spread ~1.5
+        let v_data: Vec<f32> = (0..16).map(|i| ((i % 5) as f32) - 2.0).collect(); // spread 4.0
+        let keys = cpu_tensor_from(&device, &k_data, &shape);
+        let values = cpu_tensor_from(&device, &v_data, &shape);
+
+        let compressor = LloydMaxCompressor::new(KvQuantConfig {
+            key_bits: 3,
+            value_bits: 4,
+            group_size: 4,
+            qk_compute_bits: 8,
+        });
+        let block = compressor.compress(&keys, &values).unwrap();
+        let (kq, vq) = compressor
+            .dequantize_for_attention(&block, &device, Device::Cpu)
+            .unwrap();
+        let kq = kq.to_vec_f32().unwrap();
+        let vq = vq.to_vec_f32().unwrap();
+        assert_eq!(kq.len(), k_data.len());
+        assert_eq!(vq.len(), v_data.len());
+
+        // 3-bit keys over spread 1.5 ≈ 12 bins ⇒ error ≤ 0.5*span/n_bins ≈ 0.07.
+        // 4-bit values over spread 4.0 ⇒ error ≤ 0.04. Generous 0.5 ceiling
+        // bounds catastrophic errors (wrong scale/zero, bit corruption)
+        // without being flaky to binning choices.
+        let max_k = kq
+            .iter()
+            .zip(&k_data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_v = vq
+            .iter()
+            .zip(&v_data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_k <= 0.5 && max_v <= 0.5,
+            "dequant round-trip must stay within the quantizer granularity: k={max_k} v={max_v}"
+        );
+        // And correlate: sign of the largest-magnitude value preserved.
+        assert_eq!(
+            vq.iter()
+                .zip(&v_data)
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .map(|(q, _)| q.signum()),
+            v_data
+                .iter()
+                .copied()
+                .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+                .map(f32::signum),
+            "largest value's sign must survive quantization"
+        );
+        let _ = DS::Native;
+    }
+
     #[test]
     fn test_lloyd_max_compress_decompress() {
         let config = KvQuantConfig::default();
