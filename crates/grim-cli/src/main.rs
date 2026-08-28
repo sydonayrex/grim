@@ -441,7 +441,7 @@ enum Commands {
         train_dtype: train::TrainDtype,
         /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
         /// lion-8bit, adafactor, qgalore-8bit, galore-8bit, muon, madam,
-        /// lion-vote, lomo, adalomo, came, sophia).
+        /// lion-vote, lomo, adalomo, came, sophia, scythe, sickle).
         #[arg(long, default_value = "adamw")]
         optimizer: grim_autograd::OptimizerKind,
         /// LR scheduler (cosine-warmup, linear, polynomial, constant,
