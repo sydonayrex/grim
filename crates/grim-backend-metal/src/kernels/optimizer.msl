@@ -1,0 +1,72 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// On-Device Fused AdamW & Lion Optimizers
+// ---------------------------------------------------------------------------
+kernel void grim_fused_adamw(
+    device float* p [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* m [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    constant int& total [[buffer(4)]],
+    constant float& lr [[buffer(5)]],
+    constant float& beta1 [[buffer(6)]],
+    constant float& beta2 [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    constant float& weight_decay [[buffer(9)]],
+    constant float& bc1 [[buffer(10)]],
+    constant float& bc2 [[buffer(11)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (int(idx) >= total) return;
+
+    float grad = g[idx];
+    float param = p[idx];
+
+    if (weight_decay != 0.0f) {
+        param -= lr * weight_decay * param;
+    }
+
+    float m_val = beta1 * m[idx] + (1.0f - beta1) * grad;
+    float v_val = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
+
+    m[idx] = m_val;
+    v[idx] = v_val;
+
+    float m_hat = m_val / max(bc1, 1e-7f);
+    float v_hat = v_val / max(bc2, 1e-7f);
+
+    param -= lr * m_hat / (sqrt(v_hat) + eps);
+    p[idx] = param;
+}
+
+kernel void grim_fused_lion(
+    device float* p [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* exp_avg [[buffer(2)]],
+    constant int& total [[buffer(3)]],
+    constant float& lr [[buffer(4)]],
+    constant float& beta1 [[buffer(5)]],
+    constant float& beta2 [[buffer(6)]],
+    constant float& weight_decay [[buffer(7)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (int(idx) >= total) return;
+
+    float grad = g[idx];
+    float param = p[idx];
+    float m = exp_avg[idx];
+
+    if (weight_decay != 0.0f) {
+        param -= lr * weight_decay * param;
+    }
+
+    float c = beta1 * m + (1.0f - beta1) * grad;
+    float update = (c > 0.0f) ? 1.0f : ((c < 0.0f) ? -1.0f : 0.0f);
+
+    param -= lr * update;
+    p[idx] = param;
+
+    exp_avg[idx] = beta2 * m + (1.0f - beta2) * grad;
+}
