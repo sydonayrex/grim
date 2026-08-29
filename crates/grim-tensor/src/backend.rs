@@ -149,20 +149,13 @@ pub enum MemAdvice {
     CoarseGrain,
     FineGrain,
 }
+/// Core tensor primitives every backend MUST implement: allocation,
+/// GEMM, elementwise add/mul, activation/norm/softmax kernels, embedding
+/// gather, host upload, and memory advice.
+pub trait CoreTensorOps {
 
-/// Per-device compute primitive surface. `grim-tensor` dispatches through
-/// this trait and contains no device-specific code itself. Operations
-/// return both the result storage and a `ComputeHandle` that tracks the
-/// operation's completion.
-///
-/// # Safety Taxonomy
-/// Operations implemented by backends conform to the following three-tier model:
-/// - **Tier 1 — Safe-by-construction**: Safe Rust code utilizing type-safety rules.
-/// - **Tier 2 — Explicit `unsafe` with contract**: Backend operations that execute
-///   cross-FFI boundaries (e.g. CUDA/ROCm/Vulkan API calls) requiring caller-side contracts.
-/// - **Tier 3 — Raw hardware intrinsics**: Low-level instructions (e.g. LDS swizzling, inline GCN asm).
-pub trait BackendDevice: Send + Sync {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>>;
+
 
     /// 2-D `a @ b` matmul: `a` is `(M, K)`, `b` is `(K, N)`, returns `(M, N)`.
     fn matmul(
@@ -171,6 +164,7 @@ pub trait BackendDevice: Send + Sync {
         b: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
 
     /// 2-D matmul with explicit `solution_index` (passed through to rocBLAS).
     /// Default implementation falls back to `matmul` (solution_index = 0).
@@ -185,6 +179,7 @@ pub trait BackendDevice: Send + Sync {
         self.matmul(a, b, out)
     }
 
+
     /// Elementwise add of two equally-shaped tensors (with broadcast).
     fn add(
         &self,
@@ -193,6 +188,7 @@ pub trait BackendDevice: Send + Sync {
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
 
+
     /// Elementwise multiply.
     fn mul(
         &self,
@@ -200,6 +196,83 @@ pub trait BackendDevice: Send + Sync {
         b: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+
+    /// `y = silu(x) * gate` — for LLaMA-style swiglu, fold here for now.
+    fn silu_mul(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+
+    /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
+    fn rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+
+    /// In-place RMSNorm: operates directly on `x` storage when supported, avoiding extra allocation.
+    /// Default implementation falls back to `rms_norm`.
+    fn rms_norm_inplace(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let (_storage, handle) = self.rms_norm(x, weight, eps, out)?;
+        Ok(handle)
+    }
+
+
+    /// Softmax along the last dim.
+    fn softmax(
+        &self,
+        x: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+
+    /// Embedding gather: `out[i] = weight[indices[i], :]`.
+    /// `indices` is a host-side u32 vector of the same length as the leading
+    /// dim of `out`; the backend uses it to write the output storage.
+    fn embedding(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+
+    /// Copy a slice of F32 values from host memory to the device storage.
+    // `from_cpu` is the established workspace-wide device-API name ("construct
+    // this backend's storage from host data"); renaming it would churn every
+    // backend and call site for no semantic gain.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_cpu(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>>;
+
+
+    /// Provide hints about memory usage/advice patterns to the device/system.
+    /// Maps to OS-level `madvise` or backend-specific APIs like `hipMemAdvise`.
+    fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()>;
+}
+
+/// Scalar and binary elementwise ops plus device reductions. All methods
+/// have defaults (mostly `Err(Unimplemented)`; reductions fall back to
+/// the host). `div_scalar` decomposes into `mul_scalar` (see its doc).
+pub trait ElementwiseOps {
+
 
     /// Elementwise multiply by a scalar broadcast: `out = x * scalar`.
     ///
@@ -219,6 +292,7 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+
     /// Elementwise scalar addition: `out = x + scalar`.
     fn add_scalar(
         &self,
@@ -232,6 +306,7 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+
     /// Elementwise scalar subtraction: `out = x - scalar`.
     fn sub_scalar(
         &self,
@@ -244,6 +319,7 @@ pub trait BackendDevice: Send + Sync {
             "sub_scalar not implemented for this backend".into(),
         ))
     }
+
 
     /// Elementwise scalar division: `out = x / scalar`.
     ///
@@ -264,6 +340,98 @@ pub trait BackendDevice: Send + Sync {
         }
         self.mul_scalar(x, 1.0 / scalar, out_shape)
     }
+
+
+    /// Elementwise subtract: `out = a - b` (same shapes).
+    ///
+    /// Default returns `Err(Unimplemented)`; no host fallback exists because
+    /// a naive fallback would round-trip both operands through the host.
+    fn sub(
+        &self,
+        _a: &dyn BackendStorage,
+        _b: &dyn BackendStorage,
+        _out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "sub not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Sum of all elements as f32. Default is a host fallback
+    /// (`to_cpu_vec_f32` + fold) — backends with a reduction kernel
+    /// override this.
+    fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        if v.is_empty() {
+            return Err(crate::error::Error::Backend("reduce_sum: empty tensor".into()));
+        }
+        Ok(v.iter().sum())
+    }
+
+
+    /// Maximum of all elements as f32. Default is a host fallback; NaN
+    /// inputs lose the ordering comparison like `max_by` semantics.
+    fn reduce_max(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .copied()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| crate::error::Error::Backend("reduce_max: empty tensor".into()))
+    }
+
+
+    /// Index of the maximum element (last index wins ties, matching
+    /// `Iterator::max_by`). Default is a host
+    /// fallback — this is what [`Self::sample_on_device`]'s greedy path
+    /// needs and what a device argmax kernel would replace.
+    fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .ok_or_else(|| crate::error::Error::Backend("argmax: empty tensor".into()))
+    }
+
+
+    /// Elementwise square root: `out = sqrt(x)`.
+    ///
+    /// Used by the device-resident AdamW optimizer step to compute
+    /// `sqrt(v_hat) + eps` without a host round-trip. Default returns
+    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "sqrt not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Elementwise reciprocal: `out = 1.0 / x`.
+    ///
+    /// Used by the device-resident AdamW optimizer step to compute
+    /// `1.0 / (sqrt(v_hat) + eps)` without a host round-trip. Default returns
+    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "recip not implemented for this backend".into(),
+        ))
+    }
+}
+
+/// On-device sampling from logits storage.
+pub trait SamplingOps {
+
 
     /// Stochastic or greedy on-device sampling (WI-X3).
     /// Samples token index directly from logits storage with temperature, top_p, top_k, seed.
@@ -353,29 +521,21 @@ pub trait BackendDevice: Send + Sync {
         }
         Ok(probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0))
     }
+}
 
-    /// Fused 3-in-1 SwiGLU activation + dynamic quantization:
-    /// `y = silu(gate) * up`, dynamically computes block scale, and quantizes `y` to u8 bytes.
-    /// Returns `(quantized_bytes_storage, scales_storage, compute_handle)`.
-    fn silu_mul_quantize(
-        &self,
-        gate: &dyn BackendStorage,
-        up: &dyn BackendStorage,
-        format: crate::dtype::QuantFormat,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let (y_unquant, handle) = self.silu_mul(gate, up, out_shape)?;
-        let q_bytes = self.quantize(y_unquant.as_ref(), format)?;
-        let scale_storage = self.zeros(&Shape::from_slice(&[1]), crate::dtype::DType::F32)?;
-        Ok((q_bytes, scale_storage, handle))
-    }
+/// Attention kernel family: RoPE application, dense/ALiBi/paged/tree/
+/// flash/cross/sage attention, dequantized-KV attention, and MLA.
+pub trait AttentionOps {
+
 
     /// Block-Quantized SageAttention:
     /// INT8/FP8 block-scaled attention for ultra-long context windows (>128k tokens).
+    ///
+    /// Default: falls back to plain f32 [`Self::qkv_attention`] — correct
+    /// output, WRONG precision class for the name, and loud about it (a
+    /// warning is printed once per call site). Backends without a native
+    /// Sage kernel should override this or accept that benchmarks measure
+    /// f32 attention.
     fn sage_attention(
         &self,
         q: &dyn BackendStorage,
@@ -385,6 +545,10 @@ pub trait BackendDevice: Send + Sync {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        eprintln!(
+            "[grim-tensor] sage_attention: no native quantized-attention kernel on this \
+             backend — falling back to plain f32 qkv_attention"
+        );
         self.qkv_attention(
             q,
             k,
@@ -399,338 +563,6 @@ pub trait BackendDevice: Send + Sync {
         )
     }
 
-    /// Elementwise square root: `out = sqrt(x)`.
-    ///
-    /// Used by the device-resident AdamW optimizer step to compute
-    /// `sqrt(v_hat) + eps` without a host round-trip. Default returns
-    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
-    fn sqrt(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (x, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "sqrt not implemented for this backend".into(),
-        ))
-    }
-
-    /// Elementwise reciprocal: `out = 1.0 / x`.
-    ///
-    /// Used by the device-resident AdamW optimizer step to compute
-    /// `1.0 / (sqrt(v_hat) + eps)` without a host round-trip. Default returns
-    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
-    fn recip(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (x, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "recip not implemented for this backend".into(),
-        ))
-    }
-
-    /// On-device fused AdamW parameter update step:
-    /// `p`, `g`, `m`, `v` updated on device in a single kernel.
-    fn fused_adamw_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        m: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        weight_decay: f32,
-        bc1: f32,
-        bc2: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let _ = (
-            p,
-            g,
-            m,
-            v,
-            lr,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-            bc1,
-            bc2,
-            total,
-        );
-        Err(crate::error::Error::Unimplemented(
-            "fused_adamw_step not implemented for this backend".into(),
-        ))
-    }
-
-    /// On-device fused Lion parameter update step.
-    fn fused_lion_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        exp_avg: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        weight_decay: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let _ = (p, g, exp_avg, lr, beta1, beta2, weight_decay, total);
-        Err(crate::error::Error::Unimplemented(
-            "fused_lion_step not implemented for this backend".into(),
-        ))
-    }
-
-    /// On-device fused M-Adam parameter update step.
-    fn fused_madam_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        m: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        gamma: f32,
-        weight_decay: f32,
-        bc1: f32,
-        bc2: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let _ = (
-            p,
-            g,
-            m,
-            v,
-            lr,
-            beta1,
-            beta2,
-            eps,
-            gamma,
-            weight_decay,
-            bc1,
-            bc2,
-            total,
-        );
-        Err(crate::error::Error::Unimplemented(
-            "fused_madam_step not implemented for this backend".into(),
-        ))
-    }
-
-    /// `y = silu(x) * gate` — for LLaMA-style swiglu, fold here for now.
-    fn silu_mul(
-        &self,
-        gate: &dyn BackendStorage,
-        up: &dyn BackendStorage,
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
-
-    /// SwiGLU backward: `(df, de) = silu_mul_backward(gate, up, dw)`.
-    fn silu_mul_backward(
-        &self,
-        e: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        dw: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let _ = (e, g, dw, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "silu_mul_backward not implemented for this backend".into(),
-        ))
-    }
-
-    /// RMSNorm backward: `(dx, dw) = rmsnorm_backward(x, weight, out_grad, eps)`.
-    fn rmsnorm_backward(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        out_grad: &dyn BackendStorage,
-        eps: f32,
-        x_shape: &Shape,
-        w_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let _ = (x, weight, out_grad, eps, x_shape, w_shape);
-        Err(crate::error::Error::Unimplemented(
-            "rmsnorm_backward not implemented for this backend".into(),
-        ))
-    }
-
-    /// RoPE backward: `dx = rope_backward(out_grad, cos, sin)`.
-    fn rope_backward(
-        &self,
-        out_grad: &dyn BackendStorage,
-        cos: &dyn BackendStorage,
-        sin: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (out_grad, cos, sin, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "rope_backward not implemented for this backend".into(),
-        ))
-    }
-
-    /// Softmax backward: `dx = softmax_backward(out_grad, softmax_out)`.
-    fn softmax_backward(
-        &self,
-        out_grad: &dyn BackendStorage,
-        softmax_out: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (out_grad, softmax_out, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "softmax_backward not implemented for this backend".into(),
-        ))
-    }
-
-    /// Embedding backward: scatter-add token gradients into the embedding
-    /// weight gradient — `dweight[token_ids[t], :] += out_grad[t, :]`.
-    ///
-    /// `token_ids` is a host-side slice; GPU backends upload it as a small
-    /// U32 buffer. The returned storage has shape `[vocab_size, hidden_dim]`.
-    fn embedding_backward(
-        &self,
-        out_grad: &dyn BackendStorage,
-        token_ids: &[u32],
-        vocab_size: usize,
-        hidden_dim: usize,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (out_grad, token_ids, vocab_size, hidden_dim);
-        Err(crate::error::Error::Unimplemented(
-            "embedding_backward not implemented for this backend".into(),
-        ))
-    }
-
-    /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
-    fn rms_norm(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
-
-    /// In-place RMSNorm: operates directly on `x` storage when supported, avoiding extra allocation.
-    /// Default implementation falls back to `rms_norm`.
-    fn rms_norm_inplace(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out: &Shape,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let (_storage, handle) = self.rms_norm(x, weight, eps, out)?;
-        Ok(handle)
-    }
-
-    /// Fused Add + RMSNorm: `res_out = x + residual`, `y_out = rms_norm(res_out, weight, eps)`.
-    /// Returns `(y_out, res_out, compute_handle)`.
-    fn fused_add_rms_norm(
-        &self,
-        x: &dyn BackendStorage,
-        residual: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let (res_out, _) = self.add(x, residual, out_shape)?;
-        let (y_out, handle) = self.rms_norm(res_out.as_ref(), weight, eps, out_shape)?;
-        Ok((y_out, res_out, handle))
-    }
-
-    /// Softmax along the last dim.
-    fn softmax(
-        &self,
-        x: &dyn BackendStorage,
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
-
-    /// Embedding gather: `out[i] = weight[indices[i], :]`.
-    /// `indices` is a host-side u32 vector of the same length as the leading
-    /// dim of `out`; the backend uses it to write the output storage.
-    fn embedding(
-        &self,
-        weight: &dyn BackendStorage,
-        indices: &[u32],
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
-
-    /// Copy a slice of F32 values from host memory to the device storage.
-    // `from_cpu` is the established workspace-wide device-API name ("construct
-    // this backend's storage from host data"); renaming it would churn every
-    // backend and call site for no semantic gain.
-    #[allow(clippy::wrong_self_convention)]
-    fn from_cpu(
-        &self,
-        data: &[f32],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>>;
-
-    /// Copy raw byte slice (for packed quantized representations) from host memory to device storage.
-    #[allow(clippy::wrong_self_convention)]
-    fn from_cpu_bytes(
-        &self,
-        data: &[u8],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        let _ = (data, shape, dtype);
-        Err(crate::error::Error::Unimplemented(
-            "from_cpu_bytes not implemented for this backend".into(),
-        ))
-    }
-
-    /// Allocate an uninitialized storage of the given shape on this backend.
-    ///
-    /// Used to pre-allocate the device-resident KV cache arena so decode
-    /// steps can append new rows with `copy_slice_into` instead of
-    /// re-uploading the whole cache through host memory. Contents are
-    /// undefined until written.
-    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
-        let _ = (shape, dtype);
-        Err(crate::error::Error::Unimplemented(
-            "alloc_storage not implemented for this backend".into(),
-        ))
-    }
-
-    /// Device-to-device copy of `count` contiguous F32 elements from `src`
-    /// into `dst` starting at flat element `dst_elem_offset`.
-    ///
-    /// Powers the zero-roundtrip KV cache: only the newly produced K/V rows
-    /// are copied into the device-resident cache arena; the host never sees
-    /// the cache contents.
-    fn copy_slice_into(
-        &self,
-        _dst: &dyn BackendStorage,
-        _src: &dyn BackendStorage,
-        _dst_elem_offset: usize,
-        _count: usize,
-    ) -> Result<()> {
-        Err(crate::error::Error::Unimplemented(
-            "copy_slice_into not implemented for this backend".into(),
-        ))
-    }
-
-    /// Provide hints about memory usage/advice patterns to the device/system.
-    /// Maps to OS-level `madvise` or backend-specific APIs like `hipMemAdvise`.
-    fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()>;
 
     /// Fused dequantized KV-attention (P1-WI-2).
     ///
@@ -766,6 +598,7 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+
     /// Rotary position embedding (RoPE) application on Q or K tensor.
     fn rope(
         &self,
@@ -779,6 +612,7 @@ pub trait BackendDevice: Send + Sync {
             "rope not implemented for this backend".into(),
         ))
     }
+
 
     /// Fused Re-RoPE (Position Retargeting): Un-rotate Key tensor from `old_positions`
     /// and re-rotate to `new_positions` in a single pass without re-prefill.
@@ -795,6 +629,328 @@ pub trait BackendDevice: Send + Sync {
             "rerope not implemented for this backend".into(),
         ))
     }
+
+
+    /// MLA normalization and projection split on device.
+    fn mla_q_kv_norm_split(
+        &self,
+        q_raw: &dyn BackendStorage,
+        kv_raw: &dyn BackendStorage,
+        q_norm_w: &dyn BackendStorage,
+        kv_norm_w: &dyn BackendStorage,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_dim: usize,
+        eps: f32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let _ = (
+            q_raw,
+            kv_raw,
+            q_norm_w,
+            kv_norm_w,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_dim,
+            eps,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "mla_q_kv_norm_split not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Matrix-absorbed MLA decode (DeepSeek-family multi-latent attention).
+    ///
+    /// Contracts:
+    /// - `q_absorbed`: `[1, num_heads, kv_lora_rank]` — query with `w_kc`
+    ///   absorbed (q_nope @ w_kcᵀ), post-RoPE handling
+    /// - `q_rope`: `[1, num_heads, qk_rope_dim]` — rotated query part
+    /// - `kv_cache`: `[seq_len, num_kv_heads(=1), kv_lora_rank + qk_rope_dim]`
+    ///   — compressed latent KV (kv_a_layernorm'ed c_kv + rope key)
+    /// - `w_uv`: `[num_heads * v_head_dim, kv_lora_rank]` — absorbed
+    ///   up+value projection (optional; None ⇒ output stays in latent space)
+    /// - `out_shape`: `[1, num_heads, v_head_dim]`
+    ///
+    /// Scale: `1/sqrt(kv_lora_rank + qk_rope_dim)`.
+    ///
+    /// Default: returns `Err(Unimplemented)`; loaders fall back to the
+    /// scalar latent-space loop.
+    fn mla_absorbed_decode(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "mla_absorbed_decode not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// QKV attention calculation on device.
+    ///
+    /// Contracts:
+    /// - `q`: `[seq_len, num_heads, head_dim]` (prefill) or `[1, num_heads, head_dim]` (decode)
+    /// - `k`: `[kv_seq_len, num_kv_heads, head_dim]` contiguous KV-cache buffer
+    /// - `v`: `[kv_seq_len, num_kv_heads, head_dim]` contiguous KV-cache buffer
+    /// - `num_kv_heads`: real call-site parameter (GQA ratio = num_heads / num_kv_heads)
+    /// - `kv_seq_len`:  length of the K/V cache being attended to
+    /// - `cache_offset`: absolute position of `q[0, *, *]` (for causal masking)
+    /// - `window`: optional sliding window size (e.g. `Some(512)` for Laguna-S-2.1)
+    /// - `out_shape`:  `[seq_len, num_heads, head_dim]`
+    /// - `out_max`/`out_sum`: optional flash-attention-style statistics buffers
+    ///
+    /// Causal masking: query at absolute position `(cache_offset + i)` attends
+    /// only to key positions `j` with `j <= cache_offset + i` and `j >= cache_offset + i - window + 1`.
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            out_shape,
+            out_max,
+            out_sum,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// QKV attention with ALiBi position bias (baichuan/mpt/jais/gptneox
+    /// class models). Same contract as [`BackendDevice::qkv_attention`], plus
+    /// `alibi_slopes`: `[num_heads]` per-head slopes. Score bias for query at
+    /// absolute position `i` and key at `j` is `slopes[h] * (j - i)`.
+    ///
+    /// Default: `Err(Unimplemented)` — callers fall back to
+    /// `qkv_attention`-style host paths.
+    fn qkv_attention_alibi(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        alibi_slopes: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            alibi_slopes,
+            out_shape,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_alibi not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Paged (block-table) attention for KV-cache-serving with paged memory.
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            q,
+            block_tables,
+            k_pages,
+            v_pages,
+            num_kv_heads,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            window,
+            out_shape,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_paged not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Tree attention for Speculative Decoding (DSpark / Medusa).
+    ///
+    /// Dispatches a tree-attention kernel that verifies multiple draft
+    /// positions against the target model's KV cache in a single kernel
+    /// launch. `tree_parents` encodes the draft tree structure.
+    ///
+    /// Default: returns `Err(Unimplemented)`. Only backends with a tree
+    /// attention kernel override this.
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            q,
+            k,
+            v,
+            tree_parents,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "tree_attention not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// FlashAttention (Phase 2 — mambo5.md Item 12).
+    ///
+    /// Online-softmax attention with causal mask and GQA head-sharing.
+    /// Default returns `Err(Unimplemented)`.
+    fn flash_attention(
+        &self,
+        _q: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
+        _causal: bool,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "flash_attention requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+
+    /// Cross-attention for Whisper decoder (Phase 2 — mambo5.md Item 13).
+    ///
+    /// Encoder K/V projected once, reused across decoder steps.
+    /// Default returns `Err(Unimplemented)`.
+    fn cross_attention(
+        &self,
+        _q: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _num_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
+        _kv_seq_len: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "cross_attention requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+}
+
+/// Fused epilogue/activation kernels that collapse multiple primitives
+/// into one launch. Defaults decompose into core ops.
+pub trait FusionOps: CoreTensorOps + QuantOps {
+
+
+    /// Fused 3-in-1 SwiGLU activation + dynamic quantization:
+    /// `y = silu(gate) * up`, dynamically computes block scale, and quantizes `y` to u8 bytes.
+    /// Returns `(quantized_bytes_storage, scales_storage, compute_handle)`.
+    fn silu_mul_quantize(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        format: crate::dtype::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let (y_unquant, handle) = self.silu_mul(gate, up, out_shape)?;
+        let q_bytes = self.quantize(y_unquant.as_ref(), format)?;
+        let scale_storage = self.zeros(&Shape::from_slice(&[1]), crate::dtype::DType::F32)?;
+        Ok((q_bytes, scale_storage, handle))
+    }
+
+
+    /// Fused Add + RMSNorm: `res_out = x + residual`, `y_out = rms_norm(res_out, weight, eps)`.
+    /// Returns `(y_out, res_out, compute_handle)`.
+    fn fused_add_rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let (res_out, _) = self.add(x, residual, out_shape)?;
+        let (y_out, handle) = self.rms_norm(res_out.as_ref(), weight, eps, out_shape)?;
+        Ok((y_out, res_out, handle))
+    }
+
 
     /// LFM2-style fused QKV projection: MXFP4 GEMM (`x @ W_qkv`) followed by
     /// per-head QK-Norm (separate `gamma_q` / `gamma_k`) + RoPE (YaRN-aware via
@@ -852,6 +1008,7 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+
     /// Broadcast a 1-D bias tensor `[out_dim]` into 2-D shape `[batch, out_dim]`.
     ///
     /// Contract: replicates the 1-D bias row `batch` times into `out_shape`.
@@ -868,6 +1025,7 @@ pub trait BackendDevice: Send + Sync {
             "broadcast_bias not implemented for this backend".into(),
         ))
     }
+
 
     /// In-place scale+bias epilogue on a `[batch, out_dim]` GEMM output.
     ///
@@ -893,456 +1051,101 @@ pub trait BackendDevice: Send + Sync {
             "scale_bias_epilogue not implemented for this backend".into(),
         ))
     }
+}
 
-    /// Depthwise 1D causal convolution decode step on device.
-    fn short_conv1d_causal_step(
+/// Backward-pass kernels and the LoRA accumulator. Defaults are
+/// `Err(Unimplemented)` except `lora_accumulate`, which decomposes into
+/// core matmul/add/mul (with host transposes).
+pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
+
+
+    /// SwiGLU backward: `(df, de) = silu_mul_backward(gate, up, dw)`.
+    fn silu_mul_backward(
         &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        bias: Option<&dyn BackendStorage>,
-        state: &dyn BackendStorage,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (x, weight, bias, state, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "short_conv1d_causal_step not implemented for this backend".into(),
-        ))
-    }
-
-    /// Fuse recurrent gating step for KDA (gated delta rule).
-    fn kda_gated_delta_rule_step(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        beta: &dyn BackendStorage,
-        a_gate: &dyn BackendStorage,
-        recurrent_state: &dyn BackendStorage,
-        d_k: usize,
-        d_v: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (q, k, v, beta, a_gate, recurrent_state, d_k, d_v, out_shape);
-        Err(crate::error::Error::Unimplemented(
-            "kda_gated_delta_rule_step not implemented for this backend".into(),
-        ))
-    }
-
-    /// MLA normalization and projection split on device.
-    fn mla_q_kv_norm_split(
-        &self,
-        q_raw: &dyn BackendStorage,
-        kv_raw: &dyn BackendStorage,
-        q_norm_w: &dyn BackendStorage,
-        kv_norm_w: &dyn BackendStorage,
-        qk_nope_dim: usize,
-        qk_rope_dim: usize,
-        v_dim: usize,
-        eps: f32,
     ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
         Box<dyn BackendStorage>,
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
-        let _ = (
-            q_raw,
-            kv_raw,
-            q_norm_w,
-            kv_norm_w,
-            qk_nope_dim,
-            qk_rope_dim,
-            v_dim,
-            eps,
-        );
+        let _ = (e, g, dw, out_shape);
         Err(crate::error::Error::Unimplemented(
-            "mla_q_kv_norm_split not implemented for this backend".into(),
+            "silu_mul_backward not implemented for this backend".into(),
         ))
     }
 
-    /// Matrix-absorbed MLA decode (DeepSeek-family multi-latent attention).
-    ///
-    /// Contracts:
-    /// - `q_absorbed`: `[1, num_heads, kv_lora_rank]` — query with `w_kc`
-    ///   absorbed (q_nope @ w_kcᵀ), post-RoPE handling
-    /// - `q_rope`: `[1, num_heads, qk_rope_dim]` — rotated query part
-    /// - `kv_cache`: `[seq_len, num_kv_heads(=1), kv_lora_rank + qk_rope_dim]`
-    ///   — compressed latent KV (kv_a_layernorm'ed c_kv + rope key)
-    /// - `w_uv`: `[num_heads * v_head_dim, kv_lora_rank]` — absorbed
-    ///   up+value projection (optional; None ⇒ output stays in latent space)
-    /// - `out_shape`: `[1, num_heads, v_head_dim]`
-    ///
-    /// Scale: `1/sqrt(kv_lora_rank + qk_rope_dim)`.
-    ///
-    /// Default: returns `Err(Unimplemented)`; loaders fall back to the
-    /// scalar latent-space loop.
-    fn mla_absorbed_decode(
+
+    /// RMSNorm backward: `(dx, dw) = rmsnorm_backward(x, weight, out_grad, eps)`.
+    fn rmsnorm_backward(
         &self,
-        q_absorbed: &dyn BackendStorage,
-        q_rope: &dyn BackendStorage,
-        kv_cache: &dyn BackendStorage,
-        w_uv: Option<&dyn BackendStorage>,
-        out: &dyn BackendStorage,
-        num_heads: usize,
-        kv_lora_rank: usize,
-        qk_rope_dim: usize,
-        v_head_dim: usize,
-        seq_len: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let _ = (
-            q_absorbed,
-            q_rope,
-            kv_cache,
-            w_uv,
-            out,
-            num_heads,
-            kv_lora_rank,
-            qk_rope_dim,
-            v_head_dim,
-            seq_len,
-        );
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        out_grad: &dyn BackendStorage,
+        eps: f32,
+        x_shape: &Shape,
+        w_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let _ = (x, weight, out_grad, eps, x_shape, w_shape);
         Err(crate::error::Error::Unimplemented(
-            "mla_absorbed_decode not implemented for this backend".into(),
+            "rmsnorm_backward not implemented for this backend".into(),
         ))
     }
 
-    /// QKV attention calculation on device.
-    ///
-    /// Contracts:
-    /// - `q`: `[seq_len, num_heads, head_dim]` (prefill) or `[1, num_heads, head_dim]` (decode)
-    /// - `k`: `[kv_seq_len, num_kv_heads, head_dim]` contiguous KV-cache buffer
-    /// - `v`: `[kv_seq_len, num_kv_heads, head_dim]` contiguous KV-cache buffer
-    /// - `num_kv_heads`: real call-site parameter (GQA ratio = num_heads / num_kv_heads)
-    /// - `kv_seq_len`:  length of the K/V cache being attended to
-    /// - `cache_offset`: absolute position of `q[0, *, *]` (for causal masking)
-    /// - `window`: optional sliding window size (e.g. `Some(512)` for Laguna-S-2.1)
-    /// - `out_shape`:  `[seq_len, num_heads, head_dim]`
-    /// - `out_max`/`out_sum`: optional flash-attention-style statistics buffers
-    ///
-    /// Causal masking: query at absolute position `(cache_offset + i)` attends
-    /// only to key positions `j` with `j <= cache_offset + i` and `j >= cache_offset + i - window + 1`.
-    fn qkv_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        window: Option<usize>,
-        out_shape: &Shape,
-        out_max: Option<&dyn BackendStorage>,
-        out_sum: Option<&dyn BackendStorage>,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (
-            q,
-            k,
-            v,
-            num_kv_heads,
-            kv_seq_len,
-            cache_offset,
-            window,
-            out_shape,
-            out_max,
-            out_sum,
-        );
-        Err(crate::error::Error::Unimplemented(
-            "qkv_attention not implemented for this backend".into(),
-        ))
-    }
 
-    /// QKV attention with ALiBi position bias (baichuan/mpt/jais/gptneox
-    /// class models). Same contract as [`BackendDevice::qkv_attention`], plus
-    /// `alibi_slopes`: `[num_heads]` per-head slopes. Score bias for query at
-    /// absolute position `i` and key at `j` is `slopes[h] * (j - i)`.
-    ///
-    /// Default: `Err(Unimplemented)` — callers fall back to
-    /// `qkv_attention`-style host paths.
-    fn qkv_attention_alibi(
+    /// RoPE backward: `dx = rope_backward(out_grad, cos, sin)`.
+    fn rope_backward(
         &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        window: Option<usize>,
-        alibi_slopes: &dyn BackendStorage,
+        out_grad: &dyn BackendStorage,
+        cos: &dyn BackendStorage,
+        sin: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (
-            q,
-            k,
-            v,
-            num_kv_heads,
-            kv_seq_len,
-            cache_offset,
-            window,
-            alibi_slopes,
-            out_shape,
-        );
+        let _ = (out_grad, cos, sin, out_shape);
         Err(crate::error::Error::Unimplemented(
-            "qkv_attention_alibi not implemented for this backend".into(),
+            "rope_backward not implemented for this backend".into(),
         ))
     }
 
-    /// Paged (block-table) attention for KV-cache-serving with paged memory.
-    fn qkv_attention_paged(
+
+    /// Softmax backward: `dx = softmax_backward(out_grad, softmax_out)`.
+    fn softmax_backward(
         &self,
-        q: &dyn BackendStorage,
-        block_tables: &dyn BackendStorage,
-        k_pages: &dyn BackendStorage,
-        v_pages: &dyn BackendStorage,
-        num_kv_heads: usize,
-        max_blocks: usize,
-        page_size: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        window: Option<usize>,
+        out_grad: &dyn BackendStorage,
+        softmax_out: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (
-            q,
-            block_tables,
-            k_pages,
-            v_pages,
-            num_kv_heads,
-            max_blocks,
-            page_size,
-            kv_seq_len,
-            cache_offset,
-            window,
-            out_shape,
-        );
+        let _ = (out_grad, softmax_out, out_shape);
         Err(crate::error::Error::Unimplemented(
-            "qkv_attention_paged not implemented for this backend".into(),
+            "softmax_backward not implemented for this backend".into(),
         ))
     }
 
-    /// Tree attention for Speculative Decoding (DSpark / Medusa).
+
+    /// Embedding backward: scatter-add token gradients into the embedding
+    /// weight gradient — `dweight[token_ids[t], :] += out_grad[t, :]`.
     ///
-    /// Dispatches a tree-attention kernel that verifies multiple draft
-    /// positions against the target model's KV cache in a single kernel
-    /// launch. `tree_parents` encodes the draft tree structure.
-    ///
-    /// Default: returns `Err(Unimplemented)`. Only backends with a tree
-    /// attention kernel override this.
-    fn tree_attention(
+    /// `token_ids` is a host-side slice; GPU backends upload it as a small
+    /// U32 buffer. The returned storage has shape `[vocab_size, hidden_dim]`.
+    fn embedding_backward(
         &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        tree_parents: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        out_shape: &Shape,
+        out_grad: &dyn BackendStorage,
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_dim: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (
-            q,
-            k,
-            v,
-            tree_parents,
-            num_kv_heads,
-            kv_seq_len,
-            cache_offset,
-            out_shape,
-        );
+        let _ = (out_grad, token_ids, vocab_size, hidden_dim);
         Err(crate::error::Error::Unimplemented(
-            "tree_attention not implemented for this backend".into(),
+            "embedding_backward not implemented for this backend".into(),
         ))
     }
 
-    /// Begin capturing execution calls into a hardware compute graph (e.g. HIP graph).
-    fn begin_graph_capture(&self, key: &str) -> Result<()> {
-        let _ = key;
-        Err(crate::error::Error::Unimplemented(
-            "graph capture not supported on this device backend".into(),
-        ))
-    }
-
-    /// End graph capture and instantiate the graph executable under `key`.
-    fn end_graph_capture(&self, key: &str) -> Result<()> {
-        let _ = key;
-        Err(crate::error::Error::Unimplemented(
-            "graph capture not supported on this device backend".into(),
-        ))
-    }
-
-    /// Replay the graph captured under `key`. Returns Ok(true) if replayed, Ok(false) if missing.
-    fn replay_graph(&self, key: &str) -> Result<bool> {
-        let _ = key;
-        Ok(false)
-    }
-
-    /// Check whether a graph executable is stored under `key`.
-    fn has_captured_graph(&self, key: &str) -> bool {
-        let _ = key;
-        false
-    }
-
-    /// All-Reduce collective operation across tensor-parallel devices (§4.1).
-    fn all_reduce(
-        &self,
-        inputs: &[&dyn BackendStorage],
-        op: &str,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (inputs, op);
-        Err(crate::error::Error::Unimplemented(
-            "all_reduce not implemented for this backend".into(),
-        ))
-    }
-
-    /// SCYTHE-2 CommFuse decomposed P2P fan-in (WI-1 / WI-6).
-    ///
-    /// Replaces `all_reduce` for `RowParallelLinear`: instead of a
-    /// `reduce_scatter` + `all_gather` pair (two sync points), each rank
-    /// P2P-pushes its partial directly to the rank that owns that output shard.
-    /// This eliminates the tail latency identified in CommFuse (`2604.24013`).
-    ///
-    /// `partials` is a slice of `(storage, placement)` pairs — one per GPU rank
-    /// — where `storage` is that rank's partial GEMM output and `placement` is
-    /// the controller-assigned routing metadata.
-    ///
-    /// Default: returns `Err(Unimplemented)` so non-ROCm backends compile
-    /// unchanged. The ROCm backend overrides this in WI-6.
-    fn comm_fuse_reduce(
-        &self,
-        partials: &[(&dyn BackendStorage, &ScythePlacement)],
-    ) -> Result<Box<dyn BackendStorage>> {
-        let _ = partials;
-        Err(crate::error::Error::Unimplemented(
-            "comm_fuse_reduce not implemented on this backend".into(),
-        ))
-    }
-
-    /// WaveTune bilinear latency predictor (WI-1).
-    ///
-    /// Returns estimated milliseconds for a `(M, N, K)` GEMM under the given
-    /// `placement` on this device. Used by `C2plrController::decide_miss()` to
-    /// rank candidate placements — this is the *offline table-lookup* path
-    /// described in WaveTune (`2604.10187` §4.4–4.5), not a candidate-loop.
-    ///
-    /// Default: returns `f64::INFINITY` so the controller treats this backend
-    /// as infinitely expensive and routes away from it (safe fallback).
-    fn estimate_gemm_latency_ms(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        dtype: DType,
-        placement: &ScythePlacement,
-    ) -> f64 {
-        let _ = (m, n, k, dtype, placement);
-        f64::INFINITY
-    }
-
-    /// Mamba selective scan (Phase 2 — mambo5.md Item 11).
-    ///
-    /// Computes the recurrent hidden-state update `h_t = a * h_{t-1} + x_t * b_t`
-    /// in parallel over the `n` (d_inner) dimension. Default returns
-    /// `Err(Unimplemented)` so backends without a wired kernel are unaffected;
-    /// only the ROCm backend overrides this with the real HIP launch.
-    fn selective_scan(
-        &self,
-        _x: &dyn BackendStorage,
-        _a: &dyn BackendStorage,
-        _b: &dyn BackendStorage,
-        _c: &dyn BackendStorage,
-        _d: &dyn BackendStorage,
-        _state: &dyn BackendStorage,
-        _batch: usize,
-        _dim_dstate: usize,
-        _dim_dinner: usize,
-        _seq_len: usize,
-        _out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(crate::error::Error::Unimplemented(
-            "selective_scan requires a GPU backend with a wired HIP kernel (ROCm)".into(),
-        ))
-    }
-
-    /// FlashAttention (Phase 2 — mambo5.md Item 12).
-    ///
-    /// Online-softmax attention with causal mask and GQA head-sharing.
-    /// Default returns `Err(Unimplemented)`.
-    fn flash_attention(
-        &self,
-        _q: &dyn BackendStorage,
-        _k: &dyn BackendStorage,
-        _v: &dyn BackendStorage,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _seq_len: usize,
-        _causal: bool,
-        _out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(crate::error::Error::Unimplemented(
-            "flash_attention requires a GPU backend with a wired HIP kernel (ROCm)".into(),
-        ))
-    }
-
-    /// Cross-attention for Whisper decoder (Phase 2 — mambo5.md Item 13).
-    ///
-    /// Encoder K/V projected once, reused across decoder steps.
-    /// Default returns `Err(Unimplemented)`.
-    fn cross_attention(
-        &self,
-        _q: &dyn BackendStorage,
-        _k: &dyn BackendStorage,
-        _v: &dyn BackendStorage,
-        _num_heads: usize,
-        _head_dim: usize,
-        _seq_len: usize,
-        _kv_seq_len: usize,
-        _out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(crate::error::Error::Unimplemented(
-            "cross_attention requires a GPU backend with a wired HIP kernel (ROCm)".into(),
-        ))
-    }
-
-    /// RWKV time-mix kernel (Phase 2 — mambo5.md Item 14).
-    ///
-    /// Recurrent linear attention with decay vector w, sigmoid gating.
-    /// Default returns `Err(Unimplemented)`.
-    fn rwkv_time_mix(
-        &self,
-        _x: &dyn BackendStorage,
-        _w: &dyn BackendStorage,
-        _k: &dyn BackendStorage,
-        _v: &dyn BackendStorage,
-        _g: &dyn BackendStorage,
-        _batch: usize,
-        _dim: usize,
-        _seq_len: usize,
-        _out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(crate::error::Error::Unimplemented(
-            "rwkv_time_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
-        ))
-    }
-
-    /// RWKV channel-mix kernel (Phase 2 — mambo5.md Item 14).
-    ///
-    /// RWKV-5/6 FFN-like gating with sigmoid.
-    /// Default returns `Err(Unimplemented)`.
-    fn rwkv_channel_mix(
-        &self,
-        _x: &dyn BackendStorage,
-        _k: &dyn BackendStorage,
-        _r: &dyn BackendStorage,
-        _v: &dyn BackendStorage,
-        _batch: usize,
-        _dim: usize,
-        _out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(crate::error::Error::Unimplemented(
-            "rwkv_channel_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
-        ))
-    }
 
     /// Fused LoRA accumulator: `out = base + scale * (x @ A^T) @ B^T`.
     fn lora_accumulate(
@@ -1423,13 +1226,23 @@ pub trait BackendDevice: Send + Sync {
             self.matmul(h_storage.as_ref(), b_t_storage.as_ref(), &delta_2d_shape)?;
         delta_handle.synchronize()?;
 
-        let scale_buf = self.from_cpu(
-            &vec![scale; out_shape.elem_count()],
-            &delta_2d_shape,
-            DType::F32,
-        )?;
+        let scale_buf_storage;
         let (scaled_delta_storage, scaled_delta_handle) =
-            self.mul(delta_storage.as_ref(), scale_buf.as_ref(), &delta_2d_shape)?;
+            match self.mul_scalar(delta_storage.as_ref(), scale, &delta_2d_shape) {
+                // Kernel path: no broadcast buffer, no upload.
+                Ok((scaled, handle)) => (scaled, handle),
+                // ponytail: broadcast-buffer fallback — per-call
+                // out_shape.elem_count() upload. Upgrade path: a
+                // backend-owned scaled-add epilogue kernel.
+                Err(_) => {
+                    scale_buf_storage = self.from_cpu(
+                        &vec![scale; out_shape.elem_count()],
+                        &delta_2d_shape,
+                        DType::F32,
+                    )?;
+                    self.mul(delta_storage.as_ref(), scale_buf_storage.as_ref(), &delta_2d_shape)?
+                }
+            };
         scaled_delta_handle.synchronize()?;
 
         let owned_base_2d;
@@ -1458,6 +1271,109 @@ pub trait BackendDevice: Send + Sync {
             ))
         }
     }
+}
+
+/// Device-resident fused optimizer steps (AdamW, Lion, M-Adam).
+pub trait OptimizerOps {
+
+
+    /// On-device fused AdamW parameter update step:
+    /// `p`, `g`, `m`, `v` updated on device in a single kernel.
+    fn fused_adamw_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            p,
+            g,
+            m,
+            v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            bc1,
+            bc2,
+            total,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "fused_adamw_step not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// On-device fused Lion parameter update step.
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (p, g, exp_avg, lr, beta1, beta2, weight_decay, total);
+        Err(crate::error::Error::Unimplemented(
+            "fused_lion_step not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// On-device fused M-Adam parameter update step.
+    fn fused_madam_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        gamma: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            p,
+            g,
+            m,
+            v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            gamma,
+            weight_decay,
+            bc1,
+            bc2,
+            total,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "fused_madam_step not implemented for this backend".into(),
+        ))
+    }
+}
+
+/// Quantized GEMM family and on-device quantization kernels.
+pub trait QuantOps {
+
 
     /// Fused dequantized matmul forward (`C = A @ B_dequant^T`).
     ///
@@ -1475,6 +1391,7 @@ pub trait BackendDevice: Send + Sync {
             "quantized_matmul requires a backend with fused dequantized matmul kernels".into(),
         ))
     }
+
 
     /// Fused dequantized matmul backward (WI-T3 / F5).
     ///
@@ -1502,6 +1419,7 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+
     /// Quantize a device-resident F32 tensor into a packed quantized representation,
     /// entirely on-device — no D2H/H2D round-trip.
     ///
@@ -1525,6 +1443,7 @@ pub trait BackendDevice: Send + Sync {
             "quantize not implemented for this backend".into(),
         ))
     }
+
 
     /// Fused quantize + matmul: quantize the left operand `a` on-the-fly to
     /// `format`, then compute `out = a_quant @ b`.
@@ -1552,21 +1471,302 @@ pub trait BackendDevice: Send + Sync {
     }
 }
 
-/// Blanket `BackendDevice` impl for `Arc<T>`.
+/// Recurrent / SSM kernel family: causal conv step, gated delta rule,
+/// selective scan, RWKV time/channel mix.
+pub trait RecurrentOps {
+
+
+    /// Depthwise 1D causal convolution decode step on device.
+    fn short_conv1d_causal_step(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, weight, bias, state, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "short_conv1d_causal_step not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Fuse recurrent gating step for KDA (gated delta rule).
+    fn kda_gated_delta_rule_step(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        a_gate: &dyn BackendStorage,
+        recurrent_state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (q, k, v, beta, a_gate, recurrent_state, d_k, d_v, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "kda_gated_delta_rule_step not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Mamba selective scan (Phase 2 — mambo5.md Item 11).
+    ///
+    /// Computes the recurrent hidden-state update `h_t = a * h_{t-1} + x_t * b_t`
+    /// in parallel over the `n` (d_inner) dimension. Default returns
+    /// `Err(Unimplemented)` so backends without a wired kernel are unaffected;
+    /// only the ROCm backend overrides this with the real HIP launch.
+    fn selective_scan(
+        &self,
+        _x: &dyn BackendStorage,
+        _a: &dyn BackendStorage,
+        _b: &dyn BackendStorage,
+        _c: &dyn BackendStorage,
+        _d: &dyn BackendStorage,
+        _state: &dyn BackendStorage,
+        _batch: usize,
+        _dim_dstate: usize,
+        _dim_dinner: usize,
+        _seq_len: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "selective_scan requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+
+    /// RWKV time-mix kernel (Phase 2 — mambo5.md Item 14).
+    ///
+    /// Recurrent linear attention with decay vector w, sigmoid gating.
+    /// Default returns `Err(Unimplemented)`.
+    fn rwkv_time_mix(
+        &self,
+        _x: &dyn BackendStorage,
+        _w: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _g: &dyn BackendStorage,
+        _batch: usize,
+        _dim: usize,
+        _seq_len: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "rwkv_time_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+
+    /// RWKV channel-mix kernel (Phase 2 — mambo5.md Item 14).
+    ///
+    /// RWKV-5/6 FFN-like gating with sigmoid.
+    /// Default returns `Err(Unimplemented)`.
+    fn rwkv_channel_mix(
+        &self,
+        _x: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _r: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _batch: usize,
+        _dim: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "rwkv_channel_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+}
+
+/// Tensor-parallel collectives and GEMM latency prediction.
+pub trait CollectiveOps {
+
+
+    /// All-Reduce collective operation across tensor-parallel devices (§4.1).
+    fn all_reduce(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        op: &str,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (inputs, op);
+        Err(crate::error::Error::Unimplemented(
+            "all_reduce not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// SCYTHE-2 CommFuse decomposed P2P fan-in (WI-1 / WI-6).
+    ///
+    /// Replaces `all_reduce` for `RowParallelLinear`: instead of a
+    /// `reduce_scatter` + `all_gather` pair (two sync points), each rank
+    /// P2P-pushes its partial directly to the rank that owns that output shard.
+    /// This eliminates the tail latency identified in CommFuse (`2604.24013`).
+    ///
+    /// `partials` is a slice of `(storage, placement)` pairs — one per GPU rank
+    /// — where `storage` is that rank's partial GEMM output and `placement` is
+    /// the controller-assigned routing metadata.
+    ///
+    /// Default: returns `Err(Unimplemented)` so non-ROCm backends compile
+    /// unchanged. The ROCm backend overrides this in WI-6.
+    fn comm_fuse_reduce(
+        &self,
+        partials: &[(&dyn BackendStorage, &ScythePlacement)],
+    ) -> Result<Box<dyn BackendStorage>> {
+        let _ = partials;
+        Err(crate::error::Error::Unimplemented(
+            "comm_fuse_reduce not implemented on this backend".into(),
+        ))
+    }
+
+
+    /// WaveTune bilinear latency predictor (WI-1).
+    ///
+    /// Returns estimated milliseconds for a `(M, N, K)` GEMM under the given
+    /// `placement` on this device. Used by `C2plrController::decide_miss()` to
+    /// rank candidate placements — this is the *offline table-lookup* path
+    /// described in WaveTune (`2604.10187` §4.4–4.5), not a candidate-loop.
+    ///
+    /// Default: returns `f64::INFINITY` so the controller treats this backend
+    /// as infinitely expensive and routes away from it (safe fallback).
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        placement: &ScythePlacement,
+    ) -> f64 {
+        let _ = (m, n, k, dtype, placement);
+        f64::INFINITY
+    }
+}
+
+/// Raw storage management: byte upload, uninitialized allocation,
+/// device-to-device slice copy (KV-cache arena path).
+pub trait MemoryOps {
+
+
+    /// Copy raw byte slice (for packed quantized representations) from host memory to device storage.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let _ = (data, shape, dtype);
+        Err(crate::error::Error::Unimplemented(
+            "from_cpu_bytes not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Allocate an uninitialized storage of the given shape on this backend.
+    ///
+    /// Used to pre-allocate the device-resident KV cache arena so decode
+    /// steps can append new rows with `copy_slice_into` instead of
+    /// re-uploading the whole cache through host memory. Contents are
+    /// undefined until written.
+    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
+        let _ = (shape, dtype);
+        Err(crate::error::Error::Unimplemented(
+            "alloc_storage not implemented for this backend".into(),
+        ))
+    }
+
+
+    /// Device-to-device copy of `count` contiguous F32 elements from `src`
+    /// into `dst` starting at flat element `dst_elem_offset`.
+    ///
+    /// Powers the zero-roundtrip KV cache: only the newly produced K/V rows
+    /// are copied into the device-resident cache arena; the host never sees
+    /// the cache contents.
+    fn copy_slice_into(
+        &self,
+        _dst: &dyn BackendStorage,
+        _src: &dyn BackendStorage,
+        _dst_elem_offset: usize,
+        _count: usize,
+    ) -> Result<()> {
+        Err(crate::error::Error::Unimplemented(
+            "copy_slice_into not implemented for this backend".into(),
+        ))
+    }
+}
+
+/// Hardware compute-graph capture/replay (e.g. HIP graphs).
+pub trait GraphCaptureOps {
+
+
+    /// Begin capturing execution calls into a hardware compute graph (e.g. HIP graph).
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        let _ = key;
+        Err(crate::error::Error::Unimplemented(
+            "graph capture not supported on this device backend".into(),
+        ))
+    }
+
+
+    /// End graph capture and instantiate the graph executable under `key`.
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        let _ = key;
+        Err(crate::error::Error::Unimplemented(
+            "graph capture not supported on this device backend".into(),
+        ))
+    }
+
+
+    /// Replay the graph captured under `key`. Returns Ok(true) if replayed, Ok(false) if missing.
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        let _ = key;
+        Ok(false)
+    }
+
+
+    /// Check whether a graph executable is stored under `key`.
+    fn has_captured_graph(&self, key: &str) -> bool {
+        let _ = key;
+        false
+    }
+}
+
+
+/// Per-device compute primitive surface. `grim-tensor` dispatches through
+/// this trait and contains no device-specific code itself. Operations
+/// return both the result storage and a `ComputeHandle` that tracks the
+/// operation's completion.
 ///
-/// Backends construct an `Arc`-shared singleton per ordinal (e.g.
-/// `RocmDevice::shared`) and hand out cheap `Arc` clones through the
-/// `Box<dyn BackendDevice>` API. Without this impl, dropping the temporary
-/// `Box` would run the backend's full destructor per call — on ROCm that
-/// means a device-wide `hipDeviceSynchronize`, a cache flush, and HIP module
-/// unloads on *every* primitive dispatch (the per-op CPU spin/hang). With
-/// `Arc`, dropping the box only decrements the refcount and the singleton
-/// survives. Every method forwards to the inner device so backend-specific
-/// overrides are reached through dynamic dispatch.
-impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
+/// # Safety Taxonomy
+/// Operations implemented by backends conform to the following three-tier model:
+/// - **Tier 1 — Safe-by-construction**: Safe Rust code utilizing type-safety rules.
+/// - **Tier 2 — Explicit `unsafe` with contract**: Backend operations that execute
+///   cross-FFI boundaries (e.g. CUDA/ROCm/Vulkan API calls) requiring caller-side contracts.
+/// - **Tier 3 — Raw hardware intrinsics**: Low-level instructions (e.g. LDS swizzling, inline GCN asm).
+
+pub trait BackendDevice: Send + Sync
+    + CoreTensorOps
+    + ElementwiseOps
+    + SamplingOps
+    + AttentionOps
+    + FusionOps
+    + AutogradOps
+    + OptimizerOps
+    + QuantOps
+    + RecurrentOps
+    + CollectiveOps
+    + MemoryOps
+    + GraphCaptureOps
+{
+}
+
+impl<T: CoreTensorOps + ?Sized> CoreTensorOps for std::sync::Arc<T> {
+
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         (**self).zeros(shape, dtype)
     }
+
 
     fn matmul(
         &self,
@@ -1576,6 +1776,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).matmul(a, b, out)
     }
+
 
     fn matmul_with_solution(
         &self,
@@ -1587,6 +1788,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).matmul_with_solution(a, b, out, solution_index)
     }
 
+
     fn add(
         &self,
         a: &dyn BackendStorage,
@@ -1595,6 +1797,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).add(a, b, out)
     }
+
 
     fn mul(
         &self,
@@ -1605,6 +1808,76 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).mul(a, b, out)
     }
 
+
+    fn silu_mul(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).silu_mul(gate, up, out)
+    }
+
+
+    fn rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rms_norm(x, weight, eps, out)
+    }
+
+
+    fn rms_norm_inplace(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).rms_norm_inplace(x, weight, eps, out)
+    }
+
+
+    fn softmax(
+        &self,
+        x: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).softmax(x, out)
+    }
+
+
+    fn embedding(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).embedding(weight, indices, out)
+    }
+
+
+    fn from_cpu(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).from_cpu(data, shape, dtype)
+    }
+
+
+    fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()> {
+        (**self).advise(storage, advice)
+    }
+}
+
+impl<T: ElementwiseOps + ?Sized> ElementwiseOps for std::sync::Arc<T> {
+
+
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -1613,6 +1886,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).mul_scalar(x, scalar, out_shape)
     }
+
 
     fn add_scalar(
         &self,
@@ -1623,6 +1897,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).add_scalar(x, scalar, out_shape)
     }
 
+
     fn sub_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -1632,6 +1907,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).sub_scalar(x, scalar, out_shape)
     }
 
+
     fn div_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -1640,6 +1916,53 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).div_scalar(x, scalar, out_shape)
     }
+
+
+    fn sub(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).sub(a, b, out)
+    }
+
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).sqrt(x, out_shape)
+    }
+
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).recip(x, out_shape)
+    }
+
+
+    fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
+        (**self).reduce_sum(x)
+    }
+
+
+    fn reduce_max(&self, x: &dyn BackendStorage) -> Result<f32> {
+        (**self).reduce_max(x)
+    }
+
+
+    fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
+        (**self).argmax(x)
+    }
+}
+
+impl<T: SamplingOps + ?Sized> SamplingOps for std::sync::Arc<T> {
+
 
     fn sample_on_device(
         &self,
@@ -1651,6 +1974,61 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<u32> {
         (**self).sample_on_device(logits, temperature, top_p, top_k, seed)
     }
+}
+
+impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
+
+
+    fn rope(
+        &self,
+        x: &dyn BackendStorage,
+        positions: &[u32],
+        cfg: &RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rope(x, positions, cfg, out_shape)
+    }
+
+
+    fn rerope(
+        &self,
+        k: &dyn BackendStorage,
+        old_positions: &[u32],
+        new_positions: &[u32],
+        cfg: &RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rerope(k, old_positions, new_positions, cfg, out_shape)
+    }
+
+
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            out_shape,
+            out_max,
+            out_sum,
+        )
+    }
+
 
     fn qkv_attention_alibi(
         &self,
@@ -1677,16 +2055,218 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         )
     }
 
-    fn rerope(
+
+    fn qkv_attention_paged(
         &self,
-        k: &dyn BackendStorage,
-        old_positions: &[u32],
-        new_positions: &[u32],
-        cfg: &RopeConfig,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).rerope(k, old_positions, new_positions, cfg, out_shape)
+        (**self).qkv_attention_paged(
+            q,
+            block_tables,
+            k_pages,
+            v_pages,
+            num_kv_heads,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            window,
+            out_shape,
+        )
     }
+
+
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).tree_attention(
+            q,
+            k,
+            v,
+            tree_parents,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+        )
+    }
+
+
+    fn flash_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        causal: bool,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).flash_attention(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            causal,
+            out_shape,
+        )
+    }
+
+
+    fn cross_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).cross_attention(q, k, v, num_heads, head_dim, seq_len, kv_seq_len, out_shape)
+    }
+
+
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).sage_attention(q, k, v, num_kv_heads, kv_seq_len, out_shape)
+    }
+
+
+    fn kv_dequant_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k_tensor: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_tensor: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        quant_bits: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).kv_dequant_attention(
+            q,
+            k_tensor,
+            k_scales,
+            v_tensor,
+            v_scales,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            quant_bits,
+            out_shape,
+        )
+    }
+
+
+    fn mla_q_kv_norm_split(
+        &self,
+        q_raw: &dyn BackendStorage,
+        kv_raw: &dyn BackendStorage,
+        q_norm_w: &dyn BackendStorage,
+        kv_norm_w: &dyn BackendStorage,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_dim: usize,
+        eps: f32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).mla_q_kv_norm_split(
+            q_raw,
+            kv_raw,
+            q_norm_w,
+            kv_norm_w,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_dim,
+            eps,
+        )
+    }
+
+
+    fn mla_absorbed_decode(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).mla_absorbed_decode(
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+        )
+    }
+}
+
+impl<T: FusionOps + ?Sized> FusionOps for std::sync::Arc<T> {
+
+
+    fn silu_mul_quantize(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        format: crate::dtype::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).silu_mul_quantize(gate, up, format, out_shape)
+    }
+
 
     fn fused_add_rms_norm(
         &self,
@@ -1702,6 +2282,31 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     )> {
         (**self).fused_add_rms_norm(x, residual, weight, eps, out_shape)
     }
+
+
+    fn broadcast_bias(
+        &self,
+        bias: &dyn BackendStorage,
+        batch: usize,
+        out_dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).broadcast_bias(bias, batch, out_dim, out_shape)
+    }
+
+
+    fn scale_bias_epilogue(
+        &self,
+        out: &dyn BackendStorage,
+        a_scale: Option<&dyn BackendStorage>,
+        b_scale: Option<&dyn BackendStorage>,
+        bias: Option<&dyn BackendStorage>,
+        batch: usize,
+        out_dim: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).scale_bias_epilogue(out, a_scale, b_scale, bias, batch, out_dim)
+    }
+
 
     fn fused_mxfp4_gemm_qk_norm_rope_kv(
         &self,
@@ -1751,163 +2356,10 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
             max_seq_len,
         )
     }
+}
 
-    fn broadcast_bias(
-        &self,
-        bias: &dyn BackendStorage,
-        batch: usize,
-        out_dim: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).broadcast_bias(bias, batch, out_dim, out_shape)
-    }
+impl<T: AutogradOps + ?Sized> AutogradOps for std::sync::Arc<T> {
 
-    fn scale_bias_epilogue(
-        &self,
-        out: &dyn BackendStorage,
-        a_scale: Option<&dyn BackendStorage>,
-        b_scale: Option<&dyn BackendStorage>,
-        bias: Option<&dyn BackendStorage>,
-        batch: usize,
-        out_dim: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        (**self).scale_bias_epilogue(out, a_scale, b_scale, bias, batch, out_dim)
-    }
-
-    fn short_conv1d_causal_step(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        bias: Option<&dyn BackendStorage>,
-        state: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).short_conv1d_causal_step(x, weight, bias, state, out_shape)
-    }
-
-    fn kda_gated_delta_rule_step(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        beta: &dyn BackendStorage,
-        a_gate: &dyn BackendStorage,
-        recurrent_state: &dyn BackendStorage,
-        d_k: usize,
-        d_v: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).kda_gated_delta_rule_step(
-            q, k, v, beta, a_gate, recurrent_state, d_k, d_v, out_shape,
-        )
-    }
-
-    fn mla_q_kv_norm_split(
-        &self,
-        q_raw: &dyn BackendStorage,
-        kv_raw: &dyn BackendStorage,
-        q_norm_w: &dyn BackendStorage,
-        kv_norm_w: &dyn BackendStorage,
-        qk_nope_dim: usize,
-        qk_rope_dim: usize,
-        v_dim: usize,
-        eps: f32,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        (**self).mla_q_kv_norm_split(
-            q_raw,
-            kv_raw,
-            q_norm_w,
-            kv_norm_w,
-            qk_nope_dim,
-            qk_rope_dim,
-            v_dim,
-            eps,
-        )
-    }
-
-    fn mla_absorbed_decode(
-        &self,
-        q_absorbed: &dyn BackendStorage,
-        q_rope: &dyn BackendStorage,
-        kv_cache: &dyn BackendStorage,
-        w_uv: Option<&dyn BackendStorage>,
-        out: &dyn BackendStorage,
-        num_heads: usize,
-        kv_lora_rank: usize,
-        qk_rope_dim: usize,
-        v_head_dim: usize,
-        seq_len: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        (**self).mla_absorbed_decode(
-            q_absorbed,
-            q_rope,
-            kv_cache,
-            w_uv,
-            out,
-            num_heads,
-            kv_lora_rank,
-            qk_rope_dim,
-            v_head_dim,
-            seq_len,
-        )
-    }
-
-    fn silu_mul_quantize(
-        &self,
-        gate: &dyn BackendStorage,
-        up: &dyn BackendStorage,
-        format: crate::dtype::QuantFormat,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        (**self).silu_mul_quantize(gate, up, format, out_shape)
-    }
-
-    fn sage_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).sage_attention(q, k, v, num_kv_heads, kv_seq_len, out_shape)
-    }
-
-    fn sqrt(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).sqrt(x, out_shape)
-    }
-
-    fn recip(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).recip(x, out_shape)
-    }
-
-    fn silu_mul(
-        &self,
-        gate: &dyn BackendStorage,
-        up: &dyn BackendStorage,
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).silu_mul(gate, up, out)
-    }
 
     fn silu_mul_backward(
         &self,
@@ -1922,6 +2374,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     )> {
         (**self).silu_mul_backward(e, g, dw, out_shape)
     }
+
 
     fn rmsnorm_backward(
         &self,
@@ -1939,6 +2392,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).rmsnorm_backward(x, weight, out_grad, eps, x_shape, w_shape)
     }
 
+
     fn rope_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1949,6 +2403,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).rope_backward(out_grad, cos, sin, out_shape)
     }
 
+
     fn softmax_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1957,6 +2412,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).softmax_backward(out_grad, softmax_out, out_shape)
     }
+
 
     fn embedding_backward(
         &self,
@@ -1968,322 +2424,6 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).embedding_backward(out_grad, token_ids, vocab_size, hidden_dim)
     }
 
-    fn rms_norm(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).rms_norm(x, weight, eps, out)
-    }
-
-    fn rms_norm_inplace(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out: &Shape,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        (**self).rms_norm_inplace(x, weight, eps, out)
-    }
-
-    fn softmax(
-        &self,
-        x: &dyn BackendStorage,
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).softmax(x, out)
-    }
-
-    fn embedding(
-        &self,
-        weight: &dyn BackendStorage,
-        indices: &[u32],
-        out: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).embedding(weight, indices, out)
-    }
-
-    fn from_cpu(
-        &self,
-        data: &[f32],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        (**self).from_cpu(data, shape, dtype)
-    }
-
-    fn from_cpu_bytes(
-        &self,
-        data: &[u8],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        (**self).from_cpu_bytes(data, shape, dtype)
-    }
-
-    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
-        (**self).alloc_storage(shape, dtype)
-    }
-
-    fn copy_slice_into(
-        &self,
-        dst: &dyn BackendStorage,
-        src: &dyn BackendStorage,
-        dst_elem_offset: usize,
-        count: usize,
-    ) -> Result<()> {
-        (**self).copy_slice_into(dst, src, dst_elem_offset, count)
-    }
-
-    fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()> {
-        (**self).advise(storage, advice)
-    }
-
-    fn kv_dequant_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k_tensor: &dyn BackendStorage,
-        k_scales: &dyn BackendStorage,
-        v_tensor: &dyn BackendStorage,
-        v_scales: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        quant_bits: u32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).kv_dequant_attention(
-            q,
-            k_tensor,
-            k_scales,
-            v_tensor,
-            v_scales,
-            num_kv_heads,
-            kv_seq_len,
-            cache_offset,
-            quant_bits,
-            out_shape,
-        )
-    }
-
-    fn rope(
-        &self,
-        x: &dyn BackendStorage,
-        positions: &[u32],
-        cfg: &RopeConfig,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).rope(x, positions, cfg, out_shape)
-    }
-
-    fn qkv_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        window: Option<usize>,
-        out_shape: &Shape,
-        out_max: Option<&dyn BackendStorage>,
-        out_sum: Option<&dyn BackendStorage>,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).qkv_attention(
-            q,
-            k,
-            v,
-            num_kv_heads,
-            kv_seq_len,
-            cache_offset,
-            window,
-            out_shape,
-            out_max,
-            out_sum,
-        )
-    }
-
-    fn qkv_attention_paged(
-        &self,
-        q: &dyn BackendStorage,
-        block_tables: &dyn BackendStorage,
-        k_pages: &dyn BackendStorage,
-        v_pages: &dyn BackendStorage,
-        num_kv_heads: usize,
-        max_blocks: usize,
-        page_size: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        window: Option<usize>,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).qkv_attention_paged(
-            q,
-            block_tables,
-            k_pages,
-            v_pages,
-            num_kv_heads,
-            max_blocks,
-            page_size,
-            kv_seq_len,
-            cache_offset,
-            window,
-            out_shape,
-        )
-    }
-
-    fn tree_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        tree_parents: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).tree_attention(
-            q,
-            k,
-            v,
-            tree_parents,
-            num_kv_heads,
-            kv_seq_len,
-            cache_offset,
-            out_shape,
-        )
-    }
-
-    fn begin_graph_capture(&self, key: &str) -> Result<()> {
-        (**self).begin_graph_capture(key)
-    }
-
-    fn end_graph_capture(&self, key: &str) -> Result<()> {
-        (**self).end_graph_capture(key)
-    }
-
-    fn replay_graph(&self, key: &str) -> Result<bool> {
-        (**self).replay_graph(key)
-    }
-
-    fn has_captured_graph(&self, key: &str) -> bool {
-        (**self).has_captured_graph(key)
-    }
-
-    fn all_reduce(
-        &self,
-        inputs: &[&dyn BackendStorage],
-        op: &str,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).all_reduce(inputs, op)
-    }
-
-    fn comm_fuse_reduce(
-        &self,
-        partials: &[(&dyn BackendStorage, &ScythePlacement)],
-    ) -> Result<Box<dyn BackendStorage>> {
-        (**self).comm_fuse_reduce(partials)
-    }
-
-    fn estimate_gemm_latency_ms(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        dtype: DType,
-        placement: &ScythePlacement,
-    ) -> f64 {
-        (**self).estimate_gemm_latency_ms(m, n, k, dtype, placement)
-    }
-
-    fn selective_scan(
-        &self,
-        x: &dyn BackendStorage,
-        a: &dyn BackendStorage,
-        b: &dyn BackendStorage,
-        c: &dyn BackendStorage,
-        d: &dyn BackendStorage,
-        state: &dyn BackendStorage,
-        batch: usize,
-        dim_dstate: usize,
-        dim_dinner: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).selective_scan(
-            x, a, b, c, d, state, batch, dim_dstate, dim_dinner, seq_len, out_shape,
-        )
-    }
-
-    fn flash_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        causal: bool,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).flash_attention(
-            q,
-            k,
-            v,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            seq_len,
-            causal,
-            out_shape,
-        )
-    }
-
-    fn cross_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        kv_seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).cross_attention(q, k, v, num_heads, head_dim, seq_len, kv_seq_len, out_shape)
-    }
-
-    fn rwkv_time_mix(
-        &self,
-        x: &dyn BackendStorage,
-        w: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).rwkv_time_mix(x, w, k, v, g, batch, dim, seq_len, out_shape)
-    }
-
-    fn rwkv_channel_mix(
-        &self,
-        x: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        r: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).rwkv_channel_mix(x, k, r, v, batch, dim, out_shape)
-    }
 
     fn lora_accumulate(
         &self,
@@ -2296,6 +2436,61 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).lora_accumulate(base, x, a, b, scale, out_shape)
     }
+}
+
+impl<T: OptimizerOps + ?Sized> OptimizerOps for std::sync::Arc<T> {
+    fn fused_adamw_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).fused_adamw_step(p, g, m, v, lr, beta1, beta2, eps, weight_decay, bc1, bc2, total)
+    }
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).fused_lion_step(p, g, exp_avg, lr, beta1, beta2, weight_decay, total)
+    }
+    fn fused_madam_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        gamma: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).fused_madam_step(p, g, m, v, lr, beta1, beta2, eps, gamma, weight_decay, bc1, bc2, total)
+    }
+}
+
+impl<T: QuantOps + ?Sized> QuantOps for std::sync::Arc<T> {
+
 
     fn quantized_matmul(
         &self,
@@ -2307,6 +2502,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).quantized_matmul(a, b_packed, b_scales, format, out_shape)
     }
+
 
     fn quantized_matmul_backward_dx(
         &self,
@@ -2333,6 +2529,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         )
     }
 
+
     fn quantize(
         &self,
         x: &dyn BackendStorage,
@@ -2340,6 +2537,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<Box<dyn BackendStorage>> {
         (**self).quantize(x, format)
     }
+
 
     fn fused_quant_gemm(
         &self,
@@ -2352,15 +2550,204 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     }
 }
 
+impl<T: RecurrentOps + ?Sized> RecurrentOps for std::sync::Arc<T> {
+
+
+    fn short_conv1d_causal_step(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).short_conv1d_causal_step(x, weight, bias, state, out_shape)
+    }
+
+
+    fn kda_gated_delta_rule_step(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        a_gate: &dyn BackendStorage,
+        recurrent_state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).kda_gated_delta_rule_step(
+            q, k, v, beta, a_gate, recurrent_state, d_k, d_v, out_shape,
+        )
+    }
+
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        state: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).selective_scan(
+            x, a, b, c, d, state, batch, dim_dstate, dim_dinner, seq_len, out_shape,
+        )
+    }
+
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rwkv_time_mix(x, w, k, v, g, batch, dim, seq_len, out_shape)
+    }
+
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rwkv_channel_mix(x, k, r, v, batch, dim, out_shape)
+    }
+}
+
+impl<T: CollectiveOps + ?Sized> CollectiveOps for std::sync::Arc<T> {
+
+
+    fn all_reduce(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        op: &str,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).all_reduce(inputs, op)
+    }
+
+
+    fn comm_fuse_reduce(
+        &self,
+        partials: &[(&dyn BackendStorage, &ScythePlacement)],
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).comm_fuse_reduce(partials)
+    }
+
+
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        placement: &ScythePlacement,
+    ) -> f64 {
+        (**self).estimate_gemm_latency_ms(m, n, k, dtype, placement)
+    }
+}
+
+impl<T: MemoryOps + ?Sized> MemoryOps for std::sync::Arc<T> {
+
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).from_cpu_bytes(data, shape, dtype)
+    }
+
+
+    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
+        (**self).alloc_storage(shape, dtype)
+    }
+
+
+    fn copy_slice_into(
+        &self,
+        dst: &dyn BackendStorage,
+        src: &dyn BackendStorage,
+        dst_elem_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        (**self).copy_slice_into(dst, src, dst_elem_offset, count)
+    }
+}
+
+impl<T: GraphCaptureOps + ?Sized> GraphCaptureOps for std::sync::Arc<T> {
+
+
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        (**self).begin_graph_capture(key)
+    }
+
+
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        (**self).end_graph_capture(key)
+    }
+
+
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        (**self).replay_graph(key)
+    }
+
+
+    fn has_captured_graph(&self, key: &str) -> bool {
+        (**self).has_captured_graph(key)
+    }
+}
+
+
+/// Blanket `BackendDevice` impl for `Arc<T>`.
+///
+/// Backends construct an `Arc`-shared singleton per ordinal (e.g.
+/// `RocmDevice::shared`) and hand out cheap `Arc` clones through the
+/// `Box<dyn BackendDevice>` API. Without this impl, dropping the temporary
+/// `Box` would run the backend's full destructor per call — on ROCm that
+/// means a device-wide `hipDeviceSynchronize`, a cache flush, and HIP module
+/// unloads on *every* primitive dispatch (the per-op CPU spin/hang). With
+/// `Arc`, dropping the box only decrements the refcount and the singleton
+/// survives. Every method forwards to the inner device so backend-specific
+/// overrides are reached through dynamic dispatch.
+///
+/// All twelve capability sub-traits are forwarded explicitly; the
+/// exhaustive-forwarding probe (`tests/arc_forwarding.rs`) fails CI if a
+/// newly added method is not forwarded here.
+impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {}
+
+
 /// Residual and outlier metadata for fused quantized matmul backward dispatch.
 #[derive(Debug, Clone, Default)]
 pub struct QuantizedMatmulBackwardResiduals {
     /// Count of index-value outlier overrides in device memory.
     pub outlier_count: usize,
-    /// Raw device pointer to u32 outlier indices.
-    pub outlier_indices_ptr: *const std::ffi::c_void,
-    /// Raw device pointer to f32 outlier values.
-    pub outlier_values_ptr: *const std::ffi::c_void,
+    /// Raw device pointer to u32 outlier indices. Private: raw device
+    /// pointers must only move through [`Self::set_outlier_pointers`],
+    /// which documents the ownership contract at the (single) place they
+    /// are attached.
+    outlier_indices_ptr: *const std::ffi::c_void,
+    /// Raw device pointer to f32 outlier values. See `outlier_indices_ptr`.
+    outlier_values_ptr: *const std::ffi::c_void,
     /// Bitwidth for backup1 residual layer (0 = absent).
     pub backup1_bpw: u8,
     /// Byte offset of packed backup1 codes.
@@ -2376,6 +2763,38 @@ pub struct QuantizedMatmulBackwardResiduals {
 }
 
 impl QuantizedMatmulBackwardResiduals {
+    /// Attach raw device-memory outlier pointers.
+    ///
+    /// # Safety contract (same invariant as the type's Send/Sync)
+    /// The pointers must reference live device memory owned by the
+    /// dispatching backend for as long as this struct is used in a
+    /// launch. Today that is guaranteed only by the caller serializing
+    /// all use through the engine's engine-lock (see the Send/Sync
+    /// SAFETY comment below); do not add a second concurrent access
+    /// path without serializing this type.
+    ///
+    /// # Safety
+    /// Caller must guarantee both pointers are valid (or null when
+    /// `count == 0`) for device reads at launch time.
+    pub unsafe fn set_outlier_pointers(
+        &mut self,
+        indices: *const std::ffi::c_void,
+        values: *const std::ffi::c_void,
+    ) {
+        self.outlier_indices_ptr = indices;
+        self.outlier_values_ptr = values;
+    }
+
+    /// Raw device pointer to u32 outlier indices (null when absent).
+    pub fn outlier_indices_ptr(&self) -> *const std::ffi::c_void {
+        self.outlier_indices_ptr
+    }
+
+    /// Raw device pointer to f32 outlier values (null when absent).
+    pub fn outlier_values_ptr(&self) -> *const std::ffi::c_void {
+        self.outlier_values_ptr
+    }
+
     /// Extract residual and outlier metadata from a `QuantProvenance`.
     ///
     /// Checks if the tensor carries `QuantProvenance::WithResiduals` and populates

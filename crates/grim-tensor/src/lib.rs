@@ -15,7 +15,9 @@ pub mod tensor;
 pub mod wavefront;
 
 pub use backend::{
-    BackendDevice, BackendStorage, ComputeHandle, GpuCapability, MemAdvice,
+    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
+    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, GpuCapability,
+    MemAdvice, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
     QuantizedMatmulBackwardResiduals, ReadyHandle, RopeConfig, ScytheLink, ScythePlacement,
     YaRNParams,
 };

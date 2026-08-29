@@ -1864,6 +1864,8 @@ impl GraphCaptureOps for CpuDevice {
     }
 }
 
+impl grim_tensor::BackendDevice for CpuDevice {}
+
 
 impl BackendStorage for CpuStorage {
     fn dtype(&self) -> DType {
@@ -2157,7 +2159,7 @@ mod tests {
     // any model-level refactor.
     #[test]
     fn paged_attention_matches_dense_attention() {
-        use grim_tensor::{CoreTensorOps, DType, Device, Shape};
+        use grim_tensor::{DType, Device, Shape};
         use std::sync::Arc;
 
         let dev = CpuDevice::new();

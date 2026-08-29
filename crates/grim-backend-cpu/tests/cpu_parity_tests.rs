@@ -2,7 +2,9 @@
 
 use grim_backend_cpu::CpuDevice;
 use grim_tensor::dtype::{ArithType, DType, QuantFormat, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{
+    AutogradOps, CoreTensorOps, ElementwiseOps, FusionOps, MemoryOps, QuantOps, Shape,
+};
 
 fn dev() -> CpuDevice {
     CpuDevice::new()

@@ -382,9 +382,24 @@ impl DType {
     }
 
     /// Calculate expected byte size for a given element count or shape under this DType.
+    ///
+    /// EXACT for `Native`, `KQuant`, `FloatPack`, `Block`, `ResidualPacked`
+    /// (primary code region), and `W4A16`. For `GroupInt`, `WNA16`,
+    /// `EmbeddingWNA16Int`, and the CompressedTensors variants the layout
+    /// depends on fields not carried by the type (bit width, channel
+    /// counts, segment prefixes) — the returned value there is an
+    /// `elem_count * arith.byte_size()` UPPER BOUND, not an exact size;
+    /// validate those blobs with `<=` (or extend this function with the
+    /// missing config).
     pub fn expected_bytes(&self, elem_count: usize) -> usize {
         match &self.storage {
             Storage::Native => elem_count * self.arith.byte_size(),
+            Storage::W4A16(cfg) => {
+                // 4-bit codes, 2 per byte, plus one f32 scale per
+                // (element, group): [codes][scales], no prefixes.
+                let group = cfg.group_size.max(1);
+                elem_count.div_ceil(2) + (elem_count.div_ceil(group)) * 4
+            }
             Storage::KQuant(k) => match k {
                 KQuantScheme::Q80 => (elem_count.div_ceil(32)) * 34,
                 KQuantScheme::Q4K => (elem_count.div_ceil(256)) * 144,
@@ -579,6 +594,44 @@ mod tests {
             storage: Storage::KQuant(KQuantScheme::Q4K),
         };
         assert!(q4k.is_quantized());
+    }
+
+    #[test]
+    fn test_expected_bytes_golden() {
+        // llama.cpp Q8_0: 32 values + f16 scale per block.
+        assert_eq!(
+            DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q80) }
+                .expected_bytes(32),
+            34
+        );
+        // Q4_K: 256 values → 144 bytes.
+        assert_eq!(
+            DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q4K) }
+                .expected_bytes(256),
+            144
+        );
+        // FP8: 1 byte per element.
+        assert_eq!(
+            DType { arith: ArithType::F32, storage: Storage::FloatPack(FloatPackScheme::Fp8) }
+                .expected_bytes(16),
+            16
+        );
+        // MXFP4: nibble codes + one E8M0 exponent per 32-group.
+        assert_eq!(
+            DType { arith: ArithType::F32, storage: Storage::FloatPack(FloatPackScheme::MxFp4) }
+                .expected_bytes(32),
+            17
+        );
+        // W4A16: ceil(n/2) code bytes + n/group f32 scales, no prefixes.
+        assert_eq!(
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::W4A16(W4A16Config { group_size: 128 }),
+            }
+            .expected_bytes(512),
+            256 + 4 * 4
+        );
+        assert_eq!(DType::F32.expected_bytes(10), 40);
     }
 
     #[test]
