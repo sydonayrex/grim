@@ -1,0 +1,48 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// GPU Speculative Token Acceptor
+// ---------------------------------------------------------------------------
+kernel void grim_speculative_acceptor(
+    device const float* target_probs [[buffer(0)]],
+    device const float* draft_probs [[buffer(1)]],
+    device const int* draft_tokens [[buffer(2)]],
+    device const float* uniform_rands [[buffer(3)]],
+    device int* accepted_tokens [[buffer(4)]],
+    device int* accepted_lens [[buffer(5)]],
+    constant int& batch_size [[buffer(6)]],
+    constant int& num_draft_tokens [[buffer(7)]],
+    constant int& vocab_size [[buffer(8)]],
+    uint b [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (int(b) >= batch_size) return;
+
+    if (tid == 0) {
+        int accepted_count = 0;
+        for (int k = 0; k < num_draft_tokens; ++k) {
+            int draft_tok = draft_tokens[int(b) * num_draft_tokens + k];
+            if (draft_tok < 0 || draft_tok >= vocab_size) {
+                break;
+            }
+
+            int t_idx = (int(b) * (num_draft_tokens + 1) + k) * vocab_size + draft_tok;
+            int d_idx = (int(b) * num_draft_tokens + k) * vocab_size + draft_tok;
+
+            float p = target_probs[t_idx];
+            float q = draft_probs[d_idx];
+            float r = uniform_rands[int(b) * (num_draft_tokens + 1) + k];
+
+            float accept_prob = (q > 0.0f) ? min(1.0f, p / q) : 1.0f;
+
+            if (r <= accept_prob) {
+                accepted_tokens[int(b) * (num_draft_tokens + 1) + accepted_count] = draft_tok;
+                accepted_count++;
+            } else {
+                break;
+            }
+        }
+        accepted_lens[b] = accepted_count;
+    }
+}
