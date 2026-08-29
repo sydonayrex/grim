@@ -6,7 +6,7 @@
 
 use grim_backend_metal::MetalDevice;
 use grim_tensor::dtype::DType;
-use grim_tensor::{BackendDevice, BackendStorage, Shape};
+use grim_tensor::{BackendStorage, CollectiveOps, CoreTensorOps, Shape};
 use grim_tensor::{ScytheLink, ScythePlacement};
 
 #[test]
@@ -136,43 +136,43 @@ fn test_metal_moe_fused_dispatch_parity() {
     let rexp: Vec<f32> = vec![1.0, 0.0];
     let rw: Vec<f32> = vec![1.0, 1.0];
 
-    let x = BackendDevice::from_cpu(
-        &dev,
-        &x_data,
-        &Shape::new(vec![batch as usize * hidden as usize]),
-        DType::F32,
-    )
-    .unwrap();
-    let gate = BackendDevice::from_cpu(
-        &dev,
-        &gate_flat,
-        &Shape::new(vec![
-            num_experts as usize * inter as usize * hidden as usize,
-        ]),
-        DType::F32,
-    )
-    .unwrap();
-    let up = BackendDevice::from_cpu(
-        &dev,
-        &up_flat,
-        &Shape::new(vec![
-            num_experts as usize * inter as usize * hidden as usize,
-        ]),
-        DType::F32,
-    )
-    .unwrap();
-    let down = BackendDevice::from_cpu(
-        &dev,
-        &down_flat,
-        &Shape::new(vec![
-            num_experts as usize * hidden as usize * inter as usize,
-        ]),
-        DType::F32,
-    )
-    .unwrap();
-    let tok = BackendDevice::from_cpu(&dev, &rtok, &Shape::new(vec![2]), DType::F32).unwrap();
-    let exp = BackendDevice::from_cpu(&dev, &rexp, &Shape::new(vec![2]), DType::F32).unwrap();
-    let rw_s = BackendDevice::from_cpu(&dev, &rw, &Shape::new(vec![2]), DType::F32).unwrap();
+    let x = dev
+        .from_cpu(
+            &x_data,
+            &Shape::new(vec![batch as usize * hidden as usize]),
+            DType::F32,
+        )
+        .unwrap();
+    let gate = dev
+        .from_cpu(
+            &gate_flat,
+            &Shape::new(vec![
+                num_experts as usize * inter as usize * hidden as usize,
+            ]),
+            DType::F32,
+        )
+        .unwrap();
+    let up = dev
+        .from_cpu(
+            &up_flat,
+            &Shape::new(vec![
+                num_experts as usize * inter as usize * hidden as usize,
+            ]),
+            DType::F32,
+        )
+        .unwrap();
+    let down = dev
+        .from_cpu(
+            &down_flat,
+            &Shape::new(vec![
+                num_experts as usize * hidden as usize * inter as usize,
+            ]),
+            DType::F32,
+        )
+        .unwrap();
+    let tok = dev.from_cpu(&rtok, &Shape::new(vec![2]), DType::F32).unwrap();
+    let exp = dev.from_cpu(&rexp, &Shape::new(vec![2]), DType::F32).unwrap();
+    let rw_s = dev.from_cpu(&rw, &Shape::new(vec![2]), DType::F32).unwrap();
 
     let out_shape = Shape::new(vec![batch as usize, hidden as usize]);
     let (out, handle) = dev

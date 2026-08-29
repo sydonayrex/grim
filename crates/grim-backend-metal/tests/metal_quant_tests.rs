@@ -6,7 +6,7 @@
 
 use grim_backend_metal::MetalDevice;
 use grim_tensor::dtype::{DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, Shape};
 
 #[test]
 fn test_metal_quantize_q8_0_and_fp8() {

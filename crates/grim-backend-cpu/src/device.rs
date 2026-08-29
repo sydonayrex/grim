@@ -13,7 +13,9 @@ use std::sync::Arc;
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 use grim_tensor::dtype::{DType, Device, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendDevice, BackendStorage, Shape, Tensor};
+use grim_tensor::{BackendStorage, Shape, Tensor,
+    CoreTensorOps, ElementwiseOps, SamplingOps, AttentionOps, FusionOps, AutogradOps, OptimizerOps, QuantOps, RecurrentOps, CollectiveOps, MemoryOps, GraphCaptureOps,
+};
 
 use crate::storage::CpuStorage;
 
@@ -232,7 +234,8 @@ impl CpuDevice {
     }
 }
 
-impl BackendDevice for CpuDevice {
+impl CoreTensorOps for CpuDevice {
+
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
         let n = shape.elem_count();
@@ -242,6 +245,7 @@ impl BackendDevice for CpuDevice {
             dtype,
         )))
     }
+
 
     fn matmul(
         &self,
@@ -285,6 +289,7 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+
     fn add(
         &self,
         a: &dyn BackendStorage,
@@ -312,6 +317,7 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
 
     fn mul(
         &self,
@@ -341,221 +347,6 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
-    fn mul_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x = a_storage(x)?;
-        if x.shape() != out_shape {
-            return Err(Error::Shape("mul_scalar: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let mut out = vec![0.0f32; n];
-        let xd = x.data();
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = xd[i] * scalar;
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn add_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x = a_storage(x)?;
-        if x.shape() != out_shape {
-            return Err(Error::Shape("add_scalar: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let mut out = vec![0.0f32; n];
-        let xd = x.data();
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = xd[i] + scalar;
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn sub_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x = a_storage(x)?;
-        if x.shape() != out_shape {
-            return Err(Error::Shape("sub_scalar: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let mut out = vec![0.0f32; n];
-        let xd = x.data();
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = xd[i] - scalar;
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn div_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x = a_storage(x)?;
-        if x.shape() != out_shape {
-            return Err(Error::Shape("div_scalar: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let mut out = vec![0.0f32; n];
-        let xd = x.data();
-        let inv_scalar = 1.0 / scalar;
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = xd[i] * inv_scalar;
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn silu_mul_quantize(
-        &self,
-        gate: &dyn BackendStorage,
-        up: &dyn BackendStorage,
-        _format: grim_tensor::dtype::QuantFormat,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let g = a_storage(gate)?;
-        let u = a_storage(up)?;
-        if g.shape() != u.shape() || g.shape() != out_shape {
-            return Err(Error::Shape("silu_mul_quantize: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let gd = g.data();
-        let ud = u.data();
-
-        let mut max_abs = 0.0f32;
-        let mut activated = vec![0.0f32; n];
-        for i in 0..n {
-            let x = gd[i];
-            let silu = x / (1.0 + (-x).exp());
-            let val = silu * ud[i];
-            activated[i] = val;
-            max_abs = max_abs.max(val.abs());
-        }
-
-        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-        let inv_scale = 1.0 / scale;
-        let mut qbytes = vec![0u8; n];
-        for i in 0..n {
-            let q = (activated[i] * inv_scale).clamp(-127.0, 127.0);
-            qbytes[i] = (q as i8) as u8;
-        }
-
-        let bytes_storage = CpuStorage::from_raw_bytes(
-            qbytes,
-            out_shape.clone(),
-            DType {
-                arith: grim_tensor::dtype::ArithType::U8,
-                storage: grim_tensor::dtype::Storage::Native,
-            },
-        );
-        let scale_storage = CpuStorage::new(
-            vec![scale],
-            Shape::from_slice(&[1]),
-            DType {
-                arith: grim_tensor::dtype::ArithType::F32,
-                storage: grim_tensor::dtype::Storage::Native,
-            },
-        );
-
-        Ok((
-            Box::new(bytes_storage),
-            Box::new(scale_storage),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn sage_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.qkv_attention(
-            q,
-            k,
-            v,
-            num_kv_heads,
-            kv_seq_len,
-            0,
-            None,
-            out_shape,
-            None,
-            None,
-        )
-    }
-
-    fn sqrt(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x = a_storage(x)?;
-        if x.shape() != out_shape {
-            return Err(Error::Shape("sqrt: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let mut out = vec![0.0f32; n];
-        let xd = x.data();
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = xd[i].sqrt();
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn recip(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x = a_storage(x)?;
-        if x.shape() != out_shape {
-            return Err(Error::Shape("recip: shape mismatch".into()));
-        }
-        let n = out_shape.elem_count();
-        let mut out = vec![0.0f32; n];
-        let xd = x.data();
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = 1.0 / xd[i];
-        }
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
 
     fn silu_mul(
         &self,
@@ -581,46 +372,6 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
-    fn silu_mul_backward(
-        &self,
-        e: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        dw: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let e_st = a_storage(e)?;
-        let g_st = a_storage(g)?;
-        let dw_st = a_storage(dw)?;
-        let ed = e_st.data();
-        let gd = g_st.data();
-        let dwd = dw_st.data();
-        let n = out_shape.elem_count();
-
-        let mut de = vec![0.0f32; n];
-        let mut dg = vec![0.0f32; n];
-
-        for i in 0..n {
-            let x = gd[i];
-            let sigm = 1.0f32 / (1.0f32 + (-x).exp());
-            let silu = x * sigm;
-            let dsilu = sigm * (1.0f32 + x * (1.0f32 - sigm));
-            let w = dwd[i];
-            let ev = ed[i];
-
-            de[i] = w * silu;
-            dg[i] = w * ev * dsilu;
-        }
-
-        Ok((
-            Box::new(CpuStorage::new(de, out_shape.clone(), DType::F32)),
-            Box::new(CpuStorage::new(dg, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
 
     fn rms_norm(
         &self,
@@ -664,66 +415,6 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
-    fn fused_add_rms_norm(
-        &self,
-        x: &dyn BackendStorage,
-        residual: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let x_st = a_storage(x)?;
-        let res_st = a_storage(residual)?;
-        let w_st = a_storage(weight)?;
-        let x_data = x_st.data();
-        let res_data = res_st.data();
-        let w_data = w_st.data();
-
-        let n = out_shape.elem_count();
-        let hidden_dim = w_st.shape().elem_count();
-        if hidden_dim == 0 || n % hidden_dim != 0 {
-            return Err(Error::Shape(
-                "fused_add_rms_norm: invalid dimensions".into(),
-            ));
-        }
-        let num_rows = n / hidden_dim;
-
-        let mut res_out = vec![0.0f32; n];
-        let mut y_out = vec![0.0f32; n];
-
-        for r in 0..num_rows {
-            let row_start = r * hidden_dim;
-            let mut sum_sq = 0.0f32;
-            for ((x, res), added_out) in x_data[row_start..row_start + hidden_dim]
-                .iter()
-                .zip(&res_data[row_start..row_start + hidden_dim])
-                .zip(&mut res_out[row_start..row_start + hidden_dim])
-            {
-                let added = x + res;
-                *added_out = added;
-                sum_sq += added * added;
-            }
-            let mean_sq = sum_sq / (hidden_dim as f32);
-            let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
-            for ((y, added), w) in y_out[row_start..row_start + hidden_dim]
-                .iter_mut()
-                .zip(&res_out[row_start..row_start + hidden_dim])
-                .zip(w_data)
-            {
-                *y = added * inv_rms * w;
-            }
-        }
-
-        Ok((
-            Box::new(CpuStorage::new(y_out, out_shape.clone(), DType::F32)),
-            Box::new(CpuStorage::new(res_out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
 
     fn softmax(
         &self,
@@ -757,6 +448,240 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
+
+    fn embedding(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let w = a_storage(weight)?;
+        if w.shape().rank() != 2 {
+            return Err(Error::Shape("embedding: weight must be 2-D".into()));
+        }
+        let vocab = w.shape().dim(0)?;
+        let dim = w.shape().dim(1)?;
+        if indices.len() * dim != out_shape.elem_count() {
+            return Err(Error::Shape("embedding: out size mismatch".into()));
+        }
+        let wd = w.data();
+        let mut out = vec![0.0f32; indices.len() * dim];
+        for (i, &tok) in indices.iter().enumerate() {
+            let tok = tok as usize;
+            if tok >= vocab {
+                return Err(Error::IndexOutOfBounds(format!(
+                    "token {tok} >= vocab {vocab}"
+                )));
+            }
+            out[i * dim..(i + 1) * dim].copy_from_slice(&wd[tok * dim..(tok + 1) * dim]);
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn from_cpu(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        ensure_cpu_native(&dtype)?;
+        if data.len() != shape.elem_count() {
+            return Err(Error::ShapeMismatch {
+                expected: vec![shape.elem_count()],
+                got: vec![data.len()],
+            });
+        }
+        Ok(Box::new(CpuStorage::new(
+            data.to_vec(),
+            shape.clone(),
+            dtype,
+        )))
+    }
+
+
+    fn advise(
+        &self,
+        _storage: &dyn BackendStorage,
+        _advice: grim_tensor::backend::MemAdvice,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl ElementwiseOps for CpuDevice {
+
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("mul_scalar: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i] * scalar;
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn add_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("add_scalar: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i] + scalar;
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn sub_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("sub_scalar: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i] - scalar;
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn div_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("div_scalar: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        let inv_scalar = 1.0 / scalar;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i] * inv_scalar;
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("sqrt: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i].sqrt();
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("recip: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = 1.0 / xd[i];
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+}
+
+impl SamplingOps for CpuDevice {
+}
+
+impl AttentionOps for CpuDevice {
+
+
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )
+    }
+
 
     fn rope(
         &self,
@@ -826,6 +751,7 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
 
     fn rerope(
         &self,
@@ -913,6 +839,7 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -938,6 +865,7 @@ impl BackendDevice for CpuDevice {
             out_shape,
         )
     }
+
 
     fn qkv_attention_alibi(
         &self,
@@ -970,6 +898,7 @@ impl BackendDevice for CpuDevice {
             out_shape,
         )
     }
+
 
     /// CPU **reference** implementation of fused dequantized KV-attention.
     ///
@@ -1082,102 +1011,6 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
-    fn short_conv1d_causal_step(
-        &self,
-        x: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        bias: Option<&dyn BackendStorage>,
-        conv_state: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = a_storage(x)?;
-        let w_s = a_storage(weight)?;
-        let st_s = a_storage(conv_state)?;
-
-        let x_data = x_s.data();
-        let w_data = w_s.data();
-        let st_data = st_s.data();
-
-        let hidden = x_s.shape().dims().last().cloned().unwrap_or(0);
-        let k_size = if hidden > 0 {
-            w_s.data().len().checked_div(hidden).unwrap_or(0)
-        } else {
-            1
-        };
-
-        let mut out = vec![0.0f32; out_shape.elem_count()];
-        for h in 0..hidden {
-            let mut sum = 0.0f32;
-            for k in 0..k_size.saturating_sub(1) {
-                sum += st_data[h * (k_size - 1) + k] * w_data[h * k_size + k];
-            }
-            sum += x_data[h] * w_data[h * k_size + (k_size - 1)];
-            if let Some(b) = bias {
-                let b_s = a_storage(b)?;
-                sum += b_s.data()[h];
-            }
-            out[h] = sum;
-        }
-
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
-
-    fn kda_gated_delta_rule_step(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        beta: &dyn BackendStorage,
-        a_gate: &dyn BackendStorage,
-        recurrent_state: &dyn BackendStorage,
-        d_k: usize,
-        d_v: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = a_storage(q)?;
-        let k_s = a_storage(k)?;
-        let v_s = a_storage(v)?;
-        let beta_s = a_storage(beta)?;
-        let gate_s = a_storage(a_gate)?;
-        let s_s = a_storage(recurrent_state)?;
-
-        let q_data = q_s.data();
-        let k_data = k_s.data();
-        let v_data = v_s.data();
-        let beta_val = beta_s.data()[0];
-        let gate_val = gate_s.data()[0];
-
-        let decay = gate_val.exp();
-        let mut out = vec![0.0f32; out_shape.elem_count()];
-
-        for i in 0..d_v {
-            let col: Vec<f32> = s_s.data()[i..]
-                .iter()
-                .step_by(d_v)
-                .take(d_k)
-                .copied()
-                .collect();
-            let mut k_s_decayed = 0.0f32;
-            for (k, sc) in k_data.iter().zip(&col) {
-                k_s_decayed += k * (decay * sc);
-            }
-            let delta_i = beta_val * (v_data[i] - k_s_decayed);
-            let mut out_i = 0.0f32;
-            for ((q, k), sc) in q_data.iter().zip(k_data.iter()).zip(&col) {
-                let s_new_ji = decay * sc + k * delta_i;
-                out_i += q * s_new_ji;
-            }
-            out[i] = out_i;
-        }
-
-        Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
-            Box::new(ReadyHandle),
-        ))
-    }
 
     fn mla_q_kv_norm_split(
         &self,
@@ -1253,6 +1086,7 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
 
     fn qkv_attention_paged(
         &self,
@@ -1375,87 +1209,186 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+}
 
-    fn embedding(
+impl FusionOps for CpuDevice {
+
+
+    fn silu_mul_quantize(
         &self,
-        weight: &dyn BackendStorage,
-        indices: &[u32],
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        _format: grim_tensor::dtype::QuantFormat,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let w = a_storage(weight)?;
-        if w.shape().rank() != 2 {
-            return Err(Error::Shape("embedding: weight must be 2-D".into()));
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let g = a_storage(gate)?;
+        let u = a_storage(up)?;
+        if g.shape() != u.shape() || g.shape() != out_shape {
+            return Err(Error::Shape("silu_mul_quantize: shape mismatch".into()));
         }
-        let vocab = w.shape().dim(0)?;
-        let dim = w.shape().dim(1)?;
-        if indices.len() * dim != out_shape.elem_count() {
-            return Err(Error::Shape("embedding: out size mismatch".into()));
+        let n = out_shape.elem_count();
+        let gd = g.data();
+        let ud = u.data();
+
+        let mut max_abs = 0.0f32;
+        let mut activated = vec![0.0f32; n];
+        for i in 0..n {
+            let x = gd[i];
+            let silu = x / (1.0 + (-x).exp());
+            let val = silu * ud[i];
+            activated[i] = val;
+            max_abs = max_abs.max(val.abs());
         }
-        let wd = w.data();
-        let mut out = vec![0.0f32; indices.len() * dim];
-        for (i, &tok) in indices.iter().enumerate() {
-            let tok = tok as usize;
-            if tok >= vocab {
-                return Err(Error::IndexOutOfBounds(format!(
-                    "token {tok} >= vocab {vocab}"
-                )));
-            }
-            out[i * dim..(i + 1) * dim].copy_from_slice(&wd[tok * dim..(tok + 1) * dim]);
+
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let inv_scale = 1.0 / scale;
+        let mut qbytes = vec![0u8; n];
+        for i in 0..n {
+            let q = (activated[i] * inv_scale).clamp(-127.0, 127.0);
+            qbytes[i] = (q as i8) as u8;
         }
+
+        let bytes_storage = CpuStorage::from_raw_bytes(
+            qbytes,
+            out_shape.clone(),
+            DType {
+                arith: grim_tensor::dtype::ArithType::U8,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+        );
+        let scale_storage = CpuStorage::new(
+            vec![scale],
+            Shape::from_slice(&[1]),
+            DType {
+                arith: grim_tensor::dtype::ArithType::F32,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+        );
+
         Ok((
-            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(bytes_storage),
+            Box::new(scale_storage),
             Box::new(ReadyHandle),
         ))
     }
 
-    fn from_cpu(
-        &self,
-        data: &[f32],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        ensure_cpu_native(&dtype)?;
-        if data.len() != shape.elem_count() {
-            return Err(Error::ShapeMismatch {
-                expected: vec![shape.elem_count()],
-                got: vec![data.len()],
-            });
-        }
-        Ok(Box::new(CpuStorage::new(
-            data.to_vec(),
-            shape.clone(),
-            dtype,
-        )))
-    }
 
-    fn from_cpu_bytes(
+    fn fused_add_rms_norm(
         &self,
-        data: &[u8],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        // Native f32: interpret bytes as f32.
-        match dtype.storage {
-            grim_tensor::dtype::Storage::Native => {
-                if data.len() % 4 != 0 {
-                    return Err(Error::ShapeMismatch {
-                        expected: vec![shape.elem_count() * 4],
-                        got: vec![data.len()],
-                    });
-                }
-                let f32_data: Vec<f32> = data
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect();
-                Ok(Box::new(CpuStorage::new(f32_data, shape.clone(), dtype)))
-            }
-            _ => Ok(Box::new(CpuStorage::from_raw_bytes(
-                data.to_vec(),
-                shape.clone(),
-                dtype,
-            ))),
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let x_st = a_storage(x)?;
+        let res_st = a_storage(residual)?;
+        let w_st = a_storage(weight)?;
+        let x_data = x_st.data();
+        let res_data = res_st.data();
+        let w_data = w_st.data();
+
+        let n = out_shape.elem_count();
+        let hidden_dim = w_st.shape().elem_count();
+        if hidden_dim == 0 || n % hidden_dim != 0 {
+            return Err(Error::Shape(
+                "fused_add_rms_norm: invalid dimensions".into(),
+            ));
         }
+        let num_rows = n / hidden_dim;
+
+        let mut res_out = vec![0.0f32; n];
+        let mut y_out = vec![0.0f32; n];
+
+        for r in 0..num_rows {
+            let row_start = r * hidden_dim;
+            let mut sum_sq = 0.0f32;
+            for ((x, res), added_out) in x_data[row_start..row_start + hidden_dim]
+                .iter()
+                .zip(&res_data[row_start..row_start + hidden_dim])
+                .zip(&mut res_out[row_start..row_start + hidden_dim])
+            {
+                let added = x + res;
+                *added_out = added;
+                sum_sq += added * added;
+            }
+            let mean_sq = sum_sq / (hidden_dim as f32);
+            let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
+            for ((y, added), w) in y_out[row_start..row_start + hidden_dim]
+                .iter_mut()
+                .zip(&res_out[row_start..row_start + hidden_dim])
+                .zip(w_data)
+            {
+                *y = added * inv_rms * w;
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(y_out, out_shape.clone(), DType::F32)),
+            Box::new(CpuStorage::new(res_out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
     }
+}
+
+impl AutogradOps for CpuDevice {
+
+
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let e_st = a_storage(e)?;
+        let g_st = a_storage(g)?;
+        let dw_st = a_storage(dw)?;
+        let ed = e_st.data();
+        let gd = g_st.data();
+        let dwd = dw_st.data();
+        let n = out_shape.elem_count();
+
+        let mut de = vec![0.0f32; n];
+        let mut dg = vec![0.0f32; n];
+
+        for i in 0..n {
+            let x = gd[i];
+            let sigm = 1.0f32 / (1.0f32 + (-x).exp());
+            let silu = x * sigm;
+            let dsilu = sigm * (1.0f32 + x * (1.0f32 - sigm));
+            let w = dwd[i];
+            let ev = ed[i];
+
+            de[i] = w * silu;
+            dg[i] = w * ev * dsilu;
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(de, out_shape.clone(), DType::F32)),
+            Box::new(CpuStorage::new(dg, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+}
+
+impl OptimizerOps for CpuDevice {
+}
+
+impl QuantOps for CpuDevice {
+
 
     fn quantized_matmul(
         &self,
@@ -1633,6 +1566,7 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
@@ -1720,6 +1654,145 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+}
+
+impl RecurrentOps for CpuDevice {
+
+
+    fn short_conv1d_causal_step(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        conv_state: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = a_storage(x)?;
+        let w_s = a_storage(weight)?;
+        let st_s = a_storage(conv_state)?;
+
+        let x_data = x_s.data();
+        let w_data = w_s.data();
+        let st_data = st_s.data();
+
+        let hidden = x_s.shape().dims().last().cloned().unwrap_or(0);
+        let k_size = if hidden > 0 {
+            w_s.data().len().checked_div(hidden).unwrap_or(0)
+        } else {
+            1
+        };
+
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+        for h in 0..hidden {
+            let mut sum = 0.0f32;
+            for k in 0..k_size.saturating_sub(1) {
+                sum += st_data[h * (k_size - 1) + k] * w_data[h * k_size + k];
+            }
+            sum += x_data[h] * w_data[h * k_size + (k_size - 1)];
+            if let Some(b) = bias {
+                let b_s = a_storage(b)?;
+                sum += b_s.data()[h];
+            }
+            out[h] = sum;
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
+    fn kda_gated_delta_rule_step(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        a_gate: &dyn BackendStorage,
+        recurrent_state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = a_storage(q)?;
+        let k_s = a_storage(k)?;
+        let v_s = a_storage(v)?;
+        let beta_s = a_storage(beta)?;
+        let gate_s = a_storage(a_gate)?;
+        let s_s = a_storage(recurrent_state)?;
+
+        let q_data = q_s.data();
+        let k_data = k_s.data();
+        let v_data = v_s.data();
+        let beta_val = beta_s.data()[0];
+        let gate_val = gate_s.data()[0];
+
+        let decay = gate_val.exp();
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+
+        for i in 0..d_v {
+            let col: Vec<f32> = s_s.data()[i..]
+                .iter()
+                .step_by(d_v)
+                .take(d_k)
+                .copied()
+                .collect();
+            let mut k_s_decayed = 0.0f32;
+            for (k, sc) in k_data.iter().zip(&col) {
+                k_s_decayed += k * (decay * sc);
+            }
+            let delta_i = beta_val * (v_data[i] - k_s_decayed);
+            let mut out_i = 0.0f32;
+            for ((q, k), sc) in q_data.iter().zip(k_data.iter()).zip(&col) {
+                let s_new_ji = decay * sc + k * delta_i;
+                out_i += q * s_new_ji;
+            }
+            out[i] = out_i;
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+}
+
+impl CollectiveOps for CpuDevice {
+}
+
+impl MemoryOps for CpuDevice {
+
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        // Native f32: interpret bytes as f32.
+        match dtype.storage {
+            grim_tensor::dtype::Storage::Native => {
+                if data.len() % 4 != 0 {
+                    return Err(Error::ShapeMismatch {
+                        expected: vec![shape.elem_count() * 4],
+                        got: vec![data.len()],
+                    });
+                }
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                Ok(Box::new(CpuStorage::new(f32_data, shape.clone(), dtype)))
+            }
+            _ => Ok(Box::new(CpuStorage::from_raw_bytes(
+                data.to_vec(),
+                shape.clone(),
+                dtype,
+            ))),
+        }
+    }
+
 
     fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
@@ -1730,6 +1803,7 @@ impl BackendDevice for CpuDevice {
             dtype,
         )))
     }
+
 
     fn copy_slice_into(
         &self,
@@ -1761,14 +1835,10 @@ impl BackendDevice for CpuDevice {
         }
         Ok(())
     }
+}
 
-    fn advise(
-        &self,
-        _storage: &dyn BackendStorage,
-        _advice: grim_tensor::backend::MemAdvice,
-    ) -> Result<()> {
-        Ok(())
-    }
+impl GraphCaptureOps for CpuDevice {
+
 
     // Bridge the inherent CPU graph-capture implementation into the
     // `BackendDevice` trait contract so generic `&dyn BackendDevice` callers
@@ -1778,18 +1848,22 @@ impl BackendDevice for CpuDevice {
         CpuDevice::begin_graph_capture(self, key)
     }
 
+
     fn end_graph_capture(&self, key: &str) -> Result<()> {
         CpuDevice::end_graph_capture(self, key)
     }
+
 
     fn replay_graph(&self, key: &str) -> Result<bool> {
         CpuDevice::replay_graph(self, key)
     }
 
+
     fn has_captured_graph(&self, key: &str) -> bool {
         self.graphs.has_captured(key)
     }
 }
+
 
 impl BackendStorage for CpuStorage {
     fn dtype(&self) -> DType {
@@ -2038,7 +2112,7 @@ pub fn cpu_tensor(data: Vec<f32>, shape: Shape) -> grim_tensor::Tensor {
 /// Add two tensors element-wise (broadcasting allowed).
 pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(
+    let (s, h) = grim_tensor::CoreTensorOps::add(
         &dev,
         a.storage().as_ref(),
         b.storage().as_ref(),
@@ -2083,7 +2157,7 @@ mod tests {
     // any model-level refactor.
     #[test]
     fn paged_attention_matches_dense_attention() {
-        use grim_tensor::{BackendDevice, DType, Device, Shape};
+        use grim_tensor::{CoreTensorOps, DType, Device, Shape};
         use std::sync::Arc;
 
         let dev = CpuDevice::new();
@@ -2684,6 +2758,7 @@ mod tests {
     #[test]
     fn graph_capture_wired_into_trait() {
         use grim_tensor::backend::BackendDevice;
+    // umbrella `BackendDevice` still exposes every sub-trait method to `&dyn` callers
         let dev = CpuDevice::new();
         let dyn_dev: &dyn BackendDevice = &dev;
 
