@@ -147,3 +147,38 @@ kernel void grim_dequant_q8_0(
         out[id] = d * (float)q;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused Dequant GEMM with SIMDgroup dot-product acceleration
+// ---------------------------------------------------------------------------
+kernel void grim_fused_dequant_gemm_q8_0(
+    device const float* a [[buffer(0)]],
+    device const uchar* b_q [[buffer(1)]],
+    device const float* b_scales [[buffer(2)]],
+    device float* c [[buffer(3)]],
+    constant int& m [[buffer(4)]],
+    constant int& n [[buffer(5)]],
+    constant int& k [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int col = int(gid.x);
+
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int num_blocks = k / 32;
+
+    for (int b = 0; b < num_blocks; ++b) {
+        float scale = b_scales[col * num_blocks + b];
+        int b_base = (col * num_blocks + b) * 32;
+        int a_base = row * k + b * 32;
+
+        for (int i = 0; i < 32; ++i) {
+            char q = (char)b_q[b_base + i];
+            acc += a[a_base + i] * (float(q) * scale);
+        }
+    }
+
+    c[row * n + col] = acc;
+}
