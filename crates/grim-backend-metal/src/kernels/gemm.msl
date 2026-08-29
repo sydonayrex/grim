@@ -1,0 +1,151 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct TileConfig {
+    int block_m;
+    int block_n;
+    int block_k;
+    int warp_m;
+    int warp_n;
+    int warp_k;
+    int split_k;
+    int vector_width;
+    int unroll;
+    int double_buffer;
+};
+
+// MSL Specialization constants for per-candidate specialization
+constant int SPEC_BLOCK_M [[function_constant(0)]];
+constant int SPEC_BLOCK_N [[function_constant(1)]];
+constant int SPEC_BLOCK_K [[function_constant(2)]];
+constant bool HAS_SPEC_CONSTANTS [[function_constant(3)]];
+
+kernel void grim_matmul(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    constant TileConfig& config [[buffer(6)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    threadgroup float tile_a[64][64];
+    threadgroup float tile_b[64][64];
+
+    int block_m = HAS_SPEC_CONSTANTS ? SPEC_BLOCK_M : config.block_m;
+    int block_n = HAS_SPEC_CONSTANTS ? SPEC_BLOCK_N : config.block_n;
+    int block_k = HAS_SPEC_CONSTANTS ? SPEC_BLOCK_K : config.block_k;
+
+    int row_start = tg_id.y * block_m;
+    int col_start = tg_id.x * block_n;
+
+    float acc = 0.0f;
+    for (int bk = 0; bk < k; bk += block_k) {
+        int t_row = tid.y;
+        int t_col = tid.x;
+        if (t_row < block_m && t_col < block_k) {
+            if (row_start + t_row < m && bk + t_col < k) {
+                tile_a[t_row][t_col] = a[(row_start + t_row) * k + (bk + t_col)];
+            } else {
+                tile_a[t_row][t_col] = 0.0f;
+            }
+        }
+
+        if (t_row < block_k && t_col < block_n) {
+            if (bk + t_row < k && col_start + t_col < n) {
+                tile_b[t_row][t_col] = b[(bk + t_row) * n + (col_start + t_col)];
+            } else {
+                tile_b[t_row][t_col] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = 0; i < block_k; ++i) {
+            acc += tile_a[t_row][i] * tile_b[i][t_col];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    int out_row = row_start + tid.y;
+    int out_col = col_start + tid.x;
+    if (out_row < m && out_col < n) {
+        c[out_row * n + out_col] = acc;
+    }
+}
+
+// Split-K MSL path for parallelizing K-dimension reductions across threadgroups
+kernel void grim_matmul_split_k(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* partial_c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    constant TileConfig& config [[buffer(6)]],
+    constant int& num_k_splits [[buffer(7)]],
+    uint3 tg_id [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    threadgroup float tile_a[32][32];
+    threadgroup float tile_b[32][32];
+
+    int block_m = config.block_m;
+    int block_n = config.block_n;
+    int block_k = config.block_k;
+
+    int split_idx = tg_id.z;
+    int k_chunk = (k + num_k_splits - 1) / num_k_splits;
+    int k_start = split_idx * k_chunk;
+    int k_end = min(k_start + k_chunk, k);
+
+    int row_start = tg_id.y * block_m;
+    int col_start = tg_id.x * block_n;
+
+    float acc = 0.0f;
+    for (int bk = k_start; bk < k_end; bk += block_k) {
+        int t_row = tid.y;
+        int t_col = tid.x;
+        if (row_start + t_row < m && bk + t_col < k_end) {
+            tile_a[t_row][t_col] = a[(row_start + t_row) * k + (bk + t_col)];
+        } else {
+            tile_a[t_row][t_col] = 0.0f;
+        }
+
+        if (bk + t_row < k_end && col_start + t_col < n) {
+            tile_b[t_row][t_col] = b[(bk + t_row) * n + (col_start + t_col)];
+        } else {
+            tile_b[t_row][t_col] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = 0; i < block_k; ++i) {
+            acc += tile_a[t_row][i] * tile_b[i][t_col];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    int out_row = row_start + tid.y;
+    int out_col = col_start + tid.x;
+    if (out_row < m && out_col < n) {
+        int partial_stride = m * n;
+        partial_c[split_idx * partial_stride + out_row * n + out_col] = acc;
+    }
+}
+
+kernel void grim_reduce_split_k(
+    device const float* partial_c [[buffer(0)]],
+    device float* out_c [[buffer(1)]],
+    constant int& total_elements [[buffer(2)]],
+    constant int& num_splits [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(total_elements)) {
+        float sum = 0.0f;
+        for (int s = 0; s < num_splits; ++s) {
+            sum += partial_c[s * total_elements + id];
+        }
+        out_c[id] = sum;
+    }
+}
