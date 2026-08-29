@@ -387,7 +387,30 @@ impl TrainableParams {
         Ok(())
     }
 
-    /// Zero all gradient buffers — called at the start of each training step.
+    /// Scale all parameter gradients by a constant factor `factor` (e.g. `1.0 / micro_batches`).
+    pub fn scale_grads(&mut self, factor: f32) -> Result<()> {
+        for param in self.params.values_mut() {
+            if param.is_frozen() {
+                continue;
+            }
+            let mut grad_vec = param.grad.to_vec_f32()?;
+            for value in &mut grad_vec {
+                *value *= factor;
+            }
+            let dev = crate::pick_device_for_tensor(param.grad());
+            let storage = dev.from_cpu(&grad_vec, param.grad.shape(), param.grad.dtype())?;
+            param.grad = Tensor::new(
+                std::sync::Arc::from(storage),
+                param.grad.shape().clone(),
+                param.grad.dtype(),
+                param.grad.provenance().clone(),
+                param.grad.device().clone(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Zero all gradient buffers — called at the start or completion of a training step.
     pub fn zero_all_grads(&mut self) -> Result<()> {
         for param in self.params.values_mut() {
             param.zero_grad()?;
@@ -648,5 +671,28 @@ mod tests {
             )
             .expect_err("NaN contribution weights must fail closed");
         assert!(err.to_string().contains("contribution weight"));
+    }
+
+    #[test]
+    fn test_scale_grads_for_gradient_accumulation() {
+        let mut params = TrainableParams::new();
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let mut tp = TrainableParam::new(pid, tensor(vec![1.0, 2.0], vec![2])).unwrap();
+        // Simulate accumulating 4 micro-batches of gradient [1.0, 2.0]
+        for _ in 0..4 {
+            tp.accumulate_grad(&tensor(vec![1.0, 2.0], vec![2])).unwrap();
+        }
+        params.insert(tp);
+        assert_eq!(
+            params.get(pid).unwrap().grad().to_vec_f32().unwrap(),
+            vec![4.0, 8.0]
+        );
+
+        // Average gradients across 4 micro-batches
+        params.scale_grads(1.0 / 4.0).unwrap();
+        assert_eq!(
+            params.get(pid).unwrap().grad().to_vec_f32().unwrap(),
+            vec![1.0, 2.0]
+        );
     }
 }

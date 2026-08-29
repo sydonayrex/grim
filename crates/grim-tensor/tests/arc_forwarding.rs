@@ -55,6 +55,17 @@ fn probe_err(method: &str) -> grim_tensor::Result<()> {
 // overrides directly instead — explicit and grep-friendly.
 impl CoreTensorOps for ProbeDevice {
 
+    fn transpose_2d(
+        &self,
+        _x: &dyn BackendStorage,
+        _rows: usize,
+        _cols: usize,
+        _out_shape: &Shape,
+    ) -> grim_tensor::Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        probe_err("transpose_2d")?;
+        unreachable!()
+    }
+
     fn zeros(&self, shape: &Shape, _dtype: DType) -> grim_tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(ProbeStorage {
             shape: shape.clone(),
@@ -539,6 +550,11 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
     assert_probe!(dev.reduce_sum(s.as_ref()), "reduce_sum");
     assert_probe!(dev.reduce_max(s.as_ref()), "reduce_max");
     assert_probe!(dev.argmax(s.as_ref()), "argmax");
+    // B5: transpose_2d must forward through the Arc blanket impls too.
+    assert_probe!(
+        dev.transpose_2d(s.as_ref(), 2, 2, &shape),
+        "transpose_2d"
+    );
     assert_probe!(
         dev.qkv_attention_alibi(
             s.as_ref(),

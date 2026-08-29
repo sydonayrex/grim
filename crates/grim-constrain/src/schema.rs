@@ -55,21 +55,77 @@ impl JsonSchemaConstraint {
 /// Supported subset: `type`, `properties`, `required`, `enum`, `items`,
 /// `pattern`, `additionalProperties`, `$ref` (internal pointers `#/...`), `oneOf`/`anyOf`/`allOf`, nested `object`/`array`.
 /// `format` is rejected if present.
+const SUPPORTED_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "enum",
+    "items",
+    "pattern",
+    "additionalProperties",
+    "$ref",
+    "$defs",
+    "definitions",
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "description",
+    "title",
+    "$schema",
+    "$id",
+];
+
+fn validate_schema_keywords(schema: &Value) -> Result<(), JsonSchemaCompilerError> {
+    match schema {
+        Value::Object(map) => {
+            for key in map.keys() {
+                if !SUPPORTED_KEYWORDS.contains(&key.as_str()) {
+                    return Err(JsonSchemaCompilerError {
+                        message: format!(
+                            "unsupported json_schema keyword '{key}'; supported subset: \
+                             type, properties, required, enum, items, pattern, additionalProperties, $ref, $defs, definitions, oneOf, anyOf, allOf"
+                        ),
+                    });
+                }
+            }
+            if let Some(props) = map.get("properties").and_then(|v| v.as_object()) {
+                for sub in props.values() {
+                    validate_schema_keywords(sub)?;
+                }
+            }
+            if let Some(items) = map.get("items") {
+                validate_schema_keywords(items)?;
+            }
+            if let Some(additional) = map.get("additionalProperties") {
+                if additional.is_object() {
+                    validate_schema_keywords(additional)?;
+                }
+            }
+            for combinator in &["oneOf", "anyOf", "allOf"] {
+                if let Some(arr) = map.get(*combinator).and_then(|v| v.as_array()) {
+                    for sub in arr {
+                        validate_schema_keywords(sub)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Value::Array(arr) => {
+            for sub in arr {
+                validate_schema_keywords(sub)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSchemaCompilerError> {
-    let obj = schema.as_object().ok_or_else(|| JsonSchemaCompilerError {
+    let _obj = schema.as_object().ok_or_else(|| JsonSchemaCompilerError {
         message: "json_schema must be a JSON object".to_string(),
     })?;
 
-    for unsupported in &["format"] {
-        if obj.contains_key(*unsupported) {
-            return Err(JsonSchemaCompilerError {
-                message: format!(
-                    "unsupported json_schema keyword '{unsupported}'; supported subset: \
-                     type, properties, required, enum, items, pattern, additionalProperties, $ref, oneOf, anyOf, allOf, nested object/array"
-                ),
-            });
-        }
-    }
+    validate_schema_keywords(&schema)?;
 
     let resolved_schema = resolve_refs(&schema, &schema, 0)?;
 

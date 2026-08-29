@@ -264,6 +264,47 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     out[i] = 1.0f / x[i];
 }
 
+extern "C" __global__ void grim_sub(const float* a, const float* b, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] - b[i];
+}
+
+extern "C" __global__ void grim_reduce_sum(const float* x, float* out, int rows, int cols) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float sum = 0.0f;
+    for (int c = 0; c < cols; ++c) {
+        sum += x[row * cols + c];
+    }
+    out[row] = sum;
+}
+
+extern "C" __global__ void grim_reduce_max(const float* x, float* out, int rows, int cols) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float max_val = -1e30f;
+    for (int c = 0; c < cols; ++c) {
+        max_val = fmaxf(max_val, x[row * cols + c]);
+    }
+    out[row] = max_val;
+}
+
+extern "C" __global__ void grim_argmax(const float* x, int* out, int rows, int cols) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float max_val = -1e30f;
+    int max_idx = 0;
+    for (int c = 0; c < cols; ++c) {
+        float val = x[row * cols + c];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = c;
+        }
+    }
+    out[row] = max_idx;
+}
+
 extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out, int num_tokens, int num_heads, int head_dim, float base) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_dim = head_dim / 2;

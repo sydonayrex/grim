@@ -2317,6 +2317,7 @@ dependencies = [
  "grim-tensor",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2324,12 +2325,14 @@ name = "grim-core"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "grim-backend-cpu",
  "grim-format",
  "grim-tensor",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.23",

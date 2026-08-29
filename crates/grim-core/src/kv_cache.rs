@@ -123,3 +123,138 @@ pub trait KvCache: Send {
         Ok(())
     }
 }
+
+/// A lightweight in-memory [`KvCache`] for tests (audit gap: callers
+/// previously had to pull in the heavyweight grim-memory paged store to test
+/// against the trait). Stores per-token K/V rows in flat vectors and honors
+/// the speculative `tentative_append`/`commit`/`rollback_to` contract by
+/// tracking a tentative length separately from the committed length.
+#[derive(Debug, Clone, Default)]
+pub struct MockKvCache {
+    num_heads: usize,
+    head_dim: usize,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    committed: usize,
+    tentative: usize,
+}
+
+impl MockKvCache {
+    pub fn new(num_heads: usize, head_dim: usize) -> Self {
+        Self {
+            num_heads,
+            head_dim,
+            k: Vec::new(),
+            v: Vec::new(),
+            committed: 0,
+            tentative: 0,
+        }
+    }
+
+    pub fn committed_len(&self) -> usize {
+        self.committed
+    }
+}
+
+impl KvCache for MockKvCache {
+    fn append_slot(&mut self) -> Result<()> {
+        self.committed += 1;
+        let row = self.num_heads * self.head_dim;
+        self.k.resize(self.committed * row, 0.0);
+        self.v.resize(self.committed * row, 0.0);
+        Ok(())
+    }
+
+    fn tentative_append(&mut self, n_tokens: usize) -> Result<()> {
+        self.tentative += n_tokens;
+        let total = self.committed + self.tentative;
+        let row = self.num_heads * self.head_dim;
+        self.k.resize(total * row, 0.0);
+        self.v.resize(total * row, 0.0);
+        Ok(())
+    }
+
+    fn commit(&mut self, accepted_len: usize) -> Result<()> {
+        self.committed += accepted_len.min(self.tentative);
+        self.tentative = 0;
+        let row = self.num_heads * self.head_dim;
+        self.k.truncate(self.committed * row);
+        self.v.truncate(self.committed * row);
+        Ok(())
+    }
+
+    fn rollback_to(&mut self, len: usize) -> Result<()> {
+        self.committed = self.committed.min(len);
+        self.tentative = 0;
+        let row = self.num_heads * self.head_dim;
+        self.k.truncate(self.committed * row);
+        self.v.truncate(self.committed * row);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.committed + self.tentative
+    }
+
+    fn current_k(&self) -> Result<Tensor> {
+        let shape = grim_tensor::Shape::new(vec![self.len(), self.num_heads, self.head_dim]);
+        Ok(grim_backend_cpu::cpu_tensor(self.k.clone(), shape))
+    }
+
+    fn current_v(&self) -> Result<Tensor> {
+        let shape = grim_tensor::Shape::new(vec![self.len(), self.num_heads, self.head_dim]);
+        Ok(grim_backend_cpu::cpu_tensor(self.v.clone(), shape))
+    }
+
+    fn store_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let row = self.num_heads * self.head_dim;
+        let start = (self.len().saturating_sub(1)) * row;
+        let kv = k.to_vec_f32()?;
+        let vv = v.to_vec_f32()?;
+        let take = kv.len().min(self.k.len().saturating_sub(start));
+        self.k[start..start + take].copy_from_slice(&kv[..take]);
+        let take = vv.len().min(self.v.len().saturating_sub(start));
+        self.v[start..start + take].copy_from_slice(&vv[..take]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mock_kv_cache_tests {
+    use super::*;
+
+    /// The mock must honor the speculative contract: tentative slots are
+    /// visible in `len` but discarded by rollback, and commit folds only
+    /// the accepted count.
+    #[test]
+    fn mock_kv_cache_speculative_contract() {
+        let mut kv = MockKvCache::new(2, 4);
+        assert!(kv.is_empty());
+        for _ in 0..4 {
+            kv.append_slot().unwrap();
+        }
+        assert_eq!(kv.len(), 4);
+        kv.tentative_append(3).unwrap();
+        assert_eq!(kv.len(), 7);
+        // Commit 1 of 3 drafts.
+        kv.commit(1).unwrap();
+        assert_eq!(kv.len(), 5);
+        assert_eq!(kv.committed_len(), 5);
+        // Roll back past a block boundary.
+        kv.rollback_to(2).unwrap();
+        assert_eq!(kv.len(), 2);
+        assert_eq!(kv.current_k().unwrap().to_vec_f32().unwrap().len(), 2 * 2 * 4);
+    }
+
+    /// store_kv writes into the newest slot and is readable back.
+    #[test]
+    fn mock_kv_cache_store_and_read() {
+        let mut kv = MockKvCache::new(1, 2);
+        kv.append_slot().unwrap();
+        let k = grim_backend_cpu::cpu_tensor(vec![1.5f32, -2.0], grim_tensor::Shape::new(vec![1, 2]));
+        let v = grim_backend_cpu::cpu_tensor(vec![3.0f32, 4.0], grim_tensor::Shape::new(vec![1, 2]));
+        kv.store_kv(&k, &v).unwrap();
+        assert_eq!(kv.current_k().unwrap().to_vec_f32().unwrap(), vec![1.5, -2.0]);
+        assert_eq!(kv.current_v().unwrap().to_vec_f32().unwrap(), vec![3.0, 4.0]);
+    }
+}

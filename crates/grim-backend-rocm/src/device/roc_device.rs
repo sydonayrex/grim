@@ -2045,6 +2045,21 @@ impl RocmDevice {
 }
 
 impl CoreTensorOps for RocmDevice {
+    /// Audit B5: delegate to the device-resident `grim_transpose_2d_f32` HIP
+    /// kernel via the existing inherent helper — the tensor never leaves GPU
+    /// memory (the helper synchronizes the kernel launch internally, so the
+    /// returned handle is trivially ready).
+    fn transpose_2d(
+        &self,
+        x: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let out = self.transpose_f32_2d(x, rows, cols)?;
+        Ok((out, Box::new(ReadyHandle)))
+    }
+
 
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         // P1-3: raw HIP ops below bind to the calling thread's current

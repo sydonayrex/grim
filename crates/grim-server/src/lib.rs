@@ -1035,23 +1035,25 @@ fn build_constrained_sampler(
     match ty {
         "text" | "text/plain" => Ok(inner),
         "json_object" => {
+            let v = vocab.ok_or_else(|| {
+                "constrained generation ('json_object') requires an attached model vocabulary; none available"
+                    .to_string()
+            })?;
             use grim_constrain::constrained_json_object;
-            let mut s = constrained_json_object(inner);
-            if let Some(v) = vocab {
-                s = s.with_vocab(v);
-            }
+            let s = constrained_json_object(inner).with_vocab(v);
             Ok(std::sync::Arc::new(s))
         }
         "json_schema" => {
             let schema = obj.get("json_schema").cloned().ok_or_else(|| {
                 "response_format.json_schema is required when type='json_schema'".to_string()
             })?;
+            let v = vocab.ok_or_else(|| {
+                "constrained generation ('json_schema') requires an attached model vocabulary; none available"
+                    .to_string()
+            })?;
             use grim_constrain::{ConstrainedSampler, Constraint};
             let constraint = Constraint::json_schema(schema).map_err(|e| e.to_string())?;
-            let mut s = ConstrainedSampler::new(inner, constraint);
-            if let Some(v) = vocab {
-                s = s.with_vocab(v);
-            }
+            let s = ConstrainedSampler::new(inner, constraint).with_vocab(v);
             Ok(std::sync::Arc::new(s))
         }
         other => Err(format!(
