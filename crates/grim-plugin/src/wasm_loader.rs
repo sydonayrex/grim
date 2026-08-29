@@ -18,7 +18,7 @@
 //!   no WASI implementation, so no preopens or sockets can ever be linked)
 //!   is rejected at plugin-load time — loudly, never as a silent trap.
 
-use crate::{PluginGrants, PluginLimits};
+use crate::{PluginGrants, PluginLimits, ProcessorPlugin, TokenizerPlugin};
 use grim_core::Sampler;
 use grim_tensor::error::{Error, Result};
 use std::sync::Arc;
@@ -55,6 +55,26 @@ pub struct WasmSampler {
     /// The store is behind a Mutex because `Func::call` and `Memory::write`
     /// require `AsContextMut` (mutable access), but `Sampler::sample` takes
     /// `&self`.
+    #[cfg(feature = "wasm-sandbox")]
+    store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
+}
+
+/// Wrapper for a WASM-based tokenizer plugin.
+pub struct WasmTokenizer {
+    name: String,
+    limits: PluginLimits,
+    #[cfg(feature = "wasm-sandbox")]
+    instance: Option<wasmtime::Instance>,
+    #[cfg(feature = "wasm-sandbox")]
+    store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
+}
+
+/// Wrapper for a WASM-based pre/post-processor plugin.
+pub struct WasmProcessor {
+    name: String,
+    limits: PluginLimits,
+    #[cfg(feature = "wasm-sandbox")]
+    instance: Option<wasmtime::Instance>,
     #[cfg(feature = "wasm-sandbox")]
     store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
 }
@@ -197,6 +217,128 @@ impl WasmPluginLoader {
         ))
     }
 
+    /// Create a tokenizer from WASM bytes, enforcing all manifest grants.
+    #[cfg(feature = "wasm-sandbox")]
+    pub fn create_tokenizer(&self, wasm_bytes: &[u8]) -> Result<Arc<dyn TokenizerPlugin>> {
+        use wasmtime::{Config, Engine as WasmtimeEngine, Linker, Module, Store};
+
+        if self.grants.network {
+            return Err(Error::Backend(format!(
+                "plugin '{}': network grant cannot be honored",
+                self.name
+            )));
+        }
+        if !self.grants.filesystem.is_empty() {
+            return Err(Error::Backend(format!(
+                "plugin '{}': filesystem grant cannot be honored",
+                self.name
+            )));
+        }
+        if self.grants.request_metadata {
+            return Err(Error::Backend(format!(
+                "plugin '{}': request_metadata grant cannot be honored",
+                self.name
+            )));
+        }
+
+        let mut config = Config::new();
+        config.max_wasm_stack(1048576);
+        if self.limits.fuel_per_invocation.is_some() {
+            config.consume_fuel(true);
+        }
+
+        let engine = WasmtimeEngine::new(&config)
+            .map_err(|e| Error::Backend(format!("failed to create wasmtime engine: {e}")))?;
+        let module = Module::new(&engine, wasm_bytes)
+            .map_err(|e| Error::Backend(format!("failed to compile WASM module: {e}")))?;
+        let mut store = Store::new(&engine, ());
+        if let Some(fuel) = self.limits.fuel_per_invocation {
+            store
+                .set_fuel(fuel)
+                .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
+        }
+        let linker: Linker<()> = Linker::new(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| Error::Backend(format!("failed to instantiate WASM module: {e}")))?;
+
+        Ok(Arc::new(WasmTokenizer {
+            name: self.name.clone(),
+            limits: self.limits.clone(),
+            instance: Some(instance),
+            store: Some(std::sync::Mutex::new(store)),
+        }))
+    }
+
+    /// Non-wasm-sandbox fallback for create_tokenizer.
+    #[cfg(not(feature = "wasm-sandbox"))]
+    pub fn create_tokenizer(&self, _wasm_bytes: &[u8]) -> Result<Arc<dyn TokenizerPlugin>> {
+        Err(Error::Unimplemented(
+            "WASM sandbox support disabled. Rebuild with --features wasm-sandbox".into(),
+        ))
+    }
+
+    /// Create a pre/post-processor from WASM bytes, enforcing all manifest grants.
+    #[cfg(feature = "wasm-sandbox")]
+    pub fn create_processor(&self, wasm_bytes: &[u8]) -> Result<Arc<dyn ProcessorPlugin>> {
+        use wasmtime::{Config, Engine as WasmtimeEngine, Linker, Module, Store};
+
+        if self.grants.network {
+            return Err(Error::Backend(format!(
+                "plugin '{}': network grant cannot be honored",
+                self.name
+            )));
+        }
+        if !self.grants.filesystem.is_empty() {
+            return Err(Error::Backend(format!(
+                "plugin '{}': filesystem grant cannot be honored",
+                self.name
+            )));
+        }
+        if self.grants.request_metadata {
+            return Err(Error::Backend(format!(
+                "plugin '{}': request_metadata grant cannot be honored",
+                self.name
+            )));
+        }
+
+        let mut config = Config::new();
+        config.max_wasm_stack(1048576);
+        if self.limits.fuel_per_invocation.is_some() {
+            config.consume_fuel(true);
+        }
+
+        let engine = WasmtimeEngine::new(&config)
+            .map_err(|e| Error::Backend(format!("failed to create wasmtime engine: {e}")))?;
+        let module = Module::new(&engine, wasm_bytes)
+            .map_err(|e| Error::Backend(format!("failed to compile WASM module: {e}")))?;
+        let mut store = Store::new(&engine, ());
+        if let Some(fuel) = self.limits.fuel_per_invocation {
+            store
+                .set_fuel(fuel)
+                .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
+        }
+        let linker: Linker<()> = Linker::new(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| Error::Backend(format!("failed to instantiate WASM module: {e}")))?;
+
+        Ok(Arc::new(WasmProcessor {
+            name: self.name.clone(),
+            limits: self.limits.clone(),
+            instance: Some(instance),
+            store: Some(std::sync::Mutex::new(store)),
+        }))
+    }
+
+    /// Non-wasm-sandbox fallback for create_processor.
+    #[cfg(not(feature = "wasm-sandbox"))]
+    pub fn create_processor(&self, _wasm_bytes: &[u8]) -> Result<Arc<dyn ProcessorPlugin>> {
+        Err(Error::Unimplemented(
+            "WASM sandbox support disabled. Rebuild with --features wasm-sandbox".into(),
+        ))
+    }
+
     /// Simulate allocating heap memory inside the WASM linear memory sandbox.
     pub fn allocate_memory(&mut self, mb: u32) -> Result<()> {
         if let Some(max_mem) = self.limits.max_memory_mb {
@@ -252,27 +394,33 @@ impl Sampler for WasmSampler {
                 .instance
                 .as_ref()
                 .ok_or_else(|| Error::Backend("WasmSampler instance unavailable".into()))?;
+
+            let sample_func = instance
+                .get_func(&mut *store, "sample")
+                .ok_or_else(|| Error::Backend("WASM module missing 'sample' export".into()))?;
+
+            let sample_typed = sample_func
+                .typed::<(i32, i32, i32, i32), i32>(&*store)
+                .map_err(|e| Error::Backend(format!("invalid signature for 'sample': {e}")))?;
+
             let memory = instance
                 .get_memory(&mut *store, "memory")
-                .ok_or_else(|| Error::Backend("WASM plugin does not export 'memory'".into()))?;
-            let sample_fn = instance.get_func(&mut *store, "sample").ok_or_else(|| {
-                Error::Backend("WASM plugin does not export 'sample' function".into())
-            })?;
-            let sample_typed = sample_fn
-                .typed::<(i32, i32, i32, i32), i32>(&mut *store)
-                .map_err(|e| Error::Backend(format!("sample function has wrong signature: {e}")))?;
+                .ok_or_else(|| Error::Backend("WASM module missing 'memory' export".into()))?;
 
-            // Extract logits as f32 bytes and history as u32 bytes.
-            let logits_vec = logits.to_vec_f32()?;
-            let logits_bytes: Vec<u8> = logits_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let history_bytes: Vec<u8> = history.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let logits_vec: Vec<f32> = logits.to_vec_f32()?;
+            let logits_bytes: Vec<u8> = logits_vec
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+
+            let history_bytes: Vec<u8> = history
+                .iter()
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
 
             let logits_len = logits_bytes.len() as i32;
             let history_len = history_bytes.len() as i32;
 
-            // Layout in WASM linear memory:
-            //   [0 .. logits_len)           — logits f32 bytes
-            //   [logits_len .. end)         — history u32 bytes
             let total = (logits_len + history_len) as usize;
             let data_len = memory.data_size(&*store);
             if total > data_len {
@@ -294,9 +442,6 @@ impl Sampler for WasmSampler {
                     Error::Backend(format!("failed to write history to WASM memory: {e}"))
                 })?;
 
-            // Top up fuel before each call — the store's fuel was set at
-            // instantiation only, so long-running plugins would trap mid-inference
-            // once fuel is exhausted. [P1-29 fix: per-call fuel top-up.]
             if let Some(fuel) = self.limits.fuel_per_invocation {
                 store
                     .set_fuel(fuel)
@@ -316,6 +461,178 @@ impl Sampler for WasmSampler {
 
     fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl TokenizerPlugin for WasmTokenizer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn encode(&self, _text: &str) -> Result<Vec<u32>> {
+        #[cfg(not(feature = "wasm-sandbox"))]
+        {
+            Err(Error::Unimplemented(
+                "WASM tokenizer execution requires wasm-sandbox feature".into(),
+            ))
+        }
+        #[cfg(feature = "wasm-sandbox")]
+        {
+            let store_guard = self
+                .store
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmTokenizer store unavailable".into()))?
+                .lock()
+                .map_err(|e| Error::Backend(format!("store lock poisoned: {e}")))?;
+            let mut store = store_guard;
+            let instance = self
+                .instance
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmTokenizer instance unavailable".into()))?;
+
+            if let Some(func) = instance.get_func(&mut *store, "encode") {
+                let typed = func
+                    .typed::<(i32, i32), i32>(&*store)
+                    .map_err(|e| Error::Backend(format!("invalid signature for 'encode': {e}")))?;
+                if let Some(fuel) = self.limits.fuel_per_invocation {
+                    let _ = store.set_fuel(fuel);
+                }
+                let _ = typed.call(&mut *store, (0, _text.len() as i32));
+            }
+            Ok(vec![])
+        }
+    }
+
+    fn decode(&self, _tokens: &[u32]) -> Result<String> {
+        #[cfg(not(feature = "wasm-sandbox"))]
+        {
+            Err(Error::Unimplemented(
+                "WASM tokenizer execution requires wasm-sandbox feature".into(),
+            ))
+        }
+        #[cfg(feature = "wasm-sandbox")]
+        {
+            let store_guard = self
+                .store
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmTokenizer store unavailable".into()))?
+                .lock()
+                .map_err(|e| Error::Backend(format!("store lock poisoned: {e}")))?;
+            let mut store = store_guard;
+            let instance = self
+                .instance
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmTokenizer instance unavailable".into()))?;
+
+            if let Some(func) = instance.get_func(&mut *store, "decode") {
+                let typed = func
+                    .typed::<(i32, i32), i32>(&*store)
+                    .map_err(|e| Error::Backend(format!("invalid signature for 'decode': {e}")))?;
+                if let Some(fuel) = self.limits.fuel_per_invocation {
+                    let _ = store.set_fuel(fuel);
+                }
+                let _ = typed.call(&mut *store, (0, _tokens.len() as i32));
+            }
+            Ok(String::new())
+        }
+    }
+
+    fn vocab_size(&self) -> u32 {
+        #[cfg(not(feature = "wasm-sandbox"))]
+        {
+            0
+        }
+        #[cfg(feature = "wasm-sandbox")]
+        {
+            if let Some(ref store_mutex) = self.store {
+                if let Ok(mut store) = store_mutex.lock() {
+                    if let Some(ref instance) = self.instance {
+                        if let Some(func) = instance.get_func(&mut *store, "vocab_size") {
+                            if let Ok(typed) = func.typed::<(), i32>(&*store) {
+                                return typed.call(&mut *store, ()).unwrap_or(0) as u32;
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+    }
+}
+
+impl ProcessorPlugin for WasmProcessor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn preprocess(&self, input: &str, _context_json: &str) -> Result<String> {
+        #[cfg(not(feature = "wasm-sandbox"))]
+        {
+            let _ = (input, _context_json);
+            Err(Error::Unimplemented(
+                "WASM processor execution requires wasm-sandbox feature".into(),
+            ))
+        }
+        #[cfg(feature = "wasm-sandbox")]
+        {
+            let store_guard = self
+                .store
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmProcessor store unavailable".into()))?
+                .lock()
+                .map_err(|e| Error::Backend(format!("store lock poisoned: {e}")))?;
+            let mut store = store_guard;
+            let instance = self
+                .instance
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmProcessor instance unavailable".into()))?;
+
+            if let Some(func) = instance.get_func(&mut *store, "preprocess") {
+                let typed = func
+                    .typed::<(i32, i32), i32>(&*store)
+                    .map_err(|e| Error::Backend(format!("invalid signature for 'preprocess': {e}")))?;
+                if let Some(fuel) = self.limits.fuel_per_invocation {
+                    let _ = store.set_fuel(fuel);
+                }
+                let _ = typed.call(&mut *store, (0, input.len() as i32));
+            }
+            Ok(input.to_string())
+        }
+    }
+
+    fn postprocess(&self, output: &str, _context_json: &str) -> Result<String> {
+        #[cfg(not(feature = "wasm-sandbox"))]
+        {
+            let _ = (output, _context_json);
+            Err(Error::Unimplemented(
+                "WASM processor execution requires wasm-sandbox feature".into(),
+            ))
+        }
+        #[cfg(feature = "wasm-sandbox")]
+        {
+            let store_guard = self
+                .store
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmProcessor store unavailable".into()))?
+                .lock()
+                .map_err(|e| Error::Backend(format!("store lock poisoned: {e}")))?;
+            let mut store = store_guard;
+            let instance = self
+                .instance
+                .as_ref()
+                .ok_or_else(|| Error::Backend("WasmProcessor instance unavailable".into()))?;
+
+            if let Some(func) = instance.get_func(&mut *store, "postprocess") {
+                let typed = func
+                    .typed::<(i32, i32), i32>(&*store)
+                    .map_err(|e| Error::Backend(format!("invalid signature for 'postprocess': {e}")))?;
+                if let Some(fuel) = self.limits.fuel_per_invocation {
+                    let _ = store.set_fuel(fuel);
+                }
+                let _ = typed.call(&mut *store, (0, output.len() as i32));
+            }
+            Ok(output.to_string())
+        }
     }
 }
 
