@@ -294,11 +294,16 @@ impl OmniKvCompressor {
 
         // 5. Store projected values as raw f32 bytes (Tucker core).
         let value_bits: Vec<u8> = v_proj.iter().flat_map(|v| v.to_le_bytes()).collect();
-        // Embed projection matrix R in value_meta for reconstruction.
-        // Layout: [num_value_scales (u32 as f32), R_flat (rank*head_dim f32 values)]
-        // We store R in value_meta so dequantize_visual can reconstruct.
-        let mut value_meta: Vec<f32> = Vec::new();
-        value_meta.push(0.0); // placeholder for value scales (not used in Tucker mode)
+        // Embed the projection matrix R in value_meta for reconstruction.
+        // Layout (self-describing):
+        //   [ reserved: 0.0 ][ rank: f32 ][ R_flat: rank × head_dim f32 ]
+        // The rank is stored IN the block so dequantization never has to
+        // re-derive it from a policy that depends on the (possibly
+        // different) reader-side layer_depth_ratio — the old layout
+        // hard-coded r_start = 1 with an assumed rank.
+        let mut value_meta: Vec<f32> = Vec::with_capacity(2 + r_matrix.len());
+        value_meta.push(0.0); // reserved
+        value_meta.push(rank as f32);
         value_meta.extend_from_slice(&r_matrix);
 
         Ok(CompressedKvBlock {
@@ -350,19 +355,39 @@ impl OmniKvCompressor {
         let head_dim = block.head_dim;
         let total_elems = num_tokens * num_kv_heads * head_dim;
         let policy = KvModality::Visual.policy(self.layer_depth_ratio);
-        let rank = policy.tucker_rank.unwrap_or(16).min(head_dim);
 
-        // 1. Reconstruct R from value_meta: [placeholder, R_flat (rank * head_dim)]
-        let r_start = 1; // skip placeholder
+        // 1. Reconstruct R from value_meta. Self-describing layout:
+        //      [ reserved: 0.0 ][ rank: f32 ][ R_flat: rank × head_dim ]
+        //    Legacy blocks (pre-rank-embedding) carried
+        //      [ reserved: 0.0 ][ R_flat: policy_rank × head_dim ]
+        //    and are detected by the absence of the rank field.
+        let policy_rank = policy.tucker_rank.unwrap_or(16).min(head_dim);
+        let (rank, r_start) = {
+            let legacy_len = 1 + policy_rank * head_dim;
+            if block.value_meta.len() >= 2 + head_dim && block.value_meta[1] >= 1.0 {
+                let stored = block.value_meta[1] as usize;
+                if stored <= head_dim && block.value_meta.len() >= 2 + stored * head_dim {
+                    (stored, 2)
+                } else {
+                    return Err(grim_core::error::Error::KvCache(format!(
+                        "dequantize_visual: stored Tucker rank {} invalid for head_dim {} / meta len {}",
+                        stored,
+                        head_dim,
+                        block.value_meta.len()
+                    )));
+                }
+            } else if block.value_meta.len() >= legacy_len {
+                (policy_rank, 1) // legacy layout
+            } else {
+                return Err(grim_core::error::Error::KvCache(format!(
+                    "dequantize_visual: value_meta too short for Tucker rank={}, need {} have {}",
+                    policy_rank,
+                    legacy_len,
+                    block.value_meta.len()
+                )));
+            }
+        };
         let r_end = r_start + rank * head_dim;
-        if block.value_meta.len() < r_end {
-            return Err(grim_core::error::Error::KvCache(format!(
-                "dequantize_visual: value_meta too short for Tucker rank={}, need {} have {}",
-                rank,
-                r_end,
-                block.value_meta.len()
-            )));
-        }
         let r_matrix = &block.value_meta[r_start..r_end];
 
         // 2. Dequantize projected keys: K_proj = (q - 128) / 127 * scale, stored 8-bit symmetric.
@@ -738,8 +763,9 @@ impl KvOmniEvictor {
     /// Merge KV blocks from different modalities into a joint cache.
     ///
     /// Each sub-block is serialized independently (with its modality tag embedded
-    /// in `to_bytes`), and the merged blob carries per-modality boundary offsets
-    /// in `value_meta` so dequantization can split them back out.
+    /// in `to_bytes`), and the merged blob carries per-sub-block boundary
+    /// offsets in `value_meta` so [`KvOmniEvictor::split_merged_block`] can
+    /// reconstruct the three sub-blocks exactly.
     ///
     /// Layout of merged `key_bits`:
     ///   [ text_key_bits | audio_key_bits | visual_key_bits ] (concatenated)
@@ -747,9 +773,16 @@ impl KvOmniEvictor {
     ///   [ text_value_bits | audio_value_bits | visual_value_bits ] (concatenated)
     /// Layout of merged `key_meta`:
     ///   [ text_key_meta | audio_key_meta | visual_key_meta ] (concatenated)
-    /// Layout of merged `value_meta`:
-    ///   [ n_subblocks(u32 as f32), text_boundary, audio_boundary, visual_boundary,
-    ///     text_value_meta | audio_value_meta | visual_value_meta ]
+    /// Layout of merged `value_meta` (16-f32 header + concatenated metas):
+    /// ```text
+    /// [ 3.0 ]                        // sub-block count tag
+    /// [ text_nt,   audio_nt,   visual_nt ]     // num_tokens per sub-block
+    /// [ text_km,   audio_km,   visual_km ]     // key_meta lens
+    /// [ text_kb,   audio_kb,   visual_kb ]     // key_bits byte lens
+    /// [ text_vb,   audio_vb,   visual_vb ]     // value_bits byte lens
+    /// [ text_vm,   audio_vm,   visual_vm ]     // value_meta lens
+    /// [ text_value_meta | audio_value_meta | visual_value_meta ]
+    /// ```
     pub fn merge_across_modalities(
         text_kv: CompressedKvBlock,
         audio_kv: CompressedKvBlock,
@@ -758,6 +791,28 @@ impl KvOmniEvictor {
         let total_tokens = text_kv.num_tokens + audio_kv.num_tokens + visual_kv.num_tokens;
         let num_kv_heads = text_kv.num_kv_heads;
         let head_dim = text_kv.head_dim;
+
+        let sub_meta_lens: [usize; 3] = [
+            text_kv.value_meta.len(),
+            audio_kv.value_meta.len(),
+            visual_kv.value_meta.len(),
+        ];
+        let sub_nt: [usize; 3] = [text_kv.num_tokens, audio_kv.num_tokens, visual_kv.num_tokens];
+        let sub_km: [usize; 3] = [
+            text_kv.key_meta.len(),
+            audio_kv.key_meta.len(),
+            visual_kv.key_meta.len(),
+        ];
+        let sub_kb: [usize; 3] = [
+            text_kv.key_bits.len(),
+            audio_kv.key_bits.len(),
+            visual_kv.key_bits.len(),
+        ];
+        let sub_vb: [usize; 3] = [
+            text_kv.value_bits.len(),
+            audio_kv.value_bits.len(),
+            visual_kv.value_bits.len(),
+        ];
 
         let key_bits = [text_kv.key_bits, audio_kv.key_bits, visual_kv.key_bits].concat();
         let key_meta = [text_kv.key_meta, audio_kv.key_meta, visual_kv.key_meta].concat();
@@ -768,19 +823,30 @@ impl KvOmniEvictor {
         ]
         .concat();
 
-        // Preserve all sub-block meta, prefixed with boundary info.
-        // value_meta = [n_subblocks=3, text_value_meta_len, audio_value_meta_len,
-        //               visual_value_meta_len, text_value_meta | audio_value_meta | visual_value_meta]
-        let mut value_meta = vec![3.0]; // n_subblocks
-        value_meta.push(text_kv.value_meta.len() as f32);
-        value_meta.push(audio_kv.value_meta.len() as f32);
-        value_meta.push(visual_kv.value_meta.len() as f32);
+        // Full boundary header so split_merged_block is a total inverse.
+        let mut value_meta = Vec::with_capacity(16 + sub_meta_lens.iter().sum::<usize>());
+        value_meta.push(3.0); // n_subblocks
+        for &n in &sub_nt {
+            value_meta.push(n as f32);
+        }
+        for &n in &sub_km {
+            value_meta.push(n as f32);
+        }
+        for &n in &sub_kb {
+            value_meta.push(n as f32);
+        }
+        for &n in &sub_vb {
+            value_meta.push(n as f32);
+        }
+        for &n in &sub_meta_lens {
+            value_meta.push(n as f32);
+        }
         value_meta.extend(text_kv.value_meta);
         value_meta.extend(audio_kv.value_meta);
         value_meta.extend(visual_kv.value_meta);
 
-        // Modality defaults to Text for the merged block; individual blocks
-        // retain their tags in their serialized sub-form.
+        // Modality defaults to Text for the merged block; the fixed
+        // text/audio/visual merge order is what split_merged_block keys off.
         CompressedKvBlock {
             key_bits,
             key_meta,
@@ -791,6 +857,83 @@ impl KvOmniEvictor {
             head_dim,
             modality: KvModality::Text,
         }
+    }
+
+    /// Inverse of [`KvOmniEvictor::merge_across_modalities`]: reconstruct the
+    /// three per-modality sub-blocks (text, audio, visual — the fixed merge
+    /// order) from the boundary header in the merged block's `value_meta`.
+    /// Errors if the block is not a merged block or the header is malformed.
+    pub fn split_merged_block(
+        merged: &CompressedKvBlock,
+    ) -> Result<(CompressedKvBlock, CompressedKvBlock, CompressedKvBlock)> {
+        const HDR: usize = 16;
+        if merged.value_meta.len() < HDR || merged.value_meta[0] != 3.0 {
+            return Err(grim_core::error::Error::KvCache(
+                "split_merged_block: value_meta does not carry a 3-sub-block merge header".into(),
+            ));
+        }
+        let h = &merged.value_meta[..HDR];
+        let as_usize = |v: f32| -> Result<usize> {
+            if v < 0.0 || v.fract() != 0.0 {
+                return Err(grim_core::error::Error::KvCache(
+                    "split_merged_block: non-integral boundary".into(),
+                ));
+            }
+            Ok(v as usize)
+        };
+        let nt = [as_usize(h[1])?, as_usize(h[2])?, as_usize(h[3])?];
+        let km = [as_usize(h[4])?, as_usize(h[5])?, as_usize(h[6])?];
+        let kb = [as_usize(h[7])?, as_usize(h[8])?, as_usize(h[9])?];
+        let vb = [as_usize(h[10])?, as_usize(h[11])?, as_usize(h[12])?];
+        let vm = [as_usize(h[13])?, as_usize(h[14])?, as_usize(h[15])?];
+
+        let total_km: usize = km.iter().sum();
+        let total_kb: usize = kb.iter().sum();
+        let total_vb: usize = vb.iter().sum();
+        let total_vm: usize = vm.iter().sum();
+        if merged.key_meta.len() != total_km
+            || merged.key_bits.len() != total_kb
+            || merged.value_bits.len() != total_vb
+            || merged.value_meta.len() != HDR + total_vm
+        {
+            return Err(grim_core::error::Error::KvCache(
+                "split_merged_block: header boundaries do not sum to payload lengths".into(),
+            ));
+        }
+
+        let mut km_off = 0;
+        let mut kb_off = 0;
+        let mut vb_off = 0;
+        let mut vm_off = HDR;
+        let mut nt_off = 0usize;
+        let modalities = [KvModality::Text, KvModality::Audio, KvModality::Visual];
+        let mut subs: Vec<CompressedKvBlock> = Vec::with_capacity(3);
+        for i in 0..3 {
+            subs.push(CompressedKvBlock {
+                key_bits: merged.key_bits[kb_off..kb_off + kb[i]].to_vec(),
+                key_meta: merged.key_meta[km_off..km_off + km[i]].to_vec(),
+                value_bits: merged.value_bits[vb_off..vb_off + vb[i]].to_vec(),
+                value_meta: merged.value_meta[vm_off..vm_off + vm[i]].to_vec(),
+                num_tokens: nt[i],
+                num_kv_heads: merged.num_kv_heads,
+                head_dim: merged.head_dim,
+                modality: modalities[i],
+            });
+            km_off += km[i];
+            kb_off += kb[i];
+            vb_off += vb[i];
+            vm_off += vm[i];
+            nt_off += nt[i];
+        }
+        if nt_off != merged.num_tokens {
+            return Err(grim_core::error::Error::KvCache(
+                "split_merged_block: sub-block token counts do not sum to the merged count".into(),
+            ));
+        }
+        let visual = subs.pop().expect("three sub-blocks");
+        let audio = subs.pop().expect("three sub-blocks");
+        let text = subs.pop().expect("three sub-blocks");
+        Ok((text, audio, visual))
     }
 
     /// Build an `OmniKvCompressor` with the evictor's config for modality-aware
@@ -959,8 +1102,10 @@ mod tests {
         // But values are stored as raw f32, so value_bits = 128 * 4 = 512 bytes.
         assert_eq!(block.key_bits.len(), 128);
         assert_eq!(block.value_bits.len(), 128 * 4);
-        // value_meta: [placeholder] + R [16*16 = 256] = 257 entries.
-        assert_eq!(block.value_meta.len(), 257);
+        // value_meta: [reserved, rank] + R [16*16 = 256] = 258 entries,
+        // with the rank stored in the block (self-describing layout).
+        assert_eq!(block.value_meta.len(), 258);
+        assert_eq!(block.value_meta[1], 16.0);
     }
 
     #[test]
@@ -1161,12 +1306,70 @@ mod tests {
         assert_eq!(merged.head_dim, 4);
         assert_eq!(merged.key_bits.len(), 2 * 2 * 4 + 3 * 2 * 4 + 2 * 4);
         assert_eq!(merged.value_bits.len(), 2 * 2 * 4 + 3 * 2 * 4 + 2 * 4);
-        // value_meta should have the boundary header.
-        assert!(!merged.value_meta.is_empty());
+        // value_meta carries the 16-f32 boundary header.
+        assert!(merged.value_meta.len() >= 16);
         assert_eq!(merged.value_meta[0], 3.0); // n_subblocks
-        assert_eq!(merged.value_meta[1], 2.0); // text value_meta len
-        assert_eq!(merged.value_meta[2], 3.0); // audio value_meta len
-        assert_eq!(merged.value_meta[3], 1.0); // visual value_meta len
+        // num_tokens per sub-block: text=2, audio=3, visual=1.
+        assert_eq!(merged.value_meta[1], 2.0);
+        assert_eq!(merged.value_meta[2], 3.0);
+        assert_eq!(merged.value_meta[3], 1.0);
+
+        // Split must be a total inverse of merge: the three sub-blocks come
+        // back with their modality tags, dims, and byte-identical payloads.
+        let (t, a, v) = KvOmniEvictor::split_merged_block(&merged).unwrap();
+        assert_eq!(t.modality, KvModality::Text);
+        assert_eq!(a.modality, KvModality::Audio);
+        assert_eq!(v.modality, KvModality::Visual);
+        assert_eq!((t.num_tokens, a.num_tokens, v.num_tokens), (2, 3, 1));
+        let re_merged = KvOmniEvictor::merge_across_modalities(t, a, v);
+        assert_eq!(re_merged.key_bits, merged.key_bits);
+        assert_eq!(re_merged.value_bits, merged.value_bits);
+        assert_eq!(re_merged.key_meta, merged.key_meta);
+        assert_eq!(re_merged.value_meta, merged.value_meta);
+        assert_eq!(re_merged.num_tokens, merged.num_tokens);
+    }
+
+    #[test]
+    fn test_kv_omni_split_rejects_non_merged_block() {
+        // A block without the 16-f32 merge header must error, not panic.
+        let b = dummy_block(2);
+        assert!(KvOmniEvictor::split_merged_block(&b).is_err());
+    }
+
+    #[test]
+    fn test_kv_omni_split_real_compressed_blocks_round_trip() {
+        // End-to-end: real per-modality compressor outputs merged then
+        // split; each reconstructed sub-block must be byte-identical and
+        // still dequantizable through its own modality path.
+        let device = grim_backend_cpu::CpuDevice::new();
+        let (keys, values) = make_tensors(&device, &[2, 2, 8]);
+        let text = OmniKvCompressor::new(KvModality::Text, 0.0)
+            .compress_with_modality(&keys, &values, KvModality::Text)
+            .unwrap();
+        let audio = OmniKvCompressor::new(KvModality::Audio, 0.0)
+            .compress_with_modality(&keys, &values, KvModality::Audio)
+            .unwrap();
+        let visual = OmniKvCompressor::new(KvModality::Visual, 0.0)
+            .compress_with_modality(&keys, &values, KvModality::Visual)
+            .unwrap();
+        let (t0, a0, v0) = (
+            text.clone(),
+            audio.clone(),
+            visual.clone(),
+        );
+        let merged = KvOmniEvictor::merge_across_modalities(text, audio, visual);
+        let (t, a, v) = KvOmniEvictor::split_merged_block(&merged).unwrap();
+        assert_eq!(t.key_bits, t0.key_bits);
+        assert_eq!(t.value_bits, t0.value_bits);
+        assert_eq!(a.key_bits, a0.key_bits);
+        assert_eq!(v.key_bits, v0.key_bits);
+        assert_eq!(v.value_bits, v0.value_bits);
+        // The split visual block keeps its embedded Tucker R matrix.
+        let (dk, dv) = OmniKvCompressor::new(KvModality::Visual, 0.0)
+            .dequantize_for_attention(&v, &device, Device::Cpu)
+            .unwrap();
+        assert_eq!(dk.shape().dims(), vec![2, 2, 8]);
+        assert_eq!(dv.shape().dims(), vec![2, 2, 8]);
     }
 
     #[test]

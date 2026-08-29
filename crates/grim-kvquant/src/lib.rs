@@ -42,39 +42,52 @@ impl KvModality {
 
 /// Generate a random orthogonal matrix using QR decomposition of a random matrix.
 /// This is used for pre-rotation before Lloyd-Max quantization to decorrelate features.
+///
+/// Numerics: deterministic Gaussian draws (Box-Muller over an LCG stream)
+/// are orthonormalized with **modified Gram-Schmidt with
+/// reorthogonalization** ("twice is enough"), accumulated in f64 and only
+/// cast to f32 at the end. Plain single-pass Gram-Schmidt loses
+/// orthogonality at O(dim) condition growth — measurable past dim ≈ 16 —
+/// while the two-pass MGS keeps ‖QᵀQ − I‖ at f32 representation precision
+/// (≲ 1e-4) even at dim 128, which head_dim requires.
 pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
     use std::f32::consts::PI;
 
     // Generate random matrix using deterministic LCG
     let mut state = seed;
-    let mut random_mat = vec![0.0f32; dim * dim];
+    let mut random_mat = vec![0.0f64; dim * dim];
     for slot in random_mat.iter_mut() {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let u1 = ((state >> 40) as u32 as f32) / 16777216.0;
         let u2 = (((state & 0xFFFFFFFF) >> 8) as u32 as f32) / 16777216.0;
         // Box-Muller transform
-        *slot = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * PI * u2).cos();
+        *slot = (-2.0 * (u1.max(1e-5) as f64).ln()).sqrt() * (2.0 * PI as f64 * u2 as f64).cos();
     }
 
-    // Simplified Gram-Schmidt orthogonalization
-    let mut q = vec![0.0f32; dim * dim];
+    // Modified Gram-Schmidt with one reorthogonalization pass (f64).
+    // Pass 2 re-projects each column against the finalized basis, killing
+    // the accumulated error a single classical pass leaves behind.
+    let mut q = random_mat;
     for col in 0..dim {
-        let mut v: Vec<f32> = (0..dim).map(|r| random_mat[r * dim + col]).collect();
-
-        for prev in 0..col {
-            let dot: f32 = (0..dim).map(|r| v[r] * q[r * dim + prev]).sum();
-            for r in 0..dim {
-                v[r] -= dot * q[r * dim + prev];
+        for _pass in 0..2 {
+            for prev in 0..col {
+                let dot: f64 = (0..dim).map(|r| q[r * dim + col] * q[r * dim + prev]).sum();
+                for r in 0..dim {
+                    q[r * dim + col] -= dot * q[r * dim + prev];
+                }
             }
         }
-
-        let norm = (0..dim).map(|r| v[r] * v[r]).sum::<f32>().sqrt().max(1e-5);
+        let norm = (0..dim)
+            .map(|r| q[r * dim + col] * q[r * dim + col])
+            .sum::<f64>()
+            .sqrt();
+        let inv = 1.0 / norm.max(1e-300);
         for r in 0..dim {
-            q[r * dim + col] = v[r] / norm;
+            q[r * dim + col] *= inv;
         }
     }
 
-    q
+    q.iter().map(|&v| v as f32).collect()
 }
 
 /// Apply rotation matrix to data: rotated = data @ rotation
@@ -1039,30 +1052,39 @@ impl CompressedKvBlock {
     }
 
     /// Serialize to a self-describing byte blob for on-disk persistence
-    /// (WI-R4 `.grim` KV region). Layout:
+    /// (WI-R4 `.grim` KV region). Layout (format v2):
     ///
     /// ```text
+    /// [ magic "GKVB": u8 × 4 ][ version: u8 = 2 ]
     /// [ num_tokens : u32 LE ][ num_kv_heads: u32 LE ][ head_dim: u32 LE ][ modality: u8 ]
     /// [ key_meta_len   : u32 LE ][ value_meta_len : u32 LE ]
-    /// [ key_bits_len   : u32 LE ]   // byte length of key_bits
+    /// [ key_bits_len   : u32 LE ][ value_bits_len : u32 LE ]
     /// [ key_meta   : f32 LE × key_meta_len ]
     /// [ value_meta : f32 LE × value_meta_len ]
     /// [ key_bits   : u8 × key_bits_len ]
     /// [ value_bits : u8 × (rest) ]
     /// ```
     ///
-    /// The consumer-side `grim-format` writer carries these bytes verbatim in
-    /// `GrimTensorEntry::kv_compressed_*`; a reloaded session reconstructs the
-    /// block bit-for-bit via [`CompressedKvBlock::from_bytes`].
+    /// The magic + version byte make the format self-describing: a reader
+    /// never has to infer the header layout from the blob length (the old
+    /// 24-vs-25-byte heuristic misparsed any legacy blob whose payload grew
+    /// past the new-format minimum). Blobs written before v2 are still read
+    /// by [`CompressedKvBlock::from_bytes`] via a validated legacy fallback.
+    /// The consumer-side `grim-format` writer carries these bytes verbatim
+    /// in `GrimTensorEntry::kv_compressed_*`; a reloaded session
+    /// reconstructs the block bit-for-bit via [`CompressedKvBlock::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            4 * 6
+            5
+                + 4 * 6
                 + 1
                 + self.key_meta.len() * 4
                 + self.value_meta.len() * 4
                 + self.key_bits.len()
                 + self.value_bits.len(),
         );
+        buf.extend_from_slice(b"GKVB");
+        buf.push(2); // format version
         buf.extend_from_slice(&(self.num_tokens as u32).to_le_bytes());
         buf.extend_from_slice(&(self.num_kv_heads as u32).to_le_bytes());
         buf.extend_from_slice(&(self.head_dim as u32).to_le_bytes());
@@ -1070,6 +1092,7 @@ impl CompressedKvBlock {
         buf.extend_from_slice(&(self.key_meta.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(self.value_meta.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(self.key_bits.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.value_bits.len() as u32).to_le_bytes());
         for &m in &self.key_meta {
             buf.extend_from_slice(&m.to_le_bytes());
         }
@@ -1082,81 +1105,155 @@ impl CompressedKvBlock {
     }
 
     /// Inverse of [`CompressedKvBlock::to_bytes`]. Errors on a malformed or
-    /// truncated buffer.
+    /// truncated buffer. Dispatch:
+    /// - `GKVB` magic → versioned parse (unknown version ⇒ error),
+    /// - otherwise → pre-v2 legacy parse, tried WITH the modality byte
+    ///   first and validated; on any inconsistency retried without it.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        // New layout: 13 bytes of headers (3×u32 + u8 modality + 3×u32 = 25 bytes minimum).
-        // Old layout (without modality byte) had 24 bytes minimum. We detect
-        // old-format blocks by length: if exactly 24-byte-aligned minimum with
-        // no modality byte, parse as legacy (modality defaults to Text).
-        const NEW_MIN: usize = 25;
-        const OLD_MIN: usize = 24;
-        if buf.len() < OLD_MIN {
-            return Err(grim_core::error::Error::KvCache(format!(
-                "CompressedKvBlock::from_bytes: buffer too short ({} bytes)",
-                buf.len()
-            )));
+        if buf.len() >= 5 && &buf[..4] == b"GKVB" {
+            if buf[4] != 2 {
+                return Err(grim_core::error::Error::KvCache(format!(
+                    "CompressedKvBlock::from_bytes: unsupported format version {}",
+                    buf[4]
+                )));
+            }
+            return Self::parse_v2(&buf[5..]);
+        }
+        // Legacy (pre-magic) blobs: header ambiguity (with/without the
+        // modality byte) is resolved by validated trial parse, not by blob
+        // length sniffing.
+        Self::parse_legacy_with_modality(buf)
+            .or_else(|_| Self::parse_legacy_without_modality(buf))
+            .map_err(|_| {
+                grim_core::error::Error::KvCache(format!(
+                    "CompressedKvBlock::from_bytes: malformed legacy buffer ({} bytes)",
+                    buf.len()
+                ))
+            })
+    }
+
+    fn parse_v2(body: &[u8]) -> Result<Self> {
+        const HDR: usize = 4 * 7 + 1;
+        if body.len() < HDR {
+            return Err(grim_core::error::Error::KvCache(
+                "CompressedKvBlock::from_bytes: truncated v2 header".into(),
+            ));
         }
         let mut pos = 0;
-        let rd_u32 = |b: &[u8], p: &mut usize| -> u32 {
-            let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+        let rd_u32 = |p: &mut usize| -> u32 {
+            let v = u32::from_le_bytes([body[*p], body[*p + 1], body[*p + 2], body[*p + 3]]);
             *p += 4;
             v
         };
-        let num_tokens = rd_u32(buf, &mut pos) as usize;
-        let num_kv_heads = rd_u32(buf, &mut pos) as usize;
-        let head_dim = rd_u32(buf, &mut pos) as usize;
+        let num_tokens = rd_u32(&mut pos) as usize;
+        let num_kv_heads = rd_u32(&mut pos) as usize;
+        let head_dim = rd_u32(&mut pos) as usize;
+        let modality = KvModality::from_u8(body[pos]);
+        pos += 1;
+        let key_meta_len = rd_u32(&mut pos) as usize;
+        let value_meta_len = rd_u32(&mut pos) as usize;
+        let key_bits_len = rd_u32(&mut pos) as usize;
+        let value_bits_len = rd_u32(&mut pos) as usize;
+        let need = pos + key_meta_len * 4 + value_meta_len * 4 + key_bits_len + value_bits_len;
+        if body.len() != need {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "CompressedKvBlock::from_bytes: v2 length mismatch (need {need}, have {})",
+                body.len()
+            )));
+        }
+        if body.len() < need {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "CompressedKvBlock::from_bytes: truncated v2 (need {need}, have {})",
+                body.len()
+            )));
+        }
+        let mut key_meta = Vec::with_capacity(key_meta_len);
+        for _ in 0..key_meta_len {
+            key_meta.push(f32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        let mut value_meta = Vec::with_capacity(value_meta_len);
+        for _ in 0..value_meta_len {
+            value_meta
+                .push(f32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        let key_bits = body[pos..pos + key_bits_len].to_vec();
+        let value_bits = body[pos + key_bits_len..pos + key_bits_len + value_bits_len].to_vec();
+        Ok(Self {
+            key_bits,
+            key_meta,
+            value_bits,
+            value_meta,
+            num_tokens,
+            num_kv_heads,
+            head_dim,
+            modality,
+        })
+    }
 
-        // Parse modality byte if present (new format).
-        let (modality, key_meta_len, value_meta_len, key_bits_len) = if buf.len() >= NEW_MIN {
-            let modality_byte = buf[pos];
-            pos += 1;
-            let key_meta_len = rd_u32(buf, &mut pos) as usize;
-            let value_meta_len = rd_u32(buf, &mut pos) as usize;
-            let key_bits_len = rd_u32(buf, &mut pos) as usize;
-            (
-                KvModality::from_u8(modality_byte),
-                key_meta_len,
-                value_meta_len,
-                key_bits_len,
-            )
-        } else {
-            // Legacy format: no modality byte.
-            let key_meta_len = rd_u32(buf, &mut pos) as usize;
-            let value_meta_len = rd_u32(buf, &mut pos) as usize;
-            let key_bits_len = rd_u32(buf, &mut pos) as usize;
-            (KvModality::Text, key_meta_len, value_meta_len, key_bits_len)
+    /// Pre-v2 layout, candidate A: 3×u32 dims + modality u8 + 3×u32 lens.
+    /// The modality byte must be a valid `KvModality` tag (0..=2); genuine
+    /// A-blobs always satisfy this, which rejects most spurious A-parses
+    /// of modality-less blobs before the trial B parse runs.
+    fn parse_legacy_with_modality(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 25 || buf[12] > 2 {
+            return Err(grim_core::error::Error::KvCache("not legacy-A".into()));
+        }
+        Self::parse_legacy_inner(buf, true)
+    }
+
+    /// Pre-v2 layout, candidate B: 3×u32 dims + 3×u32 lens (no modality).
+    fn parse_legacy_without_modality(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 24 {
+            return Err(grim_core::error::Error::KvCache("too short".into()));
+        }
+        Self::parse_legacy_inner(buf, false)
+    }
+
+    fn parse_legacy_inner(buf: &[u8], with_modality: bool) -> Result<Self> {
+        let mut pos = 0;
+        let rd_u32 = |b: &[u8], p: &mut usize| -> Result<u32> {
+            if *p + 4 > b.len() {
+                return Err(grim_core::error::Error::KvCache("truncated header".into()));
+            }
+            let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+            *p += 4;
+            Ok(v)
         };
-
+        let num_tokens = rd_u32(buf, &mut pos)? as usize;
+        let num_kv_heads = rd_u32(buf, &mut pos)? as usize;
+        let head_dim = rd_u32(buf, &mut pos)? as usize;
+        let modality = if with_modality {
+            let m = KvModality::from_u8(buf[pos]);
+            pos += 1;
+            m
+        } else {
+            KvModality::Text
+        };
+        let key_meta_len = rd_u32(buf, &mut pos)? as usize;
+        let value_meta_len = rd_u32(buf, &mut pos)? as usize;
+        let key_bits_len = rd_u32(buf, &mut pos)? as usize;
         let need = pos + key_meta_len * 4 + value_meta_len * 4 + key_bits_len;
         if buf.len() < need {
             return Err(grim_core::error::Error::KvCache(format!(
-                "CompressedKvBlock::from_bytes: truncated (need {need}, have {})",
+                "truncated legacy (need {need}, have {})",
                 buf.len()
             )));
         }
         let mut key_meta = Vec::with_capacity(key_meta_len);
         for _ in 0..key_meta_len {
-            key_meta.push(f32::from_le_bytes([
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-            ]));
+            key_meta.push(f32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
             pos += 4;
         }
         let mut value_meta = Vec::with_capacity(value_meta_len);
         for _ in 0..value_meta_len {
-            value_meta.push(f32::from_le_bytes([
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-            ]));
+            value_meta
+                .push(f32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
             pos += 4;
         }
         let key_bits = buf[pos..pos + key_bits_len].to_vec();
-        pos += key_bits_len;
-        let value_bits = buf[pos..].to_vec();
+        let value_bits = buf[pos + key_bits_len..].to_vec();
         Ok(Self {
             key_bits,
             key_meta,
@@ -1553,65 +1650,190 @@ mod tests {
         assert_eq!(att_out.shape().dims(), vec![2, 4, 64]);
     }
 
+    /// Orthogonality gate: the f64 modified-Gram-Schmidt-with-reorthogonalization
+    /// generator must hold ‖QᵀQ − I‖∞ at f32 representation precision across
+    /// the full range of realistic head_dims — including dim 128 where the
+    /// old single-pass Gram-Schmidt drifted past 1e-2.
     #[test]
     fn test_random_orthogonal_rotation() {
-        let dim = 16;
-        let count = 4;
-        let seed = 0xDEAD_BEEF;
+        for (dim, tol) in [(16usize, 1e-5f32), (64, 5e-5), (128, 2e-4)] {
+            let count = 4;
+            let seed = 0xDEAD_BEEF;
 
-        let rotation = random_orthogonal_matrix(dim, seed);
-        assert_eq!(rotation.len(), dim * dim);
+            let rotation = random_orthogonal_matrix(dim, seed);
+            assert_eq!(rotation.len(), dim * dim);
 
-        // Verify orthogonality: Q^T * Q ≈ I
-        // Gram-Schmidt is numerically unstable for larger dims, so tolerance is 1e-2.
-        for i in 0..dim {
-            for j in 0..dim {
-                let dot: f32 = (0..dim)
-                    .map(|r| rotation[r * dim + i] * rotation[r * dim + j])
-                    .sum();
-                if i == j {
-                    assert!(
-                        (dot - 1.0).abs() < 1e-2,
-                        "Q^T*Q[{}][{}] should be ~1.0, got {}",
-                        i,
-                        j,
-                        dot
-                    );
-                } else {
-                    assert!(
-                        dot.abs() < 1e-2,
-                        "Q^T*Q[{}][{}] should be ~0.0, got {}",
-                        i,
-                        j,
-                        dot
-                    );
+            // Verify orthogonality: Q^T * Q ≈ I at tight tolerance.
+            let mut worst_off = 0.0f32;
+            let mut worst_diag = 0.0f32;
+            for i in 0..dim {
+                for j in 0..dim {
+                    let dot: f32 = (0..dim)
+                        .map(|r| rotation[r * dim + i] * rotation[r * dim + j])
+                        .sum();
+                    if i == j {
+                        worst_diag = worst_diag.max((dot - 1.0).abs());
+                        assert!(
+                            (dot - 1.0).abs() < tol,
+                            "dim={dim} Q^T*Q[{i}][{i}] should be ~1.0, got {dot}"
+                        );
+                    } else {
+                        worst_off = worst_off.max(dot.abs());
+                        assert!(
+                            dot.abs() < tol,
+                            "dim={dim} Q^T*Q[{i}][{j}] should be ~0.0, got {dot}"
+                        );
+                    }
                 }
             }
+
+            let data: Vec<f32> = (0..count * dim).map(|i| (i as f32 * 0.01).sin()).collect();
+            let rotated = apply_rotation(&data, &rotation, dim, count);
+            assert_eq!(rotated.len(), count * dim);
+
+            // Orthogonal transform preserves L2 norm (isometry) — same tight
+            // tolerance; this is the property the dequant inverse rotation
+            // relies on.
+            for i in 0..count {
+                let orig_norm: f32 = (0..dim)
+                    .map(|j| data[i * dim + j].powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                let rot_norm: f32 = (0..dim)
+                    .map(|j| rotated[i * dim + j].powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                assert!(
+                    (orig_norm - rot_norm).abs() < tol,
+                    "dim={dim} L2 norm should be preserved: orig={orig_norm}, rot={rot_norm} (worst diag={worst_diag}, off={worst_off})"
+                );
+            }
         }
+    }
 
-        let data: Vec<f32> = (0..count * dim).map(|i| (i as f32 * 0.01).sin()).collect();
-        let rotated = apply_rotation(&data, &rotation, dim, count);
-        assert_eq!(rotated.len(), count * dim);
+    /// Determinism: the same seed produces the identical matrix (the rotation
+    /// must round-trip between compress and dequantize).
+    #[test]
+    fn random_orthogonal_matrix_is_deterministic() {
+        let a = random_orthogonal_matrix(64, 0x1337_C0DE_BA5E_B01D);
+        let b = random_orthogonal_matrix(64, 0x1337_C0DE_BA5E_B01D);
+        assert_eq!(a, b);
+        let c = random_orthogonal_matrix(64, 0x1337_C0DE_BA5E_B01E);
+        assert_ne!(a, c);
+    }
 
-        // Orthogonal transform preserves L2 norm (isometry).
-        // Tolerance is 1e-2 because simplified Gram-Schmidt is numerically
-        // unstable for larger dimensions.
-        for i in 0..count {
-            let orig_norm: f32 = (0..dim)
-                .map(|j| data[i * dim + j].powi(2))
-                .sum::<f32>()
-                .sqrt();
-            let rot_norm: f32 = (0..dim)
-                .map(|j| rotated[i * dim + j].powi(2))
-                .sum::<f32>()
-                .sqrt();
+    /// Rotation round-trip fidelity at realistic head_dim: rotate then apply
+    /// the transposed rotation must recover the input to f32 precision — the
+    /// exact operation compress/dequantize performs on keys.
+    #[test]
+    fn rotation_round_trip_is_identity_at_head_dim_128() {
+        let dim = 128;
+        let rotation = random_orthogonal_matrix(dim, 0x1337_C0DE_BA5E_B01D);
+        let mut inv = vec![0.0f32; dim * dim];
+        for r in 0..dim {
+            for c in 0..dim {
+                inv[c * dim + r] = rotation[r * dim + c];
+            }
+        }
+        let data: Vec<f32> = (0..dim).map(|i| ((i as f32 * 0.37).sin()) * 0.5).collect();
+        let rotated = apply_rotation(&data, &rotation, dim, 1);
+        let recovered = apply_rotation(&rotated, &inv, dim, 1);
+        let max_err = data
+            .iter()
+            .zip(&recovered)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-4,
+            "rotation round-trip must be near-identity, max_err={max_err}"
+        );
+    }
+
+    /// Legacy (pre-magic) blobs must still parse: candidate A carries the
+    /// modality byte, candidate B (24-byte header) defaults to Text.
+    #[test]
+    fn legacy_blob_formats_still_parse() {
+        // Legacy candidate A: with-modality header (25 bytes) + payload.
+        let mut a = Vec::new();
+        a.extend_from_slice(&7u32.to_le_bytes()); // num_tokens
+        a.extend_from_slice(&2u32.to_le_bytes()); // num_kv_heads
+        a.extend_from_slice(&64u32.to_le_bytes()); // head_dim
+        a.push(1u8); // modality = Audio
+        a.extend_from_slice(&2u32.to_le_bytes()); // key_meta_len
+        a.extend_from_slice(&1u32.to_le_bytes()); // value_meta_len
+        a.extend_from_slice(&3u32.to_le_bytes()); // key_bits_len
+        a.extend_from_slice(&0.5f32.to_le_bytes());
+        a.extend_from_slice(&0.25f32.to_le_bytes());
+        a.extend_from_slice(&1.5f32.to_le_bytes());
+        a.extend_from_slice(&[9, 8, 7]); // key_bits
+        a.extend_from_slice(&[1, 2, 3, 4]); // value_bits
+        let block_a = CompressedKvBlock::from_bytes(&a).unwrap();
+        assert_eq!(block_a.modality, KvModality::Audio);
+        assert_eq!(block_a.num_tokens, 7);
+        assert_eq!(block_a.key_bits, vec![9, 8, 7]);
+        assert_eq!(block_a.value_bits, vec![1, 2, 3, 4]);
+
+        // Legacy candidate B: WITHOUT the modality byte (24-byte header).
+        // Header: num_tokens(3), num_kv_heads(1), head_dim(16),
+        // key_meta_len(1), value_meta_len(2), key_bits_len(4).
+        // Total meta floats = 3 (12 bytes).
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // key_meta_len: 1 float
+        b.extend_from_slice(&2u32.to_le_bytes()); // value_meta_len: 2 floats
+        b.extend_from_slice(&4u32.to_le_bytes()); // key_bits_len: 4 bytes
+        b.extend_from_slice(&1.0f32.to_le_bytes()); // key_meta[0]
+        b.extend_from_slice(&2.0f32.to_le_bytes()); // value_meta[0]
+        b.extend_from_slice(&3.0f32.to_le_bytes()); // value_meta[1]
+        b.extend_from_slice(&[10, 20, 30, 40]); // key_bits (4 bytes)
+        b.extend_from_slice(&[50, 60, 70, 80, 90]); // value_bits
+        assert!(b.len() > 25, "payload must exceed the old sniff threshold");
+        let block_b = CompressedKvBlock::from_bytes(&b).unwrap();
+        assert_eq!(block_b.modality, KvModality::Text);
+        assert_eq!(block_b.key_meta, vec![1.0]);
+        assert_eq!(block_b.value_meta, vec![2.0, 3.0]);
+        assert_eq!(block_b.key_bits, vec![10, 20, 30, 40]);
+        assert_eq!(block_b.value_bits, vec![50, 60, 70, 80, 90]);
+    }
+
+    /// Corrupt v2 blobs must error, never panic or silently misparse.
+    #[test]
+    fn v2_blob_corruption_is_an_error() {
+        let config = KvQuantConfig::default();
+        let compressor = LloydMaxCompressor::new(config);
+        let shape = Shape::new(vec![1, 1, 8]);
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let device = grim_backend_cpu::CpuDevice::new();
+        let data: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+        let k_storage = Arc::from(device.from_cpu(&data, &shape, dtype.clone()).unwrap());
+        let keys = Tensor::new(
+            k_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+        let bytes = compressor.compress(&keys, &keys).unwrap().to_bytes();
+        assert_eq!(&bytes[..4], b"GKVB");
+        assert_eq!(bytes[4], 2);
+
+        // Truncations at every prefix boundary must error.
+        for cut in 0..bytes.len() {
             assert!(
-                (orig_norm - rot_norm).abs() < 1e-2,
-                "L2 norm should be preserved: orig={}, rot={}",
-                orig_norm,
-                rot_norm
+                CompressedKvBlock::from_bytes(&bytes[..cut]).is_err(),
+                "truncated blob of {} bytes must not parse",
+                cut
             );
         }
+        // Unknown version must error.
+        let mut bad = bytes.clone();
+        bad[4] = 99;
+        assert!(CompressedKvBlock::from_bytes(&bad).is_err());
     }
 
     #[test]
