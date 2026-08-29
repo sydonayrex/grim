@@ -1689,10 +1689,12 @@ impl Engine {
             if router.pool_role == grim_disagg::PoolRole::Decode {
                 let elem_per_token = self.config.num_kv_heads * self.config.head_dim;
                 let block_elems = elem_per_token * BLOCK_SIZE;
-                let num_blocks = {
-                    let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                    pool.num_blocks()
-                };
+                let req_blocks: Vec<usize> = self
+                    .sessions
+                    .get(&id)
+                    .and_then(|s| s.block_table())
+                    .map(|t| t.iter().map(|&b| b as usize).collect())
+                    .unwrap_or_default();
                 let num_layers = self
                     .sessions
                     .get(&id)
@@ -1700,7 +1702,7 @@ impl Engine {
                     .map(|kv| kv.num_layers())
                     .unwrap_or(1)
                     .max(1);
-                for block_id in 0..num_blocks {
+                for &block_id in &req_blocks {
                     let already_received = {
                         let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                         pool.block_is_received(block_id)
