@@ -118,8 +118,15 @@ pub struct LocalSpillManager {
     block_tiers: HashMap<BlockId, CacheTier>,
     /// In-memory cache for Host RAM tier.
     host_ram_cache: HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
+    /// Compressed-blob host tier: serialized `CompressedKvBlock` bytes for
+    /// blocks spilled through the pool's compressor path (closed
+    /// compression-to-spill loop). Raw `host_ram_cache` and this map are
+    /// mutually exclusive per block id.
+    compressed_host: HashMap<BlockId, Vec<u8>>,
     /// File path tracking for NVMe disk tier.
     nvme_cache: HashMap<BlockId, PathBuf>,
+    /// Compressed-blob NVMe tier.
+    nvme_compressed: HashMap<BlockId, PathBuf>,
     /// Size of each block in floats.
     block_elems: usize,
 }
@@ -134,7 +141,9 @@ impl LocalSpillManager {
             scratch_dir,
             block_tiers: HashMap::new(),
             host_ram_cache: HashMap::new(),
+            compressed_host: HashMap::new(),
             nvme_cache: HashMap::new(),
+            nvme_compressed: HashMap::new(),
             block_elems,
         })
     }
@@ -248,11 +257,103 @@ impl LocalSpillManager {
         }
     }
 
+    /// Demote an already-compressed block blob into the Host RAM tier.
+    ///
+    /// This is the compressor-side spill path (`KvBlockPool` + `KvCompressor`):
+    /// the blob is the serialized `CompressedKvBlock`, stored verbatim — no
+    /// f32-length validation applies because the payload is variable-length.
+    /// Raw and compressed residency for the same id are mutually exclusive;
+    /// demoting compressed evicts any raw copy and vice versa.
+    pub fn demote_compressed(&mut self, block_id: BlockId, blob: Vec<u8>) -> Result<()> {
+        if blob.is_empty() {
+            return Err(Error::KvCache(
+                "demote_compressed: empty blob".into(),
+            ));
+        }
+        self.host_ram_cache.remove(&block_id);
+        self.nvme_cache.remove(&block_id);
+        self.compressed_host.insert(block_id, blob);
+        self.block_tiers.insert(block_id, CacheTier::HostRam);
+        Ok(())
+    }
+
+    /// Push a compressed blob from the Host RAM tier to the NVMe tier
+    /// (atomic write + rename, mirroring `demote_to_nvme`).
+    pub fn demote_compressed_to_nvme(&mut self, block_id: BlockId) -> Result<()> {
+        let Some(blob) = self.compressed_host.remove(&block_id) else {
+            return Ok(()); // nothing in the compressed host tier — no-op
+        };
+        let temp_path = self
+            .scratch_dir
+            .join(format!("tmp_kv_block_c_{block_id}.bin"));
+        let file_path = self
+            .scratch_dir
+            .join(format!("kv_block_c_{block_id}.bin"));
+        let write_res = (|| -> Result<()> {
+            let mut file = File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
+            file.write_all(&blob)
+                .map_err(|e| Error::KvCache(e.to_string()))?;
+            file.sync_all().map_err(|e| Error::KvCache(e.to_string()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&temp_path);
+            self.compressed_host.insert(block_id, blob);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&temp_path, &file_path) {
+            let _ = fs::remove_file(&temp_path);
+            self.compressed_host.insert(block_id, blob);
+            return Err(Error::KvCache(format!("atomic rename failed: {e}")));
+        }
+        self.nvme_compressed.insert(block_id, file_path);
+        self.block_tiers.insert(block_id, CacheTier::NvMe);
+        Ok(())
+    }
+
+    /// Retrieve a compressed blob from whichever compressed tier it
+    /// currently resides in. `Ok(None)` = not compressed-tier managed
+    /// (callers fall back to the raw `retrieve` path).
+    pub fn retrieve_compressed(&mut self, block_id: BlockId) -> Result<Option<Vec<u8>>> {
+        if let Some(blob) = self.compressed_host.remove(&block_id) {
+            self.block_tiers.insert(block_id, CacheTier::Gpu);
+            return Ok(Some(blob));
+        }
+        if let Some(path) = self.nvme_compressed.remove(&block_id) {
+            let read_res = (|| -> Result<Vec<u8>> {
+                let mut bytes = Vec::new();
+                File::open(&path)
+                    .and_then(|mut f| f.read_to_end(&mut bytes))
+                    .map_err(|e| Error::KvCache(e.to_string()))?;
+                if bytes.is_empty() {
+                    return Err(Error::KvCache("compressed spill file empty".into()));
+                }
+                Ok(bytes)
+            })();
+            return match read_res {
+                Ok(blob) => {
+                    let _ = fs::remove_file(&path);
+                    self.block_tiers.insert(block_id, CacheTier::Gpu);
+                    Ok(Some(blob))
+                }
+                Err(e) => {
+                    self.nvme_compressed.insert(block_id, path);
+                    Err(e)
+                }
+            };
+        }
+        Ok(None)
+    }
+
     /// Evicts / deletes a block entirely from tiered caches.
     pub fn evict(&mut self, block_id: BlockId) {
         self.block_tiers.remove(&block_id);
         self.host_ram_cache.remove(&block_id);
+        self.compressed_host.remove(&block_id);
         if let Some(path) = self.nvme_cache.remove(&block_id) {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = self.nvme_compressed.remove(&block_id) {
             let _ = fs::remove_file(path);
         }
     }
@@ -351,6 +452,18 @@ impl SharedSpillManager {
 
     pub fn retrieve(&self, block_id: BlockId) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
         self.inner.write().retrieve(block_id)
+    }
+
+    pub fn demote_compressed(&self, block_id: BlockId, blob: Vec<u8>) -> Result<()> {
+        self.inner.write().demote_compressed(block_id, blob)
+    }
+
+    pub fn demote_compressed_to_nvme(&self, block_id: BlockId) -> Result<()> {
+        self.inner.write().demote_compressed_to_nvme(block_id)
+    }
+
+    pub fn retrieve_compressed(&self, block_id: BlockId) -> Result<Option<Vec<u8>>> {
+        self.inner.write().retrieve_compressed(block_id)
     }
 
     pub fn evict(&self, block_id: BlockId) {

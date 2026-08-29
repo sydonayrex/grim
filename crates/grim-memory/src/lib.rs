@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use grim_backend_cpu::CpuDevice;
 use grim_core::error::{Error, Result};
 use grim_core::kv_cache::KvCache;
 use grim_kvquant::{CompressedKvBlock, KvCompressor};
@@ -432,6 +433,12 @@ impl KvBlockPool {
     /// Free with optional force-demote: when `force_tier` is true, the
     /// pool actively demotes to host RAM even if the refcount is still
     /// positive (used when the caller is shedding pressure).
+    ///
+    /// Demotion is tried compressed first (compressor + spill attached),
+    /// then raw. If BOTH demotion paths fail, the block falls back to the
+    /// in-place release (zero + free list) — a failed demotion must never
+    /// strand the block in a fake `HostRam` state with no free-list path,
+    /// because nothing else would ever reclaim the slot.
     pub fn free_with_tier(&mut self, id: BlockId, force_tier: bool) -> Result<()> {
         if !self.ref_counts.contains_key(&id) && !force_tier {
             return Ok(());
@@ -448,20 +455,67 @@ impl KvBlockPool {
         }
         // Demote-before-drop: spill manager routes to host RAM + NVMe.
         if let Some(spill) = self.spill.as_ref() {
-            let k = self.blocks[id].key_data.clone();
-            let v = self.blocks[id].value_data.clone();
-            if let Err(e) = spill.demote_to_host(id, k, v) {
-                eprintln!("[BlockPool] demote_to_host failed for block {id}: {e}");
+            let mut demoted = false;
+            // 1. Compressed path: the compressor's serialized block IS the
+            // spilled bytes — closes the compression-to-spill loop instead
+            // of recording compression as metadata only.
+            if let Some(_c) = self.compressor.as_ref() {
+                if let Ok(Some(compressed)) = self.compress_block(id) {
+                    match spill.demote_compressed(id, compressed.to_bytes()) {
+                        Ok(()) => {
+                            if let Err(e) = spill.demote_compressed_to_nvme(id) {
+                                eprintln!(
+                                    "[BlockPool] compressed demote_to_nvme failed for block {id} (host copy retained): {e}"
+                                );
+                            }
+                            demoted = true;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[BlockPool] compressed demote_to_host failed for block {id}, falling back to raw: {e}"
+                            );
+                        }
+                    }
+                }
             }
-            if let Err(e) = spill.demote_to_nvme(id) {
-                eprintln!("[BlockPool] demote_to_nvme failed for block {id}: {e}");
+            // 2. Raw f32 path (also the fallback when compression failed).
+            if !demoted {
+                let k = self.blocks[id].key_data.clone();
+                let v = self.blocks[id].value_data.clone();
+                match spill.demote_to_host(id, k, v) {
+                    Ok(()) => {
+                        if let Err(e) = spill.demote_to_nvme(id) {
+                            eprintln!(
+                                "[BlockPool] demote_to_nvme failed for block {id} (host copy retained): {e}"
+                            );
+                        }
+                        demoted = true;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[BlockPool] demote_to_host failed for block {id}: {e} — releasing in place"
+                        );
+                    }
+                }
             }
-            // Mark the block as demoted so promotion can be decided later
-            // without re-querying the spill manager.
-            self.blocks[id].location = CacheTier::HostRam;
-            self.recently_zero.push_back(id);
-            // Do NOT push to free_list — the block is spilled, not available
-            // for fresh allocation. Only promote_to_gpu can reclaim it.
+            if demoted {
+                // Mark the block as demoted so promotion can be decided later
+                // without re-querying the spill manager.
+                self.blocks[id].location = CacheTier::HostRam;
+                self.recently_zero.push_back(id);
+                // Do NOT push to free_list — the block is spilled, not available
+                // for fresh allocation. Only promote_to_gpu can reclaim it.
+            } else {
+                // Both demotion paths failed: the block must stay reclaimable.
+                // Zero it in place and return it to the free list rather than
+                // stranding GPU capacity in a fake spilled state.
+                self.blocks[id].num_tokens = 0;
+                self.blocks[id].received = false;
+                self.blocks[id].key_data.fill(0.0);
+                self.blocks[id].value_data.fill(0.0);
+                self.blocks[id].location = CacheTier::Gpu;
+                self.free_list.push_back(id);
+            }
         } else {
             // No spill attached: zero the in-place contents directly.
             self.blocks[id].num_tokens = 0;
@@ -474,34 +528,59 @@ impl KvBlockPool {
         Ok(())
     }
 
-    /// Promote a previously demoted block back to GPU resident. On success
-    /// the retrieved key/value data is written back into the block and its
-    /// `location` restored to [`CacheTier::Gpu`]. Returns the contents if
-    /// promotion succeeded (the block was demoted), or `None` if there was
-    /// nothing to promote (block already GPU-resident or no spill manager).
+    /// Promote a previously demoted block back to GPU resident. Compressed
+    /// spill is decompressed back to f32 K/V first; raw spill is validated
+    /// STRICTLY: the retrieved lengths must match the block capacity
+    /// exactly, otherwise this is an `Err` — never a silent `.min()`
+    /// truncation of cache contents. On success the retrieved key/value
+    /// data is written back into the block and its `location` restored to
+    /// [`CacheTier::Gpu`]. Returns the contents if promotion succeeded
+    /// (the block was demoted), or `None` if there was nothing to promote
+    /// (block already GPU-resident or no spill manager).
     pub fn promote_to_gpu(&mut self, id: BlockId) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
         let Some(spill) = self.spill.as_ref() else {
             return Ok(None);
         };
-        match spill.retrieve(id)? {
-            Some((k, v)) => {
-                let elem = self.num_heads * self.head_dim;
-                let n = (k.len() / elem).min(BLOCK_SIZE);
-                // Validate retrieved spill data fits within the block's capacity
-                // before copying — a mismatch is a panic, not silent corruption.
-                let block_cap = self.blocks[id].key_data.len();
-                let k_len = k.len().min(block_cap);
-                let v_len = v.len().min(self.blocks[id].value_data.len());
-                self.blocks[id].key_data[..k_len].copy_from_slice(&k[..k_len]);
-                self.blocks[id].value_data[..v_len].copy_from_slice(&v[..v_len]);
-                self.blocks[id].num_tokens = n;
-                self.blocks[id].received = true;
-                self.blocks[id].location = CacheTier::Gpu;
-                self.dirty_blocks.remove(&id);
-                Ok(Some((k, v)))
+        // Compressed spill first: decompress back to full f32 K/V.
+        let (k, v) = match spill.retrieve_compressed(id)? {
+            Some(blob) => {
+                let compressor = self.compressor.as_ref().ok_or_else(|| {
+                    Error::KvCache(
+                        "compressed spill block found but no compressor attached".into(),
+                    )
+                })?;
+                let block = CompressedKvBlock::from_bytes(&blob)?;
+                let (keys, values) =
+                    compressor.dequantize_for_attention(&block, &CpuDevice::new(), Device::Cpu)?;
+                (keys.to_vec_f32()?, values.to_vec_f32()?)
             }
-            None => Ok(None),
+            None => match spill.retrieve(id)? {
+                Some((k, v)) => (k, v),
+                None => return Ok(None),
+            },
+        };
+        // Strict capacity validation — a mismatch is an error, not silent
+        // truncation (the pre-fix `.min()` copies silently dropped cache
+        // rows when the spill geometry disagreed with the pool).
+        let key_cap = self.blocks[id].key_data.len();
+        let val_cap = self.blocks[id].value_data.len();
+        if k.len() != key_cap || v.len() != val_cap {
+            return Err(Error::KvCache(format!(
+                "promote_to_gpu: spill geometry mismatch for block {id} \
+                 (k {} vs {key_cap}, v {} vs {val_cap})",
+                k.len(),
+                v.len()
+            )));
         }
+        let elem = self.num_heads * self.head_dim;
+        let n = (k.len() / elem).min(BLOCK_SIZE);
+        self.blocks[id].key_data.copy_from_slice(&k);
+        self.blocks[id].value_data.copy_from_slice(&v);
+        self.blocks[id].num_tokens = n;
+        self.blocks[id].received = true;
+        self.blocks[id].location = CacheTier::Gpu;
+        self.dirty_blocks.remove(&id);
+        Ok(Some((k, v)))
     }
 
     /// Mark a block as dirty (GPU-modified and needing mirror synchronization).
@@ -556,48 +635,86 @@ impl KvBlockPool {
             return false;
         }
         if let Some(spill) = self.spill.as_ref() {
-            let k = self.blocks[bid].key_data.clone();
-            let v = self.blocks[bid].value_data.clone();
-            if let Err(e) = spill.demote_to_host(bid, k, v) {
-                eprintln!("[BlockPool] evict demote_to_host failed for {bid}: {e}");
+            let mut demoted = false;
+            // Compressed-first demotion (mirrors free_with_tier).
+            if self.compressor.is_some() {
+                if let Ok(Some(compressed)) = self.compress_block(bid) {
+                    if spill.demote_compressed(bid, compressed.to_bytes()).is_ok() {
+                        if let Err(e) = spill.demote_compressed_to_nvme(bid) {
+                            eprintln!(
+                                "[BlockPool] evict compressed demote_to_nvme failed for {bid} (host copy retained): {e}"
+                            );
+                        }
+                        demoted = true;
+                    }
+                }
             }
-            if let Err(e) = spill.demote_to_nvme(bid) {
-                eprintln!("[BlockPool] evict demote_to_nvme failed for {bid}: {e}");
+            if !demoted {
+                let k = self.blocks[bid].key_data.clone();
+                let v = self.blocks[bid].value_data.clone();
+                if spill.demote_to_host(bid, k, v).is_ok() {
+                    if let Err(e) = spill.demote_to_nvme(bid) {
+                        eprintln!(
+                            "[BlockPool] evict demote_to_nvme failed for {bid} (host copy retained): {e}"
+                        );
+                    }
+                    demoted = true;
+                } else {
+                    eprintln!(
+                        "[BlockPool] evict demote_to_host failed for {bid} — releasing in place"
+                    );
+                }
             }
-            self.blocks[bid].location = CacheTier::HostRam;
-            self.recently_zero.push_back(bid);
-            // Do NOT push to free_list — spilled blocks are not available for
-            // fresh allocation. Only promote_to_gpu can reclaim them.
-            self.ref_counts.remove(&bid);
-            true
-        } else {
-            self.blocks[bid].num_tokens = 0;
-            self.blocks[bid].received = false;
-            self.blocks[bid].key_data.fill(0.0);
-            self.blocks[bid].value_data.fill(0.0);
-            self.ref_counts.remove(&bid);
-            self.free_list.push_back(bid);
-            true
+            if demoted {
+                self.blocks[bid].location = CacheTier::HostRam;
+                self.recently_zero.push_back(bid);
+                // Do NOT push to free_list — spilled blocks are not available for
+                // fresh allocation. Only promote_to_gpu can reclaim them.
+                self.ref_counts.remove(&bid);
+                return true;
+            }
+            // Demotion failed: fall through to the in-place release below so
+            // the slot is reclaimable instead of stranded in a fake spilled
+            // state with no valid backing storage.
         }
+        self.blocks[bid].num_tokens = 0;
+        self.blocks[bid].received = false;
+        self.blocks[bid].key_data.fill(0.0);
+        self.blocks[bid].value_data.fill(0.0);
+        self.ref_counts.remove(&bid);
+        self.free_list.push_back(bid);
+        true
     }
 
     /// Compress the latest snapshot of `id` via the attached
     /// compressor and expose the [`CompressedKvBlock`]. `None` if no
-    /// compressor is attached.
+    /// compressor is attached or the block holds no tokens — the snapshot
+    /// is taken at the block's ACTUAL `num_tokens` rows, never padded to
+    /// [`BLOCK_SIZE`], so compression does no work on padding.
     pub fn compress_block(&self, id: BlockId) -> Result<Option<CompressedKvBlock>> {
         let c = match self.compressor.as_ref() {
             Some(c) => c,
             None => return Ok(None),
         };
-        let snap = self.snapshot_block(id);
-        c.compress(&snap.0, &snap.1).map(Some)
+        if self.blocks[id].num_tokens == 0 {
+            return Ok(None);
+        }
+        let (k, v) = self.snapshot_block(id);
+        c.compress(&k, &v).map(Some)
     }
 
     fn snapshot_block(&self, id: BlockId) -> (Tensor, Tensor) {
-        let shape = grim_tensor::Shape::new(vec![BLOCK_SIZE, self.num_heads, self.head_dim]);
-        let k_tensor =
-            grim_backend_cpu::cpu_tensor(self.blocks[id].key_data.clone(), shape.clone());
-        let v_tensor = grim_backend_cpu::cpu_tensor(self.blocks[id].value_data.clone(), shape);
+        let rows = self.blocks[id].num_tokens.clamp(1, BLOCK_SIZE);
+        let elem = self.num_heads * self.head_dim;
+        let shape = grim_tensor::Shape::new(vec![rows, self.num_heads, self.head_dim]);
+        let k_tensor = grim_backend_cpu::cpu_tensor(
+            self.blocks[id].key_data[..rows * elem].to_vec(),
+            shape.clone(),
+        );
+        let v_tensor = grim_backend_cpu::cpu_tensor(
+            self.blocks[id].value_data[..rows * elem].to_vec(),
+            shape,
+        );
         (k_tensor, v_tensor)
     }
 
@@ -998,7 +1115,7 @@ impl PagedKvCache {
         head_dim: usize,
         page_size_: usize,
     ) -> Self {
-        let capacity = pool.lock().unwrap().capacity();
+        let capacity = pool.lock().unwrap_or_else(|e| e.into_inner()).capacity();
         let page_size = if page_size_ == 0 {
             BLOCK_SIZE
         } else {
@@ -1105,7 +1222,7 @@ impl KvCache for PagedKvCache {
         self.committed_tokens += 1;
         let req_blocks = self.committed_tokens.div_ceil(BLOCK_SIZE);
         if self.table.len() < req_blocks {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             let id = pool.alloc()?;
             self.table.push(id);
             self.block_table_u32.push(id as u32);
@@ -1121,7 +1238,7 @@ impl KvCache for PagedKvCache {
         let req_blocks = total_tokens.div_ceil(BLOCK_SIZE);
         if self.table.len() < req_blocks {
             let needed = req_blocks - self.table.len();
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..needed {
                 let id = pool.alloc()?;
                 self.table.push(id);
@@ -1141,7 +1258,7 @@ impl KvCache for PagedKvCache {
         } else {
             self.committed_tokens.div_ceil(BLOCK_SIZE)
         };
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         while self.table.len() > keep_blocks {
             if let Some(pid) = self.table.logical_to_physical.pop() {
                 pool.free_with_tier(pid, false).ok();
@@ -1161,7 +1278,7 @@ impl KvCache for PagedKvCache {
         } else {
             self.committed_tokens.div_ceil(BLOCK_SIZE)
         };
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         while self.table.len() > keep_blocks {
             if let Some(pid) = self.table.logical_to_physical.pop() {
                 pool.free_with_tier(pid, false).ok();
@@ -1178,7 +1295,7 @@ impl KvCache for PagedKvCache {
     }
 
     fn current_k(&self) -> Result<Tensor> {
-        let pool = self.pool.lock().unwrap();
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         let mut k_data =
             Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
         for &id in &self.table.logical_to_physical {
@@ -1193,7 +1310,7 @@ impl KvCache for PagedKvCache {
     }
 
     fn current_v(&self) -> Result<Tensor> {
-        let pool = self.pool.lock().unwrap();
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         let mut v_data =
             Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
         for &id in &self.table.logical_to_physical {
@@ -1208,7 +1325,7 @@ impl KvCache for PagedKvCache {
     }
 
     fn store_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&id) = self.table.logical_to_physical.last() {
             let k_flat = k.to_vec_f32()?;
             let v_flat = v.to_vec_f32()?;
@@ -1417,7 +1534,7 @@ impl KvCache for PagedKvCache {
     }
 
     fn seed_prefix(&mut self, blocks: &[usize]) {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         for &b in blocks {
             pool.add_ref(b);
             self.table.push(b);
@@ -1728,7 +1845,7 @@ mod tests {
 
         // Populate mock data into the pool for these physical blocks
         {
-            let mut pool_g = pool.lock().unwrap();
+            let mut pool_g = pool.lock().unwrap_or_else(|e| e.into_inner());
             let block1_id = cache.table.logical_to_physical[0];
             let block2_id = cache.table.logical_to_physical[1];
 
