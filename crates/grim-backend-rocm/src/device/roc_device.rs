@@ -2771,6 +2771,41 @@ impl ElementwiseOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
+
+    fn sub(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let neg_b = self.mul_scalar(b, -1.0, out)?;
+        self.add(a, neg_b.0.as_ref(), out)
+    }
+
+    fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        if v.is_empty() {
+            return Err(Error::Backend("reduce_sum: empty tensor".into()));
+        }
+        Ok(v.iter().sum())
+    }
+
+    fn reduce_max(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .copied()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| Error::Backend("reduce_max: empty tensor".into()))
+    }
+
+    fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .ok_or_else(|| Error::Backend("argmax: empty tensor".into()))
+    }
 }
 
 impl SamplingOps for RocmDevice {
