@@ -37,6 +37,7 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("recip", load_kernel("recip")),
         ("rope", load_kernel("rope")),
         ("rope_yarn", load_kernel("rope_yarn")),
+        ("rerope", load_kernel("rerope")),
         (
             "fused_dequant_gemm_q4k",
             load_kernel("fused_dequant_gemm_q4k"),
@@ -224,6 +225,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/qkv_attention_paged_dequant.comp");
     println!("cargo:rerun-if-changed=kernels/speculative_acceptor.comp");
     println!("cargo:rerun-if-changed=kernels/cooperative_matrix_gemm.comp");
+    println!("cargo:rerun-if-changed=kernels/rerope.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 

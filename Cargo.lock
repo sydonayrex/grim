@@ -2248,9 +2248,11 @@ dependencies = [
 name = "grim-backend-vulkan"
 version = "0.1.0"
 dependencies = [
+ "grim-backend-cpu",
  "grim-quant",
  "grim-tensor",
  "lazy_static",
+ "libc",
  "seahash",
  "serde",
  "serde_json",

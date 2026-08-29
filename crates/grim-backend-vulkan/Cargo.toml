@@ -13,8 +13,12 @@ thiserror = { workspace = true }
 lazy_static = "1.4"
 tracing = "0.1"
 seahash = "4.1"
+libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[dev-dependencies]
+grim-backend-cpu = { workspace = true }
 
 [features]
 default = []

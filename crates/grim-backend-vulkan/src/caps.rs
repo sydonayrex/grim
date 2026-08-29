@@ -40,10 +40,11 @@ impl VulkanCaps {
         device_id: u32,
         driver_version: u32,
     ) -> Self {
-        // AMD RDNA 3+ (gfx1100+): device_id in 0x7440–0x75ff range.
-        // These support native FP32 atomic add on SSBOs via ACO.
+        // AMD RDNA 3+ (gfx1100+, 0x1002) and NVIDIA Pascal+ (0x10de):
+        // These support native FP32 atomic add on SSBOs via GL_EXT_shader_atomic_float / OpAtomicFAdd.
         let supports_fp32_atomic_add =
-            vendor_id == 0x1002 && (0x7440..=0x75ff).contains(&device_id);
+            (vendor_id == 0x1002 && (0x7440..=0x75ff).contains(&device_id))
+                || vendor_id == 0x10de;
         // Intel executes EU threads at SIMD16; AMD RDNA (wave32) and
         // NVIDIA (warp32) both dispatch 32-lane subgroups.
         let subgroup_size = if vendor_id == 0x8086 { 16 } else { 32 };

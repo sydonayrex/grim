@@ -1,8 +1,10 @@
 pub mod autotune;
 pub mod caps;
+pub mod hugepage;
 
 pub use autotune::{GemmOp, ShapeClass, VulkanAutotuner, VulkanTileConfig};
 pub use caps::VulkanCaps;
+pub use hugepage::VulkanHugePageBuffer;
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -3653,6 +3655,135 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+    fn rerope(
+        &self,
+        k: &dyn BackendStorage,
+        old_positions: &[u32],
+        new_positions: &[u32],
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let k_s = k
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rerope k is not VulkanStorage".into()))?;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let num_tokens = old_positions.len();
+        if new_positions.len() != num_tokens {
+            return Err(Error::Backend(format!(
+                "Vulkan rerope: old_positions len {} != new_positions len {}",
+                num_tokens,
+                new_positions.len()
+            )));
+        }
+        let num_heads = out_shape.elem_count() / (num_tokens * dim);
+
+        let pos_shape = Shape::new(vec![num_tokens]);
+        let old_pos_storage = VulkanStorage::alloc_gpu(
+            &pos_shape,
+            DType {
+                arith: ArithType::U32,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let new_pos_storage = VulkanStorage::alloc_gpu(
+            &pos_shape,
+            DType {
+                arith: ArithType::U32,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        // Upload old_positions
+        let mut mapped_old: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let res = vkMapMemory(
+                ctx.device,
+                old_pos_storage.memory,
+                0,
+                old_pos_storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped_old,
+            );
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed for old_positions buffer: {res}"
+                )));
+            }
+            std::ptr::copy_nonoverlapping(
+                old_positions.as_ptr(),
+                mapped_old as *mut u32,
+                num_tokens,
+            );
+            vkUnmapMemory(ctx.device, old_pos_storage.memory);
+        }
+
+        // Upload new_positions
+        let mut mapped_new: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let res = vkMapMemory(
+                ctx.device,
+                new_pos_storage.memory,
+                0,
+                new_pos_storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped_new,
+            );
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed for new_positions buffer: {res}"
+                )));
+            }
+            std::ptr::copy_nonoverlapping(
+                new_positions.as_ptr(),
+                mapped_new as *mut u32,
+                num_tokens,
+            );
+            vkUnmapMemory(ctx.device, new_pos_storage.memory);
+        }
+
+        let buffers = [
+            k_s.buffer,
+            old_pos_storage.buffer,
+            new_pos_storage.buffer,
+            out_storage.buffer,
+        ];
+
+        let total_pairs = (num_tokens * num_heads * (dim / 2)) as u32;
+        let grid_x = total_pairs.div_ceil(256);
+        let push = push_params(num_tokens as u32, dim as u32, num_heads as u32, 0, 0, base);
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::Rerope,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
     fn from_cpu_bytes(
         &self,
         data: &[u8],
@@ -4493,19 +4624,23 @@ impl BackendDevice for VulkanDevice {
                             let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
                             let mut ok = true;
                             for input in inputs {
-                                let in_s = input.as_any().downcast_ref::<VulkanStorage>().unwrap();
-                                let buffers = [in_s.buffer, out_storage.buffer];
-                                if run_compute_shader(
-                                    ctx,
-                                    &spirv,
-                                    &buffers,
-                                    grid_x,
-                                    1,
-                                    1,
-                                    Some(&push),
-                                )
-                                .is_err()
-                                {
+                                if let Some(in_s) = input.as_any().downcast_ref::<VulkanStorage>() {
+                                    let buffers = [in_s.buffer, out_storage.buffer];
+                                    if run_compute_shader(
+                                        ctx,
+                                        &spirv,
+                                        &buffers,
+                                        grid_x,
+                                        1,
+                                        1,
+                                        Some(&push),
+                                    )
+                                    .is_err()
+                                    {
+                                        ok = false;
+                                        break;
+                                    }
+                                } else {
                                     ok = false;
                                     break;
                                 }
@@ -4556,9 +4691,7 @@ impl BackendDevice for VulkanDevice {
         let is_f32 = dtype.arith == ArithType::F32;
         let out_shape = Shape::new(vec![m, n_total]);
 
-        // ── GPU fast path: scatter each column shard to its offset.
-        // The `comm_fuse_reduce` kernel copies In[row, col] →
-        // Out[row, col_offset + col] on a pre-zeroed output buffer.
+        // ── GPU fast path
         {
             let all_vulkan = partials
                 .iter()
@@ -4600,34 +4733,38 @@ impl BackendDevice for VulkanDevice {
                             let mut col_offset = 0usize;
                             let mut ok = true;
                             for (storage, _placement) in partials {
-                                let s = storage.as_any().downcast_ref::<VulkanStorage>().unwrap();
-                                let n_src = s.shape().dims().get(1).copied().unwrap_or(0);
-                                let buffers = [s.buffer, out_storage.buffer];
-                                let grid_x = n_src.div_ceil(16) as u32;
-                                let grid_y = m.div_ceil(16) as u32;
-                                let push = push_params(
-                                    n_src as u32,
-                                    col_offset as u32,
-                                    n_total as u32,
-                                    m as u32,
-                                    0,
-                                    0.0,
-                                );
-                                if run_compute_shader(
-                                    ctx,
-                                    &spirv,
-                                    &buffers,
-                                    grid_x,
-                                    grid_y,
-                                    1,
-                                    Some(&push),
-                                )
-                                .is_err()
-                                {
+                                if let Some(s) = storage.as_any().downcast_ref::<VulkanStorage>() {
+                                    let n_src = s.shape().dims().get(1).copied().unwrap_or(0);
+                                    let buffers = [s.buffer, out_storage.buffer];
+                                    let grid_x = n_src.div_ceil(16) as u32;
+                                    let grid_y = m.div_ceil(16) as u32;
+                                    let push = push_params(
+                                        n_src as u32,
+                                        col_offset as u32,
+                                        n_total as u32,
+                                        m as u32,
+                                        0,
+                                        0.0,
+                                    );
+                                    if run_compute_shader(
+                                        ctx,
+                                        &spirv,
+                                        &buffers,
+                                        grid_x,
+                                        grid_y,
+                                        1,
+                                        Some(&push),
+                                    )
+                                    .is_err()
+                                    {
+                                        ok = false;
+                                        break;
+                                    }
+                                    col_offset += n_src;
+                                } else {
                                     ok = false;
                                     break;
                                 }
-                                col_offset += n_src;
                             }
                             if ok {
                                 return Ok(Box::new(out_storage));
@@ -4682,6 +4819,9 @@ pub enum VulkanKernel {
     /// ramp + `mscale` are recomputed inside the shader from push-constant
     /// scalars so no `inv_freq` buffer is needed.
     RopeYarn,
+    /// Fused un-rotate and re-rotate (Position Retargeting) RoPE. 4-binding layout:
+    /// (k_in, old_pos, new_pos, out_k).
+    Rerope,
     FusedDequantGemmQ4K,
     FusedDequantGemmQ5K,
     FusedDequantGemmQ6K,
@@ -4763,6 +4903,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
         VulkanKernel::RopeYarn => SPIRV_ROPE_YARN,
+        VulkanKernel::Rerope => SPIRV_REROPE,
         VulkanKernel::FusedDequantGemmQ4K => SPIRV_FUSED_DEQUANT_GEMM_Q4K,
         VulkanKernel::FusedDequantGemmQ5K => SPIRV_FUSED_DEQUANT_GEMM_Q5K,
         VulkanKernel::FusedDequantGemmQ6K => SPIRV_FUSED_DEQUANT_GEMM_Q6K,
@@ -4852,6 +4993,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::SiluMulBackward => 3,
         VulkanKernel::QkvAttention
         | VulkanKernel::QkvAttentionSwa
+        | VulkanKernel::Rerope
         | VulkanKernel::FlashAttention
         | VulkanKernel::MlaDecode
         | VulkanKernel::SageAttention
