@@ -24,7 +24,9 @@
 use std::time::Instant;
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape,
+    CoreTensorOps,
+};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
@@ -68,10 +70,10 @@ fn upload_inputs(
     let a_s = Shape::from_slice(&[m, k]);
     let b_s = Shape::from_slice(&[k, n]);
     let out_s = Shape::from_slice(&[m, n]);
-    let a_dev = BackendDevice::from_cpu(dev, a, &a_s, DType::F32)?;
-    let b_dev = BackendDevice::from_cpu(dev, b, &b_s, DType::F32)?;
-    let c_dev = BackendDevice::from_cpu(dev, c, &out_s, DType::F32)?;
-    let w_dev = BackendDevice::from_cpu(dev, w, &out_s, DType::F32)?;
+    let a_dev = CoreTensorOps::from_cpu(dev, a, &a_s, DType::F32)?;
+    let b_dev = CoreTensorOps::from_cpu(dev, b, &b_s, DType::F32)?;
+    let c_dev = CoreTensorOps::from_cpu(dev, c, &out_s, DType::F32)?;
+    let w_dev = CoreTensorOps::from_cpu(dev, w, &out_s, DType::F32)?;
     Ok((a_dev, b_dev, c_dev, w_dev))
 }
 
@@ -93,9 +95,9 @@ fn run_compute(
 ) -> TestResult<Box<dyn grim_tensor::BackendStorage>> {
     let out_s = Shape::from_slice(&[m, n]);
     let (a_dev, b_dev, c_dev, w_dev) = inputs;
-    let (mm, _h1) = BackendDevice::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_s)?;
-    let (added, _h2) = BackendDevice::add(dev, mm.as_ref(), c_dev.as_ref(), &out_s)?;
-    let (rn, _h3) = BackendDevice::rms_norm(dev, added.as_ref(), w_dev.as_ref(), 1e-5_f32, &out_s)?;
+    let (mm, _h1) = CoreTensorOps::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_s)?;
+    let (added, _h2) = CoreTensorOps::add(dev, mm.as_ref(), c_dev.as_ref(), &out_s)?;
+    let (rn, _h3) = CoreTensorOps::rms_norm(dev, added.as_ref(), w_dev.as_ref(), 1e-5_f32, &out_s)?;
     Ok(rn)
 }
 

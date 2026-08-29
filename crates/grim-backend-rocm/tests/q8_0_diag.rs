@@ -4,7 +4,7 @@
 //!   cargo test -p grim-backend-rocm --test q8_0_diag -- --nocapture
 
 use grim_tensor::{
-    BackendDevice, BackendStorage,
+    BackendStorage, MemoryOps,
     dtype::{ArithType, DType, KQuantScheme, Storage},
     shape::Shape,
 };

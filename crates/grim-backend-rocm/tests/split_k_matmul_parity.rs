@@ -11,8 +11,8 @@
 //! Device-gated: `GRIM_GPU_TEST=1`.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Shape};
+use grim_tensor::{CoreTensorOps};
 
 fn gpu_ready() -> bool {
     std::env::var("GRIM_GPU_TEST").as_deref() == Ok("1")

@@ -6,7 +6,7 @@
 
 use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::dtype::DType;
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, FusionOps, Shape};
 
 /// Skip the test gracefully if no Vulkan device is available.
 fn device_or_skip() -> Option<VulkanDevice> {

@@ -19,7 +19,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{ArithType, DType, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
 fn cpu_fused_ce_oracle(
     hidden: &[f32],

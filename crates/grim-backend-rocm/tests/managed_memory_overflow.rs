@@ -4,7 +4,7 @@
 //! --test managed_memory_overflow -- --nocapture` on a ROCm machine.
 
 use grim_backend_rocm::{RocmDevice, RocmStorage};
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());

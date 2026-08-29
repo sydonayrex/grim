@@ -20,7 +20,9 @@
 //!   tied to this test shape.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape,
+    CoreTensorOps,
+};
 use std::panic;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -77,12 +79,12 @@ fn run_wmma_kernel(
     let b_shape = Shape::from_slice(&[k, n]);
     let out_shape = Shape::from_slice(&[m, n]);
 
-    let a_dev = BackendDevice::from_cpu(dev, a_data, &a_shape, DType::F16)?;
-    let b_dev = BackendDevice::from_cpu(dev, b_data, &b_shape, DType::F16)?;
+    let a_dev = CoreTensorOps::from_cpu(dev, a_data, &a_shape, DType::F16)?;
+    let b_dev = CoreTensorOps::from_cpu(dev, b_data, &b_shape, DType::F16)?;
 
     // Enable the WMMA JIT branch
     dev.set_wmma_gemm_enabled(true);
-    let (out, handle) = BackendDevice::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (out, handle) = CoreTensorOps::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     handle.synchronize()?;
     dev.set_wmma_gemm_enabled(false);
 

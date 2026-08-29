@@ -819,7 +819,7 @@ fn mark_stale(block: &mut CompressedKvBlock) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grim_tensor::{ArithType, DType, Device, Shape, Storage};
+    use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Storage};
     use std::sync::Arc;
 
     fn make_tensors(device: &grim_backend_cpu::CpuDevice, shape: &[usize]) -> (Tensor, Tensor) {

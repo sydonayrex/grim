@@ -31,9 +31,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
-use grim_tensor::{BackendStorage, Shape};
+use grim_tensor::{BackendStorage, MemoryOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::pinned::RocmPinnedBuffer;

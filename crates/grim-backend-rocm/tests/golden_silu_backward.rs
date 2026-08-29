@@ -4,7 +4,7 @@
 //! ROCm device, runs the GPU kernel on random input, and asserts elementwise
 //! agreement with a CPU reference implementation.
 
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{AutogradOps, CoreTensorOps, Shape};
 
 fn silu_backward_ref(e: &[f32], g: &[f32], dw: &[f32]) -> (Vec<f32>, Vec<f32>) {
     // Forward:  y = silu(e) * g

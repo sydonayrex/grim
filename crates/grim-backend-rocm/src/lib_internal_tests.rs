@@ -821,7 +821,7 @@ mod tests {
         let Ok(dev) = crate::RocmDevice::try_new(0) else {
             return;
         };
-        use grim_tensor::{BackendDevice, DType, Shape};
+        use grim_tensor::{DType, Shape};
         let rows = 204usize;
         let width = 1024usize;
         let x: Vec<f32> = (0..rows * width)
@@ -2565,6 +2565,10 @@ mod tests {
     /// split-half RoPE rotation within 1e-4 tolerance when ROCm hardware is present.
     #[test]
     fn rocm_native_rope_device_gated_parity() {
+        if !crate::gpu_test_enabled() {
+            eprintln!("ROCm device tests disabled: skipping rocm_native_rope_device_gated_parity");
+            return;
+        }
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
             Err(_) => {

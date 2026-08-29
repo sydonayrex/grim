@@ -8,12 +8,14 @@ pub use caps::MetalCaps;
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 #[allow(unused_imports)]
 use grim_tensor::dtype::{
-    ArithType, DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
+    DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
     Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendStorage, ScythePlacement, Shape,
-    CoreTensorOps, ElementwiseOps, SamplingOps, AttentionOps, FusionOps, AutogradOps, OptimizerOps, QuantOps, RecurrentOps, CollectiveOps, MemoryOps, GraphCaptureOps,
+pub use grim_tensor::{
+    ArithType, AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
+    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps,
+    RecurrentOps, SamplingOps, ScythePlacement, Shape,
 };
 
 use grim_backend_cpu::{CpuDevice, CpuStorage};
@@ -4354,6 +4356,8 @@ impl MemoryOps for MetalDevice {
 
 impl GraphCaptureOps for MetalDevice {
 }
+
+impl grim_tensor::BackendDevice for MetalDevice {}
 
 
 impl MetalDevice {

@@ -35,12 +35,12 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use grim_tensor::Shape;
-use grim_tensor::backend::BackendDevice;
 
 use crate::RocmDevice;
 use crate::device::capability_profiler::vram_info;
 use crate::device::util::{DeviceGuard, dtype_f32, last_launch_context};
 use crate::memory::storage::RocmStorage;
+use grim_tensor::{CoreTensorOps};
 
 fn multi_gpu_available() -> Option<usize> {
     if !crate::gpu_test_enabled() {

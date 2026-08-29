@@ -43,7 +43,7 @@ use grim_engine::{Engine, model_loader};
 use grim_format::GgufTokenizer;
 use grim_models_audio::{KokoroConfig, VocosConfig};
 use grim_models_diffusion::{Flux2Config, Flux2VaeConfig};
-use grim_tensor::BackendDevice;
+use grim_tensor::{CoreTensorOps};
 
 /// Shared state passed to every handler.
 #[derive(Clone)]

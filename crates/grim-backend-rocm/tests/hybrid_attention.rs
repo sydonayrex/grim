@@ -4,7 +4,7 @@
 //! full-GPU execution as a ground truth (Gate 3.6.1).
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape, SoftmaxPartial, merge_partials};
+use grim_tensor::{AttentionOps, CoreTensorOps, DType, Shape, SoftmaxPartial, merge_partials};
 
 /// Deterministic LCG for reproducible test inputs.
 fn lcg_f32(seed: u32) -> u32 {

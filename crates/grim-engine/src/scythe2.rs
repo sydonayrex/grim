@@ -781,8 +781,7 @@ impl MoETaskDescriptor {
     /// (`dev.from_cpu_bytes(...)` then use that pointer) and makes the
     /// host-pointer mistake impossible to reintroduce silently.
     pub fn upload(&self, device: &RocmDevice) -> grim_backend_rocm::Result<u64> {
-        use grim_tensor::backend::BackendDevice;
-        let bytes = unsafe {
+                let bytes = unsafe {
             std::slice::from_raw_parts(
                 self as *const Self as *const u8,
                 std::mem::size_of::<Self>(),
@@ -904,6 +903,7 @@ impl MoETaskDescriptor {
 // via `MoETaskDescriptor::enqueue_via(...)` → `ScytheRing::enqueue(...)`.
 
 use grim_nn::moe::ExpertPlacementMap;
+use grim_tensor::{MemoryOps};
 
 /// One (token, routed-expert, combine-weight) triple from the router's output.
 /// The planner consumes a flat stream of these and partitions them by
@@ -1367,8 +1367,7 @@ impl ScytheRingExec {
             arith: grim_tensor::ArithType::U32,
             storage: grim_tensor::dtype::Storage::Native,
         };
-        use grim_tensor::backend::BackendDevice;
-        let scalar = |v: u32| -> grim_backend_rocm::Result<Box<dyn grim_tensor::BackendStorage>> {
+                let scalar = |v: u32| -> grim_backend_rocm::Result<Box<dyn grim_tensor::BackendStorage>> {
             let bytes = v.to_ne_bytes().to_vec();
             let st = device
                 .as_ref()

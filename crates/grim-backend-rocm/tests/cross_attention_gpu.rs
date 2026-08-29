@@ -4,7 +4,7 @@
 //!   RDNA4 box. Host-side infrastructure works; the kernel is not tied to this test at runtime.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{AttentionOps, CoreTensorOps, DType, Shape};
 
 /// Deterministic LCG for reproducible test inputs.
 fn lcg_f32(seed: u32) -> u32 {

@@ -3,10 +3,11 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::fp8_e4m3_to_f32;
 use grim_tensor::{
-    BackendDevice, Shape,
+    Shape,
     dtype::{ArithType, BlockDtype, DType, Storage},
 };
 use std::panic;
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -48,12 +49,12 @@ fn test_raven_fp8_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let b_shape = Shape::from_slice(&[n, k]);
         let out_shape = Shape::from_slice(&[m, n]);
 
-        let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
+        let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
         let fp8_dtype = DType {
             arith: ArithType::F32,
             storage: Storage::Block(BlockDtype::Fp8),
         };
-        let b_dev = BackendDevice::from_cpu_bytes(&dev, &fp8_bytes, &b_shape, fp8_dtype)?;
+        let b_dev = MemoryOps::from_cpu_bytes(&dev, &fp8_bytes, &b_shape, fp8_dtype)?;
 
         let (out, handle) = dev.quantized_matmul(
             a_dev.as_ref(),

@@ -6,7 +6,9 @@
 //! `fused_attn_o_proj` must fail to resolve until the epilogue fusion exists.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{
+    AttentionOps, CoreTensorOps, DType, Shape,
+};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -90,7 +92,7 @@ fn fused_attn_output_proj_matches_unfused() {
             DType::F32,
         )
         .unwrap();
-    let (proj, h) = BackendDevice::matmul(
+    let (proj, h) = CoreTensorOps::matmul(
         &dev,
         attn2d.as_ref(),
         o.as_ref(),

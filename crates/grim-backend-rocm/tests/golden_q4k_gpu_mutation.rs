@@ -9,10 +9,11 @@ use grim_backend_rocm::RocmDevice;
 use grim_format::convert::GpuDequant;
 use grim_quant::{dequant_q4k, quant_q4k};
 use grim_tensor::{
-    BackendDevice, Shape,
+    Shape,
     dtype::{ArithType, DType, KQuantScheme, Storage},
 };
 use std::panic;
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -53,12 +54,12 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let b_shape = Shape::from_slice(&[n, k]);
         let out_shape = Shape::from_slice(&[m, n]);
 
-        let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
+        let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
         let q4k_dtype = DType {
             arith: ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q4K),
         };
-        let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_packed, &b_shape, q4k_dtype)?;
+        let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &b_shape, q4k_dtype)?;
 
         let (out, handle) = dev.quantized_matmul(
             a_dev.as_ref(),

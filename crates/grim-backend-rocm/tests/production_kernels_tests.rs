@@ -2,7 +2,9 @@
 //! FlashDecoding (Split-KV Attention), DeepSeek MLA Decode, Marlin W4A16, and BitNet b1.58.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, Shape, dtype::DType};
+use grim_tensor::{Shape, dtype::DType,
+    CoreTensorOps, MemoryOps,
+};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -95,10 +97,10 @@ fn test_flash_decode_split_kv_parity() -> TestResult {
     let kv_shape = Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]);
     let out_shape = Shape::from_slice(&[1, num_heads, head_dim]);
 
-    let q_dev = BackendDevice::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
-    let k_dev = BackendDevice::from_cpu(&dev, &k_data, &kv_shape, DType::F32)?;
-    let v_dev = BackendDevice::from_cpu(&dev, &v_data, &kv_shape, DType::F32)?;
-    let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F32)?;
+    let q_dev = CoreTensorOps::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
+    let k_dev = CoreTensorOps::from_cpu(&dev, &k_data, &kv_shape, DType::F32)?;
+    let v_dev = CoreTensorOps::from_cpu(&dev, &v_data, &kv_shape, DType::F32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::F32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
     let k_s = grim_backend_rocm::device::util::as_rocm(k_dev.as_ref())?;
@@ -206,11 +208,11 @@ fn test_mla_absorbed_decode_parity() -> TestResult {
     let packed_kv_shape = Shape::from_slice(&[seq_len, kv_lora_rank + qk_rope_dim]);
     let out_shape = Shape::from_slice(&[1, num_heads, v_dim]);
 
-    let q_nope_dev = BackendDevice::from_cpu(&dev, &q_nope_data, &q_nope_shape, DType::F32)?;
-    let q_pe_dev = BackendDevice::from_cpu(&dev, &q_pe_data, &q_pe_shape, DType::F32)?;
+    let q_nope_dev = CoreTensorOps::from_cpu(&dev, &q_nope_data, &q_nope_shape, DType::F32)?;
+    let q_pe_dev = CoreTensorOps::from_cpu(&dev, &q_pe_data, &q_pe_shape, DType::F32)?;
     let packed_kv_dev =
-        BackendDevice::from_cpu(&dev, &packed_kv_data, &packed_kv_shape, DType::F32)?;
-    let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F32)?;
+        CoreTensorOps::from_cpu(&dev, &packed_kv_data, &packed_kv_shape, DType::F32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::F32)?;
 
     let q_nope_s = grim_backend_rocm::device::util::as_rocm(q_nope_dev.as_ref())?;
     let q_pe_s = grim_backend_rocm::device::util::as_rocm(q_pe_dev.as_ref())?;
@@ -272,11 +274,11 @@ fn test_marlin_gemm_w4a16_parity() -> TestResult {
     let scales_shape = Shape::from_slice(&[n, k / 16]);
     let out_shape = Shape::from_slice(&[m, n]);
 
-    let a_dev = BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&a_f16), &a_shape, DType::F16)?;
-    let b_dev = BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&b_w4), &b_shape, DType::U32)?;
+    let a_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&a_f16), &a_shape, DType::F16)?;
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&b_w4), &b_shape, DType::U32)?;
     let scales_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&scales_f16), &scales_shape, DType::F16)?;
-    let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F16)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&scales_f16), &scales_shape, DType::F16)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::F16)?;
 
     let a_s = grim_backend_rocm::device::util::as_rocm(a_dev.as_ref())?;
     let b_s = grim_backend_rocm::device::util::as_rocm(b_dev.as_ref())?;
@@ -337,10 +339,10 @@ fn test_bitnet_gemm_w158a8_parity() -> TestResult {
     let scales_shape = Shape::from_slice(&[n]);
     let out_shape = Shape::from_slice(&[m, n]);
 
-    let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
-    let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_ternary_packed, &b_shape, DType::U8)?;
-    let scales_dev = BackendDevice::from_cpu(&dev, &scales_b, &scales_shape, DType::F32)?;
-    let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F32)?;
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_ternary_packed, &b_shape, DType::U8)?;
+    let scales_dev = CoreTensorOps::from_cpu(&dev, &scales_b, &scales_shape, DType::F32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::F32)?;
 
     let a_s = grim_backend_rocm::device::util::as_rocm(a_dev.as_ref())?;
     let b_s = grim_backend_rocm::device::util::as_rocm(b_dev.as_ref())?;

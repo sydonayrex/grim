@@ -18,7 +18,9 @@
 //!   on this system.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape,
+    CoreTensorOps,
+};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -85,11 +87,11 @@ fn run_gpu(
     let out_shape = Shape::from_slice(&[m, n]);
 
     // Upload as F16; `from_cpu` converts element-wise.
-    let a_dev = BackendDevice::from_cpu(dev, a, &a_shape, DType::F16)?;
-    let b_dev = BackendDevice::from_cpu(dev, b, &b_shape, DType::F16)?;
+    let a_dev = CoreTensorOps::from_cpu(dev, a, &a_shape, DType::F16)?;
+    let b_dev = CoreTensorOps::from_cpu(dev, b, &b_shape, DType::F16)?;
 
     dev.set_wmma_gemm_enabled(true);
-    let (out, handle) = BackendDevice::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (out, handle) = CoreTensorOps::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     handle.synchronize()?;
     dev.set_wmma_gemm_enabled(false);
 
@@ -179,18 +181,18 @@ fn test_wmma_gemm_enable_disable_output_consistency() -> TestResult {
     let b_shape = Shape::from_slice(&[k, n]);
     let out_shape = Shape::from_slice(&[m, n]);
 
-    let a_dev = BackendDevice::from_cpu(&dev, &a, &a_shape, DType::F16)?;
-    let b_dev = BackendDevice::from_cpu(&dev, &b, &b_shape, DType::F16)?;
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a, &a_shape, DType::F16)?;
+    let b_dev = CoreTensorOps::from_cpu(&dev, &b, &b_shape, DType::F16)?;
 
     // Run with WMMA disabled (rocBLAS path)
     dev.set_wmma_gemm_enabled(false);
-    let (out_rocblas, h) = BackendDevice::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (out_rocblas, h) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     h.synchronize()?;
     let rocblas_result = out_rocblas.as_ref().to_cpu_vec_f32()?;
 
     // Run with WMMA enabled (should_use_wmma_path → launch_wmma_gemm)
     dev.set_wmma_gemm_enabled(true);
-    let (out_wmma, h2) = BackendDevice::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (out_wmma, h2) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     h2.synchronize()?;
     dev.set_wmma_gemm_enabled(false);
     let wmma_result = out_wmma.as_ref().to_cpu_vec_f32()?;

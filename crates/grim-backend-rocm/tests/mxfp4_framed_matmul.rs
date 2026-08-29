@@ -4,8 +4,9 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::{dequant_mxfp4, f32_to_mxfp4_e2m1, mxfp4_e2m1_to_f32};
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 use grim_tensor::{
-    BackendDevice, QuantFormat, Shape,
+    QuantFormat, Shape,
     dtype::{ArithType, DType, FloatPackScheme, Storage},
 };
 
@@ -89,9 +90,9 @@ fn mxfp4_framed_variable_exponent_parity() -> TestResult {
         arith: ArithType::F32,
         storage: Storage::FloatPack(FloatPackScheme::MxFp4),
     };
-    let a_dev = BackendDevice::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
     let b_dev =
-        BackendDevice::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
+        MemoryOps::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
     let out_shape = Shape::from_slice(&[m, n]);
     let (out_dev, _h) = dev.quantized_matmul(
         a_dev.as_ref(),
@@ -176,11 +177,11 @@ fn mxfp4_framed_quantized_matmul_parity() -> TestResult {
         arith: ArithType::F32,
         storage: Storage::FloatPack(FloatPackScheme::MxFp4),
     };
-    let a_dev = BackendDevice::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &Shape::from_slice(&[m, k]), DType::F32)?;
     // Framed weight stored with its logical [out, in] shape (as
     // `transpose_last_two` only relabels quantized ROCm tensors).
     let b_dev =
-        BackendDevice::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
+        MemoryOps::from_cpu_bytes(&dev, &framed, &Shape::from_slice(&[k, n]), mxfp4_dtype)?;
     let out_shape = Shape::from_slice(&[m, n]);
     let (out_dev, _h) = dev.quantized_matmul(
         a_dev.as_ref(),

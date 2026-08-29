@@ -3,8 +3,9 @@
 //! cache-offset variants, against an inline scalar reference.
 //! Env-gated: GRIM_RUN_GPU_TESTS=1.
 
-use grim_backend_rocm::{BackendDevice, RocmDevice, Shape};
+use grim_backend_rocm::{RocmDevice, Shape};
 use grim_tensor::DType;
+use grim_tensor::{AttentionOps, CoreTensorOps};
 
 // Argument list mirrors the GPU kernel's launch parameters one-to-one.
 #[allow(clippy::too_many_arguments)]

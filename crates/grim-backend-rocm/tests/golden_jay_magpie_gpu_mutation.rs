@@ -3,10 +3,11 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::{f32_to_mxfp4_e2m1, mxfp4_e2m1_to_f32};
 use grim_tensor::{
-    BackendDevice, Shape,
+    Shape,
     dtype::{ArithType, DType, FloatPackScheme, Storage},
 };
 use std::panic;
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -52,7 +53,7 @@ fn test_jay_mxfp4_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let b_shape = Shape::from_slice(&[n, k]);
         let out_shape = Shape::from_slice(&[m, n]);
 
-        let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
+        let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
         let mxfp4_dtype = DType {
             arith: ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
@@ -69,7 +70,7 @@ fn test_jay_mxfp4_gpu_gemm_golden_mutation_resistant() -> TestResult {
                 b_packed[j / 2] |= code << 4;
             }
         }
-        let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_packed, &b_shape, mxfp4_dtype)?;
+        let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &b_shape, mxfp4_dtype)?;
 
         // One E8M0 exponent (shared_exp) per 32-element block, matching the
         // kernel's `block_idx = (col*K+k)/32` layout. Passed via `_b_scales`

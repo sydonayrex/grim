@@ -10,7 +10,7 @@
 
 // NOTE: QkvAttentionFusionConfig intentionally omitted — not needed here.
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{AttentionOps, CoreTensorOps, DType, Shape};
 
 /// CPU reference: causal GQA attention for arbitrary head_dim.
 // Argument list mirrors the GPU kernel's launch parameters one-to-one.

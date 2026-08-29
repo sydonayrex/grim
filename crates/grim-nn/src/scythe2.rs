@@ -717,7 +717,7 @@ mod tests {
     use grim_backend_cpu::CpuDevice;
     use grim_tensor::backend::ScythePlacement;
     use grim_tensor::shape::Shape;
-    use grim_tensor::{BackendDevice, DType, Device};
+    use grim_tensor::{CoreTensorOps, DType, Device};
 
     /// Build a simple Tensor on CPU with given data.
     fn make_tensor(data: Vec<f32>, shape: Shape) -> Tensor {

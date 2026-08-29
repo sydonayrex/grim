@@ -6,7 +6,7 @@
 
 use grim_backend_cuda::CudaDevice;
 use grim_tensor::dtype::DType;
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, Shape};
 
 /// Skip the test gracefully if no CUDA device is available.
 fn device_or_skip() -> Option<CudaDevice> {

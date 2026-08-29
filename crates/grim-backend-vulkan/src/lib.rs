@@ -12,11 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{
-    ArithType, DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
+    DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
     Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendDevice, BackendStorage, ScythePlacement, Shape};
+pub use grim_tensor::{
+    ArithType, AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
+    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps,
+    RecurrentOps, SamplingOps, ScythePlacement, Shape,
+};
 
 // Vulkan FFI types and constants
 
@@ -2373,7 +2377,8 @@ impl VulkanDevice {
     }
 }
 
-impl BackendDevice for VulkanDevice {
+impl CoreTensorOps for VulkanDevice {
+
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = global_context();
         let ctx = ctx_guard
@@ -2408,6 +2413,7 @@ impl BackendDevice for VulkanDevice {
         Ok(Box::new(storage))
     }
 
+
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -2416,6 +2422,7 @@ impl BackendDevice for VulkanDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_op(a, b, out_shape, None)
     }
+
 
     fn add(
         &self,
@@ -2460,6 +2467,7 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -2502,6 +2510,7 @@ impl BackendDevice for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
+
 
     fn silu_mul(
         &self,
@@ -2547,59 +2556,6 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
-    fn silu_mul_backward(
-        &self,
-        e: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        dw: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let e_s = e.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan silu_mul_backward e is not VulkanStorage".into())
-        })?;
-        let g_s = g.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan silu_mul_backward g is not VulkanStorage".into())
-        })?;
-        let dw_s = dw.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan silu_mul_backward dw is not VulkanStorage".into())
-        })?;
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let df = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-        let de = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-        let buffers = [e_s.buffer, g_s.buffer, dw_s.buffer, df.buffer, de.buffer];
-        let push = push_params(out_shape.elem_count() as u32, 0, 0, 0, 0, 0.0);
-        run_compute_shader(
-            ctx,
-            spirv_for(VulkanKernel::SiluMulBackward),
-            &buffers,
-            out_shape.elem_count().div_ceil(256) as u32,
-            1,
-            1,
-            Some(&push),
-        )?;
-        Ok((
-            Box::new(df),
-            Box::new(de),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
-    }
 
     fn rms_norm(
         &self,
@@ -2649,86 +2605,6 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
-    /// Fused Add + RMSNorm: `y_out = x + residual`, `norm_out = rms_norm(y_out, w, eps)`.
-    /// Returns `(y_out, norm_out, compute_handle)`. Overrides the trait default with the real
-    /// fused `grim_add_rms_norm` SPIR-V pipeline — mirrors ROCm (HIP) and Metal (MSL) 1:1.
-    fn fused_add_rms_norm(
-        &self,
-        x: &dyn BackendStorage,
-        residual: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan fused_add_rms_norm: x is not VulkanStorage".into())
-        })?;
-        let r_s = residual
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| {
-                Error::Backend("Vulkan fused_add_rms_norm: residual is not VulkanStorage".into())
-            })?;
-        let w_s = weight
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| {
-                Error::Backend("Vulkan fused_add_rms_norm: weight is not VulkanStorage".into())
-            })?;
-
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let y_storage = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-        let norm_storage = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-
-        let size = out_shape.elem_count();
-        let x_dims = x.shape().dims();
-        let dim = x_dims[x_dims.len() - 1];
-
-        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::AddRmsNorm).to_vec();
-
-        // Bindings: x(0), residual(1), weight(2), y_out(3), norm_out(4).
-        let buffers = [
-            x_s.buffer,
-            r_s.buffer,
-            w_s.buffer,
-            y_storage.buffer,
-            norm_storage.buffer,
-        ];
-        let grid_x = size.div_ceil(256) as u32;
-
-        let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
-
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push)).map_err(
-            |e| {
-                Error::Backend(format!(
-                    "Vulkan fused_add_rms_norm GPU dispatch failed: {e}"
-                ))
-            },
-        )?;
-
-        Ok((
-            Box::new(y_storage),
-            Box::new(norm_storage),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
-    }
 
     fn softmax(
         &self,
@@ -2772,191 +2648,6 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
-    fn sage_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = q.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan sage_attention: q is not VulkanStorage".into())
-        })?;
-        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan sage_attention: k is not VulkanStorage".into())
-        })?;
-        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan sage_attention: v is not VulkanStorage".into())
-        })?;
-
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-
-        let q_dims = q.shape().dims();
-        let num_heads = q_dims[q_dims.len() - 2];
-        let head_dim = q_dims[q_dims.len() - 1];
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
-        let push = push_params(
-            num_heads as u32,
-            num_kv_heads as u32,
-            head_dim as u32,
-            kv_seq_len as u32,
-            64,
-            scale,
-        );
-
-        run_compute_shader_kernel(
-            ctx,
-            VulkanKernel::SageAttention,
-            &buffers,
-            num_heads as u32,
-            1,
-            1,
-            Some(&push),
-        )
-        .map_err(|e| Error::Backend(format!("Vulkan sage_attention dispatch failed: {e}")))?;
-
-        Ok((
-            Box::new(out_storage),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
-    }
-
-    fn fused_adamw_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        m: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        weight_decay: f32,
-        bc1: f32,
-        bc2: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let p_s = p
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: p is not VulkanStorage".into()))?;
-        let g_s = g
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: g is not VulkanStorage".into()))?;
-        let m_s = m
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: m is not VulkanStorage".into()))?;
-        let v_s = v
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: v is not VulkanStorage".into()))?;
-
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-
-        let buffers = [p_s.buffer, g_s.buffer, m_s.buffer, v_s.buffer];
-        let grid_x = total.div_ceil(256) as u32;
-
-        let push = [
-            total as u32,
-            lr.to_bits(),
-            beta1.to_bits(),
-            beta2.to_bits(),
-            eps.to_bits(),
-            weight_decay.to_bits(),
-            bc1.to_bits(),
-            bc2.to_bits(),
-        ];
-
-        run_compute_shader_kernel(
-            ctx,
-            VulkanKernel::FusedAdamw,
-            &buffers,
-            grid_x,
-            1,
-            1,
-            Some(&push),
-        )
-        .map_err(|e| Error::Backend(format!("Vulkan fused_adamw_step dispatch failed: {e}")))?;
-
-        Ok(Box::new(grim_tensor::backend::ReadyHandle))
-    }
-
-    fn fused_lion_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        exp_avg: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        weight_decay: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let p_s = p
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan fused_lion: p is not VulkanStorage".into()))?;
-        let g_s = g
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan fused_lion: g is not VulkanStorage".into()))?;
-        let m_s = exp_avg
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| {
-                Error::Backend("Vulkan fused_lion: exp_avg is not VulkanStorage".into())
-            })?;
-
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-
-        let buffers = [p_s.buffer, g_s.buffer, m_s.buffer];
-        let grid_x = total.div_ceil(256) as u32;
-
-        let push = [
-            total as u32,
-            lr.to_bits(),
-            beta1.to_bits(),
-            beta2.to_bits(),
-            weight_decay.to_bits(),
-            0,
-            0,
-            0,
-        ];
-
-        run_compute_shader_kernel(
-            ctx,
-            VulkanKernel::FusedLion,
-            &buffers,
-            grid_x,
-            1,
-            1,
-            Some(&push),
-        )
-        .map_err(|e| Error::Backend(format!("Vulkan fused_lion_step dispatch failed: {e}")))?;
-
-        Ok(Box::new(grim_tensor::backend::ReadyHandle))
-    }
 
     fn embedding(
         &self,
@@ -3034,6 +2725,7 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+
     fn from_cpu(
         &self,
         data: &[f32],
@@ -3084,6 +2776,7 @@ impl BackendDevice for VulkanDevice {
         Ok(Box::new(storage))
     }
 
+
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -3092,6 +2785,185 @@ impl BackendDevice for VulkanDevice {
         // Vulkan backend: MemAdvice is currently a no-op
         Ok(())
     }
+}
+
+impl ElementwiseOps for VulkanDevice {
+
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan mul_scalar x is not VulkanStorage".into()))?;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::MulScalar).to_vec();
+        let buffers = [x_s.buffer, out_storage.buffer];
+        let n = out_shape.elem_count();
+        let grid_x = n.div_ceil(256) as u32;
+
+        let push = push_params(n as u32, 0, 0, 0, 0, scalar);
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan sqrt x is not VulkanStorage".into()))?;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Sqrt).to_vec();
+        let buffers = [x_s.buffer, out_storage.buffer];
+        let n = out_shape.elem_count();
+        let grid_x = n.div_ceil(256) as u32;
+
+        let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan recip x is not VulkanStorage".into()))?;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Recip).to_vec();
+        let buffers = [x_s.buffer, out_storage.buffer];
+        let n = out_shape.elem_count();
+        let grid_x = n.div_ceil(256) as u32;
+
+        let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+}
+
+impl SamplingOps for VulkanDevice {
+}
+
+impl AttentionOps for VulkanDevice {
+
+
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = q.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan sage_attention: q is not VulkanStorage".into())
+        })?;
+        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan sage_attention: k is not VulkanStorage".into())
+        })?;
+        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan sage_attention: v is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let q_dims = q.shape().dims();
+        let num_heads = q_dims[q_dims.len() - 2];
+        let head_dim = q_dims[q_dims.len() - 1];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
+        let push = push_params(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            kv_seq_len as u32,
+            64,
+            scale,
+        );
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::SageAttention,
+            &buffers,
+            num_heads as u32,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan sage_attention dispatch failed: {e}")))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
 
     fn qkv_attention(
         &self,
@@ -3123,6 +2995,7 @@ impl BackendDevice for VulkanDevice {
             window,
         )
     }
+
 
     fn qkv_attention_paged(
         &self,
@@ -3237,6 +3110,7 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+
     fn tree_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3322,6 +3196,7 @@ impl BackendDevice for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
+
 
     fn kv_dequant_attention(
         &self,
@@ -3417,108 +3292,6 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
-    fn mul_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan mul_scalar x is not VulkanStorage".into()))?;
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-
-        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::MulScalar).to_vec();
-        let buffers = [x_s.buffer, out_storage.buffer];
-        let n = out_shape.elem_count();
-        let grid_x = n.div_ceil(256) as u32;
-
-        let push = push_params(n as u32, 0, 0, 0, 0, scalar);
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
-
-        Ok((
-            Box::new(out_storage),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
-    }
-
-    fn sqrt(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan sqrt x is not VulkanStorage".into()))?;
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-
-        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Sqrt).to_vec();
-        let buffers = [x_s.buffer, out_storage.buffer];
-        let n = out_shape.elem_count();
-        let grid_x = n.div_ceil(256) as u32;
-
-        let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
-
-        Ok((
-            Box::new(out_storage),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
-    }
-
-    fn recip(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan recip x is not VulkanStorage".into()))?;
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_device_local_gpu(
-            out_shape,
-            DType::F32,
-            ctx.device,
-            ctx.physical_device,
-        )?;
-
-        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Recip).to_vec();
-        let buffers = [x_s.buffer, out_storage.buffer];
-        let n = out_shape.elem_count();
-        let grid_x = n.div_ceil(256) as u32;
-
-        let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
-
-        Ok((
-            Box::new(out_storage),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
-    }
 
     fn rope(
         &self,
@@ -3655,6 +3428,7 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+
     fn rerope(
         &self,
         k: &dyn BackendStorage,
@@ -3784,105 +3558,6 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
-    fn from_cpu_bytes(
-        &self,
-        data: &[u8],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        let ctx_guard = global_context();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
-
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        let res = unsafe {
-            vkMapMemory(
-                ctx.device,
-                storage.memory,
-                0,
-                storage.bytes as VkDeviceSize,
-                0,
-                &mut mapped,
-            )
-        };
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "vkMapMemory failed in from_cpu_bytes: {}",
-                res
-            )));
-        }
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped as *mut u8, data.len());
-            vkUnmapMemory(ctx.device, storage.memory);
-        }
-
-        Ok(Box::new(storage))
-    }
-
-    fn selective_scan(
-        &self,
-        x: &dyn BackendStorage,
-        a: &dyn BackendStorage,
-        b: &dyn BackendStorage,
-        c: &dyn BackendStorage,
-        d: &dyn BackendStorage,
-        _state: &dyn BackendStorage,
-        batch: usize,
-        dim_dstate: usize,
-        dim_dinner: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
-        tracing::warn!("Vulkan selective_scan: falling back to CPU execution");
-        let x_v = x.to_cpu_vec_f32()?;
-        let a_v = a.to_cpu_vec_f32()?;
-        let b_v = b.to_cpu_vec_f32()?;
-        let c_v = c.to_cpu_vec_f32()?;
-        let d_v = d.to_cpu_vec_f32()?;
-
-        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
-        for b_idx in 0..batch {
-            for d_idx in 0..dim_dinner {
-                let mut h = vec![0.0f32; dim_dstate];
-                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
-
-                for t in 0..seq_len {
-                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
-                    let x_t = x_v[x_idx];
-                    let mut y_t = d_val * x_t;
-
-                    for (s, h_s) in h.iter_mut().enumerate() {
-                        let a_idx = d_idx * dim_dstate + s;
-                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
-                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
-
-                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
-                        let b_val = if b_v.len() > b_idx_off {
-                            b_v[b_idx_off]
-                        } else {
-                            1.0
-                        };
-                        let c_val = if c_v.len() > c_idx_off {
-                            c_v[c_idx_off]
-                        } else {
-                            1.0
-                        };
-
-                        *h_s = a_val * *h_s + x_t * b_val;
-                        y_t += c_val * *h_s;
-                    }
-                    out[x_idx] = y_t;
-                }
-            }
-        }
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(VulkanHandle)))
-    }
 
     fn flash_attention(
         &self,
@@ -3935,6 +3610,7 @@ impl BackendDevice for VulkanDevice {
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
+
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3964,98 +3640,282 @@ impl BackendDevice for VulkanDevice {
         )?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
+}
 
-    fn rwkv_time_mix(
+impl FusionOps for VulkanDevice {
+
+
+    /// Fused Add + RMSNorm: `y_out = x + residual`, `norm_out = rms_norm(y_out, w, eps)`.
+    /// Returns `(y_out, norm_out, compute_handle)`. Overrides the trait default with the real
+    /// fused `grim_add_rms_norm` SPIR-V pipeline — mirrors ROCm (HIP) and Metal (MSL) 1:1.
+    fn fused_add_rms_norm(
         &self,
         x: &dyn BackendStorage,
-        w: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan fused_add_rms_norm: x is not VulkanStorage".into())
+        })?;
+        let r_s = residual
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan fused_add_rms_norm: residual is not VulkanStorage".into())
+            })?;
+        let w_s = weight
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan fused_add_rms_norm: weight is not VulkanStorage".into())
+            })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let y_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let norm_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let size = out_shape.elem_count();
+        let x_dims = x.shape().dims();
+        let dim = x_dims[x_dims.len() - 1];
+
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::AddRmsNorm).to_vec();
+
+        // Bindings: x(0), residual(1), weight(2), y_out(3), norm_out(4).
+        let buffers = [
+            x_s.buffer,
+            r_s.buffer,
+            w_s.buffer,
+            y_storage.buffer,
+            norm_storage.buffer,
+        ];
+        let grid_x = size.div_ceil(256) as u32;
+
+        let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
+
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push)).map_err(
+            |e| {
+                Error::Backend(format!(
+                    "Vulkan fused_add_rms_norm GPU dispatch failed: {e}"
+                ))
+            },
+        )?;
+
+        Ok((
+            Box::new(y_storage),
+            Box::new(norm_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+}
+
+impl AutogradOps for VulkanDevice {
+
+
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
         g: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        seq_len: usize,
+        dw: &dyn BackendStorage,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
-        tracing::warn!("Vulkan rwkv_time_mix: falling back to CPU execution");
-        let x_vec = x.to_cpu_vec_f32()?;
-        let k_vec = k.to_cpu_vec_f32()?;
-        let v_vec = v.to_cpu_vec_f32()?;
-        let g_vec = g.to_cpu_vec_f32()?;
-        let w_vec = w.to_cpu_vec_f32()?;
-
-        let mut out = vec![0.0f32; batch * seq_len * dim];
-        for b in 0..batch {
-            for d in 0..dim {
-                let mut state = 0.0f32;
-                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
-
-                for t in 0..seq_len {
-                    let idx = (b * seq_len + t) * dim + d;
-                    let k_t = if k_vec.len() > idx {
-                        k_vec[idx]
-                    } else {
-                        x_vec[idx]
-                    };
-                    let v_t = if v_vec.len() > idx {
-                        v_vec[idx]
-                    } else {
-                        x_vec[idx]
-                    };
-                    let g_t = if g_vec.len() > idx {
-                        g_vec[idx]
-                    } else {
-                        1.0f32
-                    };
-
-                    state = w_val * state + k_t * v_t;
-                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
-                    out[idx] = state * sig;
-                }
-            }
-        }
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(VulkanHandle)))
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let e_s = e.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul_backward e is not VulkanStorage".into())
+        })?;
+        let g_s = g.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul_backward g is not VulkanStorage".into())
+        })?;
+        let dw_s = dw.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul_backward dw is not VulkanStorage".into())
+        })?;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let df = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let de = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let buffers = [e_s.buffer, g_s.buffer, dw_s.buffer, df.buffer, de.buffer];
+        let push = push_params(out_shape.elem_count() as u32, 0, 0, 0, 0, 0.0);
+        run_compute_shader(
+            ctx,
+            spirv_for(VulkanKernel::SiluMulBackward),
+            &buffers,
+            out_shape.elem_count().div_ceil(256) as u32,
+            1,
+            1,
+            Some(&push),
+        )?;
+        Ok((
+            Box::new(df),
+            Box::new(de),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
+}
 
-    fn rwkv_channel_mix(
+impl OptimizerOps for VulkanDevice {
+
+
+    fn fused_adamw_step(
         &self,
-        x: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        r: &dyn BackendStorage,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
         v: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
-        tracing::warn!("Vulkan rwkv_channel_mix: falling back to CPU execution");
-        let x_vec = x.to_cpu_vec_f32()?;
-        let k_vec = k.to_cpu_vec_f32()?;
-        let r_vec = r.to_cpu_vec_f32()?;
-        let v_vec = v.to_cpu_vec_f32()?;
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = p
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: p is not VulkanStorage".into()))?;
+        let g_s = g
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: g is not VulkanStorage".into()))?;
+        let m_s = m
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: m is not VulkanStorage".into()))?;
+        let v_s = v
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_adamw: v is not VulkanStorage".into()))?;
 
-        let elem_count = out_shape.elem_count();
-        let mut out = vec![0.0f32; elem_count];
-        for i in 0..elem_count {
-            let x_val = x_vec[i];
-            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
-            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
-            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
-            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
-            let relu_k = k_val.max(0.0f32);
-            out[i] = sig_r * (relu_k * relu_k) * v_val;
-        }
+        let buffers = [p_s.buffer, g_s.buffer, m_s.buffer, v_s.buffer];
+        let grid_x = total.div_ceil(256) as u32;
 
-        let _ = batch;
-        let _ = dim;
+        let push = [
+            total as u32,
+            lr.to_bits(),
+            beta1.to_bits(),
+            beta2.to_bits(),
+            eps.to_bits(),
+            weight_decay.to_bits(),
+            bc1.to_bits(),
+            bc2.to_bits(),
+        ];
 
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(VulkanHandle)))
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::FusedAdamw,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan fused_adamw_step dispatch failed: {e}")))?;
+
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
+
+
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = p
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_lion: p is not VulkanStorage".into()))?;
+        let g_s = g
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan fused_lion: g is not VulkanStorage".into()))?;
+        let m_s = exp_avg
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan fused_lion: exp_avg is not VulkanStorage".into())
+            })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let buffers = [p_s.buffer, g_s.buffer, m_s.buffer];
+        let grid_x = total.div_ceil(256) as u32;
+
+        let push = [
+            total as u32,
+            lr.to_bits(),
+            beta1.to_bits(),
+            beta2.to_bits(),
+            weight_decay.to_bits(),
+            0,
+            0,
+            0,
+        ];
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::FusedLion,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan fused_lion_step dispatch failed: {e}")))?;
+
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+}
+
+impl QuantOps for VulkanDevice {
+
 
     fn quantized_matmul(
         &self,
@@ -4273,6 +4133,7 @@ impl BackendDevice for VulkanDevice {
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
+
     fn quantize(
         &self,
         x: &dyn BackendStorage,
@@ -4281,6 +4142,7 @@ impl BackendDevice for VulkanDevice {
         let (out, _handle) = self.quantize_on_device(x, format)?;
         Ok(out)
     }
+
 
     fn fused_quant_gemm(
         &self,
@@ -4336,6 +4198,7 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader_kernel(ctx, kernel, &buffers, grid_x, grid_y, 1, Some(&push))?;
         Ok((Box::new(out_storage), Box::new(VulkanHandle)))
     }
+
 
     fn quantized_matmul_backward_dx(
         &self,
@@ -4552,6 +4415,170 @@ impl BackendDevice for VulkanDevice {
 
         Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
     }
+}
+
+impl RecurrentOps for VulkanDevice {
+
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        _state: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
+        tracing::warn!("Vulkan selective_scan: falling back to CPU execution");
+        let x_v = x.to_cpu_vec_f32()?;
+        let a_v = a.to_cpu_vec_f32()?;
+        let b_v = b.to_cpu_vec_f32()?;
+        let c_v = c.to_cpu_vec_f32()?;
+        let d_v = d.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
+        for b_idx in 0..batch {
+            for d_idx in 0..dim_dinner {
+                let mut h = vec![0.0f32; dim_dstate];
+                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
+
+                for t in 0..seq_len {
+                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
+                    let x_t = x_v[x_idx];
+                    let mut y_t = d_val * x_t;
+
+                    for (s, h_s) in h.iter_mut().enumerate() {
+                        let a_idx = d_idx * dim_dstate + s;
+                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+
+                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off {
+                            b_v[b_idx_off]
+                        } else {
+                            1.0
+                        };
+                        let c_val = if c_v.len() > c_idx_off {
+                            c_v[c_idx_off]
+                        } else {
+                            1.0
+                        };
+
+                        *h_s = a_val * *h_s + x_t * b_val;
+                        y_t += c_val * *h_s;
+                    }
+                    out[x_idx] = y_t;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(VulkanHandle)))
+    }
+
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
+        tracing::warn!("Vulkan rwkv_time_mix: falling back to CPU execution");
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let w_vec = w.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim];
+        for b in 0..batch {
+            for d in 0..dim {
+                let mut state = 0.0f32;
+                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
+
+                for t in 0..seq_len {
+                    let idx = (b * seq_len + t) * dim + d;
+                    let k_t = if k_vec.len() > idx {
+                        k_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let v_t = if v_vec.len() > idx {
+                        v_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let g_t = if g_vec.len() > idx {
+                        g_vec[idx]
+                    } else {
+                        1.0f32
+                    };
+
+                    state = w_val * state + k_t * v_t;
+                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
+                    out[idx] = state * sig;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(VulkanHandle)))
+    }
+
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
+        tracing::warn!("Vulkan rwkv_channel_mix: falling back to CPU execution");
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let r_vec = r.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+
+        let elem_count = out_shape.elem_count();
+        let mut out = vec![0.0f32; elem_count];
+        for i in 0..elem_count {
+            let x_val = x_vec[i];
+            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
+            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
+            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+
+            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
+            let relu_k = k_val.max(0.0f32);
+            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        }
+
+        let _ = batch;
+        let _ = dim;
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(VulkanHandle)))
+    }
+}
+
+impl CollectiveOps for VulkanDevice {
+
 
     fn all_reduce(
         &self,
@@ -4674,6 +4701,7 @@ impl BackendDevice for VulkanDevice {
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
+
     fn comm_fuse_reduce(
         &self,
         partials: &[(&dyn BackendStorage, &ScythePlacement)],
@@ -4792,6 +4820,54 @@ impl BackendDevice for VulkanDevice {
         Ok(storage)
     }
 }
+
+impl MemoryOps for VulkanDevice {
+
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
+
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        let res = unsafe {
+            vkMapMemory(
+                ctx.device,
+                storage.memory,
+                0,
+                storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            )
+        };
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "vkMapMemory failed in from_cpu_bytes: {}",
+                res
+            )));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped as *mut u8, data.len());
+            vkUnmapMemory(ctx.device, storage.memory);
+        }
+
+        Ok(Box::new(storage))
+    }
+}
+
+impl GraphCaptureOps for VulkanDevice {
+}
+
+impl grim_tensor::BackendDevice for VulkanDevice {}
+
 
 include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
 

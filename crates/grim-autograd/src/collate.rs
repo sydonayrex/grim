@@ -5,7 +5,7 @@
 //! training path for long context fine-tuning.
 
 use grim_tensor::{
-    BackendDevice, DType, Shape, Tensor,
+    CoreTensorOps, DType, Shape, Tensor,
     error::{Error, Result},
 };
 use std::sync::Arc;

@@ -1,9 +1,9 @@
 //! Integration test for VulkanHugePageBuffer.
 
 use grim_backend_vulkan::{VulkanDevice, VulkanHugePageBuffer};
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
+use grim_tensor::CoreTensorOps;
 
 #[test]
 fn test_vulkan_hugepage_buffer_allocation_and_dma_roundtrip() {

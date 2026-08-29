@@ -25,7 +25,7 @@
 //! benchmarked and persisted to `.autotune_cache/gfx1036.json` (8 843 bytes).
 //! `CharonSelector` consumed the measured `VariantRow` table without error.
 
-use grim_tensor::BackendDevice;
+use grim_tensor::CoreTensorOps;
 use std::time::Instant;
 
 use grim_backend_rocm::autotune::{AutotuneConfig, Autotuner, MoeKernelKey, quantize_routing_skew};

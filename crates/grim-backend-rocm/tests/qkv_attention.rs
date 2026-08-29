@@ -23,8 +23,8 @@
 //!   but the .hipfb binary is not registered for these test shapes on this RDNA4 box.
 //!   10 CPU-reference and structural tests pass.
 
-use grim_backend_rocm::{QkvAttentionFusionConfig, RocmDevice};
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_backend_rocm::{AttentionOps, CoreTensorOps, QkvAttentionFusionConfig, RocmDevice};
+use grim_tensor::{DType, Shape};
 
 /// Pure-Rust reference implementation of causal GQA attention.
 ///

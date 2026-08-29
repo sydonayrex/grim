@@ -28,9 +28,7 @@ use grim_backend_rocm::rccl::CollectiveConfig;
 #[cfg(not(feature = "rccl"))]
 use grim_backend_rocm::rccl::{UniqueId, p2p_memcpy_async};
 #[cfg(feature = "rccl")]
-use grim_tensor::backend::BackendDevice;
-#[cfg(feature = "rccl")]
-use grim_tensor::{DType, Shape};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;

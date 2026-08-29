@@ -4,7 +4,9 @@
 use grim_backend_cpu::CpuDevice;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{DType, QuantFormat};
-use grim_tensor::{BackendDevice, BackendStorage, Shape};
+use grim_tensor::{
+    AttentionOps, BackendStorage, CoreTensorOps, FusionOps, Shape,
+};
 
 #[test]
 fn test_silu_mul_quantize_parity() {

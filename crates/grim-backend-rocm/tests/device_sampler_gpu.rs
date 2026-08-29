@@ -2,7 +2,7 @@
 //! against the analytic multinomial over the same logits. Env-gated per house
 //! rule — run on real hardware with `GRIM_RUN_GPU_TESTS=1`.
 
-use grim_backend_rocm::{BackendDevice, RocmDevice, Shape, as_rocm, sample_logits_on_device_at};
+use grim_backend_rocm::{CoreTensorOps, RocmDevice, Shape, as_rocm, sample_logits_on_device_at};
 use grim_tensor::DType;
 
 #[test]

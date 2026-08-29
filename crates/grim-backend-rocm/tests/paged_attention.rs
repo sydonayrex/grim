@@ -1,6 +1,7 @@
 use grim_backend_rocm::{BlockTableEntry, RocmDevice, launch_paged_attention};
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape};
 use std::sync::Arc;
+use grim_tensor::{CoreTensorOps};
 
 #[test]
 fn test_paged_attention_gpu_matches_reference() {

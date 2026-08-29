@@ -64,7 +64,7 @@ fn roc_device_exposes_tree_attention_method() {
             out_shape: &Shape,
         ) -> grim_tensor::Result<(
             Box<dyn grim_tensor::BackendStorage>,
-            Box<dyn grim_tensor::ComputeHandle>,
+            Box<dyn grim_backend_rocm::ComputeHandle>,
         )> = RocmDevice::tree_attention;
         let _ = _phantom;
     };

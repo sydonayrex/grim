@@ -14,7 +14,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::RocmDevice;
 use grim_nn::Linear;
 use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
-use grim_tensor::backend::BackendDevice;
+use grim_tensor::backend::{CoreTensorOps};
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
@@ -129,7 +129,7 @@ fn test_moe_ffn_forward_gpu_cpu_parity_and_device_residency() {
     let cpu_v = cpu_out.to_vec_f32().expect("CPU out to vec");
 
     // 2. GPU Device-Resident Forward
-    let dev_storage = BackendDevice::from_cpu(&dev, &x_data, &Shape::new(vec![BATCH, HIDDEN]), DType::F32)
+    let dev_storage = CoreTensorOps::from_cpu(&dev, &x_data, &Shape::new(vec![BATCH, HIDDEN]), DType::F32)
         .expect("upload activation to GPU");
     let x_gpu = Tensor::new(
         Arc::from(dev_storage),

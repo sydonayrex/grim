@@ -17,8 +17,8 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_engine::scythe2::ScytheRingExec;
-use grim_tensor::backend::{BackendDevice, BackendStorage};
-use grim_tensor::{DType, Shape};
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::{CoreTensorOps, DType, MemoryOps, Shape};
 
 fn gpu_ready() -> bool {
     if std::env::var("GRIM_GPU_TEST").as_deref() != Ok("1") {

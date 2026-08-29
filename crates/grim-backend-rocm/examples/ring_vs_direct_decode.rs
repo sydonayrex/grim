@@ -9,8 +9,7 @@
 //! (release build; the debug build's numbers are not meaningful)
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
-use grim_tensor::{DType, Shape};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 const DECODE_SHAPES: &[(usize, usize, usize)] = &[
     // (m, n, k) — dense-layer projections at decode batch sizes.

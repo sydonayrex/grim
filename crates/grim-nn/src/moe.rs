@@ -38,7 +38,9 @@ use grim_tensor::dtype::{
 };
 
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, BackendStorage, Device, Tensor};
+use grim_tensor::{BackendStorage, Device, Tensor,
+    CoreTensorOps,
+};
 use std::sync::Arc;
 
 use crate::modules::Linear;
@@ -1145,19 +1147,19 @@ impl RocmResidentWeights {
         }
 
         let dev = RocmDevice::try_new(ordinal)?;
-        let gate = Arc::from(BackendDevice::from_cpu(
+        let gate = Arc::from(CoreTensorOps::from_cpu(
             &dev,
             &gate_flat,
             &Shape::new(vec![gate_flat.len()]),
             DType::F32,
         )?);
-        let up = Arc::from(BackendDevice::from_cpu(
+        let up = Arc::from(CoreTensorOps::from_cpu(
             &dev,
             &up_flat,
             &Shape::new(vec![up_flat.len()]),
             DType::F32,
         )?);
-        let down = Arc::from(BackendDevice::from_cpu(
+        let down = Arc::from(CoreTensorOps::from_cpu(
             &dev,
             &down_flat,
             &Shape::new(vec![down_flat.len()]),
@@ -1933,19 +1935,19 @@ impl MoeFfn {
 
         let dev = MetalDevice::new(ordinal)?;
         let x_storage: &dyn BackendStorage = &**x.storage();
-        let gate_buf = BackendDevice::from_cpu(
+        let gate_buf = CoreTensorOps::from_cpu(
             &dev,
             &gate_flat,
             &Shape::new(vec![num_experts * inter * hidden]),
             DType::F32,
         )?;
-        let up_buf = BackendDevice::from_cpu(
+        let up_buf = CoreTensorOps::from_cpu(
             &dev,
             &up_flat,
             &Shape::new(vec![num_experts * inter * hidden]),
             DType::F32,
         )?;
-        let down_buf = BackendDevice::from_cpu(
+        let down_buf = CoreTensorOps::from_cpu(
             &dev,
             &down_flat,
             &Shape::new(vec![num_experts * hidden * inter]),
@@ -1953,10 +1955,10 @@ impl MoeFfn {
         )?;
         // Router arrays are f32-backed (the shader casts back to int).
         let tok_buf =
-            BackendDevice::from_cpu(&dev, &rtok, &Shape::new(vec![num_pairs]), DType::F32)?;
+            CoreTensorOps::from_cpu(&dev, &rtok, &Shape::new(vec![num_pairs]), DType::F32)?;
         let exp_buf =
-            BackendDevice::from_cpu(&dev, &rexp, &Shape::new(vec![num_pairs]), DType::F32)?;
-        let w_buf = BackendDevice::from_cpu(&dev, &rw, &Shape::new(vec![num_pairs]), DType::F32)?;
+            CoreTensorOps::from_cpu(&dev, &rexp, &Shape::new(vec![num_pairs]), DType::F32)?;
+        let w_buf = CoreTensorOps::from_cpu(&dev, &rw, &Shape::new(vec![num_pairs]), DType::F32)?;
 
         let out_shape = Shape::new(vec![batch, hidden]);
         let (out_storage, _handle) = dev.moe_fused_dispatch(

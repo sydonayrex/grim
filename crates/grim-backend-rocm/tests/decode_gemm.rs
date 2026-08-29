@@ -35,7 +35,9 @@
 use std::time::Instant;
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape,
+    CoreTensorOps,
+};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
@@ -91,10 +93,10 @@ fn run_decode_kernel(
     let a_shape = Shape::from_slice(&[m, k]);
     let b_shape = Shape::from_slice(&[k, n]);
     let out_shape = Shape::from_slice(&[m, n]);
-    let a_dev = BackendDevice::from_cpu(dev, a_data, &a_shape, DType::F16)?;
-    let b_dev = BackendDevice::from_cpu(dev, b_data, &b_shape, DType::F16)?;
+    let a_dev = CoreTensorOps::from_cpu(dev, a_data, &a_shape, DType::F16)?;
+    let b_dev = CoreTensorOps::from_cpu(dev, b_data, &b_shape, DType::F16)?;
     dev.set_decode_gemm_enabled(true);
-    let (out, handle) = BackendDevice::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (out, handle) = CoreTensorOps::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     handle.synchronize()?;
     dev.set_decode_gemm_enabled(false);
     Ok(out.as_ref().to_cpu_vec_f32()?)
@@ -113,9 +115,9 @@ fn try_rocblas(
     let a_shape = Shape::from_slice(&[m, k]);
     let b_shape = Shape::from_slice(&[k, n]);
     let out_shape = Shape::from_slice(&[m, n]);
-    let a_dev = BackendDevice::from_cpu(dev, a_data, &a_shape, DType::F16)?;
-    let b_dev = BackendDevice::from_cpu(dev, b_data, &b_shape, DType::F16)?;
-    let result = BackendDevice::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape);
+    let a_dev = CoreTensorOps::from_cpu(dev, a_data, &a_shape, DType::F16)?;
+    let b_dev = CoreTensorOps::from_cpu(dev, b_data, &b_shape, DType::F16)?;
+    let result = CoreTensorOps::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape);
     match result {
         Ok((out, handle)) => {
             handle.synchronize()?;
@@ -350,7 +352,7 @@ fn debug_decode_gemm_minimal() -> TestResult {
 
     // First: verify F16 round-trip works (upload + download without compute).
     let a_shape = Shape::from_slice(&[m, k]);
-    let a_gpu = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F16)?;
+    let a_gpu = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F16)?;
     let a_back = a_gpu.as_ref().to_cpu_vec_f32()?;
     let rt_diff = max_abs_diff(&a_data, &a_back);
     eprintln!("[debug] F16 round-trip max diff = {rt_diff:.e}");

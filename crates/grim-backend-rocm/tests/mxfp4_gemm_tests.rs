@@ -3,10 +3,11 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::{f32_to_mxfp4_e2m1, mxfp4_e2m1_to_f32};
 use grim_tensor::{
-    BackendDevice, Shape,
+    Shape,
     dtype::{ArithType, DType, FloatPackScheme, Storage},
 };
 use std::panic;
+use grim_tensor::{CoreTensorOps, MemoryOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -196,8 +197,8 @@ fn test_mxfp4_tiled_gemm_parity_against_cpu() -> TestResult {
     let b_shape = Shape::from_slice(&[n, k]);
     let exps_shape = Shape::from_slice(&[num_blocks]);
 
-    let a_dev = BackendDevice::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
-    let b_dev = BackendDevice::from_cpu_bytes(
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
+    let b_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &b_packed,
         &b_shape,
@@ -206,7 +207,7 @@ fn test_mxfp4_tiled_gemm_parity_against_cpu() -> TestResult {
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     )?;
-    let exps_dev = BackendDevice::from_cpu_bytes(
+    let exps_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &b_exps_u8,
         &exps_shape,
@@ -217,7 +218,7 @@ fn test_mxfp4_tiled_gemm_parity_against_cpu() -> TestResult {
     )?;
 
     let out_shape = Shape::from_slice(&[m, n]);
-    let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::F32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::F32)?;
 
     let a_s = grim_backend_rocm::device::util::as_rocm(a_dev.as_ref())?;
     let b_s = grim_backend_rocm::device::util::as_rocm(b_dev.as_ref())?;
@@ -305,9 +306,9 @@ fn test_fused_rmsnorm_mxfp4_gemm_parity_against_cpu() -> TestResult {
     let w_shape = Shape::from_slice(&[n, k]);
     let exps_shape = Shape::from_slice(&[num_blocks]);
 
-    let x_dev = BackendDevice::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
-    let gamma_dev = BackendDevice::from_cpu(&dev, &gamma_data, &gamma_shape, DType::F32)?;
-    let w_dev = BackendDevice::from_cpu_bytes(
+    let x_dev = CoreTensorOps::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
+    let gamma_dev = CoreTensorOps::from_cpu(&dev, &gamma_data, &gamma_shape, DType::F32)?;
+    let w_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_packed,
         &w_shape,
@@ -316,7 +317,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_parity_against_cpu() -> TestResult {
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     )?;
-    let exps_dev = BackendDevice::from_cpu_bytes(
+    let exps_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
@@ -465,9 +466,9 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
     let kv_cache_shape = Shape::from_slice(&[max_seq_len, n_k]);
     let pos_shape = Shape::from_slice(&[m]);
 
-    let x_dev = BackendDevice::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
-    let gamma_dev = BackendDevice::from_cpu(&dev, &gamma_data, &gamma_shape, DType::F32)?;
-    let w_dev = BackendDevice::from_cpu_bytes(
+    let x_dev = CoreTensorOps::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
+    let gamma_dev = CoreTensorOps::from_cpu(&dev, &gamma_data, &gamma_shape, DType::F32)?;
+    let w_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_packed,
         &w_shape,
@@ -476,7 +477,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     )?;
-    let exps_dev = BackendDevice::from_cpu_bytes(
+    let exps_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
@@ -486,11 +487,11 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
         },
     )?;
     let pos_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
-    let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
-    let k_cache_dev = BackendDevice::zeros(&dev, &kv_cache_shape, DType::F32)?;
-    let v_cache_dev = BackendDevice::zeros(&dev, &kv_cache_shape, DType::F32)?;
+    let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
+    let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_cache_shape, DType::F32)?;
+    let v_cache_dev = CoreTensorOps::zeros(&dev, &kv_cache_shape, DType::F32)?;
 
     let handle = dev.fused_rmsnorm_mxfp4_gemm_rope_kv(
         x_dev.as_ref(),
@@ -693,9 +694,9 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
     let kv_cache_shape = Shape::from_slice(&[max_seq_len, n_k]);
     let pos_shape = Shape::from_slice(&[m]);
 
-    let x_dev = BackendDevice::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
-    let gamma_dev = BackendDevice::from_cpu(&dev, &gamma_data, &gamma_shape, DType::F32)?;
-    let w_dev = BackendDevice::from_cpu_bytes(
+    let x_dev = CoreTensorOps::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
+    let gamma_dev = CoreTensorOps::from_cpu(&dev, &gamma_data, &gamma_shape, DType::F32)?;
+    let w_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_packed,
         &w_shape,
@@ -704,7 +705,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     )?;
-    let exps_dev = BackendDevice::from_cpu_bytes(
+    let exps_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
@@ -713,13 +714,13 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
             storage: Storage::Native,
         },
     )?;
-    let inv_freq_dev = BackendDevice::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
+    let inv_freq_dev = CoreTensorOps::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
     let pos_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
-    let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
-    let k_cache_dev = BackendDevice::zeros(&dev, &kv_cache_shape, DType::F32)?;
-    let v_cache_dev = BackendDevice::zeros(&dev, &kv_cache_shape, DType::F32)?;
+    let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
+    let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_cache_shape, DType::F32)?;
+    let v_cache_dev = CoreTensorOps::zeros(&dev, &kv_cache_shape, DType::F32)?;
 
     let handle = dev.fused_rmsnorm_mxfp4_gemm_rope_kv(
         x_dev.as_ref(),
@@ -902,9 +903,9 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
     let kv_shape = Shape::from_slice(&[max_seq_len, n_k]);
     let pos_shape = Shape::from_slice(&[m]);
 
-    let x_dev = BackendDevice::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
-    let gamma_dev = BackendDevice::from_cpu(&dev, &gamma_qk, &gamma_shape, DType::F32)?;
-    let w_dev = BackendDevice::from_cpu_bytes(
+    let x_dev = CoreTensorOps::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
+    let gamma_dev = CoreTensorOps::from_cpu(&dev, &gamma_qk, &gamma_shape, DType::F32)?;
+    let w_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_packed,
         &w_shape,
@@ -913,7 +914,7 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     )?;
-    let exps_dev = BackendDevice::from_cpu_bytes(
+    let exps_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
@@ -923,11 +924,11 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
         },
     )?;
     let pos_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
-    let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
-    let k_cache_dev = BackendDevice::zeros(&dev, &kv_shape, DType::F32)?;
-    let v_cache_dev = BackendDevice::zeros(&dev, &kv_shape, DType::F32)?;
+    let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
+    let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_shape, DType::F32)?;
+    let v_cache_dev = CoreTensorOps::zeros(&dev, &kv_shape, DType::F32)?;
 
     let handle = dev.fused_mxfp4_gemm_qk_norm_rope_kv(
         x_dev.as_ref(),
@@ -1125,10 +1126,10 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
     let kv_shape = Shape::from_slice(&[max_seq_len, n_k]);
     let pos_shape = Shape::from_slice(&[m]);
 
-    let x_dev = BackendDevice::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
-    let gamma_q_dev = BackendDevice::from_cpu(&dev, &gamma_q, &gamma_shape, DType::F32)?;
-    let gamma_k_dev = BackendDevice::from_cpu(&dev, &gamma_k, &gamma_shape, DType::F32)?;
-    let w_dev = BackendDevice::from_cpu_bytes(
+    let x_dev = CoreTensorOps::from_cpu(&dev, &x_data, &x_shape, DType::F32)?;
+    let gamma_q_dev = CoreTensorOps::from_cpu(&dev, &gamma_q, &gamma_shape, DType::F32)?;
+    let gamma_k_dev = CoreTensorOps::from_cpu(&dev, &gamma_k, &gamma_shape, DType::F32)?;
+    let w_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_packed,
         &w_shape,
@@ -1137,7 +1138,7 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     )?;
-    let exps_dev = BackendDevice::from_cpu_bytes(
+    let exps_dev = MemoryOps::from_cpu_bytes(
         &dev,
         &w_exps,
         &exps_shape,
@@ -1146,13 +1147,13 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
             storage: Storage::Native,
         },
     )?;
-    let inv_freq_dev = BackendDevice::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
+    let inv_freq_dev = CoreTensorOps::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
     let pos_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
-    let q_out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
-    let k_cache_dev = BackendDevice::zeros(&dev, &kv_shape, DType::F32)?;
-    let v_cache_dev = BackendDevice::zeros(&dev, &kv_shape, DType::F32)?;
+    let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
+    let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_shape, DType::F32)?;
+    let v_cache_dev = CoreTensorOps::zeros(&dev, &kv_shape, DType::F32)?;
 
     let handle = dev.fused_mxfp4_gemm_qk_norm_rope_kv(
         x_dev.as_ref(),
