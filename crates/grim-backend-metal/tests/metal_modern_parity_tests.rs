@@ -25,6 +25,8 @@ fn test_metal_msl_kernels_present() {
         "grim_softmax_merge",
         "grim_qkv_attention_paged_dequant",
         "grim_speculative_acceptor",
+        "grim_fused_dequant_gemm_q4k",
+        "grim_fused_dequant_gemm_fp8",
     ];
 
     for kernel in required_kernels {

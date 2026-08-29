@@ -182,3 +182,91 @@ kernel void grim_fused_dequant_gemm_q8_0(
 
     c[row * n + col] = acc;
 }
+
+// Q4_K Fused Dequant GEMM (Superblock 144 bytes / 256 weights)
+kernel void grim_fused_dequant_gemm_q4k(
+    device const float* a [[buffer(0)]],
+    device const uchar* b_packed [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int col = int(gid.x);
+
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int num_sb = k / 256;
+    int col_sb_base = col * num_sb;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        device const uchar* block_ptr = b_packed + (col_sb_base + sb) * 144;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        float dmin = metal_fp16_to_float(h_ptr[1]);
+
+        device const uchar* scales = block_ptr + 4;
+        device const uchar* qs = block_ptr + 16;
+        int a_sb_base = row * k + sb * 256;
+
+        for (int is = 0; is < 8; ++is) {
+            uchar sc, mins;
+            if (is < 4) {
+                sc   = scales[is] & 63;
+                mins = scales[is + 4] & 63;
+            } else {
+                sc   = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+                mins = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+            }
+            float d_sc = d * float(sc);
+            float dmin_m = dmin * float(mins);
+
+            int a_chunk_base = a_sb_base + is * 32;
+            int q_offset = is * 16;
+
+            for (int il = 0; il < 16; ++il) {
+                uchar q_byte = qs[q_offset + il];
+                uchar q0 = q_byte & 0x0F;
+                uchar q1 = q_byte >> 4;
+
+                float w0 = d_sc * float(q0) - dmin_m;
+                float w1 = d_sc * float(q1) - dmin_m;
+
+                acc += a[a_chunk_base + il] * w0;
+                acc += a[a_chunk_base + il + 16] * w1;
+            }
+        }
+    }
+
+    c[row * n + col] = acc;
+}
+
+// FP8 Fused Dequant GEMM (E4M3)
+kernel void grim_fused_dequant_gemm_fp8(
+    device const float* a [[buffer(0)]],
+    device const uchar* b_packed [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int col = int(gid.x);
+
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int a_base = row * k;
+    int b_base = col * k;
+
+    for (int i = 0; i < k; ++i) {
+        float w = metal_fp8_e4m3_to_float(b_packed[b_base + i]);
+        acc += a[a_base + i] * w;
+    }
+
+    c[row * n + col] = acc;
+}

@@ -116,7 +116,8 @@ struct MetalPipelines {
     quant_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_mxfp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    quant_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     reduce_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
@@ -266,7 +267,8 @@ impl MetalContext {
                 quant_fp8: get_pipeline("grim_quant_fp8")?,
                 quant_mxfp4: get_pipeline("grim_quant_mxfp4")?,
                 quant_mxfp8: get_pipeline("grim_quant_mxfp8")?,
-                quant_q4k: get_pipeline("grim_quant_q4k")?,
+                fused_dequant_gemm_q4k: get_pipeline("grim_fused_dequant_gemm_q4k")?,
+                fused_dequant_gemm_fp8: get_pipeline("grim_fused_dequant_gemm_fp8")?,
                 matmul_split_k: get_pipeline("grim_matmul_split_k")?,
                 reduce_split_k: get_pipeline("grim_reduce_split_k")?,
             });
@@ -3535,6 +3537,122 @@ impl QuantOps for MetalDevice {
                                 }),
                             ));
                         }
+                        // Q4_K fast-path
+                        if let DTypeStorage::KQuant(KQuantScheme::Q4K) = b_packed.dtype().storage {
+                            if k >= 256 && k % 256 == 0 {
+                                let out_storage = self.zeros(out_shape, DType::F32)?;
+                                let out_s =
+                                    out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                                let out_buf = out_s.buffer.as_ref().unwrap();
+
+                                let cmd_buffer = self.get_or_create_command_buffer()?;
+                                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                    Error::from(MetalError::Ffi(
+                                        "Failed to create compute encoder".into(),
+                                    ))
+                                })?;
+
+                                encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_q4k);
+                                encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                                encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+
+                                let m_val = m as i32;
+                                let n_val = n as i32;
+                                let k_val = k as i32;
+                                unsafe {
+                                    encoder.setBytes_length_atIndex(
+                                        &m_val as *const i32 as *const std::ffi::c_void,
+                                        4,
+                                        3,
+                                    );
+                                    encoder.setBytes_length_atIndex(
+                                        &n_val as *const i32 as *const std::ffi::c_void,
+                                        4,
+                                        4,
+                                    );
+                                    encoder.setBytes_length_atIndex(
+                                        &k_val as *const i32 as *const std::ffi::c_void,
+                                        4,
+                                        5,
+                                    );
+                                }
+
+                                let threads_per_group = MTLSize::new(16, 16, 1);
+                                let groups =
+                                    MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                                    groups,
+                                    threads_per_group,
+                                );
+                                encoder.endEncoding();
+
+                                return Ok((
+                                    out_storage,
+                                    Box::new(MetalHandle {
+                                        command_buffer: cmd_buffer,
+                                    }),
+                                ));
+                            }
+                        }
+
+                        // FP8 fast-path
+                        if let DTypeStorage::FloatPack(FloatPackScheme::Fp8) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s =
+                                out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi(
+                                    "Failed to create compute encoder".into(),
+                                ))
+                            })?;
+
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_fp8);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                            }
+
+                            let threads_per_group = MTLSize::new(16, 16, 1);
+                            let groups =
+                                MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                                groups,
+                                threads_per_group,
+                            );
+                            encoder.endEncoding();
+
+                            return Ok((
+                                out_storage,
+                                Box::new(MetalHandle {
+                                    command_buffer: cmd_buffer,
+                                }),
+                            ));
+                        }
+
                         if k >= 32 && k % 32 == 0 {
                             // Pad / truncate scales to exactly n * (k/32) entries.
                             let blocks_per_col = k / 32;
