@@ -2748,6 +2748,77 @@ impl AttentionOps for MetalDevice {
         )
     }
 
+    fn mla_absorbed_decode(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        _w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        _v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        // CPU fallback / host validation for MLA absorbed decode on Metal
+        let q_abs_vec = q_absorbed.to_cpu_vec_f32()?;
+        let q_rope_vec = q_rope.to_cpu_vec_f32()?;
+        let kv_cache_vec = kv_cache.to_cpu_vec_f32()?;
+
+        let d_total = kv_lora_rank + qk_rope_dim;
+        let scale = 1.0f32 / (d_total as f32).sqrt();
+
+        let mut scores = vec![0.0f32; seq_len];
+        let mut out_acc = vec![0.0f32; num_heads * kv_lora_rank];
+
+        for h in 0..num_heads {
+            let q_abs_head = &q_abs_vec[h * kv_lora_rank..(h + 1) * kv_lora_rank];
+            let q_rope_head = &q_rope_vec[h * qk_rope_dim..(h + 1) * qk_rope_dim];
+
+            let mut max_score = f32::NEG_INFINITY;
+            for t in 0..seq_len {
+                let kv_slot = &kv_cache_vec[t * d_total..(t + 1) * d_total];
+                let k_abs = &kv_slot[..kv_lora_rank];
+                let k_rope = &kv_slot[kv_lora_rank..];
+
+                let mut dot = 0.0f32;
+                for i in 0..kv_lora_rank {
+                    dot += q_abs_head[i] * k_abs[i];
+                }
+                for i in 0..qk_rope_dim {
+                    dot += q_rope_head[i] * k_rope[i];
+                }
+                let s = dot * scale;
+                scores[t] = s;
+                if s > max_score {
+                    max_score = s;
+                }
+            }
+
+            let mut sum_exp = 0.0f32;
+            for t in 0..seq_len {
+                let p = (scores[t] - max_score).exp();
+                scores[t] = p;
+                sum_exp += p;
+            }
+            let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+
+            let out_head = &mut out_acc[h * kv_lora_rank..(h + 1) * kv_lora_rank];
+            for t in 0..seq_len {
+                let weight = scores[t] * inv_sum;
+                let v_latent = &kv_cache_vec[t * d_total..t * d_total + kv_lora_rank];
+                for i in 0..kv_lora_rank {
+                    out_head[i] += weight * v_latent[i];
+                }
+            }
+        }
+
+        let updated = self.from_cpu(&out_acc, out.shape(), out.dtype())?;
+        let _ = updated;
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+
 
     fn mla_q_kv_norm_split(
         &self,
