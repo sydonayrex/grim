@@ -2168,3 +2168,37 @@ kernel void grim_speculative_acceptor(
         accepted_lens[b] = accepted_count;
     }
 }
+
+// ---------------------------------------------------------------------------
+// SIMDgroup Matrix GEMM (Apple AMX / SIMD-matrix hardware acceleration)
+// ---------------------------------------------------------------------------
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 230)
+kernel void grim_matmul_simdgroup(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
+) {
+    simdgroup_half8x8 sg_a;
+    simdgroup_half8x8 sg_b;
+    simdgroup_half8x8 sg_c = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+
+    int row_start = (int(tg_id.y) * 4 + int(simd_group_id)) * 8;
+    int col_start = int(tg_id.x) * 8;
+
+    if (row_start >= m || col_start >= n) return;
+
+    for (int bk = 0; bk < k; bk += 8) {
+        simdgroup_load(sg_a, a + row_start * k + bk, k);
+        simdgroup_load(sg_b, b + bk * n + col_start, n);
+        simdgroup_multiply_accumulate(sg_c, sg_a, sg_b, sg_c);
+    }
+
+    simdgroup_store(sg_c, c + row_start * n + col_start, n);
+}
+#endif
