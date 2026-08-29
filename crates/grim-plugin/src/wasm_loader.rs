@@ -41,6 +41,8 @@ use std::sync::Arc;
 /// }
 /// ```
 pub const WIT_SAMPLER_INTERFACE: &str = include_str!("wit/sampler.wit");
+pub const WIT_TOKENIZER_INTERFACE: &str = include_str!("wit/tokenizer.wit");
+pub const WIT_PROCESSOR_INTERFACE: &str = include_str!("wit/processor.wit");
 
 /// Wrapper for a WASM-based sampler plugin.
 pub struct WasmSampler {

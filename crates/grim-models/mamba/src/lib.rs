@@ -298,6 +298,16 @@ impl MambaBlock {
         }
         let x_flat: Vec<f32> = xz[..self.d_inner].to_vec();
 
+        // Consistency with the GPU path (MOD-1): a missing `ssm_b` tensor
+        // zero-fills B at load, which silently turns the SSM into a
+        // zero-input recurrence. The GPU path refuses; the CPU path must
+        // refuse identically instead of degrading quietly.
+        if self.b_param.is_empty() {
+            return Err(Error::Unimplemented(
+                "Mamba step_block_cpu: b_param is empty; refusing to run with a zero B matrix".into(),
+            ));
+        }
+
         // MOD-3 fix: proper discretized SSM recurrence. The previous code used a
         // placeholder `xz_data[s] * (state.pos as f32 * 0.01)` term that has no
         // basis in the selective-scan math (it grew linearly with position and
@@ -604,5 +614,183 @@ mod audit_tests {
             "CausalLm::forward must thread SSM state across calls — a mismatch \
              means the session state was reset between calls"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Numeric reference tests (audit follow-up): the SSM recurrences were
+// previously tested only for boundedness/state-threading, never for value
+// correctness against an independent recomputation of the documented math.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod numeric_reference_tests {
+    use super::*;
+    use grim_core::rng::SimpleRng;
+
+    fn f64_matvec(w: &[f32], x: &[f64], out_dim: usize, in_dim: usize) -> Vec<f64> {
+        let mut out = vec![0.0f64; out_dim];
+        for i in 0..out_dim {
+            let mut acc = 0.0f64;
+            for j in 0..in_dim {
+                acc += w[i * in_dim + j] as f64 * x[j];
+            }
+            out[i] = acc;
+        }
+        out
+    }
+
+    fn f64_rmsnorm(x: &[f64], w: &[f32], eps: f32) -> Vec<f64> {
+        let mean_sq = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+        let inv = 1.0 / (mean_sq + eps as f64).sqrt();
+        x.iter()
+            .zip(w)
+            .map(|(&v, &wi)| v * inv * wi as f64)
+            .collect()
+    }
+
+    /// Mamba-1 selective scan (CPU path) vs an independent f64 recomputation
+    /// of the documented update h' = A·h + B·x, output = Σ_s h' + z·D,
+    /// threaded across TWO steps (so state carry is value-checked too).
+    #[test]
+    fn mamba1_scan_two_steps_match_f64_reference() {
+        let cfg = MambaConfig {
+            vocab_size: 64,
+            hidden_size: 8,
+            d_state: 4,
+            d_inner: 16,
+            d_conv: 4,
+            num_layers: 1,
+            conv_kernel: 4,
+            rms_norm_eps: 1e-5,
+        };
+        let model = Mamba::random(Device::Cpu, cfg.clone());
+        let block = &model.layers[0];
+        let eps = cfg.rms_norm_eps;
+        let w_in = block.in_proj.weight.to_vec_f32().unwrap();
+        let w_out = block.out_proj.weight.to_vec_f32().unwrap();
+        let w_norm = block.norm.weight.to_vec_f32().unwrap();
+
+        let mut state = MambaState::new(1, cfg.d_inner, cfg.d_state);
+        // Two different input tokens.
+        let inputs = [vec![0.3f32; 8], vec![-0.7f32; 8]];
+        let mut h: Vec<f64> = vec![0.0; cfg.d_inner * cfg.d_state];
+        let mut f64_inputs: Vec<Vec<f64>> = Vec::new();
+        let mut got_outputs: Vec<Vec<f32>> = Vec::new();
+        for x in &inputs {
+            let xt = cpu_tensor(x.clone(), Shape::new(vec![1, 8]));
+            got_outputs.push(block.step_block(&xt, &mut state).unwrap().to_vec_f32().unwrap());
+            f64_inputs.push(x.iter().map(|&v| v as f64).collect());
+        }
+
+        for (step, x64) in f64_inputs.iter().enumerate() {
+            let xn = f64_rmsnorm(x64, &w_norm, eps);
+            let xz = f64_matvec(&w_in, &xn, 2 * cfg.d_inner, cfg.hidden_size);
+            let x_scan = &xz[..cfg.d_inner];
+            let z = &xz[cfg.d_inner..];
+            for n in 0..cfg.d_inner {
+                for s in 0..cfg.d_state {
+                    let idx = n * cfg.d_state + s;
+                    h[idx] = block.a_log[idx] as f64 * h[idx]
+                        + block.b_param[idx] as f64 * x_scan[n];
+                }
+            }
+            let mut out = vec![0.0f64; cfg.d_inner];
+            for n in 0..cfg.d_inner {
+                out[n] = (0..cfg.d_state).map(|s| h[n * cfg.d_state + s]).sum::<f64>()
+                    + z[n] * block.d_param[n] as f64;
+            }
+            let res = f64_matvec(&w_out, &out, cfg.hidden_size, cfg.d_inner);
+            for (r, g) in res.iter().zip(&got_outputs[step]) {
+                assert!(
+                    (r - *g as f64).abs() < 1e-4,
+                    "step {step}: reference {r} vs impl {g}"
+                );
+            }
+        }
+        // And the state must NOT have been reset between steps (the second
+        // step's reference used the carried h) — implicitly proven by the
+        // step-1 comparison above.
+    }
+
+    /// Mamba-2 SSD recurrence vs an independent f64 recomputation:
+    /// decay = -exp(A_log)·softplus(dt_bias), h' = decay·h + dt·B·x,
+    /// y = Σ_s h'·C + D·x, gated by SiLU(z).
+    #[test]
+    fn mamba2_ssd_two_steps_match_f64_reference() {
+        use crate::mamba2::{Mamba2Block, Mamba2State};
+
+        let cfg = crate::configs::Mamba2Config {
+            vocab_size: 64,
+            hidden_size: 8,
+            d_state: 4,
+            d_inner: 8,
+            d_conv: 4,
+            num_heads: 2,
+            num_layers: 1,
+            rms_norm_eps: 1e-5,
+        };
+        let mut rng = SimpleRng::new(0xABCD_1234u64);
+        let block = Mamba2Block::random(&cfg, &mut rng);
+        let eps = cfg.rms_norm_eps;
+        let w_in = block.in_proj.weight.to_vec_f32().unwrap();
+        let w_out = block.out_proj.weight.to_vec_f32().unwrap();
+        let w_norm = block.norm.weight.to_vec_f32().unwrap();
+
+        let head_dim = cfg.d_inner / cfg.num_heads;
+        let group_state = 1 * cfg.d_state; // n_groups = 1
+        let mut state = Mamba2State::new(1, cfg.num_heads, cfg.d_state);
+        let inputs = [vec![0.4f32; 8], vec![-0.6f32; 8]];
+        let mut h: Vec<f64> = vec![0.0; cfg.num_heads * cfg.d_state];
+        let mut got_outputs: Vec<Vec<f32>> = Vec::new();
+        for x in &inputs {
+            let xt = cpu_tensor(x.clone(), Shape::new(vec![1, 8]));
+            got_outputs.push(block.step_block(&xt, &mut state).unwrap().to_vec_f32().unwrap());
+            let xn = f64_rmsnorm(&x.iter().map(|&v| v as f64).collect::<Vec<_>>(), &w_norm, eps);
+            let xzbc = f64_matvec(
+                &w_in,
+                &xn,
+                2 * cfg.d_inner + 2 * group_state,
+                cfg.hidden_size,
+            );
+            let x_scan = &xzbc[..cfg.d_inner];
+            let z = &xzbc[cfg.d_inner..2 * cfg.d_inner];
+            let b_flat = &xzbc[2 * cfg.d_inner..2 * cfg.d_inner + group_state];
+            let c_flat = &xzbc[2 * cfg.d_inner + group_state..];
+
+            let mut y = vec![0.0f64; cfg.d_inner];
+            for head in 0..cfg.num_heads {
+                let a = -(block.a_log[head] as f64).exp();
+                let dt_x = block.dt_bias[head] as f64;
+                let dt = if dt_x > 20.0 { dt_x } else { dt_x.exp().ln_1p() };
+                let decay = a * dt;
+                for s in 0..cfg.d_state {
+                    let mut acc = 0.0f64;
+                    for d in 0..head_dim {
+                        let x_idx = head * head_dim + d;
+                        let h_idx = head * cfg.d_state + s;
+                        let new_h =
+                            decay * h[h_idx] + dt * b_flat[s] as f64 * x_scan[x_idx];
+                        h[h_idx] = new_h;
+                        acc += new_h * c_flat[s] as f64;
+                    }
+                    for d in 0..head_dim {
+                        let x_idx = head * head_dim + d;
+                        y[x_idx] += acc + block.d_param[head] as f64 * x_scan[x_idx];
+                    }
+                }
+            }
+            // SiLU z-gate.
+            for (yi, &zi) in y.iter_mut().zip(z.iter()) {
+                *yi *= zi / (1.0 + (-zi).exp());
+            }
+            let res = f64_matvec(&w_out, &y, cfg.hidden_size, cfg.d_inner);
+            let got = got_outputs.last().unwrap();
+            for (r, g) in res.iter().zip(got) {
+                assert!((r - *g as f64).abs() < 1e-4, "reference {r} vs impl {g}");
+            }
+        }
+        // State must have been carried (both steps used the same h).
+        assert_eq!(state.pos, 2, "mamba2 state must advance once per step");
     }
 }

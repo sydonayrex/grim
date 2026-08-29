@@ -1,30 +1,20 @@
-/// WIT definition for processor plugins (§6.2).
-/// Covers moderation filters, PII redactors, grammar/constrained-decoding enforcers,
-/// and any other pre/post-processing plugin using incremental on-chunk validation.
-package grim:plugin@1.0.0;
+/// WIT (WebAssembly Interface Types) definition for pre/post-processor plugins.
+/// §6.1.1 — Canonical interface definition for WASM prompt/output processor plugins.
+
+package grim:plugin@0.1.0;
 
 interface processor {
-    enum verdict {
-        allow,      // pass the chunk through unchanged
-        transform,  // pass through a modified chunk
-        block,      // stop the stream here; emit no further chunks
-    }
+    // Get processor name
+    get-name: func() -> string;
 
-    record chunk-result {
-        verdict: verdict,
-        transformed: option<string>,
-        reason: option<string>,
-    }
+    // Pre-process input text or prompt templates
+    preprocess: func(input: string, context-json: string) -> result<string, string>;
 
-    record processor-config {
-        params: list<tuple<string, string>>,
-        fail-open: bool,
-    }
+    // Post-process generated output text
+    postprocess: func(output: string, context-json: string) -> result<string, string>;
 
-    resource processor {
-        constructor(config: processor-config);
-        on-chunk: func(text: string, window: list<string>) -> chunk-result;
-    }
+    // Memory usage query
+    memory-usage: func() -> u32;
 }
 
 world grim-processor {

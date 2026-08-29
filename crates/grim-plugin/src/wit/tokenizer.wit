@@ -1,13 +1,23 @@
-/// WIT definition for tokenizer plugins (§6.2).
-/// Minimal by design — encode/decode is the whole contract; vocab/merges
-/// live entirely in the plugin's own state.
-package grim:plugin@1.0.0;
+/// WIT (WebAssembly Interface Types) definition for tokenizer plugins.
+/// §6.1.1 — Canonical interface definition for WASM tokenizer plugins.
+
+package grim:plugin@0.1.0;
 
 interface tokenizer {
-    resource tokenizer {
-        encode: func(text: string) -> list<u32>;
-        decode: func(ids: list<u32>) -> string;
-    }
+    // Get tokenizer name
+    get-name: func() -> string;
+
+    // Encode text to token IDs
+    encode: func(text: string) -> result<list<u32>, string>;
+
+    // Decode token IDs to text
+    decode: func(tokens: list<u32>) -> result<string, string>;
+
+    // Get vocabulary size
+    vocab-size: func() -> u32;
+
+    // Memory usage query
+    memory-usage: func() -> u32;
 }
 
 world grim-tokenizer {

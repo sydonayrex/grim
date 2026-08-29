@@ -205,3 +205,90 @@ kernel void grim_tree_attention(
     }
     out[q_base + d] = running_sum > 0.0f ? acc / running_sum : 0.0f;
 }
+
+// ---------------------------------------------------------------------------
+// Fused Paged Dequant Attention (INT8 / FP16 quantized pages)
+// ---------------------------------------------------------------------------
+kernel void grim_qkv_attention_paged_dequant(
+    device const float* q_in [[buffer(0)]],
+    device const uint* block_table [[buffer(1)]],
+    device const char* k_pages_int8 [[buffer(2)]],
+    device const float* k_scales [[buffer(3)]],
+    device const char* v_pages_int8 [[buffer(4)]],
+    device const float* v_scales [[buffer(5)]],
+    device float* out [[buffer(6)]],
+    constant int& num_heads [[buffer(7)]],
+    constant int& num_kv_heads [[buffer(8)]],
+    constant int& head_dim [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& page_size [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    if (int(h) >= num_heads) return;
+
+    int gqa_ratio = num_heads / max(num_kv_heads, 1);
+    int kv_h = int(h) / max(gqa_ratio, 1);
+    int q_base = int(h) * head_dim;
+
+    threadgroup float s_scores[4096];
+
+    for (int j = 0; j < kv_seq_len; ++j) {
+        int block_idx = j / page_size;
+        int page_offset = j % page_size;
+        uint phys_block = block_table[block_idx];
+
+        int k_entry = (int(phys_block) * page_size + page_offset) * (num_kv_heads * head_dim) + kv_h * head_dim;
+        int scale_entry = (int(phys_block) * page_size + page_offset) * num_kv_heads + kv_h;
+        float ks = k_scales[scale_entry];
+
+        float dot = 0.0f;
+        for (int d = int(tid); d < head_dim; d += int(bdim)) {
+            float k_val = float(k_pages_int8[k_entry + d]) * ks;
+            dot += q_in[q_base + d] * k_val;
+        }
+
+        dot = simd_sum(dot);
+        if (tid == 0) {
+            s_scores[j] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float max_s = -1e20f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            if (s_scores[j] > max_s) max_s = s_scores[j];
+        }
+        float sum_e = 0.0f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            s_scores[j] = exp(s_scores[j] - max_s);
+            sum_e += s_scores[j];
+        }
+        float inv_sum = 1.0f / max(sum_e, 1e-8f);
+        for (int j = 0; j < kv_seq_len; ++j) {
+            s_scores[j] *= inv_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int out_base = int(h) * head_dim;
+    for (int d = int(tid); d < head_dim; d += int(bdim)) {
+        float acc = 0.0f;
+        for (int j = 0; j < kv_seq_len; ++j) {
+            int block_idx = j / page_size;
+            int page_offset = j % page_size;
+            uint phys_block = block_table[block_idx];
+
+            int v_entry = (int(phys_block) * page_size + page_offset) * (num_kv_heads * head_dim) + kv_h * head_dim;
+            int scale_entry = (int(phys_block) * page_size + page_offset) * num_kv_heads + kv_h;
+            float vs = v_scales[scale_entry];
+
+            float v_val = float(v_pages_int8[v_entry + d]) * vs;
+            acc += s_scores[j] * v_val;
+        }
+        out[out_base + d] = acc;
+    }
+}

@@ -4,7 +4,7 @@
 //! (linear attention) layers. MoE block utilizes 320 routed experts + 1 shared expert.
 
 use crate::{DeltaNetBase, DeltaNetBaseConfig};
-use grim_core::error::Result;
+use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
@@ -353,9 +353,12 @@ impl CausalLm for SolarOpen2 {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<LlamaLayerCache>>>())
-            .expect(
-                "SolarOpen2::forward: session.model_state must be Vec<Option<LlamaLayerCache>>",
-            );
+            .ok_or_else(|| {
+                Error::Session(
+                    "SolarOpen2::forward: session model_state must be Vec<Option<LlamaLayerCache>>"
+                        .into(),
+                )
+            })?;
 
         for (idx, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &pos_u32, None, Some(&mut caches[idx..idx + 1]), idx)?;

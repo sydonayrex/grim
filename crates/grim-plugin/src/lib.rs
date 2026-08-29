@@ -375,6 +375,10 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
     })
 }
 
+/// ABI version this engine's dylib loader speaks. A plugin manifest must
+/// match exactly to load through the dylib path.
+pub const ENGINE_ABI_VERSION: u32 = 1;
+
 /// Validate that the manifest's ABI version is compatible with this engine.
 pub fn validate_abi(manifest: &PluginManifest, engine_abi: u32) -> Result<()> {
     if manifest.abi_version != engine_abi {
@@ -429,23 +433,35 @@ impl PluginRegistry {
             )));
         }
         // §6.3 Processing pipeline composition checks:
-        // Reject duplicate (stage, priority) pairs at load time
-        if let (Some(stage), Some(priority)) = (&manifest.stage, manifest.priority) {
+        // Reject duplicate (stage, priority) pairs at load time. A processor
+        // declaring only ONE of stage/priority is still chainable — the
+        // missing field defaults (stage "default", priority 0) instead of the
+        // plugin silently disappearing from chain traversal.
+        let mut effective = manifest.clone();
+        if effective.stage.is_some() || effective.priority.is_some() {
+            if effective.stage.is_none() {
+                effective.stage = Some("default".to_string());
+            }
+            if effective.priority.is_none() {
+                effective.priority = Some(0);
+            }
+            let stage = effective.stage.clone().expect("stage defaulted above");
+            let priority = effective.priority.expect("priority defaulted above");
             for existing in &self.processor_chain {
-                if existing.stage.as_ref() == Some(stage) && existing.priority == Some(priority) {
+                if existing.stage.as_ref() == Some(&stage) && existing.priority == Some(priority) {
                     return Err(grim_tensor::Error::Backend(format!(
                         "Duplicate processor stage/priority detected: ({stage}, {priority})"
                     )));
                 }
             }
-            self.processor_chain.push(manifest.clone());
+            self.processor_chain.push(effective.clone());
             // Maintain sorted priority order
             self.processor_chain
                 .sort_by_key(|p| p.priority.unwrap_or(0));
         }
 
         let name = manifest.name.clone();
-        self.manifests.insert(name, manifest);
+        self.manifests.insert(name, effective);
         Ok(())
     }
 
@@ -465,7 +481,7 @@ impl PluginRegistry {
         if !dir.exists() || !dir.is_dir() {
             return Ok(());
         }
-        println!("[Plugin System] Scanning directory for plugins: {:?}", dir);
+        tracing::info!(dir = ?dir, "[Plugin System] scanning directory for plugins");
         for entry in std::fs::read_dir(dir)
             .map_err(|e| grim_tensor::Error::Backend(format!("read_dir failed: {e}")))?
         {
@@ -500,6 +516,87 @@ impl Default for PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit fix gate: a processor manifest with only `stage` (no priority)
+    /// — or only `priority` (no stage) — must still enter processor_chain
+    /// with the missing field defaulted, not silently vanish from
+    /// chain traversal.
+    #[test]
+    fn partial_processor_manifests_still_enter_chain() {
+        let mut registry = PluginRegistry::new();
+
+        let stage_only = PluginManifest {
+            name: "stage-only".into(),
+            abi_version: 1,
+            kind: PluginKind::Wasm,
+            capabilities: PluginCapabilities::PRE_POST_PROCESSOR,
+            entry: "p.wasm".into(),
+            sha256: None,
+            limits: None,
+            stage: Some("post".into()),
+            priority: None,
+            grants: PluginGrants::default(),
+            reload: PluginReload::default(),
+        };
+        registry.register_manifest(stage_only).unwrap();
+
+        let priority_only = PluginManifest {
+            name: "priority-only".into(),
+            abi_version: 1,
+            kind: PluginKind::Wasm,
+            capabilities: PluginCapabilities::PRE_POST_PROCESSOR,
+            entry: "q.wasm".into(),
+            sha256: None,
+            limits: None,
+            stage: None,
+            priority: Some(5),
+            grants: PluginGrants::default(),
+            reload: PluginReload::default(),
+        };
+        registry.register_manifest(priority_only).unwrap();
+
+        // Both must be visible to chain traversal (2 entries), with the
+        // missing fields defaulted: stage-only → priority 0, priority-only
+        // → stage "default".
+        assert_eq!(registry.processor_chain.len(), 2);
+        let by_name = |n: &str| {
+            registry
+                .processor_chain
+                .iter()
+                .find(|m| m.name == n)
+                .unwrap()
+                .clone()
+        };
+        let so = by_name("stage-only");
+        assert_eq!(so.stage.as_deref(), Some("post"));
+        assert_eq!(so.priority, Some(0));
+        let po = by_name("priority-only");
+        assert_eq!(po.stage.as_deref(), Some("default"));
+        assert_eq!(po.priority, Some(5));
+
+        // Duplicate (stage, priority) after defaulting must still be
+        // rejected: another stage-less processor also defaults to
+        // ("default", 0) — but that collides with nothing here. A second
+        // stage-only processor DOES collide with stage-only's ("post", 0).
+        let dup = PluginManifest {
+            name: "dup-post".into(),
+            abi_version: 1,
+            kind: PluginKind::Wasm,
+            capabilities: PluginCapabilities::PRE_POST_PROCESSOR,
+            entry: "r.wasm".into(),
+            sha256: None,
+            limits: None,
+            stage: Some("post".into()),
+            priority: None,
+            grants: PluginGrants::default(),
+            reload: PluginReload::default(),
+        };
+        let err = registry.register_manifest(dup).unwrap_err().to_string();
+        assert!(
+            err.contains("Duplicate processor stage/priority"),
+            "defaulted collision must be rejected: {err}"
+        );
+    }
 
     #[test]
     fn parse_simple_manifest() {
