@@ -136,6 +136,7 @@ pub use crate::kernels::jit_cache::HsacoKernelCache;
 pub use crate::kernels::source_asm::compute_kernel_source;
 
 pub use crate::memory::allocator::RocmCachingAllocator;
+pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
 

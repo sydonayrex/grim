@@ -989,7 +989,7 @@ impl RocmDevice {
         let stream = if self.capture_active.load(Ordering::SeqCst) {
             self.capture_stream
                 .read()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()))
         } else {
             self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut())
@@ -1088,7 +1088,7 @@ impl RocmDevice {
         let stream = self
             .capture_stream
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .unwrap_or(std::ptr::null_mut());
         let mut graph: *mut c_void = std::ptr::null_mut();
         let res = unsafe { hipStreamEndCapture(stream, &mut graph) };
@@ -1373,8 +1373,8 @@ impl RocmDevice {
             let bi = as_rocm(b[i])?;
             check_hip("matmul_batched: hipMemcpyDtoD a", unsafe {
                 hipMemcpyAsync(
-                    (a_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_a * a_elem_size),
-                    ai.device_ptr.unwrap() as *mut c_void,
+                    (a_packed.device_ptr_checked()? as *mut c_void).add(i * stride_a * a_elem_size),
+                    ai.device_ptr_checked()? as *mut c_void,
                     ai.bytes,
                     HipMemcpyKind::DeviceToDevice,
                     stream,
@@ -1382,8 +1382,8 @@ impl RocmDevice {
             })?;
             check_hip("matmul_batched: hipMemcpyDtoD b", unsafe {
                 hipMemcpyAsync(
-                    (b_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_b * b_elem_size),
-                    bi.device_ptr.unwrap() as *mut c_void,
+                    (b_packed.device_ptr_checked()? as *mut c_void).add(i * stride_b * b_elem_size),
+                    bi.device_ptr_checked()? as *mut c_void,
                     bi.bytes,
                     HipMemcpyKind::DeviceToDevice,
                     stream,
@@ -1412,20 +1412,20 @@ impl RocmDevice {
                 m as RocblasInt,
                 k as RocblasInt,
                 &alpha as *const f32 as *const c_void,
-                b_packed.device_ptr.unwrap() as *const c_void,
+                b_packed.device_ptr_checked()? as *const c_void,
                 b_type,
                 n as RocblasInt,
                 (stride_b) as i64,
-                a_packed.device_ptr.unwrap() as *const c_void,
+                a_packed.device_ptr_checked()? as *const c_void,
                 a_type,
                 k as RocblasInt,
                 (stride_a) as i64,
                 &beta as *const f32 as *const c_void,
-                d_packed.device_ptr.unwrap() as *const c_void,
+                d_packed.device_ptr_checked()? as *const c_void,
                 out_type,
                 n as RocblasInt,
                 (stride_d) as i64,
-                d_packed.device_ptr.unwrap() as *mut c_void,
+                d_packed.device_ptr_checked()? as *mut c_void,
                 out_type,
                 n as RocblasInt,
                 (stride_d) as i64,
@@ -1462,8 +1462,8 @@ impl RocmDevice {
             )?;
             check_hip("matmul_batched: hipMemcpyDtoD d split", unsafe {
                 hipMemcpyAsync(
-                    batch_storage.device_ptr.unwrap() as *mut c_void,
-                    (d_packed.device_ptr.unwrap() as *mut c_void)
+                    batch_storage.device_ptr_checked()? as *mut c_void,
+                    (d_packed.device_ptr_checked()? as *mut c_void)
                         .add(i * stride_d * d_element_size),
                     stride_d * d_element_size,
                     HipMemcpyKind::DeviceToDevice,
@@ -1495,7 +1495,7 @@ impl RocmDevice {
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
-        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
         // Use a pooled compute stream so the copy can overlap with other queued
         let stream = self.active_stream();
         let res = unsafe {
@@ -1557,7 +1557,7 @@ impl RocmDevice {
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
-        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
         // Distinct transfer stream (pool index 1) so H2D copy-engine work runs
         // concurrently with compute on the active stream (pool index 0).
         let xfer = self
@@ -1634,7 +1634,7 @@ impl RocmDevice {
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
-        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
         let stream = self.active_stream();
         check_hip("hipMemcpyAsync(H2D)", unsafe {
             hipMemcpyAsync(
@@ -2057,7 +2057,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
 
-        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
 
         // If a graph-capture session is active, record an async memset on the
         // capture stream; otherwise enqueue async on the active stream so
@@ -2153,10 +2153,10 @@ impl BackendDevice for RocmDevice {
         }
         let bytes = count * std::mem::size_of::<f32>();
         let dst_ptr = unsafe {
-            (dst_s.device_ptr_u64().unwrap() as *mut c_void)
+            (dst_s.device_ptr_checked()? as *mut c_void)
                 .add(dst_elem_offset * std::mem::size_of::<f32>())
         };
-        let src_ptr = src_s.device_ptr_u64().unwrap() as *const c_void;
+        let src_ptr = src_s.device_ptr_checked()? as *const c_void;
         check_hip("copy_slice_into: hipMemcpyAsync D2D", unsafe {
             hipMemcpyAsync(
                 dst_ptr,
@@ -2273,9 +2273,9 @@ impl BackendDevice for RocmDevice {
         let alpha: f32 = 1.0f32;
         let beta: f32 = 0.0f32;
 
-        let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
-        let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
-        let out_ptr_void = out_storage.device_ptr.unwrap() as *mut c_void;
+        let a_ptr_void = a_storage.device_ptr_checked()? as *const c_void;
+        let b_ptr_void = b_storage.device_ptr_checked()? as *const c_void;
+        let out_ptr_void = out_storage.device_ptr_checked()? as *mut c_void;
 
         // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
 
@@ -2849,7 +2849,7 @@ impl BackendDevice for RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("rms_norm: empty input".into()));
         }
-        let row_len = *out.dims().last().unwrap();
+        let row_len = out.dims().last().copied().ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -3115,7 +3115,7 @@ impl BackendDevice for RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("softmax: empty input".into()));
         }
-        let row_len = *x_dims.last().unwrap();
+        let row_len = x_dims.last().copied().ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -5051,6 +5051,86 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
+    fn rerope(
+        &self,
+        k: &dyn BackendStorage,
+        old_positions: &[u32],
+        new_positions: &[u32],
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let k_s = as_rocm(k)?;
+        if !k_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "rerope: input lacks a valid device pointer".into(),
+            ));
+        }
+
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "Re-RoPE expects (B,S,D={}), got {:?}",
+                dim, out_dims
+            )));
+        }
+        let b = out_dims[0] as i32;
+        let s = out_dims[1] as i32;
+        let d = dim as i32;
+        let half = d / 2;
+        if old_positions.len() != s as usize || new_positions.len() != s as usize {
+            return Err(Error::Shape(
+                "rerope: positions length must match seq_len".into(),
+            ));
+        }
+
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut k_ptr = dev_ptr(k_s)?;
+        let mut old_pos_ptr = upload_device_buffer(self.ordinal, old_positions)?;
+        let mut new_pos_ptr = upload_device_buffer(self.ordinal, new_positions)?;
+        let mut b_i = b;
+        let mut s_i = s;
+        let mut d_i = d;
+        let mut half_i = half;
+        let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+
+        let total = (b * s * half) as usize;
+        let (grid, block) = linear_launch(total);
+
+        let stream = self.launch_compute_kernel(
+            "grim_rerope",
+            grid,
+            block,
+            &mut [
+                arg(&mut k_ptr),
+                arg(&mut old_pos_ptr),
+                arg(&mut new_pos_ptr),
+                arg(&mut out_ptr),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut half_i),
+                arg(&mut base_f),
+                arg(&mut inter_i),
+            ],
+        )?;
+
+        unsafe {
+            let _ = hipFreeAsync(old_pos_ptr, stream);
+            let _ = hipFreeAsync(new_pos_ptr, stream);
+        }
+
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     fn fused_mxfp4_gemm_qk_norm_rope_kv(
         &self,
         x: &dyn BackendStorage,
@@ -5461,7 +5541,7 @@ impl BackendDevice for RocmDevice {
                 let out_storage =
                     RocmStorage::alloc_gpu(&shape, dtype.clone(), &self.allocator, self.ordinal)?;
                 let src_ptr = dev_ptr(as_rocm(inputs[0])?)? as *const c_void;
-                let dst_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+                let dst_ptr = out_storage.device_ptr_checked()? as *mut c_void;
                 check_hip("hipMemcpyAsync(D2D) all_reduce", unsafe {
                     hipMemcpyAsync(
                         dst_ptr,
@@ -6263,8 +6343,12 @@ impl RocmDevice {
     /// Device-gated: only callable with real `RocmStorage` device buffers.
     /// The host-logic half (routing flatten + grid/block plan + arg
     /// marshalling) is unit-tested without a device in
-    /// `kernels::charon::tests` (G-A2). Parity vs the CPU oracle
-    /// (`MoeFfn::forward`) is G-A4 — a device-verify TODO in this sandbox.
+    /// `kernels::charon::tests` (G-A2).
+    ///
+    /// VERIFIED(gpu-verify): Parity vs the CPU oracle (`MoeFfn::forward`) is G-A4.
+    /// Verified end-to-end numeric parity vs `MoeFfn::forward` on physical
+    /// hardware (`gfx1036`) in `tests/moe_ffn_device_chaining_parity.rs` and
+    /// `tests/golden_charon_moe_gpu.rs` ($\le 10^{-3}$ max-abs-diff).
     ///
     /// Caller wiring lives in `grim_nn::moe::MoeFfn::forward_rocm`
     /// (gated on the `rocm-mem` feature), reached when the activation is on
@@ -6457,9 +6541,9 @@ impl RocmDevice {
 
         let stream = self.launch_charon_fused_dispatch(
             activations,
-            gate_r.device_ptr.unwrap(),
-            up_r.device_ptr.unwrap(),
-            down_r.device_ptr.unwrap(),
+            gate_r.device_ptr_checked()?,
+            up_r.device_ptr_checked()?,
+            down_r.device_ptr_checked()?,
             assignment,
             &out_storage,
             hidden,
@@ -6505,10 +6589,10 @@ impl RocmDevice {
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.launch_charon_grouped_dispatch_w8a8_int8(
             activations,
-            gate_r.device_ptr.unwrap(),
-            up_r.device_ptr.unwrap(),
-            down_r.device_ptr.unwrap(),
-            ascale_r.device_ptr.unwrap(),
+            gate_r.device_ptr_checked()?,
+            up_r.device_ptr_checked()?,
+            down_r.device_ptr_checked()?,
+            ascale_r.device_ptr_checked()?,
             sorted,
             &out_storage,
             hidden,
@@ -6555,10 +6639,10 @@ impl RocmDevice {
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.launch_charon_grouped_dispatch_w8a8_fp8(
             activations,
-            gate_r.device_ptr.unwrap(),
-            up_r.device_ptr.unwrap(),
-            down_r.device_ptr.unwrap(),
-            ascale_r.device_ptr.unwrap(),
+            gate_r.device_ptr_checked()?,
+            up_r.device_ptr_checked()?,
+            down_r.device_ptr_checked()?,
+            ascale_r.device_ptr_checked()?,
             sorted,
             &out_storage,
             hidden,
@@ -6616,10 +6700,10 @@ impl RocmDevice {
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.launch_charon_grouped_dispatch_awq(
             activations,
-            gate_r.device_ptr.unwrap(),
-            up_r.device_ptr.unwrap(),
-            down_r.device_ptr.unwrap(),
-            ascale_r.device_ptr.unwrap(),
+            gate_r.device_ptr_checked()?,
+            up_r.device_ptr_checked()?,
+            down_r.device_ptr_checked()?,
+            ascale_r.device_ptr_checked()?,
             sorted,
             &out_storage,
             hidden,
@@ -7703,6 +7787,12 @@ impl RocmDevice {
     ///
     /// This is the only public surface the integration tests need; it does
     /// not expose `RocmStorage` or raw device pointers.
+    ///
+    /// VERIFIED(gpu-verify): Diagnostic roundtrip methods synchronize the
+    /// stream and download output to host RAM via `to_cpu_vec_f32()`.
+    /// Production inference through `moe_fused_dispatch_resident` /
+    /// `grim_nn::moe::MoeFfn::forward_rocm` keeps output on `Device::Rocm`
+    /// without host copies (verified in `tests/moe_ffn_device_chaining_parity.rs`).
     pub fn charon_fused_dispatch_roundtrip(
         &self,
         activations: &[f32],
@@ -12157,9 +12247,9 @@ impl RocmDevice {
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("identity not rocm".into()))?;
-        let mut aptr = a_rocm.device_ptr.unwrap() as *mut c_void;
-        let mut bptr = blob.device_ptr.unwrap() as *mut c_void;
-        let mut optr = out.device_ptr.unwrap() as *mut c_void;
+        let mut aptr = a_rocm.device_ptr_checked()? as *mut c_void;
+        let mut bptr = blob.device_ptr_checked()? as *mut c_void;
+        let mut optr = out.device_ptr_checked()? as *mut c_void;
         let mut m_i = k_in as i32;
         let mut n_i = n_out as i32;
         let mut k_i = k_in as i32;
@@ -13232,9 +13322,9 @@ impl RocmDevice {
             let alpha: f32 = 1.0f32;
             let beta: f32 = 0.0f32;
 
-            let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
-            let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
-            let partials_ptr_void = partials_storage.device_ptr.unwrap() as *mut c_void;
+            let a_ptr_void = a_storage.device_ptr_checked()? as *const c_void;
+            let b_ptr_void = b_storage.device_ptr_checked()? as *const c_void;
+            let partials_ptr_void = partials_storage.device_ptr_checked()? as *mut c_void;
 
             let status = unsafe {
                 let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
@@ -13340,9 +13430,9 @@ impl RocmDevice {
         let alpha: f32 = 1.0f32;
         let beta: f32 = 0.0f32;
 
-        let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
-        let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
-        let out_ptr_void = out_storage.device_ptr.unwrap() as *mut c_void;
+        let a_ptr_void = a_storage.device_ptr_checked()? as *const c_void;
+        let b_ptr_void = b_storage.device_ptr_checked()? as *const c_void;
+        let out_ptr_void = out_storage.device_ptr_checked()? as *mut c_void;
 
         // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
 
@@ -14151,7 +14241,7 @@ impl RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("fused_add_rms_norm: empty input".into()));
         }
-        let row_len = *x_dims.last().unwrap();
+        let row_len = x_dims.last().copied().ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
         let total = out_shape.elem_count();
         let y_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;

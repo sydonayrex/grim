@@ -121,6 +121,8 @@ unsafe extern "C" {
     pub fn hipFreeAsync(device: *mut c_void, stream: *mut c_void) -> HipErrorT;
     pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
+    pub fn hipHostRegister(hostPtr: *mut c_void, size: usize, flags: u32) -> HipErrorT;
+    pub fn hipHostUnregister(hostPtr: *mut c_void) -> HipErrorT;
     pub fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,

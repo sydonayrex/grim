@@ -91,9 +91,19 @@ impl MoeRouter {
     /// Compute gate logits for a `[batch, hidden]` input, returning a
     /// `[batch, num_experts]` tensor on the CPU for host-side selection.
     fn gate_logits(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
-        // `x` is expected to be a CPU tensor (router selection runs on host);
-        // `Linear::forward` preserves the input device, so the result is CPU.
-        self.gate.forward(x)
+        if x.device() != self.gate.weight.device() {
+            // When input is on GPU (e.g. during forward_rocm) but gate weights
+            // are CPU-resident, stage activations to CPU for the router projection.
+            let x_cpu = if x.device().is_cpu() {
+                x.clone()
+            } else {
+                let f32s = x.to_vec_f32()?;
+                grim_backend_cpu::cpu_tensor(f32s, x.shape().clone())
+            };
+            self.gate.forward(&x_cpu)
+        } else {
+            self.gate.forward(x)
+        }
     }
 
     /// Route a `[batch, hidden]` input.

@@ -23,6 +23,7 @@ serde_json = "1.0"
 # link time (no real libMIOpen.so in this env), so we dlopen it at runtime
 # via libloading and error cleanly if missing — never panic (rust-gpu-discipline §2 #12).
 libloading = "0.8"
+libc = "0.2"
 cubecl = { version = "0.10.0", features = ["hip"], optional = true }
 cubecl-hip = { version = "0.10.0", optional = true }
 # Direct dep (mirrors cubecl-hip's own) so we can read `gcnArchName`

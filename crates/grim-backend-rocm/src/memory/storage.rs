@@ -49,6 +49,20 @@ impl RocmStorage {
         self.device_ptr
     }
 
+    /// Device pointer as a structured [`Result`], for the decode/prefill hot
+    /// path — an un-uploaded (CPU-resident, `device_ptr == None`) tensor
+    /// reaching a device op surfaces an error instead of panicking on
+    /// `.device_ptr.unwrap()`.
+    pub fn device_ptr_checked(&self) -> Result<u64> {
+        self.device_ptr.ok_or_else(|| {
+            Error::Backend(
+                "expected device-resident ROCm storage (device_ptr is None) \
+                 — a CPU tensor reached a device op"
+                    .to_string(),
+            )
+        })
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }

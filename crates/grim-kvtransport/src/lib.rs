@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use grim_core::error::{Error, Result};
+use grim_tensor::backend::BackendDevice;
 
 pub mod bitmask_index;
 pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};
@@ -233,6 +234,60 @@ impl LocalSpillManager {
     /// Gets the current storage tier of a block.
     pub fn get_tier(&self, block_id: BlockId) -> Option<CacheTier> {
         self.block_tiers.get(&block_id).copied()
+    }
+
+    /// Retargets the rotary position embedding of a cached block in Host RAM from
+    /// `old_start_pos` to `new_start_pos` using CPU Re-RoPE without re-prefill.
+    pub fn retarget_block_positions(
+        &mut self,
+        block_id: BlockId,
+        old_start_pos: usize,
+        new_start_pos: usize,
+        tokens_per_block: usize,
+        head_dim: usize,
+        num_heads: usize,
+        base_freq: f32,
+    ) -> Result<()> {
+        let (k_data, v_data) = self.retrieve(block_id)?.ok_or_else(|| {
+            Error::KvCache(format!("block {} not found in cache for retargeting", block_id))
+        })?;
+
+        let expected_elems = tokens_per_block * num_heads * head_dim;
+        if k_data.len() != expected_elems {
+            return Err(Error::KvCache(format!(
+                "retarget_block_positions: block elements {} does not match expected {}",
+                k_data.len(), expected_elems
+            )));
+        }
+
+        let dev = grim_backend_cpu::CpuDevice::new();
+        let k_storage = grim_backend_cpu::CpuStorage::new(
+            k_data,
+            grim_tensor::shape::Shape::new(vec![num_heads, tokens_per_block, head_dim]),
+            grim_tensor::dtype::DType::F32,
+        );
+
+        let old_positions: Vec<u32> = (0..tokens_per_block)
+            .map(|i| (old_start_pos + i) as u32)
+            .collect();
+        let new_positions: Vec<u32> = (0..tokens_per_block)
+            .map(|i| (new_start_pos + i) as u32)
+            .collect();
+
+        let cfg = grim_tensor::RopeConfig::new(head_dim, base_freq);
+
+        let (retargeted_k, _) = dev.rerope(
+            &k_storage,
+            &old_positions,
+            &new_positions,
+            &cfg,
+            &grim_tensor::shape::Shape::new(vec![num_heads, tokens_per_block, head_dim]),
+        ).map_err(|e| Error::KvCache(e.to_string()))?;
+
+        let new_k_vec = retargeted_k.to_cpu_vec_f32().map_err(|e| Error::KvCache(e.to_string()))?;
+        self.host_ram_cache.insert(block_id, (new_k_vec, v_data));
+        self.block_tiers.insert(block_id, CacheTier::HostRam);
+        Ok(())
     }
 }
 
@@ -1021,58 +1076,83 @@ fn read_layer_weights(
     Ok(weights)
 }
 
-/// Double-buffered weight prefetch engine for NVMe layer streaming.
+/// Double-buffered weight prefetch engine for NVMe layer/unit streaming.
+///
+/// Originally framed as a "layer" streamer with a fixed 1024-element per-layer
+/// assumption; now generalised so callers specify `unit_elems` at construction
+/// time. An "embedding unit" maps naturally to this framing: `unit_id` is
+/// "which row-block of the vocabulary" and `unit_elems` is "floats per row-block"
+/// (e.g. 4096 vocab-rows × 128 hidden-dim = 524 288 floats per unit).
+///
+/// When a unit is evicted from the host-RAM LRU to NVMe, its tier transitions
+/// to `CacheTier::NvMeWeightStream` in `unit_tier_map`. Call [`NvmeWeightStreamer::get_unit_tier`]
+/// to query placement, mirroring `LocalSpillManager::get_tier` for KV blocks.
 pub struct NvmeWeightStreamer {
-    /// LRU layer cache capacity
+    /// LRU unit cache capacity (number of units held in host RAM simultaneously).
     pub lru_capacity_layers: usize,
-    /// NVMe file path for model weights
+    /// NVMe file path for model weights / embedding table.
     pub weights_path: PathBuf,
-    /// Host RAM LRU weight cache
+    /// Number of f32 elements per unit (replaces the former `const LAYER_ELEMS = 1024`).
+    /// Set once at construction; never changes after that.
+    pub unit_elems: usize,
+    /// Host RAM LRU weight cache: unit_id → f32 data.
     host_weight_cache: Mutex<HashMap<usize, Vec<f32>>>,
-    /// Track layer access order for LRU eviction
+    /// LRU access order (front = oldest, back = most-recently-used).
     lru_order: Mutex<Vec<usize>>,
-    /// Double buffers for async weight prefetching
+    /// Double buffers for async weight prefetching (active / transfer).
     double_buffers: Mutex<(Vec<f32>, Vec<f32>)>,
-    /// Simulated io_uring submission/completion queue status
+    /// Simulated io_uring submission status flag.
     uring_submitting: Mutex<bool>,
-    /// Current transfer bandwidth usage (bytes/sec)
+    /// Current transfer bandwidth usage (bytes/sec) for PCIe backpressure.
     bandwidth_usage: Mutex<f64>,
+    /// Tier tracking per unit: populated when a unit is evicted to NVMe so
+    /// `grim-scheduler` can inspect embedding-table placement the same way
+    /// it inspects KV-block placement via `LocalSpillManager::get_tier`.
+    unit_tier_map: Mutex<HashMap<usize, CacheTier>>,
 }
 
 impl NvmeWeightStreamer {
-    pub fn new(weights_path: PathBuf, lru_capacity_layers: usize) -> Self {
+    /// Create a new streamer.
+    ///
+    /// # Parameters
+    /// - `weights_path`: Path to the flat f32 weight file (row-major, concatenated units).
+    /// - `lru_capacity_layers`: How many units to keep in host RAM simultaneously.
+    /// - `unit_elems`: Number of f32 elements per unit. Replaces the former hardcoded
+    ///   `LAYER_ELEMS = 1024` constant. Pass `1024` to reproduce the old behaviour for
+    ///   tests and callers that have not yet migrated to a larger granularity.
+    pub fn new(weights_path: PathBuf, lru_capacity_layers: usize, unit_elems: usize) -> Self {
         Self {
             weights_path,
             lru_capacity_layers,
+            unit_elems,
             host_weight_cache: Mutex::new(HashMap::new()),
             lru_order: Mutex::new(Vec::new()),
             double_buffers: Mutex::new((vec![], vec![])),
             uring_submitting: Mutex::new(false),
             bandwidth_usage: Mutex::new(0.0),
+            unit_tier_map: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Prefetch a target layer's weights asynchronously into pinned CPU RAM.
+    /// Prefetch a target unit's weights asynchronously into pinned CPU RAM.
     ///
     /// In a production environment under Linux, this leverages `io_uring` and
     /// `O_DIRECT`; here we synchronously `pread` the weights file, since the
     /// network/io_uring backend is not yet wired (sims.md issue #3). The
     /// previous implementation inserted hardcoded `vec![0.5f32; 1024]` weights
-    /// instead of reading from disk, silently corrupting any computation that
-    /// consumed the cache. We now read the real bytes from `weights_path`:
+    /// instead of reading from disk. We now read the real bytes from `weights_path`:
     ///
     /// - If the file is missing or the read fails, we surface an explicit
     ///   `KvCache` error rather than substituting mock data.
-    /// - The on-disk layout is treated as a flat stream of `f32` weights
-    ///   sectioned per layer by `LAYER_ELEMS` (1024 floats / 4096 bytes per
-    ///   layer), matching the previous mock weight length so callers that
-    ///   depend on a 1024-element layer keep working when real data is
-    ///   available.
+    /// - The on-disk layout is a flat stream of `f32` weights sectioned by
+    ///   `self.unit_elems` floats per unit. When `unit_elems` is 1024 this
+    ///   matches the previous fixed behaviour exactly.
     ///
-    /// The LRU admission + bandwidth backpressure logic is preserved — only
-    /// the data source changes from mock to real.
+    /// When a unit is evicted from the host-RAM LRU, its tier is set to
+    /// `CacheTier::NvMeWeightStream` in `unit_tier_map` so `grim-scheduler`
+    /// can query embedding placement via `get_unit_tier`.
     pub fn prefetch_layer_async(&self, layer_id: usize) -> Result<()> {
-        // Bandwidth Admission and Backpressure check (real logic preserved):
+        // Bandwidth Admission and Backpressure check:
         // If bandwidth usage exceeds 12.0 GB/s (~PCIe Gen4 x8 saturation),
         // defer the prefetch instead of saturating the link.
         let cur_bandwidth = *self.bandwidth_usage.lock().unwrap();
@@ -1082,53 +1162,81 @@ impl NvmeWeightStreamer {
             ));
         }
 
-        // Per-layer size in f32 elements (matches the previous mock length so
-        // existing callers preserve their shape when backed by a real file).
-        const LAYER_ELEMS: usize = 1024;
-        let layer_bytes = LAYER_ELEMS * std::mem::size_of::<f32>();
+        // Use the caller-configured unit size rather than a hardcoded constant.
+        let unit_elems = self.unit_elems;
+        let unit_bytes = unit_elems * std::mem::size_of::<f32>();
 
-        // Read the layer's weights from the configured NVMe path. We do this
-        // up-front (before acquiring the cache locks) so an I/O error fails
-        // loudly instead of leaving the cache half-mutated.
-        let weights = read_layer_weights(&self.weights_path, layer_id, LAYER_ELEMS, layer_bytes)?;
+        // Read the unit's weights from the configured NVMe path up-front
+        // (before acquiring cache locks) so I/O errors fail loudly instead of
+        // leaving the cache half-mutated.
+        let weights = read_layer_weights(&self.weights_path, layer_id, unit_elems, unit_bytes)?;
 
         *self.uring_submitting.lock().unwrap() = true;
 
-        // Populate LRU cache
+        // Populate LRU cache.
         let mut cache = self.host_weight_cache.lock().unwrap();
         let mut order = self.lru_order.lock().unwrap();
+        let mut tier_map = self.unit_tier_map.lock().unwrap();
 
         if !cache.contains_key(&layer_id) {
-            // Evict LRU if capacity exceeded
+            // Evict LRU if capacity exceeded; record the evicted unit's tier
+            // as NvMeWeightStream so grim-scheduler can see it moved to disk.
             if cache.len() >= self.lru_capacity_layers && !order.is_empty() {
                 let evicted = order.remove(0);
                 cache.remove(&evicted);
+                tier_map.insert(evicted, CacheTier::NvMeWeightStream);
             }
 
             cache.insert(layer_id, weights.clone());
             order.push(layer_id);
+            // Unit now resident in host RAM.
+            tier_map.insert(layer_id, CacheTier::HostRam);
 
-            // Populate double buffers (async swap preparation)
+            // Populate double buffers (async swap preparation).
             let mut buffers = self.double_buffers.lock().unwrap();
             buffers.1 = weights; // Load into transfer buffer
         } else {
-            // Move layer to end of access order
+            // Move unit to end of access order (most-recently-used).
             if let Some(pos) = order.iter().position(|&x| x == layer_id) {
                 order.remove(pos);
             }
             order.push(layer_id);
+            // Ensure tier reflects current HostRam residency.
+            tier_map.insert(layer_id, CacheTier::HostRam);
         }
 
         *self.uring_submitting.lock().unwrap() = false;
         Ok(())
     }
 
+    /// Query the current storage tier of a weight unit.
+    ///
+    /// Returns `Some(CacheTier::HostRam)` if the unit is in the LRU cache,
+    /// `Some(CacheTier::NvMeWeightStream)` if it was evicted to disk, or
+    /// `None` if the unit has never been prefetched. This mirrors
+    /// `LocalSpillManager::get_tier` so `grim-scheduler` can reason about
+    /// embedding-table placement the same way it reasons about KV-block placement.
+    pub fn get_unit_tier(&self, unit_id: usize) -> Option<CacheTier> {
+        self.unit_tier_map.lock().unwrap().get(&unit_id).copied()
+    }
+
+    /// Retrieve the cached weight data for a unit, if present in host RAM.
+    ///
+    /// Returns `Some(data)` when the unit is cached, `None` when it has been
+    /// evicted or never loaded. Use `prefetch_layer_async` first to ensure the
+    /// unit is cached before calling this.
+    pub fn retrieve_unit(&self, unit_id: usize) -> Option<Vec<f32>> {
+        self.host_weight_cache
+            .lock()
+            .unwrap()
+            .get(&unit_id)
+            .cloned()
+    }
+
     /// Swaps the target double-buffers to update GPU memory.
     pub fn commit_and_swap(&self, _current_layer: usize, _next_layer: usize) -> Result<()> {
         let mut buffers = self.double_buffers.lock().unwrap();
         // Double-buffered swap: Active buffer becomes transfer buffer and vice versa.
-        // The previous implementation logged the layer ids; the swap itself is
-        // the only observable effect, so the println was just noise in logs.
         let (buf0, buf1) = &mut *buffers;
         std::mem::swap(buf0, buf1);
         Ok(())
@@ -1137,6 +1245,104 @@ impl NvmeWeightStreamer {
     /// Update the tracked transfer bandwidth usage (bytes/sec).
     pub fn set_bandwidth_usage(&self, bytes_per_sec: f64) {
         *self.bandwidth_usage.lock().unwrap() = bytes_per_sec;
+    }
+}
+
+/// Tiered embedding table spill manager.
+///
+/// Wraps `NvmeWeightStreamer` around a flat embedding weight tensor
+/// (shape `[vocab_size, hidden_dim]` row-major) sharded into row-blocks
+/// ("units") of `rows_per_unit` vocabulary rows each.
+///
+/// # Tier policy: Gpu → HostRam → NvMe
+/// - The full table is never assumed to be GPU-resident here; this manager
+///   operates at the HostRam/NvMe boundary. GPU-side promotion is up to the
+///   calling inference stack.
+/// - When a unit is evicted from the host-RAM LRU, its tier flips to
+///   `CacheTier::NvMeWeightStream` and is queryable via `get_unit_tier`.
+///
+/// # Wire to grim-scheduler
+/// `EmbeddingSpillManager::get_unit_tier` mirrors `LocalSpillManager::get_tier`
+/// so the scheduler can reason about embedding placement alongside KV-block
+/// placement using the same `CacheTier` enum.
+pub struct EmbeddingSpillManager {
+    streamer: NvmeWeightStreamer,
+    /// Number of vocabulary rows in one streaming unit.
+    pub rows_per_unit: usize,
+    /// Embedding hidden dimension (floats per vocabulary row).
+    pub hidden_dim: usize,
+}
+
+impl EmbeddingSpillManager {
+    /// Create a new manager backed by the given NVMe file.
+    ///
+    /// # Parameters
+    /// - `weights_path`: Flat row-major f32 file containing the full embedding
+    ///   table in `[vocab_size, hidden_dim]` layout (concatenated row-wise).
+    /// - `lru_capacity_units`: Number of row-block units to keep in host RAM.
+    /// - `rows_per_unit`: How many vocabulary rows per streaming unit. A
+    ///   reasonable starting point is 4096 rows; tune to match available RAM.
+    /// - `hidden_dim`: Embedding hidden dimension (floats per row).
+    pub fn new(
+        weights_path: std::path::PathBuf,
+        lru_capacity_units: usize,
+        rows_per_unit: usize,
+        hidden_dim: usize,
+    ) -> Self {
+        let unit_elems = rows_per_unit * hidden_dim;
+        Self {
+            streamer: NvmeWeightStreamer::new(weights_path, lru_capacity_units, unit_elems),
+            rows_per_unit,
+            hidden_dim,
+        }
+    }
+
+    /// Look up the embedding row for `token_id`.
+    ///
+    /// Computes which unit the token's row lives in, prefetches the unit if
+    /// not already cached, and extracts the `hidden_dim`-length row.
+    ///
+    /// Returns an explicit error if the unit cannot be loaded (file missing,
+    /// too short, or bandwidth-saturated). Never fabricates a zero row.
+    pub fn lookup(&self, token_id: u32) -> Result<Vec<f32>> {
+        let token = token_id as usize;
+        let unit_id = token / self.rows_per_unit;
+        let row_within_unit = token % self.rows_per_unit;
+
+        // Prefetch ensures the unit is in host RAM; this is a no-op if already cached.
+        self.streamer.prefetch_layer_async(unit_id)?;
+
+        let unit_data = self.streamer.retrieve_unit(unit_id).ok_or_else(|| {
+            Error::KvCache(format!(
+                "EmbeddingSpillManager: unit {unit_id} missing from cache after prefetch"
+            ))
+        })?;
+
+        let start = row_within_unit * self.hidden_dim;
+        let end = start + self.hidden_dim;
+        if end > unit_data.len() {
+            return Err(Error::KvCache(format!(
+                "EmbeddingSpillManager: token {token_id} row [{start}..{end}] \
+                 out of bounds for unit {unit_id} len {}",
+                unit_data.len()
+            )));
+        }
+        Ok(unit_data[start..end].to_vec())
+    }
+
+    /// Query the current storage tier for the unit containing `token_id`.
+    ///
+    /// Returns `None` if the containing unit has never been prefetched,
+    /// `Some(CacheTier::HostRam)` if cached, or
+    /// `Some(CacheTier::NvMeWeightStream)` if evicted to disk.
+    pub fn get_unit_tier_for_token(&self, token_id: u32) -> Option<CacheTier> {
+        let unit_id = token_id as usize / self.rows_per_unit;
+        self.streamer.get_unit_tier(unit_id)
+    }
+
+    /// Query the tier for an explicit unit id (equivalent to streamer's `get_unit_tier`).
+    pub fn get_unit_tier(&self, unit_id: usize) -> Option<CacheTier> {
+        self.streamer.get_unit_tier(unit_id)
     }
 }
 
@@ -1500,7 +1706,8 @@ mod tests {
         }
         std::fs::write(&weights_path, &buf).unwrap();
 
-        let streamer = NvmeWeightStreamer::new(weights_path.clone(), 4);
+        // Pass unit_elems=1024 to preserve existing 1024-float-per-layer behaviour.
+        let streamer = NvmeWeightStreamer::new(weights_path.clone(), 4, 1024);
 
         // Prefetch layer 0 and verify the cached weights match what we wrote.
         streamer
@@ -1532,7 +1739,8 @@ mod tests {
         // error, not silently insert mock 0.5f32 data.
         let dir = tempdir().unwrap();
         let weights_path = dir.path().join("does_not_exist.bin");
-        let streamer = NvmeWeightStreamer::new(weights_path, 4);
+        // unit_elems=1024: same element count as the former hardcoded constant.
+        let streamer = NvmeWeightStreamer::new(weights_path, 4, 1024);
 
         let res = streamer.prefetch_layer_async(0);
         assert!(
@@ -1555,7 +1763,8 @@ mod tests {
         let weights_path = dir.path().join("short.bin");
         // Only 100 bytes — far too short for layer 0 (4096 bytes).
         std::fs::write(&weights_path, [0u8; 100]).unwrap();
-        let streamer = NvmeWeightStreamer::new(weights_path, 4);
+        // unit_elems=1024: same element count as the former hardcoded constant.
+        let streamer = NvmeWeightStreamer::new(weights_path, 4, 1024);
 
         let res = streamer.prefetch_layer_async(0);
         assert!(res.is_err(), "short file must error for layer 0");
@@ -1565,5 +1774,238 @@ mod tests {
             "error should mention short file: {}",
             msg
         );
+    }
+
+    // ── New tests for generalised NvmeWeightStreamer (unit_elems param) ──────
+
+    /// Verify NvmeWeightStreamer works with non-1024 unit_elems (embedding-table granularity).
+    ///
+    /// Uses rows_per_unit=4, hidden_dim=8 → unit_elems=32 for a fast synthetic test.
+    /// Asserts exact round-trip values and that the tier map reflects HostRam after load.
+    #[test]
+    fn test_nvme_weight_streamer_configurable_unit_elems() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("embed_weights.bin");
+
+        // Two units of 32 f32 each (rows_per_unit=4, hidden_dim=8).
+        let unit_elems = 32usize;
+        let unit0: Vec<f32> = (0..unit_elems).map(|i| i as f32 * 0.1).collect();
+        let unit1: Vec<f32> = (0..unit_elems).map(|i| -(i as f32) * 0.2).collect();
+        let mut buf = Vec::with_capacity((unit0.len() + unit1.len()) * 4);
+        for f in unit0.iter().chain(unit1.iter()) {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let streamer = NvmeWeightStreamer::new(path, 4, unit_elems);
+
+        // Load unit 0 and assert exact values.
+        streamer.prefetch_layer_async(0).expect("unit 0 must prefetch");
+        let got0 = streamer.retrieve_unit(0).expect("unit 0 must be cached");
+        assert_eq!(got0, unit0, "unit 0 round-trip must be exact");
+        assert_eq!(
+            streamer.get_unit_tier(0),
+            Some(CacheTier::HostRam),
+            "unit 0 tier must be HostRam after prefetch"
+        );
+
+        // Load unit 1.
+        streamer.prefetch_layer_async(1).expect("unit 1 must prefetch");
+        let got1 = streamer.retrieve_unit(1).expect("unit 1 must be cached");
+        assert_eq!(got1, unit1, "unit 1 round-trip must be exact");
+        assert_eq!(
+            streamer.get_unit_tier(1),
+            Some(CacheTier::HostRam),
+            "unit 1 tier must be HostRam after prefetch"
+        );
+    }
+
+    /// Verify that LRU eviction records the evicted unit's tier as NvMeWeightStream.
+    ///
+    /// Capacity = 1 unit → loading unit 1 evicts unit 0.
+    /// Unit 0's tier must flip to NvMeWeightStream; unit 1's tier must be HostRam.
+    #[test]
+    fn test_nvme_weight_streamer_lru_eviction_updates_tier() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("evict_weights.bin");
+
+        let unit_elems = 8usize;
+        // Three units of 8 f32.
+        let mut buf = Vec::with_capacity(3 * unit_elems * 4);
+        for unit in 0u32..3 {
+            for elem in 0u32..unit_elems as u32 {
+                let val = (unit * 100 + elem) as f32;
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        // LRU capacity = 1: only one unit fits in host RAM at a time.
+        let streamer = NvmeWeightStreamer::new(path, 1, unit_elems);
+
+        // Load unit 0 → tier HostRam.
+        streamer.prefetch_layer_async(0).unwrap();
+        assert_eq!(streamer.get_unit_tier(0), Some(CacheTier::HostRam));
+
+        // Load unit 1 → evicts unit 0.
+        streamer.prefetch_layer_async(1).unwrap();
+        assert_eq!(
+            streamer.get_unit_tier(0),
+            Some(CacheTier::NvMeWeightStream),
+            "evicted unit 0 must have tier NvMeWeightStream"
+        );
+        assert_eq!(
+            streamer.get_unit_tier(1),
+            Some(CacheTier::HostRam),
+            "current unit 1 must have tier HostRam"
+        );
+
+        // Load unit 2 → evicts unit 1.
+        streamer.prefetch_layer_async(2).unwrap();
+        assert_eq!(
+            streamer.get_unit_tier(1),
+            Some(CacheTier::NvMeWeightStream),
+            "evicted unit 1 must have tier NvMeWeightStream"
+        );
+        assert_eq!(
+            streamer.get_unit_tier(2),
+            Some(CacheTier::HostRam),
+            "current unit 2 must have tier HostRam"
+        );
+    }
+
+    // ── EmbeddingSpillManager tests ───────────────────────────────────────────
+
+    /// Unit test: construct an EmbeddingSpillManager with a small synthetic embedding
+    /// table, lookup several token IDs, assert exact row values.
+    ///
+    /// vocab=8 tokens, hidden_dim=4, rows_per_unit=4 → 2 units.
+    #[test]
+    fn test_embedding_spill_manager_lookup_exact_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("emb.bin");
+
+        let vocab = 8usize;
+        let hidden = 4usize;
+        // Build a [vocab, hidden] table where row i = [i*hidden + 0, i*h+1, ..., i*h+hidden-1].
+        let mut table = Vec::with_capacity(vocab * hidden);
+        for i in 0..vocab {
+            for j in 0..hidden {
+                table.push((i * hidden + j) as f32);
+            }
+        }
+        let mut buf = Vec::with_capacity(table.len() * 4);
+        for f in &table {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        // rows_per_unit=4: tokens 0-3 → unit 0, tokens 4-7 → unit 1.
+        let mgr = EmbeddingSpillManager::new(path, 4, 4, hidden);
+
+        for token in 0u32..vocab as u32 {
+            let row = mgr.lookup(token).unwrap_or_else(|e| {
+                panic!("lookup({token}) must succeed: {e}")
+            });
+            assert_eq!(row.len(), hidden, "row length must be hidden_dim={hidden}");
+            let expected: Vec<f32> = (0..hidden).map(|j| (token as usize * hidden + j) as f32).collect();
+            assert_eq!(
+                row, expected,
+                "token {token} row must match exact table values"
+            );
+        }
+    }
+
+    /// Integration test: eviction under small LRU capacity, then re-request returns identical data.
+    ///
+    /// This mirrors LocalSpillManager's existing demote_to_nvme/retrieve test pattern
+    /// (plan Issue 2 criterion §2). Uses a 3-unit table with capacity=1 so the first
+    /// unit is evicted when the second is loaded. Re-requesting the first unit must
+    /// round-trip the same values (via re-prefetch from disk).
+    #[test]
+    fn test_embedding_spill_manager_eviction_and_reread_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("emb_evict.bin");
+
+        let vocab = 12usize; // 3 units of 4 rows each
+        let hidden = 8usize;
+        let rows_per_unit = 4usize;
+
+        let mut table = Vec::with_capacity(vocab * hidden);
+        for i in 0..vocab {
+            for j in 0..hidden {
+                // Distinct values per cell to catch any partial-unit read errors.
+                table.push((i as f32) * 1000.0 + j as f32);
+            }
+        }
+        let mut buf = Vec::with_capacity(table.len() * 4);
+        for f in &table {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        // LRU capacity = 1 → each new unit evicts the previous one.
+        let mgr = EmbeddingSpillManager::new(path, 1, rows_per_unit, hidden);
+
+        // First lookup: unit 0 loaded, HostRam.
+        let row0_first = mgr.lookup(0).expect("initial lookup of token 0 must succeed");
+        assert_eq!(mgr.get_unit_tier(0), Some(CacheTier::HostRam));
+
+        // Second lookup: unit 1 loaded, unit 0 evicted to NvMeWeightStream.
+        let _ = mgr.lookup(4).expect("lookup of token 4 (unit 1) must succeed");
+        assert_eq!(
+            mgr.get_unit_tier(0),
+            Some(CacheTier::NvMeWeightStream),
+            "unit 0 must be NvMeWeightStream after eviction"
+        );
+
+        // Re-request token 0: triggers re-prefetch from disk.
+        let row0_second = mgr.lookup(0).expect("re-lookup of token 0 must succeed after eviction");
+        assert_eq!(
+            row0_first, row0_second,
+            "re-read from NvMe must produce bit-identical values to first read"
+        );
+    }
+
+    /// Verify that get_unit_tier mirrors LocalSpillManager::get_tier for the embedding case
+    /// (plan Issue 2 criterion §3: scheduler-queryable placement).
+    #[test]
+    fn test_embedding_spill_manager_tier_query_mirrors_kv_pattern() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("emb_tier.bin");
+
+        let vocab = 8usize;
+        let hidden = 4usize;
+        let rows_per_unit = 4usize;
+
+        let table: Vec<f32> = (0..vocab * hidden).map(|i| i as f32).collect();
+        let buf: Vec<u8> = table.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(&path, &buf).unwrap();
+
+        let mgr = EmbeddingSpillManager::new(path, 4, rows_per_unit, hidden);
+
+        // Before any lookup: tier is None (not yet prefetched).
+        assert_eq!(
+            mgr.get_unit_tier(0),
+            None,
+            "tier must be None before first prefetch"
+        );
+        assert_eq!(
+            mgr.get_unit_tier_for_token(0),
+            None,
+            "tier-by-token must also be None before first prefetch"
+        );
+
+        // After lookup of token 0: unit 0 is HostRam.
+        mgr.lookup(0).unwrap();
+        assert_eq!(mgr.get_unit_tier(0), Some(CacheTier::HostRam));
+        assert_eq!(mgr.get_unit_tier_for_token(0), Some(CacheTier::HostRam));
+        assert_eq!(mgr.get_unit_tier_for_token(3), Some(CacheTier::HostRam),
+            "all tokens in unit 0 (rows 0-3) must report the same tier");
+
+        // After lookup of token 4 (unit 1): unit 0 is still HostRam (capacity=4, not evicted yet).
+        mgr.lookup(4).unwrap();
+        assert_eq!(mgr.get_unit_tier(0), Some(CacheTier::HostRam));
+        assert_eq!(mgr.get_unit_tier(1), Some(CacheTier::HostRam));
     }
 }

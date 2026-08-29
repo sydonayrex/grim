@@ -173,7 +173,8 @@ fn test_nvme_weight_streamer_read_and_prefetch() {
     let dummy_bytes: Vec<u8> = dummy_weights.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(&weight_file, dummy_bytes).unwrap();
 
-    let streamer = NvmeWeightStreamer::new(weight_file, 4);
+    // unit_elems=1024: matches the dummy weight file (1024 floats per layer).
+    let streamer = NvmeWeightStreamer::new(weight_file, 4, 1024);
     assert!(streamer.prefetch_layer_async(0).is_ok());
     assert!(streamer.commit_and_swap(0, 1).is_ok());
 }

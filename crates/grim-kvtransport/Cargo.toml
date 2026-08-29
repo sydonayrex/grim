@@ -8,6 +8,7 @@ description = "Tiered KV Cache local transport and spillage (GPU -> Host RAM -> 
 
 [dependencies]
 grim-tensor = { workspace = true }
+grim-backend-cpu = { workspace = true }
 grim-core = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
