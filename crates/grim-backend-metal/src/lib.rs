@@ -1,5 +1,6 @@
 pub mod autotune;
 pub mod caps;
+pub mod kernels;
 
 pub use autotune::{GemmOp, MetalAutotuner, MetalTileConfig, ShapeClass};
 pub use caps::MetalCaps;
