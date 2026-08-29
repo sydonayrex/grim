@@ -156,7 +156,17 @@ impl ConstrainedSampler {
         if let Some(vocab) = &self.vocab {
             if let Some(text) = vocab.get(token_id as usize) {
                 self.feed_sampled_token(text);
+            } else {
+                tracing::warn!(
+                    "ConstrainedSampler: token_id {} exceeds attached vocab size {}",
+                    token_id,
+                    vocab.len()
+                );
             }
+        } else {
+            tracing::warn!(
+                "ConstrainedSampler: feed_sampled_token_id called without attached vocab"
+            );
         }
     }
 
@@ -167,6 +177,11 @@ impl ConstrainedSampler {
     /// constraint. Without a vocab it falls back to the conservative
     /// all-valid rule (honest but useless; `with_vocab` is the fix).
     fn compute_mask(&self, vocab_size: usize) -> Vec<bool> {
+        if self.vocab.is_none() {
+            tracing::warn!(
+                "ConstrainedSampler: compute_mask running without attached vocab; falling back to unconstrained mask"
+            );
+        }
         match &self.constraint {
             Constraint::JsonObject => {
                 if let Some(vocab) = &self.vocab {

@@ -14,5 +14,5 @@ pub const TEST_QUANT_FORMATS: &[QuantFormat] = &[
     QuantFormat::Iq4Nl,
 ];
 
-/// List of K dimensions tested (includes blocks_per_row == 1 and > 1).
-pub const TEST_K_DIMS: &[usize] = &[256, 1536];
+/// List of K dimensions tested (includes single-block, multi-block, and large LLM head/hidden sizes).
+pub const TEST_K_DIMS: &[usize] = &[256, 512, 1536, 2048, 4096];
