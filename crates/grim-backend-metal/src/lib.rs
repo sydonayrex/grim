@@ -12,7 +12,9 @@ use grim_tensor::dtype::{
     Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendDevice, BackendStorage, ScythePlacement, Shape};
+use grim_tensor::{BackendStorage, ScythePlacement, Shape,
+    CoreTensorOps, ElementwiseOps, SamplingOps, AttentionOps, FusionOps, AutogradOps, OptimizerOps, QuantOps, RecurrentOps, CollectiveOps, MemoryOps, GraphCaptureOps,
+};
 
 use grim_backend_cpu::{CpuDevice, CpuStorage};
 
@@ -1664,7 +1666,8 @@ impl MetalDevice {
     }
 }
 
-impl BackendDevice for MetalDevice {
+impl CoreTensorOps for MetalDevice {
+
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let elem_count = shape.elem_count();
         let bytes = elem_count * dtype_byte_size(&dtype)?;
@@ -1720,6 +1723,7 @@ impl BackendDevice for MetalDevice {
         }
     }
 
+
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -1728,6 +1732,7 @@ impl BackendDevice for MetalDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_with_op_internal(a, b, out, None)
     }
+
 
     fn add(
         &self,
@@ -1756,6 +1761,7 @@ impl BackendDevice for MetalDevice {
         }
     }
 
+
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -1782,6 +1788,7 @@ impl BackendDevice for MetalDevice {
             })
         }
     }
+
 
     fn silu_mul(
         &self,
@@ -1810,113 +1817,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    fn silu_mul_backward(
-        &self,
-        e: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        dw: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if let Some(ref inner) = self.inner {
-                let e_s = e.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal silu_mul_backward: e is not MetalStorage".into())
-                })?;
-                let g_s = g.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal silu_mul_backward: g is not MetalStorage".into())
-                })?;
-                let dw_s = dw.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal silu_mul_backward: dw is not MetalStorage".into())
-                })?;
-                let e_buf = e_s
-                    .buffer
-                    .as_ref()
-                    .ok_or_else(|| Error::Backend("e has no GPU buffer".into()))?;
-                let g_buf = g_s
-                    .buffer
-                    .as_ref()
-                    .ok_or_else(|| Error::Backend("g has no GPU buffer".into()))?;
-                let dw_buf = dw_s
-                    .buffer
-                    .as_ref()
-                    .ok_or_else(|| Error::Backend("dw has no GPU buffer".into()))?;
-                let df_storage = self.zeros(out_shape, DType::F32)?;
-                let de_storage = self.zeros(out_shape, DType::F32)?;
-                let df_buf = df_storage
-                    .as_any()
-                    .downcast_ref::<MetalStorage>()
-                    .unwrap()
-                    .buffer
-                    .as_ref()
-                    .unwrap();
-                let de_buf = de_storage
-                    .as_any()
-                    .downcast_ref::<MetalStorage>()
-                    .unwrap()
-                    .buffer
-                    .as_ref()
-                    .unwrap();
-                let cmd = self.get_or_create_command_buffer()?;
-                let encoder = cmd.computeCommandEncoder().ok_or_else(|| {
-                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
-                })?;
-                encoder.setComputePipelineState(&inner.pipelines.silu_mul_backward);
-                encoder.setBuffer_offset_atIndex(Some(e_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(g_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(dw_buf), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(df_buf), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(de_buf), 0, 4);
-                let total = out_shape.elem_count() as i32;
-                unsafe {
-                    encoder.setBytes_length_atIndex(
-                        &total as *const i32 as *const std::ffi::c_void,
-                        4,
-                        5,
-                    );
-                }
-                let threads = MTLSize::new(256, 1, 1);
-                let groups = MTLSize::new(((total as usize + 255) / 256) as u64, 1, 1);
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
-                encoder.endEncoding();
-                return Ok((
-                    df_storage,
-                    de_storage,
-                    Box::new(MetalHandle {
-                        command_buffer: cmd,
-                    }),
-                ));
-            }
-        }
-        let cpu = CpuDevice::new();
-        let e_cpu = e.to_cpu_vec_f32()?;
-        let g_cpu = g.to_cpu_vec_f32()?;
-        let dw_cpu = dw.to_cpu_vec_f32()?;
-        let mut df = vec![0.0f32; out_shape.elem_count()];
-        let mut de = vec![0.0f32; out_shape.elem_count()];
-        for i in 0..df.len() {
-            let s = 1.0 / (1.0 + (-e_cpu[i]).exp());
-            df[i] = dw_cpu[i] * g_cpu[i] * s * (1.0 + e_cpu[i] * (1.0 - s));
-            de[i] = dw_cpu[i] * s * e_cpu[i];
-        }
-        let df_storage = cpu.from_cpu(&df, out_shape, DType::F32)?;
-        let de_storage = cpu.from_cpu(&de, out_shape, DType::F32)?;
-        #[cfg(target_vendor = "apple")]
-        {
-            let command_buffer = self.get_or_create_command_buffer()?;
-            return Ok((
-                df_storage,
-                de_storage,
-                Box::new(MetalHandle { command_buffer }),
-            ));
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        Ok((df_storage, de_storage, Box::new(MetalHandle)))
-    }
 
     fn rms_norm(
         &self,
@@ -2011,14 +1911,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    fn quantize(
-        &self,
-        x: &dyn BackendStorage,
-        format: QuantFormat,
-    ) -> Result<Box<dyn BackendStorage>> {
-        let (out, _handle) = self.quantize_on_device(x, format)?;
-        Ok(out)
-    }
 
     fn softmax(
         &self,
@@ -2115,6 +2007,7 @@ impl BackendDevice for MetalDevice {
             Ok((out_metal, handle))
         }
     }
+
 
     fn embedding(
         &self,
@@ -2224,6 +2117,7 @@ impl BackendDevice for MetalDevice {
         }
     }
 
+
     fn from_cpu(
         &self,
         data: &[f32],
@@ -2295,6 +2189,7 @@ impl BackendDevice for MetalDevice {
         }
     }
 
+
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -2302,6 +2197,79 @@ impl BackendDevice for MetalDevice {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+impl ElementwiseOps for MetalDevice {
+
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                return self.run_unary(
+                    inner,
+                    &inner.pipelines.mul_scalar,
+                    x,
+                    Some(scalar),
+                    out_shape,
+                    Some(1),
+                    3,
+                );
+            }
+        }
+        let x_vec = x.to_cpu_vec_f32()?;
+        let res: Vec<f32> = x_vec.into_iter().map(|v| v * scalar).collect();
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                return self.run_unary(inner, &inner.pipelines.sqrt, x, None, out_shape, None, 2);
+            }
+        }
+        let x_vec = x.to_cpu_vec_f32()?;
+        let res: Vec<f32> = x_vec.into_iter().map(|v| v.sqrt()).collect();
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                return self.run_unary(inner, &inner.pipelines.recip, x, None, out_shape, None, 2);
+            }
+        }
+        let x_vec = x.to_cpu_vec_f32()?;
+        let res: Vec<f32> = x_vec.into_iter().map(|v| 1.0 / v).collect();
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+}
+
+impl SamplingOps for MetalDevice {
+}
+
+impl AttentionOps for MetalDevice {
+
 
     fn kv_dequant_attention(
         &self,
@@ -2486,6 +2454,7 @@ impl BackendDevice for MetalDevice {
         }
     }
 
+
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -2512,6 +2481,7 @@ impl BackendDevice for MetalDevice {
             out_sum,
         )
     }
+
 
     #[allow(unused_variables)] // params only used on the cfg-gated Apple path
     fn qkv_attention_paged(
@@ -2639,6 +2609,7 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
+
     #[allow(unused_variables)] // params only used on the cfg-gated Apple path
     fn tree_attention(
         &self,
@@ -2749,65 +2720,6 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
-    fn mul_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if let Some(ref inner) = self.inner {
-                return self.run_unary(
-                    inner,
-                    &inner.pipelines.mul_scalar,
-                    x,
-                    Some(scalar),
-                    out_shape,
-                    Some(1),
-                    3,
-                );
-            }
-        }
-        let x_vec = x.to_cpu_vec_f32()?;
-        let res: Vec<f32> = x_vec.into_iter().map(|v| v * scalar).collect();
-        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
-    }
-
-    fn sqrt(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if let Some(ref inner) = self.inner {
-                return self.run_unary(inner, &inner.pipelines.sqrt, x, None, out_shape, None, 2);
-            }
-        }
-        let x_vec = x.to_cpu_vec_f32()?;
-        let res: Vec<f32> = x_vec.into_iter().map(|v| v.sqrt()).collect();
-        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
-    }
-
-    fn recip(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if let Some(ref inner) = self.inner {
-                return self.run_unary(inner, &inner.pipelines.recip, x, None, out_shape, None, 2);
-            }
-        }
-        let x_vec = x.to_cpu_vec_f32()?;
-        let res: Vec<f32> = x_vec.into_iter().map(|v| 1.0 / v).collect();
-        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
-    }
 
     fn sage_attention(
         &self,
@@ -2831,6 +2743,7 @@ impl BackendDevice for MetalDevice {
             None,
         )
     }
+
 
     fn mla_q_kv_norm_split(
         &self,
@@ -2904,84 +2817,6 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
-    fn fused_adamw_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        m: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        weight_decay: f32,
-        bc1: f32,
-        bc2: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let mut p_vec = p.to_cpu_vec_f32()?;
-        let g_vec = g.to_cpu_vec_f32()?;
-        let mut m_vec = m.to_cpu_vec_f32()?;
-        let mut v_vec = v.to_cpu_vec_f32()?;
-
-        for i in 0..total.min(p_vec.len()) {
-            let grad = g_vec[i];
-            let mut param = p_vec[i];
-            if weight_decay != 0.0 {
-                param -= lr * weight_decay * param;
-            }
-            let m_val = beta1 * m_vec[i] + (1.0 - beta1) * grad;
-            let v_val = beta2 * v_vec[i] + (1.0 - beta2) * grad * grad;
-            m_vec[i] = m_val;
-            v_vec[i] = v_val;
-
-            let m_hat = m_val / bc1.max(1e-7);
-            let v_hat = v_val / bc2.max(1e-7);
-            param -= lr * m_hat / (v_hat.sqrt() + eps);
-            p_vec[i] = param;
-        }
-
-        let _ = self.from_cpu(&p_vec, p.shape(), p.dtype())?;
-        Ok(Box::new(grim_tensor::backend::ReadyHandle))
-    }
-
-    fn fused_lion_step(
-        &self,
-        p: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        exp_avg: &dyn BackendStorage,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        weight_decay: f32,
-        total: usize,
-    ) -> Result<Box<dyn ComputeHandle>> {
-        let mut p_vec = p.to_cpu_vec_f32()?;
-        let g_vec = g.to_cpu_vec_f32()?;
-        let mut m_vec = exp_avg.to_cpu_vec_f32()?;
-
-        for i in 0..total.min(p_vec.len()) {
-            let grad = g_vec[i];
-            let mut param = p_vec[i];
-            if weight_decay != 0.0 {
-                param -= lr * weight_decay * param;
-            }
-            let c = beta1 * m_vec[i] + (1.0 - beta1) * grad;
-            let update = if c > 0.0 {
-                1.0
-            } else if c < 0.0 {
-                -1.0
-            } else {
-                0.0
-            };
-            param -= lr * update;
-            p_vec[i] = param;
-            m_vec[i] = beta2 * m_vec[i] + (1.0 - beta2) * grad;
-        }
-
-        let _ = self.from_cpu(&p_vec, p.shape(), p.dtype())?;
-        Ok(Box::new(grim_tensor::backend::ReadyHandle))
-    }
 
     fn rope(
         &self,
@@ -3233,128 +3068,6 @@ impl BackendDevice for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-    fn from_cpu_bytes(
-        &self,
-        data: &[u8],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if let Some(ref inner) = self.inner {
-                use objc2_metal::MTLResourceOptions;
-                let buffer = inner
-                    .device
-                    .newBufferWithLength_options(
-                        data.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .ok_or_else(|| {
-                        Error::from(MetalError::AllocationFailed(
-                            "Failed to allocate Metal buffer".into(),
-                        ))
-                    })?;
-
-                let contents = buffer.contents();
-                if !contents.is_null() {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            contents as *mut u8,
-                            data.len(),
-                        );
-                    }
-                }
-
-                return Ok(Box::new(MetalStorage {
-                    buffer: Some(buffer),
-                    data: None,
-                    shape: shape.clone(),
-                    dtype,
-                    provenance: QuantProvenance::GrimNative,
-                }));
-            }
-        }
-        #[cfg(target_vendor = "apple")]
-        {
-            Ok(Box::new(MetalStorage {
-                buffer: None,
-                data: Some(std::sync::Mutex::new(data.to_vec())),
-                shape: shape.clone(),
-                dtype,
-                provenance: QuantProvenance::GrimNative,
-            }))
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Ok(Box::new(MetalStorage {
-                data: std::sync::Mutex::new(data.to_vec()),
-                shape: shape.clone(),
-                dtype,
-                provenance: QuantProvenance::GrimNative,
-            }))
-        }
-    }
-
-    fn selective_scan(
-        &self,
-        x: &dyn BackendStorage,
-        a: &dyn BackendStorage,
-        b: &dyn BackendStorage,
-        c: &dyn BackendStorage,
-        d: &dyn BackendStorage,
-        _state: &dyn BackendStorage,
-        batch: usize,
-        dim_dstate: usize,
-        dim_dinner: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_v = x.to_cpu_vec_f32()?;
-        let a_v = a.to_cpu_vec_f32()?;
-        let b_v = b.to_cpu_vec_f32()?;
-        let c_v = c.to_cpu_vec_f32()?;
-        let d_v = d.to_cpu_vec_f32()?;
-
-        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
-        for b_idx in 0..batch {
-            for d_idx in 0..dim_dinner {
-                let mut h = vec![0.0f32; dim_dstate];
-                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
-
-                for t in 0..seq_len {
-                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
-                    let x_t = x_v[x_idx];
-                    let mut y_t = d_val * x_t;
-
-                    for (s, h_s) in h.iter_mut().enumerate() {
-                        let a_idx = d_idx * dim_dstate + s;
-                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
-                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
-
-                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
-                        let b_val = if b_v.len() > b_idx_off {
-                            b_v[b_idx_off]
-                        } else {
-                            1.0
-                        };
-                        let c_val = if c_v.len() > c_idx_off {
-                            c_v[c_idx_off]
-                        } else {
-                            1.0
-                        };
-
-                        *h_s = a_val * *h_s + x_t * b_val;
-                        y_t += c_val * *h_s;
-                    }
-                    out[x_idx] = y_t;
-                }
-            }
-        }
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
-    }
 
     fn flash_attention(
         &self,
@@ -3385,6 +3098,7 @@ impl BackendDevice for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
+
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3404,94 +3118,219 @@ impl BackendDevice for MetalDevice {
         let _ = seq_len;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
+}
 
-    fn rwkv_time_mix(
+impl FusionOps for MetalDevice {
+}
+
+impl AutogradOps for MetalDevice {
+
+
+    fn silu_mul_backward(
         &self,
-        x: &dyn BackendStorage,
-        w: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
+        e: &dyn BackendStorage,
         g: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        seq_len: usize,
+        dw: &dyn BackendStorage,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_vec = x.to_cpu_vec_f32()?;
-        let k_vec = k.to_cpu_vec_f32()?;
-        let v_vec = v.to_cpu_vec_f32()?;
-        let g_vec = g.to_cpu_vec_f32()?;
-        let w_vec = w.to_cpu_vec_f32()?;
-        tracing::warn!("Metal rwkv_time_mix: falling back to CPU execution");
-        let mut out = vec![0.0f32; batch * seq_len * dim];
-        for b in 0..batch {
-            for d in 0..dim {
-                let mut state = 0.0f32;
-                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
-
-                for t in 0..seq_len {
-                    let idx = (b * seq_len + t) * dim + d;
-                    let k_t = if k_vec.len() > idx {
-                        k_vec[idx]
-                    } else {
-                        x_vec[idx]
-                    };
-                    let v_t = if v_vec.len() > idx {
-                        v_vec[idx]
-                    } else {
-                        x_vec[idx]
-                    };
-                    let g_t = if g_vec.len() > idx {
-                        g_vec[idx]
-                    } else {
-                        1.0f32
-                    };
-
-                    state = w_val * state + k_t * v_t;
-                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
-                    out[idx] = state * sig;
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                let e_s = e.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal silu_mul_backward: e is not MetalStorage".into())
+                })?;
+                let g_s = g.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal silu_mul_backward: g is not MetalStorage".into())
+                })?;
+                let dw_s = dw.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal silu_mul_backward: dw is not MetalStorage".into())
+                })?;
+                let e_buf = e_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("e has no GPU buffer".into()))?;
+                let g_buf = g_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("g has no GPU buffer".into()))?;
+                let dw_buf = dw_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("dw has no GPU buffer".into()))?;
+                let df_storage = self.zeros(out_shape, DType::F32)?;
+                let de_storage = self.zeros(out_shape, DType::F32)?;
+                let df_buf = df_storage
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .unwrap()
+                    .buffer
+                    .as_ref()
+                    .unwrap();
+                let de_buf = de_storage
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .unwrap()
+                    .buffer
+                    .as_ref()
+                    .unwrap();
+                let cmd = self.get_or_create_command_buffer()?;
+                let encoder = cmd.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
+                encoder.setComputePipelineState(&inner.pipelines.silu_mul_backward);
+                encoder.setBuffer_offset_atIndex(Some(e_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(g_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(dw_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(df_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(de_buf), 0, 4);
+                let total = out_shape.elem_count() as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &total as *const i32 as *const std::ffi::c_void,
+                        4,
+                        5,
+                    );
                 }
+                let threads = MTLSize::new(256, 1, 1);
+                let groups = MTLSize::new(((total as usize + 255) / 256) as u64, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                encoder.endEncoding();
+                return Ok((
+                    df_storage,
+                    de_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd,
+                    }),
+                ));
             }
         }
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+        let cpu = CpuDevice::new();
+        let e_cpu = e.to_cpu_vec_f32()?;
+        let g_cpu = g.to_cpu_vec_f32()?;
+        let dw_cpu = dw.to_cpu_vec_f32()?;
+        let mut df = vec![0.0f32; out_shape.elem_count()];
+        let mut de = vec![0.0f32; out_shape.elem_count()];
+        for i in 0..df.len() {
+            let s = 1.0 / (1.0 + (-e_cpu[i]).exp());
+            df[i] = dw_cpu[i] * g_cpu[i] * s * (1.0 + e_cpu[i] * (1.0 - s));
+            de[i] = dw_cpu[i] * s * e_cpu[i];
+        }
+        let df_storage = cpu.from_cpu(&df, out_shape, DType::F32)?;
+        let de_storage = cpu.from_cpu(&de, out_shape, DType::F32)?;
+        #[cfg(target_vendor = "apple")]
+        {
+            let command_buffer = self.get_or_create_command_buffer()?;
+            return Ok((
+                df_storage,
+                de_storage,
+                Box::new(MetalHandle { command_buffer }),
+            ));
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        Ok((df_storage, de_storage, Box::new(MetalHandle)))
     }
+}
 
-    fn rwkv_channel_mix(
+impl OptimizerOps for MetalDevice {
+
+
+    fn fused_adamw_step(
         &self,
-        x: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        r: &dyn BackendStorage,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
         v: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_vec = x.to_cpu_vec_f32()?;
-        let k_vec = k.to_cpu_vec_f32()?;
-        let r_vec = r.to_cpu_vec_f32()?;
-        let v_vec = v.to_cpu_vec_f32()?;
-        tracing::warn!("Metal rwkv_channel_mix: falling back to CPU execution");
-        let elem_count = out_shape.elem_count();
-        let mut out = vec![0.0f32; elem_count];
-        for i in 0..elem_count {
-            let x_val = x_vec[i];
-            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
-            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
-            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut p_vec = p.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let mut m_vec = m.to_cpu_vec_f32()?;
+        let mut v_vec = v.to_cpu_vec_f32()?;
 
-            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
-            let relu_k = k_val.max(0.0f32);
-            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        for i in 0..total.min(p_vec.len()) {
+            let grad = g_vec[i];
+            let mut param = p_vec[i];
+            if weight_decay != 0.0 {
+                param -= lr * weight_decay * param;
+            }
+            let m_val = beta1 * m_vec[i] + (1.0 - beta1) * grad;
+            let v_val = beta2 * v_vec[i] + (1.0 - beta2) * grad * grad;
+            m_vec[i] = m_val;
+            v_vec[i] = v_val;
+
+            let m_hat = m_val / bc1.max(1e-7);
+            let v_hat = v_val / bc2.max(1e-7);
+            param -= lr * m_hat / (v_hat.sqrt() + eps);
+            p_vec[i] = param;
         }
 
-        let _ = batch;
-        let _ = dim;
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+        let _ = self.from_cpu(&p_vec, p.shape(), p.dtype())?;
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
+
+
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut p_vec = p.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let mut m_vec = exp_avg.to_cpu_vec_f32()?;
+
+        for i in 0..total.min(p_vec.len()) {
+            let grad = g_vec[i];
+            let mut param = p_vec[i];
+            if weight_decay != 0.0 {
+                param -= lr * weight_decay * param;
+            }
+            let c = beta1 * m_vec[i] + (1.0 - beta1) * grad;
+            let update = if c > 0.0 {
+                1.0
+            } else if c < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            param -= lr * update;
+            p_vec[i] = param;
+            m_vec[i] = beta2 * m_vec[i] + (1.0 - beta2) * grad;
+        }
+
+        let _ = self.from_cpu(&p_vec, p.shape(), p.dtype())?;
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
+}
+
+impl QuantOps for MetalDevice {
+
+
+    fn quantize(
+        &self,
+        x: &dyn BackendStorage,
+        format: QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let (out, _handle) = self.quantize_on_device(x, format)?;
+        Ok(out)
+    }
+
 
     fn quantized_matmul(
         &self,
@@ -3844,6 +3683,7 @@ impl BackendDevice for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
+
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
@@ -4024,6 +3864,164 @@ impl BackendDevice for MetalDevice {
             Box::new(MetalHandle),
         ))
     }
+}
+
+impl RecurrentOps for MetalDevice {
+
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        _state: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_v = x.to_cpu_vec_f32()?;
+        let a_v = a.to_cpu_vec_f32()?;
+        let b_v = b.to_cpu_vec_f32()?;
+        let c_v = c.to_cpu_vec_f32()?;
+        let d_v = d.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
+        for b_idx in 0..batch {
+            for d_idx in 0..dim_dinner {
+                let mut h = vec![0.0f32; dim_dstate];
+                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
+
+                for t in 0..seq_len {
+                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
+                    let x_t = x_v[x_idx];
+                    let mut y_t = d_val * x_t;
+
+                    for (s, h_s) in h.iter_mut().enumerate() {
+                        let a_idx = d_idx * dim_dstate + s;
+                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+
+                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off {
+                            b_v[b_idx_off]
+                        } else {
+                            1.0
+                        };
+                        let c_val = if c_v.len() > c_idx_off {
+                            c_v[c_idx_off]
+                        } else {
+                            1.0
+                        };
+
+                        *h_s = a_val * *h_s + x_t * b_val;
+                        y_t += c_val * *h_s;
+                    }
+                    out[x_idx] = y_t;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let w_vec = w.to_cpu_vec_f32()?;
+        tracing::warn!("Metal rwkv_time_mix: falling back to CPU execution");
+        let mut out = vec![0.0f32; batch * seq_len * dim];
+        for b in 0..batch {
+            for d in 0..dim {
+                let mut state = 0.0f32;
+                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
+
+                for t in 0..seq_len {
+                    let idx = (b * seq_len + t) * dim + d;
+                    let k_t = if k_vec.len() > idx {
+                        k_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let v_t = if v_vec.len() > idx {
+                        v_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let g_t = if g_vec.len() > idx {
+                        g_vec[idx]
+                    } else {
+                        1.0f32
+                    };
+
+                    state = w_val * state + k_t * v_t;
+                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
+                    out[idx] = state * sig;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let r_vec = r.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+        tracing::warn!("Metal rwkv_channel_mix: falling back to CPU execution");
+        let elem_count = out_shape.elem_count();
+        let mut out = vec![0.0f32; elem_count];
+        for i in 0..elem_count {
+            let x_val = x_vec[i];
+            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
+            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
+            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+
+            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
+            let relu_k = k_val.max(0.0f32);
+            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        }
+
+        let _ = batch;
+        let _ = dim;
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+}
+
+impl CollectiveOps for MetalDevice {
+
 
     #[allow(unused_variables)] // locals only used on the cfg-gated Apple path
     fn all_reduce(
@@ -4140,6 +4138,7 @@ impl BackendDevice for MetalDevice {
         #[cfg(not(target_vendor = "apple"))]
         Ok((storage, Box::new(MetalHandle)))
     }
+
 
     #[allow(unused_variables)] // locals only used on the cfg-gated Apple path
     fn comm_fuse_reduce(
@@ -4267,6 +4266,7 @@ impl BackendDevice for MetalDevice {
         Ok(storage)
     }
 
+
     fn estimate_gemm_latency_ms(
         &self,
         m: usize,
@@ -4284,6 +4284,77 @@ impl BackendDevice for MetalDevice {
         (flops / (tflops * 1e12) * 1000.0).max(0.01)
     }
 }
+
+impl MemoryOps for MetalDevice {
+
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                use objc2_metal::MTLResourceOptions;
+                let buffer = inner
+                    .device
+                    .newBufferWithLength_options(
+                        data.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| {
+                        Error::from(MetalError::AllocationFailed(
+                            "Failed to allocate Metal buffer".into(),
+                        ))
+                    })?;
+
+                let contents = buffer.contents();
+                if !contents.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            contents as *mut u8,
+                            data.len(),
+                        );
+                    }
+                }
+
+                return Ok(Box::new(MetalStorage {
+                    buffer: Some(buffer),
+                    data: None,
+                    shape: shape.clone(),
+                    dtype,
+                    provenance: QuantProvenance::GrimNative,
+                }));
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            Ok(Box::new(MetalStorage {
+                buffer: None,
+                data: Some(std::sync::Mutex::new(data.to_vec())),
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            }))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Ok(Box::new(MetalStorage {
+                data: std::sync::Mutex::new(data.to_vec()),
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            }))
+        }
+    }
+}
+
+impl GraphCaptureOps for MetalDevice {
+}
+
 
 impl MetalDevice {
     #[allow(clippy::too_many_arguments)]

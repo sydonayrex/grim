@@ -2,7 +2,7 @@
 
 use grim_backend_metal::MetalDevice;
 use grim_tensor::dtype::DType;
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, Shape};
 
 #[test]
 fn test_metal_fused_add_rms_norm_parity() {
