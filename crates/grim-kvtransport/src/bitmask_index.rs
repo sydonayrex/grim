@@ -108,6 +108,14 @@ impl BitmaskChunkIndex {
     }
 
     /// Record a chunk's presence in a specific cache tier.
+    ///
+    /// Tier bits model *presence*, not exclusivity: `record_chunk` sets the
+    /// given tier's bit and leaves all other bits untouched, so a chunk that
+    /// is copied into a second tier shows both. A chunk that *migrates*
+    /// between tiers must transition explicitly — prefer
+    /// [`Self::update_chunk_tier`], or pair `record_chunk` with
+    /// [`Self::remove_tier`] — otherwise the stale bit keeps `highest_tier`
+    /// reporting the old placement.
     pub fn record_chunk(
         &mut self,
         chunk_hash: u64,
