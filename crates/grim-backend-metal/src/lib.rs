@@ -121,6 +121,10 @@ struct MetalPipelines {
     matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     reduce_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     qkv_paged_dequant_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    sub: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    reduce_sum: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    reduce_max: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    argmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -273,6 +277,10 @@ impl MetalContext {
                 matmul_split_k: get_pipeline("grim_matmul_split_k")?,
                 reduce_split_k: get_pipeline("grim_reduce_split_k")?,
                 qkv_paged_dequant_attn: get_pipeline("grim_qkv_attention_paged_dequant")?,
+                sub: get_pipeline("grim_sub")?,
+                reduce_sum: get_pipeline("grim_reduce_sum")?,
+                reduce_max: get_pipeline("grim_reduce_max")?,
+                argmax: get_pipeline("grim_argmax")?,
             });
 
             Ok(MetalContext {
@@ -2268,6 +2276,60 @@ impl ElementwiseOps for MetalDevice {
         let res: Vec<f32> = x_vec.into_iter().map(|v| 1.0 / v).collect();
         let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn sub(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                if a.dtype().arith != ArithType::F32 || b.dtype().arith != ArithType::F32 {
+                    return Err(Error::from(MetalError::UnsupportedDType(a.dtype())));
+                }
+                return self.run_elementwise(inner, &inner.pipelines.sub, a, b, out);
+            }
+        }
+        let a_vec = a.to_cpu_vec_f32()?;
+        let b_vec = b.to_cpu_vec_f32()?;
+        if a_vec.len() != b_vec.len() {
+            return Err(Error::Backend(format!(
+                "Metal sub length mismatch: {} vs {}",
+                a_vec.len(),
+                b_vec.len()
+            )));
+        }
+        let res: Vec<f32> = a_vec.iter().zip(b_vec.iter()).map(|(x, y)| x - y).collect();
+        let out_storage = self.from_cpu(&res, out, a.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        if v.is_empty() {
+            return Err(Error::Backend("reduce_sum: empty tensor".into()));
+        }
+        Ok(v.iter().sum())
+    }
+
+    fn reduce_max(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .copied()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| Error::Backend("reduce_max: empty tensor".into()))
+    }
+
+    fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .ok_or_else(|| Error::Backend("argmax: empty tensor".into()))
     }
 }
 

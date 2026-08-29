@@ -228,3 +228,103 @@ kernel void grim_rope(
         out[i1] = v0 * sin_val + v1 * cos_val;
     }
 }
+
+kernel void grim_sub(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        c[id] = a[id] - b[id];
+    }
+}
+
+kernel void grim_reduce_sum(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    threadgroup float sdata[256];
+    uint global_idx = bid * bdim + tid;
+    float my_val = (global_idx < uint(n)) ? in[global_idx] : 0.0f;
+    sdata[tid] = my_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = bdim / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out[bid] = sdata[0];
+    }
+}
+
+kernel void grim_reduce_max(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    threadgroup float sdata[256];
+    uint global_idx = bid * bdim + tid;
+    float my_val = (global_idx < uint(n)) ? in[global_idx] : -1e30f;
+    sdata[tid] = my_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = bdim / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out[bid] = sdata[0];
+    }
+}
+
+kernel void grim_argmax(
+    device const float* in [[buffer(0)]],
+    device uint* out_idx [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint bdim [[threads_per_threadgroup]]
+) {
+    threadgroup float s_val[256];
+    threadgroup uint s_idx[256];
+    uint global_idx = bid * bdim + tid;
+
+    if (global_idx < uint(n)) {
+        s_val[tid] = in[global_idx];
+        s_idx[tid] = global_idx;
+    } else {
+        s_val[tid] = -1e30f;
+        s_idx[tid] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = bdim / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid] || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] > s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out_idx[bid] = s_idx[0];
+    }
+}
