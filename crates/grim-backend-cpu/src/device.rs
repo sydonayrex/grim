@@ -2111,19 +2111,20 @@ pub fn cpu_tensor(data: Vec<f32>, shape: Shape) -> grim_tensor::Tensor {
     )
 }
 
-/// Add two tensors element-wise (broadcasting allowed).
+/// Add two tensors element-wise (broadcasting allowed across rank differences).
 pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let target_shape = a.shape().broadcast_shape(b.shape())?;
     let dev = CpuDevice::new();
     let (s, h) = grim_tensor::CoreTensorOps::add(
         &dev,
         a.storage().as_ref(),
         b.storage().as_ref(),
-        a.shape(),
+        &target_shape,
     )?;
     h.synchronize()?;
     Ok(Tensor::new(
         Arc::from(s),
-        a.shape().clone(),
+        target_shape,
         DType::F32,
         a.provenance().clone(),
         a.device().clone(),

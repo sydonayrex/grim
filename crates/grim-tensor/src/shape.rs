@@ -114,6 +114,32 @@ impl Shape {
         }
         true
     }
+
+    /// Compute the common broadcasted target shape of two shapes, if compatible.
+    pub fn broadcast_shape(&self, other: &Shape) -> Result<Shape> {
+        let a = self.dims();
+        let b = other.dims();
+        let n = a.len().max(b.len());
+        let mut out_dims = vec![0usize; n];
+        for i in 0..n {
+            let ad = if i < a.len() { a[a.len() - 1 - i] } else { 1 };
+            let bd = if i < b.len() { b[b.len() - 1 - i] } else { 1 };
+            if ad == bd {
+                out_dims[n - 1 - i] = ad;
+            } else if ad == 1 {
+                out_dims[n - 1 - i] = bd;
+            } else if bd == 1 {
+                out_dims[n - 1 - i] = ad;
+            } else {
+                return Err(Error::Shape(format!(
+                    "shapes {:?} and {:?} are not broadcast compatible",
+                    self.dims(),
+                    other.dims()
+                )));
+            }
+        }
+        Ok(Shape::new(out_dims))
+    }
 }
 
 impl From<Vec<usize>> for Shape {
