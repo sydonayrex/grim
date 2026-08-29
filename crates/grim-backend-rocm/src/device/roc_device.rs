@@ -4572,12 +4572,12 @@ impl BackendDevice for RocmDevice {
         // [window_lo_block, abs_i + 1). This is a conservative lower bound:
         // threads whose abs_i > cache_offset attend to slightly more KV than they
         // should, but the causal upper bound (abs_i + 1) is still enforced.
-        // Laguna-S-2.1 uses seq_len == 1 for all decode calls so the bound is exact.
         let window_lo_i: i32 = match window {
             None => 0,
             Some(w) => {
                 let abs_first = cache_offset as usize;
-                abs_first.saturating_sub(w.saturating_sub(1)) as i32
+                let win_lo = abs_first.saturating_sub(w.saturating_sub(1));
+                i32::try_from(win_lo).map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
             }
         };
         let config = {
@@ -4595,7 +4595,12 @@ impl BackendDevice for RocmDevice {
                 } else {
                     hidden_dim / num_kv_heads.max(1)
                 };
-                let num_heads = hidden_dim.checked_div(head_dim).unwrap_or(1);
+                if head_dim == 0 {
+                    return Err(Error::Shape(
+                        "qkv_attention head_dim resolved to zero; malformed model dimension".into(),
+                    ));
+                }
+                let num_heads = hidden_dim / head_dim;
                 (seq_len, num_heads, head_dim)
             } else {
                 return Err(Error::Shape(
