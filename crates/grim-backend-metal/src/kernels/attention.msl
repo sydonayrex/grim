@@ -1,0 +1,207 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void grim_qkv_attention(
+    device const float* q [[buffer(0)]],
+    device const float* k_tensor [[buffer(1)]],
+    device const float* v_tensor [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* out_max [[buffer(4)]],
+    device float* out_sum [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& num_kv_heads [[buffer(7)]],
+    constant int& head_dim [[buffer(8)]],
+    constant int& seq_len [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& cache_offset [[buffer(11)]],
+    constant float& inv_sqrt_d [[buffer(12)]],
+    constant int& window_lo [[buffer(13)]],
+    constant int& has_window [[buffer(14)]],
+    uint2 id [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint i = tg_id.x;
+    uint h = tg_id.y;
+    if (i >= uint(seq_len) || h >= uint(num_heads)) return;
+
+    int q_per_kv = num_heads / num_kv_heads;
+    int kv_head = h / q_per_kv;
+    int q_offset = (i * num_heads + h) * head_dim;
+    int abs_i = cache_offset + i;
+    int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    // SWA lower bound: has_window > 0 ⇒ start at window_lo (0 = full causal).
+    int lo = (has_window > 0) ? window_lo : 0;
+    int range_len = (lo < hi) ? (hi - lo) : 0;
+
+    // Threadgroup tiling buffers for key-value slots
+    threadgroup float tile_k[32][32];
+    threadgroup float tile_v[32][32];
+
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Output registers accumulator
+    float acc[128] = {0.0f};
+
+    // Load query locally
+    float local_q[128];
+    for (int d = 0; d < head_dim && d < 128; ++d) {
+        local_q[d] = q[q_offset + d];
+    }
+
+    for (int block_start = lo; block_start < lo + range_len; block_start += 32) {
+        int block_end = min(block_start + 32, hi);
+        
+        // Coalesced collaborative load from device memory to threadgroup shared storage
+        if (tid < 32) {
+            for (int d = 0; d < head_dim && d < 32; ++d) {
+                int j = block_start + tid;
+                if (j < block_end) {
+                    tile_k[tid][d] = k_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+                    tile_v[tid][d] = v_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+                } else {
+                    tile_k[tid][d] = 0.0f;
+                    tile_v[tid][d] = 0.0f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Score evaluation & scaling over the block
+        for (int j_local = 0; j_local < (block_end - block_start); ++j_local) {
+            float score = 0.0f;
+            for (int d = 0; d < head_dim && d < 32; ++d) {
+                score += local_q[d] * tile_k[j_local][d];
+            }
+            score *= inv_sqrt_d;
+
+            float prev_max = running_max;
+            running_max = max(running_max, score);
+            float scale_prev = exp(prev_max - running_max);
+            float scale_score = exp(score - running_max);
+            
+            running_sum = running_sum * scale_prev + scale_score;
+
+            for (int d = 0; d < head_dim && d < 128; ++d) {
+                acc[d] = acc[d] * scale_prev + scale_score * tile_v[j_local][d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_sum = running_sum > 0.0f ? (1.0f / running_sum) : 1.0f;
+    for (int d = 0; d < head_dim && d < 128; ++d) {
+        out[q_offset + d] = acc[d] * inv_sum;
+    }
+
+    if (out_max != nullptr) {
+        out_max[i * num_heads + h] = running_max;
+    }
+    if (out_sum != nullptr) {
+        out_sum[i * num_heads + h] = running_sum;
+    }
+}
+
+kernel void grim_qkv_attention_paged(
+    device const float* q [[buffer(0)]],
+    device const float* k_pages [[buffer(1)]],
+    device const float* v_pages [[buffer(2)]],
+    device const uint* block_table [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant int& batch [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& head_dim [[buffer(7)]],
+    constant int& page_size [[buffer(8)]],
+    constant int& max_blocks [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& num_kv_heads [[buffer(11)]],
+    constant int& window_lo [[buffer(12)]],
+    constant int& has_window [[buffer(13)]],
+    uint3 id [[thread_position_in_grid]]) {
+    int d = int(id.x);
+    int h = int(id.y);
+    int b = int(id.z);
+    if (b >= batch || h >= num_heads || d >= head_dim) return;
+    int q_base = (b * num_heads + h) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    float acc = 0.0f;
+    int lo = (has_window > 0) ? window_lo : 0;
+    for (int pos = lo; pos < kv_seq_len; ++pos) {
+        int logical_block = pos / page_size;
+        if (logical_block >= max_blocks) break;
+        int physical_block = int(block_table[b * max_blocks + logical_block]);
+        int offset = pos % page_size;
+        int kv_head = h / (num_heads / num_kv_heads);
+        int kv_base = ((physical_block * page_size + offset) * num_kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int qd = 0; qd < head_dim; ++qd) score += q[q_base + qd] * k_pages[kv_base + qd];
+        score *= scale;
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float old_weight = exp(old_max - running_max);
+        float new_weight = exp(score - running_max);
+        running_sum = running_sum * old_weight + new_weight;
+        acc = acc * old_weight + new_weight * v_pages[kv_base + d];
+    }
+    out[q_base + d] = running_sum > 0.0f ? acc / running_sum : 0.0f;
+}
+
+kernel void grim_tree_attention(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device const uint* parents [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant int& batch [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& kv_seq_len [[buffer(7)]],
+    constant int& head_dim [[buffer(8)]],
+    constant int& gamma [[buffer(9)]],
+    constant int& cache_offset [[buffer(10)]],
+    constant int& num_kv_heads [[buffer(11)]],
+    uint3 id [[thread_position_in_grid]]) {
+    int d = int(id.x);
+    int head_work = int(id.y);
+    int b = int(id.z);
+    int nodes = gamma + 1;
+    int node = head_work / num_heads;
+    int q_head = head_work % num_heads;
+    if (b >= batch || node >= nodes || d >= head_dim) return;
+    int q_base = ((b * nodes + node) * num_heads) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    float acc = 0.0f;
+    for (int pos = 0; pos < kv_seq_len; ++pos) {
+        bool attend = pos < cache_offset;
+        if (!attend) {
+            int tree_node = pos - cache_offset;
+            if (tree_node <= node) {
+                attend = tree_node == node;
+                int cursor = node;
+                for (int depth = 0; depth <= gamma && cursor > 0; ++depth) {
+                    cursor = int(parents[cursor]);
+                    if (cursor == tree_node) { attend = true; break; }
+                }
+            }
+        }
+        if (!attend) continue;
+        int q_per_kv = num_heads / num_kv_heads;
+        int kv_head = q_head / q_per_kv;
+        int q_head_base = q_base + q_head * head_dim;
+        int kv_base = ((b * kv_seq_len + pos) * num_kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int qd = 0; qd < head_dim; ++qd) score += q[q_head_base + qd] * k[kv_base + qd];
+        score *= scale;
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float old_weight = exp(old_max - running_max);
+        float new_weight = exp(score - running_max);
+        running_sum = running_sum * old_weight + new_weight;
+        acc = acc * old_weight + new_weight * v[kv_base + d];
+    }
+    out[q_base + d] = running_sum > 0.0f ? acc / running_sum : 0.0f;
+}

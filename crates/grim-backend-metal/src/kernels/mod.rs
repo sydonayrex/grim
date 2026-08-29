@@ -6,3 +6,6 @@ pub const MATH_MSL: &str = include_str!("math.msl");
 pub fn load_unified_msl() -> &'static str {
     include_str!("../kernels.msl")
 }
+
+pub const GEMM_MSL: &str = include_str!("gemm.msl");
+pub const ATTENTION_MSL: &str = include_str!("attention.msl");
