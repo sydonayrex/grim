@@ -27,6 +27,28 @@ use std::sync::Arc;
 // Re-export Sampler trait for plugin integration
 pub use grim_core::sampler::Sampler;
 
+/// Trait for custom tokenizer plugins (WASM/Dylib).
+pub trait TokenizerPlugin: Send + Sync {
+    /// Tokenizer identifier name.
+    fn name(&self) -> &str;
+    /// Encode input text to token IDs.
+    fn encode(&self, text: &str) -> Result<Vec<u32>>;
+    /// Decode token IDs to text string.
+    fn decode(&self, tokens: &[u32]) -> Result<String>;
+    /// Vocabulary size.
+    fn vocab_size(&self) -> u32;
+}
+
+/// Trait for pre/post-processor plugins (WASM/Dylib).
+pub trait ProcessorPlugin: Send + Sync {
+    /// Processor identifier name.
+    fn name(&self) -> &str;
+    /// Pre-process input text or prompt templates before tokenization/inference.
+    fn preprocess(&self, input: &str, context_json: &str) -> Result<String>;
+    /// Post-process generated output text after generation.
+    fn postprocess(&self, output: &str, context_json: &str) -> Result<String>;
+}
+
 /// Bitflags describing what a plugin provides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -390,9 +412,11 @@ pub fn validate_abi(manifest: &PluginManifest, engine_abi: u32) -> Result<()> {
     Ok(())
 }
 
-/// Plugin registry that holds loaded samplers, processors, and their factories.
+/// Plugin registry that holds loaded samplers, processors, tokenizers, and their factories.
 pub struct PluginRegistry {
     samplers: HashMap<String, Arc<dyn Sampler>>,
+    tokenizers: HashMap<String, Arc<dyn TokenizerPlugin>>,
+    processors: HashMap<String, Arc<dyn ProcessorPlugin>>,
     manifests: HashMap<String, PluginManifest>,
     processor_chain: Vec<PluginManifest>,
 }
@@ -401,6 +425,8 @@ impl PluginRegistry {
     pub fn new() -> Self {
         Self {
             samplers: HashMap::new(),
+            tokenizers: HashMap::new(),
+            processors: HashMap::new(),
             manifests: HashMap::new(),
             processor_chain: Vec::new(),
         }
@@ -419,6 +445,36 @@ impl PluginRegistry {
     /// Check if a sampler is registered.
     pub fn has_sampler(&self, name: &str) -> bool {
         self.samplers.contains_key(name)
+    }
+
+    /// Register a tokenizer plugin by name.
+    pub fn register_tokenizer(&mut self, name: String, tokenizer: Arc<dyn TokenizerPlugin>) {
+        self.tokenizers.insert(name, tokenizer);
+    }
+
+    /// Get a tokenizer by name.
+    pub fn get_tokenizer(&self, name: &str) -> Option<Arc<dyn TokenizerPlugin>> {
+        self.tokenizers.get(name).cloned()
+    }
+
+    /// Check if a tokenizer is registered.
+    pub fn has_tokenizer(&self, name: &str) -> bool {
+        self.tokenizers.contains_key(name)
+    }
+
+    /// Register a processor plugin by name.
+    pub fn register_processor(&mut self, name: String, processor: Arc<dyn ProcessorPlugin>) {
+        self.processors.insert(name, processor);
+    }
+
+    /// Get a processor by name.
+    pub fn get_processor(&self, name: &str) -> Option<Arc<dyn ProcessorPlugin>> {
+        self.processors.get(name).cloned()
+    }
+
+    /// Check if a processor is registered.
+    pub fn has_processor(&self, name: &str) -> bool {
+        self.processors.contains_key(name)
     }
 
     /// Register a manifest for a loaded plugin.
@@ -662,5 +718,30 @@ max_memory_mb = 64
 
         registry.register_sampler("test-sampler".to_string(), Arc::new(TestSampler));
         assert!(registry.has_sampler("test-sampler"));
+
+        // Test custom tokenizer registration
+        struct TestTokenizer;
+        impl TokenizerPlugin for TestTokenizer {
+            fn name(&self) -> &str { "test-tokenizer" }
+            fn encode(&self, _text: &str) -> Result<Vec<u32>> { Ok(vec![1, 2, 3]) }
+            fn decode(&self, _tokens: &[u32]) -> Result<String> { Ok("decoded".into()) }
+            fn vocab_size(&self) -> u32 { 32000 }
+        }
+        assert!(registry.get_tokenizer("test-tokenizer").is_none());
+        registry.register_tokenizer("test-tokenizer".to_string(), Arc::new(TestTokenizer));
+        assert!(registry.has_tokenizer("test-tokenizer"));
+        assert_eq!(registry.get_tokenizer("test-tokenizer").unwrap().vocab_size(), 32000);
+
+        // Test custom processor registration
+        struct TestProcessor;
+        impl ProcessorPlugin for TestProcessor {
+            fn name(&self) -> &str { "test-processor" }
+            fn preprocess(&self, input: &str, _ctx: &str) -> Result<String> { Ok(format!("pre:{input}")) }
+            fn postprocess(&self, output: &str, _ctx: &str) -> Result<String> { Ok(format!("post:{output}")) }
+        }
+        assert!(registry.get_processor("test-processor").is_none());
+        registry.register_processor("test-processor".to_string(), Arc::new(TestProcessor));
+        assert!(registry.has_processor("test-processor"));
+        assert_eq!(registry.get_processor("test-processor").unwrap().preprocess("foo", "{}").unwrap(), "pre:foo");
     }
 }
