@@ -132,14 +132,24 @@ pub fn shard_raw_tensor(
 
     let shape = &raw.shape;
     let ndim = shape.len();
-    if ndim < 2 {
+    if ndim != 2 {
         return Err(Error::Shape(format!(
-            "shard_raw_tensor: tensor must be 2D (got {}D)",
+            "shard_raw_tensor: tensor must be 2D (got {}D) — byte offsets below assume [rows, cols]",
             ndim
         )));
     }
 
     let (rows, cols) = (shape[0], shape[1]);
+
+    // Non-divisible dims would silently truncate (rows / world_size) and
+    // drop the tail from every rank — that is silent weight corruption,
+    // so refuse instead.
+    if rows % world_size != 0 || cols % world_size != 0 {
+        return Err(Error::Shape(format!(
+            "shard_raw_tensor: dims {rows}x{cols} not divisible by world_size {world_size} \
+             — sharding would silently drop rows/cols"
+        )));
+    }
 
     if dim == 0 {
         // Column-parallel: contiguous row slice.
@@ -267,5 +277,42 @@ mod tests {
         assert!(shard_boundary_valid(256, 4, 32));
         // world_size 0 → invalid.
         assert!(!shard_boundary_valid(256, 0, 16));
+    }
+
+    /// L1 regression: non-divisible dims must ERROR — the old code
+    /// truncated and silently dropped the tail rows/cols from every rank.
+    #[test]
+    fn sharded_non_divisible_dims_error() {
+        let raw = RawTensor {
+            bytes: vec![0u8; 5 * 2 * 4],
+            shape: vec![5, 2],
+            dtype: DType::F32,
+            provenance: QuantProvenance::GrimNative,
+        };
+        let err = shard_raw_tensor(raw.clone(), 0, 0, 2).expect_err("5 rows / 2 ranks must error");
+        assert!(err.to_string().contains("not divisible"), "{err}");
+
+        let raw = RawTensor {
+            bytes: vec![0u8; 4 * 3 * 4],
+            shape: vec![4, 3],
+            dtype: DType::F32,
+            provenance: QuantProvenance::GrimNative,
+        };
+        let err = shard_raw_tensor(raw, 1, 0, 2).expect_err("3 cols / 2 ranks must error");
+        assert!(err.to_string().contains("not divisible"), "{err}");
+    }
+
+    /// L2 regression: rank > 2 must ERROR — the old code sliced with 2D
+    /// offsets over a 3D buffer and returned wrong bytes.
+    #[test]
+    fn sharded_rank3_tensor_errors() {
+        let raw = RawTensor {
+            bytes: vec![0u8; 2 * 2 * 2 * 4],
+            shape: vec![2, 2, 2],
+            dtype: DType::F32,
+            provenance: QuantProvenance::GrimNative,
+        };
+        let err = shard_raw_tensor(raw, 0, 0, 2).expect_err("3D tensor must error");
+        assert!(err.to_string().contains("must be 2D"), "{err}");
     }
 }

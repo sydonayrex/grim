@@ -246,12 +246,22 @@ pub trait BackendDevice: Send + Sync {
     }
 
     /// Elementwise scalar division: `out = x / scalar`.
+    ///
+    /// Default decomposes into `mul_scalar(1/scalar)`: identical result for
+    /// powers of two, up to 1 ulp otherwise. Backends that need exact
+    /// division override this. `scalar == 0` is an error (the decomposition
+    /// would silently produce `x * inf`).
     fn div_scalar(
         &self,
         x: &dyn BackendStorage,
         scalar: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if scalar == 0.0 {
+            return Err(crate::error::Error::Backend(
+                "div_scalar: division by zero scalar".into(),
+            ));
+        }
         self.mul_scalar(x, 1.0 / scalar, out_shape)
     }
 
@@ -272,13 +282,19 @@ pub trait BackendDevice: Send + Sync {
             ));
         }
         if temperature <= 0.0 || (top_k == 1 && (top_p >= 1.0 || top_p <= 0.0)) {
-            // Greedy argmax
-            let (max_idx, _) = cpu_logits
+            // Greedy argmax (len > 1 guaranteed by the empty check above,
+            // so this cannot fail — and NaN logits lose the max_by ordering
+            // deterministically instead of panicking).
+            if let Some((max_idx, _)) = cpu_logits
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap();
-            return Ok(max_idx as u32);
+            {
+                return Ok(max_idx as u32);
+            }
+            return Err(crate::error::Error::Backend(
+                "sample_on_device: empty logits".into(),
+            ));
         }
         // Stochastic sample with temperature and top-k/top-p filtering
         let mut scaled: Vec<(usize, f32)> = cpu_logits
@@ -291,6 +307,14 @@ pub trait BackendDevice: Send + Sync {
             scaled.truncate(top_k as usize);
         }
         let max_logit = scaled[0].1;
+        // All-(-inf) (or NaN) max would make `l - max` NaN and every
+        // probability NaN — sampling from NaN weights silently returns
+        // index 0. Refuse instead.
+        if !max_logit.is_finite() {
+            return Err(crate::error::Error::Backend(format!(
+                "sample_on_device: logits have non-finite maximum ({max_logit})"
+            )));
+        }
         let mut exp_sum = 0.0f32;
         let mut probs: Vec<(usize, f32)> = scaled
             .iter()
@@ -1341,6 +1365,18 @@ pub trait BackendDevice: Send + Sync {
         };
         let (rank, in_features_a) = (a.shape().dims()[0], a.shape().dims()[1]);
         let (out_features, rank_b) = (b.shape().dims()[0], b.shape().dims()[1]);
+        // Mismatched LoRA geometry would flow into matmul as garbage (or an
+        // opaque backend error) — fail with the actual shapes instead.
+        if rank != rank_b {
+            return Err(crate::error::Error::Shape(format!(
+                "lora_accumulate: A rank {rank} != B rank {rank_b}"
+            )));
+        }
+        if in_features != in_features_a {
+            return Err(crate::error::Error::Shape(format!(
+                "lora_accumulate: x in_features {in_features} != A in_features {in_features_a}"
+            )));
+        }
 
         let owned_x_2d;
         let x_storage_2d: &dyn BackendStorage = if x_dims.len() == 2 {
@@ -1603,6 +1639,223 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).div_scalar(x, scalar, out_shape)
+    }
+
+    fn sample_on_device(
+        &self,
+        logits: &dyn BackendStorage,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        seed: u64,
+    ) -> Result<u32> {
+        (**self).sample_on_device(logits, temperature, top_p, top_k, seed)
+    }
+
+    fn qkv_attention_alibi(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        window: Option<usize>,
+        alibi_slopes: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).qkv_attention_alibi(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            window,
+            alibi_slopes,
+            out_shape,
+        )
+    }
+
+    fn rerope(
+        &self,
+        k: &dyn BackendStorage,
+        old_positions: &[u32],
+        new_positions: &[u32],
+        cfg: &RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rerope(k, old_positions, new_positions, cfg, out_shape)
+    }
+
+    fn fused_add_rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).fused_add_rms_norm(x, residual, weight, eps, out_shape)
+    }
+
+    fn fused_mxfp4_gemm_qk_norm_rope_kv(
+        &self,
+        x: &dyn BackendStorage,
+        gamma_q: &dyn BackendStorage,
+        gamma_k: &dyn BackendStorage,
+        w_codes: &dyn BackendStorage,
+        w_exps: &dyn BackendStorage,
+        q_out: Option<&dyn BackendStorage>,
+        k_cache: Option<&dyn BackendStorage>,
+        v_cache: Option<&dyn BackendStorage>,
+        out_all: Option<&dyn BackendStorage>,
+        positions: Option<&dyn BackendStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq: Option<&dyn BackendStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).fused_mxfp4_gemm_qk_norm_rope_kv(
+            x,
+            gamma_q,
+            gamma_k,
+            w_codes,
+            w_exps,
+            q_out,
+            k_cache,
+            v_cache,
+            out_all,
+            positions,
+            m,
+            k,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rope_theta,
+            inv_freq,
+            mscale,
+            eps,
+            max_seq_len,
+        )
+    }
+
+    fn broadcast_bias(
+        &self,
+        bias: &dyn BackendStorage,
+        batch: usize,
+        out_dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).broadcast_bias(bias, batch, out_dim, out_shape)
+    }
+
+    fn scale_bias_epilogue(
+        &self,
+        out: &dyn BackendStorage,
+        a_scale: Option<&dyn BackendStorage>,
+        b_scale: Option<&dyn BackendStorage>,
+        bias: Option<&dyn BackendStorage>,
+        batch: usize,
+        out_dim: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).scale_bias_epilogue(out, a_scale, b_scale, bias, batch, out_dim)
+    }
+
+    fn short_conv1d_causal_step(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).short_conv1d_causal_step(x, weight, bias, state, out_shape)
+    }
+
+    fn kda_gated_delta_rule_step(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        a_gate: &dyn BackendStorage,
+        recurrent_state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).kda_gated_delta_rule_step(
+            q, k, v, beta, a_gate, recurrent_state, d_k, d_v, out_shape,
+        )
+    }
+
+    fn mla_q_kv_norm_split(
+        &self,
+        q_raw: &dyn BackendStorage,
+        kv_raw: &dyn BackendStorage,
+        q_norm_w: &dyn BackendStorage,
+        kv_norm_w: &dyn BackendStorage,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_dim: usize,
+        eps: f32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).mla_q_kv_norm_split(
+            q_raw,
+            kv_raw,
+            q_norm_w,
+            kv_norm_w,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_dim,
+            eps,
+        )
+    }
+
+    fn mla_absorbed_decode(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).mla_absorbed_decode(
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+        )
     }
 
     fn silu_mul_quantize(

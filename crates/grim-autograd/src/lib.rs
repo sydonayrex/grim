@@ -20,7 +20,7 @@
 //! # Scope limits (from §WI-T1)
 //!
 //! - No autodiff for the frozen base weights — that is WI-T8's problem.
-//! - No reimplementing `grim-tensor-graph`'s fusion IR; that's a different shape.
+//! - No reimplementing `grim-format::fusion`'s detector; that's a different shape.
 //! - No reaching into `grim-backend-rocm` kernel internals — goes through
 //!   `BackendDevice` like existing forward code.
 //!

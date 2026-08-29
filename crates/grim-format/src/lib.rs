@@ -3,6 +3,9 @@
 pub mod awq;
 pub mod bolt_on;
 pub mod convert;
+/// Fusion-pattern detection over checkpoint tensor names (folded in from
+/// the former grim-tensor-graph crate; `GrimFusionOp` lives here).
+pub mod fusion;
 pub mod format;
 pub mod ftw;
 pub mod gguf;
@@ -18,6 +21,7 @@ pub mod train;
 pub mod weight_format;
 
 pub use awq::{AwqConfig, AwqProvider, AwqTensorInfo, pack_awq_group_int};
+pub use fusion::{FusionGroup, TensorGraphIr, build_transformer_ir};
 pub use ftw::{FtwDirectLoader, FtwHeader, FtwHostBank, FtwQuantFormat};
 pub use torch::{PthProvider, TorchTensorEntry};
 

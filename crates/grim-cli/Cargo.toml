@@ -15,7 +15,6 @@ path = "src/lib.rs"
 
 [dependencies]
 grim-tensor = { workspace = true }
-grim-tensor-graph = { workspace = true }
 grim-core = { workspace = true }
 grim-engine = { workspace = true }
 grim-server = { workspace = true }

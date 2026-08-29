@@ -34,6 +34,10 @@
 /// assert_eq!(padded_dims(64, 64, 64), (64, 64));
 /// ```
 pub const fn padded_dims(rows: usize, cols: usize, wavefront_size: u32) -> (usize, usize) {
+    debug_assert!(
+        wavefront_size.is_power_of_two(),
+        "padded_dims: wavefront_size must be a power of two — the bit-mask rounding is wrong otherwise"
+    );
     let wf = wavefront_size as usize;
     let rows_padded = (rows + wf - 1) & !(wf - 1);
     let cols_padded = (cols + wf - 1) & !(wf - 1);

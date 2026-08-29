@@ -380,6 +380,101 @@ impl DType {
     pub fn is_quantized(&self) -> bool {
         !matches!(self.storage, Storage::Native)
     }
+
+    /// Calculate expected byte size for a given element count or shape under this DType.
+    pub fn expected_bytes(&self, elem_count: usize) -> usize {
+        match &self.storage {
+            Storage::Native => elem_count * self.arith.byte_size(),
+            Storage::KQuant(k) => match k {
+                KQuantScheme::Q80 => (elem_count.div_ceil(32)) * 34,
+                KQuantScheme::Q4K => (elem_count.div_ceil(256)) * 144,
+                KQuantScheme::Q5K => (elem_count.div_ceil(256)) * 176,
+                KQuantScheme::Q6K => (elem_count.div_ceil(256)) * 210,
+                KQuantScheme::Q2K => (elem_count.div_ceil(256)) * 84,
+                KQuantScheme::Q3K => (elem_count.div_ceil(256)) * 110,
+                KQuantScheme::IQ4NL | KQuantScheme::IQ4XS => (elem_count.div_ceil(32)) * 18,
+                KQuantScheme::IQ3XXS => (elem_count.div_ceil(256)) * 98,
+                KQuantScheme::IQ3S => (elem_count.div_ceil(256)) * 110,
+                KQuantScheme::IQ2XXS => (elem_count.div_ceil(256)) * 66,
+                KQuantScheme::IQ2XS => (elem_count.div_ceil(256)) * 74,
+                KQuantScheme::IQ2S => (elem_count.div_ceil(256)) * 82,
+            },
+            Storage::FloatPack(f) => match f {
+                FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => (elem_count + 1) / 2,
+                FloatPackScheme::Fp8 => elem_count,
+                FloatPackScheme::MxFp4 => (elem_count + 1) / 2 + (elem_count.div_ceil(32)),
+                FloatPackScheme::MxFp8 => elem_count + (elem_count.div_ceil(32)),
+            },
+            Storage::Block(b) => match b {
+                BlockDtype::Fp4 | BlockDtype::Nf4 => (elem_count + 1) / 2,
+                BlockDtype::Fp8 => elem_count,
+                BlockDtype::Fp4Block16 => (elem_count + 1) / 2 + (elem_count.div_ceil(16)) * 2,
+                BlockDtype::Fp8Block16 => elem_count + (elem_count.div_ceil(16)) * 2,
+            },
+            Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
+            _ => elem_count * self.arith.byte_size(),
+        }
+    }
+}
+
+impl From<QuantFormat> for Storage {
+    fn from(qf: QuantFormat) -> Self {
+        match qf {
+            QuantFormat::Q8_0 => Storage::KQuant(KQuantScheme::Q80),
+            QuantFormat::Q4K => Storage::KQuant(KQuantScheme::Q4K),
+            QuantFormat::Q5K => Storage::KQuant(KQuantScheme::Q5K),
+            QuantFormat::Q6K => Storage::KQuant(KQuantScheme::Q6K),
+            QuantFormat::Fp4 => Storage::FloatPack(FloatPackScheme::Fp4),
+            QuantFormat::Nf4 => Storage::FloatPack(FloatPackScheme::Nf4),
+            QuantFormat::Fp8 => Storage::FloatPack(FloatPackScheme::Fp8),
+            QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
+            QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
+            QuantFormat::Iq4Nl => Storage::KQuant(KQuantScheme::IQ4NL),
+            QuantFormat::Iq4Xs => Storage::KQuant(KQuantScheme::IQ4XS),
+            QuantFormat::Iq3Xxs => Storage::KQuant(KQuantScheme::IQ3XXS),
+            QuantFormat::Iq3S => Storage::KQuant(KQuantScheme::IQ3S),
+            QuantFormat::Iq2Xxs => Storage::KQuant(KQuantScheme::IQ2XXS),
+            QuantFormat::Iq2Xs => Storage::KQuant(KQuantScheme::IQ2XS),
+            QuantFormat::Iq2S => Storage::KQuant(KQuantScheme::IQ2S),
+        }
+    }
+}
+
+impl TryFrom<&Storage> for QuantFormat {
+    type Error = ();
+
+    fn try_from(s: &Storage) -> std::result::Result<Self, Self::Error> {
+        match s {
+            Storage::KQuant(k) => match k {
+                KQuantScheme::Q80 => Ok(QuantFormat::Q8_0),
+                KQuantScheme::Q4K => Ok(QuantFormat::Q4K),
+                KQuantScheme::Q5K => Ok(QuantFormat::Q5K),
+                KQuantScheme::Q6K => Ok(QuantFormat::Q6K),
+                KQuantScheme::IQ4NL => Ok(QuantFormat::Iq4Nl),
+                KQuantScheme::IQ4XS => Ok(QuantFormat::Iq4Xs),
+                KQuantScheme::IQ3XXS => Ok(QuantFormat::Iq3Xxs),
+                KQuantScheme::IQ3S => Ok(QuantFormat::Iq3S),
+                KQuantScheme::IQ2XXS => Ok(QuantFormat::Iq2Xxs),
+                KQuantScheme::IQ2XS => Ok(QuantFormat::Iq2Xs),
+                KQuantScheme::IQ2S => Ok(QuantFormat::Iq2S),
+                _ => Err(()),
+            },
+            Storage::FloatPack(f) => match f {
+                FloatPackScheme::Fp4 => Ok(QuantFormat::Fp4),
+                FloatPackScheme::Nf4 => Ok(QuantFormat::Nf4),
+                FloatPackScheme::Fp8 => Ok(QuantFormat::Fp8),
+                _ => Err(()),
+            },
+            Storage::Block(b) => match b {
+                BlockDtype::Fp4Block16 => Ok(QuantFormat::Fp4Block16),
+                BlockDtype::Fp8Block16 => Ok(QuantFormat::Fp8Block16),
+                BlockDtype::Fp4 => Ok(QuantFormat::Fp4),
+                BlockDtype::Nf4 => Ok(QuantFormat::Nf4),
+                BlockDtype::Fp8 => Ok(QuantFormat::Fp8),
+            },
+            _ => Err(()),
+        }
+    }
 }
 
 /// Per-tensor quantization provenance. Resolved at load time by
