@@ -1,0 +1,230 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void grim_add(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        c[id] = a[id] + b[id];
+    }
+}
+
+kernel void grim_mul(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        c[id] = a[id] * b[id];
+    }
+}
+
+kernel void grim_silu_mul(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        float g = gate[id];
+        float s = g / (1.0f + exp(-g));
+        out[id] = s * up[id];
+    }
+}
+
+kernel void grim_silu_mul_backward(
+    device const float* e [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device const float* dw [[buffer(2)]],
+    device float* df [[buffer(3)]],
+    device float* de [[buffer(4)]],
+    constant int& n [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id < uint(n)) {
+        float e_val = e[id];
+        float g_val = g[id];
+        float dw_val = dw[id];
+        float s = 1.0f / (1.0f + exp(-e_val));
+        float silu = s * e_val;
+        float dsilu = s * (1.0f + e_val * (1.0f - s));
+        df[id] = dw_val * g_val * dsilu;
+        de[id] = dw_val * silu;
+    }
+}
+
+kernel void grim_rms_norm(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& row_len [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    constant int& total [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(total)) {
+        int row = idx / row_len;
+        int col = idx % row_len;
+
+        float ss = 0.0f;
+        for (int j = 0; j < row_len; ++j) {
+            float val = x[row * row_len + j];
+            ss += val * val;
+        }
+        float rms = sqrt(ss / (float)row_len + eps);
+        out[idx] = x[idx] * w[col] / rms;
+    }
+}
+
+kernel void grim_add_rms_norm(
+    device const float* x [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* w [[buffer(2)]],
+    device float* y_out [[buffer(3)]],
+    device float* norm_out [[buffer(4)]],
+    constant int& row_len [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    constant int& total [[buffer(7)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(total)) {
+        int row = idx / row_len;
+        int col = idx % row_len;
+
+        float y_val = x[idx] + residual[idx];
+        y_out[idx] = y_val;
+
+        float ss = 0.0f;
+        for (int j = 0; j < row_len; ++j) {
+            float v = x[row * row_len + j] + residual[row * row_len + j];
+            ss += v * v;
+        }
+        float rms = sqrt(ss / (float)row_len + eps);
+        norm_out[idx] = y_val * w[col] / rms;
+    }
+}
+
+kernel void grim_softmax(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& row_len [[buffer(2)]],
+    constant int& num_rows [[buffer(3)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row < uint(num_rows)) {
+        int base = row * row_len;
+
+        float max_v = -1e30f;
+        for (int i = 0; i < row_len; ++i) {
+            float val = in[base + i];
+            if (val > max_v) {
+                max_v = val;
+            }
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < row_len; ++i) {
+            float e = exp(in[base + i] - max_v);
+            out[base + i] = e;
+            sum += e;
+        }
+
+        float inv_sum = 1.0f / (sum > 0.0f ? sum : 1e-10f);
+        for (int i = 0; i < row_len; ++i) {
+            out[base + i] *= inv_sum;
+        }
+    }
+}
+
+kernel void grim_embedding(
+    device const float* w [[buffer(0)]],
+    device const float* ids [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& hidden_dim [[buffer(3)]],
+    constant int& num_ids [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total_elems = num_ids * hidden_dim;
+    if (idx < uint(total_elems)) {
+        int token_idx = idx / hidden_dim;
+        int feature_idx = idx % hidden_dim;
+
+        int id = int(ids[token_idx]);
+        out[idx] = w[id * hidden_dim + feature_idx];
+    }
+}
+
+kernel void grim_mul_scalar(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant float& scalar [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        out[id] = in[id] * scalar;
+    }
+}
+
+kernel void grim_sqrt(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        out[id] = sqrt(in[id]);
+    }
+}
+
+kernel void grim_recip(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        out[id] = 1.0f / in[id];
+    }
+}
+
+kernel void grim_rope(
+    device const float* in [[buffer(0)]],
+    device const float* pos [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& seq_len [[buffer(3)]],
+    constant int& num_heads [[buffer(4)]],
+    constant int& head_dim [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = seq_len * num_heads * (head_dim / 2);
+    if (idx < uint(total)) {
+        int pair_idx = idx % (head_dim / 2);
+        int rem = idx / (head_dim / 2);
+        int head_idx = rem % num_heads;
+        int token_idx = rem / num_heads;
+
+        float p = pos[token_idx];
+        float freq = 1.0f / pow(theta, (float)(2 * pair_idx) / (float)head_dim);
+        float angle = p * freq;
+        float cos_val = cos(angle);
+        float sin_val = sin(angle);
+
+        int base = (token_idx * num_heads + head_idx) * head_dim;
+        int i0 = base + pair_idx;
+        int i1 = base + pair_idx + head_dim / 2;
+
+        float v0 = in[i0];
+        float v1 = in[i1];
+
+        out[i0] = v0 * cos_val - v1 * sin_val;
+        out[i1] = v0 * sin_val + v1 * cos_val;
+    }
+}
