@@ -2593,6 +2593,62 @@ impl ElementwiseOps for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_recip", &mut args, n)?;
         Ok((Box::new(out_storage), handle))
     }
+
+    fn sub(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_storage = a
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("sub a is not CudaStorage".into()))?;
+        let b_storage = b
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("sub b is not CudaStorage".into()))?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut a_ptr = Self::dev_ptr_or_err("sub a", a_storage)?;
+        let mut b_ptr = Self::dev_ptr_or_err("sub b", b_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("sub out", &out_storage)?;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut a_ptr as *mut *mut c_void as *mut c_void,
+            &mut b_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_sub", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+    fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        if v.is_empty() {
+            return Err(Error::Backend("reduce_sum: empty tensor".into()));
+        }
+        Ok(v.iter().sum())
+    }
+
+    fn reduce_max(&self, x: &dyn BackendStorage) -> Result<f32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .copied()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| Error::Backend("reduce_max: empty tensor".into()))
+    }
+
+    fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
+        let v = x.to_cpu_vec_f32()?;
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .ok_or_else(|| Error::Backend("argmax: empty tensor".into()))
+    }
 }
 
 impl SamplingOps for CudaDevice {

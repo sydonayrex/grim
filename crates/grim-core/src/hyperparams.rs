@@ -260,3 +260,105 @@ impl HyperparameterExtractor {
         }
     }
 }
+
+#[cfg(test)]
+mod extract_reference_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// HashMap-backed `MetadataLookup` for the fallback-chain tests.
+    #[derive(Default)]
+    struct MockMeta(HashMap<String, String>);
+
+    impl MockMeta {
+        fn u32(mut self, pairs: &[(&str, u32)]) -> Self {
+            for (k, v) in pairs {
+                self.0.insert(k.to_string(), v.to_string());
+            }
+            self
+        }
+    }
+
+    impl MetadataLookup for MockMeta {
+        fn get_str(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn get_u32(&self, key: &str) -> Option<u32> {
+            self.0.get(key).and_then(|v| v.parse().ok())
+        }
+        fn get_f32(&self, key: &str) -> Option<f32> {
+            self.0.get(key).and_then(|v| v.parse().ok())
+        }
+    }
+
+    /// Empty metadata yields the documented defaults.
+    #[test]
+    fn empty_metadata_yields_defaults() {
+        let meta = MockMeta::default();
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Llama, &meta);
+        assert_eq!(hp.vocab_size, 32000);
+        assert_eq!(hp.hidden_size, 4096);
+        assert_eq!(hp.num_layers, 32);
+        assert_eq!(hp.num_heads, 32);
+        // num_kv_heads falls back to num_heads (MHA), not a constant.
+        assert_eq!(hp.num_kv_heads, 32);
+    }
+
+    /// Architecture-specific keys win over llama.* fallbacks.
+    #[test]
+    fn arch_specific_keys_beat_llama_fallbacks() {
+        let meta = MockMeta::default().u32(&[
+            ("qwen3moe.embedding_length", 2048),
+            ("qwen3moe.block_count", 48),
+            ("llama.embedding_length", 1111),
+            ("llama.block_count", 22),
+            ("tokenizer.ggml.vocab_size", 151936),
+        ]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Qwen3Moe, &meta);
+        assert_eq!(hp.hidden_size, 2048);
+        assert_eq!(hp.num_layers, 48);
+        assert_eq!(hp.vocab_size, 151936);
+    }
+
+    /// When the arch-specific key is absent, llama.* keys are consulted
+    /// before the hardcoded defaults (the llama.cpp-export path).
+    #[test]
+    fn llama_fallback_keys_are_consulted() {
+        let meta = MockMeta::default().u32(&[
+            ("llama.embedding_length", 896),
+            ("llama.block_count", 4),
+            ("llama.attention.head_count", 6),
+            ("llama.attention.head_count_kv", 2),
+            ("tokenizer.ggml.vocab_size", 49152),
+        ]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Qwen3, &meta);
+        assert_eq!(hp.hidden_size, 896);
+        assert_eq!(hp.num_layers, 4);
+        assert_eq!(hp.num_heads, 6);
+        assert_eq!(hp.num_kv_heads, 2);
+        assert_eq!(hp.vocab_size, 49152);
+    }
+
+    /// SmolLm2 special case: llama.* keys are PREFERRED over
+    /// tokenizer.ggml.vocab_size (the documented stale-vocab workaround).
+    #[test]
+    fn smollm2_prefers_llama_vocab_key() {
+        let meta = MockMeta::default().u32(&[
+            ("llama.vocab_size", 49152),
+            ("tokenizer.ggml.vocab_size", 999), // known-stale key
+            ("llama.embedding_length", 576),
+        ]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::SmolLm2, &meta);
+        assert_eq!(hp.vocab_size, 49152, "llama.vocab_size must win over the stale tokenizer key");
+        assert_eq!(hp.hidden_size, 576);
+    }
+
+    /// GQA default: when only num_heads is known, num_kv_heads inherits it.
+    #[test]
+    fn kv_heads_inherit_heads_when_absent() {
+        let meta = MockMeta::default().u32(&[("llama.attention.head_count", 8)]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Llama, &meta);
+        assert_eq!(hp.num_heads, 8);
+        assert_eq!(hp.num_kv_heads, 8);
+    }
+}

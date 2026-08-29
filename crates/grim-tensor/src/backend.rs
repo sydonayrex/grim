@@ -179,6 +179,36 @@ pub trait CoreTensorOps {
         self.matmul(a, b, out)
     }
 
+    /// 2-D transpose: `[rows, cols] -> [cols, rows]`. Added for audit finding
+    /// B5: `lora_accumulate` previously shipped its A/B operands through
+    /// `to_cpu_vec_f32` + `from_cpu` on EVERY call to transpose them on the
+    /// host — a per-token host round-trip of rank×dim floats. Backends with a
+    /// device transpose kernel override this; the default degrades to the
+    /// documented host path (same shape as the reduction fallbacks).
+    fn transpose_2d(
+        &self,
+        x: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if x.shape().elem_count() != rows * cols {
+            return Err(crate::error::Error::Shape(format!(
+                "transpose_2d: storage holds {} elements, expected {rows}×{cols}",
+                x.shape().elem_count()
+            )));
+        }
+        let v = x.to_cpu_vec_f32()?;
+        let mut out = vec![0.0f32; v.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = v[r * cols + c];
+            }
+        }
+        let storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((storage, Box::new(ReadyHandle)))
+    }
+
 
     /// Elementwise add of two equally-shaped tensors (with broadcast).
     fn add(
@@ -1181,45 +1211,46 @@ pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
             )));
         }
 
+        let target_x_shape = Shape::new(vec![batch, in_features]);
         let owned_x_2d;
         let x_storage_2d: &dyn BackendStorage = if x_dims.len() == 2 {
             x
+        } else if let Ok(relabeled) = x.relabel_storage(&target_x_shape) {
+            owned_x_2d = relabeled;
+            owned_x_2d.as_ref()
         } else {
             let vec_x = x.to_cpu_vec_f32()?;
             owned_x_2d =
-                self.from_cpu(&vec_x, &Shape::new(vec![batch, in_features]), DType::F32)?;
+                self.from_cpu(&vec_x, &target_x_shape, DType::F32)?;
             owned_x_2d.as_ref()
         };
 
         // A is [rank, in_features], A^T is [in_features, rank].
         // x @ A^T requires A_T of shape [in_features, rank].
-        let vec_a = a.to_cpu_vec_f32()?;
-        let mut vec_a_t = vec![0.0f32; in_features_a * rank];
-        for r in 0..rank {
-            for i in 0..in_features_a {
-                vec_a_t[i * rank + r] = vec_a[r * in_features_a + i];
-            }
-        }
-        let a_t_storage =
-            self.from_cpu(&vec_a_t, &Shape::new(vec![in_features_a, rank]), DType::F32)?;
+        // Audit B5 fix: transpose ON DEVICE via `transpose_2d` — the old code
+        // downloaded A, transposed with host loops, and re-uploaded on every
+        // call (a per-token host round-trip of rank×in_features floats).
+        let (a_t_storage, a_t_handle) = self.transpose_2d(
+            a,
+            rank,
+            in_features_a,
+            &Shape::new(vec![in_features_a, rank]),
+        )?;
+        a_t_handle.synchronize()?;
 
         let h_2d_shape = Shape::new(vec![batch, rank]);
         let (h_storage, h_handle) = self.matmul(x_storage_2d, a_t_storage.as_ref(), &h_2d_shape)?;
         h_handle.synchronize()?;
 
-        // B is [out_features, rank], B^T is [rank, out_features].
-        let vec_b = b.to_cpu_vec_f32()?;
-        let mut vec_b_t = vec![0.0f32; rank_b * out_features];
-        for o in 0..out_features {
-            for r in 0..rank_b {
-                vec_b_t[r * out_features + o] = vec_b[o * rank_b + r];
-            }
-        }
-        let b_t_storage = self.from_cpu(
-            &vec_b_t,
+        // B is [out_features, rank], B^T is [rank, out_features] — same
+        // device-transpose treatment as A (B5).
+        let (b_t_storage, b_t_handle) = self.transpose_2d(
+            b,
+            out_features,
+            rank_b,
             &Shape::new(vec![rank_b, out_features]),
-            DType::F32,
         )?;
+        b_t_handle.synchronize()?;
 
         let delta_2d_shape = Shape::new(vec![batch, out_features]);
         let (delta_storage, delta_handle) =
@@ -1248,6 +1279,9 @@ pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
         let owned_base_2d;
         let base_storage_2d: &dyn BackendStorage = if base.shape().dims().len() == 2 {
             base
+        } else if let Ok(relabeled) = base.relabel_storage(&delta_2d_shape) {
+            owned_base_2d = relabeled;
+            owned_base_2d.as_ref()
         } else {
             let vec_base = base.to_cpu_vec_f32()?;
             owned_base_2d = self.from_cpu(&vec_base, &delta_2d_shape, DType::F32)?;
@@ -1261,8 +1295,10 @@ pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
         )?;
         add_handle.synchronize()?;
 
-        if base.shape().dims().len() == 2 {
+        if base.shape().dims().len() == 2 && out_shape.dims().len() == 2 {
             Ok((out_storage_2d, Box::new(ReadyHandle)))
+        } else if let Ok(relabeled_out) = out_storage_2d.relabel_storage(out_shape) {
+            Ok((relabeled_out, Box::new(ReadyHandle)))
         } else {
             let vec_out = out_storage_2d.to_cpu_vec_f32()?;
             Ok((
@@ -1786,6 +1822,16 @@ impl<T: CoreTensorOps + ?Sized> CoreTensorOps for std::sync::Arc<T> {
         solution_index: i32,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).matmul_with_solution(a, b, out, solution_index)
+    }
+
+    fn transpose_2d(
+        &self,
+        x: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).transpose_2d(x, rows, cols, out_shape)
     }
 
 
@@ -2909,6 +2955,26 @@ pub trait BackendStorage: Send + Sync {
     /// success immediately.
     fn prefetch_to_device(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Create a zero-copy re-labeled view of this storage with a new shape.
+    ///
+    /// If the storage implementation supports zero-copy shape relabeling (such as `CpuStorage`,
+    /// `RocmStorage`, `CudaStorage`, `MetalStorage`), it returns a new storage handle wrapping
+    /// the same underlying allocation with `new_shape`. Returns `Err(Error::Unimplemented)`
+    /// by default for storages that require fallback reallocation.
+    fn relabel_storage(&self, new_shape: &Shape) -> Result<Box<dyn BackendStorage>> {
+        if self.shape().elem_count() != new_shape.elem_count() {
+            return Err(crate::error::Error::Shape(format!(
+                "relabel_storage: element count mismatch (current {} vs requested {})",
+                self.shape().elem_count(),
+                new_shape.elem_count()
+            )));
+        }
+        let _ = new_shape;
+        Err(crate::error::Error::Unimplemented(
+            "relabel_storage not implemented for this storage type".into(),
+        ))
     }
 }
 

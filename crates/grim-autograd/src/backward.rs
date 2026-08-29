@@ -165,8 +165,12 @@ pub fn backward(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], g_b)?;
             }
             TapeMetadata::Add => {
+                let lhs_shape = get_any(tape, &overlay, entry.inputs[0]).map(|t| t.shape().clone());
+                let rhs_shape = get_any(tape, &overlay, entry.inputs[1]).map(|t| t.shape().clone());
                 let args = AddArgs {
                     out_grad: out_grad.clone(),
+                    lhs_shape,
+                    rhs_shape,
                 };
                 let (gl, gr) = add_backward(&args)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], gl)?;
@@ -362,8 +366,12 @@ pub fn backward_step(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], g_b)?;
             }
             TapeMetadata::Add => {
+                let lhs_shape = get_any(tape, &overlay, entry.inputs[0]).map(|t| t.shape().clone());
+                let rhs_shape = get_any(tape, &overlay, entry.inputs[1]).map(|t| t.shape().clone());
                 let args = AddArgs {
                     out_grad: out_grad.clone(),
+                    lhs_shape,
+                    rhs_shape,
                 };
                 let (gl, gr) = add_backward(&args)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], gl)?;

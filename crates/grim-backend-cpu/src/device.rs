@@ -236,6 +236,35 @@ impl CpuDevice {
 
 impl CoreTensorOps for CpuDevice {
 
+    /// Device-side 2-D transpose: pure re-indexing on the host-resident CPU
+    /// buffer — no data conversion, no second upload (B5).
+    fn transpose_2d(
+        &self,
+        x: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let xs = a_storage(x)?;
+        if xs.shape().elem_count() != rows * cols {
+            return Err(Error::Shape(format!(
+                "transpose_2d: storage holds {} elements, expected {rows}×{cols}",
+                xs.shape().elem_count()
+            )));
+        }
+        let data = xs.data();
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = data[r * cols + c];
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
         let n = shape.elem_count();
@@ -1942,6 +1971,25 @@ impl BackendStorage for CpuStorage {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn relabel_storage(&self, new_shape: &Shape) -> Result<Box<dyn BackendStorage>> {
+        if self.shape.elem_count() != new_shape.elem_count() {
+            return Err(Error::Shape(format!(
+                "relabel_storage: element count mismatch (current {} vs requested {})",
+                self.shape.elem_count(),
+                new_shape.elem_count()
+            )));
+        }
+        let relabeled = CpuStorage {
+            data: Arc::clone(&self.data),
+            shape: new_shape.clone(),
+            dtype: self.dtype.clone(),
+            provenance: self.provenance.clone(),
+            quant_scales: self.quant_scales.clone(),
+            raw_bytes: self.raw_bytes.as_ref().map(Arc::clone),
+        };
+        Ok(Box::new(relabeled))
+    }
 }
 
 // ---------- helpers ----------
@@ -2780,5 +2828,38 @@ mod tests {
                 .replay_graph("missing")
                 .expect("trait replay (missing)")
         );
+    }
+}
+
+#[cfg(test)]
+mod transpose_2d_tests {
+    use super::*;
+
+    /// B5 gate: CoreTensorOps::transpose_2d must produce the exact
+    /// column/row swap — this is the operation the LoRA accumulator now
+    /// relies on instead of host round-trips.
+    #[test]
+    fn transpose_2d_swaps_rows_and_columns() {
+        let dev = CpuDevice::new();
+        let x = CpuStorage::new(
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            grim_tensor::Shape::new(vec![2, 3]),
+            DType::F32,
+        );
+        let (out, handle) =
+            CoreTensorOps::transpose_2d(&dev, &x, 2, 3, &grim_tensor::Shape::new(vec![3, 2]))
+                .unwrap();
+        handle.synchronize().unwrap();
+        assert_eq!(out.shape().dims(), vec![3, 2]);
+        assert_eq!(out.as_ref().to_cpu_vec_f32().unwrap(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        // Element-count mismatch is an error, not a silent partial copy.
+        let wrong = CoreTensorOps::transpose_2d(
+            &dev,
+            &x,
+            3,
+            3,
+            &grim_tensor::Shape::new(vec![3, 3]),
+        );
+        assert!(wrong.is_err());
     }
 }

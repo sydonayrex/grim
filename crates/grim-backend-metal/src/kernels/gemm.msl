@@ -184,3 +184,96 @@ kernel void grim_matmul_simdgroup(
     simdgroup_store(sg_c, c + row_start * n + col_start, n);
 }
 #endif
+
+
+// B5: 2-D transpose for [rows, cols] f32 -> [cols, rows]. One thread per
+// output element; coalesced reads along the source row, strided writes.
+kernel void grim_transpose_2d(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint n = rows * cols;
+    if (id >= n) { return; }
+    uint r = id / cols;
+    uint c = id % cols;
+    dst[c * rows + r] = src[r * cols + c];
+}
+
+
+// B5/Metal-track: f32 SIMDgroup GEMM. `simdgroup_float8x8` gives each
+// simdgroup a hardware-accelerated 8x8 MMA; a 4-simdgroup threadgroup covers
+// a 32(row) x 8(col) output block. REQUIRES m % 8 == 0, n % 8 == 0, k % 8 == 0
+// (the host dispatch gate enforces this — simdgroup_load does not clip).
+//
+// Grid: (ceil(n/8), ceil(m/32)); threadsPerThreadgroup: 128 (4 warps).
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 230)
+kernel void grim_matmul_simdgroup_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
+) {
+    simdgroup_float8x8 sg_a;
+    simdgroup_float8x8 sg_b;
+    simdgroup_float8x8 sg_c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    int row_start = (int(tg_id.y) * 4 + int(simd_group_id)) * 8;
+    int col_start = int(tg_id.x) * 8;
+
+    if (row_start >= m || col_start >= n) return;
+
+    for (int bk = 0; bk < k; bk += 8) {
+        simdgroup_load(sg_a, a + row_start * k + bk, k);
+        simdgroup_load(sg_b, b + bk * n + col_start, n);
+        simdgroup_multiply_accumulate(sg_c, sg_a, sg_b, sg_c);
+    }
+
+    simdgroup_store(sg_c, c + row_start * n + col_start, n);
+}
+
+// 16x16-output-per-threadgroup variant: each of the 4 simdgroups owns one
+// 8x8 quadrant, so A-tile loads are duplicated across column pairs — the
+// trade is fewer threadgroups / less scheduling overhead on large-M GEMMs.
+// Grid: (ceil(n/16), ceil(m/16)); threadsPerThreadgroup: 128 (4 warps).
+// Same m/n/k % 8 == 0 requirement (quadrants are 8x8).
+kernel void grim_matmul_simdgroup_f32_16(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
+) {
+    // Quadrant map: sg0=(0,0) sg1=(1,0) sg2=(0,1) sg3=(1,1) in (row, col).
+    int sub_r = int(simd_group_id) & 1;
+    int sub_c = int(simd_group_id) >> 1;
+
+    int row_start = int(tg_id.y) * 16 + sub_r * 8;
+    int col_start = int(tg_id.x) * 16 + sub_c * 8;
+
+    if (row_start >= m || col_start >= n) return;
+
+    simdgroup_float8x8 sg_a;
+    simdgroup_float8x8 sg_b;
+    simdgroup_float8x8 sg_c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int bk = 0; bk < k; bk += 8) {
+        simdgroup_load(sg_a, a + row_start * k + bk, k);
+        simdgroup_load(sg_b, b + bk * n + col_start, n);
+        simdgroup_multiply_accumulate(sg_c, sg_a, sg_b, sg_c);
+    }
+
+    simdgroup_store(sg_c, c + row_start * n + col_start, n);
+}
+#endif

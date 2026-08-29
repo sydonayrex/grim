@@ -393,6 +393,8 @@ pub struct MatMulArgs {
 #[derive(Debug, Clone)]
 pub struct AddArgs {
     pub out_grad: Tensor,
+    pub lhs_shape: Option<Shape>,
+    pub rhs_shape: Option<Shape>,
 }
 
 /// Arguments for Scale backward evaluation.
@@ -710,11 +712,73 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     Ok((grad_a, grad_b))
 }
 
+/// Reduce a gradient tensor `grad` of shape `out_shape` to target operand shape `target_shape` by summing along broadcasted dimensions.
+fn reduce_broadcast_gradient(grad: &Tensor, target_shape: &Shape) -> Result<Tensor> {
+    if grad.shape() == target_shape {
+        return Ok(grad.clone());
+    }
+    let grad_dims = grad.shape().dims();
+    let target_dims = target_shape.dims();
+    let rank = grad_dims.len();
+    let target_rank = target_dims.len();
+
+    let mut padded_target = vec![1usize; rank];
+    for i in 0..target_rank {
+        padded_target[rank - target_rank + i] = target_dims[i];
+    }
+
+    let grad_vec = grad.to_vec_f32()?;
+    let mut reduced = vec![0.0f32; target_shape.elem_count()];
+
+    // Compute strides for target and grad
+    let mut target_strides = vec![1usize; rank];
+    for d in (0..rank.saturating_sub(1)).rev() {
+        target_strides[d] = target_strides[d + 1] * padded_target[d + 1];
+    }
+
+    for (linear_idx, &val) in grad_vec.iter().enumerate() {
+        let mut rem = linear_idx;
+        let mut target_idx = 0usize;
+        for d in (0..rank).rev() {
+            let dim_sz = grad_dims[d];
+            let coord = rem % dim_sz;
+            rem /= dim_sz;
+            if padded_target[d] != 1 {
+                target_idx += coord * target_strides[d];
+            }
+        }
+        reduced[target_idx] += val;
+    }
+
+    let dev = crate::pick_device_for_tensor(grad);
+    let storage = dev.from_cpu(&reduced, target_shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        target_shape.clone(),
+        DType::F32,
+        grad.provenance().clone(),
+        grad.device().clone(),
+    ))
+}
+
 /// Compute backward routing for elementwise add `output = LHS + RHS`.
 ///
-/// Returns `(grad_lhs, grad_rhs)` which are both clones of `out_grad`.
+/// If broadcasting occurred (e.g. `[batch, seq, dim]` + `[dim]`), the gradient for the
+/// broadcasted operand is summed along the broadcast dimensions.
 pub fn add_backward(args: &AddArgs) -> Result<(Tensor, Tensor)> {
-    Ok((args.out_grad.clone(), args.out_grad.clone()))
+    let grad_lhs = if let Some(ref target) = args.lhs_shape {
+        reduce_broadcast_gradient(&args.out_grad, target)?
+    } else {
+        args.out_grad.clone()
+    };
+
+    let grad_rhs = if let Some(ref target) = args.rhs_shape {
+        reduce_broadcast_gradient(&args.out_grad, target)?
+    } else {
+        args.out_grad.clone()
+    };
+
+    Ok((grad_lhs, grad_rhs))
 }
 
 /// Compute backward gradient for scaling `output = input * factor`.
@@ -1897,10 +1961,31 @@ mod tests {
     #[test]
     fn add_backward_routes_gradient() {
         let g = tensor(vec![1.0, 2.0], vec![2]);
-        let args = AddArgs { out_grad: g };
+        let args = AddArgs {
+            out_grad: g,
+            lhs_shape: Some(Shape::new(vec![2])),
+            rhs_shape: Some(Shape::new(vec![2])),
+        };
         let (gl, gr) = add_backward(&args).unwrap();
         assert_eq!(gl.to_vec_f32().unwrap(), vec![1.0, 2.0]);
         assert_eq!(gr.to_vec_f32().unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn add_backward_reduces_broadcast_gradients() {
+        // [2, 2] gradient, LHS is [2, 2], RHS is [2] (broadcast along dim 0)
+        let g = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let args = AddArgs {
+            out_grad: g,
+            lhs_shape: Some(Shape::new(vec![2, 2])),
+            rhs_shape: Some(Shape::new(vec![2])),
+        };
+        let (gl, gr) = add_backward(&args).unwrap();
+        assert_eq!(gl.to_vec_f32().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(gl.shape().dims(), &[2, 2]);
+        // gr should sum across rows: 1.0 + 3.0 = 4.0, 2.0 + 4.0 = 6.0
+        assert_eq!(gr.to_vec_f32().unwrap(), vec![4.0, 6.0]);
+        assert_eq!(gr.shape().dims(), &[2]);
     }
 
     #[test]

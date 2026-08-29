@@ -334,8 +334,74 @@ compile clean.
 
 P3 (BackendDevice trait decomposition): IMPLEMENTED — see "P3 executed:
 BackendDevice decomposition into capability sub-traits" below.
-B5's backend-side transpose caching still deferred (needs backend-owned
-state).
+B5's A/B host transposes: IMPLEMENTED — see "B5 executed: device-side
+transpose" below.
+
+---
+
+## B5 executed: device-side transpose for lora_accumulate
+
+The last piece of B5 (the A^T/B^T host round-trips deferred as "needs
+backend-owned state") is closed WITHOUT needing backend-owned state:
+`CoreTensorOps` gained `transpose_2d(x, rows, cols, out_shape)`, and the
+`lora_accumulate` default now transposes A and B through it instead of
+`to_cpu_vec_f32` + host loops + `from_cpu` re-upload. Per forward call this
+eliminates two host round-trips of rank×in_features and rank×out_features
+floats.
+
+- **grim-tensor**: `transpose_2d` with a documented host-fallback default
+  (same degradation model as the reductions); forwarded in the `Arc<T>`
+  blanket impl; covered by the forwarding probe.
+- **CPU**: direct re-index on the resident buffer (`transpose_2d_tests`
+  pins the exact row/column swap and the element-count mismatch error).
+- **ROCm**: delegates to the pre-existing device-resident
+  `grim_transpose_2d_f32` HIP kernel (tensor never leaves GPU memory).
+- **Metal**: new `grim_transpose_2d` MSL kernel + pipeline; non-Apple
+  builds fall back to the trait default.
+- **grim-tensor**: `golden_lora_accumulate` passes UNCHANGED — bit-exact
+  semantics through the new path.
+
+Known remainder (documented, not fixed): the non-2D `x`/`base` re-shape
+round-trips and the final output re-shape in `lora_accumulate` remain —
+device `matmul` requires 2-D storage shapes and no storage-relabel op
+exists yet. Those trigger only for non-2D LoRA operands and carry
+in_features-sized (not rank×dim) cost. A storage `relabel` op is the
+follow-up if decode-path profiling shows them mattering.
+
+---
+
+## Metal track executed: SIMDgroup GEMM wired into dispatch
+
+The `grim_matmul_simdgroup` kernel existed in gemm.msl but was DEAD CODE —
+no pipeline was created and no dispatch path referenced it (and it was
+half-only, while the device matmul path is f32). Resolved:
+
+- **New f32 kernels** (`gemm.msl`): `grim_matmul_simdgroup_f32` (8x8
+  `simdgroup_float8x8` MMA, 4-simdgroup threadgroup = 32×8 output block)
+  and `grim_matmul_simdgroup_f32_16` (16×16 output per threadgroup, one
+  8×8 quadrant per simdgroup). Both require m/n/k % 8 == 0 — unclipped
+  tile loads — which the host gate enforces.
+- **Pipelines wired**: `matmul_simdgroup_f32` / `matmul_simdgroup_f32_16`
+  in `MetalPipelines` + init.
+- **Dispatch gate**: `simdgroup_gemm_variant(m, n, k)` returns Tile8 /
+  Tile16 / None. None unless every dim is a multiple of 8 AND all dims are
+  ≥ 64 (below that the MMA scheduling cost exceeds the win); Tile16 only
+  for m, n ≥ 128 with n, m % 16 == 0 (quadrants stay populated). The
+  caller additionally requires `caps.supports_simdgroup_matrix`
+  (Apple7+/M1+). Non-eligible shapes keep the autotuned naive kernel —
+  the gate runs BEFORE the autotuner, by design (tile config is
+  meaningless for a different kernel family).
+- **Tests**: 3 platform-independent gate tests (multiples-of-8 fallback,
+  small-GEMM fallback, variant selection incl. narrow-N and n%16 cases)
+  running on every OS; an Apple-hardware parity test
+  (`simdgroup_matmul_matches_naive_path`, 128³ f32 vs independent host
+  reference) that exercises the real MMA path wherever Metal exists.
+
+Caveat recorded honestly: this Linux environment compiles the kernels and
+tests the dispatch gate, but cannot execute Metal — the MMA parity test
+needs a Mac run to go green. Kernel scheduling (which simdgroup map covers
+which quadrant) is pinned by the gate tests' geometry assumptions; any
+hardware deviation surfaces as the parity test failing on-device.
 
 ---
 

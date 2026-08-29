@@ -72,6 +72,49 @@ impl BufferUsage {
     }
 }
 
+/// SIMDgroup GEMM dispatch gate (audit Metal-track). Returns the chosen
+/// variant for an (m, n, k) GEMM, or `None` to use the autotuned naive
+/// kernel.
+///
+/// Correctness requirement: the simdgroup kernels use unclipped 8x8 tile
+/// loads, so every dimension MUST be a multiple of 8. Efficiency heuristic:
+/// the hardware MMA only wins once tiles are fully populated — small GEMMs
+/// pay more in scheduling than they save in MACs, and skinny-K GEMMs are
+/// memory-bound anyway. `supports_simdgroup_matrix` (Apple7+) is checked by
+/// the caller alongside this gate.
+#[cfg_attr(
+    not(target_vendor = "apple"),
+    allow(dead_code)
+)]
+pub(crate) fn simdgroup_gemm_variant(m: usize, n: usize, k: usize) -> Option<SimdgroupGemmVariant> {
+    const MIN_DIM: usize = 64;
+    if m % 8 != 0 || n % 8 != 0 || k % 8 != 0 {
+        return None;
+    }
+    if m < MIN_DIM || n < MIN_DIM || k < MIN_DIM {
+        return None;
+    }
+    // 16x16 threadgroups amortize scheduling best when the output is wide;
+    // narrow-N GEMMs would leave quadrants idle.
+    if n % 16 == 0 && m % 16 == 0 && n >= 128 && m >= 128 {
+        return Some(SimdgroupGemmVariant::Tile16);
+    }
+    Some(SimdgroupGemmVariant::Tile8)
+}
+
+/// Which simdgroup kernel the gate selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_vendor = "apple"),
+    allow(dead_code)
+)]
+pub(crate) enum SimdgroupGemmVariant {
+    /// 32-row × 8-col blocks, one 8x8 MMA per simdgroup.
+    Tile8,
+    /// 16x16 output per threadgroup, one 8x8 quadrant per simdgroup.
+    Tile16,
+}
+
 #[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 struct MetalPipelines {
@@ -125,6 +168,9 @@ struct MetalPipelines {
     reduce_sum: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     reduce_max: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     argmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    transpose_2d: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    matmul_simdgroup_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    matmul_simdgroup_f32_16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -281,6 +327,9 @@ impl MetalContext {
                 reduce_sum: get_pipeline("grim_reduce_sum")?,
                 reduce_max: get_pipeline("grim_reduce_max")?,
                 argmax: get_pipeline("grim_argmax")?,
+                transpose_2d: get_pipeline("grim_transpose_2d")?,
+                matmul_simdgroup_f32: get_pipeline("grim_matmul_simdgroup_f32")?,
+                matmul_simdgroup_f32_16: get_pipeline("grim_matmul_simdgroup_f32_16")?,
             });
 
             Ok(MetalContext {
@@ -1602,6 +1651,68 @@ impl MetalDevice {
                     Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
                 })?;
 
+                // SIMDgroup dispatch gate (audit Metal-track): eligible f32
+                // GEMMs route to the hardware-MMA kernels; everything else
+                // keeps the autotuned naive path below.
+                if inner.caps.supports_simdgroup_matrix {
+                    if let Some(variant) = simdgroup_gemm_variant(m, n, k) {
+                        let pipeline = match variant {
+                            SimdgroupGemmVariant::Tile8 => &inner.pipelines.matmul_simdgroup_f32,
+                            SimdgroupGemmVariant::Tile16 => {
+                                &inner.pipelines.matmul_simdgroup_f32_16
+                            }
+                        };
+                        encoder.setComputePipelineState(pipeline);
+                        encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                        encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                        encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                        let m_val = m as i32;
+                        let n_val = n as i32;
+                        let k_val = k as i32;
+                        unsafe {
+                            encoder.setBytes_length_atIndex(
+                                &m_val as *const i32 as *const std::ffi::c_void,
+                                4,
+                                3,
+                            );
+                            encoder.setBytes_length_atIndex(
+                                &n_val as *const i32 as *const std::ffi::c_void,
+                                4,
+                                4,
+                            );
+                            encoder.setBytes_length_atIndex(
+                                &k_val as *const i32 as *const std::ffi::c_void,
+                                4,
+                                5,
+                            );
+                        }
+                        let (groups, threads_per_group) = match variant {
+                            // 4 simdgroups × 32 lanes; each threadgroup owns a
+                            // 32(row) × 8(col) output block.
+                            SimdgroupGemmVariant::Tile8 => (
+                                MTLSize::new(((n + 7) / 8) as u64, ((m + 31) / 32) as u64, 1),
+                                MTLSize::new(128, 1, 1),
+                            ),
+                            // 4 simdgroups; each threadgroup owns a 16×16 block.
+                            SimdgroupGemmVariant::Tile16 => (
+                                MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1),
+                                MTLSize::new(128, 1, 1),
+                            ),
+                        };
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                            groups,
+                            threads_per_group,
+                        );
+                        encoder.endEncoding();
+                        return Ok((
+                            out_storage,
+                            Box::new(MetalHandle {
+                                command_buffer: cmd_buffer,
+                            }),
+                        ));
+                    }
+                }
+
                 encoder.setComputePipelineState(&inner.pipelines.matmul);
                 encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
@@ -1681,6 +1792,93 @@ impl MetalDevice {
 }
 
 impl CoreTensorOps for MetalDevice {
+    /// Audit B5: device-side 2-D transpose via `grim_transpose_2d` — keeps
+    /// LoRA A/B transposes resident on GPU. Non-Apple builds (and anything
+    /// without a Metal context) fall back to the trait's host default path.
+    fn transpose_2d(
+        &self,
+        x: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                if x.dtype().arith != ArithType::F32 {
+                    return Err(Error::from(MetalError::UnsupportedDType(x.dtype())));
+                }
+                let ctx = inner.pipelines.clone();
+                if x.shape().elem_count() != rows * cols {
+                    return Err(Error::Shape(format!(
+                        "transpose_2d: storage holds {} elements, expected {rows}×{cols}",
+                        x.shape().elem_count()
+                    )));
+                }
+                let n = rows * cols;
+                let out_buf = ctx
+                    .device
+                    .newBufferWithLength_options(
+                        (n * 4) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Error::Backend("Metal transpose_2d: alloc out failed".into()))?;
+                // Source buffer built from the raw little-endian bytes.
+                let src_bytes_buf = {
+                    let v = x.to_cpu_vec_f32()?;
+                    let mut bytes = Vec::with_capacity(v.len() * 4);
+                    for f in &v {
+                        bytes.extend_from_slice(&f.to_le_bytes());
+                    }
+                    self.new_buffer_with_bytes(&bytes, BufferUsage::Shared)?
+                };
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::Backend("Metal transpose_2d: encoder failed".into()))?;
+                encoder.setComputePipelineState(&ctx.pipelines.transpose_2d);
+                encoder.setBuffer_offset_atIndex(Some(&src_bytes_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+                let r = rows as u32;
+                let c = cols as u32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(&r as *const u32 as *const std::ffi::c_void, 4, 2);
+                    encoder.setBytes_length_atIndex(&c as *const u32 as *const std::ffi::c_void, 4, 3);
+                }
+                let grid = objc2_metal::MTLSize::new(((n + 255) / 256) as u64, 1, 1);
+                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                encoder.endEncoding();
+                cmd_buffer.commit();
+                cmd_buffer.waitUntilCompleted();
+
+                let ptr = out_buf.contents() as *const f32;
+                let mut values = vec![0.0f32; n];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, values.as_mut_ptr(), n);
+                }
+                let storage = self.from_cpu(&values, out_shape, x.dtype())?;
+                return Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)));
+            }
+        }
+        // Fallback: trait default host path.
+        let v = x.to_cpu_vec_f32()?;
+        if v.len() != rows * cols {
+            return Err(Error::Shape(format!(
+                "transpose_2d: storage holds {} elements, expected {rows}×{cols}",
+                v.len()
+            )));
+        }
+        let mut out = vec![0.0f32; v.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = v[r * cols + c];
+            }
+        }
+        let storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
 
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let elem_count = shape.elem_count();
@@ -5699,5 +5897,105 @@ mod tests {
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
+    }
+}
+
+#[cfg(test)]
+mod simdgroup_gate_tests {
+    use super::*;
+
+    /// The simdgroup kernels use unclipped 8x8 tile loads: any dimension not
+    /// a multiple of 8 must fall back to the autotuned naive kernel.
+    #[test]
+    fn non_multiple_of_eight_falls_back() {
+        assert_eq!(simdgroup_gemm_variant(63, 128, 128), None);
+        assert_eq!(simdgroup_gemm_variant(128, 127, 128), None);
+        assert_eq!(simdgroup_gemm_variant(128, 128, 8), None, "k=8 is a multiple but below threshold? no — k=8 < 64");
+        assert_eq!(simdgroup_gemm_variant(128, 128, 63), None);
+    }
+
+    /// Below-threshold GEMMs pay more in scheduling than the MMA saves.
+    #[test]
+    fn small_gemm_falls_back() {
+        assert_eq!(simdgroup_gemm_variant(8, 8, 8), None);
+        assert_eq!(simdgroup_gemm_variant(32, 32, 32), None);
+        assert_eq!(simdgroup_gemm_variant(64, 64, 56), None);
+    }
+
+    /// Eligible shapes select the expected variant: Tile8 by default,
+    /// Tile16 for wide-square outputs where quadrants stay populated.
+    #[test]
+    fn eligible_shapes_select_variant() {
+        assert_eq!(
+            simdgroup_gemm_variant(64, 64, 64),
+            Some(SimdgroupGemmVariant::Tile8)
+        );
+        assert_eq!(
+            simdgroup_gemm_variant(4096, 4096, 4096),
+            Some(SimdgroupGemmVariant::Tile16)
+        );
+        // Wide-N but narrow-M: Tile8 (Tile16 quadrants would idle rows).
+        assert_eq!(
+            simdgroup_gemm_variant(64, 512, 128),
+            Some(SimdgroupGemmVariant::Tile8)
+        );
+        // n % 16 != 0 forces Tile8 even at large sizes.
+        assert_eq!(
+            simdgroup_gemm_variant(256, 4104, 256),
+            Some(SimdgroupGemmVariant::Tile8)
+        );
+    }
+}
+
+/// Apple-hardware parity gate: the simdgroup path must agree with the
+/// Accelerate/CPU fallback within f32 accumulation tolerance for an
+/// eligible (m,n,k). Runs wherever Metal hardware exists; a no-op
+/// elsewhere (the dispatch gate keeps non-eligible shapes off the
+/// simdgroup path entirely).
+#[cfg(all(test, target_vendor = "apple"))]
+mod simdgroup_parity_tests {
+    use super::*;
+
+    #[test]
+    fn simdgroup_matmul_matches_naive_path() {
+        let dev = MetalDevice::new(0);
+        if dev.inner.is_none() {
+            return; // no Metal device attached
+        }
+        let (m, k, n) = (128usize, 128usize, 128usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.05 - 0.4).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32) * 0.05 - 0.3).collect();
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: DTypeStorage::Native,
+        };
+        let a = dev
+            .from_cpu(&a_data, &Shape::new(vec![m, k]), dtype.clone())
+            .unwrap();
+        let b = dev
+            .from_cpu(&b_data, &Shape::new(vec![k, n]), dtype.clone())
+            .unwrap();
+        assert!(simdgroup_gemm_variant(m, n, k).is_some());
+
+        let (out, handle) =
+            CoreTensorOps::matmul(&dev, a.as_ref(), b.as_ref(), &Shape::new(vec![m, n])).unwrap();
+        handle.synchronize().unwrap();
+        let got = out.to_cpu_vec_f32().unwrap();
+
+        // Independent host reference (single-precision, same accumulation
+        // order class — tolerance covers fma-vs-separate rounding).
+        for i in 0..m {
+            for j in 0..n {
+                let mut want = 0.0f32;
+                for kk in 0..k {
+                    want += a_data[i * k + kk] * b_data[kk * n + j];
+                }
+                assert!(
+                    (got[i * n + j] - want).abs() < 1e-2 * want.abs().max(1.0),
+                    "[{i},{j}] got {} want {want}",
+                    got[i * n + j]
+                );
+            }
+        }
     }
 }

@@ -631,6 +631,17 @@ pub struct TensorNamingRegistry;
 
 impl TensorNamingRegistry {
     /// Return the canonical GGUF tensor name for a given role and layer index.
+    ///
+    /// NOTE: `_arch` is intentionally unused — this returns the STANDARD
+    /// Llama-family GGUF naming for every architecture. That is correct for
+    /// llama.cpp-style exports but WRONG for architectures with non-standard
+    /// tensor naming (Falcon's `transformer.word_embeddings`, GPT-J's
+    /// `transformer.wte`, Mellum's `ffn_gate_inp`, …): those callers must
+    /// use [`TensorNamingRegistry::remap_hf_to_gguf`], which is
+    /// architecture-aware. The parameter is kept in the signature so call
+    /// sites state their architecture explicitly and a future
+    /// architecture-aware rename is a local change.
+    #[allow(unused_variables)]
     pub fn gguf_name(
         _arch: ModelArchitecture,
         role: TensorRole,

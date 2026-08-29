@@ -372,3 +372,172 @@ impl RuntimeEnv {
         }
     }
 }
+
+#[cfg(test)]
+mod runtime_env_tests {
+    use super::*;
+
+    /// Env vars are process-global: serialize every test that mutates them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const GRIM_VARS: &[&str] = &[
+        "GRIM_CONFIG",
+        "GRIM_HOST",
+        "GRIM_PORT",
+        "GRIM_CONTEXT",
+        "GRIM_BACKEND",
+        "GRIM_GPUS",
+        "GRIM_TP_SIZE",
+        "GRIM_PARALLEL",
+        "GRIM_MEM_BUDGET_MIB",
+        "GRIM_KERNEL_TIMEOUT",
+    ];
+
+    /// SAFETY: single-threaded with respect to the other env-mutating tests
+    /// via ENV_LOCK; no other thread reads these GRIM_* vars concurrently.
+    fn clear_grim_vars() {
+        unsafe {
+            for v in GRIM_VARS {
+                std::env::remove_var(v);
+            }
+        }
+    }
+
+    /// SAFETY: same ENV_LOCK discipline as `clear_grim_vars`.
+    fn set_var(key: &str, value: &str) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[test]
+    fn defaults_when_no_env_or_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_grim_vars();
+        // CWD is the crate dir during tests; ensure no grim.toml leak.
+        let saved_cwd = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+        let env = RuntimeEnv::from_env();
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        assert_eq!(env.host_src, "default");
+        assert!(env.host.is_none());
+        assert!(env.port.is_none());
+        assert!(env.context.is_none());
+        assert!(matches!(env.backend, Backend::Auto));
+        assert_eq!(env.backend_src, "default");
+        assert!(env.gpus.is_empty());
+        assert_eq!(env.tp_size, 0);
+        assert_eq!(env.parallel, None);
+        assert!(env.mem_budget_mib.is_none());
+        assert_eq!(env.kernel_timeout, Duration::from_secs(300));
+        assert_eq!(env.kernel_timeout_src, "default");
+    }
+
+    #[test]
+    fn env_vars_override_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_grim_vars();
+        set_var("GRIM_HOST", "0.0.0.0");
+        set_var("GRIM_PORT", "8123");
+        set_var("GRIM_CONTEXT", "131072");
+        set_var("GRIM_BACKEND", "ROCM"); // case-insensitive
+        set_var("GRIM_GPUS", "0, 2, 5");
+        set_var("GRIM_TP_SIZE", "2");
+        set_var("GRIM_PARALLEL", "yes");
+        set_var("GRIM_MEM_BUDGET_MIB", "65536");
+        set_var("GRIM_KERNEL_TIMEOUT", "45");
+
+        let env = RuntimeEnv::from_env();
+        assert_eq!(env.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(env.host_src, "env");
+        assert_eq!(env.port, Some(8123));
+        assert_eq!(env.context, Some(131072));
+        assert!(matches!(env.backend, Backend::Rocm));
+        assert_eq!(env.gpus, vec![0, 2, 5]);
+        assert_eq!(env.tp_size, 2);
+        assert_eq!(env.parallel, Some(true));
+        assert_eq!(env.mem_budget_mib, Some(65536));
+        assert_eq!(env.kernel_timeout, Duration::from_secs(45));
+
+        clear_grim_vars();
+    }
+
+    #[test]
+    fn malformed_env_values_fall_back_to_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_grim_vars();
+        set_var("GRIM_PORT", "not-a-port");
+        set_var("GRIM_CONTEXT", "-5");
+        set_var("GRIM_KERNEL_TIMEOUT", "soon");
+        set_var("GRIM_PARALLEL", "banana");
+
+        let env = RuntimeEnv::from_env();
+        assert_eq!(env.port_src, "default");
+        assert!(env.port.is_none());
+        assert!(env.context.is_none());
+        assert_eq!(env.kernel_timeout, Duration::from_secs(300));
+        assert_eq!(env.parallel, None);
+        clear_grim_vars();
+    }
+
+    #[test]
+    fn toml_config_is_parsed_and_env_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_grim_vars();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("grim.toml");
+        std::fs::write(
+            &cfg,
+            "host = \"127.0.0.1\"\nport = 9000\nbackend = \"cpu\"\ngpus = [1, 3]\n",
+        )
+        .unwrap();
+        set_var("GRIM_CONFIG", cfg.to_str().unwrap());
+
+        // toml alone.
+        let env = RuntimeEnv::from_env();
+        assert_eq!(env.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(env.host_src, "toml");
+        assert_eq!(env.port, Some(9000));
+        assert!(matches!(env.backend, Backend::Cpu));
+        assert_eq!(env.gpus, vec![1, 3]);
+
+        // Env overrides toml for the same key.
+        set_var("GRIM_PORT", "7777");
+        let env = RuntimeEnv::from_env();
+        assert_eq!(env.port, Some(7777));
+        assert_eq!(env.port_src, "env");
+        // toml value for host is untouched.
+        assert_eq!(env.host_src, "toml");
+
+        // locate_config_file honors GRIM_CONFIG when the path exists.
+        assert_eq!(
+            RuntimeEnv::locate_config_file().as_deref(),
+            Some(cfg.as_path())
+        );
+
+        clear_grim_vars();
+    }
+
+    #[test]
+    fn effective_config_summary_lists_keys_and_sources() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_grim_vars();
+        set_var("GRIM_BACKEND", "cuda");
+        let env = RuntimeEnv::from_env();
+        let summary = env.effective_config_summary();
+        assert!(!summary.is_empty());
+        // Every row is (key, value, source).
+        for (k, v, src) in &summary {
+            assert!(!k.is_empty());
+            assert!(!v.is_empty());
+            assert!(!src.is_empty());
+        }
+        let backend_row = summary.iter().find(|(k, _, _)| k == "backend");
+        assert!(backend_row.is_some(), "backend must appear in the summary");
+        let (_, v, src) = backend_row.unwrap();
+        assert_eq!(*src, "env");
+        assert!(v.eq_ignore_ascii_case("cuda"));
+        clear_grim_vars();
+    }
+}
