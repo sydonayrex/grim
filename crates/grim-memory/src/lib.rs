@@ -72,6 +72,9 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
     fn block_is_received(&self, id: BlockId) -> bool {
         self.block_is_received(id)
     }
+    fn block_num_tokens(&self, id: BlockId) -> Option<usize> {
+        KvBlockPool::block_num_tokens(self, id)
+    }
     // F8/F10: pull-mode fetch support. The inherent methods already exist;
     // they were just never exposed through the trait the KV receiver server
     // is generic over, so the server had no way to answer a fetch request.
@@ -765,6 +768,17 @@ impl KvBlockPool {
         id < self.blocks.len() && self.blocks[id].received
     }
 
+    /// Valid token count stored for block `id` (0 for out-of-range or
+    /// never-written blocks). This is the value handoffs must preserve:
+    /// deriving the count from the buffer length reports every block as
+    /// full because buffers are zero-padded to block capacity.
+    pub fn block_num_tokens(&self, id: BlockId) -> Option<usize> {
+        self.blocks
+            .get(id)
+            .filter(|b| b.received)
+            .map(|b| b.num_tokens)
+    }
+
     /// Explicitly set whether block `id` holds complete KV data; clearing
     /// the flag also resets `num_tokens` so the block reads as empty.
     ///
@@ -1043,6 +1057,27 @@ impl PagedKvCache {
     /// Return the number of active layers in this cache.
     pub fn num_layers(&self) -> usize {
         self.k_pages.len()
+    }
+
+    /// Valid token count stored in physical block `block_id` of the logical
+    /// block table: every block is a full page except the tail, which
+    /// carries the `committed_tokens` remainder. `None` when the id is
+    /// outside the table. Handoffs use this so a partially-filled tail
+    /// block does not arrive marked as fully valid.
+    pub fn block_num_tokens(&self, block_id: usize) -> Option<usize> {
+        let num_blocks = self.table.len();
+        if block_id >= num_blocks {
+            return None;
+        }
+        let full_blocks = self.committed_tokens / self.page_size;
+        let tail = self.committed_tokens % self.page_size;
+        if block_id < full_blocks {
+            Some(self.page_size)
+        } else if block_id == full_blocks {
+            Some(if tail == 0 { self.page_size } else { tail })
+        } else {
+            Some(0)
+        }
     }
 
     /// Extract key and value slices for a given layer and physical block ID.
@@ -1399,21 +1434,11 @@ impl KvCache for PagedKvCache {
     }
 
     fn layer_block_slice(&self, layer: usize, block_id: usize) -> Option<(&[f32], &[f32])> {
-        if layer >= self.k_pages.len() || layer >= self.v_pages.len() {
-            return None;
-        }
-        let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
-        let block_elems = self.page_size * stride;
-        let start = block_id * block_elems;
-        let end = start + block_elems;
-        if end <= self.k_pages[layer].len() && end <= self.v_pages[layer].len() {
-            Some((
-                &self.k_pages[layer][start..end],
-                &self.v_pages[layer][start..end],
-            ))
-        } else {
-            None
-        }
+        PagedKvCache::layer_block_slice(self, layer, block_id)
+    }
+
+    fn block_num_tokens(&self, block_id: usize) -> Option<usize> {
+        PagedKvCache::block_num_tokens(self, block_id)
     }
 
     fn write_layer_block(

@@ -106,7 +106,7 @@ fn test_all_zero_kv_block_marked_received() {
 
     let client = NetworkKvClient::new("127.0.0.1".to_string());
     client
-        .send_block_remote(0, 0, &k_data, &v_data, &decode_addr)
+        .send_block_remote(0, 0, &k_data, &v_data, 16, &decode_addr)
         .expect("send_block_remote must succeed against live receiver");
 
     // Give the receiver thread time to process.

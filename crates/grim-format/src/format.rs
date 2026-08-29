@@ -962,6 +962,7 @@ pub fn pack_row_bpw_for_wave(out: &mut Vec<u8>, row_values: &[f32], bpw: u8, wav
 /// Symmetric uniform quantization of a single f32 value to `bpw` bits.
 /// Returns a code in `[0, 2^bpw - 1]`. Used by [`pack_row_bpw`].
 fn quantize_to_bpw(value: f32, bpw: u8) -> u8 {
+    let bpw = bpw.clamp(1, 16);
     let levels = (1u32 << bpw) as f32;
     // Map [-1, 1] to [0, levels-1]; clamp outside.
     let normalized = (value.clamp(-1.0, 1.0) + 1.0) * 0.5;

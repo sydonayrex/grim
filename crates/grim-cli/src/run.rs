@@ -185,12 +185,11 @@ fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
             // ROCm available but no devices; check Metal → CUDA → Vulkan fallback.
             #[cfg(target_vendor = "apple")]
             {
-                let Some((free, total)) = grim_backend_metal::vram_info(0) else {
-                    // vram_info failed; fall through to CUDA/Vulkan
-                };
-                if total > 0 {
-                    eprintln!("[grim] Metal GPU detected");
-                    return Ok((Device::Metal(0), "metal:0".into()));
+                if let Some((_free, total)) = grim_backend_metal::vram_info(0) {
+                    if total > 0 {
+                        eprintln!("[grim] Metal GPU detected");
+                        return Ok((Device::Metal(0), "metal:0".into()));
+                    }
                 }
             }
             #[cfg(feature = "cuda")]

@@ -190,20 +190,25 @@ fn test_receptor_server_write_and_read() {
     let v_data: Vec<f32> = (0..elem_per_token).map(|i| (i + 1) as f32).collect();
     let block_id = 5usize;
 
+    // 1 token of valid data (elem_per_token elements).
     client
-        .send_block_remote(block_id, 0, &k_data, &v_data, &addr)
+        .send_block_remote(block_id, 0, &k_data, &v_data, 1, &addr)
         .expect("send_block_remote must succeed");
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
+    // Pushes ACK on commit — the data is in the pool already.
     let guard = shared.lock().unwrap();
     let recv_k = guard.read_keys(block_id);
     let recv_v = guard.read_values(block_id);
     // read_keys returns the full block (BLOCK_SIZE * elem_per_token = 512),
     // but only `elem_per_token` (32) elements were written.  Compare the
-    // written prefix.
+    // written prefix, and require the valid-token count to round-trip.
     assert_eq!(&recv_k[..k_data.len()], &k_data[..]);
     assert_eq!(&recv_v[..v_data.len()], &v_data[..]);
+    assert_eq!(
+        guard.block_num_tokens(block_id),
+        Some(1),
+        "receiver must store the sender's valid token count"
+    );
 }
 
 #[test]
@@ -239,14 +244,73 @@ fn test_layer_pipelined_kv_streamer_and_orchestrator() {
     let k_data = vec![1.23f32; 32];
     let v_data = vec![4.56f32; 32];
 
+    // 32 elements / 8 elems-per-token = 4 valid tokens.
     streamer
-        .stream_layer_block(0, 0, &k_data, &v_data)
+        .stream_layer_block(0, 0, &k_data, &v_data, 4)
         .expect("streaming layer block must succeed");
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    // Streaming ACKs on commit — the data is in the pool already.
     let guard = shared.lock().unwrap();
     let recv_k = guard.read_keys(0);
     assert_eq!(&recv_k[..32], &k_data[..]);
+    assert_eq!(guard.block_num_tokens(0), Some(4));
+}
+
+/// G2 gate: the `transfer_paged_cache_real` path must round-trip a
+/// `PagedKvCache`'s per-layer block slices through the wire — including a
+/// partially-filled tail block's valid token count.
+#[test]
+fn test_paged_cache_transfer_roundtrip() {
+    use grim_core::kv_cache::KvCache;
+    use grim_memory::PagedKvCache;
+
+    let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
+    let mut cache = PagedKvCache::new(pool.clone(), 2, 4, 16);
+    // Two physical blocks, 32 committed tokens, then roll back to 20 so
+    // block 0 is full (16 tokens) and block 1 is a 4-token tail.
+    cache.seed_prefix(&[0, 1]);
+    cache.rollback_to(20).unwrap();
+    assert_eq!(cache.block_num_tokens(0), Some(16));
+    assert_eq!(cache.block_num_tokens(1), Some(4));
+
+    // Distinct per-layer, per-block data.
+    let k = |l: usize, b: usize| -> Vec<f32> {
+        (0..128).map(|i| (l * 1000 + b * 100 + i) as f32).collect()
+    };
+    let v = |l: usize, b: usize| -> Vec<f32> {
+        (0..128).map(|i| -((l * 1000 + b * 100 + i) as f32)).collect()
+    };
+    for layer in 0..2usize {
+        for b in 0..2usize {
+            cache
+                .write_layer_block(layer, b, &k(layer, b), &v(layer, b))
+                .unwrap();
+        }
+    }
+
+    let dest_shared = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let _receiver = KvReceiverServer::new(&addr, dest_shared.clone()).unwrap();
+
+    let router = DisaggRouter::new(&addr, &addr, PoolRole::Prefill);
+    router
+        .transfer_paged_cache_real(1, &[0, 1], &cache)
+        .expect("paged-cache transfer must succeed");
+
+    let dest = dest_shared.lock().unwrap();
+    for layer in 0..2usize {
+        for b in 0..2usize {
+            let got_k = dest.read_layer_keys(b, layer).expect("keys written");
+            let got_v = dest.read_layer_values(b, layer).expect("values written");
+            assert_eq!(&got_k[..128], &k(layer, b)[..], "layer {layer} block {b} keys");
+            assert_eq!(&got_v[..128], &v(layer, b)[..], "layer {layer} block {b} values");
+        }
+    }
+    // Valid token counts must survive the wire — the tail block stays a
+    // 4-token tail instead of being marked fully valid.
+    assert_eq!(dest.block_num_tokens(0), Some(16));
+    assert_eq!(dest.block_num_tokens(1), Some(4));
 }
 
 #[test]

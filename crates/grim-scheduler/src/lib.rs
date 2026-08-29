@@ -149,10 +149,21 @@ impl AdmissionController {
     }
 
     pub fn observe_prefill(&self, prompt_tokens: usize, wall_duration: Duration) {
-        let measured_tps = prompt_tokens as f64 / wall_duration.as_secs_f64();
+        let secs = wall_duration.as_secs_f64();
+        if secs <= 0.0 || prompt_tokens == 0 {
+            return;
+        }
+        let measured_tps = prompt_tokens as f64 / secs;
+        if !measured_tps.is_finite() || measured_tps <= 0.0 {
+            return;
+        }
         const EMA_ALPHA: f64 = 0.3;
         let mut est = self.throughput_estimate.lock().unwrap();
-        *est = *est * (1.0 - EMA_ALPHA) + measured_tps * EMA_ALPHA;
+        if !est.is_finite() || *est <= 0.0 {
+            *est = measured_tps;
+        } else {
+            *est = *est * (1.0 - EMA_ALPHA) + measured_tps * EMA_ALPHA;
+        }
     }
 
     pub fn throughput_estimate(&self) -> f64 {

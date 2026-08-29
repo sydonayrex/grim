@@ -368,13 +368,25 @@ impl SharedSpillManager {
 const KV_MAGIC: u32 = 0x4B56434B;
 
 /// Current on-wire protocol version.
-const KV_PROTOCOL_VERSION: u32 = 2;
+///
+/// V3: header carries the sender's valid token count (`num_tokens`) and
+/// every push transfer is answered with a 1-header ACK, so a receiver that
+/// silently discards a block (checksum mismatch, out-of-range id) is no
+/// longer indistinguishable from a successful commit.
+const KV_PROTOCOL_VERSION: u32 = 3;
 
-/// Fixed-size header (28 bytes) prepended to every KV block transfer.
+/// Fixed-size header (32 bytes) prepended to every KV block transfer.
 ///
 /// Layout (all little-endian):
 /// | magic (u32) | version (u32) | block_id (u64) |
 /// | layer_idx (u32) | num_elements (u32) | checksum (u32) |
+/// | num_tokens (u32) |
+///
+/// `num_tokens` is the sender's valid token count for the block. The V2
+/// protocol omitted it and receivers derived the count from the payload
+/// length — which is always a full block because payloads are zero-padded —
+/// silently marking partially-filled blocks as fully valid on the
+/// destination. It is now carried end-to-end.
 #[derive(Debug, Clone, Copy)]
 pub struct KvBlockHeader {
     pub magic: u32,
@@ -383,12 +395,13 @@ pub struct KvBlockHeader {
     pub layer_idx: u32,
     pub num_elements: u32,
     pub checksum: u32,
+    pub num_tokens: u32,
 }
 
 impl KvBlockHeader {
-    pub const SIZE: usize = 28; // 4+4+8+4+4+4
+    pub const SIZE: usize = 32; // 4+4+8+4+4+4+4
 
-    /// Serialise the header to a 28-byte little-endian buffer.
+    /// Serialise the header to a 32-byte little-endian buffer.
     pub fn serialize(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -397,6 +410,7 @@ impl KvBlockHeader {
         buf[16..20].copy_from_slice(&self.layer_idx.to_le_bytes());
         buf[20..24].copy_from_slice(&self.num_elements.to_le_bytes());
         buf[24..28].copy_from_slice(&self.checksum.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.num_tokens.to_le_bytes());
         buf
     }
 
@@ -412,6 +426,7 @@ impl KvBlockHeader {
         let layer_idx = u32::from_le_bytes(buf[16..20].try_into().ok()?);
         let num_elements = u32::from_le_bytes(buf[20..24].try_into().ok()?);
         let checksum = u32::from_le_bytes(buf[24..28].try_into().ok()?);
+        let num_tokens = u32::from_le_bytes(buf[28..32].try_into().ok()?);
         Some(Self {
             magic,
             version,
@@ -419,6 +434,7 @@ impl KvBlockHeader {
             layer_idx,
             num_elements,
             checksum,
+            num_tokens,
         })
     }
 
@@ -476,6 +492,14 @@ pub trait KvBlockStore: Send + Sync {
     /// content sniff: a genuinely all-zero KV block is valid data, not
     /// "not yet arrived."
     fn block_is_received(&self, id: BlockId) -> bool;
+
+    /// Valid token count stored for block `id`, if the store tracks one.
+    /// `None` (the default) makes fetch replies fall back to deriving the
+    /// count from the payload length, which reports partially-filled blocks
+    /// as full — implementors that track fill state should override this.
+    fn block_num_tokens(&self, _id: BlockId) -> Option<usize> {
+        None
+    }
 
     /// Read key data for layer 0 of block `id`.  Returns `None` when the
     /// block is out of range — pull-mode fetch (F8/F10) turns that into a
@@ -541,19 +565,80 @@ impl NetworkKvClient {
     }
 
     /// Dispatches a KV block key/value payload buffer to a target remote IP
-    /// endpoint over a TCP/network stream using the V2 wire protocol.
+    /// endpoint over a TCP/network stream using the V3 wire protocol.
     ///
-    /// The protocol sends a 28-byte header (magic, version, block_id,
-    /// layer_idx, num_elements, checksum) followed by the raw f32 bytes of
-    /// the key slice and then the value slice.
+    /// The protocol sends a 32-byte header (magic, version, block_id,
+    /// layer_idx, num_elements, checksum, num_tokens) followed by the raw f32
+    /// bytes of the key slice and then the value slice. The receiver answers
+    /// with a 1-header ACK once the block is committed (or rejected), so
+    /// `Ok(())` means the data actually landed — not just that the bytes
+    /// left the local socket buffer.
+    ///
+    /// `num_tokens` is the block's valid token count; receivers store it
+    /// verbatim instead of deriving it from the (zero-padded) payload length.
     pub fn send_block_remote(
         &self,
         block_id: BlockId,
         layer_idx: u32,
         k: &[f32],
         v: &[f32],
+        num_tokens: usize,
         target_ip: &str,
     ) -> Result<()> {
+        let msg = Self::encode_block_message(block_id, layer_idx, k, v, num_tokens)?;
+        let addr = Self::resolve_addr(target_ip);
+        let mut stream = Self::connect_to(&addr, "send block")?;
+        Self::write_and_ack(&mut stream, &msg, block_id as u64, layer_idx)
+    }
+
+    /// Send several (block, layer) KV payloads over ONE TCP connection:
+    /// all payloads are written first, then every ACK is read back in
+    /// order. Cuts the per-message connection setup cost of
+    /// [`Self::send_block_remote`] for large multi-layer handoffs while
+    /// keeping the same per-message ACK guarantee.
+    pub fn send_blocks_batch_remote(
+        &self,
+        items: &[KvBlockTransfer<'_>],
+        target_ip: &str,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Err(Error::KvCache(
+                "send_blocks_batch_remote: item list cannot be empty".into(),
+            ));
+        }
+        let mut messages = Vec::with_capacity(items.len());
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            messages.push(Self::encode_block_message(
+                item.block_id,
+                item.layer_idx,
+                item.k,
+                item.v,
+                item.num_tokens,
+            )?);
+            ids.push((item.block_id as u64, item.layer_idx));
+        }
+        let addr = Self::resolve_addr(target_ip);
+        let mut stream = Self::connect_to(&addr, "send block batch")?;
+        for msg in &messages {
+            stream
+                .write_all(msg)
+                .map_err(|e| Error::KvCache(format!("TCP batch block write error: {e}")))?;
+        }
+        for (block_id, layer_idx) in ids {
+            Self::read_ack(&mut stream, block_id, layer_idx)?;
+        }
+        Ok(())
+    }
+
+    /// Encode one V3 block message: header + little-endian K then V floats.
+    fn encode_block_message(
+        block_id: BlockId,
+        layer_idx: u32,
+        k: &[f32],
+        v: &[f32],
+        num_tokens: usize,
+    ) -> Result<Vec<u8>> {
         if k.len() != v.len() {
             return Err(Error::KvCache(
                 "Key and Value slice lengths must match for block transport".into(),
@@ -562,14 +647,23 @@ impl NetworkKvClient {
         if k.is_empty() {
             return Err(Error::KvCache("Cannot send an empty KV block".into()));
         }
-        // The header field is u32 — reject instead of silently truncating.
+        // The header fields are u32 — reject instead of silently truncating.
         let num_elements = u32::try_from(k.len()).map_err(|_| {
             Error::KvCache(format!(
                 "block too large for the wire protocol: {} elements exceeds u32::MAX",
                 k.len()
             ))
         })?;
-        let addr = Self::resolve_addr(target_ip);
+        let num_tokens_field = u32::try_from(num_tokens).map_err(|_| {
+            Error::KvCache(format!(
+                "num_tokens {num_tokens} exceeds the wire protocol u32::MAX"
+            ))
+        })?;
+        if layer_idx > MAX_WIRE_LAYER_IDX {
+            return Err(Error::KvCache(format!(
+                "layer_idx {layer_idx} exceeds the wire protocol cap {MAX_WIRE_LAYER_IDX}"
+            )));
+        }
         let checksum = compute_checksum(k, v);
         let header = KvBlockHeader {
             magic: KV_MAGIC,
@@ -578,6 +672,7 @@ impl NetworkKvClient {
             layer_idx,
             num_elements,
             checksum,
+            num_tokens: num_tokens_field,
         };
 
         let mut buf = Vec::with_capacity(KvBlockHeader::SIZE + k.len() * 8);
@@ -585,40 +680,91 @@ impl NetworkKvClient {
         for &val in k.iter().chain(v.iter()) {
             buf.extend_from_slice(&val.to_le_bytes());
         }
+        Ok(buf)
+    }
 
+    /// Connect to a resolved `host:port` with the protocol's connect timeout.
+    fn connect_to(addr: &str, op: &str) -> Result<std::net::TcpStream> {
         let socket_addr = addr
             .parse()
-            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
-
-        let mut stream = std::net::TcpStream::connect_timeout(
+            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{addr}': {e}")))?;
+        let stream = std::net::TcpStream::connect_timeout(
             &socket_addr,
             std::time::Duration::from_millis(500),
         )
-        .map_err(|e| Error::KvCache(format!("TCP send block connection failed to {addr}: {e}")))?;
-
+        .map_err(|e| Error::KvCache(format!("TCP {op} connection failed to {addr}: {e}")))?;
+        // Deadline the whole exchange: without a socket timeout a receiver
+        // that accepts then wedges blocks the sender's write/ACK read forever.
         stream
-            .write_all(&buf)
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| Error::KvCache(format!("TCP {op}: set_read_timeout failed: {e}")))?;
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| Error::KvCache(format!("TCP {op}: set_write_timeout failed: {e}")))?;
+        Ok(stream)
+    }
+
+    /// Write one message and wait for the receiver's 1-header ACK.
+    fn write_and_ack(
+        stream: &mut std::net::TcpStream,
+        msg: &[u8],
+        block_id: u64,
+        layer_idx: u32,
+    ) -> Result<()> {
+        stream
+            .write_all(msg)
             .map_err(|e| Error::KvCache(format!("TCP send block error: {e}")))?;
+        Self::read_ack(stream, block_id, layer_idx)
+    }
+
+    /// Read and validate one push-ACK header. `checksum == ACK_OK` means
+    /// committed; `0` means the receiver rejected the message — a FINAL
+    /// error (retrying can never succeed: the receiver refused the data).
+    fn read_ack(
+        stream: &mut std::net::TcpStream,
+        block_id: u64,
+        layer_idx: u32,
+    ) -> Result<()> {
+        let mut hdr = [0u8; KvBlockHeader::SIZE];
+        stream
+            .read_exact(&mut hdr)
+            .map_err(|e| Error::KvCache(format!("TCP send block ACK read error: {e}")))?;
+        let ack = KvBlockHeader::deserialize(&hdr)
+            .ok_or_else(|| Error::KvCache("TCP send block ACK: invalid header size".into()))?;
+        if !ack.verify() {
+            return Err(Error::KvCache(
+                "TCP send block ACK: protocol mismatch".into(),
+            ));
+        }
+        if ack.block_id != block_id || ack.layer_idx != layer_idx {
+            return Err(Error::KvCache(format!(
+                "TCP send block ACK: response for block {} layer {} does not match sent block {block_id} layer {layer_idx}",
+                ack.block_id, ack.layer_idx
+            )));
+        }
+        if ack.checksum != ACK_OK {
+            return Err(Error::KvCache(format!(
+                "KV receiver rejected block {block_id} layer {layer_idx} \
+                 (checksum mismatch, out-of-range id, or oversized payload)"
+            )));
+        }
         Ok(())
     }
 
     /// Fetches a key/value payload block from a remote IP endpoint over a TCP stream.
     ///
-    /// Sends a V2 fetch request (header only) and receives a V2 response
-    /// containing the key and value data.  Returns an error if the remote
-    /// endpoint is unreachable or the response fails validation — never
-    /// fabricates data.
+    /// Sends a V3 fetch request (header only) and receives a V3 response
+    /// containing the key and value data plus the block's stored valid token
+    /// count. Returns an error if the remote endpoint is unreachable or the
+    /// response fails validation — never fabricates data.
     pub fn fetch_block_remote(
         &self,
         block_id: BlockId,
         layer_idx: u32,
         target_ip: &str,
         block_elems: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
+    ) -> Result<(Vec<f32>, Vec<f32>, usize)> {
         let addr = Self::resolve_addr(target_ip);
-        let socket_addr = addr
-            .parse()
-            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
 
         // Build a fetch-request header: same format but with a zero checksum
         // and a special request flag in layer_idx (bit 31 set). Mask bit 31
@@ -637,23 +783,13 @@ impl NetworkKvClient {
             layer_idx: (layer_idx & !FETCH_REQUEST_FLAG) | FETCH_REQUEST_FLAG,
             num_elements: req_num_elements,
             checksum: 0,
+            num_tokens: 0,
         };
 
-        let mut stream = std::net::TcpStream::connect_timeout(
-            &socket_addr,
-            std::time::Duration::from_millis(500),
-        )
-        .map_err(|e| Error::KvCache(format!("TCP fetch connection failed to {addr}: {e}")))?;
         // Deadline the whole exchange, not just the connect: a server that
         // never answers (protocol mismatch, wedged peer) must fail fast
         // instead of hanging the caller's read_exact forever (F8 follow-up).
-        const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .map_err(|e| Error::KvCache(format!("TCP fetch: set_read_timeout failed: {e}")))?;
-        stream
-            .set_write_timeout(Some(IO_TIMEOUT))
-            .map_err(|e| Error::KvCache(format!("TCP fetch: set_write_timeout failed: {e}")))?;
+        let mut stream = Self::connect_to(&addr, "fetch")?;
 
         stream
             .write_all(&req_header.serialize())
@@ -714,7 +850,11 @@ impl NetworkKvClient {
             )));
         }
 
-        Ok((k_vec, v_vec))
+        Ok((
+            k_vec,
+            v_vec,
+            header.num_tokens.min(header.num_elements) as usize,
+        ))
     }
 
     /// Send a prompt-token control message to a remote node (push model).
@@ -760,23 +900,31 @@ impl NetworkKvClient {
             layer_idx: PROMPT_FLAG,
             num_elements,
             checksum: compute_checksum_bytes(&payload),
+            num_tokens: num_elements,
         };
         let mut buf = header.serialize().to_vec();
         buf.extend_from_slice(&payload);
 
-        let socket_addr = addr
-            .parse()
-            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
-        let mut stream = std::net::TcpStream::connect_timeout(
-            &socket_addr,
-            std::time::Duration::from_millis(500),
-        )
-        .map_err(|e| Error::KvCache(format!("TCP prompt send connection failed to {addr}: {e}")))?;
+        let mut stream = Self::connect_to(&addr, "prompt send")?;
         stream
             .write_all(&buf)
             .map_err(|e| Error::KvCache(format!("TCP prompt send error: {e}")))?;
-        Ok(())
+        // Wait for the receiver's ACK so a prompt the receiver refused
+        // (over cap, checksum mismatch) surfaces as an error here instead
+        // of silently never arriving in the PromptChannel.
+        Self::read_ack(&mut stream, request_id, PROMPT_FLAG)
     }
+}
+
+/// One (block, layer) KV payload queued for [`NetworkKvClient::send_blocks_batch_remote`].
+#[derive(Debug, Clone, Copy)]
+pub struct KvBlockTransfer<'a> {
+    pub block_id: BlockId,
+    pub layer_idx: u32,
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    /// Valid token count carried end-to-end (see [`KvBlockHeader`]).
+    pub num_tokens: usize,
 }
 
 /// Bit flag embedded in `layer_idx` of a fetch-request header to signal
@@ -788,6 +936,21 @@ const FETCH_REQUEST_FLAG: u32 = 0x8000_0000;
 /// the receiver stores it in the shared [`PromptChannel`] instead of the KV
 /// block store.
 const PROMPT_FLAG: u32 = 0x4000_0000;
+
+/// Value written to the `checksum` field of a push-ACK header when the
+/// receiver committed the block (or stored the prompt). `0` means the
+/// receiver rejected the message.
+const ACK_OK: u32 = 1;
+
+/// Sanity cap on `layer_idx` of push messages. The value indexes per-layer
+/// storage on the receiver, so an unbounded (or garbage) index would make
+/// the receiver allocate `(layer_idx + 1)` per-layer buffers.
+const MAX_WIRE_LAYER_IDX: u32 = 4_096;
+
+/// Per-socket I/O deadline for both the client and the receiver. Bounds
+/// every individual read/write so a wedged peer fails the transfer instead
+/// of hanging it.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Shared store for prompt-token control messages received over the wire
 /// (see [`NetworkKvClient::send_prompt_tokens`]). Cloneable handle; `take`
@@ -802,12 +965,25 @@ impl PromptChannel {
         Self::default()
     }
 
-    /// Store (or overwrite) the prompt tokens for a request id.
+    /// Store (or overwrite) the prompt tokens for a request id. When the
+    /// channel is at [`MAX_PENDING_PROMPTS`] and this is a new request, one
+    /// pending entry is evicted (unordered — at that size every victim is
+    /// equally stale) to keep the channel bounded.
     pub fn store(&self, request_id: u64, tokens: Vec<u32>) {
-        self.inner
+        let mut map = self
+            .inner
             .lock()
-            .expect("prompt channel mutex poisoned")
-            .insert(request_id, tokens);
+            .expect("prompt channel mutex poisoned");
+        if map.len() >= MAX_PENDING_PROMPTS && !map.contains_key(&request_id) {
+            if let Some(victim) = map.keys().next().copied() {
+                map.remove(&victim);
+                eprintln!(
+                    "[grim-kvtransport] PromptChannel at cap {MAX_PENDING_PROMPTS}; \
+                     evicted pending prompt for request {victim}"
+                );
+            }
+        }
+        map.insert(request_id, tokens);
     }
 
     /// Consume the stored prompt tokens for a request id, if any.
@@ -841,6 +1017,11 @@ fn parse_f32_slice(bytes: &[u8]) -> Vec<f32> {
 
 /// Maximum tokens allowed in a single prompt-token control message (1M tokens).
 pub const MAX_PROMPT_TOKENS: usize = 1_000_000;
+
+/// Maximum number of distinct pending prompts the channel retains. Requests
+/// that are never consumed would otherwise accumulate for the process
+/// lifetime on a long-running receiver.
+pub const MAX_PENDING_PROMPTS: usize = 10_000;
 
 /// Spawns a background TCP server that listens for incoming
 /// `NetworkKvClient::send_block_remote` streams and writes them into a shared
@@ -877,7 +1058,24 @@ pub fn start_kv_receiver_server_with_prompts<T>(
 where
     T: KvBlockStore + 'static,
 {
+    let (handle, _stop) = start_kv_receiver_server_stoppable(listen_addr, pool, prompts)?;
+    Ok(handle)
+}
+
+/// Like [`start_kv_receiver_server_with_prompts`], but also returns a stop
+/// flag: setting it makes the accept loop exit within its poll interval, so
+/// callers that own the server's lifetime can shut it down (dropping the
+/// returned handle alone never stops the listener thread).
+pub fn start_kv_receiver_server_stoppable<T>(
+    listen_addr: &str,
+    pool: std::sync::Arc<std::sync::Mutex<T>>,
+    prompts: PromptChannel,
+) -> Result<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>
+where
+    T: KvBlockStore + 'static,
+{
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let listener = TcpListener::bind(listen_addr).map_err(|e| {
         Error::KvCache(format!(
@@ -888,31 +1086,49 @@ where
         .set_nonblocking(true)
         .map_err(|e| Error::KvCache(format!("set_nonblocking failed: {e}")))?;
 
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
     let addr_str = listen_addr.to_string();
+    let stop_flag = stop.clone();
     let handle = std::thread::spawn(move || {
         eprintln!("[grim-kvtransport] KV receiver listening on {addr_str}");
         loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
             match listener.accept() {
                 Ok((mut stream, _peer)) => {
-                    // Read the fixed-size header.
-                    let mut hdr = [0u8; KvBlockHeader::SIZE];
-                    if stream.read_exact(&mut hdr).is_err() {
-                        continue;
-                    }
-                    let header = match KvBlockHeader::deserialize(&hdr) {
-                        Some(h) => h,
-                        None => continue,
-                    };
+                    // Deadline every read/write on this connection: a peer
+                    // that connects, sends a header, then stalls must not
+                    // wedge the single-threaded accept loop.
+                    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                    // Drain loop: V3 clients may pipeline several messages
+                    // over one connection (batch transfers). Legacy
+                    // one-message-per-connection senders simply close after
+                    // the first message, which breaks the loop via EOF.
+                    loop {
+                        // Read the fixed-size header.
+                        let mut hdr = [0u8; KvBlockHeader::SIZE];
+                        if stream.read_exact(&mut hdr).is_err() {
+                            break;
+                        }
+                        let header = match KvBlockHeader::deserialize(&hdr) {
+                            Some(h) => h,
+                            None => break,
+                        };
 
-                    // Reject protocol mismatches immediately.
-                    if !header.verify() {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: rejecting connection \
-                             — bad magic={:#x} version={}",
-                            header.magic, header.version
-                        );
-                        continue;
-                    }
+                        // Reject protocol mismatches immediately. The payload
+                        // has not been read yet, so the stream framing is
+                        // unrecoverable: NAK, then close the connection.
+                        if !header.verify() {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: rejecting connection \
+                                 — bad magic={:#x} version={}",
+                                header.magic, header.version
+                            );
+                            send_ack(&mut stream, &header, false, 0);
+                            break;
+                        }
 
                     // F8/F10: a fetch request (FETCH_REQUEST_FLAG set in
                     // layer_idx) asks the server to REPLY with the block's
@@ -925,7 +1141,7 @@ where
                     if header.layer_idx & FETCH_REQUEST_FLAG != 0 {
                         let layer_idx = header.layer_idx & !FETCH_REQUEST_FLAG;
                         let block_id = header.block_id as usize;
-                        let (k_data, v_data) = {
+                        let (k_data, v_data, stored_tokens) = {
                             let guard = pool.lock().unwrap_or_else(|e| e.into_inner());
                             if block_id < guard.num_blocks() && guard.block_is_received(block_id) {
                                 match (
@@ -933,12 +1149,28 @@ where
                                     guard.read_layer_values(block_id, layer_idx),
                                 ) {
                                     (Some(k), Some(v)) if k.len() == v.len() && !k.is_empty() => {
-                                        (k, v)
+                                        let derived = {
+                                            let elem = guard.block_elem_per_token();
+                                            if elem == 0 {
+                                                0
+                                            } else {
+                                                k.len() / elem
+                                            }
+                                        };
+                                        // Prefer the store's own fill state; only
+                                        // fall back to the (inflation-prone)
+                                        // payload-derived count when the store
+                                        // does not track it.
+                                        let stored = guard
+                                            .block_num_tokens(block_id)
+                                            .unwrap_or(derived)
+                                            .min(derived);
+                                        (k, v, stored)
                                     }
-                                    _ => (Vec::new(), Vec::new()),
+                                    _ => (Vec::new(), Vec::new(), 0),
                                 }
                             } else {
-                                (Vec::new(), Vec::new())
+                                (Vec::new(), Vec::new(), 0)
                             }
                         };
                         let resp = KvBlockHeader {
@@ -948,6 +1180,7 @@ where
                             layer_idx,
                             num_elements: k_data.len() as u32,
                             checksum: compute_checksum(&k_data, &v_data),
+                            num_tokens: stored_tokens as u32,
                         };
                         let mut buf = resp.serialize().to_vec();
                         for &val in k_data.iter().chain(v_data.iter()) {
@@ -973,6 +1206,7 @@ where
                                 "[grim-kvtransport] KV receiver: prompt num_tokens {num_tokens} \
                                  exceeds safety cap {MAX_PROMPT_TOKENS}"
                             );
+                            send_ack(&mut stream, &header, false, 0);
                             continue;
                         }
                         let mut payload = vec![0u8; num_tokens.saturating_mul(4)];
@@ -982,7 +1216,7 @@ where
                                  for request {}",
                                 header.block_id
                             );
-                            continue;
+                            break;
                         }
                         if compute_checksum_bytes(&payload) != header.checksum {
                             eprintln!(
@@ -990,6 +1224,7 @@ where
                                  message for request {}",
                                 header.block_id
                             );
+                            send_ack(&mut stream, &header, false, 0);
                             continue;
                         }
                         let tokens: Vec<u32> = payload
@@ -997,15 +1232,31 @@ where
                             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect();
                         prompts.store(header.block_id, tokens);
+                        send_ack(&mut stream, &header, true, num_tokens as u32);
                         continue;
                     }
 
                     let num_elems = header.num_elements as usize;
+                    // Flag-free push message: layer_idx now indexes per-layer
+                    // storage, so a garbage value would make the write path
+                    // allocate `(layer_idx + 1)` per-layer buffers.
+                    if header.layer_idx > MAX_WIRE_LAYER_IDX {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: layer_idx {} exceeds cap \
+                             {MAX_WIRE_LAYER_IDX}",
+                            header.layer_idx
+                        );
+                        // Payload not consumed — framing is unrecoverable.
+                        send_ack(&mut stream, &header, false, 0);
+                        break;
+                    }
                     if num_elems > 100_000_000 {
                         eprintln!(
                             "[grim-kvtransport] KV receiver: num_elements {num_elems} exceeds safety cap"
                         );
-                        continue;
+                        // Payload not consumed — framing is unrecoverable.
+                        send_ack(&mut stream, &header, false, 0);
+                        break;
                     }
                     let total_bytes = match num_elems.checked_mul(8) {
                         Some(b) => b,
@@ -1013,7 +1264,8 @@ where
                             eprintln!(
                                 "[grim-kvtransport] KV receiver: num_elements {num_elems} multiplied by 8 overflowed usize"
                             );
-                            continue;
+                            send_ack(&mut stream, &header, false, 0);
+                            break;
                         }
                     };
                     let mut payload = vec![0u8; total_bytes];
@@ -1023,7 +1275,7 @@ where
                              block {}",
                             header.block_id
                         );
-                        continue;
+                        break;
                     }
 
                     // Verify the checksum over the RAW received bytes before
@@ -1042,61 +1294,108 @@ where
                              for block {} (expected {:#x}, got {:#x})",
                             header.block_id, header.checksum, computed
                         );
+                        send_ack(&mut stream, &header, false, 0);
                         continue;
                     }
 
                     // Write into the pool.
                     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-                    if header.block_id < guard.num_blocks() as u64 {
-                        let block_id = header.block_id as usize;
-                        let elem_per_token = guard.block_elem_per_token();
-                        // The sender computed `num_elems` using its OWN pool's
-                        // `block_elem_per_token()`. If that differs from this
-                        // receiver's value, the token count derived below is
-                        // wrong. Detect the mismatch (a sender/receiver
-                        // `elem_per_token` disagreement makes `num_elems`
-                        // non-divisible by the receiver's value) and warn, but
-                        // keep sizing off the receiver's value so the write
-                        // never overflows the block.
-                        if elem_per_token == 0 {
-                            eprintln!(
-                                "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
-                                 cannot size block {} — rejecting write",
-                                header.block_id
-                            );
-                            continue;
-                        } else if num_elems % elem_per_token != 0 {
-                            eprintln!(
-                                "[grim-kvtransport] KV receiver: num_elements {num_elems} not \
-                                 divisible by block_elem_per_token {elem_per_token} for block {} \
-                                 — possible sender/receiver elem_per_token mismatch; using \
-                                 receiver value",
-                                header.block_id
-                            );
-                        }
-                        let num_tokens = num_elems
-                            .checked_div(elem_per_token)
-                            .unwrap_or(num_elems)
-                            .min(guard.block_size());
-                        guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
-                        guard.write_layer_values(block_id, header.layer_idx, &v_data);
-                    } else {
+                    if header.block_id >= guard.num_blocks() as u64 {
                         eprintln!(
                             "[grim-kvtransport] KV receiver: block_id {} out of range",
                             header.block_id
                         );
+                        send_ack(&mut stream, &header, false, 0);
+                        continue;
+                    }
+                    let block_id = header.block_id as usize;
+                    let elem_per_token = guard.block_elem_per_token();
+                    // The sender computed `num_elems` using its OWN pool's
+                    // `block_elem_per_token()`. If that differs from this
+                    // receiver's value, the token count derived below is
+                    // wrong. Detect the mismatch (a sender/receiver
+                    // `elem_per_token` disagreement makes `num_elems`
+                    // non-divisible by the receiver's value) and warn, but
+                    // keep sizing off the receiver's value so the write
+                    // never overflows the block.
+                    if elem_per_token == 0 {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
+                             cannot size block {} — rejecting write",
+                            header.block_id
+                        );
+                        send_ack(&mut stream, &header, false, 0);
+                        continue;
+                    }
+                    if num_elems % elem_per_token != 0 {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: num_elements {num_elems} not \
+                             divisible by block_elem_per_token {elem_per_token} for block {} \
+                             — possible sender/receiver elem_per_token mismatch; using \
+                             receiver value",
+                            header.block_id
+                        );
+                    }
+                    // V3 senders carry the block's true valid token count;
+                    // cap it at what the payload can back (and at block
+                    // size). A zero field means a legacy V2-style sender —
+                    // fall back to the payload-derived count.
+                    let derived = num_elems
+                        .checked_div(elem_per_token)
+                        .unwrap_or(num_elems)
+                        .min(guard.block_size());
+                    let num_tokens = if header.num_tokens > 0 {
+                        (header.num_tokens as usize).min(derived)
+                    } else {
+                        derived
+                    };
+                    guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
+                    guard.write_layer_values(block_id, header.layer_idx, &v_data);
+                    send_ack(&mut stream, &header, true, num_tokens as u32);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No incoming connection — spin briefly.
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    // Persistent listener failure must not turn into a hot
+                    // spin; back off like the idle path.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         }
+        eprintln!("[grim-kvtransport] KV receiver on {addr_str} stopped");
     });
 
-    Ok(handle)
+    Ok((handle, stop))
+}
+
+/// Reply to a push transfer with a 1-header ACK. `ok == false` is a NAK:
+/// the receiver refused the message (checksum, range, size). Errors are
+/// logged, not propagated — the sender's own ACK read times out and
+/// surfaces the failure.
+fn send_ack(
+    stream: &mut std::net::TcpStream,
+    header: &KvBlockHeader,
+    ok: bool,
+    committed_tokens: u32,
+) {
+    let ack = KvBlockHeader {
+        magic: KV_MAGIC,
+        version: KV_PROTOCOL_VERSION,
+        block_id: header.block_id,
+        layer_idx: header.layer_idx,
+        num_elements: committed_tokens,
+        checksum: if ok { ACK_OK } else { 0 },
+        num_tokens: committed_tokens,
+    };
+    if let Err(e) = stream.write_all(&ack.serialize()) {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: ACK for block {} failed: {e}",
+            header.block_id
+        );
+    }
 }
 
 /// Reads one layer's weights from the configured NVMe weights file.
@@ -1553,7 +1852,7 @@ mod tests {
         let k = vec![1.0f32; 64];
         let v = vec![2.0f32; 64];
         client
-            .send_block_remote(100, 0, &k, &v, &addr)
+            .send_block_remote(100, 0, &k, &v, 8, &addr)
             .expect("send must succeed against live receiver");
 
         // Give the receiver thread a moment to write.
@@ -1622,7 +1921,7 @@ mod tests {
             let v = vec![0.25f32; size];
             let block_id = 42 + size;
             client
-                .send_block_remote(block_id, 0, &k, &v, &addr)
+                .send_block_remote(block_id, 0, &k, &v, size / 8, &addr)
                 .unwrap_or_else(|e| panic!("send_block_remote(size={size}) failed: {e}"));
 
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1645,6 +1944,7 @@ mod tests {
             layer_idx: 3,
             num_elements: 256,
             checksum: 0xCAFEBABE,
+            num_tokens: 16,
         };
         let bytes = header.serialize();
         assert_eq!(bytes.len(), KvBlockHeader::SIZE);
@@ -1740,17 +2040,18 @@ mod tests {
         let k: Vec<f32> = (0..64).map(|i| i as f32 * 0.25).collect();
         let v: Vec<f32> = (0..64).map(|i| (i as f32 * -0.5) - 1.0).collect();
         client
-            .send_block_remote(7, 0, &k, &v, &addr)
+            .send_block_remote(7, 0, &k, &v, 8, &addr)
             .expect("push must succeed");
 
         // Give the receiver thread a moment to commit the write.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let (got_k, got_v) = client
+        let (got_k, got_v, got_tokens) = client
             .fetch_block_remote(7, 0, &addr, 64)
             .expect("fetch must round-trip against the live server");
         assert_eq!(got_k, k, "fetched keys must match pushed keys");
         assert_eq!(got_v, v, "fetched values must match pushed values");
+        assert_eq!(got_tokens, 8, "fetched token count must match pushed count");
     }
 
     /// F8/F10: fetching a block the server does not hold must produce a
@@ -2194,7 +2495,7 @@ mod tests {
 
         let client = NetworkKvClient::new("127.0.0.1".to_string());
         client
-            .send_block_remote(901, 0, &k, &v, &addr)
+            .send_block_remote(901, 0, &k, &v, 8, &addr)
             .expect("send of NaN-bearing block must succeed");
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -2221,7 +2522,7 @@ mod tests {
         let v = vec![0.0f32; 64];
         let client = NetworkKvClient::new("127.0.0.1".to_string());
         client
-            .send_block_remote(902, 0, &k, &v, &addr)
+            .send_block_remote(902, 0, &k, &v, 8, &addr)
             .expect("send of all-zero block must succeed");
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -2259,6 +2560,7 @@ mod tests {
                     layer_idx: 0,
                     num_elements: evil_count,
                     checksum: 0,
+                    num_tokens: 0,
                 };
                 stream.write_all(&evil.serialize()).unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2314,6 +2616,7 @@ mod tests {
             layer_idx: PROMPT_FLAG,
             num_elements: u32::MAX,
             checksum: 0,
+            num_tokens: u32::MAX,
         };
         let mut stream = std::net::TcpStream::connect(&addr).unwrap();
         stream.write_all(&evil.serialize()).unwrap();
@@ -2328,7 +2631,9 @@ mod tests {
 
     /// A receiver whose store reports block_elem_per_token() == 0 cannot size
     /// the incoming write; it must skip the block entirely, never write with a
-    /// bogus token count derived from a division-by-zero fallback.
+    /// bogus token count derived from a division-by-zero fallback — and since
+    /// the ACK protocol, the sender must hear about the rejection instead of
+    /// reporting success while the data silently vanished.
     #[test]
     fn test_receiver_skips_write_when_elem_per_token_zero() {
         let port = find_free_port();
@@ -2339,10 +2644,12 @@ mod tests {
         let client = NetworkKvClient::new("127.0.0.1".to_string());
         let k = vec![1.0f32; 64];
         let v = vec![2.0f32; 64];
-        client
-            .send_block_remote(903, 0, &k, &v, &addr)
-            .expect("send must succeed");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let res = client.send_block_remote(903, 0, &k, &v, 8, &addr);
+        let err = res.expect_err("receiver-side rejection must surface as a send error");
+        assert!(
+            err.to_string().contains("rejected"),
+            "error should say the receiver rejected the block: {err}"
+        );
 
         let guard = store.lock().unwrap();
         assert_eq!(guard.write_count, 0, "store must receive no writes");

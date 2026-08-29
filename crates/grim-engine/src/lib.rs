@@ -1627,11 +1627,19 @@ impl Engine {
                                         if let Some((k_slice, v_slice)) =
                                             kv.layer_block_slice(layer, b_id)
                                         {
+                                            // Carry the block's valid token count on
+                                            // the wire; a partially-filled tail block
+                                            // must not arrive marked as full.
+                                            let num_tokens = kv
+                                                .block_num_tokens(b_id)
+                                                .unwrap_or(0)
+                                                .min(k_slice.len());
                                             if let Err(e) = router.send_layer_block_remote(
                                                 b_id,
                                                 layer as u32,
                                                 k_slice,
                                                 v_slice,
+                                                num_tokens,
                                             ) {
                                                 log::warn!(
                                                     "[grim-engine] Disagg prefill KV transfer failed for req {id}, layer {layer}, block {b_id}: {e}"
@@ -1703,8 +1711,11 @@ impl Engine {
                     let mut fetch_ok = true;
                     for layer in 0..num_layers {
                         match router.fetch_kv_block(block_id, layer as u32, block_elems) {
-                            Ok((k_data, v_data)) => {
-                                let num_tokens = block_elems / elem_per_token;
+                            // V3 wire carries the block's valid token count;
+                            // storing `block_elems / elem_per_token` instead
+                            // would mark every (partially-filled) block as
+                            // fully valid.
+                            Ok((k_data, v_data, num_tokens)) => {
                                 if layer == 0 {
                                     let mut pool =
                                         self.block_pool.lock().unwrap_or_else(|e| e.into_inner());

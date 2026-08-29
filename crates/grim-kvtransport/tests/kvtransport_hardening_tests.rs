@@ -60,6 +60,7 @@ fn test_nan_payload_checksum_exactness() {
         layer_idx: 0,
         num_elements: k.len() as u32,
         checksum: c1,
+        num_tokens: 1,
     };
     let bytes = header.serialize();
     let parsed_header = KvBlockHeader::deserialize(&bytes).unwrap();

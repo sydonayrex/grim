@@ -72,11 +72,12 @@ impl KvBlockStore for MockBlockStore {
 fn test_kv_block_header_serialization_and_checksum() {
     let header = KvBlockHeader {
         magic: 0x4B56434B,
-        version: 2,
+        version: 3,
         block_id: 42,
         layer_idx: 3,
         num_elements: 128,
         checksum: 0xDEADBEEF,
+        num_tokens: 16,
     };
 
     let serialized = header.serialize();
@@ -89,6 +90,7 @@ fn test_kv_block_header_serialization_and_checksum() {
     assert_eq!(deserialized.layer_idx, 3);
     assert_eq!(deserialized.num_elements, 128);
     assert_eq!(deserialized.checksum, 0xDEADBEEF);
+    assert_eq!(deserialized.num_tokens, 16);
     assert!(deserialized.verify());
 }
 
@@ -138,20 +140,20 @@ fn test_network_kv_transport_tcp_loopback_streaming() {
     // Give server thread a moment to bind
     std::thread::sleep(Duration::from_millis(50));
 
-    // Send KV block over network client
+    // Send KV block over network client (64 elems / 4 elems-per-token = 16 tokens).
     let client = NetworkKvClient::new("127.0.0.1".to_string());
     let k_payload = vec![0.42f32; 4 * 16];
     let v_payload = vec![0.84f32; 4 * 16];
 
-    let send_res = client.send_block_remote(2, 0, &k_payload, &v_payload, &addr.to_string());
+    let send_res =
+        client.send_block_remote(2, 0, &k_payload, &v_payload, 16, &addr.to_string());
     assert!(
         send_res.is_ok(),
-        "Client should successfully send KV block to loopback receiver"
+        "Client should successfully send KV block to loopback receiver: {:?}",
+        send_res.err()
     );
 
-    // Give server a moment to ingest payload into block store
-    std::thread::sleep(Duration::from_millis(50));
-
+    // The send only returns after the receiver's commit ACK.
     {
         let store = pool.lock().unwrap();
         assert!(

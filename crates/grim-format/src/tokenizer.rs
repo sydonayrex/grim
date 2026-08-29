@@ -164,6 +164,24 @@ impl GgufTokenizer {
             .or_else(|| token_to_id.get("<|unknown|>"))
             .copied();
 
+        let eos_token_id = token_to_id
+            .get("</s>")
+            .or_else(|| token_to_id.get("<|endoftext|>"))
+            .or_else(|| token_to_id.get("<|im_end|>"))
+            .or_else(|| token_to_id.get("<|eos|>"))
+            .or_else(|| token_to_id.get("<eos>"))
+            .or_else(|| token_to_id.get("<end_of_turn>"))
+            .or_else(|| token_to_id.get("<|eot_id|>"))
+            .copied();
+
+        let bos_token_id = token_to_id
+            .get("<s>")
+            .or_else(|| token_to_id.get("<|startoftext|>"))
+            .or_else(|| token_to_id.get("<|im_start|>"))
+            .or_else(|| token_to_id.get("<|bos|>"))
+            .or_else(|| token_to_id.get("<bos>"))
+            .copied();
+
         Ok(Self {
             tokens: id_to_token,
             token_to_id,
@@ -175,8 +193,8 @@ impl GgufTokenizer {
             } else {
                 None
             },
-            eos_token_id: None, // HF tokenizer.json doesn't have explicit EOS token ID in a standard way
-            bos_token_id: None,
+            eos_token_id,
+            bos_token_id,
             add_bos_token: false,
             unk_token_id,
             chat_template: None,
