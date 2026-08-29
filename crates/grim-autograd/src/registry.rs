@@ -6,7 +6,7 @@ use crate::AutogradScope;
 use crate::injection::{InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry};
 use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{BackendDevice, Shape, error::Result};
+use grim_tensor::{CoreTensorOps, Shape, error::Result};
 
 /// Base weights keyed by `(layer_idx, injection_point)`, in
 /// `[out_features * in_features]` row-major order. Supplied by the

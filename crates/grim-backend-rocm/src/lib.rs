@@ -33,7 +33,11 @@ pub use grim_tensor::error::Result;
 
 pub use grim_tensor::Storage as DTypeStorage;
 pub use grim_tensor::backend::{BackendDevice, ComputeHandle};
-pub use grim_tensor::{ArithType, BackendStorage};
+pub use grim_tensor::{
+    ArithType, AttentionOps, AutogradOps, BackendStorage, CollectiveOps, CoreTensorOps,
+    ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps,
+    SamplingOps,
+};
 pub use std::ffi::c_void;
 pub use std::sync::Arc;
 

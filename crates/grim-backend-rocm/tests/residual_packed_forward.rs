@@ -5,7 +5,7 @@
 
 use grim_backend_rocm::{FUSED_FORWARD_DISPATCH_STATS, RocmDevice};
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps, Shape};
 
 fn pack_bpw2(codes: [u8; 4]) -> u8 {
     (codes[0] << 6) | (codes[1] << 4) | (codes[2] << 2) | codes[3]

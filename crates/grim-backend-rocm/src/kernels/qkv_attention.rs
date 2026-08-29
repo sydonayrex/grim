@@ -1446,7 +1446,7 @@ pub fn launch_paged_attention_quant(
 mod tests {
     use super::*;
     use grim_tensor::dtype::{ArithType, DType, Storage};
-    use grim_tensor::{BackendDevice, Shape};
+    use grim_tensor::{AttentionOps, CoreTensorOps, MemoryOps, Shape};
 
     #[test]
     fn test_wmma_qkv_attention_source_contains_tensor_core_and_fallback() {

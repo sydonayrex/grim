@@ -15,9 +15,10 @@ use std::time::Instant;
 
 use grim_backend_cpu::CpuDevice;
 use grim_kvquant::{KvCompressor, KvDequantAttentionConfig, KvQuantConfig, LloydMaxCompressor};
-use grim_tensor::{BackendDevice, DType, Device, QuantProvenance, Shape, Tensor};
+use grim_tensor::{DType, Device, QuantProvenance, Shape, Tensor};
 
 use grim_backend_rocm::RocmDevice;
+use grim_tensor::{CoreTensorOps};
 
 /// Dense float attention for a single decode token vs a full KV cache.
 /// `q` is [num_heads, head_dim]; `k`/`v` are [kv_len, num_kv_heads, head_dim].

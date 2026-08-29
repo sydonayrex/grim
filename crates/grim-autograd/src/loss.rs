@@ -3,7 +3,7 @@
 //! Provides `cross_entropy_loss` returning `(loss_val, loss_grad_tensor)`.
 
 use grim_tensor::{
-    BackendDevice, DType, Shape, Storage, Tensor,
+    DType, MemoryOps, Shape, Storage, Tensor,
     error::{Error, Result},
 };
 use std::sync::Arc;

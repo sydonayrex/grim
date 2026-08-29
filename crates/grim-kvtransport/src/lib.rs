@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use grim_core::error::{Error, Result};
-use grim_tensor::backend::BackendDevice;
+use grim_tensor::AttentionOps;
 
 pub mod bitmask_index;
 pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};

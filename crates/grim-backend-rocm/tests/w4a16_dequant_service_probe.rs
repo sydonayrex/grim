@@ -2,9 +2,9 @@
 //! dequantized weight matrix. Device-gated: GRIM_GPU_TEST=1.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Device, Shape, Storage, Tensor};
 use std::sync::Arc;
+use grim_tensor::{MemoryOps};
 
 #[test]
 fn w4a16_dequant_service_round_trips() {

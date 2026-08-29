@@ -18,9 +18,9 @@ use grim_engine::{
 };
 use grim_format::GgufTokenizer;
 use grim_models_transformer::{Lfm2Config, LlamaConfig};
-use grim_tensor::BackendDevice;
 use grim_tensor::Device;
 use std::sync::Arc;
+use grim_tensor::{CoreTensorOps};
 
 /// Resolve the GPU ordinal for this TP rank's process. Only returns `Some`
 /// when multi-process TP is active (`GRIM_TP_SIZE > 1`). Mirrors the ordinal

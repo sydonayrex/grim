@@ -22,7 +22,8 @@ use std::sync::Arc;
 use grim_backend_cpu::CpuDevice;
 use grim_backend_rocm::RocmDevice;
 use grim_kvquant::{KvCompressor, KvDequantAttentionConfig, KvQuantConfig, LloydMaxCompressor};
-use grim_tensor::{ArithType, BackendDevice, DType, Device, QuantProvenance, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, QuantProvenance, Shape, Tensor};
+use grim_tensor::{CoreTensorOps};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

@@ -6,7 +6,7 @@
 
 use grim_backend_vulkan::{VulkanDevice, extract_raw_bytes};
 use grim_tensor::dtype::{DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, QuantOps, Shape};
 
 fn device_or_skip() -> Option<VulkanDevice> {
     let devices = VulkanDevice::probe().ok()?;

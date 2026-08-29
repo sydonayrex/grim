@@ -14,7 +14,7 @@ use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::cubecl::{
     add, client, embedding, gptq_correction, mul, qkv_attention, silu_mul,
 };
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 /// End-to-end check that the feature-gated A/B dispatch in `RocmDevice`
 /// actually routes `add`/`rms_norm`/`softmax`/`embedding`/`qkv_attention`/

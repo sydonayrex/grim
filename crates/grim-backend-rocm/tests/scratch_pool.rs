@@ -305,7 +305,7 @@ fn pool_buffer_can_be_uploaded_to() -> TestResult {
         // `from_cpu` does an `hipMemcpy` into the underlying device buffer
         // via `RocmStorage::copy_from_host`. We don't read back here — a
         // typo in the buffer reuse path would corrupt subsequent allocs.
-        let _uploaded = grim_tensor::BackendDevice::from_cpu(&dev, &data, &shape, DType::F32)?;
+        let _uploaded = grim_tensor::CoreTensorOps::from_cpu(&dev, &data, &shape, DType::F32)?;
         addr
     };
     // After dropping the previous scratch handle, a same-size handle

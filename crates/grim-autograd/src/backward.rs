@@ -475,7 +475,7 @@ fn accumulate_tensor_grad(
                 grim_tensor::DType::F32,
             )?)
         };
-        let (sum_storage, handle) = grim_tensor::BackendDevice::add(
+        let (sum_storage, handle) = grim_tensor::CoreTensorOps::add(
             &*dev,
             existing.storage().as_ref(),
             g_storage.as_ref(),

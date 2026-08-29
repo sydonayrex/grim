@@ -9,7 +9,7 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::dequant_q4k;
 use grim_tensor::{
-    BackendDevice, BackendStorage,
+    BackendStorage, MemoryOps,
     dtype::{ArithType, DType, KQuantScheme, Storage},
     shape::Shape,
 };

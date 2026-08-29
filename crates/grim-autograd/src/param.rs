@@ -3,7 +3,9 @@
 //! Gradient accumulation buffers for `A`/`B` per adapter, per layer.
 
 use crate::injection::LoRAInjectionPoint;
-use grim_tensor::{BackendDevice, DType, Tensor, error::Result};
+use grim_tensor::{DType, Tensor, error::Result,
+    CoreTensorOps,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -115,7 +117,7 @@ impl TrainableParam {
         } else {
             Arc::from(dev.from_cpu(&grad.to_vec_f32()?, self.grad.shape(), DType::F32)?)
         };
-        let (sum_storage, handle) = BackendDevice::add(
+        let (sum_storage, handle) = CoreTensorOps::add(
             &*dev,
             self.grad.storage().as_ref(),
             grad_storage.as_ref(),

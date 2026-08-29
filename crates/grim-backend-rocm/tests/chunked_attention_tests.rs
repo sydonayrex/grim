@@ -5,7 +5,9 @@ use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::batch_orchestrator::{
     BatchReorderer, RequestCategory, SequenceMeta,
 };
-use grim_tensor::{BackendDevice, Shape, dtype::DType};
+use grim_tensor::{Shape, dtype::DType,
+    CoreTensorOps, MemoryOps,
+};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -133,16 +135,16 @@ fn test_extend_chunk_and_lse_merge_parity() -> TestResult {
     let chunk_out_shape = Shape::from_slice(&[num_tokens, num_heads, head_dim]);
     let lse_shape = Shape::from_slice(&[num_tokens, num_heads]);
 
-    let q_dev = BackendDevice::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
-    let k_dev = BackendDevice::from_cpu(&dev, &k_data, &kv_shape, DType::F32)?;
-    let v_dev = BackendDevice::from_cpu(&dev, &v_data, &kv_shape, DType::F32)?;
+    let q_dev = CoreTensorOps::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
+    let k_dev = CoreTensorOps::from_cpu(&dev, &k_data, &kv_shape, DType::F32)?;
+    let v_dev = CoreTensorOps::from_cpu(&dev, &v_data, &kv_shape, DType::F32)?;
 
-    let out_chunk1 = BackendDevice::zeros(&dev, &chunk_out_shape, DType::F32)?;
-    let lse_chunk1 = BackendDevice::zeros(&dev, &lse_shape, DType::F32)?;
-    let out_chunk2 = BackendDevice::zeros(&dev, &chunk_out_shape, DType::F32)?;
-    let lse_chunk2 = BackendDevice::zeros(&dev, &lse_shape, DType::F32)?;
-    let out_merged = BackendDevice::zeros(&dev, &chunk_out_shape, DType::F32)?;
-    let lse_merged = BackendDevice::zeros(&dev, &lse_shape, DType::F32)?;
+    let out_chunk1 = CoreTensorOps::zeros(&dev, &chunk_out_shape, DType::F32)?;
+    let lse_chunk1 = CoreTensorOps::zeros(&dev, &lse_shape, DType::F32)?;
+    let out_chunk2 = CoreTensorOps::zeros(&dev, &chunk_out_shape, DType::F32)?;
+    let lse_chunk2 = CoreTensorOps::zeros(&dev, &lse_shape, DType::F32)?;
+    let out_merged = CoreTensorOps::zeros(&dev, &chunk_out_shape, DType::F32)?;
+    let lse_merged = CoreTensorOps::zeros(&dev, &lse_shape, DType::F32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
     let k_s = grim_backend_rocm::device::util::as_rocm(k_dev.as_ref())?;
@@ -284,19 +286,19 @@ fn test_preshuffled_paged_attention_parity() -> TestResult {
     let context_lens = vec![context_len as i32, context_len as i32];
     let cl_shape = Shape::from_slice(&[num_seqs]);
 
-    let q_dev = BackendDevice::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
-    let k_dev = BackendDevice::from_cpu(&dev, &k_tokens, &tokens_shape, DType::F32)?;
-    let v_dev = BackendDevice::from_cpu(&dev, &v_tokens, &tokens_shape, DType::F32)?;
-    let kc_dev = BackendDevice::zeros(&dev, &k_cache_shape, DType::F32)?;
-    let vc_dev = BackendDevice::zeros(&dev, &v_cache_shape, DType::F32)?;
+    let q_dev = CoreTensorOps::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
+    let k_dev = CoreTensorOps::from_cpu(&dev, &k_tokens, &tokens_shape, DType::F32)?;
+    let v_dev = CoreTensorOps::from_cpu(&dev, &v_tokens, &tokens_shape, DType::F32)?;
+    let kc_dev = CoreTensorOps::zeros(&dev, &k_cache_shape, DType::F32)?;
+    let vc_dev = CoreTensorOps::zeros(&dev, &v_cache_shape, DType::F32)?;
 
     let sm_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&slot_mapping), &slot_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&slot_mapping), &slot_shape, DType::U32)?;
     let bt_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&block_tables), &bt_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&block_tables), &bt_shape, DType::U32)?;
     let cl_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&context_lens), &cl_shape, DType::U32)?;
-    let out_dev = BackendDevice::zeros(&dev, &q_shape, DType::F32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&context_lens), &cl_shape, DType::U32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
     let k_s = grim_backend_rocm::device::util::as_rocm(k_dev.as_ref())?;

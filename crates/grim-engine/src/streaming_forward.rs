@@ -11,10 +11,11 @@ use grim_core::error::{Error, Result};
 use grim_models_transformer::{LlamaBlock, LlamaConfig};
 use grim_nn::WeightSource;
 use grim_nn::modules::{pick_device_for_storage_device, pick_device_for_tensor};
-use grim_tensor::{BackendDevice, DType, Device, Shape, Tensor, TensorProvider};
+use grim_tensor::{DType, Device, Shape, Tensor, TensorProvider};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
+use grim_tensor::{MemoryOps};
 
 /// Saved activation checkpoint for a transformer block.
 #[derive(Debug, Clone)]

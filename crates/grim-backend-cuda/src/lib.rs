@@ -35,7 +35,11 @@ use grim_tensor::dtype::{
     Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendDevice, BackendStorage, Shape};
+pub use grim_tensor::{
+    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
+    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps,
+    RecurrentOps, SamplingOps, Shape,
+};
 
 // ---------- CUDA FFI ----------
 
@@ -2166,7 +2170,8 @@ impl CudaDevice {
     }
 }
 
-impl BackendDevice for CudaDevice {
+impl CoreTensorOps for CudaDevice {
+
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         if dtype != DType::F32 {
             return Err(Error::DTypeMismatch(format!(
@@ -2198,6 +2203,7 @@ impl BackendDevice for CudaDevice {
         Ok(Box::new(storage))
     }
 
+
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -2206,6 +2212,7 @@ impl BackendDevice for CudaDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_op(a, b, out_shape, None)
     }
+
 
     fn add(
         &self,
@@ -2241,6 +2248,7 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
+
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -2275,6 +2283,7 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
+
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -2308,6 +2317,7 @@ impl BackendDevice for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_silu_mul", &mut args, n)?;
         Ok((Box::new(out_storage), handle))
     }
+
 
     fn rms_norm(
         &self,
@@ -2349,21 +2359,6 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-    /// Override the trait default with the real fused `grim_add_rms_norm` PTX kernel.
-    fn fused_add_rms_norm(
-        &self,
-        x: &dyn BackendStorage,
-        residual: &dyn BackendStorage,
-        weight: &dyn BackendStorage,
-        eps: f32,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        CudaDevice::fused_add_rms_norm(self, x, residual, weight, eps, out_shape)
-    }
 
     fn softmax(
         &self,
@@ -2393,6 +2388,7 @@ impl BackendDevice for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_softmax", &mut args, total)?;
         Ok((Box::new(out_storage), handle))
     }
+
 
     fn embedding(
         &self,
@@ -2497,6 +2493,7 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(out_storage), compute_handle))
     }
 
+
     fn from_cpu(
         &self,
         data: &[f32],
@@ -2507,6 +2504,7 @@ impl BackendDevice for CudaDevice {
         Ok(Box::new(storage))
     }
 
+
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -2514,6 +2512,94 @@ impl BackendDevice for CudaDevice {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+impl ElementwiseOps for CudaDevice {
+
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("mul_scalar x is not CudaStorage".into()))?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut x_ptr = Self::dev_ptr_or_err("mul_scalar x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("mul_scalar out", &out_storage)?;
+        let mut s_val = scalar;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut s_val as *mut f32 as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_mul_scalar", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("sqrt x is not CudaStorage".into()))?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut x_ptr = Self::dev_ptr_or_err("sqrt x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("sqrt out", &out_storage)?;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_sqrt", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("recip x is not CudaStorage".into()))?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut x_ptr = Self::dev_ptr_or_err("recip x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("recip out", &out_storage)?;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_recip", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+}
+
+impl SamplingOps for CudaDevice {
+}
+
+impl AttentionOps for CudaDevice {
+
 
     fn qkv_attention(
         &self,
@@ -2542,6 +2628,7 @@ impl BackendDevice for CudaDevice {
             out_sum,
         )
     }
+
     fn qkv_attention_paged(
         &self,
         q: &dyn BackendStorage,
@@ -2688,80 +2775,6 @@ impl BackendDevice for CudaDevice {
         Ok((gpu_out, Box::new(CudaHandle::ready(self.ordinal))))
     }
 
-    fn mul_scalar(
-        &self,
-        x: &dyn BackendStorage,
-        scalar: f32,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_storage = x
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mul_scalar x is not CudaStorage".into()))?;
-        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
-        let n = out_shape.elem_count();
-
-        let mut x_ptr = Self::dev_ptr_or_err("mul_scalar x", x_storage)?;
-        let mut out_ptr = Self::dev_ptr_or_err("mul_scalar out", &out_storage)?;
-        let mut s_val = scalar;
-        let mut n_i = n as i32;
-        let mut args = [
-            &mut x_ptr as *mut *mut c_void as *mut c_void,
-            &mut s_val as *mut f32 as *mut c_void,
-            &mut out_ptr as *mut *mut c_void as *mut c_void,
-            &mut n_i as *mut i32 as *mut c_void,
-        ];
-        let handle = self.launch_rank1_kernel("grim_mul_scalar", &mut args, n)?;
-        Ok((Box::new(out_storage), handle))
-    }
-
-    fn sqrt(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_storage = x
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("sqrt x is not CudaStorage".into()))?;
-        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
-        let n = out_shape.elem_count();
-
-        let mut x_ptr = Self::dev_ptr_or_err("sqrt x", x_storage)?;
-        let mut out_ptr = Self::dev_ptr_or_err("sqrt out", &out_storage)?;
-        let mut n_i = n as i32;
-        let mut args = [
-            &mut x_ptr as *mut *mut c_void as *mut c_void,
-            &mut out_ptr as *mut *mut c_void as *mut c_void,
-            &mut n_i as *mut i32 as *mut c_void,
-        ];
-        let handle = self.launch_rank1_kernel("grim_sqrt", &mut args, n)?;
-        Ok((Box::new(out_storage), handle))
-    }
-
-    fn recip(
-        &self,
-        x: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_storage = x
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("recip x is not CudaStorage".into()))?;
-        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
-        let n = out_shape.elem_count();
-
-        let mut x_ptr = Self::dev_ptr_or_err("recip x", x_storage)?;
-        let mut out_ptr = Self::dev_ptr_or_err("recip out", &out_storage)?;
-        let mut n_i = n as i32;
-        let mut args = [
-            &mut x_ptr as *mut *mut c_void as *mut c_void,
-            &mut out_ptr as *mut *mut c_void as *mut c_void,
-            &mut n_i as *mut i32 as *mut c_void,
-        ];
-        let handle = self.launch_rank1_kernel("grim_recip", &mut args, n)?;
-        Ok((Box::new(out_storage), handle))
-    }
 
     fn rope(
         &self,
@@ -2974,115 +2987,6 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-    fn from_cpu_bytes(
-        &self,
-        data: &[u8],
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
-        // Packed quantized storage (KQuant, FloatPack, Block, GroupInt) is
-        // smaller than `elem_count * arith.byte_size`; allocate the exact byte
-        // length so `CudaStorage::bytes()` reflects the real packed payload.
-        // For Native storage `data.len()` already equals `elem_count * byte_size`,
-        // so this remains correct for both cases.
-        let storage = CudaStorage::copy_from_host_raw_bytes(data, shape, dtype, self.ordinal)?;
-        let dev_ptr = storage.device_ptr.ok_or_else(|| {
-            Error::Backend("from_cpu_bytes: device_ptr is null after raw byte alloc".into())
-        })? as *mut c_void;
-
-        let res = unsafe {
-            cudaMemcpy(
-                dev_ptr,
-                data.as_ptr() as *const c_void,
-                data.len(),
-                cudaMemcpyHostToDevice,
-            )
-        };
-        if res != cudaSuccess {
-            return Err(Error::Backend(format!(
-                "cudaMemcpy from_cpu_bytes failed: {}",
-                res
-            )));
-        }
-
-        Ok(Box::new(storage))
-    }
-
-    fn selective_scan(
-        &self,
-        x: &dyn BackendStorage,
-        a: &dyn BackendStorage,
-        b: &dyn BackendStorage,
-        c: &dyn BackendStorage,
-        d: &dyn BackendStorage,
-        state: &dyn BackendStorage,
-        batch: usize,
-        dim_dstate: usize,
-        dim_dinner: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        tracing::warn!("CUDA selective_scan: falling back to CPU execution");
-        let x_v = x.to_cpu_vec_f32()?;
-        let a_v = a.to_cpu_vec_f32()?;
-        let b_v = b.to_cpu_vec_f32()?;
-        let c_v = c.to_cpu_vec_f32()?;
-        let d_v = d.to_cpu_vec_f32()?;
-        let state_v = state.to_cpu_vec_f32()?;
-
-        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
-        for b_idx in 0..batch {
-            for d_idx in 0..dim_dinner {
-                // Initialize state from the provided state buffer.
-                let mut h = vec![0.0f32; dim_dstate];
-                for s in 0..dim_dstate {
-                    let state_idx = (b_idx * dim_dinner + d_idx) * dim_dstate + s;
-                    h[s] = if state_v.len() > state_idx {
-                        state_v[state_idx]
-                    } else {
-                        0.0
-                    };
-                }
-                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
-
-                for t in 0..seq_len {
-                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
-                    let x_t = x_v[x_idx];
-                    let mut y_t = d_val * x_t;
-
-                    for s in 0..dim_dstate {
-                        let a_idx = d_idx * dim_dstate + s;
-                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
-                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
-
-                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
-                        let b_val = if b_v.len() > b_idx_off {
-                            b_v[b_idx_off]
-                        } else {
-                            1.0
-                        };
-                        let c_val = if c_v.len() > c_idx_off {
-                            c_v[c_idx_off]
-                        } else {
-                            1.0
-                        };
-
-                        h[s] = a_val * h[s] + x_t * b_val;
-                        y_t += c_val * h[s];
-                    }
-                    out[x_idx] = y_t;
-                }
-            }
-        }
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((
-            out_storage,
-            Box::new(CudaHandle {
-                completed: Arc::new(Mutex::new(true)),
-            }),
-        ))
-    }
 
     fn flash_attention(
         &self,
@@ -3124,6 +3028,7 @@ impl BackendDevice for CudaDevice {
         ))
     }
 
+
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3154,106 +3059,124 @@ impl BackendDevice for CudaDevice {
             }),
         ))
     }
+}
 
-    fn rwkv_time_mix(
+impl FusionOps for CudaDevice {
+
+
+    /// Override the trait default with the real fused `grim_add_rms_norm` PTX kernel.
+    fn fused_add_rms_norm(
         &self,
         x: &dyn BackendStorage,
-        w: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        seq_len: usize,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        tracing::warn!("CUDA rwkv_time_mix: falling back to CPU execution");
-        let x_vec = x.to_cpu_vec_f32()?;
-        let k_vec = k.to_cpu_vec_f32()?;
-        let v_vec = v.to_cpu_vec_f32()?;
-        let g_vec = g.to_cpu_vec_f32()?;
-        let w_vec = w.to_cpu_vec_f32()?;
-
-        let mut out = vec![0.0f32; batch * seq_len * dim];
-        for b in 0..batch {
-            for d in 0..dim {
-                let mut state = 0.0f32;
-                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
-
-                for t in 0..seq_len {
-                    let idx = (b * seq_len + t) * dim + d;
-                    let k_t = if k_vec.len() > idx {
-                        k_vec[idx]
-                    } else {
-                        x_vec[idx]
-                    };
-                    let v_t = if v_vec.len() > idx {
-                        v_vec[idx]
-                    } else {
-                        x_vec[idx]
-                    };
-                    let g_t = if g_vec.len() > idx {
-                        g_vec[idx]
-                    } else {
-                        1.0f32
-                    };
-
-                    state = w_val * state + k_t * v_t;
-                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
-                    out[idx] = state * sig;
-                }
-            }
-        }
-
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((
-            out_storage,
-            Box::new(CudaHandle {
-                completed: Arc::new(Mutex::new(true)),
-            }),
-        ))
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        CudaDevice::fused_add_rms_norm(self, x, residual, weight, eps, out_shape)
     }
+}
 
-    fn rwkv_channel_mix(
+impl AutogradOps for CudaDevice {
+
+
+    /// Fused (non-fused first cut) dequantized matmul backward on CUDA.
+    ///
+    /// Computes `dX[M, K] = dY[M, N] @ B_dequant^T` where `B` is a quantized,
+    /// CUDA-resident weight of shape `[K, N]`. The packed codes are copied to
+    /// the host, dequantized via `grim-quant` (mirroring
+    /// `grim-format::convert::dequant_tensor_data`), re-uploaded as F32, and
+    /// multiplied with `dY` through cuBLAS. This is the CUDA counterpart of the
+    /// ROCm fused path in `RocmDevice::quantized_matmul_backward_dx`; it fires
+    /// from `grim-autograd::matmul_backward` once quantized storage is kept
+    /// resident on CUDA (see `varbuilder::materialize`).
+    fn silu_mul_backward(
         &self,
-        x: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        r: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        tracing::warn!("CUDA rwkv_channel_mix: falling back to CPU execution");
-        let x_vec = x.to_cpu_vec_f32()?;
-        let k_vec = k.to_cpu_vec_f32()?;
-        let r_vec = r.to_cpu_vec_f32()?;
-        let v_vec = v.to_cpu_vec_f32()?;
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let gate_s = gate
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("silu_mul_backward: gate is not CudaStorage".into()))?;
+        let up_s = up
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("silu_mul_backward: up is not CudaStorage".into()))?;
+        let dw_s = dw
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("silu_mul_backward: dw is not CudaStorage".into()))?;
 
-        let elem_count = out_shape.elem_count();
-        let mut out = vec![0.0f32; elem_count];
-        for i in 0..elem_count {
-            let x_val = x_vec[i];
-            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
-            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
-            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+        Self::ensure_f32_input("silu_mul_backward gate", gate_s)?;
+        Self::ensure_f32_input("silu_mul_backward up", up_s)?;
+        Self::ensure_f32_input("silu_mul_backward dw", dw_s)?;
 
-            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
-            let relu_k = k_val.max(0.0f32);
-            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        if out_shape.dims() != gate_s.shape().dims() {
+            return Err(Error::Shape(format!(
+                "silu_mul_backward: out_shape must match gate shape, got {:?} vs {:?}",
+                out_shape.dims(),
+                gate_s.shape().dims()
+            )));
         }
 
-        let _ = batch;
-        let _ = dim;
+        let n = out_shape.elem_count();
+        let mut gate_ptr = Self::dev_ptr_or_err("silu_mul_backward gate", gate_s)?;
+        let mut up_ptr = Self::dev_ptr_or_err("silu_mul_backward up", up_s)?;
+        let mut dw_ptr = Self::dev_ptr_or_err("silu_mul_backward dw", dw_s)?;
 
-        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
-        Ok((
-            out_storage,
-            Box::new(CudaHandle {
-                completed: Arc::new(Mutex::new(true)),
-            }),
-        ))
+        let df_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let de_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let mut df_ptr = Self::dev_ptr_or_err("silu_mul_backward df", &df_storage)?;
+        let mut de_ptr = Self::dev_ptr_or_err("silu_mul_backward de", &de_storage)?;
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let func_name = std::ffi::CString::new("grim_silu_mul_backward")
+            .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+        let res = unsafe {
+            cuModuleGetFunction(
+                &mut f as *mut *mut c_void as *mut CUfunction,
+                module,
+                func_name.as_ptr(),
+            )
+        };
+        if res != 0 || f.is_null() {
+            return Err(Error::Backend(format!(
+                "cuModuleGetFunction(grim_silu_mul_backward) failed: {res}"
+            )));
+        }
+
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut gate_ptr as *mut *mut c_void as *mut c_void,
+            &mut up_ptr as *mut *mut c_void as *mut c_void,
+            &mut dw_ptr as *mut *mut c_void as *mut c_void,
+            &mut df_ptr as *mut *mut c_void as *mut c_void,
+            &mut de_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+
+        let handle = self.launch_rank1_kernel("silu_mul_backward", &mut args, n)?;
+        Ok((Box::new(df_storage), Box::new(de_storage), handle))
     }
+}
+
+impl OptimizerOps for CudaDevice {
+}
+
+impl QuantOps for CudaDevice {
+
 
     fn quantized_matmul(
         &self,
@@ -3557,92 +3480,6 @@ impl BackendDevice for CudaDevice {
         ))
     }
 
-    /// Fused (non-fused first cut) dequantized matmul backward on CUDA.
-    ///
-    /// Computes `dX[M, K] = dY[M, N] @ B_dequant^T` where `B` is a quantized,
-    /// CUDA-resident weight of shape `[K, N]`. The packed codes are copied to
-    /// the host, dequantized via `grim-quant` (mirroring
-    /// `grim-format::convert::dequant_tensor_data`), re-uploaded as F32, and
-    /// multiplied with `dY` through cuBLAS. This is the CUDA counterpart of the
-    /// ROCm fused path in `RocmDevice::quantized_matmul_backward_dx`; it fires
-    /// from `grim-autograd::matmul_backward` once quantized storage is kept
-    /// resident on CUDA (see `varbuilder::materialize`).
-    fn silu_mul_backward(
-        &self,
-        gate: &dyn BackendStorage,
-        up: &dyn BackendStorage,
-        dw: &dyn BackendStorage,
-        out_shape: &Shape,
-    ) -> Result<(
-        Box<dyn BackendStorage>,
-        Box<dyn BackendStorage>,
-        Box<dyn ComputeHandle>,
-    )> {
-        let gate_s = gate
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("silu_mul_backward: gate is not CudaStorage".into()))?;
-        let up_s = up
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("silu_mul_backward: up is not CudaStorage".into()))?;
-        let dw_s = dw
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("silu_mul_backward: dw is not CudaStorage".into()))?;
-
-        Self::ensure_f32_input("silu_mul_backward gate", gate_s)?;
-        Self::ensure_f32_input("silu_mul_backward up", up_s)?;
-        Self::ensure_f32_input("silu_mul_backward dw", dw_s)?;
-
-        if out_shape.dims() != gate_s.shape().dims() {
-            return Err(Error::Shape(format!(
-                "silu_mul_backward: out_shape must match gate shape, got {:?} vs {:?}",
-                out_shape.dims(),
-                gate_s.shape().dims()
-            )));
-        }
-
-        let n = out_shape.elem_count();
-        let mut gate_ptr = Self::dev_ptr_or_err("silu_mul_backward gate", gate_s)?;
-        let mut up_ptr = Self::dev_ptr_or_err("silu_mul_backward up", up_s)?;
-        let mut dw_ptr = Self::dev_ptr_or_err("silu_mul_backward dw", dw_s)?;
-
-        let df_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
-        let de_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
-        let mut df_ptr = Self::dev_ptr_or_err("silu_mul_backward df", &df_storage)?;
-        let mut de_ptr = Self::dev_ptr_or_err("silu_mul_backward de", &de_storage)?;
-
-        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
-        let mut f: CUfunction = std::ptr::null_mut();
-        let func_name = std::ffi::CString::new("grim_silu_mul_backward")
-            .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
-        let res = unsafe {
-            cuModuleGetFunction(
-                &mut f as *mut *mut c_void as *mut CUfunction,
-                module,
-                func_name.as_ptr(),
-            )
-        };
-        if res != 0 || f.is_null() {
-            return Err(Error::Backend(format!(
-                "cuModuleGetFunction(grim_silu_mul_backward) failed: {res}"
-            )));
-        }
-
-        let mut n_i = n as i32;
-        let mut args = [
-            &mut gate_ptr as *mut *mut c_void as *mut c_void,
-            &mut up_ptr as *mut *mut c_void as *mut c_void,
-            &mut dw_ptr as *mut *mut c_void as *mut c_void,
-            &mut df_ptr as *mut *mut c_void as *mut c_void,
-            &mut de_ptr as *mut *mut c_void as *mut c_void,
-            &mut n_i as *mut i32 as *mut c_void,
-        ];
-
-        let handle = self.launch_rank1_kernel("silu_mul_backward", &mut args, n)?;
-        Ok((Box::new(df_storage), Box::new(de_storage), handle))
-    }
 
     fn quantized_matmul_backward_dx(
         &self,
@@ -3712,7 +3549,7 @@ impl BackendDevice for CudaDevice {
             }
         }
         let b_t_shape = Shape::new(vec![b_cols, b_rows]);
-        let b_t_storage = BackendDevice::from_cpu(
+        let b_t_storage = CoreTensorOps::from_cpu(
             self,
             &b_t,
             &b_t_shape,
@@ -3779,22 +3616,6 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(dx_storage), compute_handle))
     }
 
-    fn estimate_gemm_latency_ms(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        dtype: DType,
-        _placement: &grim_tensor::backend::ScythePlacement,
-    ) -> f64 {
-        let flops = 2.0 * m as f64 * n as f64 * k as f64;
-        let tflops = match dtype.arith {
-            ArithType::F16 | ArithType::BF16 => 150.0,
-            ArithType::F32 => 75.0,
-            _ => 40.0,
-        };
-        (flops / (tflops * 1e12) * 1000.0).max(0.01)
-    }
 
     fn quantize(
         &self,
@@ -3808,6 +3629,7 @@ impl BackendDevice for CudaDevice {
         let out = self.quantize_on_device(x_storage, format)?;
         Ok(Box::new(out))
     }
+
 
     fn fused_quant_gemm(
         &self,
@@ -3913,6 +3735,251 @@ impl BackendDevice for CudaDevice {
         Ok((Box::new(out), handle))
     }
 }
+
+impl RecurrentOps for CudaDevice {
+
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        state: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        tracing::warn!("CUDA selective_scan: falling back to CPU execution");
+        let x_v = x.to_cpu_vec_f32()?;
+        let a_v = a.to_cpu_vec_f32()?;
+        let b_v = b.to_cpu_vec_f32()?;
+        let c_v = c.to_cpu_vec_f32()?;
+        let d_v = d.to_cpu_vec_f32()?;
+        let state_v = state.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
+        for b_idx in 0..batch {
+            for d_idx in 0..dim_dinner {
+                // Initialize state from the provided state buffer.
+                let mut h = vec![0.0f32; dim_dstate];
+                for s in 0..dim_dstate {
+                    let state_idx = (b_idx * dim_dinner + d_idx) * dim_dstate + s;
+                    h[s] = if state_v.len() > state_idx {
+                        state_v[state_idx]
+                    } else {
+                        0.0
+                    };
+                }
+                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
+
+                for t in 0..seq_len {
+                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
+                    let x_t = x_v[x_idx];
+                    let mut y_t = d_val * x_t;
+
+                    for s in 0..dim_dstate {
+                        let a_idx = d_idx * dim_dstate + s;
+                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+
+                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off {
+                            b_v[b_idx_off]
+                        } else {
+                            1.0
+                        };
+                        let c_val = if c_v.len() > c_idx_off {
+                            c_v[c_idx_off]
+                        } else {
+                            1.0
+                        };
+
+                        h[s] = a_val * h[s] + x_t * b_val;
+                        y_t += c_val * h[s];
+                    }
+                    out[x_idx] = y_t;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((
+            out_storage,
+            Box::new(CudaHandle {
+                completed: Arc::new(Mutex::new(true)),
+            }),
+        ))
+    }
+
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        tracing::warn!("CUDA rwkv_time_mix: falling back to CPU execution");
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let w_vec = w.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim];
+        for b in 0..batch {
+            for d in 0..dim {
+                let mut state = 0.0f32;
+                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
+
+                for t in 0..seq_len {
+                    let idx = (b * seq_len + t) * dim + d;
+                    let k_t = if k_vec.len() > idx {
+                        k_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let v_t = if v_vec.len() > idx {
+                        v_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let g_t = if g_vec.len() > idx {
+                        g_vec[idx]
+                    } else {
+                        1.0f32
+                    };
+
+                    state = w_val * state + k_t * v_t;
+                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
+                    out[idx] = state * sig;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((
+            out_storage,
+            Box::new(CudaHandle {
+                completed: Arc::new(Mutex::new(true)),
+            }),
+        ))
+    }
+
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        tracing::warn!("CUDA rwkv_channel_mix: falling back to CPU execution");
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let r_vec = r.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+
+        let elem_count = out_shape.elem_count();
+        let mut out = vec![0.0f32; elem_count];
+        for i in 0..elem_count {
+            let x_val = x_vec[i];
+            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
+            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
+            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+
+            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
+            let relu_k = k_val.max(0.0f32);
+            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        }
+
+        let _ = batch;
+        let _ = dim;
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((
+            out_storage,
+            Box::new(CudaHandle {
+                completed: Arc::new(Mutex::new(true)),
+            }),
+        ))
+    }
+}
+
+impl CollectiveOps for CudaDevice {
+
+
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        _placement: &grim_tensor::backend::ScythePlacement,
+    ) -> f64 {
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let tflops = match dtype.arith {
+            ArithType::F16 | ArithType::BF16 => 150.0,
+            ArithType::F32 => 75.0,
+            _ => 40.0,
+        };
+        (flops / (tflops * 1e12) * 1000.0).max(0.01)
+    }
+}
+
+impl MemoryOps for CudaDevice {
+
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        // Packed quantized storage (KQuant, FloatPack, Block, GroupInt) is
+        // smaller than `elem_count * arith.byte_size`; allocate the exact byte
+        // length so `CudaStorage::bytes()` reflects the real packed payload.
+        // For Native storage `data.len()` already equals `elem_count * byte_size`,
+        // so this remains correct for both cases.
+        let storage = CudaStorage::copy_from_host_raw_bytes(data, shape, dtype, self.ordinal)?;
+        let dev_ptr = storage.device_ptr.ok_or_else(|| {
+            Error::Backend("from_cpu_bytes: device_ptr is null after raw byte alloc".into())
+        })? as *mut c_void;
+
+        let res = unsafe {
+            cudaMemcpy(
+                dev_ptr,
+                data.as_ptr() as *const c_void,
+                data.len(),
+                cudaMemcpyHostToDevice,
+            )
+        };
+        if res != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaMemcpy from_cpu_bytes failed: {}",
+                res
+            )));
+        }
+
+        Ok(Box::new(storage))
+    }
+}
+
+impl GraphCaptureOps for CudaDevice {
+}
+
 
 /// Returns the byte size of a DType.
 fn dtype_byte_size(dtype: &DType) -> usize {

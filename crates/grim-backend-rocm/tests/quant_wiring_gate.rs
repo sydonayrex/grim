@@ -12,9 +12,9 @@
 use grim_backend_rocm::DTypeStorage;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::ArithType;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::{DType, Device, Shape, Storage, Tensor};
 use std::sync::Arc;
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 
 fn as_rocm_ref(st: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::RocmStorage {
     st.as_any()

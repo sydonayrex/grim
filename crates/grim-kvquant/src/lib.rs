@@ -1320,7 +1320,7 @@ impl KvCompressor for IdentityCompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grim_tensor::{ArithType, DType, Device, Shape, Storage};
+    use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Storage};
 
     /// Round-trip bound gate (T2.6 audit follow-up): compress → dequantize
     /// must bound the reconstruction error. The identity compressor must be

@@ -1,6 +1,5 @@
-use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::{CoreTensorOps, RocmDevice};
 use grim_backend_rocm::device::capability_profiler::CapabilityProfiler;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::{ArithType, DType, Shape, dtype::Storage as DTypeStorage};
 use std::time::Instant;
 

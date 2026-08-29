@@ -11,7 +11,7 @@
 
 use grim_quant::quant_q80;
 use grim_tensor::{
-    BackendDevice, QuantizedMatmulBackwardResiduals, Shape,
+    CoreTensorOps, MemoryOps, QuantOps, QuantizedMatmulBackwardResiduals, Shape,
     dtype::{ArithType, DType, KQuantScheme, Storage},
 };
 

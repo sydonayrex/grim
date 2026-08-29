@@ -12,7 +12,9 @@ use grim_tensor::dtype::{
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
-use grim_tensor::{BackendDevice, RawTensor};
+use grim_tensor::{RawTensor,
+    CoreTensorOps, MemoryOps,
+};
 
 use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_quant::{
@@ -500,7 +502,7 @@ fn materialize_cuda(
     // `f32s` was already dequantized in `materialize` above. Pass F32 to
     // `from_cpu` so the CUDA storage carries DType::F32, which downstream
     // embedding/matmul kernels require.
-    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    let storage = CoreTensorOps::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
         shape,
@@ -562,7 +564,7 @@ fn materialize_rocm(
     let storage = if managed {
         dev.from_cpu_managed(&f32s, &shape, DType::F32)?
     } else {
-        BackendDevice::from_cpu(dev.as_ref(), &f32s, &shape, DType::F32)?
+        CoreTensorOps::from_cpu(dev.as_ref(), &f32s, &shape, DType::F32)?
     };
     Ok(Tensor::new(
         Arc::from(storage),
@@ -598,7 +600,7 @@ fn materialize_metal(
     ordinal: usize,
 ) -> Result<Tensor> {
     let dev = MetalDevice::try_new(ordinal)?;
-    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    let storage = CoreTensorOps::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
         shape,
@@ -632,7 +634,7 @@ fn materialize_vulkan(
     device: &Device,
 ) -> Result<Tensor> {
     let dev = VulkanDevice::new();
-    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    let storage = CoreTensorOps::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
         shape,

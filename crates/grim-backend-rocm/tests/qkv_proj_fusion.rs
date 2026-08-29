@@ -7,7 +7,9 @@
 //! exists.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape,
+    CoreTensorOps,
+};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -103,7 +105,7 @@ fn qkv_proj_fusion_matches_unfused() {
     let v = dev.from_cpu(&v_w, &w_shape(v_dim), DType::F32).unwrap();
 
     // Reference: the existing unfused path — three separate GEMM launches.
-    let (q_out, h) = BackendDevice::matmul(
+    let (q_out, h) = CoreTensorOps::matmul(
         &dev,
         x.as_ref(),
         q.as_ref(),
@@ -111,7 +113,7 @@ fn qkv_proj_fusion_matches_unfused() {
     )
     .unwrap();
     h.synchronize().unwrap();
-    let (k_out, h) = BackendDevice::matmul(
+    let (k_out, h) = CoreTensorOps::matmul(
         &dev,
         x.as_ref(),
         k.as_ref(),
@@ -119,7 +121,7 @@ fn qkv_proj_fusion_matches_unfused() {
     )
     .unwrap();
     h.synchronize().unwrap();
-    let (v_out, h) = BackendDevice::matmul(
+    let (v_out, h) = CoreTensorOps::matmul(
         &dev,
         x.as_ref(),
         v.as_ref(),
@@ -226,7 +228,7 @@ fn qkv_proj_fused_uses_single_launch() {
         .unwrap();
     dev.reset_launch_count();
     for wmat in [&wq, &wk, &wv] {
-        let (_, h) = BackendDevice::matmul(
+        let (_, h) = CoreTensorOps::matmul(
             &dev,
             x.as_ref(),
             wmat.as_ref(),

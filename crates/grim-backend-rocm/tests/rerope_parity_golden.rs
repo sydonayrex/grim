@@ -6,10 +6,9 @@
 use std::panic;
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
-use grim_tensor::RopeConfig;
+use grim_tensor::{AttentionOps, CoreTensorOps, RopeConfig};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -35,7 +34,7 @@ fn test_rerope_rocm_gpu_parity_vs_fresh_rope() {
         data[i] = ((i as f32 + 1.0) * 0.1).sin();
     }
 
-    let k_orig_storage = BackendDevice::from_cpu(&dev, &data, &shape, DType::F32).unwrap();
+    let k_orig_storage = CoreTensorOps::from_cpu(&dev, &data, &shape, DType::F32).unwrap();
     let old_pos: Vec<u32> = vec![10, 11, 12, 13];
     let new_pos: Vec<u32> = vec![100, 101, 102, 103];
 

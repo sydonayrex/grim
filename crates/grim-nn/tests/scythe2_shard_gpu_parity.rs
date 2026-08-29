@@ -10,8 +10,8 @@
 //! Device-gated: `GRIM_GPU_TEST=1`, requires ≥2 visible ROCm devices.
 
 use grim_nn::scythe2::Scythe2Linear;
-use grim_tensor::backend::{BackendDevice, ScythePlacement};
-use grim_tensor::{DType, Device, Tensor};
+use grim_tensor::backend::ScythePlacement;
+use grim_tensor::{CoreTensorOps, DType, Device, Tensor};
 use std::sync::Arc;
 
 fn gpu_ready() -> bool {

@@ -5,7 +5,8 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, Encoder, ModalityHint};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -451,7 +452,7 @@ impl CausalLm for Bert {
 
 fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(
+    let (s, h) = grim_tensor::CoreTensorOps::add(
         &dev,
         a.storage().as_ref(),
         b.storage().as_ref(),

@@ -5,9 +5,9 @@ use std::panic;
 use grim_backend_rocm::{
     check_hip, hipMemcpy, HipMemcpyKind, HugePagePinnedBuffer, RocmDevice, RocmStorage
 };
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
+use grim_tensor::{MemoryOps};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {

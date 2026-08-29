@@ -1,8 +1,8 @@
 //! Parity tests for the ROCm fused Add + RMSNorm kernel.
 
-use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::{CoreTensorOps, RocmDevice};
 use grim_tensor::dtype::DType;
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::Shape;
 
 #[test]
 fn test_fused_add_rms_norm_parity() {

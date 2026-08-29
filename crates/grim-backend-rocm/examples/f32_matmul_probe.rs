@@ -1,5 +1,4 @@
-//! Isolate F32 GEMM correctness per ordinal (head-matmul zeroing hunt).
-use grim_backend_rocm::{BackendDevice, RocmDevice};
+use grim_backend_rocm::{CoreTensorOps, RocmDevice};
 use grim_tensor::{DType, Shape};
 
 fn main() {

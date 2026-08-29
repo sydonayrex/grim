@@ -16,7 +16,7 @@ use crate::param::{ParamId, TrainableParam, TrainableParams};
 use crate::tape::Tape;
 use crate::{Optimizer, backward, cross_entropy_loss};
 use grim_backend_cpu::CpuDevice;
-use grim_tensor::{BackendDevice, DType, Shape, Tensor};
+use grim_tensor::{AutogradOps, DType, Shape, Tensor};
 use std::sync::Arc;
 
 fn vec2(rows: usize, cols: usize, vals: Vec<f32>) -> Tensor {

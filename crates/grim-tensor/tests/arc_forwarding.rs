@@ -404,6 +404,59 @@ impl AutogradOps for ProbeDevice {
 }
 
 impl OptimizerOps for ProbeDevice {
+    fn fused_adamw_step(
+        &self,
+        _p: &dyn BackendStorage,
+        _g: &dyn BackendStorage,
+        _m: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _lr: f32,
+        _beta1: f32,
+        _beta2: f32,
+        _eps: f32,
+        _weight_decay: f32,
+        _bc1: f32,
+        _bc2: f32,
+        _total: usize,
+    ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
+        probe_err("fused_adamw_step")?;
+        unreachable!()
+    }
+
+    fn fused_lion_step(
+        &self,
+        _p: &dyn BackendStorage,
+        _g: &dyn BackendStorage,
+        _exp_avg: &dyn BackendStorage,
+        _lr: f32,
+        _beta1: f32,
+        _beta2: f32,
+        _weight_decay: f32,
+        _total: usize,
+    ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
+        probe_err("fused_lion_step")?;
+        unreachable!()
+    }
+
+    fn fused_madam_step(
+        &self,
+        _p: &dyn BackendStorage,
+        _g: &dyn BackendStorage,
+        _m: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _lr: f32,
+        _beta1: f32,
+        _beta2: f32,
+        _eps: f32,
+        _gamma: f32,
+        _weight_decay: f32,
+        _bc1: f32,
+        _bc2: f32,
+        _total: usize,
+    ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
+        probe_err("fused_madam_step")?;
+        unreachable!()
+    }
 }
 
 impl QuantOps for ProbeDevice {
@@ -564,5 +617,20 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
     assert_probe!(
         dev.mla_absorbed_decode(s.as_ref(), s.as_ref(), s.as_ref(), None, s2.as_ref(), 1, 1, 1, 1, 1),
         "mla_absorbed_decode"
+    );
+    // Optimizer steps: these were the methods whose forwards went missing
+    // a second time after the B1 fix (they postdate the original probe) —
+    // they must stay forwarded through the Arc blanket impls.
+    assert_probe!(
+        dev.fused_adamw_step(s.as_ref(), s.as_ref(), s.as_ref(), s.as_ref(), 1e-3, 0.9, 0.999, 1e-8, 0.0, 1.0, 1.0, 4),
+        "fused_adamw_step"
+    );
+    assert_probe!(
+        dev.fused_lion_step(s.as_ref(), s.as_ref(), s.as_ref(), 1e-3, 0.9, 0.99, 0.0, 4),
+        "fused_lion_step"
+    );
+    assert_probe!(
+        dev.fused_madam_step(s.as_ref(), s.as_ref(), s.as_ref(), s.as_ref(), 1e-3, 0.9, 0.999, 1e-8, 1.0, 0.0, 1.0, 1.0, 4),
+        "fused_madam_step"
     );
 }

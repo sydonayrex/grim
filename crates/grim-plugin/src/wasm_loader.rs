@@ -321,7 +321,7 @@ impl Sampler for WasmSampler {
 mod tests {
     use super::*;
     #[cfg(feature = "wasm-sandbox")]
-    use grim_tensor::BackendDevice;
+    use grim_tensor::CoreTensorOps;
 
     #[test]
     fn test_wasm_sandbox_limits() {

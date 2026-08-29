@@ -2,7 +2,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{ArithType, DType, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]

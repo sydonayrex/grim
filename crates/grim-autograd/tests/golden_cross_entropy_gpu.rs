@@ -2,7 +2,7 @@
 
 use grim_autograd::cross_entropy_loss;
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{BackendDevice, DType, Shape, Tensor};
+use grim_tensor::{CoreTensorOps, DType, Shape, Tensor};
 
 fn cpu_ce_ref(logits: &[f32], targets: &[usize], vocab: usize) -> (f32, Vec<f32>) {
     let b = targets.len();

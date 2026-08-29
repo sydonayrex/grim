@@ -1,9 +1,9 @@
 //! Numerical parity test for Vulkan MoE Fused Dispatch on physical GPU.
 
 use grim_backend_vulkan::VulkanDevice;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
+use grim_tensor::CoreTensorOps;
 
 #[test]
 fn test_vulkan_moe_fused_dispatch_parity() {

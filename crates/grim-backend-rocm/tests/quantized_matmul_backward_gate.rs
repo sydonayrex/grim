@@ -8,8 +8,7 @@
 
 use grim_autograd::ops::{MatMulArgs, matmul_backward};
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
-use grim_tensor::{DType, Device, Shape, Tensor};
+use grim_tensor::{CoreTensorOps, DType, Device, MemoryOps, Shape, Tensor};
 use std::sync::Arc;
 
 fn tensor_from_storage(

@@ -13,7 +13,7 @@
 use grim_backend_rocm::RocmDevice;
 use grim_quant::dequant_q3k;
 use grim_tensor::{
-    BackendDevice, DType, KQuantScheme, Shape,
+    CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape,
     dtype::{ArithType, Storage},
 };
 use std::panic;

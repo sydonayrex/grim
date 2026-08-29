@@ -3,7 +3,9 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::eplb::EplbRouter;
-use grim_tensor::{BackendDevice, Shape, dtype::DType};
+use grim_tensor::{Shape, dtype::DType,
+    CoreTensorOps, MemoryOps,
+};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -147,10 +149,10 @@ fn test_mrope_numerical_parity() -> TestResult {
     let k_shape = Shape::from_slice(&[num_tokens, num_k_heads, head_dim]);
     let pos_shape = Shape::from_slice(&[num_tokens, 3]);
 
-    let q_dev = BackendDevice::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
-    let k_dev = BackendDevice::from_cpu(&dev, &k_data, &k_shape, DType::F32)?;
+    let q_dev = CoreTensorOps::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
+    let k_dev = CoreTensorOps::from_cpu(&dev, &k_data, &k_shape, DType::F32)?;
     let pos_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
     let k_s = grim_backend_rocm::device::util::as_rocm(k_dev.as_ref())?;
@@ -235,13 +237,13 @@ fn test_speculative_rejection_sampler_parity() -> TestResult {
     let out_shape = Shape::from_slice(&[batch_size, num_draft_tokens + 1]);
     let len_shape = Shape::from_slice(&[batch_size]);
 
-    let tp_dev = BackendDevice::from_cpu(&dev, &target_probs, &tp_shape, DType::F32)?;
-    let dp_dev = BackendDevice::from_cpu(&dev, &draft_probs, &dp_shape, DType::F32)?;
+    let tp_dev = CoreTensorOps::from_cpu(&dev, &target_probs, &tp_shape, DType::F32)?;
+    let dp_dev = CoreTensorOps::from_cpu(&dev, &draft_probs, &dp_shape, DType::F32)?;
     let dt_dev =
-        BackendDevice::from_cpu_bytes(&dev, as_u8_slice(&draft_tokens), &dt_shape, DType::U32)?;
-    let ur_dev = BackendDevice::from_cpu(&dev, &uniform_rands, &ur_shape, DType::F32)?;
-    let out_dev = BackendDevice::zeros(&dev, &out_shape, DType::U32)?;
-    let len_dev = BackendDevice::zeros(&dev, &len_shape, DType::U32)?;
+        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&draft_tokens), &dt_shape, DType::U32)?;
+    let ur_dev = CoreTensorOps::from_cpu(&dev, &uniform_rands, &ur_shape, DType::F32)?;
+    let out_dev = CoreTensorOps::zeros(&dev, &out_shape, DType::U32)?;
+    let len_dev = CoreTensorOps::zeros(&dev, &len_shape, DType::U32)?;
 
     let tp_s = grim_backend_rocm::device::util::as_rocm(tp_dev.as_ref())?;
     let dp_s = grim_backend_rocm::device::util::as_rocm(dp_dev.as_ref())?;

@@ -10,7 +10,9 @@ use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, DType, Device, Tensor};
+use grim_tensor::{BackendDevice, DType, Device, Tensor,
+    CoreTensorOps,
+};
 
 use crate::varbuilder::WeightSource;
 
@@ -162,7 +164,7 @@ pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
 /// panics ("storage is not CpuStorage") when called with ROCm tensors.
 pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = pick_device_for_tensor(a);
-    let (s, h) = BackendDevice::add(&*dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+    let (s, h) = CoreTensorOps::add(&*dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
     h.synchronize()?;
     Ok(Tensor::new(
         Arc::from(s),
@@ -597,7 +599,7 @@ impl Linear {
                 )?
             }
         } else {
-            BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
+            CoreTensorOps::matmul(&*dev, a_storage, b_storage, &out_shape)?
         };
         // WI-Host-1: dropped `h.synchronize()?` here. The host-side pipeline
         // stall it forced on every `Linear::forward` call (twice per layer:
@@ -620,7 +622,7 @@ impl Linear {
 
         if let Some(b) = &self.bias {
             let broadcast_b = broadcast_bias(b, batch, out_dim)?;
-            let (s, hh) = BackendDevice::add(
+            let (s, hh) = CoreTensorOps::add(
                 &*dev,
                 mat_out.storage().as_ref(),
                 broadcast_b.storage().as_ref(),
@@ -786,7 +788,7 @@ impl RmsNorm {
         let dim = x.shape().dims().last().copied().unwrap_or(0);
         let batch = x.shape().elem_count() / dim;
         let out_shape = Shape::new(vec![batch, dim]);
-        let (s, h) = BackendDevice::rms_norm(
+        let (s, h) = CoreTensorOps::rms_norm(
             &*dev,
             x.storage().as_ref(),
             self.weight.storage().as_ref(),
@@ -949,7 +951,7 @@ impl Embedding {
         let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
         let (s, h) =
-            BackendDevice::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
+            CoreTensorOps::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
         // WI-Host-1 #3: dropped `h.synchronize()?` here. Same lazy-sync rationale
         // as `Linear::forward` (see the matmul-sync comment there): the stall is
         // redundant because the returned storage synchronizes on first read, and

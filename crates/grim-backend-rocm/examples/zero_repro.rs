@@ -196,7 +196,7 @@ fn main() {
         // < vocab and reproducible for identical seeds; a broken/zeroing
         // launch shows up as token==0 every time or a fault.
         use grim_backend_rocm::{
-            BackendDevice as _, memory::storage::RocmStorage, sample_logits_on_device_at,
+            CoreTensorOps as _, memory::storage::RocmStorage, sample_logits_on_device_at,
         };
         let vocab = 65536usize;
         let dev = std::sync::Arc::new(

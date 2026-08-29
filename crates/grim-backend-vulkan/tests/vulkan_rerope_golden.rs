@@ -2,10 +2,9 @@
 
 use grim_backend_cpu::CpuDevice;
 use grim_backend_vulkan::VulkanDevice;
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
-use grim_tensor::RopeConfig;
+use grim_tensor::{AttentionOps, CoreTensorOps, RopeConfig};
 
 #[test]
 fn test_vulkan_rerope_parity_vs_cpu_oracle() {

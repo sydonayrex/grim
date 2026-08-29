@@ -389,6 +389,7 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_tensor::{CoreTensorOps, MemoryOps};
 
     /// WI-Charon-3 gate (2), host-testable half: the persistent dispatch
     /// kernel reads every named field of `MoETaskDescriptor` when servicing
@@ -569,7 +570,7 @@ mod tests {
     fn rocm_persistent_dispatch_opcode_6_device_gated() {
         use crate::RocmDevice;
         use grim_tensor::dtype::{ArithType, DType, Storage};
-        use grim_tensor::{BackendDevice, Shape};
+        use grim_tensor::{Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
@@ -702,7 +703,7 @@ mod tests {
     fn rocm_persistent_attention_head_dim_guard_device_gated() {
         use crate::RocmDevice;
         use grim_tensor::dtype::{ArithType, DType, Storage};
-        use grim_tensor::{BackendDevice, Shape};
+        use grim_tensor::{Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
@@ -875,7 +876,7 @@ mod tests {
     fn rocm_persistent_dispatch_opcodes_1_through_5_device_gated() {
         use crate::RocmDevice;
         use grim_tensor::dtype::{ArithType, DType, Storage};
-        use grim_tensor::{BackendDevice, Shape};
+        use grim_tensor::{Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,

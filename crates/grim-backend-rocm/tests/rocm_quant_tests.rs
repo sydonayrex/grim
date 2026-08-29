@@ -6,10 +6,15 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{Shape};
+use grim_tensor::{CoreTensorOps};
 
 #[test]
 fn test_rocm_quantize_q8_0_and_fp8() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_q8_0_and_fp8");
+        return;
+    }
     let dev = RocmDevice::new(0);
 
     let shape = Shape::new(vec![32]);
@@ -39,6 +44,10 @@ fn test_rocm_quantize_q8_0_and_fp8() {
 
 #[test]
 fn test_rocm_quantize_q8_0_roundtrip() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_q8_0_roundtrip");
+        return;
+    }
     let dev = RocmDevice::new(0);
 
     let n = 256;
@@ -76,6 +85,10 @@ fn test_rocm_quantize_q8_0_roundtrip() {
 
 #[test]
 fn test_rocm_quantize_fp8_roundtrip() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_fp8_roundtrip");
+        return;
+    }
     let dev = RocmDevice::new(0);
 
     let n = 256;
@@ -107,6 +120,10 @@ fn test_rocm_quantize_fp8_roundtrip() {
 
 #[test]
 fn test_rocm_quantize_q8_0_vs_cpu_parity() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_q8_0_vs_cpu_parity");
+        return;
+    }
     let dev = RocmDevice::new(0);
 
     let n = 128;

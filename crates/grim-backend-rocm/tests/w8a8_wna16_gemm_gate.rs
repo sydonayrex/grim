@@ -5,8 +5,7 @@
 //! Device-gated: `GRIM_GPU_TEST=1`.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::backend::BackendDevice;
-use grim_tensor::{ArithType, DType, Device, Shape, Storage, Tensor};
+use grim_tensor::{ArithType, CoreTensorOps, DType, Device, MemoryOps, QuantOps, Shape, Storage, Tensor};
 use std::sync::Arc;
 
 fn wrap(st: Box<dyn grim_tensor::BackendStorage>, shape: Shape, device: Device) -> Tensor {

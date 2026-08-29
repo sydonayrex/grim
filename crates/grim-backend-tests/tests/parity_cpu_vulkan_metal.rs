@@ -7,8 +7,8 @@ use grim_backend_vulkan::caps::VulkanCaps;
 use grim_backend_vulkan::{VulkanKernel, binding_count, spirv_for};
 use grim_quant::qat_mxfp4::fake_quant_mxfp4;
 use grim_quant::{dequant_fp8, quant_fp8};
+use grim_tensor::CoreTensorOps;
 use grim_tensor::Shape;
-use grim_tensor::backend::BackendDevice;
 
 fn cpu_rmsnorm_reference(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
