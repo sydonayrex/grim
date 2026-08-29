@@ -371,13 +371,16 @@ impl TrainableParams {
         // ── Single-rank accumulation only ─────────────────────────────────
         // A host accumulation is not a multi-rank reduction. Multi-rank calls
         // were rejected above so this path cannot silently diverge replicas.
+        if (contribution_weight - 1.0).abs() < 1e-6 {
+            // Single-GPU identity: gradient is already exact; do not double-accumulate.
+            return Ok(());
+        }
         for param in self.params.values_mut() {
             let mut grad_vec = param.grad.to_vec_f32()?;
             for value in &mut grad_vec {
                 *value *= contribution_weight;
             }
-            let grad_tensor = grim_backend_cpu::cpu_tensor(grad_vec, param.grad.shape().clone());
-            param.accumulate_grad(&grad_tensor)?;
+            param.grad = grim_backend_cpu::cpu_tensor(grad_vec, param.grad.shape().clone());
         }
         Ok(())
     }
@@ -595,7 +598,7 @@ mod tests {
         params.all_reduce_grads(&dev, &placement, None).unwrap();
         assert_eq!(
             params.get(pid).unwrap().grad().to_vec_f32().unwrap(),
-            vec![1.0f32; 4]
+            vec![0.5f32; 4]
         );
     }
 

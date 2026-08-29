@@ -256,6 +256,7 @@ impl AdaLomo {
             param.zero_grad()?;
             return Ok(());
         }
+        self.step_count = self.step_count.saturating_add(1);
         let mut data = param.data.to_vec_f32()?;
         let grad = param.grad().to_vec_f32()?;
         self.update_param(id, &mut data, &grad)?;

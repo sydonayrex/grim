@@ -605,17 +605,6 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         // For both transposed (C = A^T @ B^T):
         //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]  (same as trans_a)
         //   dB_stored = G @ A    ->  dB[p][q] = sum_i G[p][i] * A[q][i]   (derived: dB^T = A^T @ G)
-        for _p in 0..a_dims[0] {
-            for _q in 0..a_dims[1] {
-                match (args.transpose_a, args.transpose_b) {
-                    (true, _) | (_, false) => {
-                        // dA = B @ G^T (for trans_a, or both trans): dA[p][q] = sum_l B[p][l] * G[q][l]
-                        // dA = G @ B (for trans_b none): dA[p][q] = sum_l G[p][l] * B[l][q]
-                    }
-                    _ => {}
-                }
-            }
-        }
 
         let use_bg_for_da = !args.transpose_a; // when A is not transposed, use dA = G @ B
 
