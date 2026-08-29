@@ -3941,9 +3941,9 @@ impl BackendDevice for RocmDevice {
             DTypeStorage::WNA16 => {
                 // Fused dequant-GEMM over the resident blob; the header
                 // carries n_bit/num_blocks.
-                let hdr = Self::wna16_read_header(b_storage, self.ordinal)?;
-                let mut n_bit_v = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as i32;
-                let mut blocks_v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as i32;
+                let (n_bit_raw, blocks_raw) = Self::wna16_read_params(b_storage, self.ordinal)?;
+                let mut n_bit_v = n_bit_raw as i32;
+                let mut blocks_v = blocks_raw as i32;
                 self.launch_elementwise_dequant_gemm(
                     "grim_wna16_dequant_gemm",
                     a_storage,
@@ -4421,9 +4421,9 @@ impl BackendDevice for RocmDevice {
             }
             DTypeStorage::WNA16 => {
                 // Fused dequant-GEMM backward: dX[M, K] = dY[M, N] @ deq(B)[N, K].
-                let hdr = Self::wna16_read_header(b_storage, self.ordinal)?;
-                let mut n_bit_v = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as i32;
-                let mut blocks_v = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as i32;
+                let (n_bit_raw, blocks_raw) = Self::wna16_read_params(b_storage, self.ordinal)?;
+                let mut n_bit_v = n_bit_raw as i32;
+                let mut blocks_v = blocks_raw as i32;
                 self.launch_elementwise_dequant_gemm_backward(
                     "grim_wna16_dequant_gemm_backward_dx",
                     dy_storage,
@@ -9485,34 +9485,13 @@ impl RocmDevice {
         blob: &dyn BackendStorage,
         num_weights: usize,
     ) -> Result<Box<dyn BackendStorage>> {
-        // Header [u32 n_bit][u32 blocks] read via pinned D2H — internal, so
-        // callers never touch device_ptr / streams.
         let packed_rocm = blob
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("wna16 blob not rocm".into()))?;
-        let mut pinned = RocmPinnedBuffer::<u8>::alloc(8)?;
-        {
-            let _g = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            let src_ptr = packed_rocm
-                .device_ptr
-                .ok_or_else(|| Error::Backend("wna16 blob has no device ptr".into()))?;
-            check_hip("wna16 head D2H", unsafe {
-                hipMemcpyAsync(
-                    pinned.as_mut_ptr() as *mut c_void,
-                    src_ptr as *const c_void,
-                    8,
-                    HipMemcpyKind::DeviceToHost,
-                    self.active_stream(),
-                )
-            })?;
-            check_hip("wna16 head D2H sync", unsafe {
-                hipStreamSynchronize(self.active_stream())
-            })?;
-        }
-        let head: Vec<u8> = unsafe { std::slice::from_raw_parts(pinned.as_ptr(), 8).to_vec() };
-        let n_bit = u32::from_le_bytes(head[0..4].try_into().unwrap()) as u8;
-        let num_blocks = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
+        let (n_bit_raw, num_blocks_raw) = Self::wna16_read_params(packed_rocm, self.ordinal)?;
+        let n_bit = n_bit_raw as u8;
+        let num_blocks = num_blocks_raw as usize;
         self.dequant_wna16_to_f32(packed_rocm, num_weights, n_bit, num_blocks)
     }
 
@@ -12161,6 +12140,20 @@ impl RocmDevice {
         let mut out = [0u8; 8];
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(pinned.as_ptr(), 8) });
         Ok(out)
+    }
+
+    /// Safely unpacks the `(n_bit, num_blocks)` tuple from a WNA16 blob header with error propagation.
+    fn wna16_read_params(blob: &RocmStorage, ordinal: usize) -> Result<(u32, u32)> {
+        let hdr = Self::wna16_read_header(blob, ordinal)?;
+        let n_bit_bytes: [u8; 4] = hdr[0..4]
+            .try_into()
+            .map_err(|e| Error::Backend(format!("wna16 header n_bit slice error: {e}")))?;
+        let blocks_bytes: [u8; 4] = hdr[4..8]
+            .try_into()
+            .map_err(|e| Error::Backend(format!("wna16 header num_blocks slice error: {e}")))?;
+        let n_bit = u32::from_le_bytes(n_bit_bytes);
+        let num_blocks = u32::from_le_bytes(blocks_bytes);
+        Ok((n_bit, num_blocks))
     }
 
     /// Public materialization service (quant workstream): dequantize a

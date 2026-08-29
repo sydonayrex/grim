@@ -2549,7 +2549,7 @@ mod tests {
         assert_eq!(t.len(), 3, "v1 polymorphic population cap = 3");
         let buckets: Vec<f32> = t.iter().map(|r| r.skew_bucket).collect();
         let mut sorted = buckets.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.total_cmp(b));
         assert_eq!(buckets.len(), 3);
         // Buckets span low → high skew.
         assert!(sorted.first().copied().unwrap_or(1.0) < 0.4, "low bucket");
