@@ -343,11 +343,11 @@ pub fn dora_backward(
         x.device().clone(),
     );
 
-    // For DoRA, the base weight w_base is frozen (not trainable), so grad_w_base is zeros
-    // matching the original stub signature: (grad_x, grad_w_base, grad_a, grad_b, grad_m)
-    let z_w_vec = vec![0.0f32; w_vec.len()];
+    // In DoRA, V = W_base + scale * (B @ A), so dL/dW_base = dL/dV.
+    // For parameter-frozen adapters, downstream TrainableParam filtering zeroes unneeded updates;
+    // computing dL/dW_base = grad_v ensures full-parameter and fine-tuning scopes learn properly.
     let grad_w_base = Tensor::new(
-        Arc::from(dev.from_cpu(&z_w_vec, &out_shape_w, DType::F32)?),
+        Arc::from(dev.from_cpu(&grad_v_vec, &out_shape_w, DType::F32)?),
         out_shape_w.clone(),
         DType::F32,
         w_base.provenance().clone(),
