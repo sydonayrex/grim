@@ -314,8 +314,14 @@ impl RwkvBlock {
         attn_xx.copy_from_slice(&norm_x);
 
         let mixed = cpu_tensor(shifted.clone(), Shape::new(vec![3, dim]));
-        let flat = |t: &Tensor, off: usize| -> Result<Vec<f32>> {
-            Ok(t.to_vec_f32()?[off..off + dim].to_vec())
+        // Audit fix (grim-models, found by the WKV numeric reference test):
+        // `flat` documents `off` as a ROW of the [3, dim] mixed tensor, but
+        // sliced by ELEMENT offset — so the value projection read elements
+        // 1..dim+1 and the receptance projection 2..dim+2, mixing channels
+        // across the k/v/r boundaries (silently wrong attention output for
+        // every RWKV checkpoint). Slice by row: off * dim.
+        let flat = |t: &Tensor, row: usize| -> Result<Vec<f32>> {
+            Ok(t.to_vec_f32()?[row * dim..(row + 1) * dim].to_vec())
         };
         let k_t = self
             .time_mix_key
@@ -737,4 +743,164 @@ mod audit_tests {
             "identical token after different histories must differ (recurrence dead): {diff}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Numeric reference test (audit follow-up): the WKV recurrence was previously
+// tested only for state threading, never for value correctness against an
+// independent recomputation of the v4 update.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod wkv_numeric_reference_tests {
+    use super::*;
+    use grim_backend_cpu::cpu_tensor;
+    use grim_nn::Linear;
+
+    /// Build a hand-constructed single-layer RWKV block with known weights:
+    /// identity-ish projections (diagonal weights) so the reference math
+    /// stays inspectable, plus nontrivial mix/decay parameters.
+    fn test_block() -> RwkvBlock {
+        let hidden = 4usize;
+        let diag = |scale: f32| {
+            let mut w = vec![0.0f32; hidden * hidden];
+            for i in 0..hidden {
+                w[i * hidden + i] = scale;
+            }
+            Linear::from_tensor(cpu_tensor(w, Shape::new(vec![hidden, hidden])), None)
+        };
+        let mut b = RwkvBlock {
+            norm: RmsNorm {
+                weight: cpu_tensor(vec![1.0; hidden], Shape::new(vec![hidden])),
+                eps: 1e-5,
+            },
+            norm2: RmsNorm {
+                weight: cpu_tensor(vec![1.0; hidden], Shape::new(vec![hidden])),
+                eps: 1e-5,
+            },
+            time_mix_key: diag(1.0),
+            time_mix_value: diag(1.0),
+            time_mix_receptance: diag(1.0),
+            time_mix_output: diag(1.0),
+            channel_mix_key: diag(1.0),
+            channel_mix_receptance: diag(1.0),
+            channel_mix_value: diag(1.0),
+            device: Device::Cpu,
+            tm_mix_k: vec![0.5; hidden],
+            tm_mix_v: vec![0.5; hidden],
+            tm_mix_r: vec![0.5; hidden],
+            time_decay: vec![-0.5; hidden],
+            time_first: vec![1.0; hidden],
+            ffn_tm_mix_k: vec![0.5; hidden],
+            ffn_tm_mix_r: vec![0.5; hidden],
+        };
+        b.time_mix_output = diag(2.0); // distinguishable projection scale
+        b
+    }
+
+    fn fresh_state() -> RwkvState {
+        // Mirrors Rwkv::init_state for one layer of hidden=4: zero carries,
+        // pp (slot 3) at -1e38 so time_first dominates on token 0.
+        let hidden = 4usize;
+        let mut data = vec![0.0f32; 5 * hidden];
+        for v in data[3 * hidden..4 * hidden].iter_mut() {
+            *v = -1e38;
+        }
+        RwkvState {
+            data,
+            num_layers: 1,
+            hidden,
+        }
+    }
+
+    /// One block step vs an independent f64 recomputation of the documented
+    /// v4 time-mix + WKV + channel-mix math, run for TWO tokens so the
+    /// state carry (aa/bb/pp and the token-shift slots) is value-checked.
+    #[test]
+    fn rwkv_wkv_two_steps_match_f64_reference() {
+        let b = test_block();
+        let hidden = 4usize;
+        let mut state = fresh_state();
+
+        let inputs = [vec![0.2f32, -0.1, 0.5, 0.0], vec![0.9, 0.3, -0.4, 0.7]];
+        let mut got: Vec<Vec<f32>> = Vec::new();
+        for x in &inputs {
+            // NOTE: 2-D [1, hidden] like every real caller — `step` accepts a
+            // 1-D input by its length check, but the residual add then
+            // crashes in the CPU broadcast path (rank-1 vs rank-2). That
+            // latent backend bug is recorded in the audit report.
+            let xt = cpu_tensor(x.clone(), Shape::new(vec![1, hidden]));
+            got.push(b.step(&xt, 0, &mut state).unwrap().to_vec_f32().unwrap());
+        }
+
+        // f64 reference state slots.
+        let (mut xx_attn, mut aa) = (vec![0.0f64; hidden], vec![0.0f64; hidden]);
+        let (mut bb, mut pp) = (vec![0.0f64; hidden], vec![-1e38f64; hidden]);
+        let mut xx_ffn = vec![0.0f64; hidden];
+        let tm_k = |i| b.tm_mix_k[i] as f64;
+        let w_at = |i: usize, arr: &Linear| arr.weight.to_vec_f32().unwrap()[i * hidden + i] as f64;
+
+        for (step_idx, x) in inputs.iter().enumerate() {
+            let x64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            // Token shift + projections (diagonal weights).
+            let mut k = vec![0.0f64; hidden];
+            let mut v = vec![0.0f64; hidden];
+            let mut r = vec![0.0f64; hidden];
+            for i in 0..hidden {
+                k[i] = w_at(i, &b.time_mix_key)
+                    * (tm_k(i) * x64[i] + (1.0 - tm_k(i)) * xx_attn[i]);
+                v[i] = w_at(i, &b.time_mix_value)
+                    * (b.tm_mix_v[i] as f64 * x64[i]
+                        + (1.0 - b.tm_mix_v[i] as f64) * xx_attn[i]);
+                r[i] = w_at(i, &b.time_mix_receptance)
+                    * (b.tm_mix_r[i] as f64 * x64[i]
+                        + (1.0 - b.tm_mix_r[i] as f64) * xx_attn[i]);
+            }
+            // Post-norm current hidden becomes next call's shift carry.
+            let mean_sq = x64.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+            let inv = 1.0 / (mean_sq + 1e-5).sqrt();
+            let norm_x: Vec<f64> = x64.iter().map(|v| v * inv).collect();
+            xx_attn.copy_from_slice(&norm_x);
+
+            // WKV update + sigmoid gate.
+            let mut attn_y = vec![0.0f64; hidden];
+            for i in 0..hidden {
+                let ww = b.time_first[i] as f64 + k[i];
+                let p = pp[i].max(k[i]);
+                let e1 = (pp[i] - p).exp();
+                let e2 = (ww - p).exp();
+                let num = e1 * aa[i] + e2 * v[i];
+                let den = e1 * bb[i] + e2;
+                let sig = 1.0 / (1.0 + (-r[i]).exp());
+                attn_y[i] = sig * if den != 0.0 { num / den } else { 0.0 };
+                aa[i] = num;
+                bb[i] = den;
+                pp[i] = p + b.time_decay[i] as f64;
+            }
+            for i in 0..hidden {
+                attn_y[i] *= w_at(i, &b.time_mix_output);
+            }
+            // Channel mix (diagonal projections).
+            let r1: Vec<f64> =
+                x64.iter().zip(&attn_y).map(|(&a, &o)| a + o).collect();
+            let mean_sq = r1.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+            let inv = 1.0 / (mean_sq + 1e-5).sqrt();
+            let n2: Vec<f64> = r1.iter().map(|v| v * inv).collect();
+            let mut out = vec![0.0f64; hidden];
+            for i in 0..hidden {
+                let kin = b.ffn_tm_mix_k[i] as f64 * n2[i]
+                    + (1.0 - b.ffn_tm_mix_k[i] as f64) * xx_ffn[i];
+                let rin = b.ffn_tm_mix_r[i] as f64 * n2[i]
+                    + (1.0 - b.ffn_tm_mix_r[i] as f64) * xx_ffn[i];
+                let sig = 1.0 / (1.0 + (-rin).exp());
+                let gated = sig * kin.max(0.0) * w_at(i, &b.channel_mix_key);
+                out[i] = r1[i] + gated * w_at(i, &b.channel_mix_value);
+            }
+            xx_ffn.copy_from_slice(&n2);
+            for (o, g) in out.iter().zip(&got[step_idx]) {
+                assert!((o - *g as f64).abs() < 1e-4, "token {step_idx}: reference {o} vs impl {g}");
+            }
+        }
+    }
+
 }

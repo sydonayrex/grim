@@ -312,11 +312,12 @@ impl LocalSpillManager {
     }
 
     /// Retrieve a compressed blob from whichever compressed tier it
-    /// currently resides in. `Ok(None)` = not compressed-tier managed
-    /// (callers fall back to the raw `retrieve` path).
+    /// currently resides in. Host-tier reads are non-destructive (cloned,
+    /// mirroring raw `retrieve`); an NVMe read promotes the blob into the
+    /// compressed host tier and hands back a clone. `Ok(None)` = not
+    /// compressed-tier managed (callers fall back to the raw path).
     pub fn retrieve_compressed(&mut self, block_id: BlockId) -> Result<Option<Vec<u8>>> {
-        if let Some(blob) = self.compressed_host.remove(&block_id) {
-            self.block_tiers.insert(block_id, CacheTier::Gpu);
+        if let Some(blob) = self.compressed_host.get(&block_id).cloned() {
             return Ok(Some(blob));
         }
         if let Some(path) = self.nvme_compressed.remove(&block_id) {
@@ -333,7 +334,8 @@ impl LocalSpillManager {
             return match read_res {
                 Ok(blob) => {
                     let _ = fs::remove_file(&path);
-                    self.block_tiers.insert(block_id, CacheTier::Gpu);
+                    self.compressed_host.insert(block_id, blob.clone());
+                    self.block_tiers.insert(block_id, CacheTier::HostRam);
                     Ok(Some(blob))
                 }
                 Err(e) => {

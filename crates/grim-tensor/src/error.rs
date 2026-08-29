@@ -1,6 +1,7 @@
-//! Grim core error type.
+//! Tensor and backend error types for `grim-tensor`.
 //!
-//! Every crate in the workspace ultimately returns `grim_tensor::Result<T>`.
+//! Low-level tensor computation and device abstraction errors. Crates that build
+//! atop `grim-tensor` convert these into `grim_core::error::Error` via `From` / `?`.
 
 use thiserror::Error;
 

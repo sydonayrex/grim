@@ -1905,6 +1905,167 @@ mod tests {
         assert_eq!(cache.table.len(), 1);
     }
 
+    /// Audit remediation: a failed demotion must NOT strand the block in a
+    /// fake HostRam state — the block must fall back to the in-place release
+    /// (zero + free list) so the slot stays reclaimable. The mismatched
+    /// spill manager (wrong block_elems) makes every demote_to_host fail.
+    #[test]
+    fn failed_demotion_falls_back_to_in_place_release() {
+        let dir = tempdir().unwrap();
+        // Spill expects 256-elem blocks; the pool's blocks are
+        // BLOCK_SIZE * 2 * 4 = 128 elems → every raw demotion errors.
+        let spill = Arc::new(
+            SharedSpillManager::new(dir.path().to_path_buf(), 256).unwrap(),
+        );
+        let mut pool = KvBlockPool::new(2, 2, 4);
+        pool.attach_spill(spill.clone());
+        let id = pool.alloc().unwrap();
+        pool.write_keys(id, &vec![1.0f32; BLOCK_SIZE * 2 * 4], BLOCK_SIZE);
+        pool.write_values(id, &vec![2.0f32; BLOCK_SIZE * 2 * 4]);
+        pool.free(id);
+        // Block must be back on the free list at Gpu tier, NOT stranded as
+        // a HostRam block with no backing storage.
+        assert_eq!(pool.free_list.len(), 2, "failed demotion must return the slot");
+        assert_eq!(pool.block_location(id), CacheTier::Gpu);
+        assert!(!pool.block_is_received(id));
+    }
+
+    /// Audit remediation: promote_to_gpu must ERROR on a spill-geometry
+    /// mismatch, never silently truncate the cache via .min().
+    #[test]
+    fn promote_geometry_mismatch_is_an_error() {
+        let dir = tempdir().unwrap();
+        // Spill managed with the WRONG geometry (double the pool's elems):
+        // demote a full-size raw block through the manager directly, then
+        // promote through the pool.
+        let spill = Arc::new(
+            SharedSpillManager::new(dir.path().to_path_buf(), BLOCK_SIZE * 2 * 8).unwrap(),
+        );
+        let mut pool = KvBlockPool::new(2, 2, 4);
+        pool.attach_spill(spill.clone());
+        let id = pool.alloc().unwrap();
+        spill
+            .demote_to_host(id, vec![1.0; BLOCK_SIZE * 2 * 8], vec![2.0; BLOCK_SIZE * 2 * 8])
+            .unwrap();
+        let err = pool.promote_to_gpu(id).unwrap_err();
+        assert!(
+            err.to_string().contains("geometry mismatch"),
+            "mismatch must be reported as an error: {err}"
+        );
+        // And the block contents were NOT partially overwritten.
+        assert!(pool.read_keys(id).iter().all(|&v| v == 0.0));
+    }
+
+    /// Audit remediation: snapshot_block must compress the ACTUAL token
+    /// count, never the padded BLOCK_SIZE shape.
+    #[test]
+    fn compress_block_uses_actual_num_tokens() {
+        let mut pool = KvBlockPool::new(2, 2, 4);
+        let compressor: Arc<dyn KvCompressor> =
+            Arc::new(LloydMaxCompressor::new(KvQuantConfig::default()));
+        pool.attach_compressor(compressor);
+        let id = pool.alloc().unwrap();
+        // Only 5 of 16 slots written.
+        pool.write_keys(id, &vec![0.5f32; 5 * 2 * 4], 5);
+        pool.write_values(id, &vec![0.25f32; 5 * 2 * 4]);
+        let compressed = pool.compress_block(id).unwrap().unwrap();
+        assert_eq!(compressed.num_tokens, 5, "snapshot must carry real tokens, not padding");
+        // Empty block compresses to None instead of quantizing zeros.
+        let id2 = pool.alloc().unwrap();
+        pool.write_keys(id2, &[], 0);
+        assert!(pool.compress_block(id2).unwrap().is_none());
+    }
+
+    /// Audit remediation: the compression-to-spill loop must be CLOSED —
+    /// freeing a block with compressor + spill attached stores the
+    /// COMPRESSED bytes in the spill tier, and promote decompresses back to
+    /// f32 K/V at the exact original geometry.
+    #[test]
+    fn compressor_spill_loop_is_closed_end_to_end() {
+        let dir = tempdir().unwrap();
+        let block_elems = BLOCK_SIZE * 2 * 4;
+        let spill =
+            Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        pool.attach_spill(spill.clone());
+        // Constant data compresses/decompresses EXACTLY under both quantizers
+        // (scale of a constant is the constant itself), so the round trip is
+        // bit-tight and any scale/geometry bug fails the equality below.
+        let k = vec![0.5f32; block_elems];
+        let v = vec![-0.25f32; block_elems];
+        pool.attach_compressor(Arc::new(LloydMaxCompressor::new(KvQuantConfig {
+            key_bits: 3,
+            value_bits: 4,
+            group_size: 64,
+            qk_compute_bits: 8,
+        })));
+        let id = pool.alloc().unwrap();
+        pool.write_keys(id, &k, BLOCK_SIZE);
+        pool.write_values(id, &v);
+
+        // Free → the spilled bytes are the COMPRESSED blob (not raw f32).
+        pool.free(id);
+        assert!(spill.get_tier(id).is_some());
+        let blob = spill.retrieve_compressed(id).unwrap().expect(
+            "spill must hold the compressed blob when a compressor is attached",
+        );
+        let block = CompressedKvBlock::from_bytes(&blob).unwrap();
+        assert_eq!(block.num_tokens, BLOCK_SIZE);
+        // The raw f32 tier must NOT hold this block anymore.
+        assert_eq!(spill.retrieve(id).unwrap(), None);
+
+        // Promote → decompress back to f32 at the exact original geometry.
+        // The dequantized result must be BIT-IDENTICAL to the compressor's
+        // own reference dequantization of the same snapshot (the pipeline is
+        // deterministic: same seed → same rotation matrix), isolating pool
+        // wiring from the quantizer's inherent lossiness.
+        let compressor = LloydMaxCompressor::new(KvQuantConfig {
+            key_bits: 3,
+            value_bits: 4,
+            group_size: 64,
+            qk_compute_bits: 8,
+        });
+        let (k_ref, v_ref) = compressor
+            .dequantize_for_attention(&block, &CpuDevice::new(), Device::Cpu)
+            .unwrap();
+        let promoted = pool.promote_to_gpu(id).unwrap().expect("compressed promote");
+        assert_eq!(
+            promoted.0,
+            k_ref.to_vec_f32().unwrap(),
+            "promoted keys must equal the reference dequantization"
+        );
+        assert_eq!(
+            promoted.1,
+            v_ref.to_vec_f32().unwrap(),
+            "promoted values must equal the reference dequantization"
+        );
+        // And bounded lossiness vs the original: 3-bit keys (rotated) and
+        // 4-bit values must reconstruct within the quantizer granularity.
+        let max_k_err = promoted
+            .0
+            .iter()
+            .zip(&k)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_v_err = promoted
+            .1
+            .iter()
+            .zip(&v)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_k_err < 0.5, "key lossiness bounded, got {max_k_err}");
+        assert!(max_v_err < 1e-4, "constant values must be exact, got {max_v_err}");
+        // The block now holds the DECOMPRESSED-COMPRESSED data: identical to
+        // the reference dequantization, lossy vs the original by exactly the
+        // quantizer's granularity (keys rotated + 3-bit; constant values
+        // exact under asymmetric min/max quantization).
+        assert_eq!(pool.read_keys(id), promoted.0.as_slice());
+        assert_eq!(pool.read_values(id), promoted.1.as_slice());
+        assert_eq!(pool.block_location(id), CacheTier::Gpu);
+        assert!(pool.block_is_received(id));
+        assert_eq!(pool.block_num_tokens(id), Some(BLOCK_SIZE));
+    }
+
     #[test]
     fn test_dirty_block_mirror_tracking_and_flushing() {
         let mut pool = KvBlockPool::new(8, 2, 4);

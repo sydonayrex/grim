@@ -203,6 +203,10 @@ impl Mamba2Block {
         for (yi, &zi) in y.iter_mut().zip(z.iter()) {
             *yi *= silu(zi);
         }
+        // Advance the position cursor: MambaState documents `pos` as the
+        // per-call token count and Mamba-1's step advances it — the Mamba-2
+        // step must too, or speculative snapshots read a stale position.
+        state.pos += 1;
         let out_t = cpu_tensor(y, Shape::new(vec![1, self.d_inner]));
         let out = self.out_proj.forward(&out_t)?;
         Ok(out)

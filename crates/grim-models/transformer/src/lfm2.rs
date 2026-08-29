@@ -1350,3 +1350,202 @@ mod audit_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Numeric reference test (audit follow-up): the shortconv causal recurrence
+// was guarded by validate() but never value-checked.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod shortconv_numeric_reference_tests {
+    use super::*;
+    use grim_nn::Linear;
+
+    fn lin(weight: Vec<f32>, out_dim: usize, in_dim: usize) -> Linear {
+        Linear::from_tensor(
+            grim_backend_cpu::cpu_tensor(weight, Shape::new(vec![out_dim, in_dim])),
+            None,
+        )
+    }
+
+    fn weights(seed: u64, n: usize) -> Vec<f32> {
+        let mut st = seed;
+        (0..n)
+            .map(|_| {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((st >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.4
+            })
+            .collect()
+    }
+
+    fn unit_norm() -> RmsNorm {
+        RmsNorm {
+            weight: grim_backend_cpu::cpu_tensor(vec![1.0; 4], Shape::new(vec![4])),
+            eps: 1e-5,
+        }
+    }
+
+    #[test]
+    fn shortconv_causal_conv_matches_f64_reference() {
+        let hidden = 4usize;
+        let l_cache = 3usize;
+        let steps = 3usize;
+        let unit = unit_norm();
+        let block = Lfm2Block {
+            attn_norm: unit.clone(),
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            shortconv_in_proj: Some(lin(weights(1, 3 * hidden * hidden), 3 * hidden, hidden)),
+            shortconv_conv: Some(grim_backend_cpu::cpu_tensor(
+                weights(2, hidden * l_cache),
+                Shape::new(vec![hidden, 1, l_cache]),
+            )),
+            shortconv_conv_vec: Some(weights(2, hidden * l_cache)),
+            shortconv_out_proj: Some(lin(weights(3, hidden * hidden), hidden, hidden)),
+            ffn_norm: unit.clone(),
+            ffn_gate: lin(weights(4, hidden * hidden), hidden, hidden),
+            ffn_up: lin(weights(5, hidden * hidden), hidden, hidden),
+            ffn_down: lin(weights(6, hidden * hidden), hidden, hidden),
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: hidden,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+        };
+
+        // 3-token input; run forward once over the whole sequence.
+        let x_data: Vec<f32> = vec![0.3, -0.5, 0.7, 0.1, -0.2, 0.4, 0.6, -0.1, 0.25, 0.05, -0.35, 0.45];
+        let x = grim_backend_cpu::cpu_tensor(x_data.clone(), Shape::new(vec![steps, hidden]));
+        let mut cache = None;
+        let out = block.forward(&x, &mut cache).unwrap().to_vec_f32().unwrap();
+        assert_eq!(out.len(), steps * hidden);
+
+        // Independent f64 reference of the documented recurrence:
+        //   proj = W_in · rmsnorm(x);  per step: b, c, xv = thirds of proj
+        //   bx = b·xv;  y[d] = c[d]·(w[d·L+L−1]·bx[d] + Σ_{k<L−1} w[d·L+k]·state[k][d])
+        //   state shifts left by one, appending bx.
+        let w_norm = vec![1.0f32; hidden];
+        let w_in = weights(1, 3 * hidden * hidden);
+        let conv = weights(2, hidden * l_cache);
+        let w_out = weights(3, hidden * hidden);
+        let eps = 1e-5f64;
+
+        let mut state = vec![0.0f64; hidden * (l_cache - 1)];
+        let mut ref_out = Vec::with_capacity(steps * hidden);
+        for step in 0..steps {
+            let xr: Vec<f64> = x_data[step * hidden..(step + 1) * hidden]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            let mean_sq = xr.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            let normed: Vec<f64> =
+                xr.iter().zip(&w_norm).map(|(&v, &w)| v * inv * w as f64).collect();
+            let mut proj = vec![0.0f64; 3 * hidden];
+            for o in 0..3 * hidden {
+                proj[o] = (0..hidden)
+                    .map(|i| w_in[o * hidden + i] as f64 * normed[i])
+                    .sum();
+            }
+            let b = &proj[..hidden];
+            let c = &proj[hidden..2 * hidden];
+            let xv = &proj[2 * hidden..3 * hidden];
+            for d in 0..hidden {
+                let bx = b[d] * xv[d];
+                let mut sum = conv[d * l_cache + l_cache - 1] as f64 * bx;
+                for k in 0..l_cache - 1 {
+                    sum += conv[d * l_cache + k] as f64 * state[k * hidden + d];
+                }
+                ref_out.push(c[d] * sum);
+            }
+            // Shift the ring: drop the oldest, append bx.
+            for k in 0..l_cache - 2 {
+                for d in 0..hidden {
+                    state[k * hidden + d] = state[(k + 1) * hidden + d];
+                }
+            }
+            for d in 0..hidden {
+                state[(l_cache - 2) * hidden + d] = b[d] * xv[d];
+            }
+        }
+        // Final projection to hidden width — per step (row-major [out, in]
+        // matvec on each step's h_dim-vector).
+        let mut per_step_ref: Vec<f64> = Vec::with_capacity(steps * hidden);
+        for step in 0..steps {
+            let y = &ref_out[step * hidden..(step + 1) * hidden];
+            for o in 0..hidden {
+                per_step_ref
+                    .push((0..hidden).map(|i| w_out[o * hidden + i] as f64 * y[i]).sum());
+            }
+        }
+        // The block continues past the conv branch: residual add, FFN norm,
+        // SwiGLU FFN (gate·silu(up) → down), second residual. Extend the
+        // reference through the full block tail.
+        let w_g = weights(4, hidden * hidden);
+        let w_u = weights(5, hidden * hidden);
+        let w_d = weights(6, hidden * hidden);
+        let mut full_ref: Vec<f64> = Vec::with_capacity(steps * hidden);
+        for step in 0..steps {
+            let xr: Vec<f64> = x_data[step * hidden..(step + 1) * hidden]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            let conv_out = &per_step_ref[step * hidden..(step + 1) * hidden];
+            let x_added: Vec<f64> = xr.iter().zip(conv_out).map(|(&a, &b)| a + b).collect();
+            let mean_sq = x_added.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            let n2: Vec<f64> = x_added.iter().map(|v| v * inv).collect();
+            let gate: Vec<f64> = (0..hidden)
+                .map(|o| (0..hidden).map(|i| w_g[o * hidden + i] as f64 * n2[i]).sum())
+                .collect();
+            let up: Vec<f64> = (0..hidden)
+                .map(|o| (0..hidden).map(|i| w_u[o * hidden + i] as f64 * n2[i]).sum())
+                .collect();
+            // SwiGLU: SiLU applies to the GATE projection.
+            let act: Vec<f64> = gate
+                .iter()
+                .zip(&up)
+                .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+                .collect();
+            for o in 0..hidden {
+                let down: f64 = (0..hidden).map(|i| w_d[o * hidden + i] as f64 * act[i]).sum();
+                full_ref.push(x_added[o] + down);
+            }
+        }
+        for (i, (r, g)) in full_ref.iter().zip(&out).enumerate() {
+            assert!(
+                (r - *g as f64).abs() < 1e-4,
+                "elem {i}: reference {r} vs impl {g}"
+            );
+        }
+
+        // Causality gate: the cache must have advanced so a FOLLOW-UP call
+        // sees the last two steps' bx values (state ring = last l_cache−1).
+        match &cache {
+            Some(Lfm2LayerCache::ShortConv(st)) => {
+                // After 3 steps with l_cache=3, the ring holds the LAST two
+                // steps' bx vectors — both must be non-zero.
+                assert!(
+                    st.iter().any(|&v| v != 0.0),
+                    "shortconv cache must hold shifted bx history"
+                );
+            }
+            _ => panic!("shortconv forward must populate a ShortConv cache"),
+        }
+    }
+}

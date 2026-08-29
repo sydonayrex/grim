@@ -6,7 +6,7 @@
 //! - **SwiGLU FFN**: Feed-forward projection with RMSNorm normalization.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_core::error::Result;
+use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, TensorParallelConfig, WeightSource};
@@ -336,15 +336,41 @@ impl CausalLm for DeltaNetBase {
         let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
         for (i, &tok_f) in ids.iter().enumerate() {
             let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
+            // An out-of-vocab token id is a tokenizer contract violation:
+            // silently embedding a zero row would feed garbage through every
+            // downstream layer with no signal — error instead.
+            if tok >= self.cfg.vocab_size {
+                return Err(Error::Session(format!(
+                    "delta_net: token id {tok} at position {i} is out of vocab (vocab_size = {})",
+                    self.cfg.vocab_size
+                )));
             }
+            hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
+                &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
+            );
         }
 
         let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
-        let mut states = vec![None; self.layers.len()];
+
+        // Audit fix (grim-models): the per-layer delta-rule states used to be
+        // a LOCAL vec — every forward started from zeroed delta-state, so
+        // decode was context-free after the first token (the same bug class
+        // the Mamba session-state fix addressed). The states now live on the
+        // session and advance across calls, mirroring the KV-cache contract.
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(Vec::<Option<Vec<f32>>>::new()));
+        }
+        let states_cell = session
+            .model_state_mut()
+            .ok_or_else(|| Error::Session("delta_net: session model_state vanished".into()))?;
+        let states = states_cell
+            .downcast_mut::<Vec<Option<Vec<f32>>>>()
+            .ok_or_else(|| {
+                Error::Session("delta_net: session model_state holds another model's state".into())
+            })?;
+        if states.len() != self.layers.len() {
+            states.resize_with(self.layers.len(), || None);
+        }
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &mut states[layer_idx])?;
@@ -366,5 +392,193 @@ mod tests {
         let cfg = DeltaNetBaseConfig::default();
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(cfg.chunk_size, 64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Numeric reference + session-state gates (audit follow-up).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod delta_numeric_reference_tests {
+    use super::*;
+    use grim_core::session::Inner;
+    use grim_nn::Linear;
+
+    fn lin(weight: Vec<f32>, out_dim: usize, in_dim: usize) -> Linear {
+        Linear::from_tensor(
+            cpu_tensor(weight, Shape::new(vec![out_dim, in_dim])),
+            None,
+        )
+    }
+
+    /// Deterministic pseudo-random weights (LCG) so the reference test
+    /// exercises non-trivial projections.
+    fn weights(seed: u64, n: usize) -> Vec<f32> {
+        let mut st = seed;
+        (0..n)
+            .map(|_| {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((st >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.3
+            })
+            .collect()
+    }
+
+    fn test_attention() -> DeltaNetAttention {
+        let d = 4usize;
+        DeltaNetAttention {
+            q_proj: lin(weights(1, d * d), d, d),
+            k_proj: lin(weights(2, d * d), d, d),
+            v_proj: lin(weights(3, d * d), d, d),
+            beta_proj: lin(weights(4, d), 1, d),
+            o_proj: lin(weights(5, d * d), d, d),
+            num_heads: 1,
+            head_dim: d,
+        }
+    }
+
+    /// Delta rule vs an independent f64 recomputation:
+    ///   S' = S + β(v − S·k)kᵀ   (β = sigmoid(β_proj·x))
+    ///   o  = q·S'ᵀ
+    /// run over a 2-token sequence WITH carried state (the second token's
+    /// output must see the state the first token wrote).
+    #[test]
+    fn delta_rule_matches_f64_reference() {
+        let attn = test_attention();
+        let d = 4usize;
+        let x_data = vec![0.4f32, -0.2, 0.6, 0.1, 0.9, 0.0, -0.5, 0.3]; // 2 tokens
+        let x = cpu_tensor(x_data.clone(), Shape::new(vec![2, d]));
+        let mut state = None;
+        let got = attn.forward(&x, &mut state).unwrap().to_vec_f32().unwrap();
+        assert!(state.is_some(), "attention must persist the delta state");
+
+        let proj = |w: &[f32], v: &[f64]| -> Vec<f64> {
+            (0..v.len())
+                .map(|o| (0..v.len()).map(|i| w[o * v.len() + i] as f64 * v[i]).sum())
+                .collect()
+        };
+        // f64 per-token projections (weight [out,in] row-major).
+        let mut s = vec![0.0f64; d * d];
+        for t in 0..2 {
+            let xt: Vec<f64> = x_data[t * d..(t + 1) * d].iter().map(|&v| v as f64).collect();
+            let q = proj(&attn.q_proj.weight.to_vec_f32().unwrap(), &xt);
+            let k = proj(&attn.k_proj.weight.to_vec_f32().unwrap(), &xt);
+            let v = proj(&attn.v_proj.weight.to_vec_f32().unwrap(), &xt);
+            let b_logit = attn.beta_proj.weight.to_vec_f32().unwrap();
+            let bl: f64 = (0..d).map(|i| b_logit[i] as f64 * xt[i]).sum();
+            let beta = 1.0 / (1.0 + (-bl).exp());
+            // Sk, delta update, query output.
+            let mut sk = vec![0.0f64; d];
+            for i in 0..d {
+                sk[i] = (0..d).map(|j| s[i * d + j] * k[j]).sum();
+            }
+            let mut o = vec![0.0f64; d];
+            for i in 0..d {
+                for j in 0..d {
+                    s[i * d + j] += beta * (v[i] - sk[i]) * k[j];
+                }
+                o[i] = (0..d).map(|j| q[j] * s[i * d + j]).sum();
+            }
+            let out = proj(&attn.o_proj.weight.to_vec_f32().unwrap(), &o);
+            for (r, g) in out.iter().zip(&got[t * d..(t + 1) * d]) {
+                assert!((r - *g as f64).abs() < 1e-4, "token {t}: reference {r} vs impl {g}");
+            }
+        }
+    }
+
+    fn test_model() -> DeltaNetBase {
+        let cfg = DeltaNetBaseConfig {
+            vocab_size: 32,
+            hidden_size: 4,
+            num_heads: 1,
+            head_dim: 4,
+            num_layers: 2,
+            intermediate_size: 4,
+            chunk_size: 64,
+            rms_norm_eps: 1e-5,
+            max_seq_len: 256,
+        };
+        let unit_norm = RmsNorm {
+            weight: cpu_tensor(vec![1.0; 4], Shape::new(vec![4])),
+            eps: 1e-5,
+        };
+        let layer = |seed: u64| DeltaNetBlock {
+            attn_norm: unit_norm.clone(),
+            attn: DeltaNetAttention {
+                q_proj: lin(weights(seed, 16), 4, 4),
+                k_proj: lin(weights(seed + 1, 16), 4, 4),
+                v_proj: lin(weights(seed + 2, 16), 4, 4),
+                beta_proj: lin(weights(seed + 3, 4), 1, 4),
+                o_proj: lin(weights(seed + 4, 16), 4, 4),
+                num_heads: 1,
+                head_dim: 4,
+            },
+            ffn_norm: unit_norm.clone(),
+            w_gate: lin(weights(seed + 5, 16), 4, 4),
+            w_up: lin(weights(seed + 6, 16), 4, 4),
+            w_down: lin(weights(seed + 7, 16), 4, 4),
+        };
+        DeltaNetBase {
+            cfg,
+            device: Device::Cpu,
+            tok_embeddings: lin(weights(50, 4 * 32), 4, 32),
+            layers: vec![layer(10), layer(20)],
+            norm: unit_norm,
+            output: lin(weights(60, 32 * 4), 32, 4),
+        }
+    }
+
+    fn tok(v: f32) -> Tensor {
+        cpu_tensor(vec![v], Shape::new(vec![1]))
+    }
+
+    /// Audit fix gate (bug #1): the delta-rule states used to be a LOCAL vec,
+    /// making every forward context-free. Through ONE session, sequential
+    /// single-token forwards must produce the same second-token logits as a
+    /// single batched 2-token forward (per-token independence of norm/FFN
+    /// means the only cross-token coupling is the delta state).
+    #[test]
+    fn deltanet_session_state_makes_decode_context_aware() {
+        let model = test_model();
+        let mut sess = Inner::new(Device::Cpu);
+
+        let first = CausalLm::forward(&model, &mut sess, &tok(3.0), &tok(0.0), &[]).unwrap();
+        let second_sequential = CausalLm::forward(&model, &mut sess, &tok(7.0), &tok(0.0), &[])
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        let batched_input = cpu_tensor(vec![3.0, 7.0], Shape::new(vec![2]));
+        let mut fresh_sess = Inner::new(Device::Cpu);
+        let batched = CausalLm::forward(&model, &mut fresh_sess, &batched_input, &tok(0.0), &[])
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let vocab = model.cfg.vocab_size;
+        let batched_last = &batched[vocab..2 * vocab]; // second token's logits
+
+        let max_diff = second_sequential
+            .iter()
+            .zip(batched_last)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "sequential decode must match batched prefill last token (state must persist): max_diff={max_diff}"
+        );
+        // The context-free (pre-fix) behavior would NOT match: the stateful
+        // second call sees token 3's delta state, the batched run sees both.
+        let _ = first;
+    }
+
+    /// Audit fix gate (bug #7): an out-of-vocab token id must be an error,
+    /// never a silently-zeroed embedding row.
+    #[test]
+    fn deltanet_rejects_out_of_vocab_tokens() {
+        let model = test_model();
+        let mut sess = Inner::new(Device::Cpu);
+        let oob = cpu_tensor(vec![32.0], Shape::new(vec![1])); // vocab_size = 32
+        let result = CausalLm::forward(&model, &mut sess, &oob, &tok(0.0), &[]);
+        assert!(result.is_err(), "OOV token must error");
     }
 }

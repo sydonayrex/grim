@@ -130,11 +130,12 @@ impl DylibPluginLoader {
 
     /// Load a dylib plugin with optional SHA-256 integrity verification.
     pub fn load_with_manifest<P: AsRef<Path>>(
-        _path: P,
+        path: P,
         manifest: Option<&PluginManifest>,
     ) -> Result<Self> {
         #[cfg(not(feature = "dylib-loading"))]
         {
+            let _ = path;
             let _ = manifest;
             Err(Error::Unimplemented(
                 "dylib-loading feature is disabled".into(),
@@ -144,10 +145,19 @@ impl DylibPluginLoader {
         unsafe {
             let path = path.as_ref();
 
+            // ABI enforcement: a manifest whose abi_version does not match
+            // this engine is rejected BEFORE the library is touched. Reading
+            // a foreign vtable layout is undefined behavior, so this check
+            // must gate the load, not trail it. (Audit fix: validate_abi
+            // existed but was only ever called from a unit test.)
+            if let Some(m) = manifest {
+                crate::validate_abi(m, crate::ENGINE_ABI_VERSION)?;
+            }
+
             // Integrity verification: if the manifest carries an expected SHA-256,
             // hash the file and compare before loading.
             if let Some(expected_hex) = manifest.and_then(|m| m.sha256.as_deref()) {
-                let file_hash = compute_sha256_file(path)?;
+                let file_hash = Self::compute_sha256_file(path)?;
                 if file_hash != expected_hex {
                     return Err(Error::Backend(format!(
                         "plugin '{}' SHA-256 mismatch: file hash {file_hash}, expected {expected_hex}",
@@ -386,7 +396,8 @@ mod tests {
             DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash");
 
         // Create a manifest with the correct hash - should fail because file isn't a valid .so
-        let _manifest = PluginManifest {
+        #[allow(unused_variables)]
+        let manifest = PluginManifest {
             name: "test-plugin".into(),
             abi_version: 1,
             kind: PluginKind::Dylib,
@@ -409,7 +420,8 @@ mod tests {
         }
 
         // Create a manifest with wrong hash - should fail at hash check
-        let _wrong_manifest = PluginManifest {
+        #[allow(unused_variables)]
+        let wrong_manifest = PluginManifest {
             name: "test-plugin".into(),
             abi_version: 1,
             kind: PluginKind::Dylib,
@@ -426,8 +438,10 @@ mod tests {
         #[cfg(feature = "dylib-loading")]
         {
             let result = DylibPluginLoader::load_with_manifest(&temp_file, Some(&wrong_manifest));
-            assert!(result.is_err());
-            let err_msg = result.unwrap_err().to_string();
+            let err_msg = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("wrong-hash manifest must be rejected"),
+            };
             assert!(
                 err_msg.contains("SHA-256 mismatch"),
                 "error should mention SHA-256 mismatch: {err_msg}"
@@ -435,6 +449,50 @@ mod tests {
         }
 
         // Clean up
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    /// Audit fix gate: a manifest whose abi_version mismatches the engine
+    /// must be rejected by the LOAD PATH itself — before the file is even
+    /// opened (the error names the ABI, not a library-load failure). The
+    /// pre-fix loader only ever ran validate_abi from a unit test.
+    #[test]
+    fn dylib_load_path_enforces_abi_version() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("test_plugin_abi_gate.so");
+        std::fs::write(&temp_file, b"not a real dylib").unwrap();
+
+        let mismatched = PluginManifest {
+            name: "abi-mismatch".into(),
+            abi_version: crate::ENGINE_ABI_VERSION + 1,
+            kind: PluginKind::Dylib,
+            capabilities: PluginCapabilities::SAMPLER,
+            entry: temp_file.to_str().unwrap().to_string(),
+            sha256: None,
+            limits: None,
+            stage: None,
+            priority: None,
+            grants: PluginGrants::default(),
+            reload: PluginReload::default(),
+        };
+
+        #[cfg(feature = "dylib-loading")]
+        {
+            let result = DylibPluginLoader::load_with_manifest(&temp_file, Some(&mismatched));
+            let err_msg = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("ABI-mismatched manifest must be rejected at load"),
+            };
+            assert!(
+                err_msg.contains("ABI version"),
+                "rejection must be the ABI gate, not a library error: {err_msg}"
+            );
+        }
+        #[cfg(not(feature = "dylib-loading"))]
+        {
+            let _ = mismatched;
+        }
+
         let _ = std::fs::remove_file(&temp_file);
     }
 

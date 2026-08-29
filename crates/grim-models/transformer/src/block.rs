@@ -1991,3 +1991,75 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod alibi_reference_tests {
+    use super::alibi_slopes_for;
+
+    /// Reference for the documented scheme:
+    /// - powers of two: slope_i = 2^(-(i+1)·8/n)  (Press et al. §2.1)
+    /// - non-powers: pair the closest-lower power's slopes with every other
+    ///   slope of the closest-HIGHER power — [lower0, higher0, lower1,
+    ///   higher2, …] — and truncate to n heads. (Note: the official ALiBi
+    ///   repo APPENDS the higher set's even-indexed slopes instead of
+    ///   interleaving; either is a valid non-power approximation, and this
+    ///   test pins the convention THIS crate documents.)
+    fn reference_slopes(n: usize) -> Vec<f32> {
+        fn pow2(n: usize) -> Vec<f32> {
+            (1..=n).map(|i| 2.0f32.powf(-8.0 * i as f32 / n as f32)).collect()
+        }
+        if n.count_ones() == 1 {
+            return pow2(n);
+        }
+        let closest = 1usize << (n as f64).log2().floor() as u32;
+        let lower = pow2(closest);
+        let higher = pow2(2 * closest);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if i % 2 == 0 {
+                out.push(lower[i / 2]);
+            } else {
+                out.push(higher[i - 1]); // pair j=(i-1)/2 ↔ higher[2j] = higher[i-1]
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn alibi_slopes_match_press_reference() {
+        // Power-of-two head counts: exact closed form.
+        for n in [1usize, 2, 4, 8, 16] {
+            let got = alibi_slopes_for(n);
+            let want = reference_slopes(n);
+            assert_eq!(got.len(), n);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-6,
+                    "n={n} slope[{i}]: got {g}, want {w}"
+                );
+            }
+        }
+        // n=8 sanity against the paper's worked example: 1/2, 1/4, …, 1/256.
+        let s8 = alibi_slopes_for(8);
+        for (i, s) in s8.iter().enumerate() {
+            assert!((s - 2.0f32.powf(-(i as f32 + 1.0))).abs() < 1e-6);
+        }
+
+        // Non-power-of-two: pinned against the documented interleave.
+        for n in [3usize, 5, 6, 7, 12, 24] {
+            let got = alibi_slopes_for(n);
+            assert_eq!(got.len(), n);
+            for w in &got {
+                assert!(*w > 0.0, "n={n}: slopes are positive (bias = slope·(j−i) < 0)");
+            }
+            let got_ref = reference_slopes(n);
+            for (g, w) in got.iter().zip(&got_ref) {
+                assert!(
+                    (g - w).abs() < 1e-6,
+                    "n={n} interleaved slope: got {g}, want {w}"
+                );
+            }
+        }
+    }
+}

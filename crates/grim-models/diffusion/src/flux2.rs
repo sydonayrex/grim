@@ -571,7 +571,16 @@ impl Model for Flux2Transformer2D {
 
 impl DiffusionModel for Flux2Transformer2D {
     fn denoise_step(&self, latents: &Tensor, timestep: &Tensor, cond: &Tensor) -> Result<Tensor> {
-        let t_val = timestep.to_vec_f32()?.first().copied().unwrap_or(0.0);
+        // A malformed timestep tensor (wrong shape / empty) previously fell
+        // back to t=0.0 SILENTLY — a denoising call at the wrong noise level
+        // produces plausible-looking garbage. Error instead.
+        let t_val = timestep
+            .to_vec_f32()?
+            .first()
+            .copied()
+            .ok_or_else(|| grim_core::error::Error::Shape(
+                "denoise_step: timestep tensor is empty".into(),
+            ))?;
         self.forward(latents, cond, t_val)
     }
 

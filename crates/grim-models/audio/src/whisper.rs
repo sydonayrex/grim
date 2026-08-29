@@ -70,6 +70,18 @@ impl WhisperConfig {
         let as_usize =
             |v: Option<serde_json::Value>| v.and_then(|v| v.as_u64()).map(|v| v as usize);
         let d = Self::default();
+        // Loud-fallback discipline (mirrors the sage_attention precedent):
+        // a partial config silently loading as whisper-tiny-shaped is a
+        // design choice, but the caller must hear about it — a wrong default
+        // shape produces confidently wrong inference.
+        let missing = |keys: &[&str]| keys.iter().all(|k| json.get(*k).is_none());
+        let mut fell_back: Vec<&'static str> = Vec::new();
+        if missing(&["encoder_attention_heads", "n_audio_head", "n_text_head"]) {
+            fell_back.push("num_heads");
+        }
+        if missing(&["encoder_ffn_dim", "d_ff", "n_audio_state"]) {
+            fell_back.push("ffn_dim");
+        }
         let num_heads = as_usize(get(&[
             "encoder_attention_heads",
             "n_audio_head",
@@ -78,6 +90,11 @@ impl WhisperConfig {
         .unwrap_or(d.num_heads);
         let ffn_dim =
             as_usize(get(&["encoder_ffn_dim", "d_ff", "n_audio_state"])).unwrap_or(d.ffn_dim);
+        if !fell_back.is_empty() {
+            eprintln!(
+                "[whisper] config.json missing {fell_back:?} — falling back to whisper-tiny defaults for those fields"
+            );
+        }
         Self {
             vocab_size: as_usize(get(&["vocab_size", "n_vocab"])).unwrap_or(d.vocab_size),
             n_mels: as_usize(get(&["num_mel_bins", "n_mels"])).unwrap_or(d.n_mels),

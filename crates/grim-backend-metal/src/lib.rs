@@ -120,6 +120,7 @@ struct MetalPipelines {
     fused_dequant_gemm_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     reduce_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    qkv_paged_dequant_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -271,6 +272,7 @@ impl MetalContext {
                 fused_dequant_gemm_fp8: get_pipeline("grim_fused_dequant_gemm_fp8")?,
                 matmul_split_k: get_pipeline("grim_matmul_split_k")?,
                 reduce_split_k: get_pipeline("grim_reduce_split_k")?,
+                qkv_paged_dequant_attn: get_pipeline("grim_qkv_attention_paged_dequant")?,
             });
 
             Ok(MetalContext {
