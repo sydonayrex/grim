@@ -3,7 +3,7 @@
 
 use grim_backend_cpu::{CpuDevice, moe_fused_dispatch};
 use grim_tensor::dtype::{ArithType, DType, Storage};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{AttentionOps, CoreTensorOps, FusionOps, Shape};
 
 #[test]
 fn cpu_full_inference_trace_and_graph_replay() {

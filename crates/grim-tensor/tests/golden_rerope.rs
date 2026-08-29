@@ -3,11 +3,10 @@
 //! Verifies that un-rotating a key tensor from position p_old and re-rotating
 //! it to p_new yields numerical identity with computing RoPE directly at p_new.
 
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
-use grim_tensor::RopeConfig;
+use grim_tensor::{AttentionOps, CoreTensorOps, RopeConfig};
 use std::sync::Arc;
 
 fn make_cpu_tensor(data: Vec<f32>, shape: Shape) -> Tensor {

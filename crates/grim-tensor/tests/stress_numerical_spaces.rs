@@ -1,11 +1,10 @@
 //! Comprehensive stress test for numerical pathways across extreme values,
 //! edge cases (subnormals, large position deltas, deep sequences), and FP tolerance bounds.
 
-use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
-use grim_tensor::RopeConfig;
+use grim_tensor::{AttentionOps, CoreTensorOps, RopeConfig};
 use std::sync::Arc;
 
 fn make_cpu_tensor(data: Vec<f32>, shape: Shape) -> Tensor {

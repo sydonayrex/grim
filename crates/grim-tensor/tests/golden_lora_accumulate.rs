@@ -1,5 +1,5 @@
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{Shape, backend::BackendDevice};
+use grim_tensor::{AutogradOps, Shape};
 
 #[test]
 fn test_lora_accumulate_golden_mutation_resistant() {
