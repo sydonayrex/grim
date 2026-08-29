@@ -827,6 +827,92 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+    fn rerope(
+        &self,
+        k: &dyn BackendStorage,
+        old_positions: &[u32],
+        new_positions: &[u32],
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let k_st = a_storage(k)?;
+        let dims = out_shape.dims().to_vec();
+        if dims.len() != 3 || dims[2] != cfg.dim {
+            return Err(Error::Shape(format!(
+                "Re-RoPE expects (B,S,D={}), got {:?}",
+                cfg.dim, dims
+            )));
+        }
+        let (b, s, d) = (dims[0], dims[1], dims[2]);
+        let rotary_dim = cfg.rotary_dim.min(d);
+        let rotary_half = rotary_dim / 2;
+
+        let inv_freq: Vec<f32> = (0..rotary_half)
+            .map(|i| {
+                let freq = 1.0 / cfg.base.powf((2 * i) as f32 / d as f32);
+                if let Some(yarn) = &cfg.yarn {
+                    let wavelength = 2.0 * std::f32::consts::PI / freq;
+                    let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
+                    let high = (yarn.original_max_pos as f32) / yarn.beta_fast;
+                    if wavelength < high {
+                        freq
+                    } else if wavelength > low {
+                        freq / yarn.factor
+                    } else {
+                        let ramp = (yarn.original_max_pos as f32 / wavelength - yarn.beta_slow)
+                            / (yarn.beta_fast - yarn.beta_slow);
+                        (1.0 - ramp) * (freq / yarn.factor) + ramp * freq
+                    }
+                } else {
+                    freq
+                }
+            })
+            .collect();
+
+        let mscale = cfg.yarn.as_ref().map_or(1.0, |y| y.attention_factor);
+        let mut src = k_st.data().to_vec();
+
+        for bi in 0..b {
+            for si in 0..s {
+                let p_old = old_positions.get(si).copied().unwrap_or(si as u32) as f32;
+                let p_new = new_positions.get(si).copied().unwrap_or(si as u32) as f32;
+                let base_index = (bi * s + si) * d;
+                let mut old_cos = vec![0.0f32; rotary_half];
+                let mut old_sin = vec![0.0f32; rotary_half];
+                let mut new_cos = vec![0.0f32; rotary_half];
+                let mut new_sin = vec![0.0f32; rotary_half];
+
+                for i in 0..rotary_half {
+                    let a_old = p_old * inv_freq[i];
+                    old_cos[i] = a_old.cos() * mscale;
+                    old_sin[i] = a_old.sin() * mscale;
+
+                    let a_new = p_new * inv_freq[i];
+                    new_cos[i] = a_new.cos() * mscale;
+                    new_sin[i] = a_new.sin() * mscale;
+                }
+
+                for i in 0..rotary_half {
+                    let k1_rot = src[base_index + 2 * i];
+                    let k2_rot = src[base_index + 2 * i + 1];
+
+                    // 1. Un-rotate using old cos/sin (inverse rotation matrix)
+                    // Since forward is [cos, -sin; sin, cos], inverse is [cos, sin; -sin, cos]
+                    let k1_orig = k1_rot * old_cos[i] + k2_rot * old_sin[i];
+                    let k2_orig = -k1_rot * old_sin[i] + k2_rot * old_cos[i];
+
+                    // 2. Re-rotate using new cos/sin
+                    src[base_index + 2 * i] = k1_orig * new_cos[i] - k2_orig * new_sin[i];
+                    src[base_index + 2 * i + 1] = k1_orig * new_sin[i] + k2_orig * new_cos[i];
+                }
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(src, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,

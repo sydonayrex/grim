@@ -2220,6 +2220,7 @@ dependencies = [
  "grim-tensor",
  "half",
  "lazy_static",
+ "libc",
  "libloading 0.8.9",
  "log",
  "seahash",
@@ -2446,6 +2447,7 @@ dependencies = [
 name = "grim-kvtransport"
 version = "0.1.0"
 dependencies = [
+ "grim-backend-cpu",
  "grim-core",
  "grim-tensor",
  "libc",
@@ -2545,10 +2547,12 @@ dependencies = [
  "grim-backend-rocm",
  "grim-backend-vulkan",
  "grim-format",
+ "grim-kvtransport",
  "grim-quant",
  "grim-tensor",
  "parking_lot",
  "rayon",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

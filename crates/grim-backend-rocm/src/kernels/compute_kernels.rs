@@ -181,6 +181,53 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
 
+// Fused Re-RoPE (Position Retargeting) kernel.
+// Un-rotates Key vectors from old_positions and re-rotates them to new_positions
+// in a single pass via compound Delta-p angle arithmetic:
+//   Delta_p = p_new - p_old
+//   x1'' = x1' * cos(Delta_p * freq) - x2' * sin(Delta_p * freq)
+//   x2'' = x1' * sin(Delta_p * freq) + x2' * cos(Delta_p * freq)
+extern "C" __global__ void grim_rerope(const float* k,
+                                       const unsigned int* old_positions,
+                                       const unsigned int* new_positions,
+                                       float* out,
+                                       int b, int s, int d, int half, float base,
+                                       int interleaved) {
+    int total = b * s * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int bi = idx / (s * half);
+    int rem = idx - bi * (s * half);
+    int si = rem / half;
+    int i = rem - si * half;
+    float p_old = (float)old_positions[si];
+    float p_new = (float)new_positions[si];
+    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+
+    float val_old = p_old * freq;
+    float old_cos = cosf(val_old);
+    float old_sin = sinf(val_old);
+
+    float val_new = p_new * freq;
+    float new_cos = cosf(val_new);
+    float new_sin = sinf(val_new);
+
+    int base_idx = (bi * s + si) * d;
+    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
+
+    float k1_rot = k[a_idx];
+    float k2_rot = k[b_idx];
+
+    // 1. Un-rotate: inverse 2D rotation [cos, sin; -sin, cos]
+    float k1_orig = k1_rot * old_cos + k2_rot * old_sin;
+    float k2_orig = -k1_rot * old_sin + k2_rot * old_cos;
+
+    // 2. Re-rotate: forward 2D rotation [cos, -sin; sin, cos]
+    out[a_idx] = k1_orig * new_cos - k2_orig * new_sin;
+    out[b_idx] = k2_orig * new_cos + k1_orig * new_sin;
+}
+
 // Partial-rotary + YaRN kernel.
 // Handles rotary_dim <= d (partial) and pre-computed YaRN-ramp frequencies.
 //

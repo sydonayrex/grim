@@ -2,6 +2,7 @@
 
 pub mod allocator;
 pub mod budget;
+pub mod hugepage;
 pub mod pinned;
 pub mod pool;
 pub mod storage;

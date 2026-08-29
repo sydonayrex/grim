@@ -756,6 +756,22 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Fused Re-RoPE (Position Retargeting): Un-rotate Key tensor from `old_positions`
+    /// and re-rotate to `new_positions` in a single pass without re-prefill.
+    fn rerope(
+        &self,
+        k: &dyn BackendStorage,
+        old_positions: &[u32],
+        new_positions: &[u32],
+        cfg: &RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (k, old_positions, new_positions, cfg, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "rerope not implemented for this backend".into(),
+        ))
+    }
+
     /// LFM2-style fused QKV projection: MXFP4 GEMM (`x @ W_qkv`) followed by
     /// per-head QK-Norm (separate `gamma_q` / `gamma_k`) + RoPE (YaRN-aware via
     /// `inv_freq` + `mscale`). Optional on backends; returns `Unimplemented` by

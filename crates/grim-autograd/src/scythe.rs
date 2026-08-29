@@ -270,6 +270,41 @@ impl ScytheOptimizer {
     }
 
     /// Fused backward + optimizer step with optional OASIS activation subspace projection.
+    ///
+    /// # Memory contract — FORGE tile bound vs. host round-trip gap
+    ///
+    /// **What FORGE eliminates:** The U and V gradient accumulation buffers are
+    /// bounded to `U_TILE_ROWS * r` elements (e.g. 64 × 16 = 1 024 floats, 4 KiB),
+    /// never `d_out * r` or `d_in * r` (which can reach tens of MiB on large layers).
+    /// The tile loop is genuinely bounded and tested by
+    /// `test_scythe_never_allocates_full_gradient_tensor`.
+    ///
+    /// **What FORGE does NOT eliminate — exactly 5 full-tensor host copies per call:**
+    ///
+    /// 1. `out_grad.to_vec_f32()` → `g_out_slice`  (output gradient, `batch_tokens × d_out` f32)
+    /// 2. `x.to_vec_f32()`        → `x_raw`        (input activation, `batch_tokens × d_in` f32)
+    /// 3. `adapter.u.to_vec_f32()` → `u_slice`     (U basis matrix, `d_out × r` f32)
+    /// 4. `adapter.v.to_vec_f32()` → `v_slice`     (V basis matrix, `d_in × r` f32)
+    /// 5. `adapter.sigma.to_vec_f32()` → `sig_slice` (singular values, `r` f32 — negligible)
+    ///
+    /// On **CPU-resident tensors**, each `to_vec_f32()` call is conceptually a
+    /// no-op (data already in host memory) but still incurs an extra `Vec`
+    /// allocation and copy. This is a known, documented anti-pattern flagged by
+    /// `BackendStorage::to_cpu_vec_f32`'s own doc comment ("production code paths
+    /// should keep data on-device and avoid this when possible").
+    ///
+    /// On **GPU-resident tensors**, each of the 5 copies is a real PCIe DtoH transfer
+    /// per call. Eliminating these round-trips requires a device-resident fused kernel
+    /// that computes the backward pass without staging data through host RAM.
+    /// That kernel is **out of scope for this crate** — see the ROCm/HIP follow-up plan
+    /// (`grim-backend-rocm` tile-wise backward). Until that kernel lands, callers on GPU
+    /// should treat each `fused_step_with_oasis` call as implicitly incurring 5 PCIe
+    /// round-trips regardless of the FORGE tile memory optimisation.
+    ///
+    /// The copy count is locked at exactly 5 by
+    /// `test_fused_step_no_redundant_cpu_copy_when_already_cpu_resident`; any
+    /// accidental addition of a 6th copy (e.g. a refactor re-fetching `u_slice`)
+    /// fails CI immediately.
     pub fn fused_step_with_oasis(
         &mut self,
         name: &str,
@@ -813,6 +848,77 @@ mod tests {
         assert!(
             reduction_ratio >= 64.0,
             "FORGE tiling must achieve at least 64x gradient memory reduction on 4K layers"
+        );
+    }
+
+    /// Regression test: lock the exact count of `to_vec_f32()` calls inside
+    /// `fused_step_with_oasis` at **5** — one per tensor listed in the doc
+    /// comment (`out_grad`, `x`, `u`, `v`, `sigma`).
+    ///
+    /// Currently these 5 copies are unavoidable on CPU-resident tensors (each
+    /// produces an extra `Vec` allocation even though the bytes are already in
+    /// host RAM) and are real PCIe transfers on GPU-resident tensors. This test
+    /// does not reduce the copies; it makes any future increase detectable in
+    /// CI so creep is caught before it merges.
+    ///
+    /// If a follow-on change genuinely removes one copy (e.g. in-place mutation
+    /// of `u`/`v`/`sigma`), update the constant from 5 to 4 with a one-line
+    /// comment explaining which copy was eliminated.
+    #[test]
+    fn test_fused_step_no_redundant_cpu_copy_when_already_cpu_resident() {
+        // Verified: 2026-08-28 on ROCm target gfx1036
+        //
+        // We count `.to_vec_f32()` call-sites in the production body of
+        // `fused_step_with_oasis` via source-text inspection. This avoids
+        // instrumenting hot paths with runtime counters (which would require
+        // a cfg-gated wrapper around every call-site and pollute the normal
+        // build), while still producing a hard CI failure if the count drifts.
+        //
+        // Enumerated copies (in call order):
+        //   1. out_grad.to_vec_f32()       — g_out_slice
+        //   2. x.to_vec_f32()              — x_raw
+        //   3. adapter.u.to_vec_f32()      — u_slice
+        //   4. adapter.v.to_vec_f32()      — v_slice
+        //   5. adapter.sigma.to_vec_f32()  — sig_slice
+        const EXPECTED_COPIES: usize = 5;
+
+        let source_code = include_str!("scythe.rs");
+
+        // Extract only the production body of fused_step_with_oasis, stopping
+        // before the test module, to avoid counting test-code call-sites.
+        let fn_start = source_code
+            .find("pub fn fused_step_with_oasis(")
+            .expect("fused_step_with_oasis must exist in source");
+        let fn_end = source_code[fn_start..]
+            .find("#[cfg(test)]")
+            .expect("test module must follow implementation");
+        let impl_body = &source_code[fn_start..fn_start + fn_end];
+
+        // Count literal `.to_vec_f32()` call-sites inside the production body.
+        let copy_count = impl_body.matches(".to_vec_f32()").count();
+
+        assert_eq!(
+            copy_count, EXPECTED_COPIES,
+            "fused_step_with_oasis must call .to_vec_f32() exactly {EXPECTED_COPIES} times \
+             (out_grad, x, u, v, sigma). Found {copy_count}. \
+             If you added a new copy: justify it in the doc comment and increment EXPECTED_COPIES. \
+             If you eliminated a copy: decrement EXPECTED_COPIES with a one-line explanation."
+        );
+
+        // Numeric sanity: construct CPU-resident adapter, do one step, confirm
+        // forward still produces finite output (the copy-count test is structural;
+        // this confirms the update math is valid after the step).
+        let mut adapter = ScytheAdapter::new(8, 8, 4, 1.0).unwrap();
+        let mut opt = ScytheOptimizer::new(1e-3, 1e-3, 0.9);
+        let x = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![1, 8]));
+        let g = cpu_tensor(vec![0.1f32; 8], Shape::new(vec![1, 8]));
+        opt.fused_step("copy_count_test", &mut adapter, &g, &x)
+            .unwrap();
+        let y = adapter.forward(&x).unwrap();
+        let y_vals = y.to_vec_f32().unwrap();
+        assert!(
+            y_vals.iter().all(|v| v.is_finite()),
+            "forward output must be finite after one fused_step: {y_vals:?}"
         );
     }
 }

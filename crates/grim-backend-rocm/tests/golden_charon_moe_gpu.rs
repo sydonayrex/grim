@@ -693,6 +693,13 @@ fn charon_grouped_fp8_matches_fp32() {
         return;
     };
 
+    let arch = grim_backend_rocm::detect_gpu_arch(0);
+    // FP8 MFMA is supported on RDNA4 / gfx1200+ and CDNA / gfx94x+; gate out gfx10xx/gfx11xx
+    if !arch.starts_with("gfx12") && !arch.starts_with("gfx94") {
+        eprintln!("Architecture {arch} does not have native FP8 MFMA instructions; skipping FP8 KAT");
+        return;
+    }
+
     let routed_scaling_factor = 1.0f32;
     let moe = build_moe_oracle(routed_scaling_factor);
     let x_vec = deterministic_activations();
@@ -1071,6 +1078,13 @@ fn charon_grouped_mxfp4_matches_fp32() {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping MXFP4 KAT");
         return;
     };
+
+    let arch = grim_backend_rocm::detect_gpu_arch(0);
+    // MXFP4 instructions require hardware support on RDNA4 / gfx1200+ and CDNA / gfx94x+
+    if !arch.starts_with("gfx12") && !arch.starts_with("gfx94") {
+        eprintln!("Architecture {arch} does not have native MXFP4 instructions; skipping MXFP4 KAT");
+        return;
+    }
 
     let routed_scaling_factor = 1.0f32;
     let moe = build_moe_oracle(routed_scaling_factor);
