@@ -651,14 +651,15 @@ impl Engine {
         self.kv_receiver.as_ref()
     }
 
-    /// Record an observed peer heartbeat (§5.6): call when traffic proves the
+    /// Record an incoming heartbeat from a peer role indicating that the
     /// peer role is alive (a successful KV transfer to the decode node, an
     /// ingested block from the prefill node, or a server-layer health probe).
     /// `tick()` evaluates these timestamps against
     /// [`EngineConfig::disagg_heartbeat_timeout_ms`].
     pub fn disagg_record_peer_heartbeat(&self, role: grim_disagg::PoolRole, now_ms: u64) {
         if let Some(orch) = &self.disagg_orchestrator {
-            orch.lock().unwrap().record_heartbeat(role, now_ms);
+            let mut guard = orch.lock().unwrap_or_else(|p| p.into_inner());
+            guard.record_heartbeat(role, now_ms);
         }
     }
 
@@ -668,17 +669,17 @@ impl Engine {
         if let Some(orch) = &self.disagg_orchestrator {
             let effective = orch
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .evaluate_failover(now_ms, self.config.disagg_heartbeat_timeout_ms);
-            *self.disagg_effective_role.lock().unwrap() = effective;
+            *self.disagg_effective_role.lock().unwrap_or_else(|p| p.into_inner()) = effective;
         }
-        *self.disagg_effective_role.lock().unwrap()
+        *self.disagg_effective_role.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// The effective role after failover evaluation: `Colocated` means the
     /// remote peer is presumed dead and remote handoff is gated off.
     pub fn disagg_effective_role(&self) -> grim_disagg::PoolRole {
-        *self.disagg_effective_role.lock().unwrap()
+        *self.disagg_effective_role.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Return live snapshot of visible GPU capabilities if profiler is active.

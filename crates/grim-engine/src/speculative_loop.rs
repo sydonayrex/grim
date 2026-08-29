@@ -89,7 +89,8 @@ impl SpeculativeLoop {
             let r = if i < random_uniform.len() {
                 random_uniform[i]
             } else {
-                0.0
+                // Short random buffer cannot verify token; stop and reject
+                break;
             };
 
             if r <= ratio {

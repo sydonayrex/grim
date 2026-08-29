@@ -86,10 +86,15 @@ impl PackedBatch {
     /// sequence per `seqlen_offsets`.
     pub fn block_diagonal_causal_mask(&self) -> Vec<bool> {
         let t = self.concatenated_tokens.len();
-        let mut mask = vec![false; t * t];
         if t == 0 {
-            return mask;
+            return Vec::new();
         }
+        let total_elements = t.checked_mul(t).expect("packed batch mask dimensions overflow usize");
+        // Cap dense boolean mask allocation to 16M elements (16MB) to prevent OOM
+        if total_elements > 16 * 1024 * 1024 {
+            panic!("packed sequence length {} exceeds maximum dense mask capacity (4096 tokens)", t);
+        }
+        let mut mask = vec![false; total_elements];
         let mut seq_of = vec![0usize; t];
         let mut cur = 0usize;
         for (pos, slot) in seq_of.iter_mut().enumerate() {
