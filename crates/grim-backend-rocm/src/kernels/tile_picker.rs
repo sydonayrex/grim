@@ -217,8 +217,7 @@ pub fn fcp_fallback_tile_search(
 
     candidates.sort_by(|a, b| {
         roofline_cost(spec, dims, a)
-            .partial_cmp(&roofline_cost(spec, dims, b))
-            .unwrap()
+            .total_cmp(&roofline_cost(spec, dims, b))
     });
     candidates.truncate(candidates.len().min(16));
     candidates.dedup();
