@@ -16,6 +16,7 @@ impl TierMask {
     pub const HOST: u8 = 1 << 1;
     pub const NVME: u8 = 1 << 2;
     pub const REMOTE: u8 = 1 << 3;
+    pub const NVME_WEIGHT_STREAM: u8 = 1 << 4;
 
     #[inline]
     pub fn new() -> Self {
@@ -33,7 +34,8 @@ impl TierMask {
         match tier {
             CacheTier::Gpu => self.0 |= Self::GPU,
             CacheTier::HostRam => self.0 |= Self::HOST,
-            CacheTier::NvMe | CacheTier::NvMeWeightStream => self.0 |= Self::NVME,
+            CacheTier::NvMe => self.0 |= Self::NVME,
+            CacheTier::NvMeWeightStream => self.0 |= Self::NVME_WEIGHT_STREAM,
         }
     }
 
@@ -42,7 +44,8 @@ impl TierMask {
         match tier {
             CacheTier::Gpu => self.0 &= !Self::GPU,
             CacheTier::HostRam => self.0 &= !Self::HOST,
-            CacheTier::NvMe | CacheTier::NvMeWeightStream => self.0 &= !Self::NVME,
+            CacheTier::NvMe => self.0 &= !Self::NVME,
+            CacheTier::NvMeWeightStream => self.0 &= !Self::NVME_WEIGHT_STREAM,
         }
     }
 
@@ -51,7 +54,8 @@ impl TierMask {
         match tier {
             CacheTier::Gpu => (self.0 & Self::GPU) != 0,
             CacheTier::HostRam => (self.0 & Self::HOST) != 0,
-            CacheTier::NvMe | CacheTier::NvMeWeightStream => (self.0 & Self::NVME) != 0,
+            CacheTier::NvMe => (self.0 & Self::NVME) != 0,
+            CacheTier::NvMeWeightStream => (self.0 & Self::NVME_WEIGHT_STREAM) != 0,
         }
     }
 
@@ -63,6 +67,8 @@ impl TierMask {
             Some(CacheTier::HostRam)
         } else if self.has_tier(CacheTier::NvMe) {
             Some(CacheTier::NvMe)
+        } else if self.has_tier(CacheTier::NvMeWeightStream) {
+            Some(CacheTier::NvMeWeightStream)
         } else {
             None
         }
@@ -122,6 +128,19 @@ impl BitmaskChunkIndex {
         entry.token_count = token_count;
         entry.tier_mask.set_tier(tier);
         self.block_to_hash.insert(block_id, chunk_hash);
+    }
+
+    /// Migrate a chunk from one tier to another atomically.
+    pub fn update_chunk_tier(
+        &mut self,
+        chunk_hash: u64,
+        old_tier: CacheTier,
+        new_tier: CacheTier,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&chunk_hash) {
+            entry.tier_mask.clear_tier(old_tier);
+            entry.tier_mask.set_tier(new_tier);
+        }
     }
 
     /// Remove a specific cache tier from a chunk's mask.

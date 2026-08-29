@@ -157,19 +157,36 @@ impl LocalSpillManager {
     /// Demotes a block from Host RAM to NVMe disk cache, freeing RAM space.
     pub fn demote_to_nvme(&mut self, block_id: BlockId) -> Result<()> {
         if let Some((k, v)) = self.host_ram_cache.remove(&block_id) {
+            let temp_path = self.scratch_dir.join(format!("tmp_kv_block_{}.bin", block_id));
             let file_path = self.scratch_dir.join(format!("kv_block_{}.bin", block_id));
-            let mut file = File::create(&file_path).map_err(|e| Error::KvCache(e.to_string()))?;
 
-            // Write keys and values as raw bytes
-            let k_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
-            let v_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            let write_res = (|| -> Result<()> {
+                let mut file = File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
+                let k_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
+                let v_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
 
-            file.write_all(k_bytes)
-                .map_err(|e| Error::KvCache(e.to_string()))?;
-            file.write_all(v_bytes)
-                .map_err(|e| Error::KvCache(e.to_string()))?;
+                file.write_all(k_bytes)
+                    .map_err(|e| Error::KvCache(e.to_string()))?;
+                file.write_all(v_bytes)
+                    .map_err(|e| Error::KvCache(e.to_string()))?;
+                file.sync_all().map_err(|e| Error::KvCache(e.to_string()))?;
+                Ok(())
+            })();
+
+            if let Err(e) = write_res {
+                let _ = fs::remove_file(&temp_path);
+                // Put back in host cache if write failed
+                self.host_ram_cache.insert(block_id, (k, v));
+                return Err(e);
+            }
+
+            if let Err(e) = fs::rename(&temp_path, &file_path) {
+                let _ = fs::remove_file(&temp_path);
+                self.host_ram_cache.insert(block_id, (k, v));
+                return Err(Error::KvCache(format!("atomic rename failed: {e}")));
+            }
 
             self.nvme_cache.insert(block_id, file_path);
             self.block_tiers.insert(block_id, CacheTier::NvMe);
@@ -189,28 +206,40 @@ impl LocalSpillManager {
             CacheTier::Gpu => Ok(None),
             CacheTier::HostRam => Ok(self.host_ram_cache.get(&block_id).cloned()),
             CacheTier::NvMe => {
-                if let Some(path) = self.nvme_cache.get(&block_id) {
-                    let mut file = File::open(path).map_err(|e| Error::KvCache(e.to_string()))?;
-                    let mut k = vec![0.0f32; self.block_elems];
-                    let mut v = vec![0.0f32; self.block_elems];
+                if let Some(path) = self.nvme_cache.remove(&block_id) {
+                    let read_res = (|| -> Result<(Vec<f32>, Vec<f32>)> {
+                        let mut file = File::open(&path).map_err(|e| Error::KvCache(e.to_string()))?;
+                        let mut k = vec![0.0f32; self.block_elems];
+                        let mut v = vec![0.0f32; self.block_elems];
 
-                    let k_bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(k.as_mut_ptr() as *mut u8, k.len() * 4)
-                    };
-                    let v_bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4)
-                    };
+                        let k_bytes: &mut [u8] = unsafe {
+                            std::slice::from_raw_parts_mut(k.as_mut_ptr() as *mut u8, k.len() * 4)
+                        };
+                        let v_bytes: &mut [u8] = unsafe {
+                            std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4)
+                        };
 
-                    file.read_exact(k_bytes)
-                        .map_err(|e| Error::KvCache(e.to_string()))?;
-                    file.read_exact(v_bytes)
-                        .map_err(|e| Error::KvCache(e.to_string()))?;
+                        file.read_exact(k_bytes)
+                            .map_err(|e| Error::KvCache(e.to_string()))?;
+                        file.read_exact(v_bytes)
+                            .map_err(|e| Error::KvCache(e.to_string()))?;
+                        Ok((k, v))
+                    })();
 
-                    // Bring back to Host RAM (cache promotion)
-                    self.host_ram_cache.insert(block_id, (k.clone(), v.clone()));
-                    self.block_tiers.insert(block_id, CacheTier::HostRam);
-
-                    Ok(Some((k, v)))
+                    match read_res {
+                        Ok((k, v)) => {
+                            // Remove disk spill file on promotion to Host RAM
+                            let _ = fs::remove_file(&path);
+                            self.host_ram_cache.insert(block_id, (k.clone(), v.clone()));
+                            self.block_tiers.insert(block_id, CacheTier::HostRam);
+                            Ok(Some((k, v)))
+                        }
+                        Err(e) => {
+                            // Put back the path if read failed
+                            self.nvme_cache.insert(block_id, path);
+                            Err(e)
+                        }
+                    }
                 } else {
                     Err(Error::KvCache("NVMe block path missing".into()))
                 }
@@ -377,13 +406,19 @@ impl KvBlockHeader {
         if buf.len() < Self::SIZE {
             return None;
         }
+        let magic = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let block_id = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+        let layer_idx = u32::from_le_bytes(buf[16..20].try_into().ok()?);
+        let num_elements = u32::from_le_bytes(buf[20..24].try_into().ok()?);
+        let checksum = u32::from_le_bytes(buf[24..28].try_into().ok()?);
         Some(Self {
-            magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            block_id: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            layer_idx: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            num_elements: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            checksum: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            magic,
+            version,
+            block_id,
+            layer_idx,
+            num_elements,
+            checksum,
         })
     }
 
@@ -395,7 +430,7 @@ impl KvBlockHeader {
 
 /// FNV-1a 32-bit checksum over raw bytes.  A simple non-cryptographic
 /// checksum sufficient to detect truncation or bit-corruption on the wire.
-fn compute_checksum_bytes(bytes: &[u8]) -> u32 {
+pub fn compute_checksum_bytes(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9275; // FNV offset basis
     for &b in bytes {
         hash ^= b as u32;
@@ -404,13 +439,19 @@ fn compute_checksum_bytes(bytes: &[u8]) -> u32 {
     hash
 }
 
-/// FNV-1a 32-bit checksum over the raw bytes of the key and value float slices.
-fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
-    let mut buf = Vec::with_capacity((k.len() + v.len()) * 4);
-    for f in k.iter().chain(v.iter()) {
-        buf.extend_from_slice(&f.to_le_bytes());
+/// FNV-1a 32-bit checksum over the raw bytes of the key and value float slices,
+/// preserving exact bit representations for all IEEE-754 payloads including NaNs.
+pub fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
+    let k_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
+    let v_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+    let mut hash: u32 = 0x811c9275;
+    for &b in k_bytes.iter().chain(v_bytes.iter()) {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x01000193);
     }
-    compute_checksum_bytes(&buf)
+    hash
 }
 
 /// Trait abstracting the operations a network KV receiver needs from a block
@@ -755,14 +796,20 @@ impl PromptChannel {
     }
 }
 
-/// Reinterpret a byte slice as f32 values (little-endian).  Safe parse — no
+/// Reinterpret a byte slice as f32 values (little-endian). Safe parse — no
 /// unsafe pointer casts, avoids alignment UB on Vec<u8> buffers.
 fn parse_f32_slice(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .map(|chunk| {
+            let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            f32::from_le_bytes(arr)
+        })
         .collect()
 }
+
+/// Maximum tokens allowed in a single prompt-token control message (1M tokens).
+pub const MAX_PROMPT_TOKENS: usize = 1_000_000;
 
 /// Spawns a background TCP server that listens for incoming
 /// `NetworkKvClient::send_block_remote` streams and writes them into a shared
@@ -848,7 +895,7 @@ where
                         let layer_idx = header.layer_idx & !FETCH_REQUEST_FLAG;
                         let block_id = header.block_id as usize;
                         let (k_data, v_data) = {
-                            let guard = pool.lock().unwrap();
+                            let guard = pool.lock().unwrap_or_else(|e| e.into_inner());
                             if block_id < guard.num_blocks() && guard.block_is_received(block_id) {
                                 match (
                                     guard.read_layer_keys(block_id, layer_idx),
@@ -890,6 +937,13 @@ where
                     // prompt channel — never into the KV block store.
                     if header.layer_idx & PROMPT_FLAG != 0 {
                         let num_tokens = header.num_elements as usize;
+                        if num_tokens > MAX_PROMPT_TOKENS {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: prompt num_tokens {num_tokens} \
+                                 exceeds safety cap {MAX_PROMPT_TOKENS}"
+                            );
+                            continue;
+                        }
                         let mut payload = vec![0u8; num_tokens.saturating_mul(4)];
                         if stream.read_exact(&mut payload).is_err() {
                             eprintln!(
@@ -909,7 +963,7 @@ where
                         }
                         let tokens: Vec<u32> = payload
                             .chunks_exact(4)
-                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect();
                         prompts.store(header.block_id, tokens);
                         continue;
@@ -957,7 +1011,7 @@ where
                     }
 
                     // Write into the pool.
-                    let mut guard = pool.lock().unwrap();
+                    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
                     if header.block_id < guard.num_blocks() as u64 {
                         let block_id = header.block_id as usize;
                         let elem_per_token = guard.block_elem_per_token();
@@ -1040,11 +1094,22 @@ fn read_layer_weights(
         ))
     })?;
 
-    let offset = layer_id as u64 * layer_bytes as u64;
+    let offset = (layer_id as u64)
+        .checked_mul(layer_bytes as u64)
+        .ok_or_else(|| {
+            Error::KvCache(format!(
+                "offset overflow calculating layer {layer_id} * {layer_bytes}"
+            ))
+        })?;
     let metadata = file
         .metadata()
         .map_err(|e| Error::KvCache(format!("failed to stat NVMe weights: {}", e)))?;
-    if metadata.len() < offset + layer_bytes as u64 {
+    let required_len = offset.checked_add(layer_bytes as u64).ok_or_else(|| {
+        Error::KvCache(format!(
+            "offset + layer_bytes overflow calculating layer {layer_id}"
+        ))
+    })?;
+    if metadata.len() < required_len {
         return Err(Error::KvCache(format!(
             "NVMe weights file {:?} too short for layer {}: have {} bytes, need {} at offset {}",
             weights_path,
@@ -1121,6 +1186,7 @@ impl NvmeWeightStreamer {
     ///   `LAYER_ELEMS = 1024` constant. Pass `1024` to reproduce the old behaviour for
     ///   tests and callers that have not yet migrated to a larger granularity.
     pub fn new(weights_path: PathBuf, lru_capacity_layers: usize, unit_elems: usize) -> Self {
+        assert!(unit_elems > 0, "NvmeWeightStreamer: unit_elems must be greater than 0");
         Self {
             weights_path,
             lru_capacity_layers,
@@ -1289,7 +1355,11 @@ impl EmbeddingSpillManager {
         rows_per_unit: usize,
         hidden_dim: usize,
     ) -> Self {
-        let unit_elems = rows_per_unit * hidden_dim;
+        assert!(rows_per_unit > 0, "EmbeddingSpillManager: rows_per_unit must be > 0");
+        assert!(hidden_dim > 0, "EmbeddingSpillManager: hidden_dim must be > 0");
+        let unit_elems = rows_per_unit
+            .checked_mul(hidden_dim)
+            .expect("EmbeddingSpillManager: unit_elems (rows_per_unit * hidden_dim) overflowed usize");
         Self {
             streamer: NvmeWeightStreamer::new(weights_path, lru_capacity_units, unit_elems),
             rows_per_unit,

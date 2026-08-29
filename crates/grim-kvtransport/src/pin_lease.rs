@@ -72,7 +72,7 @@ impl PinLeaseMonitor {
 
         for (&id, lease) in self.leases.iter_mut() {
             if lease.status == LeaseStatus::Active
-                && now.duration_since(lease.acquired_at) > lease.timeout
+                && now.checked_duration_since(lease.acquired_at).unwrap_or_default() > lease.timeout
             {
                 lease.status = LeaseStatus::TimedOut;
                 expired.push(id);
