@@ -13,3 +13,5 @@ pub const ATTENTION_MSL: &str = include_str!("attention.msl");
 pub const QUANTIZATION_MSL: &str = include_str!("quantization.msl");
 
 pub const OPTIMIZER_MSL: &str = include_str!("optimizer.msl");
+
+pub const SPECULATIVE_MSL: &str = include_str!("speculative.msl");
