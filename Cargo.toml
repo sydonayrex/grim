@@ -3,7 +3,6 @@ resolver = "2"
 exclude = ["third-party/convert_case-0.10.1"]
 members = [
     "crates/grim-tensor",
-    "crates/grim-tensor-graph",
     "crates/grim-backend-cpu",
     "crates/grim-backend-rocm",
     "crates/grim-backend-cuda",
@@ -60,7 +59,6 @@ all = "warn"
 [workspace.dependencies]
 # Internal crates
 grim-tensor        = { path = "crates/grim-tensor" }
-grim-tensor-graph  = { path = "crates/grim-tensor-graph" }
 grim-backend-cpu   = { path = "crates/grim-backend-cpu" }
 grim-backend-rocm  = { path = "crates/grim-backend-rocm" }
 grim-backend-cuda  = { path = "crates/grim-backend-cuda" }

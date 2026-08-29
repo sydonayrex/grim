@@ -48,6 +48,57 @@ impl Shape {
         Shape { dims: d }
     }
 
+    /// Return the standard row-major contiguous strides for this shape.
+    pub fn strides(&self) -> Vec<usize> {
+        let mut s = vec![1; self.dims.len()];
+        for i in (0..self.dims.len().saturating_sub(1)).rev() {
+            s[i] = s[i + 1] * self.dims[i + 1];
+        }
+        s
+    }
+
+    /// Reshape to new dimensions with the same total element count.
+    pub fn reshape(&self, new_dims: impl Into<Vec<usize>>) -> Result<Shape> {
+        let new_shape = Shape::new(new_dims);
+        if new_shape.elem_count() != self.elem_count() {
+            return Err(Error::Shape(format!(
+                "cannot reshape from total elements {} to {}",
+                self.elem_count(),
+                new_shape.elem_count()
+            )));
+        }
+        Ok(new_shape)
+    }
+
+    /// Permute dimensions according to a permutation order.
+    pub fn transpose(&self, permutation: &[usize]) -> Result<Shape> {
+        if permutation.len() != self.rank() {
+            return Err(Error::Shape(format!(
+                "transpose permutation length {} does not match shape rank {}",
+                permutation.len(),
+                self.rank()
+            )));
+        }
+        let mut seen = vec![false; self.rank()];
+        let mut new_dims = Vec::with_capacity(self.rank());
+        for &axis in permutation {
+            if axis >= self.rank() {
+                return Err(Error::IndexOutOfBounds(format!(
+                    "transpose axis {axis} out of bounds for rank {}",
+                    self.rank()
+                )));
+            }
+            if seen[axis] {
+                return Err(Error::Shape(format!(
+                    "duplicate axis {axis} in transpose permutation"
+                )));
+            }
+            seen[axis] = true;
+            new_dims.push(self.dims[axis]);
+        }
+        Ok(Shape::new(new_dims))
+    }
+
     /// Generic "broadcast" check used by elementwise ops — both must agree on
     /// every dim or one must be 1.
     pub fn broadcast_compatible(&self, other: &Shape) -> bool {

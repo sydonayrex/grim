@@ -77,7 +77,9 @@ impl SoftmaxPartial {
 /// returned unchanged (modulo cloning) — the `exp(-inf - new_max)` scale
 /// factors zero out the empty side's contributions.
 pub fn merge_partials(a: &SoftmaxPartial, b: &SoftmaxPartial) -> SoftmaxPartial {
-    debug_assert_eq!(
+    // Not debug_assert: a release-build mismatch would zip-truncate to the
+    // shorter accumulator and silently return a wrong-shaped partial.
+    assert_eq!(
         a.acc.len(),
         b.acc.len(),
         "merge_partials: head_dim mismatch ({} != {})",

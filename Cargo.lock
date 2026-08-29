@@ -2289,7 +2289,6 @@ dependencies = [
  "grim-server",
  "grim-speculative",
  "grim-tensor",
- "grim-tensor-graph",
  "rand",
  "ratatui",
  "rcgen",
@@ -2658,14 +2657,6 @@ dependencies = [
  "grim-compressed-tensors",
  "serde",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "grim-tensor-graph"
-version = "0.1.0"
-dependencies = [
- "grim-format",
- "grim-tensor",
 ]
 
 [[package]]

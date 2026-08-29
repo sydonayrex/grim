@@ -19,7 +19,7 @@ use grim_quant::{
     dequant_q80, evopress_search, rewrite_tensor_data,
 };
 use grim_tensor::provider::TensorProvider;
-use grim_tensor_graph::build_transformer_ir;
+use grim_format::fusion::build_transformer_ir;
 
 const OXIDIZER_VERSION: u32 = 1;
 
