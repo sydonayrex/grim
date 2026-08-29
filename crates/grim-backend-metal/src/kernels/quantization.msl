@@ -1,0 +1,149 @@
+#include <metal_stdlib>
+using namespace metal;
+
+inline float metal_fp16_to_float(ushort h) {
+    uint sign = (h >> 15) & 1;
+    uint exp  = (h >> 10) & 0x1f;
+    uint mant = h & 0x3ff;
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        float res = (float)mant / 1024.0f * 0.00006103515625f;
+        return sign ? -res : res;
+    } else if (exp == 31) {
+        return sign ? -1.0f/0.0f : 1.0f/0.0f;
+    }
+    float res = (1.0f + (float)mant / 1024.0f) * pow(2.0f, (float)exp - 15.0f);
+    return sign ? -res : res;
+}
+
+inline float metal_fp8_e4m3_to_float(uchar val) {
+    int sign = (val >> 7) & 1;
+    int exp = (val >> 3) & 0x0F;
+    int mant = val & 0x07;
+    if (exp == 0xF) {
+        if (mant == 7) return 0.0f / 0.0f; // NaN
+        float v = 448.0f;
+        return sign ? -v : v;
+    }
+    float res;
+    if (exp != 0) {
+        res = (1.0f + (float)mant / 8.0f) * pow(2.0f, (float)exp - 7.0f);
+    } else {
+        res = (float)mant / 512.0f;
+    }
+    return sign ? -res : res;
+}
+
+inline float metal_mxfp4_to_float(uchar code, uchar shared_exp) {
+    int sign = (code >> 3) & 1;
+    int exp = (code >> 1) & 3;
+    int mant = code & 1;
+    float base_val = 0.0f;
+    if (exp == 0) {
+        base_val = (float)mant * 0.5f;
+    } else {
+        base_val = (1.0f + (float)mant * 0.5f) * pow(2.0f, (float)exp - 1.0f);
+    }
+    if (sign) base_val = -base_val;
+    float scale = pow(2.0f, (float)shared_exp - 127.0f);
+    return base_val * scale;
+}
+
+kernel void grim_dequant_fp8(
+    device const uchar* packed [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& elem_count [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(elem_count)) {
+        out[id] = metal_fp8_e4m3_to_float(packed[id]);
+    }
+}
+
+kernel void grim_dequant_mxfp4(
+    device const uchar* codes [[buffer(0)]],
+    device const uchar* exps [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& elem_count [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(elem_count)) {
+        int byte_idx = id / 2;
+        uchar packed = codes[byte_idx];
+        uchar nib = (id % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+        uchar shared_exp = exps[id / 32];
+        out[id] = metal_mxfp4_to_float(nib, shared_exp);
+    }
+}
+
+kernel void grim_dequant_mxfp8(
+    device const uchar* codes [[buffer(0)]],
+    device const uchar* exps [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& elem_count [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(elem_count)) {
+        uchar code = codes[id];
+        uchar shared_exp = exps[id / 32];
+        float base_val = metal_fp8_e4m3_to_float(code);
+        float scale = pow(2.0f, (float)shared_exp - 127.0f);
+        out[id] = base_val * scale;
+    }
+}
+
+kernel void grim_dequant_q4k(
+    device const uchar* packed [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n_blocks [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n_blocks * 256)) {
+        int block_idx = id / 256;
+        int in_sb = id % 256;
+        device const uchar* block_ptr = packed + block_idx * 144;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        float dmin = metal_fp16_to_float(h_ptr[1]);
+
+        device const uchar* scales = block_ptr + 4;
+        device const uchar* qs = block_ptr + 16;
+
+        int is = in_sb / 32;
+        uchar sc, m;
+        if (is < 4) {
+            sc = scales[is] & 63;
+            m  = scales[is + 4] & 63;
+        } else {
+            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+            m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+        }
+
+        int il = in_sb % 32;
+        uchar q;
+        if (il < 16) {
+            q = qs[is * 16 + il] & 0xF;
+        } else {
+            q = qs[is * 16 + il - 16] >> 4;
+        }
+
+        out[id] = d * (float)sc * (float)q - dmin * (float)m;
+    }
+}
+
+kernel void grim_dequant_q8_0(
+    device const uchar* packed [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n_blocks [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n_blocks * 32)) {
+        int block_idx = id / 32;
+        int in_block = id % 32;
+        device const uchar* block_ptr = packed + block_idx * 34;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        char q = (char)block_ptr[2 + in_block];
+        out[id] = d * (float)q;
+    }
+}

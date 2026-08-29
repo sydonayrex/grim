@@ -9,3 +9,5 @@ pub fn load_unified_msl() -> &'static str {
 
 pub const GEMM_MSL: &str = include_str!("gemm.msl");
 pub const ATTENTION_MSL: &str = include_str!("attention.msl");
+
+pub const QUANTIZATION_MSL: &str = include_str!("quantization.msl");
