@@ -53,8 +53,8 @@ impl JsonSchemaConstraint {
 /// than silently ignored.
 ///
 /// Supported subset: `type`, `properties`, `required`, `enum`, `items`,
-/// `$ref` (internal pointers `#/...`), `oneOf`/`anyOf`/`allOf`, nested `object`/`array`.
-/// `format`, `pattern`, `additionalProperties` are rejected if unrecognized.
+/// `pattern`, `additionalProperties`, `$ref` (internal pointers `#/...`), `oneOf`/`anyOf`/`allOf`, nested `object`/`array`.
+/// `format` is rejected if present.
 pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSchemaCompilerError> {
     let obj = schema.as_object().ok_or_else(|| JsonSchemaCompilerError {
         message: "json_schema must be a JSON object".to_string(),
@@ -65,7 +65,7 @@ pub fn compile_json_schema(schema: Value) -> Result<JsonSchemaConstraint, JsonSc
             return Err(JsonSchemaCompilerError {
                 message: format!(
                     "unsupported json_schema keyword '{unsupported}'; supported subset: \
-                     type, properties, required, enum, items, pattern, $ref, oneOf, anyOf, allOf, nested object/array"
+                     type, properties, required, enum, items, pattern, additionalProperties, $ref, oneOf, anyOf, allOf, nested object/array"
                 ),
             });
         }
@@ -631,10 +631,11 @@ fn validate(value: &Value, schema: &Value) -> bool {
             return false;
         }
     }
-    // object: properties + required
+    // object: properties + required + additionalProperties
     if let Some(obj) = value.as_object() {
-        if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-            for (key, sub) in props {
+        let props = schema.get("properties").and_then(|v| v.as_object());
+        if let Some(props_map) = props {
+            for (key, sub) in props_map {
                 if let Some(val) = obj.get(key) {
                     if !validate(val, sub) {
                         return false;
@@ -647,6 +648,25 @@ fn validate(value: &Value, schema: &Value) -> bool {
                 let name = r.as_str().unwrap_or("");
                 if !obj.contains_key(name) {
                     return false;
+                }
+            }
+        }
+        if let Some(additional) = schema.get("additionalProperties") {
+            if let Some(allowed) = additional.as_bool() {
+                if !allowed {
+                    for key in obj.keys() {
+                        if props.map(|p| !p.contains_key(key)).unwrap_or(true) {
+                            return false;
+                        }
+                    }
+                }
+            } else if additional.is_object() {
+                for (key, val) in obj {
+                    if props.map(|p| !p.contains_key(key)).unwrap_or(true) {
+                        if !validate(val, additional) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -803,6 +823,31 @@ mod tests {
             c.lookahead_jump_forward("{"),
             Some("\"user_id\": ".to_string())
         );
+    }
+
+    #[test]
+    fn test_additional_properties_validation() {
+        let schema_false = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "allowed": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+        let c_false = compile_json_schema(schema_false).unwrap();
+        assert!(c_false.is_consistent("{\"allowed\": \"yes\"}"));
+        assert!(!c_false.is_consistent("{\"allowed\": \"yes\", \"extra\": 123}"));
+
+        let schema_typed = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "additionalProperties": { "type": "number" }
+        });
+        let c_typed = compile_json_schema(schema_typed).unwrap();
+        assert!(c_typed.is_consistent("{\"name\": \"test\", \"age\": 30}"));
+        assert!(!c_typed.is_consistent("{\"name\": \"test\", \"city\": \"NY\"}"));
     }
 }
 
