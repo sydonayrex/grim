@@ -15,8 +15,8 @@ fn test_local_spill_manager_retarget_block_positions() {
 
     let mut k_init = vec![0.0f32; block_elems];
     let v_init = vec![1.0f32; block_elems];
-    for i in 0..block_elems {
-        k_init[i] = ((i as f32 + 1.0) * 0.05).sin();
+    for (i, slot) in k_init.iter_mut().enumerate() {
+        *slot = ((i as f32 + 1.0) * 0.05).sin();
     }
 
     let block_id = 42;

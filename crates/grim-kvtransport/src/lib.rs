@@ -162,14 +162,15 @@ impl LocalSpillManager {
 
             let write_res = (|| -> Result<()> {
                 let mut file = File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
-                let k_bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
-                let v_bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
 
-                file.write_all(k_bytes)
-                    .map_err(|e| Error::KvCache(e.to_string()))?;
-                file.write_all(v_bytes)
+                // Explicit little-endian encoding: host-endianness independent,
+                // bit-exact for every IEEE-754 payload including NaNs.
+                let mut bytes = Vec::with_capacity((k.len() + v.len()) * 4);
+                for f in k.iter().chain(v.iter()) {
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+
+                file.write_all(&bytes)
                     .map_err(|e| Error::KvCache(e.to_string()))?;
                 file.sync_all().map_err(|e| Error::KvCache(e.to_string()))?;
                 Ok(())
@@ -209,20 +210,16 @@ impl LocalSpillManager {
                 if let Some(path) = self.nvme_cache.remove(&block_id) {
                     let read_res = (|| -> Result<(Vec<f32>, Vec<f32>)> {
                         let mut file = File::open(&path).map_err(|e| Error::KvCache(e.to_string()))?;
-                        let mut k = vec![0.0f32; self.block_elems];
-                        let mut v = vec![0.0f32; self.block_elems];
+                        let mut bytes = vec![0u8; self.block_elems * 8];
 
-                        let k_bytes: &mut [u8] = unsafe {
-                            std::slice::from_raw_parts_mut(k.as_mut_ptr() as *mut u8, k.len() * 4)
-                        };
-                        let v_bytes: &mut [u8] = unsafe {
-                            std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4)
-                        };
+                        file.read_exact(&mut bytes)
+                            .map_err(|e| Error::KvCache(e.to_string()))?;
 
-                        file.read_exact(k_bytes)
-                            .map_err(|e| Error::KvCache(e.to_string()))?;
-                        file.read_exact(v_bytes)
-                            .map_err(|e| Error::KvCache(e.to_string()))?;
+                        // Decode the explicit little-endian layout written by
+                        // demote_to_nvme (safe parse, no pointer casts).
+                        let split = self.block_elems * 4;
+                        let k = parse_f32_slice(&bytes[..split]);
+                        let v = parse_f32_slice(&bytes[split..]);
                         Ok((k, v))
                     })();
 
@@ -267,6 +264,9 @@ impl LocalSpillManager {
 
     /// Retargets the rotary position embedding of a cached block in Host RAM from
     /// `old_start_pos` to `new_start_pos` using CPU Re-RoPE without re-prefill.
+    // The Re-RoPE retarget configuration is naturally seven flat positional
+    // parameters; a config struct would be ceremony without a second caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn retarget_block_positions(
         &mut self,
         block_id: BlockId,
@@ -439,17 +439,17 @@ pub fn compute_checksum_bytes(bytes: &[u8]) -> u32 {
     hash
 }
 
-/// FNV-1a 32-bit checksum over the raw bytes of the key and value float slices,
-/// preserving exact bit representations for all IEEE-754 payloads including NaNs.
+/// FNV-1a 32-bit checksum over the on-wire little-endian encoding of the key
+/// and value float slices. Encodes via `to_le_bytes` (never a host-endian
+/// pointer reinterpretation) so the checksum always describes the exact bytes
+/// put on the wire, bit-exactly for every IEEE-754 payload including NaNs.
 pub fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
-    let k_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
-    let v_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
     let mut hash: u32 = 0x811c9275;
-    for &b in k_bytes.iter().chain(v_bytes.iter()) {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x01000193);
+    for f in k.iter().chain(v.iter()) {
+        for b in f.to_le_bytes() {
+            hash ^= b as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
     }
     hash
 }
@@ -562,6 +562,13 @@ impl NetworkKvClient {
         if k.is_empty() {
             return Err(Error::KvCache("Cannot send an empty KV block".into()));
         }
+        // The header field is u32 — reject instead of silently truncating.
+        let num_elements = u32::try_from(k.len()).map_err(|_| {
+            Error::KvCache(format!(
+                "block too large for the wire protocol: {} elements exceeds u32::MAX",
+                k.len()
+            ))
+        })?;
         let addr = Self::resolve_addr(target_ip);
         let checksum = compute_checksum(k, v);
         let header = KvBlockHeader {
@@ -569,7 +576,7 @@ impl NetworkKvClient {
             version: KV_PROTOCOL_VERSION,
             block_id: block_id as u64,
             layer_idx,
-            num_elements: k.len() as u32,
+            num_elements,
             checksum,
         };
 
@@ -616,13 +623,19 @@ impl NetworkKvClient {
         // Build a fetch-request header: same format but with a zero checksum
         // and a special request flag in layer_idx (bit 31 set). Mask bit 31
         // out of the caller's layer so a stray high bit can't smuggle a
-        // second flag into the request.
+        // second flag into the request. The element-count field is u32 —
+        // reject an absurd block_elems rather than silently truncating.
+        let req_num_elements = u32::try_from(block_elems).map_err(|_| {
+            Error::KvCache(format!(
+                "block_elems {block_elems} exceeds the wire protocol u32::MAX"
+            ))
+        })?;
         let req_header = KvBlockHeader {
             magic: KV_MAGIC,
             version: KV_PROTOCOL_VERSION,
             block_id: block_id as u64,
             layer_idx: (layer_idx & !FETCH_REQUEST_FLAG) | FETCH_REQUEST_FLAG,
-            num_elements: block_elems as u32,
+            num_elements: req_num_elements,
             checksum: 0,
         };
 
@@ -686,10 +699,14 @@ impl NetworkKvClient {
             .read_exact(&mut payload)
             .map_err(|e| Error::KvCache(format!("TCP fetch read error: {e}")))?;
 
-        // Verify checksum
-        let k_vec = parse_f32_slice(&payload[..header.num_elements as usize * 4]);
-        let v_vec = parse_f32_slice(&payload[header.num_elements as usize * 4..]);
-        let expected = compute_checksum(&k_vec, &v_vec);
+        // Verify the checksum over the RAW received bytes, not a
+        // parse→re-encode round-trip: IEEE-754 NaN payloads are not guaranteed
+        // to survive an f32 bit round-trip, and re-encoding is host-endian
+        // dependent. The sender checksummed the exact bytes transmitted.
+        let expected = compute_checksum_bytes(&payload);
+        let split = header.num_elements as usize * 4;
+        let k_vec = parse_f32_slice(&payload[..split]);
+        let v_vec = parse_f32_slice(&payload[split..]);
         if expected != header.checksum {
             return Err(Error::KvCache(format!(
                 "TCP fetch: checksum mismatch (expected {expected:#x}, got {:#x})",
@@ -717,6 +734,20 @@ impl NetworkKvClient {
                 "send_prompt_tokens: token list cannot be empty".into(),
             ));
         }
+        // Enforce the receiver's prompt cap up-front (the header field is u32
+        // anyway — reject instead of silently truncating).
+        if tokens.len() > MAX_PROMPT_TOKENS {
+            return Err(Error::KvCache(format!(
+                "send_prompt_tokens: {} tokens exceeds MAX_PROMPT_TOKENS ({MAX_PROMPT_TOKENS})",
+                tokens.len()
+            )));
+        }
+        let num_elements = u32::try_from(tokens.len()).map_err(|_| {
+            Error::KvCache(format!(
+                "send_prompt_tokens: {} tokens exceeds u32::MAX",
+                tokens.len()
+            ))
+        })?;
         let addr = Self::resolve_addr(target_ip);
         let mut payload = Vec::with_capacity(tokens.len() * 4);
         for &t in tokens {
@@ -727,7 +758,7 @@ impl NetworkKvClient {
             version: KV_PROTOCOL_VERSION,
             block_id: request_id,
             layer_idx: PROMPT_FLAG,
-            num_elements: tokens.len() as u32,
+            num_elements,
             checksum: compute_checksum_bytes(&payload),
         };
         let mut buf = header.serialize().to_vec();
@@ -995,12 +1026,16 @@ where
                         continue;
                     }
 
-                    // Split payload into key/value float slices and verify checksum.
+                    // Verify the checksum over the RAW received bytes before
+                    // parsing: re-encoding parsed floats back to bytes is not
+                    // guaranteed to reproduce the wire representation for NaN
+                    // payloads (and is host-endian dependent). The sender
+                    // checksummed the exact bytes transmitted.
+                    let computed = compute_checksum_bytes(&payload);
                     let k_bytes = &payload[..num_elems * 4];
                     let v_bytes = &payload[num_elems * 4..];
                     let k_data = parse_f32_slice(k_bytes);
                     let v_data = parse_f32_slice(v_bytes);
-                    let computed = compute_checksum(&k_data, &v_data);
                     if computed != header.checksum {
                         eprintln!(
                             "[grim-kvtransport] KV receiver: checksum mismatch \
@@ -1026,9 +1061,10 @@ where
                         if elem_per_token == 0 {
                             eprintln!(
                                 "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
-                                 cannot size block {}",
+                                 cannot size block {} — rejecting write",
                                 header.block_id
                             );
+                            continue;
                         } else if num_elems % elem_per_token != 0 {
                             eprintln!(
                                 "[grim-kvtransport] KV receiver: num_elements {num_elems} not \
@@ -2077,5 +2113,256 @@ mod tests {
         mgr.lookup(4).unwrap();
         assert_eq!(mgr.get_unit_tier(0), Some(CacheTier::HostRam));
         assert_eq!(mgr.get_unit_tier(1), Some(CacheTier::HostRam));
+    }
+
+    // ── Hardening follow-ups: numeric-pathway coverage the first pass missed ──
+
+    /// Shared in-memory [`KvBlockStore`] stand-in for wire-protocol tests.
+    struct WireTestStore {
+        blocks: std::collections::HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
+        received: std::collections::HashSet<BlockId>,
+        write_count: usize,
+        elem_per_token: usize,
+    }
+
+    impl WireTestStore {
+        fn new(elem_per_token: usize) -> Self {
+            Self {
+                blocks: std::collections::HashMap::new(),
+                received: std::collections::HashSet::new(),
+                write_count: 0,
+                elem_per_token,
+            }
+        }
+    }
+
+    impl KvBlockStore for WireTestStore {
+        fn num_blocks(&self) -> usize {
+            1024
+        }
+        fn block_elem_per_token(&self) -> usize {
+            self.elem_per_token
+        }
+        fn block_size(&self) -> usize {
+            64
+        }
+        fn write_keys(&mut self, id: BlockId, keys: &[f32], _num_tokens: usize) {
+            self.blocks.insert(id, (keys.to_vec(), Vec::new()));
+            self.received.insert(id);
+            self.write_count += 1;
+        }
+        fn write_values(&mut self, id: BlockId, values: &[f32]) {
+            if let Some((_, v)) = self.blocks.get_mut(&id) {
+                *v = values.to_vec();
+            }
+        }
+        fn block_is_received(&self, id: BlockId) -> bool {
+            self.received.contains(&id)
+        }
+        fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
+            self.blocks.get(&id).map(|(k, _)| k.clone())
+        }
+        fn read_values(&self, id: BlockId) -> Option<Vec<f32>> {
+            self.blocks.get(&id).map(|(_, v)| v.clone())
+        }
+    }
+
+    /// A block carrying every awkward IEEE-754 pattern (NaNs with differing
+    /// payloads, -0.0, subnormals, infinity) must round-trip the wire
+    /// bit-exactly. The receiver verifies raw wire bytes, so no parse→re-encode
+    /// step can spuriously fail the checksum or canonicalize NaN payloads.
+    #[test]
+    fn test_wire_roundtrip_nan_and_special_bit_patterns() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
+        let _handle = start_kv_receiver_server(&addr, store.clone()).unwrap();
+
+        let mut k: Vec<f32> = vec![
+            f32::from_bits(0x7fc0_0001), // quiet NaN, nonzero payload
+            f32::from_bits(0x7ff0_0001), // NaN, inf-style payload
+            f32::NAN,
+            -0.0,
+            f32::MIN_POSITIVE * 0.5, // subnormal
+            f32::INFINITY,
+            1.0,
+            0.0,
+        ];
+        k.resize(64, 3.5);
+        let mut v = vec![-2.25f32; 64];
+        v[0] = f32::from_bits(0x7fc0_aabb);
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        client
+            .send_block_remote(901, 0, &k, &v, &addr)
+            .expect("send of NaN-bearing block must succeed");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let guard = store.lock().unwrap();
+        let stored = guard.blocks.get(&901).expect("NaN block must be stored");
+        for (i, (a, b)) in stored.0.iter().zip(k.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "key word {i} must round-trip bit-exactly");
+        }
+        for (i, (a, b)) in stored.1.iter().zip(v.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "value word {i} must round-trip bit-exactly");
+        }
+    }
+
+    /// A genuinely all-zero KV block is valid data: it must be accepted and
+    /// stored, not dropped (the old non-zero content sniff is gone).
+    #[test]
+    fn test_wire_roundtrip_all_zero_block() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
+        let _handle = start_kv_receiver_server(&addr, store.clone()).unwrap();
+
+        let k = vec![0.0f32; 64];
+        let v = vec![0.0f32; 64];
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        client
+            .send_block_remote(902, 0, &k, &v, &addr)
+            .expect("send of all-zero block must succeed");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let guard = store.lock().unwrap();
+        assert!(guard.block_is_received(902), "all-zero block must count as received");
+        let stored = guard.blocks.get(&902).expect("all-zero block must be stored");
+        assert!(stored.0.iter().all(|f| f.to_bits() == 0));
+        assert!(stored.1.iter().all(|f| f.to_bits() == 0));
+    }
+
+    /// FNV-1a over an empty payload is the offset basis — pin the constant so
+    /// an accidental algorithm swap is caught.
+    #[test]
+    fn test_checksum_empty_payload_is_fnv_offset_basis() {
+        assert_eq!(compute_checksum_bytes(&[]), 0x811c_9275);
+        assert_eq!(compute_checksum(&[], &[]), 0x811c_9275);
+    }
+
+    /// A malicious or compromised server answering a fetch with a header
+    /// claiming a huge payload must be refused BEFORE any allocation happens:
+    /// u32::MAX elements and exactly MAX_PAYLOAD_BYTES/8 + 1 both reject.
+    #[test]
+    fn test_fetch_rejects_malicious_oversized_num_elements() {
+        for evil_count in [u32::MAX, (512 * 1024 * 1024 / 8) + 1] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut hdr = [0u8; KvBlockHeader::SIZE];
+                stream.read_exact(&mut hdr).unwrap();
+                let evil = KvBlockHeader {
+                    magic: KV_MAGIC,
+                    version: KV_PROTOCOL_VERSION,
+                    block_id: 9,
+                    layer_idx: 0,
+                    num_elements: evil_count,
+                    checksum: 0,
+                };
+                stream.write_all(&evil.serialize()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+
+            let client = NetworkKvClient::new("127.0.0.1".to_string());
+            let res = client.fetch_block_remote(9, 0, &format!("127.0.0.1:{port}"), 8);
+            let err = res.expect_err("malicious oversized num_elements must be rejected");
+            assert!(
+                err.to_string().contains("cap"),
+                "error should mention the payload cap: {err}"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    /// Prompt-token control messages must flow end-to-end: send → receiver
+    /// stores into the PromptChannel → take consumes exactly once.
+    #[test]
+    fn test_prompt_tokens_roundtrip() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
+        let prompts = PromptChannel::new();
+        let _handle = start_kv_receiver_server_with_prompts(&addr, store, prompts.clone()).unwrap();
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        let tokens = vec![1u32, 2, 3, u32::MAX, 0];
+        client
+            .send_prompt_tokens(77, &tokens, &addr)
+            .expect("prompt send must succeed");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(prompts.contains(77));
+        assert_eq!(prompts.take(77), Some(tokens), "stored prompt tokens must round-trip");
+        assert_eq!(prompts.take(77), None, "take must consume the stored prompt");
+    }
+
+    /// A prompt message whose header claims more tokens than the cap must be
+    /// rejected before the receiver allocates its payload buffer.
+    #[test]
+    fn test_prompt_message_oversized_rejected_before_alloc() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
+        let prompts = PromptChannel::new();
+        let _handle = start_kv_receiver_server_with_prompts(&addr, store, prompts.clone()).unwrap();
+
+        let evil = KvBlockHeader {
+            magic: KV_MAGIC,
+            version: KV_PROTOCOL_VERSION,
+            block_id: 999,
+            layer_idx: PROMPT_FLAG,
+            num_elements: u32::MAX,
+            checksum: 0,
+        };
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        stream.write_all(&evil.serialize()).unwrap();
+        drop(stream);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(
+            prompts.take(999).is_none(),
+            "oversized prompt message must be rejected, not stored"
+        );
+    }
+
+    /// A receiver whose store reports block_elem_per_token() == 0 cannot size
+    /// the incoming write; it must skip the block entirely, never write with a
+    /// bogus token count derived from a division-by-zero fallback.
+    #[test]
+    fn test_receiver_skips_write_when_elem_per_token_zero() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(0)));
+        let _handle = start_kv_receiver_server(&addr, store.clone()).unwrap();
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        let k = vec![1.0f32; 64];
+        let v = vec![2.0f32; 64];
+        client
+            .send_block_remote(903, 0, &k, &v, &addr)
+            .expect("send must succeed");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.write_count, 0, "store must receive no writes");
+        assert!(!guard.blocks.contains_key(&903), "block must not be written");
+    }
+
+    /// `layer_id * layer_bytes` must not wrap: an absurd layer id yields an
+    /// explicit error (offset overflow, or too-short file on narrow usize)
+    /// instead of a wrapped offset that silently passes the length check.
+    #[test]
+    fn test_prefetch_layer_offset_overflow_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tiny.bin");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let streamer = NvmeWeightStreamer::new(path, 2, 8);
+
+        let res = streamer.prefetch_layer_async(usize::MAX);
+        assert!(
+            res.is_err(),
+            "huge layer id must error (offset overflow or too-short file), not wrap around"
+        );
     }
 }
