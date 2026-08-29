@@ -180,6 +180,7 @@ fn check_service_status(report: &mut DoctorReport, service_name: &str) {
             }
         }
         Err(e) => {
+            report.service_is_active = Some(false);
             report
                 .warnings
                 .push(format!("Could not query systemctl is-active: {e}"));

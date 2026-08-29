@@ -104,6 +104,14 @@ pub trait KvCache: Send {
         None
     }
 
+    /// Valid token count stored in physical block `block_id` (handoffs must
+    /// preserve it; deriving from the zero-padded buffer length would mark
+    /// every block fully valid). `None` when the cache does not track
+    /// per-block fill state.
+    fn block_num_tokens(&self, _block_id: usize) -> Option<usize> {
+        None
+    }
+
     /// Write raw key and value slices directly into a physical block for a layer (e.g. for disagg network ingestion).
     fn write_layer_block(
         &mut self,

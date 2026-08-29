@@ -180,6 +180,9 @@ impl Drop for RequestCleanupGuard {
         // Remove per-request sampler params so the map cannot grow with
         // every served request.
         let _ = take_request_sampler_params(self.request_id);
+        if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
+            hist.remove(&self.request_id);
+        }
         LIVE_CLEANUP_GUARDS.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -507,6 +510,14 @@ fn sample_on_device(
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(0);
+    let top_p: f32 = params
+        .top_p
+        .or_else(|| {
+            std::env::var("GRIM_SAMPLE_TOP_P")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(1.0);
     // Per-step reproducible stream: low bits = base seed, high bits = step.
     let base_seed: u64 = params
         .seed
@@ -524,7 +535,7 @@ fn sample_on_device(
         vocab_size,
         temperature,
         top_k,
-        1.0,
+        top_p,
         seed,
         step as u32,
     )
@@ -701,29 +712,24 @@ fn strip_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
 fn split_think_content(text: &str) -> (Option<String>, String) {
     let mut reasoning = String::new();
     let mut clean = String::new();
-    let mut in_think = false;
-    for part in text.split("<think>") {
-        if in_think {
-            // We're inside a think block — find the closing tag.
-            if let Some(pos) = part.find("</think>") {
-                reasoning.push_str(&part[..pos]);
-                reasoning.push('\n');
-                in_think = false;
-                // Continue processing after the closing tag.
-                let remainder = &part[pos + "</think>".len()..];
-                clean.push_str(remainder);
-            } else {
-                // No closing tag — entire remainder is reasoning.
-                reasoning.push_str(part);
-                reasoning.push('\n');
-                break;
-            }
+    let mut cursor = text;
+
+    while let Some(start_pos) = cursor.find("<think>") {
+        clean.push_str(&cursor[..start_pos]);
+        let after_start = &cursor[start_pos + "<think>".len()..];
+        if let Some(end_pos) = after_start.find("</think>") {
+            reasoning.push_str(&after_start[..end_pos]);
+            reasoning.push('\n');
+            cursor = &after_start[end_pos + "</think>".len()..];
         } else {
-            // Outside a think block — this part is clean content, but may
-            // contain the opening tag that triggered the split.
-            clean.push_str(part);
+            reasoning.push_str(after_start);
+            reasoning.push('\n');
+            cursor = "";
+            break;
         }
     }
+    clean.push_str(cursor);
+
     if reasoning.is_empty() {
         (None, text.to_string())
     } else {

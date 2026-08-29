@@ -54,14 +54,21 @@ fn orchestrator_fails_over_after_heartbeat_timeout() {
 }
 
 #[test]
-fn orchestrator_without_heartbeat_never_fails_over() {
-    // A peer that has never been seen is not declared dead by the
-    // orchestrator's conservative contract (no fabricated failover).
-    let engine = decode_engine(1);
+fn orchestrator_without_heartbeat_gets_startup_grace_then_fails_over() {
+    // A peer that has never been seen gets one timeout window of grace
+    // from the FIRST evaluation, then is declared dead. (The old contract
+    // trusted a peer that never heartbeated forever, which meant a decode
+    // node whose pushes were all silently dropped never failed over.)
+    let engine = decode_engine(1_000);
     assert_eq!(
         engine.disagg_evaluate_failover(10_000),
         PoolRole::Decode,
-        "never-seen peer must not flip the role"
+        "first evaluation starts the grace window, not a failover"
+    );
+    assert_eq!(
+        engine.disagg_evaluate_failover(10_000 + 1_001),
+        PoolRole::Colocated,
+        "a never-seen peer must fail over once the grace window lapses"
     );
 }
 
