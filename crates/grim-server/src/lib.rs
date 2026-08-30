@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 pub mod audio;
 /// Tool parsing and structured JSON call extraction.
 /// See `docs/howto/tool-calling.md` for a complete client-side loop walkthrough.
-mod tool_parse;
+pub mod tool_parse;
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 

@@ -6,6 +6,7 @@
 //! GPU and model code runs only on the worker.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -41,6 +42,9 @@ pub mod kill_ring;
 /// Frecency-based file ranking for autocomplete.
 pub mod frecency;
 
+/// Markdown → ratatui rendering.
+pub mod markdown;
+
 /// Speed history ring buffer for sparklines.
 pub mod sparkline;
 
@@ -55,6 +59,9 @@ pub mod layout;
 
 /// Toast notification system.
 pub mod toast;
+
+/// Coding tool definitions and sandboxed execution.
+pub mod tools;
 
 /// 16ms render-throttle scheduler.
 pub mod throttle;
@@ -197,6 +204,14 @@ pub struct App {
     pub frecency: Frecency,
     /// Desktop notification sent on generation complete (dedup flag).
     pub generation_complete_notified: bool,
+    /// Pending tool call awaiting UI approval (call_id, name, arguments).
+    pub pending_tool_call: Option<(String, String, String)>,
+    /// Tool definitions exposed to the model (empty = tools disabled).
+    pub tools: Vec<grim_format::ToolDef>,
+    /// Sandbox root for tool execution.
+    pub sandbox_root: PathBuf,
+    /// Whether the user is being asked to approve a tool call.
+    pub tool_approval_mode: bool,
 }
 
 impl App {
@@ -220,6 +235,10 @@ impl App {
             toast: None,
             frecency: Frecency::new(),
             generation_complete_notified: false,
+            pending_tool_call: None,
+            tools: crate::tui::tools::coding_tools(),
+            sandbox_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            tool_approval_mode: false,
         }
     }
 
@@ -303,6 +322,19 @@ impl App {
                 self.transcript
                     .push_system(format!("model '{name}' failed to load: {error}"));
             }
+            WorkerEvent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                // Show the tool call in the transcript and enter approval mode.
+                self.transcript.push_tool_call(&name, &arguments);
+                self.pending_tool_call = Some((call_id, name.clone(), arguments));
+                self.tool_approval_mode = true;
+                self.show_toast(Toast::info(format!(
+                    "Tool: {name} — press Enter to approve, Esc to deny"
+                )));
+            }
         }
     }
 
@@ -349,6 +381,12 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) {
+        // Tool approval mode takes precedence over normal chat input.
+        if self.tool_approval_mode {
+            self.handle_tool_approval_key(key);
+            return;
+        }
+
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let is_alt = key.modifiers.contains(KeyModifiers::ALT);
         let is_shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -900,6 +938,49 @@ impl App {
             _ => {}
         }
     }
+
+    /// Handle key presses during tool-call approval mode.
+    fn handle_tool_approval_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                // Approve: execute the tool and send the result to the worker.
+                if let Some((call_id, name, arguments)) = self.pending_tool_call.take() {
+                    let call = grim_format::ToolCallMsg {
+                        id: call_id,
+                        name: name.clone(),
+                        arguments,
+                    };
+                    let result = crate::tui::tools::execute_tool(
+                        &call,
+                        &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
+                    );
+                    let output = match result {
+                        Ok(s) => s,
+                        Err(e) => format!("error: {e}"),
+                    };
+                    self.transcript.push_tool_result(output.clone());
+                    let _ = self.cmd_tx.send(WorkerCommand::ToolResult {
+                        call_id: call.id,
+                        output,
+                    });
+                }
+                self.tool_approval_mode = false;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                // Deny: send an error result so the model knows the tool was rejected.
+                if let Some((call_id, _name, _arguments)) = self.pending_tool_call.take() {
+                    let _ = self.cmd_tx.send(WorkerCommand::ToolResult {
+                        call_id,
+                        output: "tool call denied by user".to_string(),
+                    });
+                }
+                self.tool_approval_mode = false;
+                self.transcript
+                    .push_system("tool call denied".to_string());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Helper exporting transcript nodes to a text file or JSONL.
@@ -1010,6 +1091,7 @@ fn import_transcript(
                 thinking,
                 thought_folded: true,
                 turn_stats: stats,
+                ..Default::default()
             });
         }
     }
@@ -1445,6 +1527,51 @@ fn ui(f: &mut Frame, app: &App) {
     ));
 
     // Render toast overlay in the top-right corner.
+    // Render tool-call approval overlay.
+    if let Some((call_id, name, arguments)) = &app.pending_tool_call {
+        let width = 72.min(f.area().width.saturating_sub(4));
+        let height = 12u16;
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let pretty = serde_json::from_str::<serde_json::Value>(arguments)
+            .and_then(|v| serde_json::to_string_pretty(&v))
+            .unwrap_or_else(|_| arguments.clone());
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("⚙ Tool Call: {}", name),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  id: {}", call_id),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Arguments:",
+            Style::default().fg(Color::White),
+        )));
+        for arg_line in pretty.lines().take(5) {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", arg_line),
+                Style::default().fg(Color::LightMagenta),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Enter/y = approve · Esc/n = deny",
+            Style::default().fg(Color::Yellow),
+        )));
+        let modal = Paragraph::new(lines).block(
+            Block::bordered()
+                .title("Tool Approval")
+                .border_style(Style::default().fg(Color::Magenta)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
     if let Some(toast) = &app.toast {
         let toast_width = 40.min(f.area().width.saturating_sub(4));
         let toast_lines = render_toast(toast, toast_width);
@@ -1789,5 +1916,84 @@ mod tests {
         // Starting a new generation resets the flag.
         app.submit_chat("hello");
         assert!(!app.generation_complete_notified);
+    }
+
+    #[test]
+    fn test_tool_call_enters_approval_mode() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Simulate a WorkerEvent::ToolCall.
+        app.handle_event(WorkerEvent::ToolCall {
+            call_id: "call_1".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path": "a.txt", "content": "hello"}"#.into(),
+        });
+
+        assert!(app.tool_approval_mode);
+        assert!(app.pending_tool_call.is_some());
+        assert_eq!(app.pending_tool_call.as_ref().unwrap().1, "write_file");
+        // Transcript should have a ToolCall node.
+        assert!(app
+            .transcript
+            .nodes
+            .iter()
+            .any(|n| n.role == crate::tui::transcript::Role::ToolCall));
+    }
+
+    #[test]
+    fn test_tool_approval_executes_and_sends_result() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Set up a sandbox-friendly directory.
+        let dir = tempfile::tempdir().unwrap();
+        app.sandbox_root = dir.path().to_path_buf();
+
+        // Enter approval mode with a read tool.
+        app.handle_event(WorkerEvent::ToolCall {
+            call_id: "call_2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "test.txt", "content": "approved"}).to_string(),
+        });
+        assert!(app.tool_approval_mode);
+
+        // Approve with Enter.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(!app.tool_approval_mode);
+        assert!(app.pending_tool_call.is_none());
+
+        // Verify a ToolResult was sent to the worker.
+        let result = rx.try_recv();
+        assert!(matches!(
+            result,
+            Ok(WorkerCommand::ToolResult { call_id, .. }) if call_id == "call_2"
+        ));
+    }
+
+    #[test]
+    fn test_tool_denial_sends_error_result() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.handle_event(WorkerEvent::ToolCall {
+            call_id: "call_3".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command": "rm -rf /"}"#.into(),
+        });
+        assert!(app.tool_approval_mode);
+
+        // Deny with Esc.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert!(!app.tool_approval_mode);
+
+        // Verify a ToolResult with denial was sent.
+        let result = rx.try_recv();
+        assert!(matches!(
+            result,
+            Ok(WorkerCommand::ToolResult { call_id, output }) if call_id == "call_3" && output.contains("denied")
+        ));
     }
 }
