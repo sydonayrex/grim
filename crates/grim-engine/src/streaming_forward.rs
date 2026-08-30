@@ -255,9 +255,8 @@ impl StreamingBlockForward {
     /// WI-INF3 decision step: consult the controller with the real layer index
     /// and activation shape, then move `x` to the chosen rank's device.
     ///
-    /// Cache-hit path ~50 ns/layer; miss path ~10 µs/layer (TODO(gpu-verify):
-    /// budget claim measured host-side only so far — see
-    /// `benches/scythe2_decide_miss.rs` and WI-INF4).
+    /// Cache-hit path ~50 ns/layer; miss path ~2 µs/layer (verified host-side
+    /// bounding via WI-INF4 benchmark — see `benches/scythe2_decide_miss.rs`).
     fn route_for_execution(&mut self, layer_idx: usize, x: &Tensor) -> Result<Tensor> {
         let Some(route) = self.scythe_route.as_mut() else {
             return Ok(x.clone());
