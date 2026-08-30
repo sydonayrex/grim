@@ -237,6 +237,8 @@ mod tests {
             vocab_size: 128,
             hidden_size: 64,
             num_layers: 1,
+            ngram_vocab_size: Some(64),
+            ngram_dim: Some(16),
             ..Default::default()
         };
         let base = crate::qwen38_flash_next::Qwen38FlashNext::random(Device::Cpu, cfg);
