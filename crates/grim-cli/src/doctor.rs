@@ -450,9 +450,9 @@ fn check_configuration(_report: &mut DoctorReport) {
 ///   - VRAM fit vs. detected free VRAM (fits / tight / doesn't fit)
 ///   - codec-vs-arch compat (native / fallback / unsupported)
 ///
-/// `TODO(gpu-verify)`: this is a *prediction*, not a guarantee. The real
-/// check is whether the model actually loads and runs; that's out of scope
-/// to automate here.
+/// Note: This is an instant pre-flight prediction based on static headers, not a
+/// runtime execution test. Actual allocation/runtime verification occurs when loading
+/// and executing the model.
 fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
     println!("\n=== Model Pre-Flight (WI-2) ===");
     println!("  Model: {}", path.display());

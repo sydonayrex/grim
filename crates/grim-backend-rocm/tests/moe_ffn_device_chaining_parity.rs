@@ -1,11 +1,11 @@
 //! Integration test: MoeFfn::forward end-to-end device execution vs CPU reference parity
 //! and on-device output chaining verification without redundant host roundtrips.
 //!
-//! Addresses TODO(gpu-verify) items for Charon MoE:
+//! VERIFIED(gpu-verify): Charon MoE verified on live hardware:
 //! 1. MoeFfn::forward GPU vs CPU oracle parity under full batch and multi-expert routing.
 //! 2. Verification that the GPU forward path stays entirely on-device (zero D2H roundtrip).
 //!
-//! Verified on: gfx1036 (RDNA2)
+//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 (RDNA2) — 2026-08-29
 
 use std::panic;
 use std::sync::Arc;
