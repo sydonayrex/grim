@@ -1492,4 +1492,91 @@ extern "C" __global__ void grim_moe_fused_dispatch(
         }
     }
 }
+
+// ---- Speculative Rejection Sampling (GPU-resident) ----------------------
+extern "C" __global__ void grim_speculative_rejection_sample(
+    const float* __restrict__ target_probs,   // [batch_size, num_draft_tokens + 1, vocab_size]
+    const float* __restrict__ draft_probs,    // [batch_size, num_draft_tokens, vocab_size]
+    const int* __restrict__ draft_tokens,     // [batch_size, num_draft_tokens]
+    const float* __restrict__ uniform_rands,  // [batch_size, num_draft_tokens + 1]
+    int* __restrict__ accepted_tokens,        // [batch_size, num_draft_tokens + 1]
+    int* __restrict__ accepted_lens,          // [batch_size]
+    int batch_size,
+    int num_draft_tokens,
+    int vocab_size
+) {
+    const int b = blockIdx.x; // batch index
+    const int tid = threadIdx.x;
+
+    if (b >= batch_size) return;
+
+    if (tid == 0) {
+        int accepted_count = 0;
+        bool rejected = false;
+
+        for (int k = 0; k < num_draft_tokens; ++k) {
+            const int draft_tok = draft_tokens[b * num_draft_tokens + k];
+            if (draft_tok < 0 || draft_tok >= vocab_size) {
+                rejected = true;
+                break;
+            }
+
+            const float p = target_probs[(b * (num_draft_tokens + 1) + k) * vocab_size + draft_tok];
+            const float q = draft_probs[(b * num_draft_tokens + k) * vocab_size + draft_tok];
+            const float r = uniform_rands[b * (num_draft_tokens + 1) + k];
+
+            const float accept_prob = (q > 0.0f) ? fminf(1.0f, p / q) : 1.0f;
+
+            if (r <= accept_prob) {
+                accepted_tokens[b * (num_draft_tokens + 1) + accepted_count] = draft_tok;
+                accepted_count++;
+            } else {
+                rejected = true;
+                float sum_res = 0.0f;
+                for (int v = 0; v < vocab_size; ++v) {
+                    float pv = target_probs[(b * (num_draft_tokens + 1) + k) * vocab_size + v];
+                    float qv = draft_probs[(b * num_draft_tokens + k) * vocab_size + v];
+                    float diff = fmaxf(0.0f, pv - qv);
+                    sum_res += diff;
+                }
+
+                if (sum_res > 1e-8f) {
+                    float target_val = uniform_rands[b * (num_draft_tokens + 1) + k] * sum_res;
+                    float cum_sum = 0.0f;
+                    int chosen = 0;
+                    for (int v = 0; v < vocab_size; ++v) {
+                        float pv = target_probs[(b * (num_draft_tokens + 1) + k) * vocab_size + v];
+                        float qv = draft_probs[(b * num_draft_tokens + k) * vocab_size + v];
+                        float diff = fmaxf(0.0f, pv - qv);
+                        cum_sum += diff;
+                        if (cum_sum >= target_val) {
+                            chosen = v;
+                            break;
+                        }
+                    }
+                    accepted_tokens[b * (num_draft_tokens + 1) + accepted_count] = chosen;
+                    accepted_count++;
+                }
+                break;
+            }
+        }
+
+        if (!rejected) {
+            float r_last = uniform_rands[b * (num_draft_tokens + 1) + num_draft_tokens];
+            float cum = 0.0f;
+            int last_token = 0;
+            for (int v = 0; v < vocab_size; ++v) {
+                cum += target_probs[(b * (num_draft_tokens + 1) + num_draft_tokens) * vocab_size + v];
+                if (cum >= r_last) {
+                    last_token = v;
+                    break;
+                }
+            }
+            accepted_tokens[b * (num_draft_tokens + 1) + accepted_count] = last_token;
+            accepted_count++;
+        }
+
+        accepted_lens[b] = accepted_count;
+    }
+}
 "#;

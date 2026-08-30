@@ -251,6 +251,12 @@ impl LayerPipelinedKvStreamer {
         }
     }
 
+    /// Set the transport wire protocol (TCP, RDMA/RoCE, or UCX Direct).
+    pub fn with_protocol(mut self, protocol: grim_kvtransport::TransportProtocol) -> Self {
+        self.kv_client.protocol = protocol;
+        self
+    }
+
     /// Stream a single layer's KV block slice across the wire. Transient
     /// connection failures retry per the default [`RetryPolicy`];
     /// `num_tokens` is the block's valid token count (carried end-to-end so
@@ -451,6 +457,12 @@ impl DisaggRouter {
     /// instead of synthetic payloads.
     pub fn with_pool(mut self, pool: Arc<Mutex<KvBlockPool>>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Set the transport wire protocol (TCP, RDMA/RoCE, or UCX Direct).
+    pub fn with_protocol(mut self, protocol: grim_kvtransport::TransportProtocol) -> Self {
+        self.kv_client.protocol = protocol;
         self
     }
 

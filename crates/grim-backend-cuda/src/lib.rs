@@ -49,6 +49,8 @@ pub const cudaSuccess: i32 = 0;
 pub const cudaMemcpyHostToDevice: i32 = 1;
 #[allow(non_upper_case_globals)]
 pub const cudaMemcpyDeviceToHost: i32 = 2;
+#[allow(non_upper_case_globals)]
+pub const cudaMemcpyDeviceToDevice: i32 = 3;
 
 pub const CUBLAS_STATUS_SUCCESS: i32 = 0;
 pub const CUBLAS_OP_N: i32 = 0;
@@ -76,6 +78,13 @@ unsafe extern "C" {
     fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(devPtr: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
+    fn cudaMemcpyPeer(
+        dst: *mut c_void,
+        dstDevice: i32,
+        src: *const c_void,
+        srcDevice: i32,
+        count: usize,
+    ) -> i32;
     fn cudaDeviceSynchronize() -> i32;
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaSetDevice(device: i32) -> i32;
@@ -2093,6 +2102,152 @@ impl CudaDevice {
         );
 
         Ok((Box::new(out_storage), compute_handle))
+    }
+
+    /// Launch GPU Speculative Rejection Sampling kernel on CUDA.
+    pub fn launch_speculative_rejection_sample(
+        &self,
+        target_probs_storage: &CudaStorage,
+        draft_probs_storage: &CudaStorage,
+        draft_tokens_storage: &CudaStorage,
+        uniform_rands_storage: &CudaStorage,
+        accepted_tokens_storage: &CudaStorage,
+        accepted_lens_storage: &CudaStorage,
+        batch_size: usize,
+        num_draft_tokens: usize,
+        vocab_size: usize,
+    ) -> Result<()> {
+        let tp_ptr = target_probs_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: target_probs has no device ptr".into()))?;
+        let dp_ptr = draft_probs_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: draft_probs has no device ptr".into()))?;
+        let dt_ptr = draft_tokens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: draft_tokens has no device ptr".into()))?;
+        let ur_ptr = uniform_rands_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: uniform_rands has no device ptr".into()))?;
+        let at_ptr = accepted_tokens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: accepted_tokens has no device ptr".into()))?;
+        let al_ptr = accepted_lens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: accepted_lens has no device ptr".into()))?;
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut kernel: *mut c_void = std::ptr::null_mut();
+        let name = std::ffi::CString::new("grim_speculative_rejection_sample").unwrap();
+        unsafe {
+            let res = cuModuleGetFunction(&mut kernel, module, name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction failed for grim_speculative_rejection_sample: {res}"
+                )));
+            }
+
+            let mut tp = tp_ptr as *mut c_void;
+            let mut dp = dp_ptr as *mut c_void;
+            let mut dt = dt_ptr as *mut c_void;
+            let mut ur = ur_ptr as *mut c_void;
+            let mut at = at_ptr as *mut c_void;
+            let mut al = al_ptr as *mut c_void;
+            let mut bs = batch_size as i32;
+            let mut ndt = num_draft_tokens as i32;
+            let mut vs = vocab_size as i32;
+
+            let mut args: [*mut c_void; 9] = [
+                &mut tp as *mut _ as *mut c_void,
+                &mut dp as *mut _ as *mut c_void,
+                &mut dt as *mut _ as *mut c_void,
+                &mut ur as *mut _ as *mut c_void,
+                &mut at as *mut _ as *mut c_void,
+                &mut al as *mut _ as *mut c_void,
+                &mut bs as *mut _ as *mut c_void,
+                &mut ndt as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+            ];
+
+            let res = cuLaunchKernel(
+                kernel,
+                batch_size as u32, 1, 1,
+                256, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel failed for grim_speculative_rejection_sample: {res}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Cross-device direct copy between CUDA devices using cudaMemcpyPeer or staging fallback.
+    pub fn copy_via_route(
+        &self,
+        src_ordinal: i32,
+        dst_ordinal: i32,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+        bytes: usize,
+    ) -> Result<()> {
+        if src_ordinal == dst_ordinal {
+            unsafe {
+                let res = cudaMemcpy(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice);
+                if res != cudaSuccess {
+                    return Err(Error::Backend(format!(
+                        "copy_via_route D2D failed on device {dst_ordinal}: {res}"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        // Try direct peer memcpy
+        unsafe {
+            let res = cudaMemcpyPeer(
+                dst_ptr,
+                dst_ordinal,
+                src_ptr,
+                src_ordinal,
+                bytes,
+            );
+            if res == cudaSuccess {
+                return Ok(());
+            }
+
+            // Fallback via host staging buffer
+            let mut staging = vec![0u8; bytes];
+            let res_d2h = cudaMemcpy(
+                staging.as_mut_ptr() as *mut c_void,
+                src_ptr,
+                bytes,
+                cudaMemcpyDeviceToHost,
+            );
+            if res_d2h != cudaSuccess {
+                return Err(Error::Backend(format!(
+                    "copy_via_route D2H fallback failed: {res_d2h}"
+                )));
+            }
+            let _ = cudaSetDevice(dst_ordinal);
+            let res_h2d = cudaMemcpy(
+                dst_ptr,
+                staging.as_ptr() as *const c_void,
+                bytes,
+                cudaMemcpyHostToDevice,
+            );
+            if res_h2d != cudaSuccess {
+                return Err(Error::Backend(format!(
+                    "copy_via_route H2D fallback failed: {res_h2d}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Explicit engine-floor tagger for the lm_head / logit-projection GEMM. Forces

@@ -122,6 +122,29 @@ fn transfer_to_device(x: &Tensor, target_device: &Device) -> Result<Tensor> {
         // Same ordinal, distinct device identity: no data movement needed.
         return Ok(x.clone());
     }
+    // Same-backend CUDA move: peer memcpy / staging.
+    #[cfg(feature = "cuda")]
+    if let (Device::Cuda(src_ord), Device::Cuda(dst_ord)) = (x.device(), target_device) {
+        if src_ord != dst_ord {
+            if let Ok(dev) = grim_backend_cuda::CudaDevice::new(*dst_ord) {
+                if let Ok(dst_storage) = dev.alloc_storage(x.shape(), DType::F32) {
+                    if let (Some(src_ptr), Some(dst_ptr)) = (x.storage().device_ptr(), dst_storage.device_ptr()) {
+                        let bytes = x.shape().elem_count() * std::mem::size_of::<f32>();
+                        if dev.copy_via_route(*src_ord as i32, *dst_ord as i32, src_ptr as *const c_void, dst_ptr as *mut c_void, bytes).is_ok() {
+                            return Ok(Tensor::new(
+                                Arc::from(dst_storage),
+                                x.shape().clone(),
+                                DType::F32,
+                                x.provenance().clone(),
+                                target_device.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(x.clone());
+    }
     // Cross-backend: host-staged upload onto the target device.
     let dev = pick_device_for_storage_device(target_device);
     let out_storage = dev.from_cpu(&x.to_vec_f32()?, x.shape(), DType::F32)?;

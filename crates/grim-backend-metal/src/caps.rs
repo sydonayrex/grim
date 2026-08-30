@@ -46,8 +46,7 @@ impl MetalCaps {
         let mut cached = CACHED_FINGERPRINT.lock().unwrap();
         let changed = cached.as_ref() != Some(&fp);
         let epoch = if changed {
-            CAP_EPOCH.fetch_add(1, Ordering::SeqCst);
-            let e = CAP_EPOCH.load(Ordering::SeqCst);
+            let e = CAP_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
             *cached = Some(fp);
             e
         } else {

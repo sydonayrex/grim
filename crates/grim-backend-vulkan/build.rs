@@ -41,6 +41,8 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("reduce_max", load_kernel("reduce_max")),
         ("argmax", load_kernel("argmax")),
         ("transpose_2d", load_kernel("transpose_2d")),
+        ("broadcast_bias", load_kernel("broadcast_bias")),
+        ("scale_bias_epilogue", load_kernel("scale_bias_epilogue")),
         ("sqrt", load_kernel("sqrt")),
         ("recip", load_kernel("recip")),
         ("rope", load_kernel("rope")),
@@ -185,6 +187,16 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/qkv_attention.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention_swa.comp");
     println!("cargo:rerun-if-changed=kernels/mul_scalar.comp");
+    println!("cargo:rerun-if-changed=kernels/sub.comp");
+    println!("cargo:rerun-if-changed=kernels/add_scalar.comp");
+    println!("cargo:rerun-if-changed=kernels/sub_scalar.comp");
+    println!("cargo:rerun-if-changed=kernels/div_scalar.comp");
+    println!("cargo:rerun-if-changed=kernels/reduce_sum.comp");
+    println!("cargo:rerun-if-changed=kernels/reduce_max.comp");
+    println!("cargo:rerun-if-changed=kernels/argmax.comp");
+    println!("cargo:rerun-if-changed=kernels/transpose_2d.comp");
+    println!("cargo:rerun-if-changed=kernels/broadcast_bias.comp");
+    println!("cargo:rerun-if-changed=kernels/scale_bias_epilogue.comp");
     println!("cargo:rerun-if-changed=kernels/sub.comp");
     println!("cargo:rerun-if-changed=kernels/add_scalar.comp");
     println!("cargo:rerun-if-changed=kernels/sub_scalar.comp");
