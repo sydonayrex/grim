@@ -1,4 +1,4 @@
-//! Host memory bank management with lazy mmap and pin-after-fill direct I/O (FreeToken).
+//! Host memory bank management with lazy mmap and pin-after-fill direct I/O.
 //!
 //! Allocates lazy virtual memory allocations (`MAP_ANONYMOUS | MAP_PRIVATE`)
 //! without immediate page commit, streams weights directly from disk into the

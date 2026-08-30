@@ -1,4 +1,4 @@
-//! Bandwidth-adaptive CPU-GPU hybrid MoE execution ($q^\star$ from FreeToken).
+//! Bandwidth-adaptive CPU-GPU hybrid MoE execution ($q^\star$).
 //!
 //! When active MoE experts exceed device VRAM, work is partitioned by the
 //! bandwidth ratio $q^\star = \text{BW}_{\text{pcie}} / \text{BW}_{\text{cpu\_ram}}$.

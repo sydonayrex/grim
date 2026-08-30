@@ -1,77 +1,150 @@
 # grim-memory
 
 ## Purpose
-The `grim-memory` crate handles the lifecycle, allocation, and multi-tier spilling of Key-Value (KV) cache memory. It implements the `KvCache` trait from `grim-core`, providing a `PagedKvCache` that supports logical block tables, prefix sharing, and integration with `grim-kvtransport` for demoting unused blocks to Host RAM or NVMe storage.
+
+`grim-memory` manages the lifecycle, allocation, prefix tree caching, MoE expert double-buffering, and multi-tier spilling of Key-Value (KV) cache memory. It implements logical-to-physical block tables, prompt prefix sharing, and radix matching for dynamic prefix reuse across sequence requests.
 
 ## Boundaries
-This crate concerns itself solely with *memory management* of the KV state. It tracks logical-to-physical block mappings, refcounts, and offload orchestration. It does *not* perform attention computation, tensor algebra, or network layer RPCs (though it invokes transport interfaces for spilling). 
+
+`grim-memory` does **not**:
+- Execute tensor attention matrix multiplication or compute kernels (delegated to backend crates).
+- Perform physical network I/O or inter-node migrations (delegated to `grim-kvtransport` and `grim-disagg`).
+- Implement continuous sequence batching scheduling algorithms (delegated to `grim-scheduler`).
 
 ## Dependency Graph
+
 ```mermaid
-graph TD
-    %% Focal Node
-    grim-memory(("grim-memory"))
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#2b2d42', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#edf2f4'}}}%%
+flowchart TD
+    subgraph Sibling Dependents
+        grim_engine["grim-engine"]
+        grim_server["grim-server"]
+        grim_cli["grim-cli"]
+    end
 
-    %% Workspace Dependencies
-    grim-memory --> grim-tensor
-    grim-memory --> grim-core
-    grim-memory --> grim-kvtransport
-    grim-memory --> grim-kvquant
-    grim-memory --> grim-backend-cpu
-    grim-memory --> thiserror
+    subgraph Focal Node
+        grim_memory["grim-memory"]
+    end
 
-    %% Reverse Workspace Dependents
-    grim-engine --> grim-memory
+    subgraph Workspace Dependencies
+        grim_tensor["grim-tensor"]
+        grim_core["grim-core"]
+        grim_kvtransport["grim-kvtransport"]
+        grim_kvquant["grim-kvquant"]
+        grim_backend_cpu["grim-backend-cpu"]
+    end
+
+    subgraph External Dependencies
+        thiserror["thiserror"]
+        parking_lot["parking_lot"]
+    end
+
+    grim_engine --> grim_memory
+    grim_server --> grim_memory
+    grim_cli --> grim_memory
+
+    grim_memory --> grim_tensor
+    grim_memory --> grim_core
+    grim_memory --> grim_kvtransport
+    grim_memory --> grim_kvquant
+    grim_memory --> grim_backend_cpu
+    grim_memory --> thiserror
+    grim_memory --> parking_lot
+
+    classDef focal fill:#d90429,stroke:#ef233c,stroke-width:2px,color:#ffffff;
+    classDef workspace fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#edf2f4;
+    classDef sibling fill:#4a4e69,stroke:#9a8c98,stroke-width:1px,color:#f2e9e4;
+    classDef external fill:#1f2421,stroke:#495867,stroke-width:1px,color:#f0f3f4;
+
+    class grim_memory focal;
+    class grim_tensor,grim_core,grim_kvtransport,grim_kvquant,grim_backend_cpu workspace;
+    class grim_engine,grim_server,grim_cli sibling;
+    class thiserror,parking_lot external;
 ```
 
 ## Public API Overview
-- **`PagedKvCache`**: The primary implementation of `grim_core::kv_cache::KvCache`, managing tentative (speculative) and committed tokens.
-- **`KvBlockPool`**: A pre-allocated shared pool of physical blocks. Handles refcounting, prefix cache hashes, block allocation, and SSM state pools.
-- **`BlockTable`**: Maps a sequence's logical blocks to the physical block IDs in the pool.
-- **Tier Spilling Hooks**: `attach_spill` and `attach_compressor` on the `KvBlockPool` to wire in compression and NVMe/RAM demotion.
-- **`moe_budget::*`**: Budget tracking for MoE resident-set HBM constraints (`MoeResidentBudget`).
+
+Exposed from `src/lib.rs`:
+
+```rust
+/// Primary implementation of the KvCache trait managing physical block tables.
+pub struct PagedKvCache {
+    // ...
+}
+
+/// Pre-allocated shared pool of physical blocks with refcounting and prefix hashing.
+pub struct KvBlockPool {
+    // ...
+}
+
+/// Dynamic prefix matching and blending result for partial cache reuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixMatchResult {
+    pub matched_tokens: usize,
+    pub block_ids: Vec<u64>,
+    pub requires_blending: bool,
+    pub divergence_token: usize,
+}
+
+/// Match prompt tokens against radix prefix cache with support for partial block blending.
+pub fn match_prefix_blending(
+    prompt_tokens: &[u32],
+    cached_blocks: &[(u64, Vec<u32>)],
+    block_size: usize,
+) -> PrefixMatchResult;
+
+/// Double-buffered MoE offload cache overlapping host-to-device transfers with compute.
+pub struct OffloadMoeCache {
+    // ...
+}
+
+impl OffloadMoeCache {
+    pub fn new(capacity_slots: usize) -> Self;
+    pub fn swap_buffers(&mut self);
+    pub fn stage_expert(&mut self, expert_id: usize) -> Option<usize>;
+    pub fn active_expert_slot(&self, expert_id: usize) -> Option<usize>;
+}
+```
 
 ## Usage Example
-```rust
-use grim_memory::{KvBlockPool, PagedKvCache};
-use grim_core::kv_cache::KvCache;
-use std::sync::{Arc, Mutex};
 
-fn setup_cache() {
-    let num_heads = 32;
-    let head_dim = 128;
-    let capacity_blocks = 1024;
-    
-    // Create physical pool
-    let pool = Arc::new(Mutex::new(KvBlockPool::new(
-        capacity_blocks,
-        num_heads,
-        head_dim
-    )));
-    
-    // Create a logical sequence cache
-    let mut seq_cache = PagedKvCache::new(pool.clone(), num_heads, head_dim);
-    
-    // Append a slot and commit tokens
-    seq_cache.append_slot().unwrap();
-    seq_cache.commit(1).unwrap();
-    
-    println!("Sequence length: {}", seq_cache.len());
+```rust
+use grim_memory::{match_prefix_blending, OffloadMoeCache};
+
+fn main() {
+    let block_size = 16;
+    let block0_tokens = (0..16).collect::<Vec<u32>>();
+    let cached_blocks = vec![(100u64, block0_tokens)];
+
+    // Prompt matches first 12 tokens, then diverges
+    let mut prompt = (0..12).collect::<Vec<u32>>();
+    prompt.extend_from_slice(&[999, 998, 997, 996]);
+
+    let res = match_prefix_blending(&prompt, &cached_blocks, block_size);
+    assert_eq!(res.matched_tokens, 12);
+    assert!(res.requires_blending);
+    assert_eq!(res.divergence_token, 12);
+
+    // Double-buffered MoE cache timeline overlap
+    let mut moe_cache = OffloadMoeCache::new(4);
+    let stage_slot = moe_cache.stage_expert(42).unwrap();
+    moe_cache.swap_buffers();
+    assert_eq!(moe_cache.active_expert_slot(42), Some(stage_slot));
 }
 ```
 
 ## Use Cases
-- Allocating continuous token context during LLM text generation.
-- Speculative decoding workflows where tokens are tentatively appended and then rolled back (`rollback_to`) if speculation fails.
-- Reusing context windows across requests via prefix caching (sharing physical blocks for matching prompt hashes).
-- Evicting old KV blocks to NVMe when GPU HBM fills up during heavy server load.
+
+- Managing continuous PagedAttention token blocks during LLM prefill and autoregressive decode.
+- Reusing KV cache blocks across prompt variations using radix prefix caching with partial block blending.
+- Double-buffered ping-pong buffer management for offloading massive MoE expert banks over PCIe without execution stalls.
 
 ## Edge Cases, Limitations, and Quirks
-- **Block Granularity Truncation**: When rolling back or truncating block tables, the `truncate` logic operates strictly on *block counts*, not token counts. Tentative/speculative tokens must be managed carefully so partial blocks are aligned correctly.
-- **Zero Content Optimization**: Blocks in the pool track a `received` boolean. An all-zero block might genuinely be received data rather than an uninitialized state, bypassing fragile content-sniffing heuristics.
+
+1. **Prefix Blending Threshold**: `match_prefix_blending` flags `requires_blending = true` only when divergence occurs mid-block; exact whole-block matches return `requires_blending = false`.
+2. **Block Table Truncation**: Rolling back speculative tokens truncates logical block allocations on block boundaries while maintaining reference counts on shared prefix nodes.
 
 ## Build Flags, Feature Flags, and Environment Variables
-- **Features**: 
-  - `default = []`
-  - `rocm-aiter`: Alters internal configuration to use a block-major layout, optimizing LDS accesses on ROCm hardware.
-- **Dev-Dependencies**: Uses `tempfile` for testing NVMe spill behaviors.
+
+- `default`: No special features.
+- `rocm-aiter`: Enables block-major memory layout optimizations for AMD ROCm LDS access patterns.

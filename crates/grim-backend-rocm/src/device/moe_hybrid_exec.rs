@@ -1,4 +1,4 @@
-//! FreeToken ROCm/HIP hybrid MoE decode executor with bandwidth-adaptive CPU-GPU co-execution.
+//! ROCm/HIP hybrid MoE decode executor with bandwidth-adaptive CPU-GPU co-execution.
 //!
 //! When serving frontier MoE models (DeepSeek-V4, Qwen3.6-MoE, GLM-5.2) on consumer/workstation
 //! AMD GPUs, the full expert pool exceeds VRAM. This module coordinates concurrent execution

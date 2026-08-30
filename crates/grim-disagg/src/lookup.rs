@@ -1,4 +1,4 @@
-//! Distributed lookup client with Bloom filter pre-filtering (LMCache).
+//! Distributed lookup client with Bloom filter pre-filtering.
 //!
 //! Queries local bloom filter summaries of remote peer KV cache tables before
 //! issuing network requests, avoiding expensive TCP round-trips for prefix misses.

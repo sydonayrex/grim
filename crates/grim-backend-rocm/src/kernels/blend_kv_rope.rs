@@ -1,4 +1,4 @@
-//! Fused RoPE + Scatter KV Cache Blending Kernel (LMCache).
+//! Fused RoPE + Scatter KV Cache Blending Kernel.
 //!
 //! Reuses partially-matched prefix block contents (tokens `0..divergence_token`),
 //! computes rotary positional embeddings (RoPE) only for the divergent token tail
