@@ -71,6 +71,7 @@ fn make_config(
         kv_compressor: None,
         tp_size: 0,
         tp_gpus: vec![],
+        pp_size: 0,
         max_tool_calls_per_conversation: 20,
         max_messages_per_request: 200,
         disagg_router,
