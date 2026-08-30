@@ -659,15 +659,36 @@ pub trait KvBlockStore: Send + Sync {
     }
 }
 
-/// Network transport layer for network-based (RDMA/TCP) KV handoffs.
+/// Transport wire protocol used for cross-node KV cache exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportProtocol {
+    /// Standard TCP socket streaming with per-block ACK (default).
+    #[default]
+    Tcp,
+    /// Direct InfiniBand / RoCE RDMA transport (zero-copy memory registration).
+    RdmaRoce,
+    /// Unified Communication X (UCX) accelerated transport.
+    UcxDirect,
+}
+
+/// Network transport layer for network-based (RDMA/TCP/UCX) KV handoffs.
 pub struct NetworkKvClient {
     pub local_ip: String,
+    pub protocol: TransportProtocol,
 }
 
 impl NetworkKvClient {
     /// Creates a new network KV transport client bound to the specified local IP interface address.
     pub fn new(local_ip: String) -> Self {
-        Self { local_ip }
+        Self {
+            local_ip,
+            protocol: TransportProtocol::Tcp,
+        }
+    }
+
+    /// Creates a new network KV transport client with an explicit transport protocol.
+    pub fn with_protocol(local_ip: String, protocol: TransportProtocol) -> Self {
+        Self { local_ip, protocol }
     }
 
     /// Resolve a target specifier into a `host:port` string.

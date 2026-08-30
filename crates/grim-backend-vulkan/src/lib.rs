@@ -769,6 +769,7 @@ impl Drop for VulkanContext {
 
 lazy_static::lazy_static! {
     static ref GLOBAL_CONTEXT: Mutex<Option<VulkanContext>> = Mutex::new(VulkanContext::init().ok());
+    static ref QUEUE_LOCK: Mutex<()> = Mutex::new(());
 }
 
 /// Guards against re-attempting Vulkan init on every consumer call after a
@@ -1306,6 +1307,7 @@ fn copy_device_buffer_to_host(
             signal_semaphore_count: 0,
             p_signal_semaphores: std::ptr::null(),
         };
+        let _q_lock = QUEUE_LOCK.lock().unwrap();
         let res = vkQueueSubmit(queue, 1, &submit_info, 0);
         if res != VK_SUCCESS {
             return Err(Error::Backend(format!(
@@ -1906,6 +1908,7 @@ fn run_compute_shader(
             signal_semaphore_count: 0,
             p_signal_semaphores: std::ptr::null(),
         };
+        let _q_lock = QUEUE_LOCK.lock().unwrap();
         let res = vkQueueSubmit(ctx.queue, 1, &submit_info, 0);
         if res != VK_SUCCESS {
             return Err(Error::Backend(format!("vkQueueSubmit failed: {res}")));
@@ -2405,6 +2408,54 @@ impl CoreTensorOps for VulkanDevice {
         self.matmul(a, b, out)
     }
 
+    /// B5: device-side 2-D transpose — `[rows, cols] -> [cols, rows]` via the
+    /// `grim_transpose_2d` compute shader. Eliminates the host round-trip the
+    /// `lora_accumulate` default previously needed to transpose its A/B
+    /// operands on every forward call.
+    fn transpose_2d(
+        &self,
+        x: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan transpose_2d x is not VulkanStorage".into()))?;
+        if x.shape().elem_count() != rows.checked_mul(cols).ok_or_else(|| {
+            Error::Shape("Vulkan transpose_2d: rows*cols overflow".into())
+        })? {
+            return Err(Error::Shape(format!(
+                "Vulkan transpose_2d: storage holds {} elements, expected {rows}×{cols}",
+                x.shape().elem_count()
+            )));
+        }
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Transpose2d).to_vec();
+        let buffers = [x_s.buffer, out_storage.buffer];
+        let n = rows * cols;
+        let grid_x = n.div_ceil(256) as u32;
+
+        let push = push_params(rows as u32, cols as u32, 0, 0, 0, 0.0);
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
 
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = global_context();
@@ -2847,6 +2898,7 @@ impl VulkanDevice {
 
         let push = push_params(n as u32, 0, 0, 0, 0, scalar);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+        drop(ctx_guard);
 
         Ok((
             Box::new(out_storage),
@@ -2934,6 +2986,7 @@ impl ElementwiseOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
+
 
 
     fn sqrt(
@@ -3923,6 +3976,85 @@ impl AttentionOps for VulkanDevice {
 
 impl FusionOps for VulkanDevice {
 
+    /// Tier B: real device path — silu(gate)*up on device, then quantize on
+    /// device via the existing `quantize_on_device` helper. No host
+    /// round-trip (the trait default decomposes into silu_mul + a host
+    /// quantize).
+    fn silu_mul_quantize(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        format: grim_tensor::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let (y_unquant, handle) = self.silu_mul(gate, up, out_shape)?;
+        handle.synchronize()?;
+        let (q_bytes, q_handle) = self.quantize_on_device(y_unquant.as_ref(), format)?;
+        q_handle.synchronize()?;
+        let scale_storage = self.zeros(&Shape::from_slice(&[1]), grim_tensor::DType::F32)?;
+        Ok((q_bytes, scale_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    /// Tier B: broadcast a 1-D bias `[out_dim]` into `[batch, out_dim]`.
+    fn broadcast_bias(
+        &self,
+        bias: &dyn BackendStorage,
+        _batch: usize,
+        out_dim: usize,
+        
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let b_s = bias.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan broadcast_bias: bias is not VulkanStorage".into()))?;
+        let ctx_guard=global_context(); let ctx=ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage=VulkanStorage::alloc_device_local_gpu(out_shape,DType::F32,ctx.device,ctx.physical_device)?;
+        let spirv_source:Vec<u8>=spirv_for(VulkanKernel::BroadcastBias).to_vec();
+        let buffers=[b_s.buffer,out_storage.buffer];
+        let n=out_shape.elem_count();
+        let grid_x=n.div_ceil(256) as u32;
+        let push=push_params(n as u32, 0, 0, out_dim as u32, 0, 0.0);
+        run_compute_shader(ctx,&spirv_source,&buffers,grid_x,1,1,Some(&push))?;
+        drop(ctx_guard);
+        Ok((Box::new(out_storage),Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    /// Tier B: in-place scale+bias epilogue on a `[batch, out_dim]` GEMM output.
+    /// Absent a_scale/b_scale are unity-padded; absent bias is zero-padded by
+    /// the host before dispatch.
+    fn scale_bias_epilogue(
+        &self,
+        out: &dyn BackendStorage,
+        a_scale: Option<&dyn BackendStorage>,
+        b_scale: Option<&dyn BackendStorage>,
+        bias: Option<&dyn BackendStorage>,
+        _batch: usize,
+        out_dim: usize,
+        
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let out_s=out.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: out is not VulkanStorage".into()))?;
+        let n=_batch*out_dim;
+        if out.shape().elem_count()!=n { return Err(Error::Shape("Vulkan scale_bias_epilogue: out size mismatch".into())); }
+        // Build padded buffers: absent scale -> [1] filled 1.0; absent bias -> [1] filled 0.0.
+        let ones=vec![1.0f32]; let zeros=vec![0.0f32];
+        let a_data:Vec<f32>=if let Some(a)=a_scale { a.to_cpu_vec_f32()? } else { ones.clone() };
+        let b_data:Vec<f32>=if let Some(b)=b_scale { b.to_cpu_vec_f32()? } else { ones.clone() };
+        let bias_data:Vec<f32>=if let Some(b)=bias { b.to_cpu_vec_f32()? } else { zeros.clone() };
+        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
+        let a_s=self.from_cpu(&a_data,&Shape::new(vec![a_data.len()]),dtype.clone())?;
+        let b_s=self.from_cpu(&b_data,&Shape::new(vec![b_data.len()]),dtype.clone())?;
+        let bi_s=self.from_cpu(&bias_data,&Shape::new(vec![bias_data.len()]),dtype.clone())?;
+        let a_buf=a_s.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: a_scale is not VulkanStorage".into()))?.buffer;
+        let b_buf=b_s.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: b_scale is not VulkanStorage".into()))?.buffer;
+        let bi_buf=bi_s.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: bias is not VulkanStorage".into()))?.buffer;
+        let ctx_guard=global_context(); let ctx=ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let spirv_source:Vec<u8>=spirv_for(VulkanKernel::ScaleBiasEpilogue).to_vec();
+        let buffers=[out_s.buffer,a_buf,b_buf,bi_buf];
+        let grid_x=n.div_ceil(256) as u32;
+        let push=push_params(n as u32, out_dim as u32, 0, 0, 0, 0.0);
+        run_compute_shader(ctx,&spirv_source,&buffers,grid_x,1,1,Some(&push))?;
+        drop(ctx_guard);
+        Ok(Box::new(grim_tensor::backend::ReadyHandle))
+    }
 
     /// Fused Add + RMSNorm: `y_out = x + residual`, `norm_out = rms_norm(y_out, w, eps)`.
     /// Returns `(y_out, norm_out, compute_handle)`. Overrides the trait default with the real
@@ -5175,6 +5307,8 @@ pub enum VulkanKernel {
     ReduceMax,
     Argmax,
     Transpose2d,
+    BroadcastBias,
+    ScaleBiasEpilogue,
     Sqrt,
     Recip,
     Rope,
@@ -5270,6 +5404,8 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::ReduceMax => SPIRV_REDUCE_MAX,
         VulkanKernel::Argmax => SPIRV_ARGMAX,
         VulkanKernel::Transpose2d => SPIRV_TRANSPOSE_2D,
+        VulkanKernel::BroadcastBias => SPIRV_BROADCAST_BIAS,
+        VulkanKernel::ScaleBiasEpilogue => SPIRV_SCALE_BIAS_EPILOGUE,
         VulkanKernel::Sqrt => SPIRV_SQRT,
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
@@ -5370,6 +5506,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::ReduceMax
         | VulkanKernel::Argmax
         | VulkanKernel::Transpose2d => 2,
+        | VulkanKernel::BroadcastBias => 2,
+        | VulkanKernel::ScaleBiasEpilogue => 4,
         VulkanKernel::QkvAttention
         | VulkanKernel::QkvAttentionSwa
         | VulkanKernel::Rerope
@@ -6279,5 +6417,63 @@ mod tier_a_semi_parity_tests {
         h.synchronize().unwrap();
         assert_eq!(out.shape().dims(), vec![3, 2]);
         assert_eq!(out.to_cpu_vec_f32().unwrap(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+}
+
+
+#[cfg(test)]
+mod tier_b_semi_parity_tests {
+    use super::*;
+    use grim_tensor::backend::{FusionOps, CoreTensorOps};
+
+    fn ctx_ok()->bool{ global_context().as_ref().is_some() }
+    fn stor(dev:&VulkanDevice,data:&[f32],shape:&[usize])->Box<dyn BackendStorage>{
+        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
+        dev.from_cpu(data,&Shape::new(shape.to_vec()),dtype).unwrap()
+    }
+
+    #[test]
+    fn vulkan_broadcast_bias_replicates_rows(){
+        let dev=VulkanDevice::new();
+        if !ctx_ok(){return;}
+        let bias=stor(&dev,&[1.0f32,2.0,3.0],&[3]);
+        let out_shape=Shape::new(vec![2,3]);
+        let (out,h)=FusionOps::broadcast_bias(&dev,bias.as_ref(),2,3,&out_shape).unwrap();
+        h.synchronize().unwrap();
+        assert_eq!(out.to_cpu_vec_f32().unwrap(),vec![1.0,2.0,3.0,1.0,2.0,3.0]);
+    }
+
+    #[test]
+    fn vulkan_scale_bias_epilogue_applies(){
+        let dev=VulkanDevice::new();
+        if !ctx_ok(){return;}
+        // out=[1,2,3,4] ([2,2]), a_scale=[10](per-token->replicated as [batch]? use [2]),
+        // b_scale=[100,1000], bias=[0.5,0.5]
+        // expected: [1*10*100+0.5, 2*10*1000+0.5, 3*7*100+0.5, 4*7*1000+0.5]
+        let out=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[2,2]);
+        let a_scale=stor(&dev,&[10.0f32,7.0],&[2]);
+        let b_scale=stor(&dev,&[100.0f32,1000.0],&[2]);
+        let bias=stor(&dev,&[0.5f32,0.5],&[2]);
+        let h=FusionOps::scale_bias_epilogue(&dev,out.as_ref(),Some(a_scale.as_ref()),Some(b_scale.as_ref()),Some(bias.as_ref()),2,2).unwrap();
+        h.synchronize().unwrap();
+        let got=out.to_cpu_vec_f32().unwrap();
+        assert!((got[0]-(1.0*10.0*100.0+0.5)).abs()<1e-3,"got {got:?}");
+        assert!((got[1]-(2.0*10.0*1000.0+0.5)).abs()<1e-2);
+        assert!((got[2]-(3.0*7.0*100.0+0.5)).abs()<1e-2);
+        assert!((got[3]-(4.0*7.0*1000.0+0.5)).abs()<1e-1);
+    }
+
+    #[test]
+    fn vulkan_silu_mul_quantize_produces_bytes(){
+        let dev=VulkanDevice::new();
+        if !ctx_ok(){return;}
+        let gate=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[4]);
+        let up=stor(&dev,&[0.5f32,0.5,0.5,0.5],&[4]);
+        let (qbytes,_scales,h)=FusionOps::silu_mul_quantize(&dev,gate.as_ref(),up.as_ref(),grim_tensor::QuantFormat::Q8_0,&Shape::new(vec![4])).unwrap();
+        h.synchronize().unwrap();
+        // 4 elems -> 1 block of Q8_0 = 34 bytes
+        assert_eq!(qbytes.to_cpu_vec_f32().unwrap_or_default().len(), 0, "qbytes are u8-packed; just confirm non-empty storage");
+        let n=qbytes.shape().elem_count();
+        assert!(n>=34,"Q8_0 for 4 elems should be >=34 bytes, got {n}");
     }
 }
