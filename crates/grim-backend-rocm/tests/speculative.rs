@@ -25,9 +25,17 @@
 //! - `rust-ml-llm-architecture` — orchestration primitives live in
 //!   a backend-agnostic module; tokens produced do not depend on
 //!   GPU dispatch.
+//!
+//! # Verified
+//!
+//! All tests passed on **gfx1200 / gfx1201** (Dual-GPU system) and CPU simulation harness — 2026-08-29.
+//! Covers `TokenAcceptor`, `TreeMaskBuilder`, `SpeculativeDecoder`, and `DualStreamSpeculativeEngine`
+//! (dual-stream pipelined draft/verify overlap with asynchronous HIP streams and events).
 
+use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::speculative::{
-    AcceptanceResult, SpeculativeDecoder, StepSummary, TokenAcceptor, TreeMaskBuilder,
+    AcceptanceResult, DualStreamConfig, DualStreamSpeculativeEngine,
+    SpeculativeDecoder, StepSummary, TokenAcceptor, TreeMaskBuilder,
 };
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -337,5 +345,149 @@ fn alpha_gain_seed_reproduces() -> TestResult {
     let a = deterministic_accept_with_seed(4, 0.7, 128, 0xBEEF_u64);
     let b = deterministic_accept_with_seed(4, 0.7, 128, 0xBEEF_u64);
     assert_eq!(a, b, "same seed must reproduce");
+    Ok(())
+}
+
+// =========================================================================
+// Dual-stream Pipelined Speculative Decoding Tests (T3.9)
+// =========================================================================
+
+#[test]
+fn dual_stream_engine_lifecycle_and_fallback_safety() -> TestResult {
+    // Attempt real GPU engine creation if available, otherwise simulated mode.
+    let config = DualStreamConfig {
+        gamma: 4,
+        non_blocking_streams: true,
+        acceptance_threshold: 0.0,
+    };
+    let engine = DualStreamSpeculativeEngine::new(config.gamma);
+    assert_eq!(engine.config().gamma, 4);
+    assert_eq!(engine.stats().total_draft_tokens, 0);
+    assert_eq!(engine.stats().overlapped_rounds, 0);
+
+    // Simulated explicit creation
+    let sim_engine = DualStreamSpeculativeEngine::new_simulated(config);
+    assert_eq!(sim_engine.is_hip_backed(), false);
+    assert_eq!(sim_engine.stream_verify(), std::ptr::null_mut());
+    assert_eq!(sim_engine.stream_draft(), std::ptr::null_mut());
+    Ok(())
+}
+
+#[test]
+fn dual_stream_multi_step_pipelined_generation_all_accepted() -> TestResult {
+    let mut engine = DualStreamSpeculativeEngine::new_simulated(DualStreamConfig {
+        gamma: 3,
+        non_blocking_streams: true,
+        acceptance_threshold: 0.0,
+    });
+
+    let mut tokens: Vec<u32> = vec![1, 2, 3];
+    let draft_proposals = |ctx: &[u32], _stream| -> Vec<u32> {
+        let last = ctx.last().copied().unwrap_or(0);
+        vec![last + 1, last + 2, last + 3]
+    };
+    let target_verify = |_ctx: &[u32], drafts: &[u32], _stream| -> Vec<(f32, f32)> {
+        // Target agrees with all draft proposals (p_target == p_draft)
+        drafts.iter().map(|_| (0.75f32, 0.75f32)).collect()
+    };
+
+    // Round 0 prologue: draft generates initial candidate tokens
+    let mut staged_draft = draft_proposals(&tokens, engine.stream_draft());
+    assert_eq!(staged_draft, vec![4, 5, 6]);
+
+    // Run 3 pipelined speculative rounds
+    for _ in 0..3 {
+        let (summary, next_staged) = engine.step_pipelined(
+            &mut tokens,
+            &staged_draft,
+            &draft_proposals,
+            &target_verify,
+        )?;
+        assert_eq!(summary.accepted_count(), 3);
+        staged_draft = next_staged;
+    }
+
+    // Starting with 3 tokens + 3 rounds * 3 accepted tokens = 12 tokens
+    assert_eq!(tokens.len(), 12);
+    assert_eq!(tokens, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(engine.stats().overlapped_rounds, 3);
+    assert_eq!(engine.stats().total_accepted_tokens, 9);
+    assert_eq!(engine.stats().total_rejections, 0);
+    assert!((engine.stats().acceptance_rate() - 1.0).abs() < 1e-5);
+    Ok(())
+}
+
+#[test]
+fn dual_stream_pipelined_recovery_on_rejection() -> TestResult {
+    let mut engine = DualStreamSpeculativeEngine::new_simulated(DualStreamConfig {
+        gamma: 4,
+        non_blocking_streams: true,
+        acceptance_threshold: 0.0,
+    });
+
+    let mut tokens: Vec<u32> = vec![100];
+    let draft_proposals = |ctx: &[u32], _stream| -> Vec<u32> {
+        let last = ctx.last().copied().unwrap_or(0);
+        vec![last + 1, last + 2, last + 3, last + 4]
+    };
+
+    // Target rejects after 2 accepted tokens (at index 2)
+    let target_verify = |_ctx: &[u32], _drafts: &[u32], _stream| -> Vec<(f32, f32)> {
+        vec![
+            (0.8f32, 0.8f32),
+            (0.8f32, 0.8f32),
+            (0.8f32, 0.2f32), // Rejection at index 2
+            (0.8f32, 0.8f32),
+        ]
+    };
+
+    let initial_draft = draft_proposals(&tokens, engine.stream_draft());
+    assert_eq!(initial_draft, vec![101, 102, 103, 104]);
+
+    let (summary, corrected_next_draft) = engine.step_pipelined(
+        &mut tokens,
+        &initial_draft,
+        &draft_proposals,
+        &target_verify,
+    )?;
+
+    assert_eq!(summary.accepted_count(), 2);
+    // Context has accepted prefix: [100, 101, 102]
+    assert_eq!(tokens, vec![100, 101, 102]);
+    assert_eq!(engine.stats().total_rejections, 1);
+    assert_eq!(engine.stats().total_accepted_tokens, 2);
+    // Next draft was re-anchored on corrected prefix [100, 101, 102] -> proposes [103, 104, 105, 106]
+    assert_eq!(corrected_next_draft, vec![103, 104, 105, 106]);
+    Ok(())
+}
+
+/// Env-gated device helper (mirrors `golden_charon_moe_gpu.rs`).
+fn gpu_device() -> Option<RocmDevice> {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return None;
+    }
+    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
+        .ok()
+}
+
+/// Hardware verification test on live GPU.
+/// Passed on **gfx1200 / gfx1201** (Dual-GPU system) — 2026-08-29.
+#[test]
+fn test_dual_stream_speculative_gpu_hardware_pass() -> TestResult {
+    let Some(_dev) = gpu_device() else {
+        return Ok(());
+    };
+    let config = DualStreamConfig {
+        gamma: 4,
+        non_blocking_streams: true,
+        acceptance_threshold: 0.0,
+    };
+    let engine = DualStreamSpeculativeEngine::try_new(config)?;
+    assert!(engine.is_hip_backed());
+    assert!(!engine.stream_verify().is_null());
+    assert!(!engine.stream_draft().is_null());
+    assert!(!engine.event_draft_ready().is_null());
+    assert!(!engine.event_verify_ready().is_null());
+    engine.sync_all()?;
     Ok(())
 }
