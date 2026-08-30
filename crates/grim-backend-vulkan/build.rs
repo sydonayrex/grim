@@ -29,6 +29,7 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("softmax", load_kernel("softmax")),
         ("softmax_backward", load_kernel("softmax_backward")),
         ("embedding", load_kernel("embedding")),
+        ("embedding_backward", load_kernel("embedding_backward")),
         ("matmul_32", load_kernel("matmul_tile_32")),
         ("matmul_64", load_kernel("matmul_tile_64")),
         ("matmul_64_bf16", load_kernel("matmul_tile_64_bf16")),
@@ -186,6 +187,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/softmax.comp");
     println!("cargo:rerun-if-changed=kernels/softmax_backward.comp");
     println!("cargo:rerun-if-changed=kernels/embedding.comp");
+    println!("cargo:rerun-if-changed=kernels/embedding_backward.comp");
     println!("cargo:rerun-if-changed=kernels/matmul_tile_32.comp");
     println!("cargo:rerun-if-changed=kernels/matmul_tile_64.comp");
     println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
