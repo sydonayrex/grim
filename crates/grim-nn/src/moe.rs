@@ -1586,9 +1586,8 @@ impl MoeFfn {
     /// folding `routed_scaling_factor` per-term, so results are bitwise identical
     /// to `forward` under IEEE-754 (non-associative FP addition otherwise
     /// diverges).
-    #[cfg(feature = "moe-deterministic-dispatch")]
     pub fn forward_deterministic(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
-        use crate::moe_deterministic::DeterministicTokenMap;
+        use crate::moe_deterministic::{DeterministicTokenMap, ScoreboardSync};
 
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
@@ -1600,6 +1599,123 @@ impl MoeFfn {
             .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
         if batch == 0 {
             return Ok(cpu_tensor(vec![], Shape::new(vec![0, hidden])));
+        }
+
+        let num_experts = self.experts.gate.len();
+
+        // ── GPU path: persistent-SM mega-kernel (R2 UniEP) ────────────────
+        #[cfg(feature = "rocm-mem")]
+        if let Device::Rocm(ordinal) = x.device() {
+            let ordinal = *ordinal;
+            let inter = self
+                .experts
+                .gate
+                .first()
+                .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+                .unwrap_or(0);
+
+            if inter > 0 && num_experts > 0 && hidden > 0 {
+                let map = DeterministicTokenMap::build(&indices, num_experts)?;
+                let top_k = map.top_k;
+                let total_routed = map.total_routed_instances;
+
+                let dest_slots_u32: Vec<u32> = map.destination_slots.iter().map(|&s| s as u32).collect();
+                let offsets_u32: Vec<u32> = map.global_offsets.iter().map(|&o| o as u32).collect();
+                let counts_u32: Vec<u32> = map.expert_counts.iter().map(|&c| c as u32).collect();
+
+                let mut router_tokens = Vec::with_capacity(total_routed);
+                let mut router_experts = Vec::with_capacity(total_routed);
+                let mut router_weights = Vec::with_capacity(total_routed);
+                for slot in 0..total_routed {
+                    let (t_idx, exp_id, k_idx) = map.reverse_map[slot];
+                    router_tokens.push(t_idx as u32);
+                    router_experts.push(exp_id as u32);
+                    router_weights.push(weights[t_idx][k_idx]);
+                }
+
+                let launch_config = grim_backend_rocm::kernels::moe_mega_kernel::MoeMegaLaunchConfig::new(
+                    batch,
+                    hidden,
+                    inter,
+                    num_experts,
+                    top_k,
+                    self.routed_scaling_factor,
+                    32,
+                );
+
+                let scoreboard = ScoreboardSync::new(launch_config.num_tiles, launch_config.tile_size);
+                let (arrivals, ready) = scoreboard.to_device_buffers();
+
+                let resident = {
+                    let mut guard = self.rocm_weights.lock().unwrap_or_else(|e| e.into_inner());
+                    let key = (num_experts, hidden, inter);
+                    match guard.as_ref() {
+                        Some(r) if r.fingerprint == key => {
+                            (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+                        }
+                        _ => {
+                            let built = RocmResidentWeights::build(
+                                &self.experts,
+                                num_experts,
+                                hidden,
+                                inter,
+                                ordinal,
+                            )?;
+                            let triple = (
+                                Arc::clone(&built.gate),
+                                Arc::clone(&built.up),
+                                Arc::clone(&built.down),
+                            );
+                            *guard = Some(built);
+                            triple
+                        }
+                    }
+                };
+
+                let gate_r = resident.0.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+                let up_r = resident.1.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+                let down_r = resident.2.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+
+                let x_storage: &dyn BackendStorage = &**x.storage();
+                if let Some(x_rocm) = x_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                    let out_shape = Shape::new(vec![batch, hidden]);
+                    let dev = RocmDevice::try_new(ordinal)?;
+                    let out_box = dev.zeros(&out_shape, DType::F32)?;
+                    let out_storage = out_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+
+                    dev.launch_moe_mega_dispatch(
+                        x_rocm,
+                        gate_r.device_ptr_checked()?,
+                        up_r.device_ptr_checked()?,
+                        down_r.device_ptr_checked()?,
+                        &dest_slots_u32,
+                        &offsets_u32,
+                        &counts_u32,
+                        &router_tokens,
+                        &router_experts,
+                        &router_weights,
+                        &arrivals,
+                        &ready,
+                        out_storage,
+                        &launch_config,
+                    )?;
+
+                    let mut out_tensor = Tensor::new(
+                        Arc::from(out_box),
+                        out_shape,
+                        DType::F32,
+                        QuantProvenance::default(),
+                        Device::Rocm(ordinal),
+                    );
+
+                    if let Some(sh) = &self.shared_expert {
+                        let s = sh.forward(x)?;
+                        out_tensor = crate::modules::add_tensors(&out_tensor, &s)?;
+                    }
+
+                    return Ok(out_tensor);
+                }
+            }
         }
 
         // 1. Deterministic token map: conflict-free destination addressing.

@@ -29,9 +29,11 @@ vulkan-mem = []
 gpu-selection = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 # R2 — deterministic MoE dispatch (UniEP idea): route tokens through a
 # DeterministicTokenMap (conflict-free prefix-sum addressing) so the CPU
-# reference and a future fused GPU mega-kernel share one routing path.
-# Bitwise-identical to the default forward on CPU (property-tested).
+# reference and fused GPU mega-kernel share one routing path.
+# Produces bitwise-identical output on CPU without rocm-mem; with rocm-mem
+# it additionally exercises the GPU persistent-SM mega-kernel.
 moe-deterministic-dispatch = []
+moe-mega-kernel = ["rocm-mem", "moe-deterministic-dispatch"]
 
 [dev-dependencies]
 grim-format = { workspace = true }

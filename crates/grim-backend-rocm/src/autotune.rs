@@ -250,6 +250,47 @@ pub fn charon_scalar_candidates(arch: &str, device_smem_limit: u32) -> Vec<Launc
     candidates
 }
 
+/// Tuning knob for the UniEP persistent-SM MoE Mega-Kernel.
+/// Parameterizes the tuple (wdisp, Ndisp, Nrelay):
+/// - `num_sm_blocks`: active persistent SM blocks running task queues.
+/// - `block_threads`: threadblock dimension (wavefronts per block).
+/// - `tile_size`: scoreboard synchronization granularity.
+/// - `n_relay_tasks`: on-device multicast relay worker count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MoeMegaKnob {
+    pub num_sm_blocks: usize,
+    pub block_threads: usize,
+    pub tile_size: usize,
+    pub n_relay_tasks: usize,
+}
+
+impl MoeMegaKnob {
+    /// Generates candidate tuning configurations for MoE mega-kernel on a given GPU architecture.
+    pub fn candidate_grid(cu_count: usize) -> Vec<Self> {
+        let sm_counts = [cu_count.saturating_div(2).max(1), cu_count.max(1), cu_count.saturating_mul(2).max(2)];
+        let threads_opts = [128, 256];
+        let tile_sizes = [8, 16, 32];
+        let relay_opts = [0, 4];
+
+        let mut candidates = Vec::new();
+        for &sm in &sm_counts {
+            for &th in &threads_opts {
+                for &ts in &tile_sizes {
+                    for &ro in &relay_opts {
+                        candidates.push(Self {
+                            num_sm_blocks: sm,
+                            block_threads: th,
+                            tile_size: ts,
+                            n_relay_tasks: ro,
+                        });
+                    }
+                }
+            }
+        }
+        candidates
+    }
+}
+
 /// Subspace decomposition for CharTuner scalar candidates. Instead of the
 /// full Cartesian product of [8,16,32,64] × [32,64,128] × [32,64] × [1,2,4]
 /// × [64,128,256], this partitions the M-N-K search into subspaces keyed by

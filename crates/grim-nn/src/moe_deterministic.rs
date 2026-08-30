@@ -261,6 +261,13 @@ impl ScoreboardSync {
             r.store(0, Ordering::SeqCst);
         }
     }
+
+    /// Expose atomic values as raw vectors of u32 for GPU device buffer uploads.
+    pub fn to_device_buffers(&self) -> (Vec<u32>, Vec<u32>) {
+        let arrivals = self.token_arrivals.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let ready = self.tile_ready.iter().map(|r| r.load(Ordering::Relaxed)).collect();
+        (arrivals, ready)
+    }
 }
 
 #[cfg(test)]
