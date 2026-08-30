@@ -4452,8 +4452,11 @@ impl AutogradOps for VulkanDevice {
         Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-    /// RMSNorm backward w.r.t. x: classic `dx = (1/N) * w * (g_mean - g·x·x_mean) / rms`
-    /// decomposition. ROCm kernel: `grim_rmsnorm_backward`.
+    /// RMSNorm backward w.r.t. x and weight.
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::RmsnormBackward`. The `dw`
+    /// accumulation uses `atomicAdd` (requires `OpAtomicFAddEXT`, gated by
+    /// `VulkanCaps::supports_fp32_atomic_add` — RDNA3+ / NVIDIA).
     fn rmsnorm_backward(
         &self,
         x: &dyn BackendStorage,
@@ -4463,35 +4466,54 @@ impl AutogradOps for VulkanDevice {
         x_shape: &Shape,
         w_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_v = x.to_cpu_vec_f32()?;
-        let w_v = weight.to_cpu_vec_f32()?;
-        let g_v = out_grad.to_cpu_vec_f32()?;
-        let rows = x_shape.dims().first().copied().unwrap_or(1);
-        let cols = if x_shape.dims().len() > 1 { x_shape.dims()[1] } else { 1 };
-        let n = (rows * cols).max(1);
-        if x_v.len() != n || g_v.len() != n || w_v.len() != cols {
-            return Err(Error::Shape("rmsnorm_backward: shape mismatch".into()));
+        if !self.caps.supports_fp32_atomic_add {
+            return Err(Error::Backend(
+                "rmsnorm_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into()
+            ));
         }
-        let inv_n = 1.0 / cols as f32;
-        let mut dx = vec![0.0f32; n];
-        let mut dw = vec![0.0f32; cols];
-        for r in 0..rows {
-            let base = r * cols;
-            let mean_sq: f32 = (0..cols).map(|c| x_v[base + c] * x_v[base + c]).sum::<f32>() * inv_n;
-            let rms = (mean_sq + eps).sqrt();
-            let inv_rms = 1.0 / rms;
-            // sum_xg = Σ x_i * g_i ; dot = Σ g_i * x_i / rms  (== sum_xg * inv_rms)
-            let sum_xg: f32 = (0..cols).map(|c| x_v[base + c] * g_v[base + c]).sum();
-            for c in 0..cols {
-                let xn = x_v[base + c] * inv_rms;
-                dx[base + c] = w_v[c] * (g_v[base + c] * inv_rms - xn * sum_xg * inv_n * inv_rms);
-                dw[c] += g_v[base + c] * xn;
+
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rmsnorm_backward: x is not VulkanStorage".into()))?;
+        let w_s = weight.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rmsnorm_backward: weight is not VulkanStorage".into()))?;
+        let g_s = out_grad.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rmsnorm_backward: grad is not VulkanStorage".into()))?;
+
+        let cols = if x_shape.dims().len() > 1 { x_shape.dims()[1] } else { 1 };
+        let total = x_shape.elem_count();
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard.as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let dx = VulkanStorage::alloc_device_local_gpu(x_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let dw = VulkanStorage::alloc_device_local_gpu(w_shape, DType::F32, ctx.device, ctx.physical_device)?;
+
+        // Zero-initialize dw buffer (atomic scatter-add target)
+        unsafe {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            let res = vkMapMemory(ctx.device, dw.memory, 0, dw.bytes as VkDeviceSize, 0, &mut mapped);
+            if res == VK_SUCCESS {
+                std::ptr::write_bytes(mapped, 0, dw.bytes);
+                vkUnmapMemory(ctx.device, dw.memory);
             }
         }
-        // Trait contract returns (dx, dw): pack via from_cpu on x_shape for dx.
-        let dx_storage = self.from_cpu(&dx, x_shape, DType::F32)?;
-        let dw_storage = self.from_cpu(&dw, w_shape, DType::F32)?;
-        Ok((dx_storage, dw_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+
+        let buffers = [x_s.buffer, w_s.buffer, g_s.buffer, dx.buffer, dw.buffer];
+        let grid_x = total.div_ceil(256) as u32;
+        let push = push_params(total as u32, cols as u32, 0, 0, 0, eps);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::RmsnormBackward,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok((Box::new(dx), Box::new(dw), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     /// RoPE backward: `dx = rotate(out_grad, -positions)` (inverse rotation).
@@ -5872,6 +5894,7 @@ pub enum VulkanKernel {
     Mul,
     SiluMul,
     RmsNorm,
+    RmsnormBackward,
     AddRmsNorm,
     Softmax,
     SoftmaxBackward,
@@ -5972,6 +5995,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Mul => SPIRV_MUL,
         VulkanKernel::SiluMul => SPIRV_SILU_MUL,
         VulkanKernel::RmsNorm => SPIRV_RMS_NORM,
+        VulkanKernel::RmsnormBackward => SPIRV_RMSNORM_BACKWARD,
         VulkanKernel::AddRmsNorm => SPIRV_ADD_RMS_NORM,
         VulkanKernel::Softmax => SPIRV_SOFTMAX,
         VulkanKernel::SoftmaxBackward => SPIRV_SOFTMAX_BACKWARD,
@@ -6111,7 +6135,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::QuantizedMatmulBackwardDx
         | VulkanKernel::QuantizedMatmulBackwardDxQ8_0
         | VulkanKernel::FusedLinearCe
-        | VulkanKernel::AddRmsNorm => 5,
+        | VulkanKernel::AddRmsNorm
+        | VulkanKernel::RmsnormBackward => 5,
         VulkanKernel::KvDequantAttention
         | VulkanKernel::SelectiveScan
         | VulkanKernel::FlashDecodeSplitK
