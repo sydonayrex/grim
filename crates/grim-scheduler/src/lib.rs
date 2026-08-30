@@ -6,7 +6,12 @@ use std::time::Duration;
 
 use grim_core::DeterminismMode;
 
+pub mod readiness_dispatch;
 pub mod self_tuning;
+
+pub use readiness_dispatch::{
+    MicrobatchTask, ReadinessDispatcher, ReadySet, ScheduleHint, TaskKind,
+};
 pub use self_tuning::{SelfTuningController, TunableKnob};
 
 /// Real KV-memory pressure source (§5.2): reports current KV pool occupancy

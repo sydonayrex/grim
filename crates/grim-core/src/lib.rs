@@ -8,6 +8,7 @@ pub mod env_config;
 pub mod error;
 pub mod hyperparams;
 pub mod kv_cache;
+pub mod memory_certificate;
 pub mod model;
 pub mod paths;
 pub mod rng;
@@ -22,6 +23,9 @@ pub use client::{
 pub use env_config::{Backend, RuntimeEnv};
 pub use error::{Error, Result, TensorError};
 pub use hyperparams::{ArchHyperparameters, HyperparameterExtractor, MetadataLookup};
+pub use memory_certificate::{
+    AuthorityGrade, BoundaryVector, ExactnessContract, MemoryCertificate, ModelInventory,
+};
 pub use kv_cache::KvCache;
 pub use model::{
     AudioVocoder, CausalLm, DiffusionModel, Encoder, EncoderDecoderLm, ModalityHint, Model,
