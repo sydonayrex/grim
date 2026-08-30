@@ -131,6 +131,22 @@ impl RowParallelLinear {
             return Ok(local_out);
         }
 
+        // Fast path: if on a hardware accelerator device with native all_reduce, use device-resident collective
+        if !local_out.device().is_cpu() {
+            let dev = grim_nn::pick_device_for_tensor(&local_out);
+            let s: &dyn grim_tensor::BackendStorage = local_out.storage().as_ref();
+            if let Ok((storage, handle)) = dev.all_reduce(&[s], "sum") {
+                let _ = handle.synchronize();
+                return Ok(Tensor::new(
+                    Arc::from(storage),
+                    local_out.shape().clone(),
+                    local_out.dtype(),
+                    local_out.provenance().clone(),
+                    local_out.device().clone(),
+                ));
+            }
+        }
+
         if let Some(comm) = &self.comm {
             let mut out_vec = local_out.to_vec_f32()?;
             comm.all_reduce_sum_f32(&mut out_vec)?;
@@ -179,5 +195,32 @@ mod tests {
         let x = tensor_from_f32_vec(vec![1.0, 2.0], Shape::from_slice(&[1, 2]));
         let out = col_lin.forward(&x).unwrap();
         assert_eq!(out.shape().dims(), &[1, 4]);
+    }
+
+    #[test]
+    fn test_row_parallel_all_reduce() {
+        let ring = Arc::new(HostStagingRing::new(2));
+        let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap());
+        let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap());
+
+        let tp0 = TensorParallelConfig { rank: 0, world_size: 2 };
+        let tp1 = TensorParallelConfig { rank: 1, world_size: 2 };
+
+        let w0 = tensor_from_f32_vec(vec![1.0, 2.0], Shape::from_slice(&[1, 2]));
+        let w1 = tensor_from_f32_vec(vec![3.0, 4.0], Shape::from_slice(&[1, 2]));
+
+        let row0 = RowParallelLinear::new(Linear::from_tensor(w0, None), tp0, Some(comm0));
+        let row1 = RowParallelLinear::new(Linear::from_tensor(w1, None), tp1, Some(comm1));
+
+        let x0 = tensor_from_f32_vec(vec![1.0, 1.0], Shape::from_slice(&[1, 2]));
+        let x1 = tensor_from_f32_vec(vec![1.0, 1.0], Shape::from_slice(&[1, 2]));
+
+        // Simulated parallel execution
+        let _out0 = row0.forward(&x0).unwrap();
+        let out1 = row1.forward(&x1).unwrap();
+
+        let v1 = out1.to_vec_f32().unwrap();
+        // Rank 0: (1*1 + 1*2) = 3; Rank 1: (1*3 + 1*4) = 7 -> Sum = 10.0
+        assert_eq!(v1, vec![10.0]);
     }
 }

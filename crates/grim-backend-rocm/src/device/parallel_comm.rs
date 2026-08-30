@@ -95,6 +95,8 @@ pub struct ParallelCommunicator {
     pub backend: CommBackendType,
     /// Host staging ring for CPU-side / simulated multi-device test environments.
     staging_ring: Option<Arc<HostStagingRing>>,
+    /// RCCL multi-GPU collective handle for direct on-device execution.
+    rccl: Option<Arc<crate::rccl::RcclAllReduce>>,
 }
 
 impl ParallelCommunicator {
@@ -108,6 +110,7 @@ impl ParallelCommunicator {
             },
             backend: CommBackendType::P2pDirect,
             staging_ring: None,
+            rccl: None,
         }
     }
 
@@ -123,6 +126,38 @@ impl ParallelCommunicator {
             topology,
             backend: CommBackendType::SharedHostStaging,
             staging_ring: Some(staging_ring),
+            rccl: None,
+        })
+    }
+
+    /// Constructs a multi-rank communicator backed by physical RCCL device collectives.
+    pub fn with_rccl(
+        rank: usize,
+        world_size: usize,
+        device_ordinals: Vec<usize>,
+        rccl: Arc<crate::rccl::RcclAllReduce>,
+    ) -> Result<Self> {
+        let topology = ParallelTopology::new(rank, world_size, device_ordinals)?;
+        Ok(Self {
+            topology,
+            backend: CommBackendType::Rccl,
+            staging_ring: None,
+            rccl: Some(rccl),
+        })
+    }
+
+    /// Constructs a multi-rank communicator configured for direct peer-to-peer HIP memory DMA.
+    pub fn with_p2p(
+        rank: usize,
+        world_size: usize,
+        device_ordinals: Vec<usize>,
+    ) -> Result<Self> {
+        let topology = ParallelTopology::new(rank, world_size, device_ordinals)?;
+        Ok(Self {
+            topology,
+            backend: CommBackendType::P2pDirect,
+            staging_ring: None,
+            rccl: None,
         })
     }
 
@@ -171,16 +206,37 @@ impl ParallelCommunicator {
     }
 
     /// Performs an in-place All-Reduce (SUM) on a device-resident `RocmStorage` tensor.
-    pub fn all_reduce_sum_storage(&self, storage: &mut RocmStorage) -> Result<()> {
+    /// Uses direct on-device RCCL collectives when available, avoiding host roundtrips.
+    pub fn all_reduce_sum_storage(&self, storage: &mut RocmStorage, stream_u64: u64) -> Result<()> {
         if self.topology.world_size <= 1 {
             return Ok(());
         }
         let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
 
-        if let Ok(mut host_vec) = storage.to_cpu_vec_f32() {
-            self.all_reduce_sum_f32(&mut host_vec)?;
+        if let Some(rccl) = &self.rccl {
+            let ptr = storage.device_ptr.ok_or_else(|| Error::Backend("No valid device pointer on storage".into()))?;
+            let count = storage.shape.elem_count();
+            rccl.sum_gradients_device(ptr, ptr, count, stream_u64, self.topology.rank)?;
+            Ok(())
+        } else if let Some(_ring) = &self.staging_ring {
+            if let Ok(mut host_vec) = storage.to_cpu_vec_f32() {
+                self.all_reduce_sum_f32(&mut host_vec)?;
+                let bytes: Vec<u8> = host_vec.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                if let Some(ptr_val) = storage.device_ptr {
+                    unsafe {
+                        crate::hipMemcpy(
+                            ptr_val as *mut std::ffi::c_void,
+                            bytes.as_ptr() as *const std::ffi::c_void,
+                            bytes.len(),
+                            crate::HipMemcpyKind::HostToDevice,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Gathers slices from all ranks into a concatenated destination buffer.
@@ -299,6 +355,38 @@ impl ParallelCommunicator {
                     recv_data[..len].copy_from_slice(&src_slot[..len]);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Point-to-point asynchronous device-to-device copy for Pipeline Parallelism stage handoffs.
+    /// Executes direct `hipMemcpyPeerAsync` across GPU devices, avoiding host RAM bounce.
+    pub fn send_recv_p2p_device(
+        &self,
+        send_dev_ptr: Option<u64>,
+        dst_rank: usize,
+        recv_dev_ptr: Option<u64>,
+        src_rank: usize,
+        count_bytes: usize,
+        stream_u64: u64,
+    ) -> Result<()> {
+        let my_ordinal = self.topology.local_device_ordinal() as i32;
+        let _guard = DeviceGuard::set(my_ordinal);
+
+        if let Some(send_ptr) = send_dev_ptr {
+            let dst_ordinal = self.topology.device_ordinals.get(dst_rank).copied().unwrap_or(dst_rank) as i32;
+            if let Some(recv_ptr) = recv_dev_ptr {
+                crate::rccl::p2p_memcpy_async(
+                    recv_ptr as *mut std::ffi::c_void,
+                    dst_ordinal,
+                    send_ptr as *const std::ffi::c_void,
+                    my_ordinal,
+                    count_bytes,
+                    stream_u64 as *mut std::ffi::c_void,
+                )?;
+            }
+        } else if let Some(_recv_ptr) = recv_dev_ptr {
+            let _src_ordinal = self.topology.device_ordinals.get(src_rank).copied().unwrap_or(src_rank) as i32;
         }
         Ok(())
     }
