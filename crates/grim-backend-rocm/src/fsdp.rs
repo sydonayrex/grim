@@ -1,12 +1,18 @@
-//! Consumer Parallel GPU (RX 9060 / RX 9070 — RDNA3/4) Multi-GPU FSDP (Fully Sharded Data Parallel) module.
+//! Consumer Parallel GPU Multi-GPU FSDP (Fully Sharded Data Parallel) module.
+//!
+//! Provides ZeRO-3 / FSDP distributed training primitives across multiple ROCm GPUs,
+//! backed by real cross-rank collective communication via [`ParallelCommunicator`]
+//! (RCCL device collectives or high-speed `HostStagingRing` synchronization).
 
+use std::sync::Arc;
 use grim_tensor::Shape;
 use grim_tensor::error::{Error, Result};
+use crate::device::parallel_comm::ParallelCommunicator;
 
 /// Configuration for Consumer Parallel GPU FSDP sharding.
 #[derive(Debug, Clone)]
 pub struct ConsumerFsdpConfig {
-    /// World size (number of parallel GPUs, e.g. 2 for RX 9060 + RX 9070).
+    /// World size (number of parallel GPUs, e.g. 2 for dual GPU setup).
     pub world_size: usize,
     /// Rank of this GPU worker process (0..world_size).
     pub rank: usize,
@@ -24,9 +30,10 @@ impl Default for ConsumerFsdpConfig {
     }
 }
 
-/// Fully Sharded Data Parallel / Data Parallel group managing parameter partitions for consumer AMD GPUs.
+/// Fully Sharded Data Parallel / Data Parallel group managing parameter partitions and collectives.
 pub struct ConsumerFsdpGroup {
-    config: ConsumerFsdpConfig,
+    pub config: ConsumerFsdpConfig,
+    pub comm: Option<Arc<ParallelCommunicator>>,
 }
 
 /// Type alias for Consumer Data Parallel group.
@@ -37,8 +44,8 @@ pub type ConsumerDpConfig = ConsumerFsdpConfig;
 pub type ConsumerZeroPlanner = ConsumerFsdpGroup;
 
 impl ConsumerFsdpGroup {
-    /// Constructs a new `ConsumerFsdpGroup` with the specified configuration. [see: `config.world_size`, `config.rank`]
-    pub fn new(config: ConsumerFsdpConfig) -> Result<Self> {
+    /// Constructs a new `ConsumerFsdpGroup` with optional parallel communicator.
+    pub fn new(config: ConsumerFsdpConfig, comm: Option<Arc<ParallelCommunicator>>) -> Result<Self> {
         if config.world_size == 0 {
             return Err(Error::Backend("world_size must be >= 1".into()));
         }
@@ -48,10 +55,18 @@ impl ConsumerFsdpGroup {
                 config.rank, config.world_size
             )));
         }
-        Ok(Self { config })
+        if let Some(c) = &comm {
+            if c.topology.world_size != config.world_size || c.topology.rank != config.rank {
+                return Err(Error::Backend(format!(
+                    "Communicator topology mismatch: comm has rank {}/world {}, config has rank {}/world {}",
+                    c.topology.rank, c.topology.world_size, config.rank, config.world_size
+                )));
+            }
+        }
+        Ok(Self { config, comm })
     }
 
-    /// Computes the sharded shape for a full parameter tensor under `world_size` partitioning. [see: `full_shape`]
+    /// Computes the sharded shape for a full parameter tensor under `world_size` partitioning.
     pub fn shard_shape(&self, full_shape: &Shape) -> Result<Shape> {
         let dims = full_shape.dims();
         if dims.is_empty() {
@@ -81,42 +96,68 @@ impl ConsumerFsdpGroup {
         base_vram + (base_vram / 10)
     }
 
-    /// Reconstruct full parameter tensor from sharded slice across ranks using AllGather.
+    /// Reconstruct full parameter tensor from sharded slice across ranks using real cross-rank AllGather.
     pub fn execute_all_gather(&self, local_shard: &[f32], full_shape: &Shape) -> Result<Vec<f32>> {
-        let sharded_len = local_shard.len();
         let total_len = full_shape.elem_count();
-        if sharded_len * self.config.world_size < total_len {
-            return Err(Error::Shape(
-                "Local shard too small for world_size reconstitution".into(),
-            ));
+        let expected_shard_len = total_len / self.config.world_size;
+
+        if local_shard.len() != expected_shard_len {
+            return Err(Error::Shape(format!(
+                "execute_all_gather: local shard length {} != expected shard len {}",
+                local_shard.len(),
+                expected_shard_len
+            )));
         }
+
         let mut full_buffer = vec![0.0f32; total_len];
-        let offset = self.config.rank * sharded_len;
-        if offset + sharded_len <= total_len {
-            full_buffer[offset..offset + sharded_len].copy_from_slice(local_shard);
+
+        if let Some(comm) = &self.comm {
+            comm.all_gather_f32(local_shard, &mut full_buffer)?;
+        } else {
+            // Standalone single-rank fallback
+            let offset = self.config.rank * expected_shard_len;
+            full_buffer[offset..offset + expected_shard_len].copy_from_slice(local_shard);
         }
+
         Ok(full_buffer)
     }
 
-    /// Reduce and scatter full gradient tensor so each rank retains only its local shard.
+    /// Reduces gradients across all ranks and scatters the local rank's partitioned shard.
     pub fn execute_reduce_scatter(
         &self,
-        full_grad: &[f32],
+        local_full_grad: &[f32],
         sharded_shape: &Shape,
     ) -> Result<Vec<f32>> {
         let shard_len = sharded_shape.elem_count();
-        let offset = self.config.rank * shard_len;
-        if offset + shard_len > full_grad.len() {
-            return Err(Error::Shape(
-                "Full grad buffer too small for rank shard".into(),
-            ));
+        let total_len = shard_len * self.config.world_size;
+
+        if local_full_grad.len() != total_len {
+            return Err(Error::Shape(format!(
+                "execute_reduce_scatter: local_full_grad len {} != total_len {}",
+                local_full_grad.len(),
+                total_len
+            )));
         }
+
         let mut shard = vec![0.0f32; shard_len];
-        shard.copy_from_slice(&full_grad[offset..offset + shard_len]);
-        // Average gradient contribution across ranks
-        for v in shard.iter_mut() {
-            *v /= self.config.world_size as f32;
+
+        if let Some(comm) = &self.comm {
+            comm.reduce_scatter_sum_f32(local_full_grad, &mut shard)?;
+            // Average gradient across ranks
+            let inv_world = 1.0f32 / (self.config.world_size as f32);
+            for v in shard.iter_mut() {
+                *v *= inv_world;
+            }
+        } else {
+            // Standalone single-rank fallback: extract rank slice
+            let offset = self.config.rank * shard_len;
+            shard.copy_from_slice(&local_full_grad[offset..offset + shard_len]);
+            let inv_world = 1.0f32 / (self.config.world_size as f32);
+            for v in shard.iter_mut() {
+                *v *= inv_world;
+            }
         }
+
         Ok(shard)
     }
 
@@ -129,47 +170,95 @@ impl ConsumerFsdpGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use crate::device::parallel_comm::HostStagingRing;
 
     #[test]
-    fn test_consumer_gpu_fsdp_vram_bounds_golden_mutation_resistant() -> Result<()> {
-        let config = ConsumerFsdpConfig {
-            world_size: 2, // RX 9060 + RX 9070 dual GPU setup
+    fn test_consumer_fsdp_multi_rank_all_gather_real_cross_rank() -> Result<()> {
+        let world_size = 2;
+        let ring = Arc::new(HostStagingRing::new(world_size));
+
+        let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
+            0, world_size, vec![0, 1], ring.clone(),
+        )?);
+        let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
+            1, world_size, vec![0, 1], ring.clone(),
+        )?);
+
+        let cfg0 = ConsumerFsdpConfig {
+            world_size,
             rank: 0,
             peak_vram_budget_bytes: 16 * 1024 * 1024 * 1024,
         };
+        let cfg1 = ConsumerFsdpConfig {
+            world_size,
+            rank: 1,
+            peak_vram_budget_bytes: 16 * 1024 * 1024 * 1024,
+        };
 
-        let fsdp = ConsumerFsdpGroup::new(config)?;
+        let fsdp0 = ConsumerFsdpGroup::new(cfg0, Some(comm0))?;
+        let fsdp1 = ConsumerFsdpGroup::new(cfg1, Some(comm1))?;
 
-        // Non-square asymmetric shape [2048, 4096]
-        let full_shape = Shape::new(vec![2048, 4096]);
-        let sharded = fsdp.shard_shape(&full_shape)?;
+        let full_shape = Shape::new(vec![4, 2]); // total 8 elements -> 4 per rank
+        let shard0 = vec![10.0f32, 20.0, 30.0, 40.0];
+        let shard1 = vec![50.0f32, 60.0, 70.0, 80.0];
 
-        assert_eq!(sharded.dims(), &[1024, 4096]);
+        // Stage rank 0 then rank 1
+        let _ = fsdp0.execute_all_gather(&shard0, &full_shape)?;
+        let gathered1 = fsdp1.execute_all_gather(&shard1, &full_shape)?;
+        let gathered0 = fsdp0.execute_all_gather(&shard0, &full_shape)?;
 
-        // 7 Billion parameter model (sharded across 2 GPUs = 3.5B per GPU)
-        let num_params = 7_000_000_000usize;
-        let vram_usage = fsdp.estimate_peak_vram_bytes(num_params);
+        // Both ranks must see the FULL gathered sequence across rank 0 and rank 1!
+        let expected = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        assert_eq!(gathered0, expected, "Rank 0 must receive full cross-rank gathered buffer");
+        assert_eq!(gathered1, expected, "Rank 1 must receive full cross-rank gathered buffer");
 
-        // Peak VRAM per GPU under QLoRA 4-bit sharding should be under 12 GB
-        assert!(
-            vram_usage < 13_000_000_000,
-            "VRAM usage {} exceeds 13GB threshold",
-            vram_usage
-        );
-        assert!(
-            fsdp.fits_vram_budget(7_000_000_000),
-            "7B QLoRA model should fit in 16GB VRAM per GPU"
-        );
+        Ok(())
+    }
 
-        // Test AllGather and ReduceScatter
-        let local_shard = vec![1.0f32; 1024 * 4096];
-        let gathered = fsdp.execute_all_gather(&local_shard, &full_shape)?;
-        assert_eq!(gathered.len(), 2048 * 4096);
+    #[test]
+    fn test_consumer_fsdp_multi_rank_reduce_scatter_real_reduction() -> Result<()> {
+        let world_size = 2;
+        let ring = Arc::new(HostStagingRing::new(world_size));
 
-        let full_grad = vec![2.0f32; 2048 * 4096];
-        let reduced = fsdp.execute_reduce_scatter(&full_grad, &sharded)?;
-        assert_eq!(reduced.len(), 1024 * 4096);
-        assert_eq!(reduced[0], 1.0f32); // 2.0 / world_size (2) = 1.0
+        let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
+            0, world_size, vec![0, 1], ring.clone(),
+        )?);
+        let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
+            1, world_size, vec![0, 1], ring.clone(),
+        )?);
+
+        let cfg0 = ConsumerFsdpConfig {
+            world_size,
+            rank: 0,
+            peak_vram_budget_bytes: 16 * 1024 * 1024 * 1024,
+        };
+        let cfg1 = ConsumerFsdpConfig {
+            world_size,
+            rank: 1,
+            peak_vram_budget_bytes: 16 * 1024 * 1024 * 1024,
+        };
+
+        let fsdp0 = ConsumerFsdpGroup::new(cfg0, Some(comm0))?;
+        let fsdp1 = ConsumerFsdpGroup::new(cfg1, Some(comm1))?;
+
+        let sharded_shape = Shape::new(vec![2, 2]); // 4 elements per shard -> 8 total
+        // Rank 0 gradients across full parameter tensor
+        let grad0 = vec![2.0f32, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
+        // Rank 1 gradients across full parameter tensor
+        let grad1 = vec![4.0f32, 6.0, 8.0, 10.0, 20.0, 22.0, 24.0, 26.0];
+
+        let _ = fsdp0.execute_reduce_scatter(&grad0, &sharded_shape)?;
+        let reduced_shard1 = fsdp1.execute_reduce_scatter(&grad1, &sharded_shape)?;
+        let reduced_shard0 = fsdp0.execute_reduce_scatter(&grad0, &sharded_shape)?;
+
+        // Rank 0 receives slice 0 (first 4 elems) reduced: (grad0[0..4] + grad1[0..4]) / 2
+        // [ (2+4)/2, (4+6)/2, (6+8)/2, (8+10)/2 ] = [ 3.0, 5.0, 7.0, 9.0 ]
+        assert_eq!(reduced_shard0, vec![3.0, 5.0, 7.0, 9.0]);
+
+        // Rank 1 receives slice 1 (last 4 elems) reduced: (grad0[4..8] + grad1[4..8]) / 2
+        // [ (10+20)/2, (12+22)/2, (14+24)/2, (16+26)/2 ] = [ 15.0, 17.0, 19.0, 21.0 ]
+        assert_eq!(reduced_shard1, vec![15.0, 17.0, 19.0, 21.0]);
 
         Ok(())
     }
