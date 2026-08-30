@@ -4517,7 +4517,9 @@ impl AutogradOps for VulkanDevice {
     }
 
     /// RoPE backward: `dx = rotate(out_grad, -positions)` (inverse rotation).
-    /// ROCm kernel: `grim_rope_backward`.
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::RopeBackward`. The even-indexed
+    /// thread writes both elements of each interleaved pair.
     fn rope_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -4525,20 +4527,38 @@ impl AutogradOps for VulkanDevice {
         sin: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let g = out_grad.to_cpu_vec_f32()?;
-        let c = cos.to_cpu_vec_f32()?;
-        let sn = sin.to_cpu_vec_f32()?;
-        if g.len() != c.len() || g.len() != sn.len() {
-            return Err(Error::Shape("rope_backward: length mismatch".into()));
-        }
-        // Interleaved pairing: inverse rotation swaps the sign of the sin term.
-        let mut dx = vec![0.0f32; g.len()];
-        for i in (0..g.len()).step_by(2) {
-            dx[i] = g[i] * c[i] + g[i + 1] * sn[i];
-            dx[i + 1] = -g[i] * sn[i] + g[i + 1] * c[i];
-        }
-        let storage = self.from_cpu(&dx, out_shape, DType::F32)?;
-        Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
+        let g_s = out_grad.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rope_backward: grad is not VulkanStorage".into()))?;
+        let c_s = cos.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rope_backward: cos is not VulkanStorage".into()))?;
+        let s_s = sin.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rope_backward: sin is not VulkanStorage".into()))?;
+
+        let total = out_shape.elem_count();
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard.as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let dx = VulkanStorage::alloc_device_local_gpu(
+            out_shape, DType::F32, ctx.device, ctx.physical_device,
+        )?;
+
+        let buffers = [g_s.buffer, c_s.buffer, s_s.buffer, dx.buffer];
+        let grid_x = total.div_ceil(256) as u32;
+        let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::RopeBackward,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     /// Embedding backward: scatter-add `dweight[token_ids[t], :] += out_grad[t, :]`.
@@ -5920,6 +5940,7 @@ pub enum VulkanKernel {
     Sqrt,
     Recip,
     Rope,
+    RopeBackward,
     /// Partial-rotary + YaRN RoPE. Same 3-binding layout as `Rope`; the YaRN
     /// ramp + `mscale` are recomputed inside the shader from push-constant
     /// scalars so no `inv_freq` buffer is needed.
@@ -6019,6 +6040,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Sqrt => SPIRV_SQRT,
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
+        VulkanKernel::RopeBackward => SPIRV_ROPE_BACKWARD,
         VulkanKernel::RopeYarn => SPIRV_ROPE_YARN,
         VulkanKernel::Rerope => SPIRV_REROPE,
         VulkanKernel::FusedDequantGemmQ4K => SPIRV_FUSED_DEQUANT_GEMM_Q4K,
@@ -6128,7 +6150,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedAdamw
         | VulkanKernel::MarlinGemm
         | VulkanKernel::SoftmaxMerge
-        | VulkanKernel::RwkvTimeMix => 4,
+        | VulkanKernel::RwkvTimeMix
+        | VulkanKernel::RopeBackward => 4,
         VulkanKernel::QkvAttentionPaged
         | VulkanKernel::QkvAttentionPagedSwa
         | VulkanKernel::TreeAttention
