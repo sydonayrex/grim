@@ -667,6 +667,8 @@ pub enum TransportProtocol {
     Tcp,
     /// Direct InfiniBand / RoCE RDMA transport (zero-copy memory registration).
     RdmaRoce,
+    /// Peer-to-peer / shared memory direct zero-copy VRAM or host-pinned pool transport.
+    SharedMemP2p,
     /// Unified Communication X (UCX) accelerated transport.
     UcxDirect,
 }
@@ -692,7 +694,7 @@ impl NetworkKvClient {
     }
 
     /// Resolve a target specifier into a `host:port` string.
-    fn resolve_addr(target_ip: &str) -> String {
+    pub(crate) fn resolve_addr(target_ip: &str) -> String {
         if target_ip.contains(':') {
             target_ip.to_string()
         } else {
@@ -701,18 +703,77 @@ impl NetworkKvClient {
     }
 
     /// Dispatches a KV block key/value payload buffer to a target remote IP
-    /// endpoint over a TCP/network stream using the V3 wire protocol.
+    /// endpoint using the client's configured [`TransportProtocol`].
     ///
-    /// The protocol sends a 32-byte header (magic, version, block_id,
-    /// layer_idx, num_elements, checksum, num_tokens) followed by the raw f32
-    /// bytes of the key slice and then the value slice. The receiver answers
-    /// with a 1-header ACK once the block is committed (or rejected), so
-    /// `Ok(())` means the data actually landed — not just that the bytes
-    /// left the local socket buffer.
+    /// The V3 wire contract is transport-independent: a 32-byte header
+    /// (magic, version, block_id, layer_idx, num_elements, checksum,
+    /// num_tokens) followed by the raw f32 bytes of the key slice and then
+    /// the value slice; `Ok(())` means the data actually landed and was
+    /// committed by the receiver — not just that the bytes left the local
+    /// buffer.
     ///
     /// `num_tokens` is the block's valid token count; receivers store it
     /// verbatim instead of deriving it from the (zero-padded) payload length.
+    ///
+    /// Per-protocol behavior:
+    /// * `Tcp` — sockets, one ACK per block.
+    /// * `SharedMemP2p` — same-host file-inbox handoff (tmpfs-backed when
+    ///   `/dev/shm` is available); receiver consumption acts as the ACK.
+    ///   If the receiver has no active inbox the send **falls back to TCP**
+    ///   with a logged warning. Cross-host targets are a hard error.
+    /// * `RdmaRoce` / `UcxDirect` — explicit error: no hardware backend is
+    ///   implemented in this build, and silently downgrading RDMA to TCP
+    ///   would misrepresent the deployment.
     pub fn send_block_remote(
+        &self,
+        block_id: BlockId,
+        layer_idx: u32,
+        k: &[f32],
+        v: &[f32],
+        num_tokens: usize,
+        target_ip: &str,
+    ) -> Result<()> {
+        match self.protocol {
+            TransportProtocol::Tcp => {
+                self.send_block_tcp(block_id, layer_idx, k, v, num_tokens, target_ip)
+            }
+            TransportProtocol::SharedMemP2p => {
+                let item = KvBlockTransfer {
+                    block_id,
+                    layer_idx,
+                    k,
+                    v,
+                    num_tokens,
+                };
+                let shm = SharedMemWireTransport::default();
+                if let Err(shm_err) = shm.send_block(&item, target_ip) {
+                    eprintln!(
+                        "[grim-kvtransport] SharedMemP2p send for block {block_id} layer \
+                         {layer_idx} failed ({shm_err}); falling back to TCP"
+                    );
+                    return self.send_block_tcp(
+                        block_id,
+                        layer_idx,
+                        k,
+                        v,
+                        num_tokens,
+                        target_ip,
+                    );
+                }
+                Ok(())
+            }
+            TransportProtocol::RdmaRoce | TransportProtocol::UcxDirect => Err(Error::KvCache(
+                format!(
+                    "{:?} transport requested but no hardware backend is implemented in \
+                     this build; use Tcp or SharedMemP2p (same-host)",
+                    self.protocol
+                ),
+            )),
+        }
+    }
+
+    /// Plain-TCP V3 send: one connection, one message, one ACK.
+    fn send_block_tcp(
         &self,
         block_id: BlockId,
         layer_idx: u32,
@@ -768,7 +829,7 @@ impl NetworkKvClient {
     }
 
     /// Encode one V3 block message: header + little-endian K then V floats.
-    fn encode_block_message(
+    pub(crate) fn encode_block_message(
         block_id: BlockId,
         layer_idx: u32,
         k: &[f32],
@@ -820,7 +881,7 @@ impl NetworkKvClient {
     }
 
     /// Connect to a resolved `host:port` with the protocol's connect timeout.
-    fn connect_to(addr: &str, op: &str) -> Result<std::net::TcpStream> {
+    pub(crate) fn connect_to(addr: &str, op: &str) -> Result<std::net::TcpStream> {
         let socket_addr = addr
             .parse()
             .map_err(|e| Error::KvCache(format!("Invalid target IP address '{addr}': {e}")))?;
@@ -841,7 +902,7 @@ impl NetworkKvClient {
     }
 
     /// Write one message and wait for the receiver's 1-header ACK.
-    fn write_and_ack(
+    pub(crate) fn write_and_ack(
         stream: &mut std::net::TcpStream,
         msg: &[u8],
         block_id: u64,
@@ -856,7 +917,7 @@ impl NetworkKvClient {
     /// Read and validate one push-ACK header. `checksum == ACK_OK` means
     /// committed; `0` means the receiver rejected the message — a FINAL
     /// error (retrying can never succeed: the receiver refused the data).
-    fn read_ack(
+    pub(crate) fn read_ack(
         stream: &mut std::net::TcpStream,
         block_id: u64,
         layer_idx: u32,
@@ -1414,80 +1475,17 @@ where
                         break;
                     }
 
-                    // Verify the checksum over the RAW received bytes before
-                    // parsing: re-encoding parsed floats back to bytes is not
-                    // guaranteed to reproduce the wire representation for NaN
-                    // payloads (and is host-endian dependent). The sender
-                    // checksummed the exact bytes transmitted.
-                    let computed = compute_checksum_bytes(&payload);
-                    let k_bytes = &payload[..num_elems * 4];
-                    let v_bytes = &payload[num_elems * 4..];
-                    let k_data = parse_f32_slice(k_bytes);
-                    let v_data = parse_f32_slice(v_bytes);
-                    if computed != header.checksum {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: checksum mismatch \
-                             for block {} (expected {:#x}, got {:#x})",
-                            header.block_id, header.checksum, computed
-                        );
-                        send_ack(&mut stream, &header, false, 0);
-                        continue;
+                    // Verify + store via the shared push-path fn so the
+                    // TCP and shared-memory wire paths cannot drift.
+                    match store_push_payload(&pool, &header, &payload) {
+                        Ok(num_tokens) => {
+                            send_ack(&mut stream, &header, true, num_tokens as u32);
+                        }
+                        Err(PushRejection::Rejected) => {
+                            send_ack(&mut stream, &header, false, 0);
+                            continue;
+                        }
                     }
-
-                    // Write into the pool.
-                    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-                    if header.block_id >= guard.num_blocks() as u64 {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: block_id {} out of range",
-                            header.block_id
-                        );
-                        send_ack(&mut stream, &header, false, 0);
-                        continue;
-                    }
-                    let block_id = header.block_id as usize;
-                    let elem_per_token = guard.block_elem_per_token();
-                    // The sender computed `num_elems` using its OWN pool's
-                    // `block_elem_per_token()`. If that differs from this
-                    // receiver's value, the token count derived below is
-                    // wrong. Detect the mismatch (a sender/receiver
-                    // `elem_per_token` disagreement makes `num_elems`
-                    // non-divisible by the receiver's value) and warn, but
-                    // keep sizing off the receiver's value so the write
-                    // never overflows the block.
-                    if elem_per_token == 0 {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
-                             cannot size block {} — rejecting write",
-                            header.block_id
-                        );
-                        send_ack(&mut stream, &header, false, 0);
-                        continue;
-                    }
-                    if num_elems % elem_per_token != 0 {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: num_elements {num_elems} not \
-                             divisible by block_elem_per_token {elem_per_token} for block {} \
-                             — possible sender/receiver elem_per_token mismatch; using \
-                             receiver value",
-                            header.block_id
-                        );
-                    }
-                    // V3 senders carry the block's true valid token count;
-                    // cap it at what the payload can back (and at block
-                    // size). A zero field means a legacy V2-style sender —
-                    // fall back to the payload-derived count.
-                    let derived = num_elems
-                        .checked_div(elem_per_token)
-                        .unwrap_or(num_elems)
-                        .min(guard.block_size());
-                    let num_tokens = if header.num_tokens > 0 {
-                        (header.num_tokens as usize).min(derived)
-                    } else {
-                        derived
-                    };
-                    guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
-                    guard.write_layer_values(block_id, header.layer_idx, &v_data);
-                    send_ack(&mut stream, &header, true, num_tokens as u32);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1887,6 +1885,417 @@ impl EmbeddingSpillManager {
     }
 }
 
+// ── Wire transports ──────────────────────────────────────────────────────────
+//
+// `TransportProtocol` variants map onto concrete senders here. TCP is the
+// portable baseline; `SharedMemP2p` is the same-host fast path (tmpfs-backed
+// file handoff when `/dev/shm` is available); RDMA/UCX stay explicitly
+// unimplemented rather than silently downgrading to TCP.
+
+/// Transport-agnostic single-block send. Implementations must preserve the
+/// V3 contract: `send_block` returns `Ok` only after the receiver committed
+/// the payload.
+pub trait KvWireTransport: Send + Sync {
+    /// Protocol this transport implements.
+    fn protocol(&self) -> TransportProtocol;
+    /// Transfer one KV block payload to the receiver at `addr`.
+    fn send_block(&self, item: &KvBlockTransfer<'_>, addr: &str) -> Result<()>;
+}
+
+/// TCP V3 baseline: one connection, one message, one ACK.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpWireTransport;
+
+impl KvWireTransport for TcpWireTransport {
+    fn protocol(&self) -> TransportProtocol {
+        TransportProtocol::Tcp
+    }
+
+    fn send_block(&self, item: &KvBlockTransfer<'_>, addr: &str) -> Result<()> {
+        let msg = NetworkKvClient::encode_block_message(
+            item.block_id,
+            item.layer_idx,
+            item.k,
+            item.v,
+            item.num_tokens,
+        )?;
+        let resolved = NetworkKvClient::resolve_addr(addr);
+        let mut stream = NetworkKvClient::connect_to(&resolved, "send block")?;
+        NetworkKvClient::write_and_ack(&mut stream, &msg, item.block_id as u64, item.layer_idx)
+    }
+}
+
+/// Same-host shared-memory handoff. Payloads are the *same V3 wire bytes*
+/// the TCP path sends, published atomically (tmp file + rename) into the
+/// receiver's inbox directory; the receiver consuming the file acts as the
+/// ACK. On Linux the inbox lives under `/dev/shm` when available, so the
+/// handoff never touches a socket or a disk platter.
+#[derive(Debug, Clone)]
+pub struct SharedMemWireTransport {
+    /// How long to wait for the receiver to consume the handoff file.
+    pub ack_timeout: std::time::Duration,
+}
+
+impl Default for SharedMemWireTransport {
+    fn default() -> Self {
+        Self {
+            ack_timeout: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+/// Root directory for shared-memory KV inboxes. Overridable with
+/// `GRIM_SHM_DIR`; defaults to `/dev/shm` when present (RAM-backed), else
+/// the OS temp dir.
+pub fn shm_root() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("GRIM_SHM_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let dev_shm = std::path::PathBuf::from("/dev/shm");
+    if dev_shm.is_dir() {
+        return dev_shm.join("grim-kv");
+    }
+    std::env::temp_dir().join("grim-kv-shm")
+}
+
+/// Deterministic inbox directory for the receiver listening on `port`.
+pub fn shm_inbox_for_port(port: u16) -> std::path::PathBuf {
+    shm_root().join(format!("kv_{port}"))
+}
+
+fn shm_is_same_host(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0")
+}
+
+static SHM_HANDOFF_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl KvWireTransport for SharedMemWireTransport {
+    fn protocol(&self) -> TransportProtocol {
+        TransportProtocol::SharedMemP2p
+    }
+
+    fn send_block(&self, item: &KvBlockTransfer<'_>, addr: &str) -> Result<()> {
+        use std::io::Write;
+
+        let resolved = NetworkKvClient::resolve_addr(addr);
+        if !shm_is_same_host(&resolved) {
+            return Err(Error::KvCache(format!(
+                "SharedMemP2p target {resolved} is not a same-host endpoint; \
+                 shared-memory handoff cannot cross machines"
+            )));
+        }
+        let port: u16 = resolved
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| Error::KvCache(format!("SharedMemP2p: cannot parse port from {resolved}")))?;
+        let inbox = shm_inbox_for_port(port);
+        // The `active` marker is written by `start_shm_inbox_poller`; its
+        // absence means no receiver is picking up this inbox and the caller
+        // should fall back to TCP (or fail loudly under an explicit policy).
+        if !inbox.join("active").exists() {
+            return Err(Error::KvCache(format!(
+                "SharedMemP2p: no active receiver inbox at {}",
+                inbox.display()
+            )));
+        }
+
+        // Same wire bytes as TCP: header + K + V. The poller reuses the
+        // shared push-path validation, so both transports accept exactly
+        // the same payloads.
+        let wire = NetworkKvClient::encode_block_message(
+            item.block_id,
+            item.layer_idx,
+            item.k,
+            item.v,
+            item.num_tokens,
+        )?;
+
+        let seq = SHM_HANDOFF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(
+            "pending_{}_{}_{}_{}.bin",
+            item.block_id,
+            item.layer_idx,
+            std::process::id(),
+            seq
+        );
+        let tmp_path = inbox.join(format!("{name}.tmp"));
+        let path = inbox.join(&name);
+        {
+            let mut f = std::fs::File::create(&tmp_path)
+                .map_err(|e| Error::KvCache(format!("SharedMemP2p: create handoff file: {e}")))?;
+            f.write_all(&wire)
+                .map_err(|e| Error::KvCache(format!("SharedMemP2p: write handoff file: {e}")))?;
+            f.sync_all()
+                .map_err(|e| Error::KvCache(format!("SharedMemP2p: sync handoff file: {e}")))?;
+        }
+        // Atomic publish: the poller only ever sees complete files.
+        std::fs::rename(&tmp_path, &path)
+            .map_err(|e| Error::KvCache(format!("SharedMemP2p: publish handoff: {e}")))?;
+
+        // Consumption = ACK; an explicit `rejected_` rename = NAK.
+        let rejected = inbox.join(format!("rejected_{name}"));
+        let deadline = std::time::Instant::now() + self.ack_timeout;
+        loop {
+            if !path.exists() {
+                return Ok(());
+            }
+            if rejected.exists() {
+                let _ = std::fs::remove_file(&rejected);
+                return Err(Error::KvCache(format!(
+                    "SharedMemP2p: receiver rejected block {} layer {}",
+                    item.block_id, item.layer_idx
+                )));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = std::fs::remove_file(&path);
+                return Err(Error::KvCache(format!(
+                    "SharedMemP2p: receiver did not consume block {} layer {} within {:?}",
+                    item.block_id, item.layer_idx, self.ack_timeout
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+/// Why a push payload was not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushRejection {
+    /// Checksum, range, or sizing failure — safe to keep the wire path alive
+    /// (TCP drain loop continues; shm file is quarantined as `rejected_`).
+    Rejected,
+}
+
+/// Verify + store one V3 push payload. Shared by the TCP accept loop and the
+/// shared-memory inbox poller so the two wire paths cannot drift apart on
+/// validation or store semantics.
+fn store_push_payload<T: KvBlockStore>(
+    pool: &std::sync::Arc<std::sync::Mutex<T>>,
+    header: &KvBlockHeader,
+    payload: &[u8],
+) -> std::result::Result<usize, PushRejection> {
+    // Verify the checksum over the RAW received bytes before parsing:
+    // re-encoding parsed floats back to bytes is not guaranteed to reproduce
+    // the wire representation for NaN payloads (and is host-endian
+    // dependent). The sender checksummed the exact bytes transmitted.
+    let computed = compute_checksum_bytes(payload);
+    if computed != header.checksum {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: checksum mismatch \
+             for block {} (expected {:#x}, got {:#x})",
+            header.block_id, header.checksum, computed
+        );
+        return Err(PushRejection::Rejected);
+    }
+    let num_elems = header.num_elements as usize;
+    let k_bytes = &payload[..num_elems * 4];
+    let v_bytes = &payload[num_elems * 4..];
+    let k_data = parse_f32_slice(k_bytes);
+    let v_data = parse_f32_slice(v_bytes);
+
+    // Write into the pool.
+    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+    if header.block_id >= guard.num_blocks() as u64 {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: block_id {} out of range",
+            header.block_id
+        );
+        return Err(PushRejection::Rejected);
+    }
+    let block_id = header.block_id as usize;
+    let elem_per_token = guard.block_elem_per_token();
+    // The sender computed `num_elems` using its OWN pool's
+    // `block_elem_per_token()`. If that differs from this receiver's value,
+    // the token count derived below is wrong. Detect the mismatch and warn,
+    // but keep sizing off the receiver's value so the write never overflows
+    // the block.
+    if elem_per_token == 0 {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
+             cannot size block {} — rejecting write",
+            header.block_id
+        );
+        return Err(PushRejection::Rejected);
+    }
+    if num_elems % elem_per_token != 0 {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: num_elements {num_elems} not \
+             divisible by block_elem_per_token {elem_per_token} for block {} \
+             — possible sender/receiver elem_per_token mismatch; using \
+             receiver value",
+            header.block_id
+        );
+    }
+    // V3 senders carry the block's true valid token count; cap it at what
+    // the payload can back (and at block size). A zero field means a legacy
+    // V2-style sender — fall back to the payload-derived count.
+    let derived = num_elems
+        .checked_div(elem_per_token)
+        .unwrap_or(num_elems)
+        .min(guard.block_size());
+    let num_tokens = if header.num_tokens > 0 {
+        (header.num_tokens as usize).min(derived)
+    } else {
+        derived
+    };
+    guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
+    guard.write_layer_values(block_id, header.layer_idx, &v_data);
+    Ok(num_tokens)
+}
+
+/// Consume one handoff file: validate + store, then either remove it (ACK)
+/// or quarantine it as `rejected_*` (NAK) so the sender's poll observes a
+/// definitive answer.
+fn consume_shm_handoff<T: KvBlockStore>(
+    path: &std::path::Path,
+    pool: &std::sync::Arc<std::sync::Mutex<T>>,
+) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return, // sender cleaned it up mid-poll; not an error
+    };
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let rejected_path = path.with_file_name(format!("rejected_{file_name}"));
+
+    let reject = |why: String| {
+        eprintln!(
+            "[grim-kvtransport] shm inbox: rejecting {}: {why}",
+            path.display()
+        );
+        let _ = std::fs::rename(path, &rejected_path);
+    };
+
+    if bytes.len() < KvBlockHeader::SIZE {
+        reject("handoff file shorter than a V3 header".into());
+        return;
+    }
+    let header = match KvBlockHeader::deserialize(&bytes[..KvBlockHeader::SIZE]) {
+        Some(h) => h,
+        None => {
+            reject("invalid V3 header".into());
+            return;
+        }
+    };
+    if !header.verify() {
+        reject("protocol mismatch (bad magic/version)".into());
+        return;
+    }
+    // Push-only path: fetch requests and prompt control messages stay on
+    // TCP by design (fetch needs a reply stream; prompts use the channel).
+    if header.layer_idx & (FETCH_REQUEST_FLAG | PROMPT_FLAG) != 0 {
+        reject("flagged control/fetch message over shm inbox".into());
+        return;
+    }
+    if header.layer_idx > MAX_WIRE_LAYER_IDX {
+        reject(format!("layer_idx {} exceeds cap", header.layer_idx));
+        return;
+    }
+    let num_elems = header.num_elements as usize;
+    if num_elems > 100_000_000 {
+        reject(format!("num_elements {num_elems} exceeds safety cap"));
+        return;
+    }
+    let total_bytes = match num_elems.checked_mul(8) {
+        Some(b) => b,
+        None => {
+            reject("num_elements * 8 overflowed".into());
+            return;
+        }
+    };
+    if bytes.len() != KvBlockHeader::SIZE + total_bytes {
+        reject(format!(
+            "payload length {} does not match header framing {}",
+            bytes.len() - KvBlockHeader::SIZE,
+            total_bytes
+        ));
+        return;
+    }
+    let payload = &bytes[KvBlockHeader::SIZE..];
+    match store_push_payload(pool, &header, payload) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(path); // consumption = ACK
+        }
+        Err(PushRejection::Rejected) => {
+            reject("store rejected the payload".into());
+        }
+    }
+}
+
+/// Start a polling receiver for [`SharedMemWireTransport`] handoffs addressed
+/// to `listen_addr`'s port. Every consumed file is validated and stored with
+/// the exact same [`store_push_payload`] semantics as the TCP accept loop.
+/// The poller runs until `stop` flips, then removes its inbox marker.
+///
+/// Requires an explicit port in `listen_addr` (`:0` cannot have a
+/// deterministic inbox address).
+pub fn start_shm_inbox_poller<T: KvBlockStore + 'static>(
+    listen_addr: &str,
+    pool: std::sync::Arc<std::sync::Mutex<T>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+
+    let port: u16 = listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| {
+            Error::KvCache(format!(
+                "start_shm_inbox_poller: cannot parse explicit port from {listen_addr}"
+            ))
+        })?;
+    if port == 0 {
+        return Err(Error::KvCache(
+            "start_shm_inbox_poller: shared-memory inbox requires an explicit (non-zero) \
+             port so senders can address it deterministically"
+                .into(),
+        ));
+    }
+
+    let inbox = shm_inbox_for_port(port);
+    std::fs::create_dir_all(&inbox)
+        .map_err(|e| Error::KvCache(format!("shm inbox create {}: {e}", inbox.display())))?;
+    std::fs::write(
+        inbox.join("active"),
+        format!("pid={}\n", std::process::id()),
+    )
+    .map_err(|e| Error::KvCache(format!("shm inbox marker write: {e}")))?;
+
+    Ok(std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let mut handoffs: Vec<std::path::PathBuf> = match std::fs::read_dir(&inbox) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().starts_with("pending_"))
+                            .unwrap_or(false)
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            handoffs.sort();
+            for path in handoffs {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                consume_shm_handoff(&path, &pool);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let _ = std::fs::remove_file(inbox.join("active"));
+        // Best-effort teardown so ephemeral test/service ports don't leak
+        // inbox directories in /dev/shm.
+        let _ = std::fs::remove_dir_all(&inbox);
+        eprintln!("[grim-kvtransport] shm inbox poller for port {port} stopped");
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2121,6 +2530,108 @@ mod tests {
             !msg.contains("fabricated"),
             "error must not reference fabricated data: {msg}"
         );
+    }
+
+    /// `SharedMemP2p` round-trip gate: sender → inbox file → poller → store,
+    /// with byte-identical K/V and consumption-as-ACK semantics.
+    #[test]
+    fn shm_transport_roundtrip_via_inbox_poller() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(4)));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poller = start_shm_inbox_poller(&addr, store.clone(), stop.clone()).unwrap();
+
+        // The `active` marker must exist before sending — its absence is the
+        // sender's signal to fall back to TCP, which would defeat this test.
+        let inbox = shm_inbox_for_port(port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !inbox.join("active").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shm inbox never became active at {}",
+                inbox.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let client = NetworkKvClient::with_protocol(
+            "127.0.0.1".to_string(),
+            TransportProtocol::SharedMemP2p,
+        );
+        let k: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let v: Vec<f32> = (0..16).map(|i| -(i as f32)).collect();
+        // Layer 0: `WireTestStore` rides the trait's default layer-write
+        // impl, which only lands data at layer 0.
+        client
+            .send_block_remote(7, 0, &k, &v, 4, &addr)
+            .expect("shm send must land in the polled inbox");
+
+        {
+            let guard = store.lock().unwrap();
+            assert!(guard.block_is_received(7), "block must be stored");
+            let (got_k, got_v) = guard.blocks.get(&7).expect("block present");
+            assert_eq!(got_k, &k, "keys must be byte-identical");
+            assert_eq!(got_v, &v, "values must be byte-identical");
+            assert_eq!(guard.write_count, 1, "exactly one store write");
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = poller.join();
+        assert!(!inbox.join("active").exists(), "poller must clear its marker");
+    }
+
+    /// No active inbox → `SharedMemP2p` must fall back to TCP and still
+    /// deliver (graceful-degradation contract), not hang or drop.
+    #[test]
+    fn shm_transport_falls_back_to_tcp_without_poller() {
+        let port = find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(4)));
+        let (_handle, stop) = start_kv_receiver_server_stoppable(
+            &addr,
+            store.clone(),
+            PromptChannel::new(),
+        )
+        .unwrap();
+
+        let client = NetworkKvClient::with_protocol(
+            "127.0.0.1".to_string(),
+            TransportProtocol::SharedMemP2p,
+        );
+        let k: Vec<f32> = (0..16).map(|i| 100.0 + i as f32).collect();
+        let v: Vec<f32> = (0..16).map(|i| 200.0 + i as f32).collect();
+        client
+            .send_block_remote(11, 0, &k, &v, 4, &addr)
+            .expect("fallback send must succeed over TCP");
+
+        let guard = store.lock().unwrap();
+        assert!(guard.block_is_received(11));
+        let (got_k, got_v) = guard.blocks.get(&11).expect("block present");
+        assert_eq!(got_k, &k);
+        assert_eq!(got_v, &v);
+        drop(guard);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// RDMA/UCX stay honestly unimplemented: explicit error, never a silent
+    /// TCP downgrade that would misrepresent the deployment.
+    #[test]
+    fn rdma_and_ucx_protocols_are_explicitly_unsupported() {
+        for protocol in [
+            TransportProtocol::RdmaRoce,
+            TransportProtocol::UcxDirect,
+        ] {
+            let client =
+                NetworkKvClient::with_protocol("127.0.0.1".to_string(), protocol);
+            let res = client.send_block_remote(1, 0, &[1.0], &[1.0], 1, "127.0.0.1:1");
+            let err = res.expect_err("hardware transports must error without a backend");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no hardware backend"),
+                "{protocol:?} error must be the explicit unsupported error: {msg}"
+            );
+        }
     }
 
     /// F8/F10: the receiver server must ANSWER fetch requests from the

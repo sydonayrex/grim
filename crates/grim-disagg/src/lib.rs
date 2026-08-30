@@ -873,13 +873,21 @@ pub struct KvReceiverServer {
     /// (`NetworkKvClient::send_prompt_tokens` → `PROMPT_FLAG` protocol).
     prompts: PromptChannel,
     stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Stop flag for the shared-memory inbox poller (`SharedMemP2p`
+    /// handoffs). `None` when the listen address had no explicit port.
+    shm_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl KvReceiverServer {
     /// Start a KV receiver server on `listen_addr` that writes into `pool`.
     /// Prompt-token control messages are collected in an internal
     /// [`PromptChannel`] — read them via [`KvReceiverServer::take_prompt_tokens`].
+    ///
+    /// Also starts the same-host shared-memory inbox poller when the listen
+    /// address carries an explicit port, so `SharedMemP2p` senders can hand
+    /// off without touching a socket; TCP senders are unaffected.
     pub fn new(listen_addr: &str, pool: Arc<Mutex<KvBlockPool>>) -> Result<Self> {
+        use std::sync::atomic::AtomicBool;
         let prompts = PromptChannel::new();
         // The receiver thread is detached: dropping the server signals the
         // stop flag (see Drop), and the accept loop exits on its next poll.
@@ -888,11 +896,34 @@ impl KvReceiverServer {
             pool.clone(),
             prompts.clone(),
         )?;
+
+        let shm_stop =
+            match listen_addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                Some(port) if port != 0 => {
+                    let flag = Arc::new(AtomicBool::new(false));
+                    match grim_kvtransport::start_shm_inbox_poller(
+                        listen_addr,
+                        pool.clone(),
+                        flag.clone(),
+                    ) {
+                        Ok(_handle) => Some(flag),
+                        Err(e) => {
+                            eprintln!(
+                                "[grim-disagg] shm inbox poller disabled for {listen_addr}: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
         Ok(Self {
             listen_addr: listen_addr.to_string(),
             pool,
             prompts,
             stop: Some(stop),
+            shm_stop,
         })
     }
 
@@ -914,6 +945,9 @@ impl KvReceiverServer {
 impl Drop for KvReceiverServer {
     fn drop(&mut self) {
         if let Some(stop) = &self.stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(stop) = &self.shm_stop {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }

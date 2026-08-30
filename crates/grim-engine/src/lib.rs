@@ -2,6 +2,7 @@
 pub mod cache_blend;
 pub mod model_loader;
 pub mod packing;
+pub mod pipeline_engine;
 pub mod pipelines;
 pub mod rope_scaling;
 /// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
@@ -10,6 +11,7 @@ pub mod scythe2;
 pub mod scythe_ab;
 pub mod speculative_loop;
 pub mod streaming_forward;
+pub mod tp_layers;
 /// P2: packed-step training driver (varlen grouping + one optimizer step per group).
 pub mod train_packed;
 
@@ -1315,6 +1317,164 @@ impl Engine {
         self.adapters.values().find(|a| a.name == name)
     }
 
+    /// Apply fused batched multi-LoRA (S-LoRA / Punica style) deltas to a
+    /// stacked logits matrix, in place.
+    ///
+    /// Each maximal run of equal adapter ids in `row_adapters` becomes one
+    /// segment; adapter 0 marks base-model rows, which are passed through
+    /// untouched. On a ROCm-configured engine the segments run on-device in
+    /// a single residency (one upload of X/Y, one shrink+expand kernel pair
+    /// per segment); any device failure falls back to the CPU reference with
+    /// a logged warning — never silently.
+    ///
+    /// # Contract (MED-5 surrogate)
+    /// `stacked` is the base logits matrix itself: `[rows, dim]` where `dim`
+    /// is the logits width. This mirrors `apply_adapters_to_logits`, which
+    /// uses the final logits row as a surrogate hidden state, so an adapter
+    /// whose A in_dim / B out_dim differs from `dim` is a loud config error,
+    /// not a silent wrong-shape read.
+    pub fn apply_batched_lora_to_rows(
+        &self,
+        stacked: &mut [f32],
+        row_adapters: &[u32],
+        dim: usize,
+        device: Option<&grim_tensor::dtype::Device>,
+    ) -> Result<()> {
+        if dim == 0 {
+            return Err(Error::Config(
+                "apply_batched_lora_to_rows: logits width must be > 0".into(),
+            ));
+        }
+        let rows = stacked.len() / dim;
+        if rows * dim != stacked.len() || row_adapters.len() != rows {
+            return Err(Error::Config(format!(
+                "apply_batched_lora_to_rows: stacked len {} not rows*dim \
+                 (rows from adapters: {}) * dim {dim}",
+                stacked.len(),
+                row_adapters.len()
+            )));
+        }
+
+        // Resolve every non-base segment to (kernel segment, A, B) up front
+        // so weight-download failures surface before any device work.
+        let mut prepared: Vec<(
+            grim_backend_rocm::kernels::batched_lora::BatchedLoraSegment,
+            Vec<f32>,
+            Vec<f32>,
+        )> = Vec::new();
+        for seg in grim_scheduler::LoraRowSegment::plan_for_rows(row_adapters) {
+            if seg.adapter_id == 0 || seg.row_count == 0 {
+                continue;
+            }
+            let Some(loaded) = self.adapters.get(&seg.adapter_id) else {
+                return Err(Error::Config(format!(
+                    "apply_batched_lora_to_rows: unknown adapter id {}",
+                    seg.adapter_id
+                )));
+            };
+            let a_vec = loaded.handle.a.to_vec_f32()?;
+            let b_vec = loaded.handle.b.to_vec_f32()?;
+            let rank = loaded.handle.a.shape().dim(0)?;
+            let in_dim = loaded.handle.a.shape().dim(1)?;
+            let out_dim = loaded.handle.b.shape().dim(0)?;
+            if in_dim != dim || out_dim != dim {
+                return Err(Error::Config(format!(
+                    "apply_batched_lora_to_rows: adapter {} A[{rank},{in_dim}] B[{out_dim},{rank}] \
+                     is incompatible with logits width {dim} (surrogate contract: in_dim == out_dim == dim)",
+                    seg.adapter_id
+                )));
+            }
+            let scaling = loaded.handle.alpha / (rank as f32).max(1.0);
+            prepared.push((
+                grim_backend_rocm::kernels::batched_lora::BatchedLoraSegment {
+                    adapter_id: seg.adapter_id,
+                    token_start: seg.row_start,
+                    token_count: seg.row_count,
+                    rank,
+                    scaling,
+                },
+                a_vec,
+                b_vec,
+            ));
+        }
+        if prepared.is_empty() {
+            return Ok(());
+        }
+
+        // GPU path first (fewer D2H/H2D round-trips than the legacy
+        // per-request logits apply); CPU reference is the portable fallback.
+        if let Some(grim_tensor::dtype::Device::Rocm(ordinal)) = device {
+            if grim_backend_rocm::device::roc_device::RocmDevice::probe_one(*ordinal)
+                .unwrap_or(false)
+            {
+                let device = grim_backend_rocm::device::roc_device::RocmDevice::new(*ordinal);
+                let x = stacked.to_vec();
+                let groups = prepared
+                    .iter()
+                    .map(|(seg, a, b)| {
+                        grim_backend_rocm::kernels::batched_lora::BatchedLoraGroup {
+                            segment: seg.clone(),
+                            a_weights: a,
+                            b_weights: b,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                match grim_backend_rocm::kernels::batched_lora::batched_lora_group_device(
+                    &device, &x, stacked, dim, dim, &groups,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        log::warn!(
+                            "[grim-engine] batched LoRA device dispatch failed (ordinal \
+                             {ordinal}), falling back to CPU reference: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let x = stacked.to_vec();
+        for (seg, a, b) in &prepared {
+            grim_backend_rocm::kernels::batched_lora::batched_lora_accumulate_cpu(
+                &x, stacked, dim, dim, seg, a, b,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild a logits tensor with `data` contents on the same device,
+    /// dtype and provenance as `like`, so downstream device-resident
+    /// sampling (WI-X3) keeps working after the batched LoRA pass.
+    fn logits_tensor_like(
+        data: Vec<f32>,
+        shape: grim_tensor::Shape,
+        like: &grim_tensor::Tensor,
+    ) -> Result<grim_tensor::Tensor> {
+        if like.device().is_cpu() {
+            let storage = Arc::new(grim_backend_cpu::storage::CpuStorage::new(
+                data,
+                shape.clone(),
+                grim_tensor::DType::F32,
+            ));
+            return Ok(grim_tensor::Tensor::new(
+                storage,
+                shape,
+                grim_tensor::DType::F32,
+                like.provenance().clone(),
+                like.device().clone(),
+            ));
+        }
+        let dev = grim_nn::modules::pick_device_for_tensor(like);
+        let storage = dev.from_cpu(&data, &shape, grim_tensor::dtype::DType::F32)?;
+        Ok(grim_tensor::Tensor::new(
+            std::sync::Arc::from(storage),
+            shape,
+            grim_tensor::dtype::DType::F32,
+            like.provenance().clone(),
+            like.device().clone(),
+        ))
+    }
+
     /// Fresh adapter id: max existing + 1. (`adapter_count() + 1` would reuse
     /// ids freed by `drop_adapter`, silently aliasing stale references.)
     pub fn next_adapter_id(&self) -> u32 {
@@ -1780,10 +1940,6 @@ impl Engine {
         input_ids: &grim_tensor::Tensor,
         positions: &grim_tensor::Tensor,
     ) -> Result<StepOutcome> {
-        // SCYTHE-2 farm mode: a pinned request executes on its replica, not
-        // the base registration (same weights, different device).
-        let model_id = self.effective_model_id(request_id, model_id);
-        let model_id = model_id.as_str();
         // Resolve adapters for this specific request from the adapter registry
         let adapter_ids = self
             .request_adapters
@@ -1791,6 +1947,30 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         let adapters = { self.resolve_adapters(&adapter_ids).unwrap_or_default() };
+        self.drive_forward_with_adapters(
+            model_id,
+            request_id,
+            input_ids,
+            positions,
+            &adapters,
+        )
+    }
+
+    /// `drive_forward` with explicit adapters: the batched-LoRA decode pass
+    /// (`step_batch`) drives *base* forwards through this with `&[]` and
+    /// applies adapter deltas once per adapter segment afterwards.
+    fn drive_forward_with_adapters(
+        &mut self,
+        model_id: &str,
+        request_id: u64,
+        input_ids: &grim_tensor::Tensor,
+        positions: &grim_tensor::Tensor,
+        adapters: &[AdapterHandle],
+    ) -> Result<StepOutcome> {
+        // SCYTHE-2 farm mode: a pinned request executes on its replica, not
+        // the base registration (same weights, different device).
+        let model_id = self.effective_model_id(request_id, model_id);
+        let model_id = model_id.as_str();
         let was_speculative_path = match self.models.get(model_id) {
             Some(m) => m.model.strategy() != Strategy::Plain,
             None => return Err(Error::Config(format!("unknown model {model_id}"))),
@@ -1811,7 +1991,7 @@ impl Engine {
             positions,
             live,
             self.scheduler.running.len(),
-            &adapters,
+            adapters,
         )?;
         // MIN-2: Report the actual accepted token count from the session
         // (set by the speculative wrapper's decode_one). Non-speculative
@@ -1843,16 +2023,201 @@ impl Engine {
     ///
     /// Drives decoding across up to N requests in a single scheduling tick,
     /// returning each request's corresponding StepOutcome.
+    ///
+    /// Batched multi-LoRA (§4.5, S-LoRA/Punica style) is applied here in two
+    /// phases so heterogeneous adapters share one kernel dispatch per adapter
+    /// segment instead of one per-request logits pass:
+    ///
+    ///   Phase A — per item, drive a *base* forward (no adapters) and stage
+    ///     the request's logits rows plus its primary adapter id. Only
+    ///     `Strategy::Plain` items with at most one adapter take this path;
+    ///     speculative strategies and multi-adapter requests keep the legacy
+    ///     per-request path (adapters applied inside `decode_one`), which
+    ///     their draft/verify loops depend on.
+    ///   Phase B — per model group, stack the staged rows, plan contiguous
+    ///     row segments from the actual batch layout, and apply all segments
+    ///     in one batched call (`Engine::apply_batched_lora_to_rows`).
+    ///
+    /// Zero-adapter requests go through phase A too (their rows pass through
+    /// the batched apply untouched), so every plain-decode item shares the
+    /// same code path and ordering is deterministic.
     pub fn step_batch(
         &mut self,
         items: &[(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)],
     ) -> Result<Vec<(u64, StepOutcome)>> {
-        let mut results = Vec::with_capacity(items.len());
-        for &(req_id, model_id, input_ids, positions) in items {
-            let outcome = self.step_one(req_id, model_id, input_ids, positions)?;
-            results.push((req_id, outcome));
+        #[derive(Clone)]
+        enum Slot {
+            /// Fully stepped in phase A (legacy path or no logits).
+            Done(u64, StepOutcome),
+            /// Base logits staged; adapter delta applied in phase B.
+            Staged {
+                request_id: u64,
+                model_id: String,
+                base: Arc<grim_tensor::Tensor>,
+                adapter: u32,
+                accepted_tokens: usize,
+            },
         }
-        Ok(results)
+        let mut slots: Vec<Slot> = Vec::with_capacity(items.len());
+
+        for &(req_id, model_id, input_ids, positions) in items {
+            let effective = self.effective_model_id(req_id, model_id);
+            let strategy_plain = self
+                .models
+                .get(&effective)
+                .map(|m| m.model.strategy() == Strategy::Plain)
+                .unwrap_or(false);
+            let adapter_ids = self
+                .request_adapters
+                .get(&req_id)
+                .cloned()
+                .unwrap_or_default();
+
+            if !strategy_plain || adapter_ids.len() > 1 {
+                // Legacy path: adapters applied inside decode_one.
+                let outcome = self.drive_forward(model_id, req_id, input_ids, positions)?;
+                slots.push(Slot::Done(req_id, outcome));
+                continue;
+            }
+
+            // Batched-LoRA path: base forward now, delta applied per segment.
+            let outcome = self.drive_forward_with_adapters(
+                model_id,
+                req_id,
+                input_ids,
+                positions,
+                &[],
+            )?;
+            let Some(base) = outcome.logits else {
+                slots.push(Slot::Done(req_id, outcome));
+                continue;
+            };
+            slots.push(Slot::Staged {
+                request_id: req_id,
+                model_id: effective,
+                base,
+                adapter: adapter_ids.first().copied().unwrap_or(0),
+                accepted_tokens: outcome.accepted_tokens,
+            });
+        }
+
+        // Phase B: group staged rows by model (vocab is per-model constant),
+        // stable-sort by adapter id so equal ids are contiguous, apply once.
+        let mut staged_count = 0usize;
+        let mut group_order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (slot_idx, slot) in slots.iter().enumerate() {
+            let Slot::Staged { model_id, .. } = slot else {
+                continue;
+            };
+            staged_count += 1;
+            let entry = groups
+                .entry(model_id.clone())
+                .or_insert_with(|| {
+                    group_order.push(model_id.clone());
+                    Vec::new()
+                });
+            entry.push(slot_idx);
+        }
+
+        if staged_count > 0 {
+            // Scratch space per group: (slot index, staged rows, adapter id).
+            let mut stacked: Vec<f32> = Vec::new();
+            let mut row_adapters: Vec<u32> = Vec::new();
+            let mut layout: Vec<(usize, usize)> = Vec::new();
+
+            for model_id in &group_order {
+                let slot_idxs = &groups[model_id];
+                let mut sorted: Vec<usize> = slot_idxs.clone();
+                let adapter_of = |s: &Slot| match s {
+                    Slot::Staged { adapter, .. } => *adapter,
+                    Slot::Done(..) => 0,
+                };
+                sorted.sort_by_key(|&i| adapter_of(&slots[i]));
+
+                // Group width: every staged tensor of the same model shares
+                // its vocab. A mismatch would mean cross-model corruption —
+                // fail loudly instead.
+                let dim_of = |s: &Slot| -> usize {
+                    match s {
+                        Slot::Staged { base, .. } => {
+                            base.shape().dims().last().copied().unwrap_or(0)
+                        }
+                        Slot::Done(..) => 0,
+                    }
+                };
+                let dim = dim_of(&slots[sorted[0]]);
+                if dim == 0 {
+                    return Err(Error::Config(format!(
+                        "step_batch: model {model_id} produced a zero-width logits row"
+                    )));
+                }
+
+                stacked.clear();
+                row_adapters.clear();
+                layout.clear();
+                for &i in &sorted {
+                    let Slot::Staged { base, .. } = &slots[i] else {
+                        continue;
+                    };
+                    let rows = base.shape().elem_count() / dim;
+                    let data = base.to_vec_f32()?;
+                    if data.len() != rows * dim {
+                        return Err(Error::Config(format!(
+                            "step_batch: model {model_id} staged logits len {} is not \
+                             rows*{dim} — refusing to stack",
+                            data.len()
+                        )));
+                    }
+                    stacked.extend_from_slice(&data);
+                    let adapter = adapter_of(&slots[i]);
+                    row_adapters.extend(std::iter::repeat(adapter).take(rows));
+                    layout.push((i, rows));
+                }
+
+                // The adapter deltas must land on the device the model's
+                // logits live on, so downstream on-device sampling (WI-X3)
+                // keeps working.
+                let model_device = self.models.get(model_id).map(|m| m.device.clone());
+                self.apply_batched_lora_to_rows(&mut stacked, &row_adapters, dim, model_device.as_ref())?;
+
+                // Scatter adapted rows back into the staged slots.
+                let mut offset = 0usize;
+                for &(i, rows) in &layout {
+                    let (request_id, accepted_tokens, base) = match &slots[i] {
+                        Slot::Staged {
+                            request_id,
+                            base,
+                            accepted_tokens,
+                            ..
+                        } => (*request_id, *accepted_tokens, base.clone()),
+                        Slot::Done(..) => continue,
+                    };
+                    let shape = base.shape().clone();
+                    let data = stacked[offset..offset + rows * dim].to_vec();
+                    offset += rows * dim;
+                    let adapted = Self::logits_tensor_like(data, shape, &base)?;
+                    slots[i] = Slot::Done(
+                        request_id,
+                        StepOutcome {
+                            logits: Some(Arc::new(adapted)),
+                            accepted_tokens,
+                            speculative: false,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(
+            slots
+                .into_iter()
+                .map(|slot| match slot {
+                    Slot::Done(id, outcome) => (id, outcome),
+                    Slot::Staged { .. } => unreachable!("staged slot left unfilled by phase B"),
+                })
+                .collect(),
+        )
     }
 
     /// Check if a model is registered by name.
@@ -3594,5 +3959,164 @@ mod tests {
         assert!(engine.sessions.contains_key(&900));
         assert!(engine.scythe_pin_of(900).is_some());
         assert_eq!(engine.scheduler.waiting.len(), 1);
+    }
+
+    #[test]
+    fn test_engine_fused_batched_lora_execution() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let dim = 4;
+        let rank = 2;
+
+        let a = grim_backend_cpu::cpu_tensor(
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            grim_tensor::Shape::new(vec![rank, dim]),
+        );
+        let b = grim_backend_cpu::cpu_tensor(
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            grim_tensor::Shape::new(vec![dim, rank]),
+        );
+        let handle = AdapterHandle {
+            id: 10,
+            a,
+            b,
+            alpha: 2.0,
+        };
+        engine.register_adapter("default", "lora_test", handle);
+
+        // Rows 0-1 carry adapter 10, row 2 is base (passthrough).
+        let mut stacked = vec![
+            1.0, 1.0, 1.0, 1.0, //
+            2.0, 2.0, 2.0, 2.0, //
+            5.0, 5.0, 5.0, 5.0, //
+        ];
+        let row_adapters = vec![10, 10, 0];
+
+        engine
+            .apply_batched_lora_to_rows(&mut stacked, &row_adapters, dim, None)
+            .unwrap();
+
+        // Alpha/rank = 2.0/2.0 = 1.0; deltas accumulate onto the base rows.
+        // Row 0: [1,1,1,1]+[1,1,0,0] = [2,2,1,1]
+        // Row 1: [2,2,2,2]+[2,2,0,0] = [4,4,2,2]
+        // Row 2 untouched.
+        assert_eq!(&stacked[0..4], &[2.0, 2.0, 1.0, 1.0]);
+        assert_eq!(&stacked[4..8], &[4.0, 4.0, 2.0, 2.0]);
+        assert_eq!(&stacked[8..12], &[5.0, 5.0, 5.0, 5.0]);
+    }
+
+    /// Batched multi-LoRA contract gate: the grouped decode path
+    /// (`step_batch`, base forwards + one segment apply) must produce the
+    /// same logits as the legacy per-request path (adapters applied inside
+    /// `decode_one`) on identical engines.
+    #[test]
+    fn test_step_batch_grouped_lora_matches_per_request_path() {
+        // The runtime LoRA surrogate contract (MED-5) requires adapter
+        // in_dim == logits width, so this model sets hidden == vocab.
+        let build = || -> Engine {
+            let mut engine = Engine::new(EngineConfig::default());
+            let model = Box::new(Llama::random(
+                Device::Cpu,
+                LlamaConfig {
+                    vocab_size: 32,
+                    hidden_size: 32,
+                    num_heads: 2,
+                    num_kv_heads: 1,
+                    head_dim: 16,
+                    num_layers: 1,
+                    intermediate_size: 64,
+                    rms_norm_eps: 1e-5,
+                    rope_theta: 10000.0,
+                    max_seq_len: 64,
+                    partial_rotary_factor: 1.0,
+                    yarn: None,
+                },
+            ));
+            engine.register_model("tiny", model);
+
+            // Rank-2 identity A: [2, 32] = two 32-dim selection rows.
+            let a = grim_backend_cpu::cpu_tensor(
+                (0..64)
+                    .map(|i| if i / 32 == i % 32 { 1.0 } else { 0.0 })
+                    .collect::<Vec<f32>>(),
+                grim_tensor::Shape::new(vec![2, 32]),
+            );
+            let b = grim_backend_cpu::cpu_tensor(
+                vec![0.5; 2 * 32],
+                grim_tensor::Shape::new(vec![32, 2]),
+            );
+            engine.register_adapter(
+                "tiny",
+                "shared_lora",
+                AdapterHandle {
+                    id: 10,
+                    a,
+                    b,
+                    alpha: 2.0,
+                },
+            );
+            engine
+        };
+
+        // Request 1 and 3 share adapter 10; request 2 runs the base model.
+        let enqueue = |engine: &mut Engine| {
+            for (id, adapter) in [(1u64, vec![10u32]), (2, vec![]), (3, vec![10])] {
+                let req = grim_scheduler::Request {
+                    id,
+                    prompt_tokens: 2,
+                    priority: 0,
+                    model_id: Some("tiny".into()),
+                    adapter_ids: adapter.clone(),
+                    ..Default::default()
+                };
+                engine.enqueue_request(req).unwrap();
+                engine.request_adapters.insert(id, adapter);
+            }
+        };
+
+        // Grouped path: one step_batch over all three items.
+        let mut grouped = build();
+        enqueue(&mut grouped);
+        let items: Vec<(u64, &str, grim_tensor::Tensor, grim_tensor::Tensor)> = (1..=3)
+            .map(|id| {
+                let tok = grim_backend_cpu::cpu_tensor(
+                    vec![3.0],
+                    grim_tensor::Shape::new(vec![1]),
+                );
+                let pos = grim_backend_cpu::cpu_tensor(
+                    vec![1.0],
+                    grim_tensor::Shape::new(vec![1]),
+                );
+                (id, "tiny", tok, pos)
+            })
+            .collect();
+        let item_refs: Vec<(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)> =
+            items.iter().map(|(id, m, t, p)| (*id, *m, t, p)).collect();
+        let grouped_out = grouped.step_batch(&item_refs).unwrap();
+
+        // Legacy path: identical engine, per-request stepping (adapters
+        // applied inside decode_one).
+        let mut legacy = build();
+        enqueue(&mut legacy);
+        let legacy_out: Vec<(u64, StepOutcome)> = items
+            .iter()
+            .map(|(id, m, t, p)| {
+                let outcome = legacy.step_one(*id, m, t, p).unwrap();
+                (*id, outcome)
+            })
+            .collect();
+
+        assert_eq!(grouped_out.len(), legacy_out.len());
+        for ((gid, g), (lid, l)) in grouped_out.iter().zip(&legacy_out) {
+            assert_eq!(gid, lid);
+            let g_logits = g.logits.as_ref().expect("grouped logits").to_vec_f32().unwrap();
+            let l_logits = l.logits.as_ref().expect("legacy logits").to_vec_f32().unwrap();
+            assert_eq!(g_logits.len(), l_logits.len());
+            for (i, (gv, lv)) in g_logits.iter().zip(&l_logits).enumerate() {
+                assert!(
+                    (gv - lv).abs() < 1e-5,
+                    "request {gid} logits[{i}] grouped {gv} != legacy {lv}"
+                );
+            }
+        }
     }
 }

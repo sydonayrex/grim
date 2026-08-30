@@ -195,14 +195,77 @@ pub struct Scheduler {
     kv_pressure: Option<Arc<dyn KvPressureSource>>,
 }
 
+/// Contiguous segment of sequences sharing a LoRA adapter ID. Advisory
+/// summary of one `schedule()` call — execution plans row-level segments
+/// via [`LoraRowSegment::plan_for_rows`] from the forwarded batch layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoraSegment {
+    /// Primary adapter ID (0 = base model, > 0 = fine-tuned adapter).
+    pub adapter_id: u32,
+    /// Starting sequence offset within the batch.
+    pub seq_start: usize,
+    /// Number of sequences in this segment.
+    pub seq_count: usize,
+    /// Sequence IDs belonging to this segment.
+    pub seq_ids: Vec<u64>,
+}
+
+/// Contiguous segment of *batch rows* sharing one LoRA adapter, for fused
+/// multi-LoRA kernel execution (S-LoRA/Punica style) over a stacked
+/// `[rows, dim]` matrix.
+///
+/// Unlike [`LoraSegment`] (sequence-level, advisory), row segments are the
+/// execution contract: `row_start`/`row_count` index packed rows directly, so
+/// the consumer must plan them from the batch layout it actually forwards
+/// ([`LoraRowSegment::plan_for_rows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoraRowSegment {
+    /// Adapter applied to every row in this segment (0 = base model, no delta).
+    pub adapter_id: u32,
+    /// First row of the segment within the stacked matrix.
+    pub row_start: usize,
+    /// Number of consecutive rows in the segment.
+    pub row_count: usize,
+}
+
+impl LoraRowSegment {
+    /// Plan contiguous row segments from per-row primary adapter ids.
+    ///
+    /// Rows are consumed in the given order; equal adapter ids adjacent in
+    /// that order coalesce into one segment. This is a pure grouping pass —
+    /// callers that want maximal contiguity should sort their rows by adapter
+    /// id (stable, to keep determinism) before calling.
+    pub fn plan_for_rows(row_adapters: &[u32]) -> Vec<Self> {
+        let mut segments: Vec<Self> = Vec::new();
+        for (row, &adapter_id) in row_adapters.iter().enumerate() {
+            match segments.last_mut() {
+                Some(seg) if seg.adapter_id == adapter_id => seg.row_count += 1,
+                _ => segments.push(Self {
+                    adapter_id,
+                    row_start: row,
+                    row_count: 1,
+                }),
+            }
+        }
+        segments
+    }
+}
+
 /// Result of one `schedule()` call — the engine uses this to run the batch.
 #[derive(Debug, Default)]
 pub struct SchedulerOutput {
     pub prefill_ids: Vec<u64>,
     pub decode_ids: Vec<u64>,
     pub preempted_ids: Vec<u64>,
-    /// Grouping of running sequence IDs by primary LoRA adapter ID (0 = base model) for fused batched LoRA kernel dispatch.
+    /// Advisory grouping of running sequence IDs by primary LoRA adapter ID
+    /// (0 = base model). Nothing in the execution path is required to consume
+    /// this: fused batched LoRA dispatch plans its own row segments from the
+    /// batch layout it actually forwards (`LoraRowSegment::plan_for_rows`).
+    /// This field exists for observability and as a scheduling-level summary.
     pub adapter_batches: std::collections::HashMap<u32, Vec<u64>>,
+    /// Contiguous sequence-level segment descriptors (advisory, same contract
+    /// as `adapter_batches`).
+    pub lora_segments: Vec<LoraSegment>,
 }
 
 /// Read-only queue counts for status and observability surfaces.
@@ -481,7 +544,28 @@ impl Scheduler {
                 .or_default()
                 .push(r.id);
         }
+
+        // Build deterministic contiguous segments for fused Multi-LoRA kernel execution
+        let mut sorted_adapters: Vec<u32> = adapter_batches.keys().copied().collect();
+        sorted_adapters.sort_unstable();
+
+        let mut lora_segments = Vec::new();
+        let mut seq_offset = 0;
+        for adapter_id in sorted_adapters {
+            if let Some(seq_ids) = adapter_batches.get(&adapter_id) {
+                let count = seq_ids.len();
+                lora_segments.push(LoraSegment {
+                    adapter_id,
+                    seq_start: seq_offset,
+                    seq_count: count,
+                    seq_ids: seq_ids.clone(),
+                });
+                seq_offset += count;
+            }
+        }
+
         output.adapter_batches = adapter_batches;
+        output.lora_segments = lora_segments;
 
         output
     }
@@ -1247,5 +1331,49 @@ mod tests {
         assert_eq!(out.adapter_batches.get(&101), Some(&vec![10, 20]));
         assert_eq!(out.adapter_batches.get(&202), Some(&vec![30]));
         assert_eq!(out.adapter_batches.get(&0), Some(&vec![40]));
+
+        // Verify contiguous segment layout (0, 101, 202)
+        assert_eq!(out.lora_segments.len(), 3);
+        assert_eq!(out.lora_segments[0], LoraSegment {
+            adapter_id: 0,
+            seq_start: 0,
+            seq_count: 1,
+            seq_ids: vec![40],
+        });
+        assert_eq!(out.lora_segments[1], LoraSegment {
+            adapter_id: 101,
+            seq_start: 1,
+            seq_count: 2,
+            seq_ids: vec![10, 20],
+        });
+        assert_eq!(out.lora_segments[2], LoraSegment {
+            adapter_id: 202,
+            seq_start: 3,
+            seq_count: 1,
+            seq_ids: vec![30],
+        });
+    }
+
+    #[test]
+    fn test_lora_row_segment_planning() {
+        // Empty batch -> no segments.
+        assert!(LoraRowSegment::plan_for_rows(&[]).is_empty());
+
+        // Adjacent equal ids coalesce; every id change opens a new segment.
+        let segs = LoraRowSegment::plan_for_rows(&[7, 7, 0, 0, 0, 9]);
+        assert_eq!(
+            segs,
+            vec![
+                LoraRowSegment { adapter_id: 7, row_start: 0, row_count: 2 },
+                LoraRowSegment { adapter_id: 0, row_start: 2, row_count: 3 },
+                LoraRowSegment { adapter_id: 9, row_start: 5, row_count: 1 },
+            ]
+        );
+
+        // Single base-only batch: one passthrough segment covering all rows.
+        assert_eq!(
+            LoraRowSegment::plan_for_rows(&[0, 0]),
+            vec![LoraRowSegment { adapter_id: 0, row_start: 0, row_count: 2 }]
+        );
     }
 }
