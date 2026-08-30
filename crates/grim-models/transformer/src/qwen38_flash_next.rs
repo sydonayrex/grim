@@ -534,13 +534,9 @@ impl Qwen38FlashNext {
         let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
             (cfg.ngram_vocab_size, cfg.ngram_dim)
         {
-            // For mock/random initialization (e.g. unit tests and MTP wrappers),
-            // cap mock allocation to 256 rows to avoid a 40.96 GB RAM spike (20M * 512 * 4B).
-            // Real checkpoint weights are loaded without truncation in load_tp.
-            let mock_vocab = ngram_vocab.min(256);
             let table = cpu_tensor(
-                vec![0.01f32; mock_vocab * ngram_dim],
-                grim_tensor::Shape::new(vec![mock_vocab, ngram_dim]),
+                vec![0.01f32; ngram_vocab * ngram_dim],
+                grim_tensor::Shape::new(vec![ngram_vocab, ngram_dim]),
             );
             let proj = Linear::from_tensor(
                 cpu_tensor(
@@ -550,7 +546,7 @@ impl Qwen38FlashNext {
                 None,
             );
             Some(Qwen38NgramEmbedding {
-                ngram_vocab_size: mock_vocab,
+                ngram_vocab_size: ngram_vocab,
                 ngram_dim,
                 hidden_size: cfg.hidden_size,
                 table,
