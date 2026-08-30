@@ -408,6 +408,91 @@ impl Qwen38FlashNextBlock {
     }
 }
 
+/// Precomputed modular polynomial weights and moduli for N-gram embedding addressing
+/// (matching SGLang / vLLM LongCat-Flash & Qwen Flash N-gram architecture).
+#[derive(Clone, Debug)]
+pub struct Qwen38NgramAddressing {
+    pub vocab_size: usize,
+    pub m_base: usize,
+    pub split_parts: usize,
+    pub neighbor_num: usize,
+    pub ne_mods: Vec<u64>,
+    pub ne_weights: Vec<u64>,
+    pub exclusive_sizes: Vec<usize>,
+}
+
+impl Qwen38NgramAddressing {
+    /// Construct addressing tables with coprime moduli and precomputed power weights:
+    /// $\text{mod}_{i, j} = m + 2 \cdot (i \cdot k + j) + 1$,
+    /// $w_{i, j, \delta} = V^\delta \pmod{\text{mod}_{i, j}}$.
+    pub fn new(vocab_size: usize, m_base: usize, split_parts: usize, neighbor_num: usize) -> Self {
+        let n_minus_1 = neighbor_num.saturating_sub(1).max(1);
+        let k = split_parts.max(1);
+        let num_configs = n_minus_1 * k;
+
+        let mut ne_mods = Vec::with_capacity(num_configs);
+        let mut ne_weights = Vec::with_capacity(num_configs * neighbor_num);
+        let mut sizes = Vec::with_capacity(num_configs);
+        let mut exclusive_sizes = Vec::with_capacity(num_configs + 1);
+        exclusive_sizes.push(0);
+
+        for i in 0..n_minus_1 {
+            for j in 0..k {
+                let mod_val = (m_base + 2 * (i * k + j) + 1) as u64;
+                ne_mods.push(mod_val);
+                sizes.push(mod_val as usize);
+
+                for delta in 0..neighbor_num {
+                    let mut w = 1u64;
+                    for _ in 0..delta {
+                        w = ((w as u128 * vocab_size as u128) % mod_val as u128) as u64;
+                    }
+                    ne_weights.push(w);
+                }
+            }
+        }
+
+        let mut sum = 0;
+        for &s in &sizes {
+            sum += s;
+            exclusive_sizes.push(sum);
+        }
+
+        Self {
+            vocab_size,
+            m_base,
+            split_parts: k,
+            neighbor_num,
+            ne_mods,
+            ne_weights,
+            exclusive_sizes,
+        }
+    }
+
+    /// Computes the exact SGLang / vLLM polynomial n-gram ID for a token sequence ending at position `curr_pos`.
+    pub fn compute_ngram_id(&self, tokens: &[u32], curr_pos: usize, config_idx: usize) -> usize {
+        let n_minus_1 = self.neighbor_num.saturating_sub(1).max(1);
+        let k = self.split_parts;
+        let c_idx = config_idx % (n_minus_1 * k);
+        let n = c_idx / k;
+        let ne_mod = self.ne_mods[c_idx];
+        let weight_base = c_idx * self.neighbor_num;
+
+        let mut ngram_id = 0u64;
+        for j in 0..(n + 2).min(self.neighbor_num) {
+            if curr_pos < j {
+                break;
+            }
+            let tok = tokens[curr_pos - j] as u64;
+            let weight = self.ne_weights[weight_base + j];
+            let term = ((tok as u128 * weight as u128) % ne_mod as u128) as u64;
+            ngram_id = (ngram_id + term) % ne_mod;
+        }
+
+        ngram_id as usize
+    }
+}
+
 /// N-gram embedding layer implementing Position-aware / Prompt-Lookup N-gram Embedding (PLE).
 ///
 /// Maps high-order token n-grams ($N \in [2, 3]$) to compact auxiliary representations
@@ -415,45 +500,24 @@ impl Qwen38FlashNextBlock {
 /// is placed in host RAM (mirroring llama.cpp `-ot "ple_ngram_embd=CPU"` offloading)
 /// and gathered per token before being projected into the transformer's hidden space.
 ///
-/// # Addressing Scheme Contract
-/// In production checkpoints, the $20\text{M}$ embedding table is indexed either by a
-/// tokenizer trie / n-gram vocab ID mapping or a checkpoint-specific rolling hash.
-/// `hash_ngram` provides a deterministic rolling polynomial hash fallback until the
-/// exact upstream n-gram tokenizer mapping metadata is deserialized from the GGUF/Safetensors
-/// vocabulary header.
+/// Addressing uses the exact coprime modular polynomial index generator from SGLang/vLLM.
 #[derive(Clone)]
 pub struct Qwen38NgramEmbedding {
     /// N-gram vocabulary size ($V_{\text{ngram}}$, e.g. 20M entries).
     pub ngram_vocab_size: usize,
-    /// N-gram embedding dimension ($d_{\text{ngram}}$, e.g. 512).
+    /// N-gram embedding dimension ($d_{\text{ngram}}$, e.g. 2560).
     pub ngram_dim: usize,
-    /// Model hidden dimension ($d_{\text{model}}$, e.g. 4096).
+    /// Model hidden dimension ($d_{\text{model}}$, e.g. 2560).
     pub hidden_size: usize,
     /// Host-pinned N-gram embedding table ($V_{\text{ngram}} \times d_{\text{ngram}}$).
     pub table: Tensor,
     /// Linear projection from $d_{\text{ngram}} \to d_{\text{model}}$.
     pub proj: Linear,
+    /// Deterministic coprime polynomial modular addressing generator.
+    pub addressing: Qwen38NgramAddressing,
 }
 
 impl Qwen38NgramEmbedding {
-    /// Computes 64-bit FNV-1a hash of a token sequence modulo `vocab_size`.
-    ///
-    /// # Contract
-    /// * Deterministic across all platforms.
-    /// * Returns an index in `0 .. vocab_size - 1` (or 0 if empty/zero vocab).
-    /// * Note: Serves as a placeholder for exact checkpoint-level n-gram trie vocabulary mapping.
-    pub fn hash_ngram(tokens: &[u32], vocab_size: usize) -> usize {
-        if tokens.is_empty() || vocab_size == 0 {
-            return 0;
-        }
-        let mut h = 0xcbf29ce484222325u64;
-        for &tok in tokens {
-            h ^= tok as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        (h as usize) % vocab_size
-    }
-
     /// Performs N-gram lookup and projection for a sequence of tokens.
     ///
     /// # Contract
@@ -469,12 +533,10 @@ impl Qwen38NgramEmbedding {
         let mut gathered_ngram = vec![0.0f32; seq_len * self.ngram_dim];
 
         for i in 0..seq_len {
-            // N-gram requires at least 2 tokens (bigram or trigram)
+            // N-gram lookup for positions with context history
             if i >= 1 {
-                let start = i.saturating_sub(2);
-                let window = &tokens[start..=i];
-                let hash_idx = Self::hash_ngram(window, self.ngram_vocab_size);
-                let table_offset = hash_idx * self.ngram_dim;
+                let ngram_idx = self.addressing.compute_ngram_id(tokens, i, 0) % self.ngram_vocab_size;
+                let table_offset = ngram_idx * self.ngram_dim;
                 let dst_offset = i * self.ngram_dim;
                 if table_offset + self.ngram_dim <= table_vec.len() {
                     gathered_ngram[dst_offset..dst_offset + self.ngram_dim]
@@ -580,12 +642,20 @@ impl Qwen38FlashNext {
                 ))
             })?;
 
+            let addressing = Qwen38NgramAddressing::new(
+                cfg.vocab_size,
+                ngram_vocab,
+                cfg.split_ngram_parts,
+                cfg.ngram_size,
+            );
+
             Some(Qwen38NgramEmbedding {
                 ngram_vocab_size: ngram_vocab,
                 ngram_dim,
                 hidden_size: cfg.hidden_size,
                 table,
                 proj,
+                addressing,
             })
         } else {
             None
@@ -637,12 +707,19 @@ impl Qwen38FlashNext {
                 ),
                 None,
             );
+            let addressing = Qwen38NgramAddressing::new(
+                cfg.vocab_size,
+                ngram_vocab,
+                cfg.split_ngram_parts,
+                cfg.ngram_size,
+            );
             Some(Qwen38NgramEmbedding {
                 ngram_vocab_size: ngram_vocab,
                 ngram_dim,
                 hidden_size: cfg.hidden_size,
                 table,
                 proj,
+                addressing,
             })
         } else {
             None
@@ -765,20 +842,23 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen38_ngram_hash_determinism_and_bounds() {
-        let vocab = 20_000_000;
+    fn test_qwen38_ngram_addressing_determinism_and_bounds() {
+        let vocab = 248320;
+        let m_base = 20_000_000;
+        let addressing = Qwen38NgramAddressing::new(vocab, m_base, 128, 3);
+
         let tokens1 = vec![101, 202];
         let tokens2 = vec![101, 202];
         let tokens3 = vec![101, 203];
 
-        let h1 = Qwen38NgramEmbedding::hash_ngram(&tokens1, vocab);
-        let h2 = Qwen38NgramEmbedding::hash_ngram(&tokens2, vocab);
-        let h3 = Qwen38NgramEmbedding::hash_ngram(&tokens3, vocab);
+        let id1 = addressing.compute_ngram_id(&tokens1, 1, 0);
+        let id2 = addressing.compute_ngram_id(&tokens2, 1, 0);
+        let id3 = addressing.compute_ngram_id(&tokens3, 1, 0);
 
-        assert_eq!(h1, h2, "identical token sequences must produce identical hashes");
-        assert_ne!(h1, h3, "distinct token sequences should produce distinct hashes");
-        assert!(h1 < vocab);
-        assert!(h3 < vocab);
+        assert_eq!(id1, id2, "identical token sequences must produce identical polynomial IDs");
+        assert_ne!(id1, id3, "distinct token sequences should produce distinct polynomial IDs");
+        assert!(id1 < m_base + 256);
+        assert!(id3 < m_base + 256);
     }
 
     #[test]
@@ -813,12 +893,14 @@ mod tests {
             cpu_tensor(vec![1.0f32; 8 * 4], grim_tensor::Shape::new(vec![8, 4])),
             None,
         );
+        let addressing = Qwen38NgramAddressing::new(16, 50, 4, 3);
         let ngram_emb = Qwen38NgramEmbedding {
             ngram_vocab_size: 50,
             ngram_dim: 4,
             hidden_size: 8,
             table,
             proj,
+            addressing,
         };
 
         // For a single token [7], position 0 has no preceding n-gram (must return all 0s)
@@ -854,12 +936,14 @@ mod tests {
             None,
         );
 
+        let addressing = Qwen38NgramAddressing::new(16, ngram_vocab_size, 2, 3);
         let ngram_emb = Qwen38NgramEmbedding {
             ngram_vocab_size,
             ngram_dim,
             hidden_size,
             table,
             proj,
+            addressing: addressing.clone(),
         };
 
         let tokens = vec![4u32, 8u32];
@@ -870,9 +954,9 @@ mod tests {
         assert_eq!(&res_vec[0..4], &[0.0, 0.0, 0.0, 0.0]);
 
         // Token 1 (bigram [4, 8]):
-        let hash = Qwen38NgramEmbedding::hash_ngram(&[4, 8], ngram_vocab_size);
-        let e0 = table_data[hash * 2];
-        let e1 = table_data[hash * 2 + 1];
+        let id = addressing.compute_ngram_id(&tokens, 1, 0) % ngram_vocab_size;
+        let e0 = table_data[id * 2];
+        let e1 = table_data[id * 2 + 1];
 
         let expected_t1 = [
             1.0 * e0 + 0.0 * e1, // e0
