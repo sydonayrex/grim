@@ -2,6 +2,7 @@
 
 pub mod awq_gemm;
 pub mod bitnet_gemm;
+pub mod blend_kv_rope;
 /// Charon — P-DAFD fused MoE dispatch kernel (`rocm_kernel_plan.md` WI-A).
 pub mod charon;
 /// Charon — MoE backward pass (expert-weight gradients, WI-Charon-1).
@@ -57,6 +58,7 @@ pub mod mrope;
 pub mod mxfp4_gemm;
 pub mod mxfp_standalone;
 pub mod preshuffled_attention;
+pub mod prefill_compact;
 pub mod q2k_gemm;
 pub mod q3k_gemm;
 pub mod q4k_dequant;

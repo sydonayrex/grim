@@ -1,5 +1,14 @@
 //! Distributed serving and disaggregation layer: decouples prefill/decode, manages cross-node KV cache transfers.
 //!
+
+pub mod bloom;
+pub mod lookup;
+pub mod coherence;
+
+pub use bloom::BloomFilter;
+pub use lookup::LookupClient;
+pub use coherence::{CacheCoherenceManager, InvalidationMsg};
+
 /// ReMP 2D KV-cache migration (WI-8): coalesced 128-byte block-major transfer within same VRAM pool.
 use std::sync::Arc;
 use std::sync::Mutex;

@@ -5,6 +5,8 @@ pub mod modules;
 pub mod moe;
 /// Deterministic token mapping and scoreboard synchronization (UniEP).
 pub mod moe_deterministic;
+/// Bandwidth-adaptive CPU-GPU hybrid execution (FreeToken).
+pub mod moe_hybrid;
 /// SCYTHE-2 WI-3: capacity-calibrated sharded linears.
 pub mod scythe2;
 pub mod sparse_attention;
@@ -23,6 +25,7 @@ pub use modules::{
 };
 
 pub use moe_deterministic::{DeterministicTokenMap, ScoreboardSync};
+pub use moe_hybrid::{HybridExecutor, PcieBench};
 pub use scythe2::{Scythe2Linear, slice_input_dim, slice_output_dim};
 pub use varbuilder::WeightSource;
 pub use embedding_spill::SpillableEmbedding;
