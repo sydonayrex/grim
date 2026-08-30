@@ -4403,35 +4403,53 @@ impl AutogradOps for VulkanDevice {
     // that should replace it.
     // ---------------------------------------------------------------------------
 
-    /// Softmax backward: `dx_i = s_i * (g_i - Σ_j g_j s_j)` per row. ROCm
-    /// kernel: `grim_softmax_backward`.
+    /// Softmax backward: `dx_i = s_i * (g_i - Σ_j g_j s_j)` per row.
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::SoftmaxBackward`. Replaces the
+    /// earlier CPU fallback (correctness was identical; this avoids the PCIe
+    /// round-trip per layer on the training backward pass).
     fn softmax_backward(
         &self,
         out_grad: &dyn BackendStorage,
         softmax_out: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let g = out_grad.to_cpu_vec_f32()?;
-        let s = softmax_out.to_cpu_vec_f32()?;
-        if g.len() != s.len() {
-            return Err(Error::Shape("softmax_backward: grad/out length mismatch".into()));
-        }
+        let g_s = out_grad
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan softmax_backward: grad is not VulkanStorage".into()))?;
+        let s_s = softmax_out
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan softmax_backward: softmax_out is not VulkanStorage".into()))?;
+
+        let total = out_shape.elem_count();
         let row_len = out_shape.dims().last().copied().unwrap_or(1).max(1);
-        if g.len() % row_len != 0 {
-            return Err(Error::Shape("softmax_backward: size not divisible by row_len".into()));
-        }
-        let mut dx = vec![0.0f32; g.len()];
-        for row in (0..g.len()).step_by(row_len) {
-            let mut dot = 0.0f32;
-            for k in 0..row_len {
-                dot += g[row + k] * s[row + k];
-            }
-            for k in 0..row_len {
-                dx[row + k] = s[row + k] * (g[row + k] - dot);
-            }
-        }
-        let storage = self.from_cpu(&dx, out_shape, DType::F32)?;
-        Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let dx = VulkanStorage::alloc_device_local_gpu(
+            out_shape, DType::F32, ctx.device, ctx.physical_device,
+        )?;
+
+        let buffers = [g_s.buffer, s_s.buffer, dx.buffer];
+        let grid_x = total.div_ceil(256) as u32;
+        let push = push_params(total as u32, row_len as u32, 0, 0, 0, 0.0);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::SoftmaxBackward,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     /// RMSNorm backward w.r.t. x: classic `dx = (1/N) * w * (g_mean - g·x·x_mean) / rms`
@@ -5856,6 +5874,7 @@ pub enum VulkanKernel {
     RmsNorm,
     AddRmsNorm,
     Softmax,
+    SoftmaxBackward,
     Embedding,
     Matmul64,
     Matmul32,
@@ -5955,6 +5974,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::RmsNorm => SPIRV_RMS_NORM,
         VulkanKernel::AddRmsNorm => SPIRV_ADD_RMS_NORM,
         VulkanKernel::Softmax => SPIRV_SOFTMAX,
+        VulkanKernel::SoftmaxBackward => SPIRV_SOFTMAX_BACKWARD,
         VulkanKernel::Embedding => SPIRV_EMBEDDING,
         VulkanKernel::Matmul64 => SPIRV_MATMUL_64,
         VulkanKernel::Matmul32 => SPIRV_MATMUL_32,
@@ -6063,7 +6083,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedQuantGemmFp8
         | VulkanKernel::FusedLion
         | VulkanKernel::CooperativeMatrixGemm
-        | VulkanKernel::SiluMulBackward => 3,
+        | VulkanKernel::SiluMulBackward
+        | VulkanKernel::SoftmaxBackward => 3,
         VulkanKernel::Sub => 3,
         VulkanKernel::AddScalar
         | VulkanKernel::SubScalar

@@ -2176,6 +2176,7 @@ dependencies = [
  "grim-quant",
  "grim-tensor",
  "half",
+ "libloading 0.8.9",
  "seahash",
  "serde",
  "serde_json",
