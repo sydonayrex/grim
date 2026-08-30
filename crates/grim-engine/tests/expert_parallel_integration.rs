@@ -6,7 +6,7 @@
 //! 3. MoeFfn::forward_expert_parallel vs monolithic reference forward numerical parity.
 //! 4. EPLB greedy LPT load balancing and hot expert replication under skewed routing.
 //!
-//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29
+//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-30
 
 use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::device::eplb::EplbRouter;
