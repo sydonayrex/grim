@@ -1,6 +1,7 @@
 pub mod autotune;
 pub mod caps;
 pub mod collective;
+pub mod fsdp;
 pub mod graph_capture;
 pub mod hugepage;
 
