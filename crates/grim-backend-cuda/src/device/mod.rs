@@ -4,6 +4,7 @@ pub mod cublas;
 pub mod cuda_device;
 pub mod handles;
 pub mod jit_cache;
+pub mod parallel_comm;
 
 pub use cublas::CublasHandle;
 pub use cuda_device::{CudaDevice, compute_utilization, vram_info};
