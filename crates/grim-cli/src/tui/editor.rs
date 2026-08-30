@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::process::Command;
 
-use grim_tensor::error::{Error, Result};
+use grim_core::error::{Error, Result};
 
 /// Open the user's external editor with the given initial content.
 ///
@@ -18,7 +18,7 @@ use grim_tensor::error::{Error, Result};
 pub fn open_editor(content: &str) -> Result<Option<String>> {
     let editor = env::var_os("VISUAL")
         .or_else(|| env::var_os("EDITOR"))
-        .or_else(windows_notepad_fallback);
+        .or_else(|| windows_notepad_fallback());
     let editor = match editor {
         Some(e) => e,
         None => return Ok(None),
@@ -31,9 +31,9 @@ pub fn open_editor(content: &str) -> Result<Option<String>> {
     // Write initial content to the temp file.
     {
         let mut file = std::fs::File::create(&path)
-            .map_err(|e| Error::Backend(format!("failed to create temp file: {e}")))?;
+            .map_err(|e| Error::Config(format!("failed to create temp file: {e}")))?;
         file.write_all(content.as_bytes())
-            .map_err(|e| Error::Backend(format!("failed to write temp file: {e}")))?;
+            .map_err(|e| Error::Config(format!("failed to write temp file: {e}")))?;
     }
 
     // Parse the editor command (supports "code --wait" style multi-token).
@@ -49,7 +49,7 @@ pub fn open_editor(content: &str) -> Result<Option<String>> {
         .args(&parts[1..])
         .arg(&path)
         .status()
-        .map_err(|e| Error::Backend(format!("failed to spawn editor: {e}")));
+        .map_err(|e| Error::Config(format!("failed to spawn editor: {e}")));
 
     // Re-enter raw mode regardless of editor outcome.
     let mut term = ratatui::init();
@@ -64,7 +64,7 @@ pub fn open_editor(content: &str) -> Result<Option<String>> {
 
     // Read back the edited content.
     let edited = std::fs::read_to_string(&path)
-        .map_err(|e| Error::Backend(format!("failed to read temp file: {e}")))?;
+        .map_err(|e| Error::Config(format!("failed to read temp file: {e}")))?;
     let _ = std::fs::remove_file(&path);
 
     // Trim trailing newline that many editors add.

@@ -29,6 +29,10 @@ pub enum WorkerCommand {
     SetContextLimit {
         limit: Option<u64>,
     },
+    SetSamplingParams {
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    },
     Cancel,
     Quit,
 }
@@ -145,6 +149,8 @@ enum WorkerOutcome {
 struct Worker {
     engine: Engine,
     sampler: Box<dyn Sampler>,
+    sampling_params: SamplingParams,
+    seed: u64,
     tokenizer: Option<GgufTokenizer>,
     vocab: usize,
     current_id: Option<String>,
@@ -161,6 +167,19 @@ impl Worker {
             WorkerCommand::Cancel => WorkerOutcome::Ignored,
             WorkerCommand::SetContextLimit { limit } => {
                 self.ctx_override = limit;
+                WorkerOutcome::Ignored
+            }
+            WorkerCommand::SetSamplingParams {
+                temperature,
+                top_p,
+            } => {
+                if let Some(t) = temperature {
+                    self.sampling_params.temperature = t;
+                }
+                if let Some(p) = top_p {
+                    self.sampling_params.top_p = p;
+                }
+                self.sampler = self.sampling_params.clone().into_sampler(self.seed);
                 WorkerOutcome::Ignored
             }
             WorkerCommand::LoadModel { name } => self.load_model(name),
@@ -244,16 +263,8 @@ impl Worker {
             .map(|t| t.tokens.len())
             .unwrap_or(512);
 
-        // sampler is rebuilt with the same seed on every load so behavior is
-        // deterministic across /model switches.
-        let params = SamplingParams {
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 40,
-            repeat_penalty: 1.1,
-            thinking_level: ThinkingLevel::Default,
-        };
-        self.sampler = params.into_sampler(42);
+        // sampler is rebuilt with the configured sampling params and seed on every load.
+        self.sampler = self.sampling_params.clone().into_sampler(self.seed);
 
         let catalog_entry = grim_core::catalog::list_local_models()
             .into_iter()
@@ -550,7 +561,9 @@ pub fn spawn_worker(
         };
         let mut worker = Worker {
             engine: Engine::new(EngineConfig::default()),
-            sampler: sampling.into_sampler(params.seed),
+            sampler: sampling.clone().into_sampler(params.seed),
+            sampling_params: sampling,
+            seed: params.seed,
             tokenizer: None,
             vocab: 512,
             current_id: None,

@@ -208,6 +208,9 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
     if snap.ctx_limit > 0 {
         out.push(format!("ctx {}", bar(snap.ctx_used, snap.ctx_limit)));
         out.push(format!("{} / {} tok", snap.ctx_used, snap.ctx_limit));
+        if snap.ctx_used * 100 / snap.ctx_limit >= 85 {
+            out.push("! ctx >= 85% (try /clear)".into());
+        }
     } else {
         out.push(format!("ctx {} tok", snap.ctx_used));
         out.push("ctx limit: ?".into());
@@ -341,5 +344,16 @@ mod tests {
             lines.iter().any(|l| l == "ram: n/a"),
             "missing ram n/a line"
         );
+    }
+
+    #[test]
+    fn sidebar_lines_context_warning() {
+        let snap = DiagnosticsSnapshot {
+            ctx_used: 7200,
+            ctx_limit: 8000,
+            ..Default::default()
+        };
+        let lines = sidebar_lines(&snap);
+        assert!(lines.iter().any(|l| l == "! ctx >= 85% (try /clear)"));
     }
 }
