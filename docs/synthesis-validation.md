@@ -209,6 +209,21 @@ structure with passing tests, then stop before wiring it. To prevent this:
 
 ---
 
+## 5. Follow-up work items (GPU execution)
+
+The two GPU-execution counterparts of landed recommendations are scoped
+separately because they need >=2 GPUs to verify and are weeks of work, not
+stale stubs. Full file-level steps:
+[`docs/gpu-followup-workitems.md`](/D/rex/projects/grim/docs/gpu-followup-workitems.md).
+
+* **Work item 1 — MoE fused mega-kernel (R2 GPU).** Replace the per-slot CPU
+  loop in `forward_deterministic` with a persistent-SM HIP kernel using the
+  already-built `DeterministicTokenMap` for conflict-free packing. Parity-gated
+  by the existing bitwise property test.
+* **Work item 2 — Multi-rank VPP execution (R3 multi-node).** Drive the
+  existing `VirtualPipelinePlan` across >=2 ranks with async bidirectional
+  comm at fold points; measure bubble ratio on long-context prefill.
+
 ## Implementation status (2026-08-30)
 
 ### R1 — Wire ReadinessDispatcher into `Scheduler::schedule()` ✅ DONE
