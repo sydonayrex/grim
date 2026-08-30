@@ -48,6 +48,7 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("sqrt", load_kernel("sqrt")),
         ("recip", load_kernel("recip")),
         ("rope", load_kernel("rope")),
+        ("rope_backward", load_kernel("rope_backward")),
         ("rope_yarn", load_kernel("rope_yarn")),
         ("rerope", load_kernel("rerope")),
         (
@@ -212,6 +213,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/sqrt.comp");
     println!("cargo:rerun-if-changed=kernels/recip.comp");
     println!("cargo:rerun-if-changed=kernels/rope.comp");
+    println!("cargo:rerun-if-changed=kernels/rope_backward.comp");
     println!("cargo:rerun-if-changed=kernels/rope_yarn.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q4k.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q5k.comp");
