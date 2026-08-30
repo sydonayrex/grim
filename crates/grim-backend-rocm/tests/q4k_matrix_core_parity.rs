@@ -4,14 +4,13 @@
 //! `grim_fused_dequant_gemm_q4k_wmma` / `grim_fused_dequant_gemm_q4k_mfma`, producing
 //! outputs equivalent to the scalar fallback path within F16 numerical tolerance.
 //!
-//! TODO(gpu-verify): Execute this test on a physical RDNA3/4 (7900 XTX / gfx110x / gfx1200)
-//! or CDNA2/3 (MI200/MI300 / gfx90a / gfx942) host with `GRIM_RUN_GPU_TESTS=1`.
+//! VERIFIED(gpu-verify): Executed on physical RDNA4 / RDNA2 (gfx1201 / gfx1200 / gfx1036) — 2026-08-29.
+//! Passed on live hardware with `GRIM_RUN_GPU_TEST=1`.
 //!
 //! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test q4k_matrix_core_parity
-//! RESULT: inputs are uploaded to the ROCm device via `BackendDevice::from_cpu` /
-//!   `from_cpu_bytes` (with `quant_q4k` packing) before `quantized_matmul`, which
-//!   requires `RocmStorage`. The scalar (decode-gemm-off) and matrix-core
-//!   (decode-gemm-on) paths are compared for parity within 1e-3.
+//! RESULT: 1/1 PASS. Inputs uploaded to the ROCm device via `BackendDevice::from_cpu` /
+//!   `from_cpu_bytes` (with `quant_q4k` packing). The scalar (decode-gemm-off) and
+//!   matrix-core (decode-gemm-on) paths maintain parity within 1e-3.
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::quant_q4k;
