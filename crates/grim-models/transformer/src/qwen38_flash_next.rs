@@ -13,13 +13,13 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, Tensor, YaRNParams};
+use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-/// Configuration for Qwen3.8-Flash-Next architecture.
+/// Configuration for Qwen3.8-Flash-Next architecture (matching HuggingFace `qwen4_exp_text`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Qwen38FlashNextConfig {
     pub vocab_size: usize,
@@ -38,9 +38,15 @@ pub struct Qwen38FlashNextConfig {
     pub linear_num_key_heads: usize,
     pub linear_value_head_dim: usize,
     pub linear_num_value_heads: usize,
+    pub linear_conv_kernel_dim: usize,
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
     pub ngram_vocab_size: Option<usize>,
     pub ngram_dim: Option<usize>,
-    pub gated_residual_branches: usize,
+    pub ngram_size: usize,
+    pub split_ngram_parts: usize,
+    pub ple_layer_ids: Vec<usize>,
+    pub ple_conv_kernel_size: usize,
     pub mrope_section: [usize; 3],
     pub partial_rotary_factor: f32,
     pub rms_norm_eps: f32,
@@ -52,38 +58,44 @@ pub struct Qwen38FlashNextConfig {
 impl Default for Qwen38FlashNextConfig {
     fn default() -> Self {
         Self {
-            vocab_size: 152064,
-            hidden_size: 4096,
-            num_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
+            vocab_size: 248320,
+            hidden_size: 2560,
+            num_heads: 24,
+            num_kv_heads: 2,
+            head_dim: 256,
             num_layers: 48,
-            intermediate_size: 2048,
+            intermediate_size: 640,
             num_experts: 512,
             num_experts_per_tok: 10,
-            shared_expert_intermediate_size: Some(2048),
+            shared_expert_intermediate_size: Some(640),
             routed_scaling_factor: 2.5,
             layer_types: (0..48)
                 .map(|i| {
                     if i % 4 == 3 {
-                        "qsa_moe".into()
+                        "full_attention".into()
                     } else {
-                        "deltanet_moe".into()
+                        "linear_attention".into()
                     }
                 })
                 .collect(),
             linear_key_head_dim: 128,
-            linear_num_key_heads: 8,
+            linear_num_key_heads: 16,
             linear_value_head_dim: 128,
-            linear_num_value_heads: 8,
+            linear_num_value_heads: 48,
+            linear_conv_kernel_dim: 4,
+            hc_count: 4,
+            hc_lowrank: 320,
             ngram_vocab_size: Some(20_000_000),
-            ngram_dim: Some(512),
-            gated_residual_branches: 4,
+            ngram_dim: Some(2560),
+            ngram_size: 3,
+            split_ngram_parts: 128,
+            ple_layer_ids: vec![1],
+            ple_conv_kernel_size: 4,
             mrope_section: [11, 11, 10],
-            partial_rotary_factor: 1.0,
+            partial_rotary_factor: 0.25,
             rms_norm_eps: 1e-6,
             rope_theta: 10000000.0,
-            max_seq_len: 131072,
+            max_seq_len: 262144,
             full_yarn: None,
         }
     }
@@ -98,6 +110,69 @@ impl ModelConfig for Qwen38FlashNextConfig {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hyper-Connection Mixer (Residual Stream Routing)
+// ---------------------------------------------------------------------------
+
+/// Hyper-Connection Mixer performing low-rank multi-branch residual projection.
+#[derive(Clone)]
+pub struct Qwen38HyperConnection {
+    pub hc_norm: RmsNorm,
+    pub input_mix_down: Linear,
+    pub input_mix_up: Linear,
+    pub block_inject: Option<Linear>,
+}
+
+impl Qwen38HyperConnection {
+    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, hc_lowrank: usize, eps: f32) -> Result<Self> {
+        let hc_norm = RmsNorm::load(&ws.scoped("hc_norm"), hidden_size, eps)?;
+        let input_mix_down = Linear::load_shape(&ws.scoped("input_mix_weight_down"), [hidden_size, hc_lowrank])?;
+        let input_mix_up = Linear::load_shape(&ws.scoped("input_mix_weight_up"), [hc_lowrank, hidden_size])?;
+        let block_inject = Linear::load_shape(&ws.scoped("block_inject_weight"), [hidden_size, hidden_size]).ok();
+
+        Ok(Self {
+            hc_norm,
+            input_mix_down,
+            input_mix_up,
+            block_inject,
+        })
+    }
+
+    pub fn random(hidden_size: usize, hc_lowrank: usize, eps: f32) -> Self {
+        let hc_norm = RmsNorm {
+            weight: cpu_tensor(vec![1.0f32; hidden_size], Shape::new(vec![hidden_size])),
+            eps,
+        };
+        let down_w = cpu_tensor(
+            vec![0.01f32; hc_lowrank * hidden_size],
+            Shape::new(vec![hc_lowrank, hidden_size]),
+        );
+        let up_w = cpu_tensor(
+            vec![0.01f32; hidden_size * hc_lowrank],
+            Shape::new(vec![hidden_size, hc_lowrank]),
+        );
+        Self {
+            hc_norm,
+            input_mix_down: Linear::from_tensor(down_w, None),
+            input_mix_up: Linear::from_tensor(up_w, None),
+            block_inject: None,
+        }
+    }
+
+    pub fn mix(&self, x: &Tensor) -> Result<Tensor> {
+        let normed = self.hc_norm.forward(x)?;
+        let down = self.input_mix_down.forward(&normed)?;
+        let up = self.input_mix_up.forward(&down)?;
+        let x_vec = x.to_vec_f32()?;
+        let up_vec = up.to_vec_f32()?;
+        let mut mixed = vec![0.0f32; x_vec.len()];
+        for i in 0..mixed.len() {
+            mixed[i] = x_vec[i] + up_vec[i];
+        }
+        Ok(cpu_tensor(mixed, x.shape().clone()))
     }
 }
 
@@ -261,7 +336,7 @@ impl Qwen38FlashNextBlock {
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
-            gated_residual_scale: 1.0 / (cfg.gated_residual_branches as f32).sqrt(),
+            gated_residual_scale: 1.0 / (cfg.hc_count as f32).sqrt(),
         })
     }
 
@@ -446,7 +521,11 @@ impl Qwen38FlashNext {
         cfg: Qwen38FlashNextConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
-        let root = ws.scoped("model");
+        let root = if ws.scoped("model").scoped("language_model").get([cfg.vocab_size, cfg.hidden_size], "embed_tokens").is_ok() {
+            ws.scoped("model").scoped("language_model")
+        } else {
+            ws.scoped("model")
+        };
 
         let tok_embeddings = Linear::load_shape(
             &root.scoped("embed_tokens"),
@@ -456,10 +535,17 @@ impl Qwen38FlashNext {
         let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
             (cfg.ngram_vocab_size, cfg.ngram_dim)
         {
-            // Loud failure: checkpoint specifies PLE config so weights must be present
             let table = root
-                .scoped("ngram_embeddings")
-                .get([ngram_vocab, ngram_dim], "weight")
+                .scoped("layers")
+                .scoped("1")
+                .scoped("ple")
+                .scoped("ple_embedding")
+                .scoped("ngram_embedding")
+                .get([ngram_vocab, ngram_dim], "shard_0")
+                .or_else(|_| {
+                    root.scoped("ngram_embeddings")
+                        .get([ngram_vocab, ngram_dim], "weight")
+                })
                 .or_else(|_| {
                     root.scoped("ple_ngram_embd")
                         .get([ngram_vocab, ngram_dim], "weight")
@@ -467,15 +553,20 @@ impl Qwen38FlashNext {
                 .map_err(|e| {
                     grim_core::Error::Config(format!(
                         "Qwen38FlashNext: checkpoint config defines ngram_vocab_size={ngram_vocab}, \
-                         ngram_dim={ngram_dim}, but neither 'model.ngram_embeddings.weight' nor \
-                         'model.ple_ngram_embd.weight' were found in checkpoint: {e}"
+                         ngram_dim={ngram_dim}, but PLE table shards were not found: {e}"
                     ))
                 })?;
 
             let proj = Linear::load_shape(
-                &root.scoped("ngram_proj"),
+                &root.scoped("layers").scoped("1").scoped("ple").scoped("key_proj"),
                 [ngram_dim, cfg.hidden_size],
             )
+            .or_else(|_| {
+                Linear::load_shape(
+                    &root.scoped("ngram_proj"),
+                    [ngram_dim, cfg.hidden_size],
+                )
+            })
             .or_else(|_| {
                 Linear::load_shape(
                     &root.scoped("ple_ngram_proj"),
@@ -484,8 +575,8 @@ impl Qwen38FlashNext {
             })
             .map_err(|e| {
                 grim_core::Error::Config(format!(
-                    "Qwen38FlashNext: checkpoint config specifies PLE N-gram projection, \
-                     but neither 'model.ngram_proj' nor 'model.ple_ngram_proj' were found in weights: {e}"
+                    "Qwen38FlashNext: checkpoint config specifies PLE projection, \
+                     but 'key_proj'/'ngram_proj' were not found in weights: {e}"
                 ))
             })?;
 
@@ -508,7 +599,8 @@ impl Qwen38FlashNext {
             layers.push(block);
         }
 
-        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps)
+            .or_else(|_| RmsNorm::load(&root.scoped("hyper_connection_mixer").scoped("hc_norm"), cfg.hidden_size, cfg.rms_norm_eps))?;
         let output = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
             .unwrap_or_else(|_| Linear::from_tensor(tok_embeddings.w_t.clone(), None));
 
@@ -658,13 +750,17 @@ mod tests {
     fn test_qwen38_flash_next_config_defaults() {
         let cfg = Qwen38FlashNextConfig::default();
         assert_eq!(cfg.name(), "qwen3_8_flash_next");
+        assert_eq!(cfg.vocab_size, 248320);
+        assert_eq!(cfg.hidden_size, 2560);
         assert_eq!(cfg.num_experts, 512);
         assert_eq!(cfg.num_experts_per_tok, 10);
-        assert_eq!(cfg.gated_residual_branches, 4);
+        assert_eq!(cfg.hc_count, 4);
+        assert_eq!(cfg.hc_lowrank, 320);
         assert_eq!(cfg.mrope_section, [11, 11, 10]);
-        assert_eq!(cfg.max_seq_len, 131072);
+        assert_eq!(cfg.max_seq_len, 262144);
         assert_eq!(cfg.ngram_vocab_size, Some(20_000_000));
-        assert_eq!(cfg.ngram_dim, Some(512));
+        assert_eq!(cfg.ngram_dim, Some(2560));
+        assert_eq!(cfg.split_ngram_parts, 128);
     }
 
     #[test]
