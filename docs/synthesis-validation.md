@@ -262,16 +262,25 @@ Wired `MemoryCertificate::certify` into `Engine::admit_placed_request`:
 **Test:** `test_memory_certificate_admission_gate` proves rejection below the
 envelope and admission above it. All engine/scheduler/core/nn/rocm suites green.
 
-### R2 — Fuse DeterministicTokenMap into MoeFfn::forward ⏸ DEFERRED (high effort, high risk)
+### R2 — Fuse DeterministicTokenMap into MoeFfn::forward ✅ DONE (feature-gated)
 
-`DeterministicTokenMap::build` already computes conflict-free destination
-offsets (the correctness-critical part). But `MoeFfn::forward` is the
-numerically-sensitive CPU reference that every backend's fused path is tested
-*against*. Reordering its accumulation is only safe after bitwise-equivalence
-proofing across all quant formats and backends. **Recommendation:** prototype
-behind a feature flag (`moe-deterministic-dispatch`) with a property test
-asserting bitwise equality with the current `forward` before switching the
-default. Land the memory-certificate probe first.
+Fused the deterministic dispatch into `MoeFfn::forward` behind the
+`moe-deterministic-dispatch` feature flag:
+
+- `MoeFfn::forward_deterministic` routes through `DeterministicTokenMap::build`
+  (conflict-free prefix-sum destination addressing), `pack_activations` (gather
+  tokens into expert-ordered slots), per-slot expert evaluation, then a combine
+  that replicates the reference's exact FP order (`routed += w*y`, THEN
+  `out += rsf*routed`) so results are bitwise identical.
+- `forward` dispatches to `forward_deterministic` when the feature is on,
+  otherwise runs the unchanged CPU reference.
+- `test_deterministic_dispatch_is_bitwise_identical_to_reference` asserts
+  bitwise equality (`to_bits()`) across both router kinds, with/without a
+  shared expert, multiple `routed_scaling_factor` values, and batch sizes 1/2/4.
+  Both default (27 tests) and feature-gated (28 tests) MoE suites pass.
+
+The packing is what enables a fused comm-compute mega-kernel on GPU; on CPU it
+is a correctness-equivalent reorganization proven identical to the reference.
 
 ### R3 — VPP virtual-stage traversal ⏸ DEFERRED
 

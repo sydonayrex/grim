@@ -1517,6 +1517,79 @@ impl MoeFfn {
             }
         }
 
+
+        // R2 — deterministic dispatch path (UniEP idea). When enabled,
+        // `forward_deterministic` replaces the CPU reference below. It is
+        // bitwise-identical (property-tested) but packs tokens into
+        // expert-ordered slots so the same routing drives a fused GPU kernel.
+        #[cfg(feature = "moe-deterministic-dispatch")]
+        {
+            return self.forward_deterministic(x);
+        }
+
+        #[cfg(not(feature = "moe-deterministic-dispatch"))]
+        {
+            let (indices, weights) = self.router.route(x)?;
+            let batch = indices.len();
+            let hidden = self
+                .experts
+                .down
+                .first()
+                .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+                .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+
+            let mut out_vec = vec![0.0f32; batch * hidden];
+
+            for t in 0..batch {
+                let experts = &indices[t];
+                let w = &weights[t];
+                let xt = slice_row(x, t)?; // [1, hidden]
+                // Routed experts: combined output is scaled by `routed_scaling_factor`
+                // (DeepSeek/Laguna convention — scales the *routed* path, not shared).
+                let mut routed = vec![0.0f32; hidden];
+                for (rank, &e) in experts.iter().enumerate() {
+                    let y = self.experts.expert_forward(e, &xt)?; // [1, hidden]
+                    let yv = y.to_vec_f32()?;
+                    for (i, v) in yv.iter().enumerate() {
+                        routed[i] += w[rank] * v;
+                    }
+                }
+                for (i, v) in routed.iter().enumerate() {
+                    out_vec[t * hidden + i] += self.routed_scaling_factor * v;
+                }
+                // Shared/always-on expert is added unscaled.
+                if let Some(sh) = &self.shared_expert {
+                    let s = sh.forward(&xt)?;
+                    let sv = s.to_vec_f32()?;
+                    for (i, v) in sv.iter().enumerate() {
+                        out_vec[t * hidden + i] += v;
+                    }
+                }
+            }
+
+            Ok(cpu_tensor(out_vec, Shape::new(vec![batch, hidden])))
+        }
+    }
+
+    /// Deterministic batched multi-LoRA MoE forward (UniEP/R2 idea).
+    ///
+    /// Bitwise-identical to [`MoeFfn::forward`] on CPU but routes through
+    /// [`DeterministicTokenMap`]: tokens are packed into expert-ordered slots
+    /// (conflict-free destination addressing via exclusive prefix sums), each
+    /// expert is evaluated on its packed slots, then results are combined back
+    /// per-token. The packing is what enables a fused comm-compute mega-kernel on
+    /// GPU; on CPU it is a correctness-equivalent reorganization that a property
+    /// test proves matches the reference accumulation order exactly.
+    ///
+    /// The combine step deliberately replicates the reference's floating-point
+    /// operation order (`routed += w * y`, THEN `out += rsf * routed`) rather than
+    /// folding `routed_scaling_factor` per-term, so results are bitwise identical
+    /// to `forward` under IEEE-754 (non-associative FP addition otherwise
+    /// diverges).
+    #[cfg(feature = "moe-deterministic-dispatch")]
+    pub fn forward_deterministic(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        use crate::moe_deterministic::DeterministicTokenMap;
+
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
         let hidden = self
@@ -1525,32 +1598,56 @@ impl MoeFfn {
             .first()
             .map(|l| l.weight.shape().dim(0).unwrap_or(0))
             .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+        if batch == 0 {
+            return Ok(cpu_tensor(vec![], Shape::new(vec![0, hidden])));
+        }
 
+        // 1. Deterministic token map: conflict-free destination addressing.
+        let map = DeterministicTokenMap::build(&indices, self.experts.gate.len())?;
+
+        // 2. Pack activations [batch, hidden] -> [total_routed, hidden].
+        let flat = x.to_vec_f32()?;
+        let mut packed = vec![0.0f32; map.total_routed_instances * hidden];
+        map.pack_activations(&flat, hidden, &mut packed)?;
+
+        // 3. Evaluate every (token, expert) slot independently. Each slot holds
+        //    one token's activation; the expert sees the same input the reference
+        //    passes to `expert_forward(e, x[t])`, so outputs are bitwise equal.
+        let mut packed_outputs = vec![0.0f32; map.total_routed_instances * hidden];
+        for slot in 0..map.total_routed_instances {
+            let (_, expert_id, _) = map.reverse_map[slot];
+            let slot_input = cpu_tensor(
+                packed[slot * hidden..slot * hidden + hidden].to_vec(),
+                Shape::new(vec![1, hidden]),
+            );
+            let y = self.experts.expert_forward(expert_id, &slot_input)?;
+            let yv = y.to_vec_f32()?;
+            packed_outputs[slot * hidden..slot * hidden + hidden].copy_from_slice(&yv);
+        }
+
+        // 4. Combine back per-token, replicating the reference's exact FP order:
+        //    `routed[i] += w[k] * y[i]` then `out[t][i] += rsf * routed[i]`.
         let mut out_vec = vec![0.0f32; batch * hidden];
-
         for t in 0..batch {
-            let experts = &indices[t];
-            let w = &weights[t];
-            let xt = slice_row(x, t)?; // [1, hidden]
-            // Routed experts: combined output is scaled by `routed_scaling_factor`
-            // (DeepSeek/Laguna convention — scales the *routed* path, not shared).
             let mut routed = vec![0.0f32; hidden];
-            for (rank, &e) in experts.iter().enumerate() {
-                let y = self.experts.expert_forward(e, &xt)?; // [1, hidden]
-                let yv = y.to_vec_f32()?;
-                for (i, v) in yv.iter().enumerate() {
-                    routed[i] += w[rank] * v;
+            for k in 0..map.top_k {
+                let instance_idx = t * map.top_k + k;
+                let slot = map.destination_slots[instance_idx];
+                let w = weights[t][k];
+                for i in 0..hidden {
+                    routed[i] += w * packed_outputs[slot * hidden + i];
                 }
             }
-            for (i, v) in routed.iter().enumerate() {
-                out_vec[t * hidden + i] += self.routed_scaling_factor * v;
+            for i in 0..hidden {
+                out_vec[t * hidden + i] += self.routed_scaling_factor * routed[i];
             }
-            // Shared/always-on expert is added unscaled.
+            // Shared/always-on expert added unscaled (mirrors the reference).
             if let Some(sh) = &self.shared_expert {
+                let xt = slice_row(x, t)?;
                 let s = sh.forward(&xt)?;
                 let sv = s.to_vec_f32()?;
-                for (i, v) in sv.iter().enumerate() {
-                    out_vec[t * hidden + i] += v;
+                for i in 0..hidden {
+                    out_vec[t * hidden + i] += sv[i];
                 }
             }
         }
@@ -3621,5 +3718,85 @@ mod tests {
                 ep_out[i]
             );
         }
+    }
+
+    /// R2 property test: the deterministic dispatch path must be BITWISE
+    /// identical to the CPU reference across routing kinds, shared-expert
+    /// presence, routed_scaling_factor values, and multi-token batches. This is
+    /// the correctness gate that lets the same DeterministicTokenMap drive a
+    /// fused GPU mega-kernel without changing output numerics.
+    #[cfg(feature = "moe-deterministic-dispatch")]
+    #[test]
+    fn deterministic_dispatch_is_bitwise_identical_to_reference() {
+        let kinds = [RouterKind::SoftmaxTopK, RouterKind::SigmoidTopKWithBias];
+        let rsfs = [0.5_f32, 1.0, 2.5];
+        let batch_sizes = [1usize, 2, 4];
+
+        for kind in &kinds {
+            for &rsf in &rsfs {
+                for &batch in &batch_sizes {
+                    check_parity(kind.clone(), None, rsf, batch);
+                    let shared = {
+                        let hidden = 4;
+                        let inter = 4;
+                        let gate = identity_linear(hidden, inter);
+                        let up = identity_linear(hidden, inter);
+                        let down = identity_linear(hidden, inter);
+                        ExpertTriple { gate, up, down, inter, hidden }
+                    };
+                    check_parity(kind.clone(), Some(shared), rsf, batch);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "moe-deterministic-dispatch")]
+    fn check_parity(
+        kind: RouterKind,
+        shared: Option<ExpertTriple>,
+        rsf: f32,
+        batch: usize,
+    ) {
+        let hidden = 4;
+        let moe = build_synthetic_rsf(kind.clone(), shared, None, rsf);
+        // Distinct tokens so packing exercises multiple slots.
+        let mut xs = Vec::new();
+        for t in 0..batch {
+            let mut v = vec![0.0f32; hidden];
+            // Vary which dim is active + a small offset to spread gate logits.
+            v[t % hidden] = 1.0 + (t as f32) * 0.1;
+            xs.extend_from_slice(&v);
+        }
+        let input = cpu_tensor(xs, Shape::new(vec![batch, hidden]));
+
+        let ref_out = moe.forward(&input).unwrap().to_vec_f32().unwrap();
+        let det_out = moe.forward_deterministic(&input).unwrap().to_vec_f32().unwrap();
+
+        assert_eq!(
+            ref_out.len(),
+            det_out.len(),
+            "length mismatch kind={kind:?} rsf={rsf} batch={batch}"
+        );
+        for i in 0..ref_out.len() {
+            assert_eq!(
+                ref_out[i].to_bits(),
+                det_out[i].to_bits(),
+                "BITWISE mismatch at token-dim {i} (kind={kind:?} rsf={rsf} batch={batch}): ref={} det={}",
+                ref_out[i],
+                det_out[i],
+            );
+        }
+    }
+
+    #[cfg(feature = "moe-deterministic-dispatch")]
+    fn identity_linear(rows: usize, cols: usize) -> Linear {
+        let mut w = vec![0.0f32; rows * cols];
+        for i in 0..rows.min(cols) {
+            w[i * cols + i] = 1.0;
+        }
+        Linear::from_tensor(
+            cpu_tensor(w, Shape::new(vec![rows, cols])),
+            None,
+        )
     }
 }
