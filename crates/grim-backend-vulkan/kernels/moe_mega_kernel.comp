@@ -1,0 +1,56 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Activations {
+    float act_data[];         // [batch, hidden]
+};
+layout(set = 0, binding = 1) readonly buffer GateW {
+    float gw_data[];          // [num_experts, inter, hidden]
+};
+layout(set = 0, binding = 2) readonly buffer UpW {
+    float uw_data[];          // [num_experts, inter, hidden]
+};
+layout(set = 0, binding = 3) readonly buffer DownW {
+    float dw_data[];          // [num_experts, hidden, inter]
+};
+layout(set = 0, binding = 4) readonly buffer DestSlots {
+    uint ds_data[];           // [total_routed]
+};
+layout(set = 0, binding = 5) readonly buffer GlobalOffsets {
+    uint go_data[];           // [num_experts + 1]
+};
+layout(set = 0, binding = 6) readonly buffer ExpertCounts {
+    uint ec_data[];           // [num_experts]
+};
+layout(set = 0, binding = 7) buffer Output {
+    float out_data[];         // [batch, hidden]
+};
+
+layout(push_constant) uniform PushConstants {
+    uint batch;
+    uint hidden;
+    uint inter;
+    uint num_experts;
+    uint top_k;
+    uint total_routed;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.total_routed) return;
+
+    uint token_idx = ds_data[gid];
+    uint expert_idx = gid % pc.num_experts; // simplified; real kernel uses router output
+
+    // Load activation for this token (structural scaffold — real kernel uses
+    // shared memory and persistent-worker scoreboard synchronization).
+    float result = 0.0;
+    for (uint h = 0; h < pc.hidden; ++h) {
+        result += act_data[token_idx * pc.hidden + h]
+                * gw_data[expert_idx * pc.inter * pc.hidden + h];
+    }
+
+    atomicAdd(out_data[token_idx * pc.hidden + gid % pc.hidden], result);
+}

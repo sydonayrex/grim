@@ -4720,6 +4720,143 @@ impl VulkanDevice {
 
         Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
     }
+
+    /// Charon MoE expert-weight backward: compute d_gate_w, d_up_w, d_down_w.
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::CharonBackward`. Structural
+    /// scaffold — the real implementation needs forward-pass activated values
+    /// (not available without recompute/save). Documents the atomic scatter-add
+    /// pattern for expert-weight gradients.
+    pub fn charon_backward(
+        &self,
+        x: &dyn BackendStorage,
+        gate_w: &dyn BackendStorage,
+        up_w: &dyn BackendStorage,
+        down_w: &dyn BackendStorage,
+        grad: &dyn BackendStorage,
+        num_experts: u32,
+        hidden: u32,
+        inter: u32,
+    ) -> Result<()> {
+        if !self.caps.supports_fp32_atomic_add {
+            return Err(Error::Backend(
+                "charon_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into()
+            ));
+        }
+
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan charon_backward: x is not VulkanStorage".into()))?;
+        let gw_s = gate_w.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan charon_backward: gate_w is not VulkanStorage".into()))?;
+        let uw_s = up_w.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan charon_backward: up_w is not VulkanStorage".into()))?;
+        let dw_s = down_w.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan charon_backward: down_w is not VulkanStorage".into()))?;
+        let g_s = grad.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan charon_backward: grad is not VulkanStorage".into()))?;
+
+        let num_tokens = x_s.shape.elem_count() / hidden as usize;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard.as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        // Allocate output gradient buffer (d_gate_w + d_up_w + d_down_w)
+        let total_grad_elems = (num_experts as usize) * (inter as usize) * (hidden as usize) * 2
+            + (num_experts as usize) * (hidden as usize) * (inter as usize);
+        let dg_shape = Shape::new(vec![total_grad_elems]);
+        let dg = VulkanStorage::alloc_device_local_gpu(&dg_shape, DType::F32, ctx.device, ctx.physical_device)?;
+
+        // Zero-initialize (atomic scatter-add target)
+        unsafe {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            let res = vkMapMemory(ctx.device, dg.memory, 0, dg.bytes as VkDeviceSize, 0, &mut mapped);
+            if res == VK_SUCCESS {
+                std::ptr::write_bytes(mapped, 0, dg.bytes);
+                vkUnmapMemory(ctx.device, dg.memory);
+            }
+        }
+
+        let buffers = [x_s.buffer, gw_s.buffer, uw_s.buffer, dw_s.buffer, g_s.buffer, dg.buffer];
+        let total_dw = (num_experts as usize) * (hidden as usize) * (inter as usize);
+        let grid_x = total_dw.div_ceil(64) as u32;
+        let push = push_params(num_experts, hidden, inter, num_tokens as u32, 0, 0.0);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::CharonBackward,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok(())
+    }
+
+    /// MoE persistent-worker comm-compute mega-kernel dispatch.
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::MoeMegaKernel`. Structural
+    /// scaffold — the real implementation needs persistent-worker scoreboard
+    /// synchronization across multiple dispatches. Documents the activation
+    /// loading + expert-weight multiply pattern.
+    pub fn moe_mega_kernel(
+        &self,
+        activations: &dyn BackendStorage,
+        gate_w: &dyn BackendStorage,
+        up_w: &dyn BackendStorage,
+        down_w: &dyn BackendStorage,
+        dest_slots: &dyn BackendStorage,
+        global_offsets: &dyn BackendStorage,
+        expert_counts: &dyn BackendStorage,
+        batch: u32,
+        hidden: u32,
+        inter: u32,
+        num_experts: u32,
+        top_k: u32,
+        total_routed: u32,
+    ) -> Result<()> {
+        let act_s = activations.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: activations is not VulkanStorage".into()))?;
+        let gw_s = gate_w.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: gate_w is not VulkanStorage".into()))?;
+        let uw_s = up_w.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: up_w is not VulkanStorage".into()))?;
+        let dw_s = down_w.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: down_w is not VulkanStorage".into()))?;
+        let ds_s = dest_slots.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: dest_slots is not VulkanStorage".into()))?;
+        let go_s = global_offsets.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: global_offsets is not VulkanStorage".into()))?;
+        let ec_s = expert_counts.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: expert_counts is not VulkanStorage".into()))?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard.as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        // Allocate output buffer
+        let out_elems = (batch as usize) * (hidden as usize);
+        let out_shape = Shape::new(vec![out_elems]);
+        let output = VulkanStorage::alloc_device_local_gpu(&out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+
+        let buffers = [act_s.buffer, gw_s.buffer, uw_s.buffer, dw_s.buffer, ds_s.buffer, go_s.buffer, ec_s.buffer, output.buffer];
+        let grid_x = total_routed.max(1);
+        let push = push_params(batch, hidden, inter, num_experts, top_k, 0.0);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::MoeMegaKernel,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok(())
+    }
 }
 
 impl OptimizerOps for VulkanDevice {
@@ -6215,6 +6352,10 @@ pub enum VulkanKernel {
     SpeculativeAcceptor,
     /// Cooperative matrix hardware accelerated GEMM.
     CooperativeMatrixGemm,
+    /// Charon — MoE expert-weight backward (gate/up/down gradients).
+    CharonBackward,
+    /// MoE persistent-worker comm-compute mega-kernel dispatch.
+    MoeMegaKernel,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -6299,6 +6440,8 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::QkvAttentionPagedDequant => SPIRV_QKV_ATTENTION_PAGED_DEQUANT,
         VulkanKernel::SpeculativeAcceptor => SPIRV_SPECULATIVE_ACCEPTOR,
         VulkanKernel::CooperativeMatrixGemm => SPIRV_COOPERATIVE_MATRIX_GEMM,
+        VulkanKernel::CharonBackward => SPIRV_CHARON_BACKWARD,
+        VulkanKernel::MoeMegaKernel => SPIRV_MOE_MEGA_KERNEL,
     }
 }
 
@@ -6377,8 +6520,10 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::SelectiveScan
         | VulkanKernel::FlashDecodeSplitK
         | VulkanKernel::SpeculativeAcceptor
-        | VulkanKernel::QuantizedMatmulBackwardDxGeneric => 6,
+        | VulkanKernel::QuantizedMatmulBackwardDxGeneric
+        | VulkanKernel::CharonBackward => 6,
         VulkanKernel::QkvAttentionPagedDequant => 7,
+        VulkanKernel::MoeMegaKernel => 8,
         VulkanKernel::MulScalar
         | VulkanKernel::Sqrt
         | VulkanKernel::Recip
