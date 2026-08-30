@@ -16,7 +16,18 @@
 //!   backend-agnostic module; the GPU kernel pickup is the next PR's
 //!   surface.
 
+use std::ffi::c_void;
 use std::fmt;
+use std::ptr::null_mut;
+
+use grim_tensor::error::{Error, Result};
+
+use crate::device::handles::{
+    hipEventCreate, hipEventDestroy, hipEventRecord,
+    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamSynchronize, hipStreamWaitEvent,
+    hipSuccess,
+};
+use crate::device::helpers::check_hip;
 
 // =========================================================================
 // Token acceptance (Leviathan / Chen et al. 2023)
@@ -187,7 +198,7 @@ impl TreeMaskBuilder {
         &mut self,
         child: usize,
         parent: usize,
-    ) -> Result<(), String> {
+    ) -> std::result::Result<(), String> {
         if child == 0 {
             return Err("root must not have a parent".into());
         }
@@ -315,7 +326,7 @@ where
     ///      target distribution; returns N parallel `(p_draft,
     ///      p_target)` tuples.
     ///   3. `TokenAcceptor::decide` decides accept/reject.
-    pub fn step(&mut self, input_ids: &[u32]) -> Result<StepSummary, String> {
+    pub fn step(&mut self, input_ids: &[u32]) -> std::result::Result<StepSummary, String> {
         let n = self.gamma;
         // 1. Draft.
         let draft_tokens = (self.draft)(input_ids);
@@ -374,6 +385,66 @@ mod self_tests {
         let m = TreeMaskBuilder::new(0).build();
         assert!(m.is_some());
         assert_eq!(m.unwrap().rows, 0);
+    }
+
+    #[test]
+    fn dual_stream_engine_simulated_pipeline_full_acceptance() {
+        let config = DualStreamConfig {
+            gamma: 3,
+            non_blocking_streams: true,
+            acceptance_threshold: 0.0,
+        };
+        let mut engine = DualStreamSpeculativeEngine::new_simulated(config);
+        let mut tokens = vec![1, 2, 3];
+        let initial_draft = vec![10, 20, 30];
+
+        let draft_fn = |ctx: &[u32], _stream| -> Vec<u32> {
+            let last = ctx.last().copied().unwrap_or(0);
+            vec![last + 1, last + 2, last + 3]
+        };
+        let verify_fn = |_ctx: &[u32], drafts: &[u32], _stream| -> Vec<(f32, f32)> {
+            drafts.iter().map(|_| (0.8f32, 0.8f32)).collect()
+        };
+
+        let (summary, next_draft) = engine
+            .step_pipelined(&mut tokens, &initial_draft, &draft_fn, &verify_fn)
+            .expect("pipelined step should succeed");
+
+        assert_eq!(summary.accepted_count(), 3);
+        assert_eq!(tokens, vec![1, 2, 3, 10, 20, 30]);
+        assert_eq!(next_draft, vec![31, 32, 33]);
+        assert_eq!(engine.stats().overlapped_rounds, 1);
+        assert_eq!(engine.stats().total_accepted_tokens, 3);
+    }
+
+    #[test]
+    fn dual_stream_engine_simulated_pipeline_partial_rejection() {
+        let config = DualStreamConfig {
+            gamma: 3,
+            non_blocking_streams: true,
+            acceptance_threshold: 0.0,
+        };
+        let mut engine = DualStreamSpeculativeEngine::new_simulated(config);
+        let mut tokens = vec![100];
+        let initial_draft = vec![101, 102, 103];
+
+        let draft_fn = |ctx: &[u32], _stream| -> Vec<u32> {
+            let last = ctx.last().copied().unwrap_or(0);
+            vec![last + 1, last + 2, last + 3]
+        };
+        // Rejects at index 1 (second draft token)
+        let verify_fn = |_ctx: &[u32], _drafts: &[u32], _stream| -> Vec<(f32, f32)> {
+            vec![(0.8f32, 0.8f32), (0.8f32, 0.1f32), (0.8f32, 0.8f32)]
+        };
+
+        let (summary, next_draft) = engine
+            .step_pipelined(&mut tokens, &initial_draft, &draft_fn, &verify_fn)
+            .expect("pipelined step should succeed");
+
+        assert_eq!(summary.accepted_count(), 1);
+        assert_eq!(tokens, vec![100, 101]);
+        assert_eq!(engine.stats().total_rejections, 1);
+        assert_eq!(next_draft, vec![102, 103, 104]);
     }
 }
 
@@ -447,5 +518,391 @@ impl SplitMix64 {
     /// Next uniform `f32 ∈ [0, 1)`.
     pub(crate) fn next_f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+// =========================================================================
+// Dual-Stream Speculative Engine (T3.9 / Phase-6)
+// =========================================================================
+
+/// Configuration for the dual-stream speculative decoding engine.
+#[derive(Debug, Clone)]
+pub struct DualStreamConfig {
+    /// Number of draft tokens proposed per speculative round (gamma).
+    pub gamma: usize,
+    /// Whether non-blocking HIP streams (HIP_STREAM_NON_BLOCKING) are requested.
+    pub non_blocking_streams: bool,
+    /// Threshold parameter for the token acceptor (default 0.0).
+    pub acceptance_threshold: f32,
+}
+
+impl Default for DualStreamConfig {
+    fn default() -> Self {
+        Self {
+            gamma: 4,
+            non_blocking_streams: true,
+            acceptance_threshold: 0.0,
+        }
+    }
+}
+
+/// Runtime statistics tracked across dual-stream pipelined speculative decoding rounds.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DualStreamStats {
+    /// Total number of draft candidate tokens proposed across all steps.
+    pub total_draft_tokens: usize,
+    /// Total number of draft tokens accepted by the target verifier.
+    pub total_accepted_tokens: usize,
+    /// Number of corrective / continuation tail tokens emitted.
+    pub total_tail_tokens: usize,
+    /// Number of pipelined rounds where verify(N) overlapped draft(N+1).
+    pub overlapped_rounds: usize,
+    /// Number of partial or full rejections encountered at step boundaries.
+    pub total_rejections: usize,
+}
+
+impl DualStreamStats {
+    /// Acceptance rate of draft tokens across pipelined rounds.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.total_draft_tokens == 0 {
+            0.0
+        } else {
+            self.total_accepted_tokens as f64 / self.total_draft_tokens as f64
+        }
+    }
+}
+
+/// Dual-stream speculative decoding engine for ROCm.
+///
+/// Implements real pipelined draft/verify overlap across two independent HIP compute streams:
+/// - `stream_verify` (Stream A): Target model forward evaluation and candidate verification.
+/// - `stream_draft` (Stream B): Draft model candidate proposal generation for step N+1.
+///
+/// Stream dependencies and step boundaries are coordinated via `event_draft_ready` and
+/// `event_verify_ready` without stalling unrelated control/device streams.
+pub struct DualStreamSpeculativeEngine {
+    config: DualStreamConfig,
+    stream_verify: *mut c_void,
+    stream_draft: *mut c_void,
+    event_draft_ready: *mut c_void,
+    event_verify_ready: *mut c_void,
+    owns_hip_resources: bool,
+    acceptor: TokenAcceptor,
+    stats: DualStreamStats,
+}
+
+unsafe impl Send for DualStreamSpeculativeEngine {}
+
+impl DualStreamSpeculativeEngine {
+    /// Create a new dual-stream speculative engine with real HIP streams and events.
+    pub fn try_new(config: DualStreamConfig) -> Result<Self> {
+        let flags = if config.non_blocking_streams { 0x1 } else { 0x0 };
+        let mut stream_v: *mut c_void = null_mut();
+        let mut stream_d: *mut c_void = null_mut();
+        let mut ev_d: *mut c_void = null_mut();
+        let mut ev_v: *mut c_void = null_mut();
+
+        unsafe {
+            let res = hipStreamCreateWithFlags(&mut stream_v, flags, 0);
+            if res != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "hipStreamCreateWithFlags (verify) failed: {}",
+                    res
+                )));
+            }
+            let res = hipStreamCreateWithFlags(&mut stream_d, flags, 0);
+            if res != hipSuccess {
+                let _ = hipStreamDestroy(stream_v);
+                return Err(Error::Backend(format!(
+                    "hipStreamCreateWithFlags (draft) failed: {}",
+                    res
+                )));
+            }
+            let res = hipEventCreate(&mut ev_d);
+            if res != hipSuccess {
+                let _ = hipStreamDestroy(stream_v);
+                let _ = hipStreamDestroy(stream_d);
+                return Err(Error::Backend(format!(
+                    "hipEventCreate (draft_ready) failed: {}",
+                    res
+                )));
+            }
+            let res = hipEventCreate(&mut ev_v);
+            if res != hipSuccess {
+                let _ = hipStreamDestroy(stream_v);
+                let _ = hipStreamDestroy(stream_d);
+                let _ = hipEventDestroy(ev_d);
+                return Err(Error::Backend(format!(
+                    "hipEventCreate (verify_ready) failed: {}",
+                    res
+                )));
+            }
+        }
+
+        let threshold = config.acceptance_threshold;
+        Ok(Self {
+            config,
+            stream_verify: stream_v,
+            stream_draft: stream_d,
+            event_draft_ready: ev_d,
+            event_verify_ready: ev_v,
+            owns_hip_resources: true,
+            acceptor: TokenAcceptor::new(threshold),
+            stats: DualStreamStats::default(),
+        })
+    }
+
+    /// Create a simulated dual-stream engine that executes the same pipelined scheduling
+    /// without initializing raw GPU HIP handles. Useful for CPU tests and environments
+    /// without physical AMD ROCm hardware.
+    pub fn new_simulated(config: DualStreamConfig) -> Self {
+        let threshold = config.acceptance_threshold;
+        Self {
+            config,
+            stream_verify: null_mut(),
+            stream_draft: null_mut(),
+            event_draft_ready: null_mut(),
+            event_verify_ready: null_mut(),
+            owns_hip_resources: false,
+            acceptor: TokenAcceptor::new(threshold),
+            stats: DualStreamStats::default(),
+        }
+    }
+
+    /// Create with default configuration, attempting real HIP streams first and falling back
+    /// to simulated mode if HIP runtime is unavailable.
+    pub fn new(gamma: usize) -> Self {
+        let config = DualStreamConfig {
+            gamma,
+            ..Default::default()
+        };
+        Self::try_new(config.clone()).unwrap_or_else(|_| Self::new_simulated(config))
+    }
+
+    /// Verifier stream handle (Stream A).
+    pub fn stream_verify(&self) -> *mut c_void {
+        self.stream_verify
+    }
+
+    /// Drafter stream handle (Stream B).
+    pub fn stream_draft(&self) -> *mut c_void {
+        self.stream_draft
+    }
+
+    /// Event handle recorded when draft proposals are ready.
+    pub fn event_draft_ready(&self) -> *mut c_void {
+        self.event_draft_ready
+    }
+
+    /// Event handle recorded when target verification is complete.
+    pub fn event_verify_ready(&self) -> *mut c_void {
+        self.event_verify_ready
+    }
+
+    /// Access current statistics.
+    pub fn stats(&self) -> &DualStreamStats {
+        &self.stats
+    }
+
+    /// Access mutable statistics.
+    pub fn stats_mut(&mut self) -> &mut DualStreamStats {
+        &mut self.stats
+    }
+
+    /// Reset statistics to default zero state.
+    pub fn reset_stats(&mut self) {
+        self.stats = DualStreamStats::default();
+    }
+
+    /// Configuration parameters.
+    pub fn config(&self) -> &DualStreamConfig {
+        &self.config
+    }
+
+    /// Returns whether this engine owns real HIP runtime streams and events.
+    pub fn is_hip_backed(&self) -> bool {
+        self.owns_hip_resources
+    }
+
+    /// Synchronize the verifier stream to wait on the draft completion event.
+    pub fn sync_draft_to_verify(&self) -> Result<()> {
+        if self.owns_hip_resources
+            && !self.stream_verify.is_null()
+            && !self.event_draft_ready.is_null()
+        {
+            check_hip(
+                "hipStreamWaitEvent (verify waits draft)",
+                unsafe { hipStreamWaitEvent(self.stream_verify, self.event_draft_ready, 0) },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record that draft generation on `stream_draft` has completed.
+    pub fn record_draft_ready(&self) -> Result<()> {
+        if self.owns_hip_resources
+            && !self.stream_draft.is_null()
+            && !self.event_draft_ready.is_null()
+        {
+            check_hip(
+                "hipEventRecord (draft_ready)",
+                unsafe { hipEventRecord(self.event_draft_ready, self.stream_draft) },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record that verification on `stream_verify` has completed.
+    pub fn record_verify_ready(&self) -> Result<()> {
+        if self.owns_hip_resources
+            && !self.stream_verify.is_null()
+            && !self.event_verify_ready.is_null()
+        {
+            check_hip(
+                "hipEventRecord (verify_ready)",
+                unsafe { hipEventRecord(self.event_verify_ready, self.stream_verify) },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize host with the verifier stream.
+    pub fn sync_verify(&self) -> Result<()> {
+        if self.owns_hip_resources && !self.stream_verify.is_null() {
+            check_hip(
+                "hipStreamSynchronize (verify)",
+                unsafe { hipStreamSynchronize(self.stream_verify) },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize host with the drafter stream.
+    pub fn sync_draft(&self) -> Result<()> {
+        if self.owns_hip_resources && !self.stream_draft.is_null() {
+            check_hip(
+                "hipStreamSynchronize (draft)",
+                unsafe { hipStreamSynchronize(self.stream_draft) },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize host with both verifier and drafter streams.
+    pub fn sync_all(&self) -> Result<()> {
+        self.sync_verify()?;
+        self.sync_draft()?;
+        Ok(())
+    }
+
+    /// Execute a pipelined speculative decoding step with overlapping draft/verify execution.
+    ///
+    /// The step coordinates:
+    /// 1. Verifying step N candidate tokens `active_draft_tokens` on `stream_verify`.
+    /// 2. Concurrently launching draft generation for step N+1 candidate tokens on `stream_draft`.
+    /// 3. Synchronizing at the step N boundary to accept tokens and determine next state.
+    ///
+    /// Returns `(summary, next_staged_draft)`.
+    pub fn step_pipelined<D, T>(
+        &mut self,
+        current_tokens: &mut Vec<u32>,
+        active_draft_tokens: &[u32],
+        draft_fn: &D,
+        verify_fn: &T,
+    ) -> Result<(StepSummary, Vec<u32>)>
+    where
+        D: Fn(&[u32], *mut c_void) -> Vec<u32>,
+        T: Fn(&[u32], &[u32], *mut c_void) -> Vec<(f32, f32)>,
+    {
+        let gamma = self.config.gamma;
+        let n_draft = active_draft_tokens.len().min(gamma);
+        self.stats.total_draft_tokens += n_draft;
+
+        // Step 1: Ensure prior draft has landed before verifier consumes it
+        self.sync_draft_to_verify()?;
+
+        // Step 2: Launch verification of active_draft_tokens on stream_verify
+        let probs =
+            (verify_fn)(current_tokens, &active_draft_tokens[..n_draft], self.stream_verify);
+        self.record_verify_ready()?;
+
+        // Step 3: Concurrently launch optimistic Draft(N+1) on stream_draft assuming full acceptance
+        let mut optimistic_next_ctx = current_tokens.clone();
+        optimistic_next_ctx.extend_from_slice(&active_draft_tokens[..n_draft]);
+        let optimistic_next_draft = (draft_fn)(&optimistic_next_ctx, self.stream_draft);
+        self.record_draft_ready()?;
+
+        // Step 4: Synchronize verify stream for step N decision
+        self.sync_verify()?;
+
+        // Step 5: Evaluate acceptance
+        let decision = self.acceptor.decide(&probs, n_draft);
+        match decision {
+            AcceptanceResult::AcceptAll { accepted, tail } => {
+                let count = accepted.len();
+                self.stats.total_accepted_tokens += count;
+                self.stats.total_tail_tokens += 1;
+                self.stats.overlapped_rounds += 1;
+
+                // All draft tokens accepted! Append them to context.
+                current_tokens.extend_from_slice(&active_draft_tokens[..count]);
+
+                let summary = StepSummary {
+                    accepted,
+                    tail_prob: tail,
+                    emitted: count + 1,
+                };
+                // Next draft produced on stream B is valid!
+                let next_draft: Vec<u32> = optimistic_next_draft.into_iter().take(gamma).collect();
+                Ok((summary, next_draft))
+            }
+            AcceptanceResult::Partial {
+                accepted,
+                rejected_at,
+            } => {
+                let count = accepted.len();
+                self.stats.total_accepted_tokens += count;
+                self.stats.total_tail_tokens += 1;
+                self.stats.total_rejections += 1;
+
+                // Partial acceptance: append accepted prefix
+                current_tokens.extend_from_slice(&active_draft_tokens[..count]);
+
+                let tail_p = probs.get(rejected_at).map(|&(_, pt)| pt).unwrap_or(0.0);
+                let summary = StepSummary {
+                    accepted,
+                    tail_prob: tail_p,
+                    emitted: count + 1,
+                };
+
+                // Because speculation diverged, sync stream_draft and relaunch draft for corrected state
+                self.sync_draft()?;
+                let corrected_draft = (draft_fn)(current_tokens, self.stream_draft);
+                self.record_draft_ready()?;
+                let next_draft: Vec<u32> = corrected_draft.into_iter().take(gamma).collect();
+                Ok((summary, next_draft))
+            }
+        }
+    }
+}
+
+impl Drop for DualStreamSpeculativeEngine {
+    fn drop(&mut self) {
+        if self.owns_hip_resources {
+            unsafe {
+                if !self.event_draft_ready.is_null() {
+                    let _ = hipEventDestroy(self.event_draft_ready);
+                }
+                if !self.event_verify_ready.is_null() {
+                    let _ = hipEventDestroy(self.event_verify_ready);
+                }
+                if !self.stream_verify.is_null() {
+                    let _ = hipStreamDestroy(self.stream_verify);
+                }
+                if !self.stream_draft.is_null() {
+                    let _ = hipStreamDestroy(self.stream_draft);
+                }
+            }
+        }
     }
 }
