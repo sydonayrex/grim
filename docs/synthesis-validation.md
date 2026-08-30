@@ -1,8 +1,8 @@
 # Synthesis Validation: research recommendations vs. grim codebase reality
 
-**Date:** 2026-08-30 · **Scope:** validate every actionable recommendation in
-[`old/tp/synthesis.md`](/D/rex/projects/grim/old/tp/synthesis.md) against the live
-codebase (`main` @ 70017881), then prioritize the real gaps.
+**Date:** 2026-08-30 (updated after R1 implementation) · **Scope:** validate every
+actionable recommendation in [`old/tp/synthesis.md`](/D/rex/projects/grim/old/tp/synthesis.md)
+against the live codebase (`main`), then prioritize the real gaps.
 
 ## Verification method
 
@@ -206,3 +206,75 @@ structure with passing tests, then stop before wiring it. To prevent this:
 3. **Wire-before-claim discipline.** The synthesis' "competitive advantage" is
    only real when R1–R4 are on the hot path. Until then, grim has research-grade
    primitives, not production advantage.
+
+---
+
+## Implementation status (2026-08-30)
+
+### R1 — Wire ReadinessDispatcher into `Scheduler::schedule()` ✅ DONE
+
+**What landed** (`crates/grim-scheduler/src/lib.rs`):
+- Added `readiness: Option<ReadinessDispatcher>` field to `Scheduler` and a
+  `set_readiness_dispatch()` setter (constructor keeps `None` → legacy path
+  untouched).
+- In `schedule()`: when the dispatcher is set **and** token pressure is active,
+  submit one ready-decode `MicrobatchTask` per decode-eligible running request
+  (keyed by request id, priority 100, zero dependencies), then
+  `arbitrate()`. If decode wins, **defer all new prefill admission to next
+  tick** so decode runs this tick — RRFP decode-first interleaving applied to
+  the prefill/decode contention. Without the dispatcher or off pressure, the
+  legacy greedy prefill path runs unchanged.
+- `READINESS_DECODE_PRIORITY` constant; dead-code/unused-variable lints honored.
+
+**Test:** `test_readiness_dispatch_defers_prefill_under_pressure` proves that
+with the dispatcher + pressure + a decode-eligible running request, a contending
+new prefill is deferred (not in `output.prefill_ids`) while decode is returned;
+and that without the dispatcher the legacy path admits the prefill greedily.
+All 39 `grim-scheduler` tests pass; 135 `grim-engine` tests pass.
+
+**Why this is the right adaptation.** grim's scheduler is a single-stage
+continuous batcher, not a multi-stage PP pipeline, so "per pipeline stage"
+does not apply. RRFP's core insight — "schedule as a hint, dispatch ready work,
+skip blocked work" — generalizes to: decode is always ready, prefill contends
+for budget, so arbitrate decode-first under pressure. The deferral protects ITL
+without head-of-line-blocking decode behind a fresh prefill.
+
+### R4 — Enforce MemoryCertificate at admission ⏸ DEFERRED
+
+`MemoryCertificate::certify` is a pure function of `ArchHyperparameters` +
+boundary vector, but wiring it into `admit_placed_request` requires per-backend
+device-memory probes (ROCm/Vulkan/Metal/CUDA free-memory queries) that the
+engine does not yet expose. **Recommendation:** scope as a follow-up that
+(1) adds a `free_device_memory()` capability probe to each backend, (2) calls
+`certify` at model load using the model's actual `ArchHyperparameters`, and
+(3) rejects/queues requests that exceed the envelope. Do not claim "certified
+exactness" until (1)–(3) ship.
+
+### R2 — Fuse DeterministicTokenMap into MoeFfn::forward ⏸ DEFERRED (high effort, high risk)
+
+`DeterministicTokenMap::build` already computes conflict-free destination
+offsets (the correctness-critical part). But `MoeFfn::forward` is the
+numerically-sensitive CPU reference that every backend's fused path is tested
+*against*. Reordering its accumulation is only safe after bitwise-equivalence
+proofing across all quant formats and backends. **Recommendation:** prototype
+behind a feature flag (`moe-deterministic-dispatch`) with a property test
+asserting bitwise equality with the current `forward` before switching the
+default. Land the memory-certificate probe first.
+
+### R3 — VPP virtual-stage traversal ⏸ DEFERRED
+
+`PipelinePlan` is static layer partitioning (Megatron-style), not VPP's
+V-shaped fold-back traversal with async bidirectional comm. The real VPP
+mechanism — chunk `k` visiting virtual stages `{s0,s1,s2,s3}` in a V, async
+send/recv at fold points, pipelined drain-window packing — is not present.
+**Recommendation:** after R1, implement the V-traversal as a
+`PipelinePlan::virtual_stage_traversal(chunks, num_ranks)` returning the
+per-chunk stage schedule, then reuse the existing `grim-kvtransport` async
+primitives for fold-point handoffs. Benchmark bubble ratio on long-context
+prefill before claiming improvement.
+
+### R5 — Disaggregated attention/FFN placement ⏸ DEFERRED (lowest priority)
+
+Not implemented. DisagMoE's disaggregation assumes datacenter multi-node EP;
+grim targets single-node consumer GPU. **Recommendation:** revisit only if
+multi-GPU consumer configs become a real deployment target.
