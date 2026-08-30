@@ -722,6 +722,111 @@ impl RcclAllReduce {
         }
     }
 
+    /// All-gather device buffers of an explicit NCCL dtype on `rank`'s communicator.
+    pub fn all_gather_device(
+        &self,
+        send_dev_ptr: u64,
+        recv_dev_ptr: u64,
+        send_count: usize,
+        nccl_dtype: NcclDataType,
+        stream: u64,
+        rank: usize,
+    ) -> Result<()> {
+        if self.num_gpus <= 1 || send_count == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "rccl")]
+        {
+            let comm = self
+                .comms
+                .get(rank)
+                .copied()
+                .unwrap_or(NcclComm(std::ptr::null_mut()));
+            if comm.0.is_null() {
+                return Err(Error::Backend(
+                    "RCCL communicator is unavailable for multi-GPU all-gather".into(),
+                ));
+            }
+            let status = unsafe {
+                ncclAllGather(
+                    send_dev_ptr as *const c_void,
+                    recv_dev_ptr as *mut c_void,
+                    send_count,
+                    nccl_dtype,
+                    comm,
+                    stream as *mut c_void,
+                )
+            };
+            if status != NCCL_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "RcclAllReduce::all_gather_device: ncclAllGather failed (status {})",
+                    status,
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "rccl"))]
+        {
+            let _ = (send_dev_ptr, recv_dev_ptr, send_count, nccl_dtype, stream, rank);
+            Err(Error::Backend(
+                "RcclAllReduce::all_gather_device: multi-GPU RCCL requires `rccl` feature flag".into(),
+            ))
+        }
+    }
+
+    /// Reduce-scatter device buffers of an explicit NCCL dtype on `rank`'s communicator.
+    pub fn reduce_scatter_device(
+        &self,
+        send_dev_ptr: u64,
+        recv_dev_ptr: u64,
+        recv_count: usize,
+        nccl_dtype: NcclDataType,
+        stream: u64,
+        rank: usize,
+    ) -> Result<()> {
+        if self.num_gpus <= 1 || recv_count == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "rccl")]
+        {
+            let comm = self
+                .comms
+                .get(rank)
+                .copied()
+                .unwrap_or(NcclComm(std::ptr::null_mut()));
+            if comm.0.is_null() {
+                return Err(Error::Backend(
+                    "RCCL communicator is unavailable for multi-GPU reduce-scatter".into(),
+                ));
+            }
+            let status = unsafe {
+                ncclReduceScatter(
+                    send_dev_ptr as *const c_void,
+                    recv_dev_ptr as *mut c_void,
+                    recv_count,
+                    nccl_dtype,
+                    NCCL_SUM,
+                    comm,
+                    stream as *mut c_void,
+                )
+            };
+            if status != NCCL_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "RcclAllReduce::reduce_scatter_device: ncclReduceScatter failed (status {})",
+                    status,
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "rccl"))]
+        {
+            let _ = (send_dev_ptr, recv_dev_ptr, recv_count, nccl_dtype, stream, rank);
+            Err(Error::Backend(
+                "RcclAllReduce::reduce_scatter_device: multi-GPU RCCL requires `rccl` feature flag".into(),
+            ))
+        }
+    }
+
     /// Average already-reduced gradients in-place by `1/num_gpus`.
     ///
     /// This operates on host memory and is useful when the caller has

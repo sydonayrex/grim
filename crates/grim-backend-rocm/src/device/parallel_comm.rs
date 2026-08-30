@@ -516,6 +516,146 @@ impl ParallelCommunicator {
             Ok(())
         }
     }
+
+    /// Performs an All-Gather on a device-resident `RocmStorage` tensor.
+    /// Concatenates shards from all ranks into `dst` on-device via RCCL when available.
+    pub fn all_gather_storage(
+        &self,
+        src: &RocmStorage,
+        dst: &mut RocmStorage,
+        stream_u64: u64,
+    ) -> Result<()> {
+        let world_size = self.topology.world_size;
+        let chunk_size = src.shape.elem_count();
+
+        if dst.shape.elem_count() != chunk_size * world_size {
+            return Err(Error::Backend(format!(
+                "all_gather_storage: dst elems {} != chunk_size {} * world_size {}",
+                dst.shape.elem_count(),
+                chunk_size,
+                world_size
+            )));
+        }
+
+        if world_size <= 1 {
+            if let (Some(s_ptr), Some(d_ptr)) = (src.device_ptr, dst.device_ptr) {
+                let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
+                unsafe {
+                    crate::hipMemcpy(
+                        d_ptr as *mut std::ffi::c_void,
+                        s_ptr as *const std::ffi::c_void,
+                        src.bytes(),
+                        crate::HipMemcpyKind::DeviceToDevice,
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
+
+        if let Some(rccl) = &self.rccl {
+            let send_ptr = src.device_ptr.ok_or_else(|| Error::Backend("all_gather_storage: src device pointer missing".into()))?;
+            let recv_ptr = dst.device_ptr.ok_or_else(|| Error::Backend("all_gather_storage: dst device pointer missing".into()))?;
+            rccl.all_gather_device(
+                send_ptr,
+                recv_ptr,
+                chunk_size,
+                crate::rccl::NCCL_FLOAT32,
+                stream_u64,
+                self.topology.rank,
+            )?;
+            Ok(())
+        } else {
+            // Host staging fallback
+            let src_vec = src.to_cpu_vec_f32()?;
+            let mut dst_vec = vec![0.0f32; dst.shape.elem_count()];
+            self.all_gather_f32(&src_vec, &mut dst_vec)?;
+
+            if let Some(d_ptr) = dst.device_ptr {
+                let bytes: Vec<u8> = dst_vec.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                unsafe {
+                    crate::hipMemcpy(
+                        d_ptr as *mut std::ffi::c_void,
+                        bytes.as_ptr() as *const std::ffi::c_void,
+                        bytes.len(),
+                        crate::HipMemcpyKind::HostToDevice,
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Performs a Reduce-Scatter (SUM) on a device-resident `RocmStorage` tensor.
+    /// Reduces gradient tensors across all ranks and scatters the rank shard into `dst` on-device via RCCL.
+    pub fn reduce_scatter_storage(
+        &self,
+        src: &RocmStorage,
+        dst: &mut RocmStorage,
+        stream_u64: u64,
+    ) -> Result<()> {
+        let world_size = self.topology.world_size;
+        let chunk_size = dst.shape.elem_count();
+
+        if src.shape.elem_count() != chunk_size * world_size {
+            return Err(Error::Backend(format!(
+                "reduce_scatter_storage: src elems {} != chunk_size {} * world_size {}",
+                src.shape.elem_count(),
+                chunk_size,
+                world_size
+            )));
+        }
+
+        if world_size <= 1 {
+            if let (Some(s_ptr), Some(d_ptr)) = (src.device_ptr, dst.device_ptr) {
+                let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
+                unsafe {
+                    crate::hipMemcpy(
+                        d_ptr as *mut std::ffi::c_void,
+                        s_ptr as *const std::ffi::c_void,
+                        dst.bytes(),
+                        crate::HipMemcpyKind::DeviceToDevice,
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
+
+        if let Some(rccl) = &self.rccl {
+            let send_ptr = src.device_ptr.ok_or_else(|| Error::Backend("reduce_scatter_storage: src device pointer missing".into()))?;
+            let recv_ptr = dst.device_ptr.ok_or_else(|| Error::Backend("reduce_scatter_storage: dst device pointer missing".into()))?;
+            rccl.reduce_scatter_device(
+                send_ptr,
+                recv_ptr,
+                chunk_size,
+                crate::rccl::NCCL_FLOAT32,
+                stream_u64,
+                self.topology.rank,
+            )?;
+            Ok(())
+        } else {
+            // Host staging fallback
+            let src_vec = src.to_cpu_vec_f32()?;
+            let mut dst_vec = vec![0.0f32; dst.shape.elem_count()];
+            self.reduce_scatter_sum_f32(&src_vec, &mut dst_vec)?;
+
+            if let Some(d_ptr) = dst.device_ptr {
+                let bytes: Vec<u8> = dst_vec.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                unsafe {
+                    crate::hipMemcpy(
+                        d_ptr as *mut std::ffi::c_void,
+                        bytes.as_ptr() as *const std::ffi::c_void,
+                        bytes.len(),
+                        crate::HipMemcpyKind::HostToDevice,
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
