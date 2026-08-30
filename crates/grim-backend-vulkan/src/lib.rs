@@ -5863,9 +5863,13 @@ impl MemoryOps for VulkanDevice {
         Ok(Box::new(storage))
     }
 
-    /// KV-arena path: device-to-device copy of `count` f32 elements from
-    /// `src` into `dst` at `dst_elem_offset`. Both storages must live on this
-    /// device (no peer routing — that is `copy_via_route`'s job).
+    /// Device-to-device copy of `count` f32 elements from `src` into `dst` at
+    /// `dst_elem_offset`. Both storages must live on this device (no peer
+    /// routing — that is `copy_via_route`'s job).
+    ///
+    /// Device-side `vkCmdCopyBuffer` one-shot command buffer. Replaces the
+    /// earlier CPU read-back/re-upload fallback so KV-arena appends avoid the
+    /// PCIe round-trip.
     fn copy_slice_into(
         &self,
         dst: &dyn BackendStorage,
@@ -5873,36 +5877,108 @@ impl MemoryOps for VulkanDevice {
         dst_elem_offset: usize,
         count: usize,
     ) -> Result<()> {
-        let dst_v = dst.to_cpu_vec_f32()?;
-        let src_v = src.to_cpu_vec_f32()?;
-        let dst_off = dst_elem_offset;
-        if dst_off.saturating_add(count) > dst_v.len() {
-            return Err(Error::Backend("copy_slice_into: dst offset+count out of bounds".into()));
-        }
-        if count > src_v.len() {
-            return Err(Error::Backend("copy_slice_into: count exceeds src".into()));
-        }
-        // CPU fallback (correct first): splice the source slice into the dest
-        // view, then re-upload. A device-side `vkCmdCopyBuffer` kernel is the
-        // documented upgrade to close the KV-arena zero-roundtrip path.
-        let mut out = dst_v;
-        for i in 0..count {
-            out[dst_off + i] = src_v[i];
-        }
         let dst_s = dst.as_any().downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan copy_slice_into: dst is not VulkanStorage".into()))?;
-        // Re-upload via the mapped-GPU path used by from_cpu_bytes.
-        let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let total_bytes = (out.len() * 4) as VkDeviceSize;
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { vkMapMemory(ctx.device, dst_s.memory, 0, total_bytes, 0, &mut mapped) };
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("copy_slice_into: vkMapMemory failed: {res}")));
+        let src_s = src.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan copy_slice_into: src is not VulkanStorage".into()))?;
+
+        let dst_elem_count = dst_s.shape.elem_count();
+        let src_elem_count = src_s.shape.elem_count();
+        let dst_off = dst_elem_offset;
+        if dst_off.saturating_add(count) > dst_elem_count {
+            return Err(Error::Backend("copy_slice_into: dst offset+count out of bounds".into()));
         }
+        if count > src_elem_count {
+            return Err(Error::Backend("copy_slice_into: count exceeds src".into()));
+        }
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard.as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
         unsafe {
-            std::ptr::copy_nonoverlapping(out.as_ptr() as *const u8, mapped as *mut u8, total_bytes as usize);
-            vkUnmapMemory(ctx.device, dst_s.memory);
+            // Create a one-shot command pool on the compute family.
+            let pool_ci = VkCommandPoolCreateInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                queue_family_index: ctx.compute_family_index,
+            };
+            let mut command_pool = 0u64;
+            let res = vkCreateCommandPool(ctx.device, &pool_ci, std::ptr::null(), &mut command_pool);
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("copy_slice_into: vkCreateCommandPool failed: {res}")));
+            }
+
+            struct PoolCleanup { device: *mut c_void, command_pool: u64 }
+            impl Drop for PoolCleanup {
+                fn drop(&mut self) {
+                    if self.command_pool != 0 {
+                        unsafe { vkDestroyCommandPool(self.device, self.command_pool, std::ptr::null()); }
+                    }
+                }
+            }
+            let _pool = PoolCleanup { device: ctx.device, command_pool };
+
+            // Allocate a one-time command buffer.
+            let cmd_alloc = VkCommandBufferAllocateInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                p_next: std::ptr::null(),
+                command_pool,
+                level: 0, // VK_COMMAND_BUFFER_LEVEL_PRIMARY
+                command_buffer_count: 1,
+            };
+            let mut command_buffer: *mut c_void = std::ptr::null_mut();
+            let res = vkAllocateCommandBuffers(ctx.device, &cmd_alloc, &mut command_buffer);
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("copy_slice_into: vkAllocateCommandBuffers failed: {res}")));
+            }
+
+            let begin_info = VkCommandBufferBeginInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                p_next: std::ptr::null(),
+                flags: 1, // VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+                p_inheritance_info: std::ptr::null(),
+            };
+            let res = vkBeginCommandBuffer(command_buffer, &begin_info);
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("copy_slice_into: vkBeginCommandBuffer failed: {res}")));
+            }
+
+            let elem_bytes = std::mem::size_of::<f32>() as VkDeviceSize;
+            let region = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: (dst_off as VkDeviceSize) * elem_bytes,
+                size: (count as VkDeviceSize) * elem_bytes,
+            };
+            vkCmdCopyBuffer(command_buffer, src_s.buffer, dst_s.buffer, 1, &region);
+
+            let res = vkEndCommandBuffer(command_buffer);
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("copy_slice_into: vkEndCommandBuffer failed: {res}")));
+            }
+
+            let cmd_buf_u64 = command_buffer as u64;
+            let submit_info = VkSubmitInfo {
+                s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                p_next: std::ptr::null(),
+                wait_semaphore_count: 0,
+                p_wait_semaphores: std::ptr::null(),
+                p_wait_dst_stage_mask: std::ptr::null(),
+                command_buffer_count: 1,
+                p_command_buffers: &cmd_buf_u64,
+                signal_semaphore_count: 0,
+                p_signal_semaphores: std::ptr::null(),
+            };
+            let _q_lock = QUEUE_LOCK.lock().unwrap();
+            let res = vkQueueSubmit(ctx.queue, 1, &submit_info, 0);
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("copy_slice_into: vkQueueSubmit failed: {res}")));
+            }
+            let res = vkQueueWaitIdle(ctx.queue);
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("copy_slice_into: vkQueueWaitIdle failed: {res}")));
+            }
         }
         Ok(())
     }
