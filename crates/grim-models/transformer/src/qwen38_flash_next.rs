@@ -1123,4 +1123,48 @@ mod tests {
             assert!(!val.is_infinite(), "Logits must not contain Inf");
         }
     }
+
+    #[test]
+    fn test_qwen38_real_disk_safetensor_shard_numerics() {
+        use std::path::Path;
+        use grim_format::tprov::SafetensorsProvider;
+
+        let shard_path = Path::new("../../../models/qwen3.8-model-00001-of-00131.safetensors");
+        if !shard_path.exists() {
+            // If running in a context where full 992MB model shard is not mounted, skip gracefully
+            return;
+        }
+
+        let provider = SafetensorsProvider::open(shard_path.to_str().unwrap())
+            .expect("Must open real 992MB Qwen 3.8 safetensors shard");
+        let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+
+        // Verify hyper-connection mixer weights present in shard 1
+        let hc_lowrank = 320;
+        let hidden_size = 10240; // 4 branches * 2560
+        let hc_mixer_res = Qwen38HyperConnection::load(
+            &ws.scoped("model").scoped("language_model").scoped("hyper_connection_mixer"),
+            hidden_size,
+            hc_lowrank,
+            1e-6,
+        );
+
+        assert!(hc_mixer_res.is_ok(), "Hyper-connection mixer must load from real safetensor shard: {:?}", hc_mixer_res.err());
+        let hc_mixer = hc_mixer_res.unwrap();
+
+        // Verify numeric forward mixing with real BF16 weights converted to tensor
+        let x = cpu_tensor(vec![1.0f32; hidden_size], Shape::new(vec![hidden_size]));
+        let mixed = hc_mixer.mix(&x).expect("HC mixer must run forward without error");
+        let mixed_vec = mixed.to_vec_f32().unwrap();
+
+        assert_eq!(mixed_vec.len(), hidden_size);
+        for (i, &v) in mixed_vec.iter().enumerate() {
+            assert!(!v.is_nan(), "Mixed value at index {i} must not be NaN");
+            assert!(!v.is_infinite(), "Mixed value at index {i} must not be Inf");
+        }
+
+        // Verify that mixing actually transformed the signal (not a trivial no-op zero)
+        let mean = mixed_vec.iter().sum::<f32>() / (mixed_vec.len() as f32);
+        assert!(mean.abs() > 1e-4, "Real weights must produce non-trivial mean response (got {mean})");
+    }
 }
