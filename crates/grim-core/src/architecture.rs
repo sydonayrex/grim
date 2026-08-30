@@ -162,6 +162,13 @@ pub enum ModelArchitecture {
     MiniMaxM3,
     MuseGlimmer,
     SolarOpen2,
+    GptOss,
+    GraniteMoeHybrid,
+    Exaone45,
+    Glm4MoeLite,
+    LongCatFlash,
+    HyV4,
+    Dots3Note,
     Unknown,
 }
 
@@ -331,6 +338,13 @@ impl ModelArchitecture {
             "delta_net_base" | "delta-net-base" | "delta_net" | "deltanet" => Self::DeltaNetBase,
             "muse-glimmer" | "museglimmer" | "muse_glimmer" => Self::MuseGlimmer,
             "solar_open2" | "solaropen2" | "solar-open2" => Self::SolarOpen2,
+            "gpt_oss" | "gpt-oss" | "gptoss" => Self::GptOss,
+            "granite_moe_hybrid" | "granite-moe-hybrid" | "granitemoehybrid" => Self::GraniteMoeHybrid,
+            "exaone4_5" | "exaone4.5" | "exaone-4.5" => Self::Exaone45,
+            "glm4_moe_lite" | "glm4-moe-lite" | "glm4moelite" => Self::Glm4MoeLite,
+            "longcat_flash" | "longcat-flash" | "longcat" => Self::LongCatFlash,
+            "hy_v4" | "hy-v4" | "hyv4" => Self::HyV4,
+            "dots3_note" | "dots3-note" | "dots-note" => Self::Dots3Note,
             _ => Self::Unknown,
         }
     }
@@ -490,6 +504,13 @@ impl ModelArchitecture {
             Self::DiffusionGemma => "diffusion_gemma",
             Self::MiniMaxM3 => "minimax_m3",
             Self::SolarOpen2 => "solar_open2",
+            Self::GptOss => "gpt_oss",
+            Self::GraniteMoeHybrid => "granite_moe_hybrid",
+            Self::Exaone45 => "exaone4_5",
+            Self::Glm4MoeLite => "glm4_moe_lite",
+            Self::LongCatFlash => "longcat_flash",
+            Self::HyV4 => "hy_v4",
+            Self::Dots3Note => "dots3_note",
             Self::Unknown => "unknown",
         }
     }
@@ -539,6 +560,8 @@ impl ModelArchitecture {
                 | Self::NemotronHMoe
                 | Self::ExaoneMoe
                 | Self::GraniteMoe
+                | Self::GraniteMoeHybrid
+                | Self::Glm4MoeLite
                 | Self::BailingMoe
                 | Self::BailingMoe2
                 | Self::BailingMoe3
