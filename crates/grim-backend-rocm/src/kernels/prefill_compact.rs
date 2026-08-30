@@ -1,4 +1,4 @@
-//! Prefill hit compaction kernel (FreeToken).
+//! Prefill hit compaction kernel.
 //!
 //! Compacts MoE expert request vectors on-device by partitioning cache-resident
 //! expert slots (which can be gathered via high-bandwidth D2D copy) from cache

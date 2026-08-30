@@ -1,4 +1,4 @@
-//! Distributed Bloom filter for remote prefix lookup pre-filtering (LMCache).
+//! Distributed Bloom filter for remote prefix lookup pre-filtering.
 //!
 //! Provides fast sub-millisecond local membership testing to eliminate wasted
 //! network round-trips when querying multi-node disaggregated KV cache tiers.

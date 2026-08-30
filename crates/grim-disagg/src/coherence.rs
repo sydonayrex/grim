@@ -1,4 +1,4 @@
-//! Multi-node distributed cache coherence protocol (LMCache / FreeToken).
+//! Multi-node distributed cache coherence protocol.
 //!
 //! Synchronizes cache invalidation events across cluster nodes so that when
 //! a prefix or KV block is modified or evicted on one node, peer nodes drop

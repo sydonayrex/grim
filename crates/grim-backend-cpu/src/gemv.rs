@@ -1,4 +1,4 @@
-//! CPU GEMV matrix-vector multiplication kernel for expert offload (FreeToken).
+//! CPU GEMV matrix-vector multiplication kernel for expert offload.
 //!
 //! Provides host-RAM matrix-vector multiplication for computing offloaded MoE
 //! expert feed-forward passes directly on CPU without GPU round-trips.
