@@ -4562,7 +4562,10 @@ impl AutogradOps for VulkanDevice {
     }
 
     /// Embedding backward: scatter-add `dweight[token_ids[t], :] += out_grad[t, :]`.
-    /// ROCm kernel: `grim_embedding_backward` (atomic scatter-add).
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::EmbeddingBackward`. Uses
+    /// `atomicAdd` on the dweight buffer (requires `OpAtomicFAddEXT`, gated by
+    /// `VulkanCaps::supports_fp32_atomic_add` — RDNA3+ / NVIDIA).
     fn embedding_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -4570,29 +4573,63 @@ impl AutogradOps for VulkanDevice {
         vocab_size: usize,
         hidden_dim: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let g = out_grad.to_cpu_vec_f32()?;
+        if !self.caps.supports_fp32_atomic_add {
+            return Err(Error::Backend(
+                "embedding_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into()
+            ));
+        }
+
+        let g_s = out_grad.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan embedding_backward: grad is not VulkanStorage".into()))?;
+
         let num_tokens = token_ids.len();
         if num_tokens == 0 || hidden_dim == 0 || vocab_size == 0 {
             return Err(Error::Shape("embedding_backward: empty vocab/hidden/tokens".into()));
         }
-        if g.len() != num_tokens * hidden_dim {
+        let total = num_tokens * hidden_dim;
+        if g_s.shape.elem_count() != total {
             return Err(Error::Shape("embedding_backward: grad size mismatch".into()));
         }
-        let mut dweight = vec![0.0f32; vocab_size * hidden_dim];
-        for (t, &tok) in token_ids.iter().enumerate() {
-            let tok = tok as usize;
-            if tok >= vocab_size {
-                return Err(Error::Shape(format!("embedding_backward: token id {tok} >= vocab {vocab_size}")));
-            }
-            let src = t * hidden_dim;
-            let dst = tok * hidden_dim;
-            for d in 0..hidden_dim {
-                dweight[dst + d] += g[src + d];
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard.as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        // Upload token_ids as a u32 buffer
+        let token_shape = Shape::new(vec![num_tokens]);
+        let tok_s = self.upload_u32(token_ids, &token_shape)?;
+
+        let dw_shape = Shape::new(vec![vocab_size, hidden_dim]);
+        let dw = VulkanStorage::alloc_device_local_gpu(&dw_shape, DType::F32, ctx.device, ctx.physical_device)?;
+
+        // Zero-initialize dw buffer (atomic scatter-add target)
+        unsafe {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            let res = vkMapMemory(ctx.device, dw.memory, 0, dw.bytes as VkDeviceSize, 0, &mut mapped);
+            if res == VK_SUCCESS {
+                std::ptr::write_bytes(mapped, 0, dw.bytes);
+                vkUnmapMemory(ctx.device, dw.memory);
             }
         }
-        let out_shape = Shape::new(vec![vocab_size, hidden_dim]);
-        let storage = self.from_cpu(&dweight, &out_shape, DType::F32)?;
-        Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
+
+        let tok_vk = tok_s.as_any().downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan embedding_backward: token_ids storage is not VulkanStorage".into()))?;
+
+        let buffers = [tok_vk.buffer, g_s.buffer, dw.buffer];
+        let grid_x = total.div_ceil(256) as u32;
+        let push = push_params(num_tokens as u32, hidden_dim as u32, 0, 0, 0, 0.0);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::EmbeddingBackward,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok((Box::new(dw), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 }
 
@@ -5919,6 +5956,7 @@ pub enum VulkanKernel {
     Softmax,
     SoftmaxBackward,
     Embedding,
+    EmbeddingBackward,
     Matmul64,
     Matmul32,
     Matmul64Bf16,
@@ -6021,6 +6059,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Softmax => SPIRV_SOFTMAX,
         VulkanKernel::SoftmaxBackward => SPIRV_SOFTMAX_BACKWARD,
         VulkanKernel::Embedding => SPIRV_EMBEDDING,
+        VulkanKernel::EmbeddingBackward => SPIRV_EMBEDDING_BACKWARD,
         VulkanKernel::Matmul64 => SPIRV_MATMUL_64,
         VulkanKernel::Matmul32 => SPIRV_MATMUL_32,
         VulkanKernel::Matmul64Bf16 => SPIRV_MATMUL_64_BF16,
@@ -6130,7 +6169,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedLion
         | VulkanKernel::CooperativeMatrixGemm
         | VulkanKernel::SiluMulBackward
-        | VulkanKernel::SoftmaxBackward => 3,
+        | VulkanKernel::SoftmaxBackward
+        | VulkanKernel::EmbeddingBackward => 3,
         VulkanKernel::Sub => 3,
         VulkanKernel::AddScalar
         | VulkanKernel::SubScalar
