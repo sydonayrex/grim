@@ -16,6 +16,10 @@ pub mod tp_layers;
 pub mod train_packed;
 
 pub use cache_blend::{CacheBlendEngine, CachedSegment, StitchedPromptLayout};
+pub use pipeline_engine::{
+    PipelinePlan, PipelineStageConfig, PipelineStageExecutor, PipelineStageRunner,
+    PipelinedModelCoordinator,
+};
 pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
 
 use std::collections::HashMap;

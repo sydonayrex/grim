@@ -3,8 +3,9 @@
 //! Partitions transformer layers across multiple pipeline stages/GPUs and schedules
 //! activation transfers between adjacent stages using point-to-point communication.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use grim_core::error::{Error, Result};
+use grim_memory::KvBlockPool;
 use grim_tensor::tensor::Tensor;
 use grim_tensor::shape::Shape;
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
@@ -179,6 +180,130 @@ impl PipelineStageExecutor {
     }
 }
 
+/// Runtime stage runner that executes assigned transformer layers and manages
+/// the per-stage isolated KV cache block pool.
+pub struct PipelineStageRunner {
+    pub config: PipelineStageConfig,
+    pub executor: PipelineStageExecutor,
+    pub block_pool: Arc<Mutex<KvBlockPool>>,
+}
+
+impl PipelineStageRunner {
+    /// Creates a new stage runner pinned to the stage's target device ordinal
+    /// and assigned layer range.
+    pub fn new(
+        config: PipelineStageConfig,
+        comm: Option<Arc<ParallelCommunicator>>,
+        pool_capacity: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let pool = KvBlockPool::new_on_device(
+            pool_capacity,
+            num_heads,
+            head_dim,
+            config.device_ordinal,
+        )
+        .with_layer_range(config.start_layer, config.end_layer);
+
+        let executor = PipelineStageExecutor::new(config.clone(), comm);
+        Self {
+            config,
+            executor,
+            block_pool: Arc::new(Mutex::new(pool)),
+        }
+    }
+
+    /// Number of transformer layers assigned to this stage.
+    pub fn num_local_layers(&self) -> usize {
+        self.config.end_layer - self.config.start_layer
+    }
+
+    /// Forward pass through the stage's assigned layers.
+    pub fn forward_stage<F>(
+        &self,
+        input_activations: Tensor,
+        layer_forward_fn: F,
+    ) -> Result<Option<Tensor>>
+    where
+        F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
+    {
+        let mut h = input_activations;
+        {
+            let mut pool = self.block_pool.lock().map_err(|e| {
+                Error::KvCache(format!("Failed to lock stage KV block pool: {}", e))
+            })?;
+
+            for layer_idx in self.config.start_layer..self.config.end_layer {
+                h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+            }
+        }
+
+        if self.config.is_last_stage() {
+            Ok(Some(h))
+        } else {
+            self.executor.send_activations(&h)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Coordinator for multi-stage pipelined execution over microbatches.
+pub struct PipelinedModelCoordinator {
+    pub plan: PipelinePlan,
+    pub runners: Vec<PipelineStageRunner>,
+}
+
+impl PipelinedModelCoordinator {
+    /// Creates a new pipelined model coordinator.
+    pub fn new(
+        plan: PipelinePlan,
+        pool_capacity: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let runners = plan
+            .stages
+            .iter()
+            .map(|cfg| {
+                PipelineStageRunner::new(
+                    cfg.clone(),
+                    None,
+                    pool_capacity,
+                    num_heads,
+                    head_dim,
+                )
+            })
+            .collect();
+        Self { plan, runners }
+    }
+
+    /// Execute a forward pass across all pipeline stages in sequence.
+    pub fn forward_pipeline<F>(
+        &self,
+        initial_input: Tensor,
+        layer_forward_fn: F,
+    ) -> Result<Tensor>
+    where
+        F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
+    {
+        let mut curr = initial_input;
+        for runner in &self.runners {
+            let mut h = curr;
+            {
+                let mut pool = runner.block_pool.lock().map_err(|e| {
+                    Error::KvCache(format!("Failed to lock stage KV block pool: {}", e))
+                })?;
+                for layer_idx in runner.config.start_layer..runner.config.end_layer {
+                    h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+                }
+            }
+            curr = h;
+        }
+        Ok(curr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +361,59 @@ mod tests {
         assert_eq!(partitions[2].end_layer, 23); // 7
         assert_eq!(partitions[3].start_layer, 23);
         assert_eq!(partitions[3].end_layer, 30); // 7
+    }
+
+    #[test]
+    fn test_pipeline_stage_runner_kv_isolation() {
+        let plan = PipelinePlan::plan(8, 2, &[0, 1]).unwrap();
+        let runner0 = PipelineStageRunner::new(plan.stages[0].clone(), None, 16, 4, 32);
+        let runner1 = PipelineStageRunner::new(plan.stages[1].clone(), None, 16, 4, 32);
+
+        assert_eq!(runner0.config.device_ordinal, 0);
+        assert_eq!(runner0.num_local_layers(), 4);
+        assert_eq!(runner1.config.device_ordinal, 1);
+        assert_eq!(runner1.num_local_layers(), 4);
+
+        let p0 = runner0.block_pool.lock().unwrap();
+        assert_eq!(p0.device_ordinal(), 0);
+        assert!(p0.owns_layer(0));
+        assert!(p0.owns_layer(3));
+        assert!(!p0.owns_layer(4));
+
+        let p1 = runner1.block_pool.lock().unwrap();
+        assert_eq!(p1.device_ordinal(), 1);
+        assert!(!p1.owns_layer(3));
+        assert!(p1.owns_layer(4));
+        assert!(p1.owns_layer(7));
+    }
+
+    #[test]
+    fn test_pipelined_model_coordinator_forward_parity() {
+        let plan = PipelinePlan::plan(4, 2, &[0, 1]).unwrap();
+        let coordinator = PipelinedModelCoordinator::new(plan, 16, 2, 16);
+
+        let input_data = vec![1.0f32; 8];
+        let input_tensor = tensor_from_f32_vec(input_data, Shape::new(vec![1, 8]));
+
+        // Simulated layer forward: each layer adds (layer_idx + 1) * 0.5 to all activation elements
+        let layer_fn = |layer_idx: usize, x: &Tensor, _pool: &mut KvBlockPool| -> Result<Tensor> {
+            let mut v = x.to_vec_f32()?;
+            let add = (layer_idx as f32 + 1.0) * 0.5;
+            for val in &mut v {
+                *val += add;
+            }
+            Ok(tensor_from_f32_vec(v, x.shape().clone()))
+        };
+
+        let output = coordinator
+            .forward_pipeline(input_tensor, layer_fn)
+            .expect("pipelined forward should succeed");
+
+        let out_vec = output.to_vec_f32().unwrap();
+        // Layer 0: +0.5, Layer 1: +1.0, Layer 2: +1.5, Layer 3: +2.0 -> total added = 5.0
+        // Input was 1.0 -> expected output is 6.0 for each element
+        for val in out_vec {
+            assert!((val - 6.0f32).abs() < 1e-5);
+        }
     }
 }

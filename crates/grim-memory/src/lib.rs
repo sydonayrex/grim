@@ -182,6 +182,10 @@ pub struct KvBlockPool {
     pub device_mirror: KvDeviceMirror,
     num_heads: usize,
     head_dim: usize,
+    /// Target hardware device ordinal assigned to this pool (default 0).
+    device_ordinal: usize,
+    /// Optional assigned layer index range [start_layer, end_layer) for pipeline parallelism.
+    layer_range: Option<(usize, usize)>,
     compressor: Option<Arc<dyn KvCompressor>>,
     spill: Option<Arc<SharedSpillManager>>,
     /// Number of bytes per block (`BLOCK_SIZE * num_heads * head_dim * 4`).
@@ -190,6 +194,16 @@ pub struct KvBlockPool {
 
 impl KvBlockPool {
     pub fn new(capacity: usize, num_heads: usize, head_dim: usize) -> Self {
+        Self::new_on_device(capacity, num_heads, head_dim, 0)
+    }
+
+    /// Construct a new KV block pool pinned to a specific hardware device ordinal.
+    pub fn new_on_device(
+        capacity: usize,
+        num_heads: usize,
+        head_dim: usize,
+        device_ordinal: usize,
+    ) -> Self {
         let block_elem = BLOCK_SIZE * num_heads * head_dim;
         let mut blocks = Vec::with_capacity(capacity);
         let mut free_list = VecDeque::with_capacity(capacity);
@@ -227,9 +241,35 @@ impl KvBlockPool {
             device_mirror,
             num_heads,
             head_dim,
+            device_ordinal,
+            layer_range: None,
             compressor: None,
             spill: None,
             block_bytes: block_elem * std::mem::size_of::<f32>(),
+        }
+    }
+
+    /// Pin this KV block pool to a specific pipeline stage layer range [start_layer, end_layer).
+    pub fn with_layer_range(mut self, start_layer: usize, end_layer: usize) -> Self {
+        self.layer_range = Some((start_layer, end_layer));
+        self
+    }
+
+    /// Hardware device ordinal assigned to this pool.
+    pub fn device_ordinal(&self) -> usize {
+        self.device_ordinal
+    }
+
+    /// Pipeline stage layer range assigned to this pool, if any.
+    pub fn layer_range(&self) -> Option<(usize, usize)> {
+        self.layer_range
+    }
+
+    /// Check if this KV pool manages the specified transformer layer.
+    pub fn owns_layer(&self, layer_idx: usize) -> bool {
+        match self.layer_range {
+            Some((start, end)) => layer_idx >= start && layer_idx < end,
+            None => true,
         }
     }
 
@@ -2092,6 +2132,17 @@ mod tests {
         assert_eq!(pool.dirty_count(), 0);
         assert!(!pool.is_dirty(b0));
         assert!(!pool.is_dirty(b1));
+    }
+
+    #[test]
+    fn test_per_stage_kv_block_pool_on_device() {
+        let pool = KvBlockPool::new_on_device(16, 4, 64, 1).with_layer_range(8, 16);
+        assert_eq!(pool.device_ordinal(), 1);
+        assert_eq!(pool.layer_range(), Some((8, 16)));
+        assert!(!pool.owns_layer(7));
+        assert!(pool.owns_layer(8));
+        assert!(pool.owns_layer(15));
+        assert!(!pool.owns_layer(16));
     }
 }
 
