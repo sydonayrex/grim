@@ -3,6 +3,8 @@
 pub mod modules;
 /// Mixture-of-Experts primitives (router, expert bank, routed FFN).
 pub mod moe;
+/// Deterministic token mapping and scoreboard synchronization (UniEP).
+pub mod moe_deterministic;
 /// SCYTHE-2 WI-3: capacity-calibrated sharded linears.
 pub mod scythe2;
 pub mod sparse_attention;
@@ -20,6 +22,7 @@ pub use modules::{
     pick_device_for_storage_device, pick_device_for_tensor, require_single_device, short_conv1d,
 };
 
+pub use moe_deterministic::{DeterministicTokenMap, ScoreboardSync};
 pub use scythe2::{Scythe2Linear, slice_input_dim, slice_output_dim};
 pub use varbuilder::WeightSource;
 pub use embedding_spill::SpillableEmbedding;

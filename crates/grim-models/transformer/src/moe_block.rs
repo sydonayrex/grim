@@ -307,4 +307,50 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_deterministic_moe_token_map_parity() -> Result<()> {
+        use grim_nn::moe_deterministic::DeterministicTokenMap;
+
+        // 4 tokens, top-2 routing, 4 experts
+        let selected = vec![
+            vec![0, 1],
+            vec![1, 2],
+            vec![0, 3],
+            vec![2, 3],
+        ];
+        let weights = vec![
+            vec![0.6, 0.4],
+            vec![0.7, 0.3],
+            vec![0.5, 0.5],
+            vec![0.8, 0.2],
+        ];
+
+        let map = DeterministicTokenMap::build(&selected, 4).unwrap();
+        assert_eq!(map.num_tokens, 4);
+        assert_eq!(map.top_k, 2);
+        assert_eq!(map.total_routed_instances, 8);
+
+        let hidden = 4;
+        let acts: Vec<f32> = (0..4 * hidden).map(|i| (i as f32) * 0.1).collect();
+
+        let mut packed = vec![0.0f32; 8 * hidden];
+        map.pack_activations(&acts, hidden, &mut packed).unwrap();
+
+        // Check that slot 0 has token 0 activation
+        assert_eq!(&packed[0..hidden], &acts[0..hidden]);
+
+        let mut combined = vec![0.0f32; 4 * hidden];
+        map.combine_expert_outputs(&packed, &weights, hidden, 1.0, &mut combined).unwrap();
+
+        // Since expert GEMM here is identity, each token output is sum(weight_k * token_act) = token_act * 1.0
+        for t in 0..4 {
+            let t_src = &acts[t * hidden..(t + 1) * hidden];
+            let t_out = &combined[t * hidden..(t + 1) * hidden];
+            for d in 0..hidden {
+                assert!((t_out[d] - t_src[d]).abs() < 1e-5);
+            }
+        }
+        Ok(())
+    }
 }
