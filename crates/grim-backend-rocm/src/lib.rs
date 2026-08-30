@@ -67,7 +67,8 @@ pub mod trace;
 
 /// SCYTHE-2 WI-2: capability profiler re-export.
 pub use device::capability_profiler::{
-    CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch, vram_info,
+    CAPABILITY_EPOCH, CapabilityProfiler, bump_epoch, compute_utilization, current_epoch,
+    free_device_memory, vram_info,
 };
 pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
 

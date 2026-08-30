@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use grim_backend_cpu::DeterministicRng;
 use grim_core::error::{Error, Result};
+use grim_core::memory_certificate::{BoundaryVector, MemoryCertificate};
 use grim_core::model::{AdapterHandle, CausalLm, ModelConfig};
 use grim_core::session::{DeterminismMode, SessionT};
 use grim_memory::{BLOCK_SIZE, KvBlockPool};
@@ -47,6 +48,11 @@ pub struct LoadedModel {
     /// means single-device; otherwise carries the per-rank `(rank, world_size)`
     /// so callers can report or query the shard index of a loaded model.
     pub tp_config: Option<grim_nn::TensorParallelConfig>,
+    /// Architecture hyperparameters, when the model reports them (R4). The
+    /// admission gate re-certifies the request footprint against *current*
+    /// free device memory using these. `None` when the model can't report
+    /// them — the gate is then skipped (fail-open).
+    pub arch_hyperparams: Option<grim_core::hyperparams::ArchHyperparameters>,
 }
 
 /// A loaded adapter bundle (one LoRA's A/B matrices + scaling). LoRA batches
@@ -58,6 +64,25 @@ pub struct LoadedAdapter {
     pub name: String,
     pub handle: AdapterHandle,
     pub base_model_id: String,
+}
+
+/// Best-effort current free-device-memory probe for the admission gate (R4).
+/// Returns `None` when the backend cannot probe free memory (CPU/Vulkan/Metal
+/// without a probe), in which case the gate is skipped (fail-open).
+fn free_device_memory(device: &grim_tensor::Device) -> Option<u64> {
+    // Test/override hook: GRIM_TEST_FREE_DEVICE_BYTES lets tests (and
+    // operators) inject a known free-memory value without a live device.
+    if let Ok(v) = std::env::var("GRIM_TEST_FREE_DEVICE_BYTES") {
+        if let Ok(bytes) = v.parse::<u64>() {
+            return Some(bytes);
+        }
+    }
+    match device {
+        grim_tensor::Device::Rocm(ordinal) => {
+            grim_backend_rocm::free_device_memory(*ordinal)
+        }
+        _ => None,
+    }
 }
 
 /// Engine configuration.
@@ -1186,6 +1211,10 @@ impl Engine {
         // Hardcoding TextInTextOut misreported every non-text model that
         // registered through this path, including the audio models.
         let modality = model.config().modality();
+        // R4 — capture the model's hyperparameters (when reportable) before
+        // `model` is moved into the speculative wrapper, so the admission gate
+        // can re-certify each request's footprint against *current* free memory.
+        let arch_hyperparams = model.arch_hyperparams();
         let wrapped = SpeculativeCausalLm::auto(
             model,
             draft,
@@ -1198,6 +1227,7 @@ impl Engine {
             name: id.to_string(),
             modality,
         });
+
         self.models.insert(
             id.to_string(),
             LoadedModel {
@@ -1205,6 +1235,7 @@ impl Engine {
                 config,
                 device: dev,
                 tp_config: self.tp_config(),
+                arch_hyperparams,
             },
         );
     }
@@ -1217,6 +1248,8 @@ impl Engine {
     ) {
         let dev = grim_core::Model::device(model.as_ref()).clone();
         let modality = grim_core::Model::config(model.as_ref()).modality();
+        // R4 — capture hyperparams before `model` moves into the adapters.
+        let arch_hyperparams = model.arch_hyperparams();
         let adapter = grim_speculative::LlamaMtpAdapter::new(model.clone());
         let mtp_arc: Arc<dyn grim_speculative::NativeMtp> = Arc::new(adapter);
         let wrapped = SpeculativeCausalLm::with_native_mtp(
@@ -1234,6 +1267,7 @@ impl Engine {
                 config,
                 device: dev,
                 tp_config: self.tp_config(),
+                arch_hyperparams,
             },
         );
     }
@@ -2380,6 +2414,58 @@ impl Engine {
                     .unwrap_or(grim_tensor::Device::Cpu),
             }
         };
+        // R4 — memory-sovereign admission gate. If the model reported
+        // hyperparameters and the backend can probe current free device
+        // memory, certify this request's footprint (prompt + max_tokens) fits
+        // within what is *currently* free. On failure, return a clear error
+        // instead of admitting a request that would OOM mid-prefill.
+        // Fail-open when either the hyperparams or the memory probe is
+        // unavailable (CPU/Vulkan/Metal without a probe, or models that don't
+        // report hyperparams).
+        if let Some(base_model) = request
+            .model_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|id| self.models.get(id))
+            .or_else(|| self.models.values().next())
+        {
+            if let Some(hparams) = &base_model.arch_hyperparams {
+                let target_seq_len =
+                    request.prompt_tokens.saturating_add(request.max_new_tokens);
+                if let Some(free_device) = free_device_memory(&device) {
+                    let host_allowance = std::env::var("GRIM_HOST_ALLOWANCE_GB")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(8)
+                        * 1024
+                        * 1024
+                        * 1024;
+                    let reserve = std::env::var("GRIM_MEMORY_RESERVE_GB")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(2)
+                        * 1024
+                        * 1024
+                        * 1024;
+                    let live_boundary =
+                        BoundaryVector::standard(host_allowance, free_device, reserve);
+                    if let Err(e) = MemoryCertificate::certify(
+                        hparams,
+                        live_boundary,
+                        target_seq_len,
+                        1,
+                        2,
+                        &request.id.to_string(),
+                    ) {
+                        return Err(Error::Config(format!(
+                            "request {} ({} tokens) exceeds current memory envelope: {}",
+                            request.id, target_seq_len, e
+                        )));
+                    }
+                }
+            }
+        }
+
         let mut kv = grim_memory::PagedKvCache::new(
             self.block_pool.clone(),
             self.config.num_kv_heads,
@@ -4199,5 +4285,62 @@ mod tests {
         assert_eq!(cfg.pp_size, 0, "default EngineConfig must have pp_size off");
         // Engine::new with pp_size 0 should NOT panic.
         let _ = Engine::new(cfg);
+    }
+
+    /// R4 validation: the memory-sovereign admission gate rejects a request
+    /// whose footprint exceeds the current memory envelope, and admits it when
+    /// the envelope is large enough. Uses the GRIM_TEST_FREE_DEVICE_BYTES
+    /// override so the probe is deterministic without a live device.
+    #[test]
+    fn test_memory_certificate_admission_gate() {
+        use grim_scheduler::Request;
+
+        // SAFETY: single-threaded test; env vars are set then restored.
+        unsafe {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_model("tiny", small_llama());
+
+        // Tiny envelope: 1 MiB free device, 1 MiB host, 0 reserve. A request
+        // with a 4096-token prompt cannot fit -> admission must fail with an
+        // envelope error.
+        std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "500000");
+        std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "0");
+        std::env::set_var("GRIM_MEMORY_RESERVE_GB", "0");
+        let big = Request {
+            id: 1,
+            prompt_tokens: 4096,
+            max_new_tokens: 256,
+            model_id: Some("tiny".into()),
+            ..Default::default()
+        };
+        let err = engine
+            .enqueue_request(big)
+            .expect_err("oversize request must be rejected by the admission gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds current memory envelope"),
+            "unexpected error: {msg}"
+        );
+
+        // Large envelope: 128 GiB free device, 64 GiB host. Same request fits.
+        std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "128849018880");
+        std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "64");
+        std::env::set_var("GRIM_MEMORY_RESERVE_GB", "1");
+        let ok = Request {
+            id: 2,
+            prompt_tokens: 4096,
+            max_new_tokens: 256,
+            model_id: Some("tiny".into()),
+            ..Default::default()
+        };
+        engine
+            .enqueue_request(ok)
+            .expect("request must be admitted when envelope is large enough");
+
+        // Cleanup env so other tests are unaffected.
+        std::env::remove_var("GRIM_TEST_FREE_DEVICE_BYTES");
+        std::env::remove_var("GRIM_HOST_ALLOWANCE_GB");
+        std::env::remove_var("GRIM_MEMORY_RESERVE_GB");
+        } // unsafe
     }
 }

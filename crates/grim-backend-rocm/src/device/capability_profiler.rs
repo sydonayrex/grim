@@ -538,6 +538,23 @@ fn query_vram_free(ordinal: usize) -> u64 {
     vram_info(ordinal).0
 }
 
+/// Free device memory probe for the memory-sovereign admission gate (R4).
+///
+/// Returns the current free VRAM in bytes for `ordinal`, or `None` if the
+/// backend cannot probe it. The engine uses this to certify, per request at
+/// admission, that a new request's footprint fits within what is *currently*
+/// free rather than what was free at model load. Backends without a probe
+/// return `None`, in which case the admission gate is skipped (fail-open — the
+/// request is admitted and bounded by the KV pool instead).
+pub fn free_device_memory(ordinal: usize) -> Option<u64> {
+    let (free, total) = vram_info(ordinal);
+    if total == 0 {
+        None
+    } else {
+        Some(free)
+    }
+}
+
 /// Query `(free_bytes, total_bytes)` VRAM via `hipMemGetInfo`. [see: `(0, 0)`]
 pub fn vram_info(ordinal: usize) -> (u64, u64) {
     let mut free: usize = 0;
