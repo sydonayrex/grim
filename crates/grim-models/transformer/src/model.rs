@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
 use grim_core::error::Result;
+use grim_core::hyperparams::ArchHyperparameters;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
@@ -507,6 +508,33 @@ impl CausalLm for Llama {
 
     fn hidden_size_hint(&self) -> Option<usize> {
         Some(self.cfg.hidden_size)
+    }
+
+    fn arch_hyperparams(&self) -> Option<ArchHyperparameters> {
+        Some(ArchHyperparameters {
+            architecture: grim_core::architecture::ModelArchitecture::Llama,
+            vocab_size: self.cfg.vocab_size,
+            hidden_size: self.cfg.hidden_size,
+            num_heads: self.cfg.num_heads,
+            num_kv_heads: self.cfg.num_kv_heads,
+            head_dim: self.cfg.head_dim,
+            num_layers: self.cfg.num_layers,
+            intermediate_size: self.cfg.intermediate_size,
+            rms_norm_eps: self.cfg.rms_norm_eps,
+            rope_theta: self.cfg.rope_theta,
+            max_seq_len: self.cfg.max_seq_len,
+            expert_count: None,
+            expert_used_count: None,
+            expert_feed_forward_length: None,
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: false,
+            ssm_d_state: None,
+            ssm_d_inner: None,
+            ssm_d_conv: None,
+            ssm_dt_rank: None,
+            ssm_n_group: None,
+            full_attention_interval: None,
+        })
     }
 
     fn forward(

@@ -239,16 +239,28 @@ skip blocked work" — generalizes to: decode is always ready, prefill contends
 for budget, so arbitrate decode-first under pressure. The deferral protects ITL
 without head-of-line-blocking decode behind a fresh prefill.
 
-### R4 — Enforce MemoryCertificate at admission ⏸ DEFERRED
+### R4 — Enforce MemoryCertificate at admission ✅ DONE
 
-`MemoryCertificate::certify` is a pure function of `ArchHyperparameters` +
-boundary vector, but wiring it into `admit_placed_request` requires per-backend
-device-memory probes (ROCm/Vulkan/Metal/CUDA free-memory queries) that the
-engine does not yet expose. **Recommendation:** scope as a follow-up that
-(1) adds a `free_device_memory()` capability probe to each backend, (2) calls
-`certify` at model load using the model's actual `ArchHyperparameters`, and
-(3) rejects/queues requests that exceed the envelope. Do not claim "certified
-exactness" until (1)–(3) ship.
+Wired `MemoryCertificate::certify` into `Engine::admit_placed_request`:
+
+1. **Per-backend free-memory probe.** Added `free_device_memory(ordinal)` to the
+   ROCm backend (`capability_profiler.rs`, re-exported at crate root) using the
+   existing `hipMemGetInfo`-based `vram_info`. Other backends return `None`
+   (fail-open). A `GRIM_TEST_FREE_DEVICE_BYTES` override makes the probe
+   deterministic for tests and operators.
+2. **Hyperparameters at registration.** Added an optional `arch_hyperparams()`
+   method to the `CausalLm` trait (default `None`) and implemented it for the
+   Llama family. The engine captures and stores
+   `arch_hyperparams: Option<ArchHyperparameters>` in each `LoadedModel`.
+3. **Admission gate.** `admit_placed_request` re-certifies each request's
+   footprint (prompt + max_tokens) against a `BoundaryVector` built from
+   *currently-free* device memory. On failure it returns a clear
+   "exceeds current memory envelope" error instead of admitting a request that
+   would OOM mid-prefill. Fail-open when hyperparams or the probe are
+   unavailable.
+
+**Test:** `test_memory_certificate_admission_gate` proves rejection below the
+envelope and admission above it. All engine/scheduler/core/nn/rocm suites green.
 
 ### R2 — Fuse DeterministicTokenMap into MoeFfn::forward ⏸ DEFERRED (high effort, high risk)
 
