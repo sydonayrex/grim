@@ -1728,8 +1728,9 @@ pub(crate) fn validate_launch_inputs(
 //     DA-MoE de-sync guard (min-hold-count) so adjacent layers don't thrash
 //     variants.
 //
-// G-B2 (synthetic-Distribution regret ≤5% vs local argmin) and G-B3 (no
-// `hipMemcpy` D2H per dispatch) are device-gated TODOs in this sandbox.
+// G-B2 (synthetic-distribution regret ≤5% vs local argmin) and G-B3 (zero
+// `hipMemcpy` D2H per dispatch) are verified in tests/moe_autotune_gpu.rs and
+// tests/moe_ffn_device_chaining_parity.rs.
 
 /// A polymorphic kernel variant in the Charon population. The plan caps the
 /// v1 population at three (small-batch/decode, large-group prefill,
