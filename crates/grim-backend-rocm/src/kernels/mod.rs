@@ -28,6 +28,7 @@ pub mod charon_backward;
 /// the scalar grouped kernel.
 pub mod charon_wmma;
 /// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in.
+pub mod batched_lora;
 pub mod comm_fuse;
 pub mod compressed_gemm;
 pub mod compute_kernels;

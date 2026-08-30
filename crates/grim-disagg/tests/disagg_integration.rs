@@ -354,3 +354,100 @@ fn test_disagg_p2p_direct_transfer() {
     assert_eq!(&recv_k[..32], &k_data[..]);
     assert_eq!(&recv_v[..32], &v_data[..]);
 }
+
+#[test]
+fn test_disagg_shared_mem_transport_loopback_integrity() {
+    // End-to-end `SharedMemP2p` gate: the same-host file-inbox transport
+    // must deliver byte-identical K/V (plus the valid token count) into the
+    // receiver's pool — and its inbox must actually be exercised, not
+    // silently bypassed by the TCP fallback.
+    use grim_disagg::LayerPipelinedKvStreamer;
+    use grim_kvtransport::TransportProtocol;
+
+    let elem_per_token = 32;
+    let src_pool = KvBlockPool::new(4, 2, elem_per_token);
+    let dst_pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, elem_per_token)));
+
+    let k0: Vec<f32> = (0..elem_per_token * 4).map(|i| (i as f32) * 0.25).collect();
+    let v0: Vec<f32> = (0..elem_per_token * 4).map(|i| -(i as f32) * 0.5).collect();
+    let k1: Vec<f32> = (0..elem_per_token * 4).map(|i| (i as f32) + 100.0).collect();
+    let v1: Vec<f32> = (0..elem_per_token * 4).map(|i| (i as f32) - 100.0).collect();
+
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let _receiver = KvReceiverServer::new(&addr, dst_pool.clone()).unwrap();
+    {
+        // Prove the receiver has an active shm inbox before sending: this is
+        // the marker the sender checks, and its absence would silently
+        // degrade the transfer to TCP.
+        let inbox = grim_kvtransport::shm_inbox_for_port(port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !inbox.join("active").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receiver shm inbox never became active at {}",
+                inbox.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let streamer =
+        LayerPipelinedKvStreamer::new(addr.clone()).with_protocol(TransportProtocol::SharedMemP2p);
+    // Both layers per block: `block_num_tokens` only reports a count once
+    // every layer of the block carries data.
+    let handoffs: [(usize, u32, &Vec<f32>, &Vec<f32>); 4] = [
+        (0, 0, &k0, &v0),
+        (0, 1, &k1, &v1),
+        (1, 0, &k1, &v1),
+        (1, 1, &k0, &v0),
+    ];
+    for (block, layer, k, v) in handoffs {
+        streamer
+            .stream_layer_block(block, layer, k, v, 4)
+            .expect("shm handoff must land in the polled inbox");
+    }
+
+    let dst = dst_pool.lock().unwrap();
+    let got_k0 = dst.read_layer_keys(0, 0).expect("keys written");
+    let got_v0 = dst.read_layer_values(0, 0).expect("values written");
+    assert_eq!(&got_k0[..k0.len()], &k0[..], "block 0 layer 0 keys");
+    assert_eq!(&got_v0[..v0.len()], &v0[..], "block 0 layer 0 values");
+    let got_k1 = dst.read_layer_keys(0, 1).expect("keys written");
+    let got_v1 = dst.read_layer_values(0, 1).expect("values written");
+    assert_eq!(&got_k1[..k1.len()], &k1[..], "block 0 layer 1 keys");
+    assert_eq!(&got_v1[..v1.len()], &v1[..], "block 0 layer 1 values");
+    let got_k2 = dst.read_layer_keys(1, 1).expect("keys written");
+    let got_v2 = dst.read_layer_values(1, 1).expect("values written");
+    assert_eq!(&got_k2[..k0.len()], &k0[..], "block 1 layer 1 keys");
+    assert_eq!(&got_v2[..v0.len()], &v0[..], "block 1 layer 1 values");
+    // Valid token counts survive the handoff end-to-end (128 elems /
+    // 64 elem-per-token = 2 valid tokens).
+    assert_eq!(dst.block_num_tokens(0), Some(2));
+    assert_eq!(dst.block_num_tokens(1), Some(2));
+    drop(dst);
+    let _ = src_pool;
+}
+
+#[test]
+fn test_disagg_rdma_protocol_is_explicitly_unsupported() {
+    // Requesting RDMA must fail loudly — never a silent TCP downgrade that
+    // would misrepresent the deployment.
+    use grim_disagg::LayerPipelinedKvStreamer;
+    use grim_kvtransport::TransportProtocol;
+
+    let dst_pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 32)));
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let _receiver = KvReceiverServer::new(&addr, dst_pool).unwrap();
+
+    let streamer =
+        LayerPipelinedKvStreamer::new(addr).with_protocol(TransportProtocol::RdmaRoce);
+    let err = streamer
+        .stream_layer_block(0, 0, &[1.0; 128], &[1.0; 128], 4)
+        .expect_err("RdmaRoce must be an explicit error without a hardware backend");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no hardware backend"),
+        "unexpected error text: {msg}"
+    );
+}

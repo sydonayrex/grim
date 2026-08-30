@@ -81,6 +81,34 @@ pub enum ClientIntegration {
     Zcode,
 }
 
+/// Kill TP peer children when rank 0's serve scope exits. A surviving peer
+/// rank is worse than a dead one: it would hang on collectives forever.
+struct TpChildGuard(Vec<std::process::Child>);
+
+impl Drop for TpChildGuard {
+    fn drop(&mut self) {
+        for child in self.0.iter_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Liveness probe for a TP peer pid. Linux-only by way of /proc; other
+/// platforms conservatively report alive (the peer's own HTTP port going
+/// silent is then the operator's signal).
+fn tp_pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start the inference HTTP server (Ollama-compatible, default port 11434). Used by systemd/launchd.
@@ -125,6 +153,13 @@ enum Commands {
         /// binding to a wildcard address is refused for safety.
         #[arg(long)]
         allow_public: bool,
+        /// Tensor-parallel size (Design A: one OS process per rank). This
+        /// process is rank 0; ranks 1..N spawn as children with
+        /// GRIM_TP_SIZE/GRIM_TP_RANK stamped and HTTP ports offset by rank.
+        /// All ranks must receive the same request stream in the same order —
+        /// rank 0's collectives rendezvous with its peers on every forward.
+        #[arg(long, default_value = "1")]
+        tp_size: usize,
     },
     /// One-shot inference or HTTP serving.
     Run {
@@ -926,6 +961,7 @@ async fn main() -> Result<()> {
             prefill_addr,
             decode_addr,
             allow_public,
+            tp_size,
         } => {
             if !config.is_empty() {
                 unsafe {
@@ -937,6 +973,109 @@ async fn main() -> Result<()> {
                     std::env::set_var("GRIM_BACKEND", b);
                 }
             }
+            // Tensor-parallel launcher (Design A, one OS process per rank):
+            // this process is rank 0; peers 1..tp_size-1 run as children with
+            // their rank and HTTP port stamped. Children never re-spawn —
+            // launching is gated on GRIM_TP_RANK being unset. Peers die with
+            // this process (ChildGuard) and this process dies with any peer
+            // (fail-stop monitor): a TP rank set missing one rank deadlocks
+            // the survivors' collectives on the next forward.
+            let mut tp_children: Vec<std::process::Child> = Vec::new();
+            let mut tp_peer_pids: Vec<u32> = Vec::new();
+            if tp_size > 1 {
+                if !address.is_empty() {
+                    eprintln!(
+                        "[grim] serve: --address cannot be combined with --tp-size; use \
+                         --host/--port so per-rank ports can be derived"
+                    );
+                    std::process::exit(2);
+                }
+                let my_rank: usize = std::env::var("GRIM_TP_RANK")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if my_rank == 0 {
+                    unsafe {
+                        std::env::set_var("GRIM_TP_SIZE", tp_size.to_string());
+                        std::env::set_var("GRIM_TP_RANK", "0");
+                    }
+                    let base_port = port.unwrap_or_else(|| {
+                        std::env::var("GRIM_PORT")
+                            .ok()
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(11434u16)
+                    });
+                    let exe = std::env::current_exe().unwrap_or_else(|e| {
+                        eprintln!("[grim] serve: cannot resolve current exe for TP peers: {e}");
+                        std::process::exit(2);
+                    });
+                    let mut pass_args: Vec<String> = std::env::args().skip(1).collect();
+                    let port_flag = pass_args
+                        .iter()
+                        .position(|a| a == "--port" || a == "-p");
+                    match port_flag {
+                        Some(pos) => {
+                            if let Some(next) = pass_args.get_mut(pos + 1) {
+                                *next = base_port.to_string();
+                            }
+                        }
+                        None => {
+                            pass_args.push("--port".into());
+                            pass_args.push(base_port.to_string());
+                        }
+                    }
+                    for rank in 1..tp_size {
+                        let mut args = pass_args.clone();
+                        if let Some(pos) = args.iter().position(|a| a == "--port" || a == "-p") {
+                            if let Some(next) = args.get_mut(pos + 1) {
+                                *next = (base_port + rank as u16).to_string();
+                            }
+                        }
+                        let result = std::process::Command::new(&exe)
+                            .args(&args)
+                            .env("GRIM_TP_SIZE", tp_size.to_string())
+                            .env("GRIM_TP_RANK", rank.to_string())
+                            .spawn();
+                        match result {
+                            Ok(child) => {
+                                eprintln!(
+                                    "[grim] TP rank {rank}/{tp_size} spawned (pid {}, port {})",
+                                    child.id(),
+                                    base_port as usize + rank
+                                );
+                                tp_peer_pids.push(child.id());
+                                tp_children.push(child);
+                            }
+                            Err(e) => {
+                                eprintln!("[grim] serve: failed to spawn TP rank {rank}: {e}");
+                                for c in tp_children.iter_mut() {
+                                    let _ = c.kill();
+                                }
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    // Fail-stop monitor: any peer dying breaks rank 0's
+                    // collectives on the next all-reduce, so take rank 0
+                    // down instead of hanging the next forward.
+                    let watched = tp_peer_pids.clone();
+                    std::thread::spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        for pid in &watched {
+                            if !tp_pid_alive(*pid) {
+                                eprintln!(
+                                    "[grim] TP peer pid {pid} died; rank set is broken,                                      rank 0 exiting instead of hanging on collectives"
+                                );
+                                std::process::exit(3);
+                            }
+                        }
+                    });
+                }
+            }
+            // Children are killed whenever this arm's scope exits (server
+            // shutdown, error return) — a surviving rank is worse than a
+            // dead one.
+            let _tp_child_guard = TpChildGuard(tp_children);
             // Build EngineConfig with optional disaggregation wiring.
             let mut engine_config = grim_engine::EngineConfig::default();
             let role_lower = disagg_role.to_ascii_lowercase();

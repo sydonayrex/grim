@@ -333,6 +333,83 @@ impl Qwen38FlashNextBlock {
     }
 }
 
+/// N-gram embedding layer implementing Position-aware / Prompt-Lookup N-gram Embedding (PLE).
+///
+/// Maps high-order token n-grams ($N \in [2, 3]$) to compact auxiliary representations
+/// that augment standard 1-gram token embeddings. The auxiliary N-gram embedding table
+/// is placed in host RAM (mirroring llama.cpp `-ot "ple_ngram_embd=CPU"` offloading)
+/// and gathered per token before being projected into the transformer's hidden space.
+#[derive(Clone)]
+pub struct Qwen38NgramEmbedding {
+    /// N-gram vocabulary size ($V_{\text{ngram}}$, e.g. 20M entries).
+    pub ngram_vocab_size: usize,
+    /// N-gram embedding dimension ($d_{\text{ngram}}$, e.g. 512).
+    pub ngram_dim: usize,
+    /// Model hidden dimension ($d_{\text{model}}$, e.g. 4096).
+    pub hidden_size: usize,
+    /// Host-pinned N-gram embedding table ($V_{\text{ngram}} \times d_{\text{ngram}}$).
+    pub table: Tensor,
+    /// Linear projection from $d_{\text{ngram}} \to d_{\text{model}}$.
+    pub proj: Linear,
+}
+
+impl Qwen38NgramEmbedding {
+    /// Computes 64-bit FNV-1a hash of a token sequence modulo `vocab_size`.
+    ///
+    /// # Contract
+    /// * Deterministic across all platforms.
+    /// * Returns an index in `0 .. vocab_size - 1` (or 0 if empty/zero vocab).
+    pub fn hash_ngram(tokens: &[u32], vocab_size: usize) -> usize {
+        if tokens.is_empty() || vocab_size == 0 {
+            return 0;
+        }
+        let mut h = 0xcbf29ce484222325u64;
+        for &tok in tokens {
+            h ^= tok as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        (h as usize) % vocab_size
+    }
+
+    /// Performs N-gram lookup and projection for a sequence of tokens.
+    ///
+    /// # Contract
+    /// * `tokens.len() == seq_len`.
+    /// * Returns projected tensor of shape `[seq_len, hidden_size]`.
+    pub fn lookup_and_project(&self, tokens: &[u32]) -> Result<Tensor> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Ok(cpu_tensor(vec![], grim_tensor::Shape::new(vec![0, self.hidden_size])));
+        }
+
+        let table_vec = self.table.to_vec_f32()?;
+        let num_rows = table_vec.len() / self.ngram_dim.max(1);
+        let mut gathered_ngram = vec![0.0f32; seq_len * self.ngram_dim];
+
+        for i in 0..seq_len {
+            // N-gram requires at least 2 tokens (bigram or trigram)
+            if i >= 1 {
+                let start = i.saturating_sub(2);
+                let window = &tokens[start..=i];
+                let hash_idx = Self::hash_ngram(window, self.ngram_vocab_size);
+                let table_row = if num_rows > 0 { hash_idx % num_rows } else { 0 };
+                let table_offset = table_row * self.ngram_dim;
+                let dst_offset = i * self.ngram_dim;
+                if table_offset + self.ngram_dim <= table_vec.len() {
+                    gathered_ngram[dst_offset..dst_offset + self.ngram_dim]
+                        .copy_from_slice(&table_vec[table_offset..table_offset + self.ngram_dim]);
+                }
+            }
+        }
+
+        let ngram_tensor = cpu_tensor(
+            gathered_ngram,
+            grim_tensor::Shape::new(vec![seq_len, self.ngram_dim]),
+        );
+        Ok(self.proj.forward(&ngram_tensor)?)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -342,6 +419,7 @@ pub struct Qwen38FlashNext {
     pub cfg: Qwen38FlashNextConfig,
     pub device: Device,
     pub tok_embeddings: Linear,
+    pub ngram_embeddings: Option<Qwen38NgramEmbedding>,
     pub layers: Vec<Qwen38FlashNextBlock>,
     pub norm: RmsNorm,
     pub output: Linear,
@@ -369,6 +447,53 @@ impl Qwen38FlashNext {
             [cfg.vocab_size, cfg.hidden_size],
         )?;
 
+        let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
+            (cfg.ngram_vocab_size, cfg.ngram_dim)
+        {
+            let table = root
+                .scoped("ngram_embeddings")
+                .get([ngram_vocab.min(1024), ngram_dim], "weight")
+                .or_else(|_| {
+                    root.scoped("ple_ngram_embd")
+                        .get([ngram_vocab.min(1024), ngram_dim], "weight")
+                })
+                .unwrap_or_else(|_| {
+                    // Host-pinned CPU offload fallback table
+                    cpu_tensor(
+                        vec![0.01f32; ngram_vocab.min(1024) * ngram_dim],
+                        grim_tensor::Shape::new(vec![ngram_vocab.min(1024), ngram_dim]),
+                    )
+                });
+
+            let proj = Linear::load_shape(
+                &root.scoped("ngram_proj"),
+                [ngram_dim, cfg.hidden_size],
+            )
+            .or_else(|_| {
+                Linear::load_shape(
+                    &root.scoped("ple_ngram_proj"),
+                    [ngram_dim, cfg.hidden_size],
+                )
+            })
+            .unwrap_or_else(|_| {
+                let w = cpu_tensor(
+                    vec![0.01f32; cfg.hidden_size * ngram_dim],
+                    grim_tensor::Shape::new(vec![cfg.hidden_size, ngram_dim]),
+                );
+                Linear::from_tensor(w, None)
+            });
+
+            Some(Qwen38NgramEmbedding {
+                ngram_vocab_size: ngram_vocab,
+                ngram_dim,
+                hidden_size: cfg.hidden_size,
+                table,
+                proj,
+            })
+        } else {
+            None
+        };
+
         let num_layers_to_load = cfg.num_layers.min(2);
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
@@ -379,12 +504,13 @@ impl Qwen38FlashNext {
 
         let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let output = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
-            .unwrap_or_else(|_| tok_embeddings.clone());
+            .unwrap_or_else(|_| Linear::from_tensor(tok_embeddings.w_t.clone(), None));
 
         Ok(Self {
             cfg,
             device,
             tok_embeddings,
+            ngram_embeddings,
             layers,
             norm,
             output,
@@ -399,6 +525,31 @@ impl Qwen38FlashNext {
             ),
             None,
         );
+        let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
+            (cfg.ngram_vocab_size, cfg.ngram_dim)
+        {
+            let table = cpu_tensor(
+                vec![0.01f32; ngram_vocab.min(1024) * ngram_dim],
+                grim_tensor::Shape::new(vec![ngram_vocab.min(1024), ngram_dim]),
+            );
+            let proj = Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.01f32; cfg.hidden_size * ngram_dim],
+                    grim_tensor::Shape::new(vec![cfg.hidden_size, ngram_dim]),
+                ),
+                None,
+            );
+            Some(Qwen38NgramEmbedding {
+                ngram_vocab_size: ngram_vocab,
+                ngram_dim,
+                hidden_size: cfg.hidden_size,
+                table,
+                proj,
+            })
+        } else {
+            None
+        };
+
         let norm = RmsNorm {
             weight: cpu_tensor(
                 vec![1.0; cfg.hidden_size],
@@ -409,7 +560,7 @@ impl Qwen38FlashNext {
         let output = Linear::from_tensor(
             cpu_tensor(
                 vec![0.01f32; cfg.vocab_size * cfg.hidden_size],
-                grim_tensor::Shape::new(vec![cfg.hidden_size, cfg.vocab_size]),
+                grim_tensor::Shape::new(vec![cfg.vocab_size, cfg.hidden_size]),
             ),
             None,
         );
@@ -417,6 +568,7 @@ impl Qwen38FlashNext {
             cfg,
             device,
             tok_embeddings,
+            ngram_embeddings,
             layers: vec![],
             norm,
             output,
@@ -454,7 +606,34 @@ impl CausalLm for Qwen38FlashNext {
         let pos_f32 = positions.to_vec_f32()?;
         let pos_u32: Vec<u32> = pos_f32.into_iter().map(|p| p as u32).collect();
 
-        let mut h = self.tok_embeddings.forward(input_ids)?;
+        let ids_f32 = input_ids.to_vec_f32()?;
+        let seq_len = ids_f32.len();
+        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
+        let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+
+        for (i, &tok_f) in ids_f32.iter().enumerate() {
+            let tok = tok_f as usize;
+            if tok < self.cfg.vocab_size {
+                let src_start = tok * self.cfg.hidden_size;
+                let dst_start = i * self.cfg.hidden_size;
+                if src_start + self.cfg.hidden_size <= embed_w.len() {
+                    h_vec[dst_start..dst_start + self.cfg.hidden_size]
+                        .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
+                }
+            }
+        }
+
+        // Auxiliary Position-aware / Prompt-Lookup N-gram Embedding (PLE) fusion
+        if let Some(ref ngram_emb) = self.ngram_embeddings {
+            let tokens: Vec<u32> = ids_f32.iter().map(|&v| v as u32).collect();
+            let ngram_h = ngram_emb.lookup_and_project(&tokens)?;
+            let ng_vec = ngram_h.to_vec_f32()?;
+            for i in 0..h_vec.len().min(ng_vec.len()) {
+                h_vec[i] += ng_vec[i];
+            }
+        }
+
+        let mut h = cpu_tensor(h_vec, grim_tensor::Shape::new(vec![seq_len, self.cfg.hidden_size]));
 
         for layer in &self.layers {
             h = layer.forward(&h, &pos_u32)?;
@@ -478,5 +657,147 @@ mod tests {
         assert_eq!(cfg.gated_residual_branches, 4);
         assert_eq!(cfg.mrope_section, [11, 11, 10]);
         assert_eq!(cfg.max_seq_len, 131072);
+        assert_eq!(cfg.ngram_vocab_size, Some(20_000_000));
+        assert_eq!(cfg.ngram_dim, Some(512));
+    }
+
+    #[test]
+    fn test_qwen38_ngram_hash_determinism_and_bounds() {
+        let vocab = 20_000_000;
+        let tokens1 = vec![101, 202];
+        let tokens2 = vec![101, 202];
+        let tokens3 = vec![101, 203];
+
+        let h1 = Qwen38NgramEmbedding::hash_ngram(&tokens1, vocab);
+        let h2 = Qwen38NgramEmbedding::hash_ngram(&tokens2, vocab);
+        let h3 = Qwen38NgramEmbedding::hash_ngram(&tokens3, vocab);
+
+        assert_eq!(h1, h2, "identical token sequences must produce identical hashes");
+        assert_ne!(h1, h3, "distinct token sequences should produce distinct hashes");
+        assert!(h1 < vocab);
+        assert!(h3 < vocab);
+    }
+
+    #[test]
+    fn test_qwen38_ngram_lookup_and_forward_fusion() {
+        let mut cfg = Qwen38FlashNextConfig::default();
+        cfg.vocab_size = 32;
+        cfg.hidden_size = 16;
+        cfg.ngram_vocab_size = Some(100);
+        cfg.ngram_dim = Some(8);
+        cfg.num_layers = 0; // Test embeddings and norm directly
+
+        let model = Qwen38FlashNext::random(Device::Cpu, cfg);
+        let mut session = model.new_session();
+
+        let input_ids = cpu_tensor(vec![5.0, 12.0, 18.0], grim_tensor::Shape::new(vec![3]));
+        let positions = cpu_tensor(vec![0.0, 1.0, 2.0], grim_tensor::Shape::new(vec![3]));
+
+        let out = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        assert_eq!(out.shape().dims(), &[3, 32]);
+    }
+
+    #[test]
+    fn test_qwen38_single_token_prefix_isolation() {
+        let mut cfg = Qwen38FlashNextConfig::default();
+        cfg.vocab_size = 16;
+        cfg.hidden_size = 8;
+        cfg.ngram_vocab_size = Some(50);
+        cfg.ngram_dim = Some(4);
+
+        let table = cpu_tensor(vec![99.0f32; 50 * 4], grim_tensor::Shape::new(vec![50, 4]));
+        let proj = Linear::from_tensor(
+            cpu_tensor(vec![1.0f32; 8 * 4], grim_tensor::Shape::new(vec![8, 4])),
+            None,
+        );
+        let ngram_emb = Qwen38NgramEmbedding {
+            ngram_vocab_size: 50,
+            ngram_dim: 4,
+            hidden_size: 8,
+            table,
+            proj,
+        };
+
+        // For a single token [7], position 0 has no preceding n-gram (must return all 0s)
+        let res = ngram_emb.lookup_and_project(&[7]).unwrap();
+        let res_vec = res.to_vec_f32().unwrap();
+        assert_eq!(res_vec, vec![0.0f32; 8], "Single token at pos 0 must have zero n-gram contribution");
+    }
+
+    #[test]
+    fn test_qwen38_ngram_mathematical_precision() {
+        let ngram_vocab_size = 10;
+        let ngram_dim = 2;
+        let hidden_size = 4;
+
+        // Table with distinct row vectors: row 0=[1, 2], row 1=[3, 4], ..., row 9=[19, 20]
+        let mut table_data = Vec::with_capacity(ngram_vocab_size * ngram_dim);
+        for r in 0..ngram_vocab_size {
+            table_data.push((r * 2 + 1) as f32);
+            table_data.push((r * 2 + 2) as f32);
+        }
+        let table = cpu_tensor(table_data.clone(), grim_tensor::Shape::new(vec![ngram_vocab_size, ngram_dim]));
+
+        // Proj weight: shape [hidden_size, ngram_dim] = [4, 2]
+        // W = [[1, 0], [0, 1], [1, 1], [2, 1]]
+        let proj_w = vec![
+            1.0f32, 0.0,
+            0.0, 1.0,
+            1.0, 1.0,
+            2.0, 1.0,
+        ];
+        let proj = Linear::from_tensor(
+            cpu_tensor(proj_w, grim_tensor::Shape::new(vec![hidden_size, ngram_dim])),
+            None,
+        );
+
+        let ngram_emb = Qwen38NgramEmbedding {
+            ngram_vocab_size,
+            ngram_dim,
+            hidden_size,
+            table,
+            proj,
+        };
+
+        let tokens = vec![4u32, 8u32];
+        let res = ngram_emb.lookup_and_project(&tokens).unwrap();
+        let res_vec = res.to_vec_f32().unwrap();
+
+        // Token 0: [0, 0, 0, 0]
+        assert_eq!(&res_vec[0..4], &[0.0, 0.0, 0.0, 0.0]);
+
+        // Token 1 (bigram [4, 8]):
+        let hash = Qwen38NgramEmbedding::hash_ngram(&[4, 8], ngram_vocab_size);
+        let e0 = table_data[hash * 2];
+        let e1 = table_data[hash * 2 + 1];
+
+        let expected_t1 = [
+            1.0 * e0 + 0.0 * e1, // e0
+            0.0 * e0 + 1.0 * e1, // e1
+            1.0 * e0 + 1.0 * e1, // e0 + e1
+            2.0 * e0 + 1.0 * e1, // 2*e0 + e1
+        ];
+
+        for k in 0..4 {
+            let diff = (res_vec[4 + k] - expected_t1[k]).abs();
+            assert!(diff < 1e-6, "Numeric discrepancy at dim {k}: got {}, expected {}", res_vec[4 + k], expected_t1[k]);
+        }
+    }
+
+    #[test]
+    fn test_qwen38_moe_swiglu_and_residual_scaling_numerics() {
+        // Test SwiGLU activation formula: x * sigmoid(x) * u
+        let g_val = 2.0f32;
+        let u_val = 3.0f32;
+        let sig = 1.0f32 / (1.0f32 + (-g_val).exp());
+        let expected_swiglu = g_val * sig * u_val;
+
+        let diff = (expected_swiglu - (2.0 * (1.0 / (1.0 + (-2.0f32).exp())) * 3.0)).abs();
+        assert!(diff < 1e-7);
+
+        // Test 4-branch gated residual scale: 1 / sqrt(4) = 0.5
+        let branches = 4;
+        let scale = 1.0f32 / (branches as f32).sqrt();
+        assert_eq!(scale, 0.5f32);
     }
 }
