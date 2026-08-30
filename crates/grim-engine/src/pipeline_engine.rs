@@ -304,6 +304,196 @@ impl PipelinedModelCoordinator {
     }
 }
 
+// ── Virtual Pipeline Parallelism (VPP) ───────────────────────────────────────
+
+/// Virtual pipeline stage configuration mapping a virtual stage slice
+/// onto a physical hardware rank in a V-shaped fold-back topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualStageConfig {
+    /// Virtual stage index in forward traversal order (0 .. 2*num_physical_ranks - 1).
+    pub virtual_stage_id: usize,
+    /// Physical hardware GPU rank assigned to this virtual stage.
+    pub physical_rank: usize,
+    /// Total number of virtual stages in the model.
+    pub num_virtual_stages: usize,
+    /// Total number of physical hardware ranks.
+    pub num_physical_ranks: usize,
+    /// First transformer layer index executed on this virtual stage.
+    pub start_layer: usize,
+    /// Last transformer layer index (exclusive) executed on this virtual stage.
+    pub end_layer: usize,
+    /// Hardware GPU ordinal assigned to this stage.
+    pub device_ordinal: usize,
+}
+
+impl VirtualStageConfig {
+    /// Whether this is the entry stage of the entire model.
+    pub fn is_model_head(&self) -> bool {
+        self.virtual_stage_id == 0
+    }
+
+    /// Whether this is the final output stage of the entire model.
+    pub fn is_model_tail(&self) -> bool {
+        self.virtual_stage_id + 1 == self.num_virtual_stages
+    }
+
+    /// Whether this virtual stage is at the fold turning point (stays on same physical rank).
+    pub fn is_fold_point(&self) -> bool {
+        self.virtual_stage_id + 1 == self.num_physical_ranks
+    }
+}
+
+/// Computed V-shaped Virtual Pipeline Parallel Plan (VPP).
+///
+/// Partitions $L$ layers into $2N$ virtual stages $\{s_0, s_1, \dots, s_{2N-1}\}$
+/// mapped onto $N$ physical ranks:
+/// - Rank 0: $\{s_0, s_{2N-1}\}$ (model head and final tail)
+/// - Rank 1: $\{s_1, s_{2N-2}\}$
+/// - ...
+/// - Rank $N-1$: $\{s_{N-1}, s_N\}$ (middle fold-back stages)
+#[derive(Debug, Clone)]
+pub struct VirtualPipelinePlan {
+    /// Virtual stages in forward traversal order ($0 \dots 2N-1$).
+    pub virtual_stages: Vec<VirtualStageConfig>,
+    /// Number of physical hardware ranks.
+    pub num_physical_ranks: usize,
+}
+
+impl VirtualPipelinePlan {
+    /// Generate a V-shaped virtual pipeline plan.
+    ///
+    /// # Contracts
+    /// * `num_physical_ranks >= 1`
+    /// * `total_layers >= 2 * num_physical_ranks`
+    /// * `device_ordinals.len() == num_physical_ranks`
+    pub fn plan(
+        total_layers: usize,
+        num_physical_ranks: usize,
+        device_ordinals: &[usize],
+    ) -> Result<Self> {
+        let num_virtual_stages = 2 * num_physical_ranks;
+        if total_layers < num_virtual_stages {
+            return Err(Error::Config(format!(
+                "VirtualPipelinePlan: {total_layers} layers cannot fill {num_virtual_stages} virtual stages"
+            )));
+        }
+        if device_ordinals.len() != num_physical_ranks {
+            return Err(Error::Config(format!(
+                "VirtualPipelinePlan: {} device ordinals for {num_physical_ranks} physical ranks",
+                device_ordinals.len()
+            )));
+        }
+
+        let layers_per_vstage = total_layers / num_virtual_stages;
+        let remainder = total_layers % num_virtual_stages;
+
+        let mut virtual_stages = Vec::with_capacity(num_virtual_stages);
+        let mut curr_layer = 0;
+
+        for vs in 0..num_virtual_stages {
+            let count = layers_per_vstage + if vs < remainder { 1 } else { 0 };
+            let start = curr_layer;
+            let end = curr_layer + count;
+            curr_layer = end;
+
+            // Fold-back rank mapping:
+            // Forward arm: vs 0..N-1 -> rank vs
+            // Return arm: vs N..2N-1 -> rank (2N - 1 - vs)
+            let phys_rank = if vs < num_physical_ranks {
+                vs
+            } else {
+                (2 * num_physical_ranks - 1) - vs
+            };
+
+            let dev = device_ordinals[phys_rank];
+            virtual_stages.push(VirtualStageConfig {
+                virtual_stage_id: vs,
+                physical_rank: phys_rank,
+                num_virtual_stages,
+                num_physical_ranks,
+                start_layer: start,
+                end_layer: end,
+                device_ordinal: dev,
+            });
+        }
+
+        Ok(Self {
+            virtual_stages,
+            num_physical_ranks,
+        })
+    }
+
+    /// Retrieve the two virtual stages assigned to a physical rank.
+    pub fn stages_for_rank(&self, physical_rank: usize) -> (VirtualStageConfig, VirtualStageConfig) {
+        let first = self.virtual_stages[physical_rank].clone();
+        let second = self.virtual_stages[2 * self.num_physical_ranks - 1 - physical_rank].clone();
+        (first, second)
+    }
+}
+
+/// Dual-queue chunked prefill coordinator using V-shaped Virtual Pipeline Parallelism.
+pub struct VirtualPipelineCoordinator {
+    pub plan: VirtualPipelinePlan,
+    pub runners: Vec<PipelineStageRunner>,
+}
+
+impl VirtualPipelineCoordinator {
+    /// Creates a new VPP model coordinator.
+    pub fn new(
+        plan: VirtualPipelinePlan,
+        pool_capacity: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let runners = plan
+            .virtual_stages
+            .iter()
+            .map(|cfg| {
+                let stage_cfg = PipelineStageConfig {
+                    stage_id: cfg.virtual_stage_id,
+                    num_stages: cfg.num_virtual_stages,
+                    start_layer: cfg.start_layer,
+                    end_layer: cfg.end_layer,
+                    device_ordinal: cfg.device_ordinal,
+                };
+                PipelineStageRunner::new(
+                    stage_cfg,
+                    None,
+                    pool_capacity,
+                    num_heads,
+                    head_dim,
+                )
+            })
+            .collect();
+        Self { plan, runners }
+    }
+
+    /// Execute a forward pass across all virtual pipeline stages in V-traversal sequence.
+    pub fn forward_vpp<F>(
+        &self,
+        initial_input: Tensor,
+        layer_forward_fn: F,
+    ) -> Result<Tensor>
+    where
+        F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
+    {
+        let mut curr = initial_input;
+        for runner in &self.runners {
+            let mut h = curr;
+            {
+                let mut pool = runner.block_pool.lock().map_err(|e| {
+                    Error::KvCache(format!("Failed to lock stage KV block pool: {}", e))
+                })?;
+                for layer_idx in runner.config.start_layer..runner.config.end_layer {
+                    h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+                }
+            }
+            curr = h;
+        }
+        Ok(curr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +604,71 @@ mod tests {
         // Input was 1.0 -> expected output is 6.0 for each element
         for val in out_vec {
             assert!((val - 6.0f32).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_virtual_pipeline_plan_fold_back_mapping() {
+        // 8 layers partitioned across 2 physical ranks -> 4 virtual stages:
+        // Rank 0: s0 (0..2), s3 (6..8)
+        // Rank 1: s1 (2..4), s2 (4..6)
+        let vplan = VirtualPipelinePlan::plan(8, 2, &[0, 1]).unwrap();
+        assert_eq!(vplan.virtual_stages.len(), 4);
+
+        assert_eq!(vplan.virtual_stages[0].virtual_stage_id, 0);
+        assert_eq!(vplan.virtual_stages[0].physical_rank, 0);
+        assert_eq!(vplan.virtual_stages[0].start_layer, 0);
+        assert_eq!(vplan.virtual_stages[0].end_layer, 2);
+        assert!(vplan.virtual_stages[0].is_model_head());
+
+        assert_eq!(vplan.virtual_stages[1].virtual_stage_id, 1);
+        assert_eq!(vplan.virtual_stages[1].physical_rank, 1);
+        assert_eq!(vplan.virtual_stages[1].start_layer, 2);
+        assert_eq!(vplan.virtual_stages[1].end_layer, 4);
+        assert!(vplan.virtual_stages[1].is_fold_point());
+
+        assert_eq!(vplan.virtual_stages[2].virtual_stage_id, 2);
+        assert_eq!(vplan.virtual_stages[2].physical_rank, 1);
+        assert_eq!(vplan.virtual_stages[2].start_layer, 4);
+        assert_eq!(vplan.virtual_stages[2].end_layer, 6);
+
+        assert_eq!(vplan.virtual_stages[3].virtual_stage_id, 3);
+        assert_eq!(vplan.virtual_stages[3].physical_rank, 0);
+        assert_eq!(vplan.virtual_stages[3].start_layer, 6);
+        assert_eq!(vplan.virtual_stages[3].end_layer, 8);
+        assert!(vplan.virtual_stages[3].is_model_tail());
+
+        let (r0_s0, r0_s1) = vplan.stages_for_rank(0);
+        assert_eq!(r0_s0.virtual_stage_id, 0);
+        assert_eq!(r0_s1.virtual_stage_id, 3);
+    }
+
+    #[test]
+    fn test_virtual_pipeline_forward_vpp_equivalence() {
+        let vplan = VirtualPipelinePlan::plan(4, 2, &[0, 1]).unwrap();
+        let coordinator = VirtualPipelineCoordinator::new(vplan, 16, 2, 16);
+
+        let input_data = vec![2.0f32; 8];
+        let input_tensor = tensor_from_f32_vec(input_data, Shape::new(vec![1, 8]));
+
+        let layer_fn = |layer_idx: usize, x: &Tensor, _pool: &mut KvBlockPool| -> Result<Tensor> {
+            let mut v = x.to_vec_f32()?;
+            let add = (layer_idx as f32 + 1.0) * 0.25;
+            for val in &mut v {
+                *val += add;
+            }
+            Ok(tensor_from_f32_vec(v, x.shape().clone()))
+        };
+
+        let output = coordinator
+            .forward_vpp(input_tensor, layer_fn)
+            .expect("vpp forward should succeed");
+
+        let out_vec = output.to_vec_f32().unwrap();
+        // Layer 0: +0.25, Layer 1: +0.5, Layer 2: +0.75, Layer 3: +1.0 -> total added = 2.5
+        // Input was 2.0 -> expected output is 4.5
+        for val in out_vec {
+            assert!((val - 4.5f32).abs() < 1e-5);
         }
     }
 }

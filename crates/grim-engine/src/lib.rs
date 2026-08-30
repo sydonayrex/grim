@@ -1385,13 +1385,25 @@ impl Engine {
             )));
         }
 
-        // Resolve every non-base segment to (kernel segment, A, B) up front
-        // so weight-download failures surface before any device work.
-        let mut prepared: Vec<(
+        // Resolve every non-base adapter to its weights up front so shape
+        // failures surface before any device work. We build TWO views of the
+        // same data:
+        //  * `segments` + `weight_bank` — contiguous adapter segments, for the
+        //    CPU reference path (kept as the source of truth the GPU kernels are
+        //    tested against).
+        //  * `dispatched_adapters` + `token_adapter_idx` — dense-indexed
+        //    adapters + a per-row indirection table, for the dispatched GPU
+        //    path that issues just two kernel launches for any adapter count.
+        let mut segments: Vec<(
             grim_backend_rocm::kernels::batched_lora::BatchedLoraSegment,
-            Vec<f32>,
-            Vec<f32>,
+            usize, // index into weight_bank
         )> = Vec::new();
+        let mut weight_bank: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut id_to_idx: std::collections::HashMap<u32, (usize, usize)> =
+            std::collections::HashMap::new();
+        let mut dispatched_adapters: Vec<
+            grim_backend_rocm::kernels::batched_lora::DispatchedLoraAdapter,
+        > = Vec::new();
         for seg in grim_scheduler::LoraRowSegment::plan_for_rows(row_adapters) {
             if seg.adapter_id == 0 || seg.row_count == 0 {
                 continue;
@@ -1415,47 +1427,64 @@ impl Engine {
                 )));
             }
             let scaling = loaded.handle.alpha / (rank as f32).max(1.0);
-            prepared.push((
-                grim_backend_rocm::kernels::batched_lora::BatchedLoraSegment {
-                    adapter_id: seg.adapter_id,
-                    token_start: seg.row_start,
-                    token_count: seg.row_count,
-                    rank,
-                    scaling,
-                },
-                a_vec,
-                b_vec,
-            ));
+
+            // Stable dense index per adapter id: an adapter that spans multiple
+            // contiguous segments reuses the same index (and the same weights).
+            let (dense, bank_idx) = *id_to_idx.entry(seg.adapter_id).or_insert_with(|| {
+                let bank_idx = weight_bank.len();
+                let dense = dispatched_adapters.len();
+                weight_bank.push((a_vec.clone(), b_vec.clone()));
+                dispatched_adapters.push(
+                    grim_backend_rocm::kernels::batched_lora::DispatchedLoraAdapter {
+                        a_weights: a_vec,
+                        b_weights: b_vec,
+                        rank,
+                        scaling,
+                    },
+                );
+                (dense, bank_idx)
+            });
+            let seg_kernel = grim_backend_rocm::kernels::batched_lora::BatchedLoraSegment {
+                adapter_id: dense as u32,
+                token_start: seg.row_start,
+                token_count: seg.row_count,
+                rank,
+                scaling,
+            };
+            segments.push((seg_kernel, bank_idx));
         }
-        if prepared.is_empty() {
+        if segments.is_empty() {
             return Ok(());
         }
 
-        // GPU path first (fewer D2H/H2D round-trips than the legacy
-        // per-request logits apply); CPU reference is the portable fallback.
+        // Per-row adapter indirection table for the dispatched path: one dense
+        // index (or u32::MAX for the base model) per row.
+        let token_adapter_idx: Vec<u32> = row_adapters
+            .iter()
+            .map(|&id| {
+                if id == 0 {
+                    u32::MAX
+                } else {
+                    id_to_idx.get(&id).copied().expect("adapter validated above").0 as u32
+                }
+            })
+            .collect();
+
+        // GPU DISPATCHED path (preferred): two kernel launches total for any
+        // number of adapters. Falls back to the CPU reference.
         if let Some(grim_tensor::dtype::Device::Rocm(ordinal)) = device {
             if grim_backend_rocm::device::roc_device::RocmDevice::probe_one(*ordinal)
                 .unwrap_or(false)
             {
                 let device = grim_backend_rocm::device::roc_device::RocmDevice::new(*ordinal);
                 let x = stacked.to_vec();
-                let groups = prepared
-                    .iter()
-                    .map(|(seg, a, b)| {
-                        grim_backend_rocm::kernels::batched_lora::BatchedLoraGroup {
-                            segment: seg.clone(),
-                            a_weights: a,
-                            b_weights: b,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                match grim_backend_rocm::kernels::batched_lora::batched_lora_group_device(
-                    &device, &x, stacked, dim, dim, &groups,
+                match grim_backend_rocm::kernels::batched_lora::batched_lora_dispatched_device(
+                    &device, &x, stacked, dim, dim, &token_adapter_idx, &dispatched_adapters,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         log::warn!(
-                            "[grim-engine] batched LoRA device dispatch failed (ordinal \
+                            "[grim-engine] batched LoRA dispatched dispatch failed (ordinal \
                              {ordinal}), falling back to CPU reference: {e}"
                         );
                     }
@@ -1463,8 +1492,11 @@ impl Engine {
             }
         }
 
+        // CPU portable reference (also the source of truth the GPU kernels are
+        // tested against): per-adapter-segment accumulation.
         let x = stacked.to_vec();
-        for (seg, a, b) in &prepared {
+        for (seg, bank_idx) in &segments {
+            let (a, b) = &weight_bank[*bank_idx];
             grim_backend_rocm::kernels::batched_lora::batched_lora_accumulate_cpu(
                 &x, stacked, dim, dim, seg, a, b,
             )?;

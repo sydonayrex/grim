@@ -63,6 +63,87 @@ impl Default for ArchHyperparameters {
     }
 }
 
+impl ArchHyperparameters {
+    /// Computes the semantic-demand lower bound $U_{\text{sum}}$ for worst-case prefill sequence.
+    ///
+    /// Returns: (static_parameter_bytes, semantic_demand_bytes, kv_cache_bytes, peak_activation_bytes, demanded_experts, total_experts)
+    pub fn compute_detailed_memory_bounds(
+        &self,
+        target_seq_len: usize,
+        batch_size: usize,
+        bytes_per_elem: usize,
+    ) -> (u64, u64, u64, u64, usize, usize) {
+        let bpe = bytes_per_elem as u64;
+        let d = self.hidden_size as u64;
+        let l = self.num_layers as u64;
+        let v = self.vocab_size as u64;
+        let intermediate = self.intermediate_size as u64;
+        let kv_heads = self.num_kv_heads as u64;
+        let q_heads = self.num_heads as u64;
+        let head_dim = self.head_dim as u64;
+
+        // Base attention + norm parameters per layer
+        let qkv_proj = d * head_dim * (q_heads + 2 * kv_heads);
+        let out_proj = d * d;
+        let attn_layer_params = qkv_proj + out_proj + 2 * d; // + norms
+
+        // FFN parameters
+        let (total_static_bytes, semantic_demand_bytes, demanded_experts, total_experts) =
+            if let Some(num_experts) = self.expert_count {
+                let top_k = self.expert_used_count.unwrap_or(2) as u64;
+                let exp_ffn = self.expert_feed_forward_length.unwrap_or(self.intermediate_size) as u64;
+                let per_expert_ffn = 3 * d * exp_ffn; // SwiGLU: gate + up + down
+                let shared_ffn = 3 * d * intermediate;
+
+                let static_params = (2 * v * d) // embed + lm_head
+                    + l * (attn_layer_params + shared_ffn + (num_experts as u64) * per_expert_ffn);
+
+                // Semantic demand: for sequence length S with top-k routing,
+                // worst-case distinct experts demanded across sequence = min(S * top_k, E) per layer
+                let active_per_layer = ((target_seq_len as u64) * top_k).min(num_experts as u64);
+                let demanded_params = (2 * v * d)
+                    + l * (attn_layer_params + shared_ffn + active_per_layer * per_expert_ffn);
+
+                (
+                    static_params * bpe,
+                    demanded_params * bpe,
+                    (active_per_layer * l) as usize,
+                    num_experts * self.num_layers,
+                )
+            } else {
+                let dense_ffn = 3 * d * intermediate;
+                let static_params = (2 * v * d) + l * (attn_layer_params + dense_ffn);
+                (
+                    static_params * bpe,
+                    static_params * bpe,
+                    0,
+                    0,
+                )
+            };
+
+        // KV cache reservation: 2 * L * B * S * N_kv * H_dim * bpe
+        let kv_cache_bytes = 2 * l * (batch_size as u64) * (target_seq_len as u64) * kv_heads * head_dim * bpe;
+
+        // Peak working activation buffer: 2 * B * S * D * bpe
+        let peak_activation_bytes = 2 * (batch_size as u64) * (target_seq_len as u64) * d * bpe;
+
+        (
+            total_static_bytes,
+            semantic_demand_bytes,
+            kv_cache_bytes,
+            peak_activation_bytes,
+            demanded_experts,
+            total_experts,
+        )
+    }
+
+    /// Returns the semantic-demand lower bound in bytes for a target context and batch size.
+    pub fn semantic_demand_lower_bound(&self, target_seq_len: usize, batch_size: usize, bytes_per_elem: usize) -> u64 {
+        let (_, demand, kv, act, _, _) = self.compute_detailed_memory_bounds(target_seq_len, batch_size, bytes_per_elem);
+        demand + kv + act
+    }
+}
+
 /// Metadata accessor abstraction for unified GGUF / HF metadata resolution.
 pub trait MetadataLookup {
     /// Retrieve string metadata by key.

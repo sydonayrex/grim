@@ -8,7 +8,7 @@ use crate::model::ModalityHint;
 use std::collections::HashMap;
 
 /// Comprehensive enumeration of model architectures supported by llama.cpp and Grim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ModelArchitecture {
     Llama,
     Llama4,
