@@ -21,6 +21,8 @@
 //!   — On heterogeneous consumer GPUs (e.g. RDNA4 without xGMI), RCCL direct PCIe P2P
 //!     DMA can deadlock across host PCIe bridges. Setting `NCCL_P2P_DISABLE=1`
 //!     forces host staging and resolves the PCIe bridge hang.
+//!
+//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29.
 
 use grim_backend_rocm::rccl::CollectiveConfig;
 // `UniqueId`/`p2p_memcpy_async` are declared unconditionally but their OFF-build
