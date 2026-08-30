@@ -22,6 +22,7 @@ default = []
 
 [dev-dependencies]
 grim-memory = { workspace = true }
+grim-format = { workspace = true }
 
 
 [lints]
