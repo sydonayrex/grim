@@ -241,6 +241,86 @@ impl TensorParallelConfig {
     }
 }
 
+// ---------- Expert Parallelism (EP) ----------
+
+/// Expert Parallelism configuration for multi-GPU MoE expert sharding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertParallelConfig {
+    pub rank: usize,
+    pub world_size: usize,
+    pub num_total_experts: usize,
+    pub assigned_experts: Vec<usize>,
+}
+
+impl Default for ExpertParallelConfig {
+    fn default() -> Self {
+        Self {
+            rank: 0,
+            world_size: 1,
+            num_total_experts: 0,
+            assigned_experts: Vec::new(),
+        }
+    }
+}
+
+impl ExpertParallelConfig {
+    /// Read EP rank / world size from the environment.
+    ///
+    /// - `GRIM_EP_SIZE` → `world_size` (defaults to 1).
+    /// - `GRIM_EP_RANK` → `rank` (defaults to 0).
+    pub fn from_env(num_total_experts: usize) -> Option<Self> {
+        let world_size = std::env::var("GRIM_EP_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&w| w > 1)?;
+        let rank = std::env::var("GRIM_EP_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let experts_per_rank = num_total_experts.div_ceil(world_size);
+        let start = (rank * experts_per_rank).min(num_total_experts);
+        let end = ((rank + 1) * experts_per_rank).min(num_total_experts);
+        let assigned_experts = (start..end).collect();
+
+        Some(Self {
+            rank,
+            world_size,
+            num_total_experts,
+            assigned_experts,
+        })
+    }
+
+    /// Construct uniform expert partitioning across `world_size` ranks for `num_total_experts`.
+    pub fn uniform(rank: usize, world_size: usize, num_total_experts: usize) -> Self {
+        let experts_per_rank = num_total_experts.div_ceil(world_size.max(1));
+        let start = (rank * experts_per_rank).min(num_total_experts);
+        let end = ((rank + 1) * experts_per_rank).min(num_total_experts);
+        let assigned_experts = (start..end).collect();
+        Self {
+            rank,
+            world_size,
+            num_total_experts,
+            assigned_experts,
+        }
+    }
+
+    /// Whether this rank hosts expert `expert_id`.
+    pub fn owns_expert(&self, expert_id: usize) -> bool {
+        self.assigned_experts.contains(&expert_id)
+    }
+
+    /// Returns the target rank that hosts `expert_id`.
+    pub fn rank_for_expert(&self, expert_id: usize) -> usize {
+        let experts_per_rank = self.num_total_experts.div_ceil(self.world_size.max(1));
+        if experts_per_rank == 0 {
+            0
+        } else {
+            (expert_id / experts_per_rank).min(self.world_size - 1)
+        }
+    }
+}
+
 /// Refuse tensor parallelism for architecture `arch` when `tp.world_size > 1`.
 ///
 /// Used by `Foo::load_tp` stubs for architectures whose `forward` path does

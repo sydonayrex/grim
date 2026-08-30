@@ -34,7 +34,7 @@
 //!   — all 16 tests PASS (16/16), including HostStagingBuffer pinned alloc + D2H round-trip.
 //!
 //! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test p2p_route
-//! RESULT: 16/16 PASS. Verified on the dual-GPU RDNA4 box.
+//! RESULT: 16/16 PASS. Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29.
 
 use grim_backend_rocm::p2p_route::{HostStagingBuffer, RouteLink, to_route_link};
 use grim_backend_rocm::peer_access::P2PStatus;

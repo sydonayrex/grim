@@ -5,6 +5,8 @@
 //! 2. Per-stage KvBlockPool device isolation and layer range filtering.
 //! 3. Multi-stage PipelinedModelCoordinator execution parity vs sequential execution.
 //! 4. P2P activation send/recv between adjacent pipeline stages.
+//!
+//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29
 
 use std::sync::Arc;
 use grim_core::error::Result;

@@ -17,7 +17,7 @@
 //!
 //! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test quantization
 //! RESULT: 19/19 PASS. All tests are CPU-side arch table logic — no GPU calls.
-//!   Verified on the dual-GPU RDNA4 box.
+//!   Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29.
 
 use grim_backend_rocm::quantization::{GcnArch, QuantMode, arch_capability, gcn_arch};
 

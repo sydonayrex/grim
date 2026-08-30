@@ -43,7 +43,7 @@ use grim_tensor::{BackendStorage, Device, Tensor,
 };
 use std::sync::Arc;
 
-use crate::modules::Linear;
+use crate::modules::{ExpertParallelConfig, Linear};
 use crate::varbuilder::WeightSource;
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1558,44 @@ impl MoeFfn {
         Ok(cpu_tensor(out_vec, Shape::new(vec![batch, hidden])))
     }
 
+    /// Expert Parallel (EP) forward pass: routes tokens, packs them by destination rank,
+    /// evaluates through local/sharded expert banks, and combines weighted returns.
+    pub fn forward_expert_parallel(
+        &self,
+        x: &Tensor,
+        ep_config: &ExpertParallelConfig,
+    ) -> Result<Tensor, grim_tensor::error::Error> {
+        let (indices, weights) = self.router.route(x)?;
+        let (dispatched_tokens, metadata) =
+            EpTokenDispatcher::plan_dispatch(x, &indices, &weights, ep_config)?;
+
+        let mut returned_per_rank: Vec<Vec<Tensor>> = Vec::with_capacity(ep_config.world_size);
+        for rank in 0..ep_config.world_size {
+            let slots = &metadata.rank_dispatch_slots[rank];
+            let tokens = &dispatched_tokens[rank];
+            let evaluated = EpTokenDispatcher::evaluate_local_experts(
+                &self.experts,
+                ep_config,
+                tokens,
+                slots,
+            )?;
+            returned_per_rank.push(evaluated);
+        }
+
+        let shared_out = if let Some(sh) = &self.shared_expert {
+            Some(sh.forward(x)?)
+        } else {
+            None
+        };
+
+        EpTokenDispatcher::combine_dispatched_results(
+            &metadata,
+            &returned_per_rank,
+            self.routed_scaling_factor,
+            shared_out.as_ref(),
+        )
+    }
+
     /// MoE-aware bandwidth-adaptive hybrid decode forward pass.
     ///
     /// # Contract
@@ -2191,6 +2229,131 @@ fn bias_opt(has_bias: bool, dim: usize) -> Option<Tensor> {
         Some(cpu_tensor(vec![0.0f32; dim], Shape::new(vec![dim])))
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expert Parallel (EP) Token Dispatcher and Combiner
+// ---------------------------------------------------------------------------
+
+/// Metadata recording token routing per rank for dispatch and combine.
+#[derive(Debug, Clone)]
+pub struct EpDispatchMetadata {
+    /// Token row -> chosen top-k expert IDs
+    pub token_expert_indices: Vec<Vec<usize>>,
+    /// Token row -> chosen top-k routing weights
+    pub token_expert_weights: Vec<Vec<f32>>,
+    /// For each EP rank: list of (token_row, top_k_slot, expert_id) sent to that rank
+    pub rank_dispatch_slots: Vec<Vec<(usize, usize, usize)>>,
+    /// Batch token count
+    pub num_tokens: usize,
+    /// Hidden dimension
+    pub hidden_dim: usize,
+}
+
+/// Token dispatcher and combiner for Expert Parallel (EP) MoE execution.
+pub struct EpTokenDispatcher;
+
+impl EpTokenDispatcher {
+    /// Inspects router outputs and packs tokens into per-rank dispatch groups.
+    pub fn plan_dispatch(
+        x: &Tensor,
+        indices: &[Vec<usize>],
+        weights: &[Vec<f32>],
+        ep_config: &ExpertParallelConfig,
+    ) -> Result<(Vec<Vec<Tensor>>, EpDispatchMetadata), grim_tensor::error::Error> {
+        let num_tokens = indices.len();
+        let hidden_dim = x.shape().dims().last().copied().unwrap_or(0);
+        let world_size = ep_config.world_size.max(1);
+
+        let mut rank_dispatch_slots: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); world_size];
+
+        for t in 0..num_tokens {
+            for (k, &expert_id) in indices[t].iter().enumerate() {
+                let target_rank = ep_config.rank_for_expert(expert_id);
+                rank_dispatch_slots[target_rank].push((t, k, expert_id));
+            }
+        }
+
+        // Pack per-rank token tensors
+        let mut rank_tokens: Vec<Vec<Tensor>> = vec![Vec::new(); world_size];
+        for rank in 0..world_size {
+            for &(t, _k, _exp_id) in &rank_dispatch_slots[rank] {
+                let xt = slice_row(x, t)?;
+                rank_tokens[rank].push(xt);
+            }
+        }
+
+        let metadata = EpDispatchMetadata {
+            token_expert_indices: indices.to_vec(),
+            token_expert_weights: weights.to_vec(),
+            rank_dispatch_slots,
+            num_tokens,
+            hidden_dim,
+        };
+
+        Ok((rank_tokens, metadata))
+    }
+
+    /// Evaluates locally received token tensors using the local ExpertBank.
+    pub fn evaluate_local_experts(
+        local_experts: &ExpertBank,
+        ep_config: &ExpertParallelConfig,
+        incoming_tokens: &[Tensor],
+        incoming_slots: &[(usize, usize, usize)],
+    ) -> Result<Vec<Tensor>, grim_tensor::error::Error> {
+        let mut evaluated = Vec::with_capacity(incoming_tokens.len());
+        for (i, token_tensor) in incoming_tokens.iter().enumerate() {
+            let (_src_t, _src_k, expert_id) = incoming_slots[i];
+            let local_idx = if local_experts.gate.len() == ep_config.num_total_experts {
+                expert_id
+            } else {
+                ep_config
+                    .assigned_experts
+                    .iter()
+                    .position(|&e| e == expert_id)
+                    .unwrap_or(0)
+            };
+
+            let out = local_experts.expert_forward(local_idx, token_tensor)?;
+            evaluated.push(out);
+        }
+        Ok(evaluated)
+    }
+
+    /// Combines returned expert evaluation tensors back into the final [batch, hidden] output tensor.
+    pub fn combine_dispatched_results(
+        metadata: &EpDispatchMetadata,
+        returned_per_rank: &[Vec<Tensor>],
+        routed_scaling_factor: f32,
+        shared_expert_output: Option<&Tensor>,
+    ) -> Result<Tensor, grim_tensor::error::Error> {
+        let num_tokens = metadata.num_tokens;
+        let hidden_dim = metadata.hidden_dim;
+        let mut out_vec = vec![0.0f32; num_tokens * hidden_dim];
+
+        for (rank, returned) in returned_per_rank.iter().enumerate() {
+            let slots = &metadata.rank_dispatch_slots[rank];
+            for (i, token_out) in returned.iter().enumerate() {
+                let (token_idx, k_slot, _exp_id) = slots[i];
+                let weight = metadata.token_expert_weights[token_idx][k_slot];
+                let v = token_out.to_vec_f32()?;
+                let base = token_idx * hidden_dim;
+                for h in 0..hidden_dim {
+                    out_vec[base + h] += routed_scaling_factor * weight * v[h];
+                }
+            }
+        }
+
+        // Add shared expert contribution if present
+        if let Some(shared) = shared_expert_output {
+            let sv = shared.to_vec_f32()?;
+            for i in 0..out_vec.len() {
+                out_vec[i] += sv[i];
+            }
+        }
+
+        Ok(cpu_tensor(out_vec, Shape::new(vec![num_tokens, hidden_dim])))
     }
 }
 
@@ -3382,6 +3545,80 @@ mod tests {
                 "Mismatch at {i}: std {}, hybrid {}",
                 std_out[i],
                 hybrid_out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_expert_parallel_matches_monolithic_forward() {
+        let hidden = 4;
+        let inter = 8;
+        let num_experts = 4;
+        let top_k = 2;
+
+        let gate_weight = cpu_tensor(
+            vec![0.2; hidden * num_experts],
+            Shape::new(vec![num_experts, hidden]),
+        );
+        let gate_linear = Linear::from_tensor(gate_weight, None);
+        let router = MoeRouter::new(
+            gate_linear,
+            RouterKind::SoftmaxTopK,
+            top_k,
+            num_experts,
+            None,
+        );
+
+        let mut gate_layers = Vec::new();
+        let mut up_layers = Vec::new();
+        let mut down_layers = Vec::new();
+
+        for e in 0..num_experts {
+            let val = (e + 1) as f32 * 0.05;
+            gate_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])),
+                None,
+            ));
+            up_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; inter * hidden], Shape::new(vec![inter, hidden])),
+                None,
+            ));
+            down_layers.push(Linear::from_tensor(
+                cpu_tensor(vec![val; hidden * inter], Shape::new(vec![hidden, inter])),
+                None,
+            ));
+        }
+
+        let experts = ExpertBank {
+            gate: gate_layers,
+            up: up_layers,
+            down: down_layers,
+        };
+
+        let moe = MoeFfn::new(router, experts, None, 1.0);
+        let input = cpu_tensor(
+            vec![1.0, 0.5, -0.5, 2.0, 0.2, -1.0, 1.5, 0.8],
+            Shape::new(vec![2, hidden]),
+        );
+
+        // Reference monolithic forward
+        let ref_out = moe.forward(&input).unwrap().to_vec_f32().unwrap();
+
+        // 2-rank Expert Parallel forward
+        let ep_cfg = ExpertParallelConfig::uniform(0, 2, num_experts);
+        let ep_out = moe
+            .forward_expert_parallel(&input, &ep_cfg)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(ref_out.len(), ep_out.len());
+        for i in 0..ref_out.len() {
+            assert!(
+                (ref_out[i] - ep_out[i]).abs() < 1e-5,
+                "EP mismatch at index {i}: ref={}, ep={}",
+                ref_out[i],
+                ep_out[i]
             );
         }
     }

@@ -21,7 +21,7 @@
 //!   — all 8 tests PASS, including peer_status(0,1) symmetry and enable_peer_access(0,1)
 //!
 //! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test peer_access
-//! RESULT: 8/8 PASS. Verified on the dual-GPU RDNA4 box.
+//! RESULT: 8/8 PASS. Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29.
 
 use std::sync::Arc;
 
