@@ -2455,6 +2455,7 @@ dependencies = [
  "grim-core",
  "grim-tensor",
  "libc",
+ "libloading 0.8.9",
  "parking_lot",
  "tempfile",
  "thiserror 1.0.69",
