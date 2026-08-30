@@ -1,0 +1,35 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer Grad { float g[]; };
+layout(std430, binding = 1) readonly buffer SoftmaxOut { float s[]; };
+layout(std430, binding = 2) writeonly buffer Dx { float dx[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.size) return;
+
+    uint row = i / params.dim;
+    uint row_start = row * params.dim;
+    uint row_end = min(row_start + params.dim, params.size);
+
+    // Compute dot = Σ_j g_j * s_j for this row.
+    // Each thread walks its own row — correct first, fast later (subgroup
+    // reduction when row geometry is known-aligned).
+    float dot = 0.0;
+    for (uint j = row_start; j < row_end; ++j) {
+        dot += g[j] * s[j];
+    }
+
+    dx[i] = s[i] * (g[i] - dot);
+}
