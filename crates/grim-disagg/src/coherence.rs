@@ -38,9 +38,21 @@ impl InvalidationMsg {
             )));
         }
 
-        let prefix_hash = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let origin_node = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let timestamp = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+        let prefix_hash = u64::from_le_bytes(
+            buf[0..8]
+                .try_into()
+                .map_err(|e| Error::Config(format!("prefix_hash slice conversion: {e}")))?,
+        );
+        let origin_node = u32::from_le_bytes(
+            buf[8..12]
+                .try_into()
+                .map_err(|e| Error::Config(format!("origin_node slice conversion: {e}")))?,
+        );
+        let timestamp = u64::from_le_bytes(
+            buf[12..20]
+                .try_into()
+                .map_err(|e| Error::Config(format!("timestamp slice conversion: {e}")))?,
+        );
 
         Ok(Self {
             prefix_hash,
