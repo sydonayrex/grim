@@ -430,7 +430,7 @@ kernel void grim_embedding(
     constant int& embedding_dim [[buffer(3)]],
     constant int& num_indices [[buffer(4)]],
     uint idx [[thread_position_in_grid]]
-) {
+|) {
     int total = num_indices * embedding_dim;
     if (idx < uint(total)) {
         int token_idx = idx / embedding_dim;
@@ -438,6 +438,165 @@ kernel void grim_embedding(
 
         uint word_idx = indices[token_idx];
         out[idx] = weight[word_idx * embedding_dim + embed_offset];
+    }
+}
+
+// Reverse-mode autodiff for RMSNorm (warp-per-row).
+// dx[i] = (w[i]/rms)*g[i] - x[i] * (sum_j g[j]*w[j]*x[j]) / (row_len * rms^3)
+// dw[i] = sum_rows g[row,i] * (x[row,i] / rms)
+kernel void grim_rmsnorm_backward(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device const float* g [[buffer(2)]],
+    device float* dx [[buffer(3)]],
+    device float* dw [[buffer(4)]],
+    constant int& row_len [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    constant int& total [[buffer(7)]],
+    constant int& num_rows [[buffer(8)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    int warp_id = int(gid.y);
+    int lane = int(tid.y);
+    int rows = num_rows;
+    if (warp_id >= rows) return;
+    const device float* x_row = x + (size_t)warp_id * row_len;
+    const device float* g_row = g + (size_t)warp_id * row_len;
+    device float* dx_row = dx + (size_t)warp_id * row_len;
+    const uint shfl_mask = 0xffffffffu;
+
+    float ss = 0.0f;
+    float sum_gw = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        float xv = x_row[col];
+        float gv = g_row[col];
+        float wv = w[col];
+        ss += xv * xv;
+        sum_gw += gv * wv * xv;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += simd_xor(ss, off);
+        sum_gw += simd_xor(sum_gw, off);
+    }
+    float rms = sqrt(ss / (float)row_len + eps);
+    float rms_inv = 1.0f / rms;
+    float scale_sub = (sum_gw / (float)row_len) * (rms_inv * rms_inv * rms_inv);
+
+    for (int col = lane; col < row_len; col += 32) {
+        float xv = x_row[col];
+        float gv = g_row[col];
+        float wv = w[col];
+        dx_row[col] = (wv * rms_inv) * gv - xv * scale_sub;
+    }
+    // Accumulate dw: dw[i] += g[row, i] * (x[row, i] / rms)
+    // We do this per-row and atomically accumulate into dw[i].
+    // To avoid atomics per-element across rows, we do a two-pass:
+    // first compute local dw_contrib per row, then use atomics across rows.
+    // For simplicity (Metal native), we use atomics_add here.
+    for (int col = lane; col < row_len; col += 32) {
+        float xv = x_row[col];
+        float gv = g_row[col];
+        float contrib = gv * (xv * rms_inv);
+        atomic_add_explicit(&dw[col], contrib, memory_order_relaxed);
+    }
+}
+
+// Reverse-mode autodiff for Rotary Position Embedding (RoPE).
+// dx0 = g0*cos + g1*sin, dx1 = -g0*sin + g1*cos
+kernel void grim_rope_backward(
+    device const float* out_grad [[buffer(0)]],
+    device const float* cos_tab [[buffer(1)]],
+    device const float* sin_tab [[buffer(2)]],
+    device float* dx [[buffer(3)]],
+    constant int& half_dim [[buffer(4)]],
+    constant int& total_tokens [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int head_dim = half_dim * 2;
+    int total_pairs = (total_tokens * head_dim) / 2;
+    if (idx >= uint(total_pairs)) return;
+
+    int t = idx / half_dim;
+    int i = idx % half_dim;
+    int offset = t * head_dim;
+
+    float g0 = out_grad[offset + i];
+    float g1 = out_grad[offset + half_dim + i];
+    float c = cos_tab[i];
+    float s = sin_tab[i];
+
+    dx[offset + i] = g0 * c + g1 * s;
+    dx[offset + half_dim + i] = -g0 * s + g1 * c;
+}
+
+// Reverse-mode autodiff for Softmax.
+// dx_i = s_i * (g_i - sum_j g_j * s_j)
+kernel void grim_softmax_backward(
+    device const float* out_grad [[buffer(0)]],
+    device const float* s_out [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant int& row_len [[buffer(3)]],
+    constant int& total [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(total)) {
+        int row = idx / row_len;
+        int col = idx % row_len;
+
+        float max_val = -1e30f;
+        for (int j = 0; j < row_len; ++j) {
+            max_val = max(max_val, out_grad[(row * row_len) + j]);
+        }
+        float sum_g_s = 0.0f;
+        for (int j = 0; j < row_len; ++j) {
+            sum_g_s += out_grad[(row * row_len) + j] * s_out[(row * row_len) + j];
+        }
+
+        dx[idx] = s_out[idx] * (out_grad[idx] - sum_g_s);
+    }
+}
+
+// Scatter-add for embedding backward.
+// dweight[token_ids[t], :] += out_grad[t, :]
+// We need two passes: zero-fill dweight, then scatter-add.
+kernel void grim_embedding_scatter_add(
+    device const float* out_grad [[buffer(0)]],
+    device const uint* token_ids [[buffer(1)]],
+    device float* dweight [[buffer(2)]],
+    constant int& hidden_dim [[buffer(3)]],
+    constant int& num_tokens [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = num_tokens * hidden_dim;
+    if (idx < uint(total)) {
+        int t = idx / hidden_dim;
+        int h = idx % hidden_dim;
+        uint word_idx = token_ids[t];
+        float val = out_grad[idx];
+        atomic_add_explicit(&dweight[word_idx * hidden_dim + h], val, memory_order_relaxed);
+    }
+}
+
+// Zero-fill for embedding backward (dweight init).
+kernel void grim_embedding_zero_fill(
+    device float* dweight [[buffer(0)]],
+    constant int& size [[buffer(1)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(size)) {
+        dweight[idx] = 0.0f;
+    }
+}
+
+// Zero-fill for general use (used by embedding_backward's two-pass approach)
+kernel void grim_zeros_f32(
+    device float* out [[buffer(0)]],
+    constant int& size [[buffer(1)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(size)) {
+        out[idx] = 0.0f;
     }
 }
 
@@ -1819,6 +1978,48 @@ kernel void grim_fused_linear_ce(
         float lse = s_max + log(max(s_sum, 1e-8f));
         loss_out[row] = lse - s_target;
         lse_out[row] = lse;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// On-Device Fused Linear Cross-Entropy Backward Pass
+// ---------------------------------------------------------------------------
+kernel void grim_fused_linear_ce_backward(
+    device const float* hidden [[buffer(0)]],
+    device const float* lm_head [[buffer(1)]],
+    device const uint* targets [[buffer(2)]],
+    device const float* lse [[buffer(3)]],
+    device float* grad_h [[buffer(4)]],
+    constant int& hidden_dim [[buffer(5)]],
+    constant int& vocab_size [[buffer(6)]],
+    constant int& v_tile_size [[buffer(7)]],
+    constant float& inv_batch [[buffer(8)]],
+    constant int& batch [[buffer(9)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (int(row) >= batch) return;
+
+    int tid = thread_position_in_threadgroup;
+    int bdim = threads_per_threadgroup;
+    int target = targets[row];
+    float lse_row = lse[row];
+
+    for (int d = tid; d < int(hidden_dim); d += int(bdim)) {
+        grad_h[row * hidden_dim + d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int v = 0; v < int(vocab_size); ++v) {
+        float logit = 0.0f;
+        int h_base = int(row) * hidden_dim;
+        int w_base = v * hidden_dim;
+        for (int d = 0; d < int(hidden_dim); ++d) {
+            logit += hidden[h_base + d] * lm_head[w_base + d];
+        }
+        float dl = (exp(logit - lse_row) - (v == target ? 1.0f : 0.0f)) * inv_batch;
+        for (int d = tid; d < int(hidden_dim); d += int(bdim)) {
+            atomic_add(&grad_h[row * hidden_dim + d], dl * lm_head[w_base + d]);
+        }
     }
 }
 
