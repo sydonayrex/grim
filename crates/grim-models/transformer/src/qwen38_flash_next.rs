@@ -1148,9 +1148,11 @@ mod tests {
 
         let shard_path = Path::new("../../../models/qwen3.8-model-00001-of-00131.safetensors");
         if !shard_path.exists() {
-            // If running in a context where full 992MB model shard is not mounted, skip gracefully
+            println!("[SKIP] test_qwen38_real_disk_safetensor_shard_numerics: '{}' not present in environment", shard_path.display());
             return;
         }
+
+        println!("[EXEC] test_qwen38_real_disk_safetensor_shard_numerics: reading real 992MB shard '{}'", shard_path.display());
 
         let provider = SafetensorsProvider::open(shard_path.to_str().unwrap())
             .expect("Must open real 992MB Qwen 3.8 safetensors shard");
