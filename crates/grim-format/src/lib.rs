@@ -1,6 +1,7 @@
 //! Model checkpoint parsers, tokenizers, metadata headers, and format converters (.gguf, .safetensors, .grim).
 
 pub mod awq;
+pub mod bank;
 pub mod bolt_on;
 pub mod convert;
 /// Fusion-pattern detection over checkpoint tensor names (folded in from

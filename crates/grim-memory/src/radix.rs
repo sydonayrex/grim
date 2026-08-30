@@ -85,6 +85,13 @@ impl RadixTree {
         (matched, offset)
     }
 
+    /// Walk from the root, returning matched blocks, full token count, and whether blending is available.
+    pub fn match_prefix_blending(&self, tokens: &[u32]) -> (Vec<usize>, usize, bool) {
+        let (matched, full_tokens) = self.match_prefix(tokens);
+        let blended = full_tokens < tokens.len() && !matched.is_empty();
+        (matched, full_tokens, blended)
+    }
+
     /// Walk from the root, returning the matched physical blocks, token count,
     /// and the deepest valid `recurrent_state_id` anchored along the matched path.
     pub fn match_prefix_with_anchor(&self, tokens: &[u32]) -> (Vec<usize>, usize, Option<usize>) {

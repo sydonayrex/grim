@@ -321,6 +321,113 @@ impl LruResidencyTracker {
     }
 }
 
+/// Time duration range in milliseconds representing a streaming pipeline interval.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeRange {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl TimeRange {
+    /// Whether two time ranges overlap.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+
+    /// Total duration.
+    pub fn duration(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+}
+
+/// Expert buffer slot in a ping-pong double buffering system.
+#[derive(Debug, Clone)]
+pub struct ExpertSlotBuffer {
+    pub layer_id: usize,
+    pub resident_experts: Vec<usize>,
+}
+
+/// Double-buffered offloaded MoE cache supporting PCIe-GEMM overlap (FreeToken).
+pub struct OffloadMoeCache {
+    /// Whether prefill overlap is active.
+    pub prefill_overlap: bool,
+    /// Number of expert slots per buffer.
+    pub slots_per_buffer: usize,
+    /// Dual ping-pong buffers.
+    pub buffers: [ExpertSlotBuffer; 2],
+    /// Simulated timeline tracking for pipeline scheduling.
+    last_gemm_end: std::sync::atomic::AtomicU64,
+    last_load_end: std::sync::atomic::AtomicU64,
+}
+
+impl OffloadMoeCache {
+    /// Creates a new double-buffered offload MoE cache.
+    pub fn new(prefill_overlap: bool, slots_per_buffer: usize) -> Self {
+        Self {
+            prefill_overlap,
+            slots_per_buffer,
+            buffers: [
+                ExpertSlotBuffer {
+                    layer_id: usize::MAX,
+                    resident_experts: Vec::new(),
+                },
+                ExpertSlotBuffer {
+                    layer_id: usize::MAX,
+                    resident_experts: Vec::new(),
+                },
+            ],
+            last_gemm_end: std::sync::atomic::AtomicU64::new(0),
+            last_load_end: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether overlap is enabled.
+    pub fn is_overlap_enabled(&self) -> bool {
+        self.prefill_overlap
+    }
+
+    /// Schedule a layer's asynchronous load and GEMM execution returning their (Load, GEMM) time intervals.
+    pub fn schedule_layer(&self, _layer: usize, experts: &[usize]) -> (TimeRange, TimeRange) {
+        let load_duration = (experts.len() as f64) * 1.5; // Simulated DMA load duration
+        let gemm_duration = (experts.len() as f64) * 2.0; // Simulated GEMM compute duration
+
+        if self.prefill_overlap {
+            let last_load = (self.last_load_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
+            let last_gemm = (self.last_gemm_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
+
+            // Load can start as soon as the previous load finishes
+            let load_start = last_load;
+            let load_end = load_start + load_duration;
+
+            // GEMM can start only after its own load finishes AND the previous GEMM finishes
+            let gemm_start = load_end.max(last_gemm);
+            let gemm_end = gemm_start + gemm_duration;
+
+            self.last_load_end.store((load_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
+            self.last_gemm_end.store((gemm_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
+
+            (
+                TimeRange { start: load_start, end: load_end },
+                TimeRange { start: gemm_start, end: gemm_end },
+            )
+        } else {
+            let last_end = (self.last_gemm_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
+            let load_start = last_end;
+            let load_end = load_start + load_duration;
+            let gemm_start = load_end;
+            let gemm_end = gemm_start + gemm_duration;
+
+            self.last_load_end.store((load_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
+            self.last_gemm_end.store((gemm_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
+
+            (
+                TimeRange { start: load_start, end: load_end },
+                TimeRange { start: gemm_start, end: gemm_end },
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -447,6 +447,11 @@ impl KvBlockPool {
         Ok((all_blocks, matched_tokens))
     }
 
+    /// Match prefix tokens returning matched blocks, full token count, and whether blending is available.
+    pub fn match_prefix_blending(&self, tokens: &[u32]) -> (Vec<BlockId>, usize, bool) {
+        self.prefix_tree.match_prefix_blending(tokens)
+    }
+
     /// SSM State Pool management (§5.1): Retrieve a state vector by request ID.
     pub fn get_ssm_state(&self, request_id: u32) -> Option<&Vec<f32>> {
         self.ssm_states.get(&request_id)

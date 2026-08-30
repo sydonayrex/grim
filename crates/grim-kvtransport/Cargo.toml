@@ -13,6 +13,7 @@ grim-core = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 libc = "0.2"
+libloading = "0.8"
 
 
 [dev-dependencies]

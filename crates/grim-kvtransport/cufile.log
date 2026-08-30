@@ -1,0 +1,51 @@
+ 30-08-2026 11:00:55:814 [pid=2083535 tid=2083538] WARN   0:140 unable to load,  liburcu-bp.so.6 
+
+ 30-08-2026 11:00:55:815 [pid=2083535 tid=2083538] WARN   0:140 unable to load,  liburcu-bp.so.1 
+
+ 30-08-2026 11:00:55:815 [pid=2083535 tid=2083538] WARN   0:184 failed to open /proc/driver/nvidia-fs/devcount  error: No such file or directory
+ 30-08-2026 11:00:55:815 [pid=2083535 tid=2083538] NOTICE  cufio-drv:1160 running in compatible mode
+ 30-08-2026 11:00:55:815 [pid=2083535 tid=2083538] WARN   0:81 cannot find json field: properties.gpu_bounce_buffer_slab_config.slab_size_kb 0 3
+ 30-08-2026 11:00:55:815 [pid=2083535 tid=2083538] WARN   0:488 Using legacy GPU bounce buffer configuration
+ 30-08-2026 11:00:56:490 [pid=2083535 tid=2083538] NOTICE  cufio-drv:938 GPU deviceid: 0 ( NVIDIA GeForce RTX 4070 Laptop GPU ) no native GDS - compat mode only
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083538] ERROR  cufio:222 cuFileHandleregister error, invalid api arguments
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083538] ERROR  cufio:363 cuFileHandleRegister error: invalid arguments
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083537] ERROR  cufio:222 cuFileHandleregister error, invalid api arguments
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083538] ERROR  cufio:395 cuFile fh 5022 not present in file hashtable
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083537] ERROR  cufio:363 cuFileHandleRegister error: invalid arguments
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083537] ERROR  cufio_core:3684 cuFile error issuing IO, file descriptor is not registered
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083537] ERROR  cufio_core:3873 cuFileWrite invalid parameters file descriptor is not registered fd 0 offset 172032 length 4096 bufOff 0 devPtr 0x7f0b8c000e90
+ 30-08-2026 11:00:56:692 [pid=2083535 tid=2083537] ERROR  cufio:395 cuFile fh 5022 not present in file hashtable
+ 30-08-2026 11:01:14:340 [pid=2084149 tid=2084152] WARN   0:140 unable to load,  liburcu-bp.so.6 
+
+ 30-08-2026 11:01:14:341 [pid=2084149 tid=2084152] WARN   0:140 unable to load,  liburcu-bp.so.1 
+
+ 30-08-2026 11:01:14:341 [pid=2084149 tid=2084152] WARN   0:184 failed to open /proc/driver/nvidia-fs/devcount  error: No such file or directory
+ 30-08-2026 11:01:14:341 [pid=2084149 tid=2084152] NOTICE  cufio-drv:1160 running in compatible mode
+ 30-08-2026 11:01:14:341 [pid=2084149 tid=2084152] WARN   0:81 cannot find json field: properties.gpu_bounce_buffer_slab_config.slab_size_kb 0 3
+ 30-08-2026 11:01:14:341 [pid=2084149 tid=2084152] WARN   0:488 Using legacy GPU bounce buffer configuration
+ 30-08-2026 11:01:15:36 [pid=2084149 tid=2084152] NOTICE  cufio-drv:938 GPU deviceid: 0 ( NVIDIA GeForce RTX 4070 Laptop GPU ) no native GDS - compat mode only
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084152] ERROR  cufio:222 cuFileHandleregister error, invalid api arguments
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084152] ERROR  cufio:363 cuFileHandleRegister error: invalid arguments
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084151] ERROR  cufio:222 cuFileHandleregister error, invalid api arguments
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084151] ERROR  cufio:363 cuFileHandleRegister error: invalid arguments
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084152] ERROR  cufio:395 cuFile fh 5022 not present in file hashtable
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084151] ERROR  cufio_core:3684 cuFile error issuing IO, file descriptor is not registered
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084151] ERROR  cufio_core:3873 cuFileWrite invalid parameters file descriptor is not registered fd 0 offset 172032 length 4096 bufOff 0 devPtr 0x7f5638000eb0
+ 30-08-2026 11:01:15:238 [pid=2084149 tid=2084151] ERROR  cufio:395 cuFile fh 5022 not present in file hashtable
+ 30-08-2026 11:05:47:347 [pid=2096267 tid=2096269] WARN   0:140 unable to load,  liburcu-bp.so.6 
+
+ 30-08-2026 11:05:47:347 [pid=2096267 tid=2096269] WARN   0:140 unable to load,  liburcu-bp.so.1 
+
+ 30-08-2026 11:05:47:347 [pid=2096267 tid=2096269] WARN   0:184 failed to open /proc/driver/nvidia-fs/devcount  error: No such file or directory
+ 30-08-2026 11:05:47:347 [pid=2096267 tid=2096269] NOTICE  cufio-drv:1160 running in compatible mode
+ 30-08-2026 11:05:47:358 [pid=2096267 tid=2096269] WARN   0:81 cannot find json field: properties.gpu_bounce_buffer_slab_config.slab_size_kb 0 3
+ 30-08-2026 11:05:47:358 [pid=2096267 tid=2096269] WARN   0:488 Using legacy GPU bounce buffer configuration
+ 30-08-2026 11:05:48:66 [pid=2096267 tid=2096269] NOTICE  cufio-drv:938 GPU deviceid: 0 ( NVIDIA GeForce RTX 4070 Laptop GPU ) no native GDS - compat mode only
+ 30-08-2026 11:05:48:267 [pid=2096267 tid=2096269] ERROR  cufio:222 cuFileHandleregister error, invalid api arguments
+ 30-08-2026 11:05:48:267 [pid=2096267 tid=2096269] ERROR  cufio:363 cuFileHandleRegister error: invalid arguments
+ 30-08-2026 11:05:48:267 [pid=2096267 tid=2096270] ERROR  cufio:222 cuFileHandleregister error, invalid api arguments
+ 30-08-2026 11:05:48:267 [pid=2096267 tid=2096270] ERROR  cufio:363 cuFileHandleRegister error: invalid arguments
+ 30-08-2026 11:05:48:267 [pid=2096267 tid=2096269] ERROR  cufio_core:3684 cuFile error issuing IO, file descriptor is not registered
+ 30-08-2026 11:05:48:267 [pid=2096267 tid=2096269] ERROR  cufio_core:3873 cuFileWrite invalid parameters file descriptor is not registered fd 0 offset 172032 length 4096 bufOff 0 devPtr 0x7fbca80c76c0
+ 30-08-2026 11:05:48:268 [pid=2096267 tid=2096270] ERROR  cufio:395 cuFile fh 5022 not present in file hashtable
+ 30-08-2026 11:05:48:268 [pid=2096267 tid=2096269] ERROR  cufio:395 cuFile fh 5022 not present in file hashtable

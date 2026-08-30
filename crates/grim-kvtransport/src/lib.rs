@@ -19,6 +19,12 @@ pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};
 pub mod pin_lease;
 pub use pin_lease::{LeaseStatus, PinLeaseMonitor, PinnedLease, SharedPinLeaseMonitor};
 
+pub mod gds_ffi;
+pub use gds_ffi::{HipFileHandle, HipFileLib};
+
+pub mod gds;
+pub use gds::GdsTier;
+
 pub type BlockId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
