@@ -158,6 +158,8 @@ fn kernels() -> Vec<(&'static str, String)> {
             "cooperative_matrix_gemm",
             load_kernel("cooperative_matrix_gemm"),
         ),
+        ("charon_backward", load_kernel("charon_backward")),
+        ("moe_mega_kernel", load_kernel("moe_mega_kernel")),
     ]
 }
 
@@ -265,6 +267,8 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/qkv_attention_paged_dequant.comp");
     println!("cargo:rerun-if-changed=kernels/speculative_acceptor.comp");
     println!("cargo:rerun-if-changed=kernels/cooperative_matrix_gemm.comp");
+    println!("cargo:rerun-if-changed=kernels/charon_backward.comp");
+    println!("cargo:rerun-if-changed=kernels/moe_mega_kernel.comp");
     println!("cargo:rerun-if-changed=kernels/rerope.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
