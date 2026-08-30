@@ -24,6 +24,7 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("mul", load_kernel("mul")),
         ("silu_mul", load_kernel("silu_mul")),
         ("rms_norm", load_kernel("rms_norm")),
+        ("rmsnorm_backward", load_kernel("rmsnorm_backward")),
         ("add_rms_norm", load_kernel("add_rms_norm")),
         ("softmax", load_kernel("softmax")),
         ("softmax_backward", load_kernel("softmax_backward")),
@@ -180,6 +181,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/mul.comp");
     println!("cargo:rerun-if-changed=kernels/silu_mul.comp");
     println!("cargo:rerun-if-changed=kernels/rms_norm.comp");
+    println!("cargo:rerun-if-changed=kernels/rmsnorm_backward.comp");
     println!("cargo:rerun-if-changed=kernels/softmax.comp");
     println!("cargo:rerun-if-changed=kernels/softmax_backward.comp");
     println!("cargo:rerun-if-changed=kernels/embedding.comp");
