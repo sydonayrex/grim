@@ -414,5 +414,11 @@ mod tests {
         for &tok in &tokens {
             assert!(tok < 128);
         }
+
+        // Verify that the trunk forward pass populated the real contextual hidden state in session
+        let trunk_last_h = session.get_last_hidden_state();
+        assert!(trunk_last_h.is_some(), "trunk forward must populate session.last_hidden_state");
+        let h_dims = trunk_last_h.unwrap().shape().dims().to_vec();
+        assert_eq!(h_dims, vec![2, 64]);
     }
 }
