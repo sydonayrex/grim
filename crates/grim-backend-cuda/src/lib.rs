@@ -15,9 +15,15 @@
 pub mod autotune;
 pub mod caps;
 pub mod device;
+pub mod fsdp;
 pub mod graph_capture;
 pub mod kernels;
 pub mod memory;
+pub mod nccl;
+
+pub use fsdp::{ConsumerDpConfig, ConsumerDpGroup, ConsumerFsdpConfig, ConsumerFsdpGroup, ConsumerZeroPlanner};
+pub use device::parallel_comm::{CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology};
+pub use nccl::{CudaComm, UniqueId};
 
 #[cfg(test)]
 mod device_tests;
