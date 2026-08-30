@@ -52,10 +52,12 @@ impl MtpLayer {
     /// Load an MTP stage from checkpoint weight source.
     ///
     /// # Contract
-    /// Fails loudly if `proj`, `norm`, or `lm_head` are not found in the checkpoint.
+    /// Fails loudly if MTP projection layers or LM head are not found in the checkpoint.
     pub fn load(ws: &WeightSource<'_>, hidden_size: usize, vocab_size: usize, eps: f32) -> Result<Self> {
-        let proj = Linear::load_shape(&ws.scoped("proj"), [hidden_size * 2, hidden_size])?;
-        let norm = RmsNorm::load(&ws.scoped("norm"), hidden_size, eps)?;
+        let proj = Linear::load_shape(&ws.scoped("fc_hidden"), [hidden_size, hidden_size])
+            .or_else(|_| Linear::load_shape(&ws.scoped("proj"), [hidden_size * 2, hidden_size]))?;
+        let norm = RmsNorm::load(&ws.scoped("pre_fc_norm_hidden"), hidden_size, eps)
+            .or_else(|_| RmsNorm::load(&ws.scoped("norm"), hidden_size, eps))?;
         let lm_head = Linear::load_shape(&ws.scoped("lm_head"), [hidden_size, vocab_size])?;
         Ok(Self {
             proj,
