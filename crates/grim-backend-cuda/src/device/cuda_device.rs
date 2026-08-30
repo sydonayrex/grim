@@ -2554,6 +2554,29 @@ impl AttentionOps for CudaDevice {
             }),
         ))
     }
+
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )
+    }
 }
 
 impl FusionOps for CudaDevice {
