@@ -4671,6 +4671,57 @@ impl AutogradOps for VulkanDevice {
     }
 }
 
+impl VulkanDevice {
+    /// Log-softmax VJP: `dx_i = exp(log_p_i) * (g_i - Σ_j g_j)` per row.
+    ///
+    /// GPU-resident dispatch via `VulkanKernel::LogSoftmaxVjp`. Used by the
+    /// DPO/GRPO/SIMPO preference-optimization backward pass where the
+    /// log-probability gradient flows through a softmax-like reduction.
+    pub fn log_softmax_vjp(
+        &self,
+        out_grad: &dyn BackendStorage,
+        log_probs: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let g_s = out_grad
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan log_softmax_vjp: grad is not VulkanStorage".into()))?;
+        let lp_s = log_probs
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan log_softmax_vjp: log_probs is not VulkanStorage".into()))?;
+
+        let total = out_shape.elem_count();
+        let row_len = out_shape.dims().last().copied().unwrap_or(1).max(1);
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let dx = VulkanStorage::alloc_device_local_gpu(
+            out_shape, DType::F32, ctx.device, ctx.physical_device,
+        )?;
+
+        let buffers = [g_s.buffer, lp_s.buffer, dx.buffer];
+        let grid_x = total.div_ceil(256) as u32;
+        let push = push_params(total as u32, row_len as u32, 0, 0, 0, 0.0);
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::LogSoftmaxVjp,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )?;
+
+        Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+}
+
 impl OptimizerOps for VulkanDevice {
 
 
@@ -6107,6 +6158,7 @@ pub enum VulkanKernel {
     FusedDequantGemmQ6K,
     FusedDequantGemmQ80,
     FusedDequantGemmIQ4NL,
+    LogSoftmaxVjp,
     FusedDequantGemmIQ4XS,
     FusedDequantGemmIQ3XXS,
     FusedDequantGemmIQ3S,
@@ -6213,6 +6265,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::FusedDequantGemmFp8E4M3 => SPIRV_FUSED_DEQUANT_GEMM_FP8_E4M3,
         VulkanKernel::FusedDequantGemmMxFp4 => SPIRV_FUSED_DEQUANT_GEMM_MXFP4,
         VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
+        VulkanKernel::LogSoftmaxVjp => SPIRV_LOG_SOFTMAX_VJP,
         VulkanKernel::SelectiveScan => SPIRV_SELECTIVE_SCAN,
         VulkanKernel::QkvAttentionPaged => SPIRV_QKV_ATTENTION_PAGED,
         VulkanKernel::QkvAttentionPagedSwa => SPIRV_QKV_ATTENTION_PAGED_SWA,
@@ -6289,7 +6342,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::SiluMulBackward
         | VulkanKernel::SoftmaxBackward
         | VulkanKernel::EmbeddingBackward
-        | VulkanKernel::RingAllReduce => 3,
+        | VulkanKernel::RingAllReduce
+        | VulkanKernel::LogSoftmaxVjp => 3,
         VulkanKernel::Sub => 3,
         VulkanKernel::AddScalar
         | VulkanKernel::SubScalar
