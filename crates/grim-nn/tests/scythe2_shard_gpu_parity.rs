@@ -9,7 +9,7 @@
 //!
 //! Device-gated: `GRIM_GPU_TEST=1`, requires ≥2 visible ROCm devices.
 //!
-//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-29.
+//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-30.
 
 use grim_nn::scythe2::Scythe2Linear;
 use grim_tensor::backend::ScythePlacement;

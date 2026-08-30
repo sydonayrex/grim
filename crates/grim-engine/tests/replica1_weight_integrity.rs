@@ -4,6 +4,8 @@
 //! host-side `grim_quant::dequant_q4k` of the same GGUF tensor.
 //!
 //! Device-gated (needs ≥2 HIP devices): GRIM_GPU_TEST=1.
+//!
+//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-30
 
 use grim_engine::model_loader::{load_from_path_on_device, load_model_from_gguf};
 use grim_models_transformer::Lfm2;
