@@ -71,6 +71,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::compressed_gemm::WEIGHT_NA16_KERNEL);
     s.push_str(crate::kernels::compressed_gemm::EMBEDDING_NA16_INT_KERNEL);
     s.push_str(crate::kernels::compressed_gemm::W8A8_GEMM_KERNEL);
+    s.push_str(crate::kernels::moe_mega_kernel::MOE_MEGA_KERNEL_SOURCE);
     s
 }
 

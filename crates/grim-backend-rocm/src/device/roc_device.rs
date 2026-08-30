@@ -6785,6 +6785,143 @@ impl RocmDevice {
         Ok((out_storage, RocmHandle::new(Some(stream))))
     }
 
+    /// Launches the MoE fused comm-compute mega-kernel (UniEP persistent SM model).
+    pub fn launch_moe_mega_dispatch(
+        &self,
+        activations: &RocmStorage,
+        expert_gate_w_ptr: u64,
+        expert_up_w_ptr: u64,
+        expert_down_w_ptr: u64,
+        destination_slots: &[u32],
+        global_offsets: &[u32],
+        expert_counts: &[u32],
+        router_tokens: &[u32],
+        router_experts: &[u32],
+        router_weights: &[f32],
+        scoreboard_arrivals: &[u32],
+        scoreboard_ready: &[u32],
+        out_storage: &RocmStorage,
+        config: &crate::kernels::moe_mega_kernel::MoeMegaLaunchConfig,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("moe_mega_dispatch: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("moe_mega_dispatch: out has no device ptr".into()))?;
+
+        crate::kernels::moe_mega_kernel::validate_mega_kernel_inputs(
+            a_ptr as *mut c_void,
+            expert_gate_w_ptr as *mut c_void,
+            expert_up_w_ptr as *mut c_void,
+            expert_down_w_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            config,
+        )?;
+
+        check_hip("moe_mega hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        let mut dest_slots_ptr = upload_device_buffer(self.ordinal, destination_slots)?;
+        let mut offsets_ptr = upload_device_buffer(self.ordinal, global_offsets)?;
+        let mut counts_ptr = upload_device_buffer(self.ordinal, expert_counts)?;
+        let mut tokens_ptr = upload_device_buffer(self.ordinal, router_tokens)?;
+        let mut experts_ptr = upload_device_buffer(self.ordinal, router_experts)?;
+        let mut weights_ptr = upload_device_buffer(self.ordinal, router_weights)?;
+        let mut arrivals_ptr = upload_device_buffer(self.ordinal, scoreboard_arrivals)?;
+        let mut ready_ptr = upload_device_buffer(self.ordinal, scoreboard_ready)?;
+        let mut cursor_ptr = upload_device_buffer(self.ordinal, &[0u32])?;
+
+        let packed_elem_count = config.total_routed_instances * config.hidden;
+        let zero_act = vec![0.0f32; packed_elem_count.max(1)];
+        let zero_out = vec![0.0f32; packed_elem_count.max(1)];
+        let mut packed_act_ptr = upload_device_buffer(self.ordinal, &zero_act)?;
+        let mut packed_out_ptr = upload_device_buffer(self.ordinal, &zero_out)?;
+
+        let grid_dim = HipDim3::new(config.num_sm_blocks as u32, 1, 1);
+        let block_dim = HipDim3::new(config.block_threads as u32, 1, 1);
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = expert_gate_w_ptr as *mut c_void;
+        let mut uw = expert_up_w_ptr as *mut c_void;
+        let mut dw = expert_down_w_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut batch_i = config.batch as i32;
+        let mut hidden_i = config.hidden as i32;
+        let mut inter_i = config.inter as i32;
+        let mut num_exp_i = config.num_experts as i32;
+        let mut top_k_i = config.top_k as i32;
+        let mut total_routed_i = config.total_routed_instances as i32;
+        let mut tile_size_i = config.tile_size as i32;
+        let mut num_tiles_i = config.num_tiles as i32;
+        let mut n_comm_i = config.n_comm_tasks as i32;
+        let mut n_comp_i = config.n_comp_tasks as i32;
+        let mut n_relay_i = config.n_relay_tasks as i32;
+        let mut rsf = config.routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_mega_kernel",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut dest_slots_ptr),
+                arg(&mut offsets_ptr),
+                arg(&mut counts_ptr),
+                arg(&mut tokens_ptr),
+                arg(&mut experts_ptr),
+                arg(&mut weights_ptr),
+                arg(&mut arrivals_ptr),
+                arg(&mut ready_ptr),
+                arg(&mut cursor_ptr),
+                arg(&mut packed_act_ptr),
+                arg(&mut packed_out_ptr),
+                arg(&mut optr),
+                arg(&mut batch_i),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_exp_i),
+                arg(&mut top_k_i),
+                arg(&mut total_routed_i),
+                arg(&mut tile_size_i),
+                arg(&mut num_tiles_i),
+                arg(&mut n_comm_i),
+                arg(&mut n_comp_i),
+                arg(&mut n_relay_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                hipFree(dest_slots_ptr);
+                hipFree(offsets_ptr);
+                hipFree(counts_ptr);
+                hipFree(tokens_ptr);
+                hipFree(experts_ptr);
+                hipFree(weights_ptr);
+                hipFree(arrivals_ptr);
+                hipFree(ready_ptr);
+                hipFree(cursor_ptr);
+                hipFree(packed_act_ptr);
+                hipFree(packed_out_ptr);
+                if sync != hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "moe_mega hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+            }
+        }
+        Ok(stream)
+    }
+
     /// Fused grouped MoE dispatch for CompressedTensors W8A8 INT8.
     pub fn moe_fused_grouped_dispatch_w8a8_int8(
         &self,
