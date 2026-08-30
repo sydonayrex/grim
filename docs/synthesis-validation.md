@@ -282,20 +282,41 @@ Fused the deterministic dispatch into `MoeFfn::forward` behind the
 The packing is what enables a fused comm-compute mega-kernel on GPU; on CPU it
 is a correctness-equivalent reorganization proven identical to the reference.
 
-### R3 — VPP virtual-stage traversal ⏸ DEFERRED
+### R3 — VPP virtual-stage traversal ✅ IMPLEMENTED (planner + forward)
 
-`PipelinePlan` is static layer partitioning (Megatron-style), not VPP's
-V-shaped fold-back traversal with async bidirectional comm. The real VPP
-mechanism — chunk `k` visiting virtual stages `{s0,s1,s2,s3}` in a V, async
-send/recv at fold points, pipelined drain-window packing — is not present.
-**Recommendation:** after R1, implement the V-traversal as a
-`PipelinePlan::virtual_stage_traversal(chunks, num_ranks)` returning the
-per-chunk stage schedule, then reuse the existing `grim-kvtransport` async
-primitives for fold-point handoffs. Benchmark bubble ratio on long-context
-prefill before claiming improvement.
+The V-shaped fold-back planner and execution path are implemented in
+`pipeline_engine.rs`:
 
-### R5 — Disaggregated attention/FFN placement ⏸ DEFERRED (lowest priority)
+- `VirtualPipelinePlan::plan(total_layers, num_physical_ranks, device_ordinals)`
+  partitions $L$ layers into $2N$ virtual stages mapped onto $N$ physical ranks
+  with V-fold rank assignment (rank $r$ hosts virtual stages $s_r$ and
+  $s_{2N-1-r}$). `stages_for_rank(r)` returns the pair.
+- `VirtualPipelineCoordinator::forward_vpp(initial_input, layer_forward_fn)`
+  executes the full V-traversal sequence across all virtual stages.
 
-Not implemented. DisagMoE's disaggregation assumes datacenter multi-node EP;
-grim targets single-node consumer GPU. **Recommendation:** revisit only if
-multi-GPU consumer configs become a real deployment target.
+**Tests:** `test_virtual_pipeline_plan_fold_back_mapping` verifies the
+fold-back layer/rank mapping (8 layers / 2 ranks → 4 virtual stages with
+correct head/fold/tail classification); `test_virtual_pipeline_forward_vpp_equivalence`
+runs `forward_vpp` through a 4-layer toy model and asserts correct output.
+
+**Honest gap:** this is the VPP *planner and the single-node forward* that
+drives it. The multi-rank execution (async bidirectional comm at fold points
+via `grim-kvtransport`, pipelined drain-window packing across requests, and the
+bubble-ratio benchmark that the synthesis cites — 98% reduction on 512K
+prefill) is NOT wired. The planner is real and tested; production multi-rank
+VPP is the follow-up that needs the cross-rank transport + the benchmark
+before claiming the throughput number.
+
+### R5 — Disaggregated attention/FFN placement ✅ IMPLEMENTED (advisor)
+
+DisagMoE's *execution* (cross-node attention/FFN GPU groups with asymmetric
+bandwidth) is datacenter-scoped and mismatched to grim's single-node consumer
+target — so it is NOT built. The *analytical core* IS portable and useful:
+`grim_core::disagg_placement::advise_placement` computes a compute-communication
+roofline and recommends `CoLocated` vs `Disaggregated` (with bandwidth split)
+for a model + GPU set. For all realistic consumer configs it correctly returns
+`CoLocated` (FFN matmul is compute-bound); the `Disaggregated` branch is
+reachable only at extreme bandwidth deficit (the datacenter regime). Unit-tested:
+`consumer_configs_are_colocated`, `disaggregation_reachable_only_at_extreme_bandwidth_deficit`,
+plus `bandwidth_split`/`validate`. grim's placement controller can consume
+these hints when laying out MoE layers across consumer multi-GPU boxes.
