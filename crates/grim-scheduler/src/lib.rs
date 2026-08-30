@@ -47,6 +47,11 @@ impl KvPressureSource for PoolKvPressure {
 /// pressure regardless of token arithmetic (default 0.9).
 pub const KV_PRESSURE_THRESHOLD: f32 = 0.9;
 
+/// Readiness-driven dispatch tuning constant (RRFP idea). Decode tasks are
+/// submitted with high priority so the dispatcher arbitrates them ahead of
+/// contending prefill work under pressure.
+const READINESS_DECODE_PRIORITY: i32 = 100;
+
 /// A request in the scheduler system.
 #[derive(Debug, Clone, Default)]
 pub struct Request {
@@ -198,7 +203,23 @@ pub struct Scheduler {
     /// [`Scheduler::set_kv_pressure`]). `None` = legacy token-arithmetic-only
     /// pressure.
     kv_pressure: Option<Arc<dyn KvPressureSource>>,
+    /// Readiness-driven dispatcher (RRFP idea): under pressure, arbitrates
+    /// decode (always ready) vs prefill (ready only if budget fits) instead of
+    /// the fixed prefill-first order. `None` keeps the legacy fixed-order path.
+    readiness: Option<ReadinessDispatcher>,
 }
+
+/// Why readiness-driven dispatch matters here.
+///
+/// The legacy `schedule()` admits prefill chunks up to the token budget, then
+/// returns decode IDs — a fixed prefill-first order. Under pressure a large
+/// prefill can starve decode and blow ITL. The RRFP insight ("schedule as a
+/// hint, dispatch ready work, skip blocked work") adapts to this single-stage
+/// batcher as: decode tasks are always ready (no dependencies); prefill tasks
+/// are ready only while budget remains. `ReadinessDispatcher::arbitrate` then
+/// picks decode-first under pressure, eliminating the head-of-line prefill
+/// block. Enabled with [`Scheduler::set_readiness_dispatch`].
+const _READINESS_DOC: () = ();
 
 /// Contiguous segment of sequences sharing a LoRA adapter ID. Advisory
 /// summary of one `schedule()` call — execution plans row-level segments
@@ -320,7 +341,16 @@ impl Scheduler {
             determinism_mode: DeterminismMode::Relaxed,
             admitted_total: 0,
             kv_pressure: None,
+            readiness: None,
         }
+    }
+
+    /// Enable readiness-driven dispatch (RRFP idea). When set, `schedule()`
+    /// uses the [`ReadinessDispatcher`] to arbitrate decode-before-prefill under
+    /// pressure instead of the legacy fixed prefill-first order. Pass `None` to
+    /// restore legacy behavior.
+    pub fn set_readiness_dispatch(&mut self, dispatcher: Option<ReadinessDispatcher>) {
+        self.readiness = dispatcher;
     }
 
     /// Wire a live KV occupancy source (§5.2): when occupancy exceeds
@@ -451,12 +481,63 @@ impl Scheduler {
         // 1. Admit from admitted queue up to budget.
         let mut total_prefill = 0usize;
         let current_running = self.running.len();
+
+        // Readiness-driven decode-first interleaving (RRFP idea). The engine
+        // runs all admitted prefills before any decode this tick, so under
+        // pressure a large newly-admitted prefill chunk head-of-line-blocks
+        // ready decode work and spikes ITL. When the dispatcher is enabled and
+        // decode work is ready under pressure, interleave: submit the ready
+        // decode tasks, let the dispatcher arbitrate decode-first, and if it
+        // does, defer new prefill admission to next tick so decode runs now.
+        // This is the RRFP "dispatch ready work, skip blocked work" insight
+        // applied to the prefill/decode contention — not a new pipeline stage.
+        // Without the dispatcher (or off pressure) prefill proceeds greedily.
+        let defer_prefill_this_tick = if self.readiness.is_some() && pressure_active {
+            let decode_ready: Vec<&Request> = self
+                .running
+                .iter()
+                .filter(|r| r.consumed_tokens >= r.prompt_tokens)
+                .collect();
+            if decode_ready.is_empty() {
+                false
+            } else if let Some(ref readiness) = self.readiness {
+                // Submit one ready-decode task per decode-eligible request,
+                // keyed by request id so they don't collide in the ready set.
+                for r in &decode_ready {
+                    readiness.submit_task(
+                        r.id,
+                        r.id,
+                        TaskKind::ForwardDecode,
+                        READINESS_DECODE_PRIORITY,
+                        0,
+                    );
+                }
+                // Arbitration: decode (no dependencies) always wins over a
+                // contending prefill, so a decode task is returned.
+                readiness
+                    .arbitrate()
+                    .map(|t| t.kind == TaskKind::ForwardDecode)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let decode_deferred_prefill = defer_prefill_this_tick;
+
         while let Some(r) = admitted.pop_front() {
             if current_running + output.prefill_ids.len() >= self.max_num_seqs {
                 self.waiting.push_back(r);
                 continue;
             }
 
+            // Honor the decode-first arbitration: when decode won, defer new
+            // prefill admission to next tick so decode runs this tick.
+            if decode_deferred_prefill {
+                self.waiting.push_back(r);
+                continue;
+            }
             // Chunked prefill (Sarathi-Serve style, §5.2): drain tokens up to
             // chunked_prefill_size only under load. Chunks operate on the
             // REMAINING unconsumed tokens — F9 (audit): the previous code
@@ -1380,5 +1461,66 @@ mod tests {
             LoraRowSegment::plan_for_rows(&[0, 0]),
             vec![LoraRowSegment { adapter_id: 0, row_start: 0, row_count: 2 }]
         );
+    }
+
+    /// R1 validation: with the readiness dispatcher enabled, a decode-eligible
+    /// running request wins arbitration over a contending new prefill under
+    /// pressure, so the prefill is deferred to protect ITL (RRFP decode-first
+    /// interleaving). Without the dispatcher, the prefill is admitted greedily.
+    #[test]
+    fn test_readiness_dispatch_defers_prefill_under_pressure() {
+        use crate::readiness_dispatch::ReadinessDispatcher;
+
+        let make_sched = |with_readiness: bool| -> Scheduler {
+            let ctrl = AdmissionController::new(1000, 1000);
+            let mut sched = Scheduler::new(64, 8, ctrl);
+            if with_readiness {
+                sched.set_readiness_dispatch(Some(ReadinessDispatcher::new(0, None)));
+            }
+            sched.max_batched_tokens = 64;
+            sched.chunked_prefill_size = 32;
+            // One decode-eligible running request (fully prefilled).
+            sched.running.push(Request {
+                id: 1,
+                prompt_tokens: 16,
+                consumed_tokens: 16,
+                ..Default::default()
+            });
+            // A new large prefill waiting to be admitted.
+            sched.waiting.push_back(Request {
+                id: 2,
+                prompt_tokens: 100,
+                ..Default::default()
+            });
+            sched
+        };
+
+        // Without readiness dispatch: prefill is admitted greedily (legacy).
+        {
+            let mut sched = make_sched(false);
+            let out = sched.schedule();
+            assert!(
+                out.prefill_ids.contains(&2),
+                "legacy path should admit the prefill"
+            );
+            assert!(out.decode_ids.contains(&1), "decode should be returned");
+        }
+
+        // With readiness dispatch + pressure: decode wins arbitration, prefill
+        // is deferred to protect ITL.
+        {
+            let mut sched = make_sched(true);
+            // Force pressure so the decode-first gate is active: backlog from the
+            // waiting request exceeds the token budget.
+            let out = sched.schedule();
+            assert!(
+                out.decode_ids.contains(&1),
+                "decode-eligible request must be returned"
+            );
+            assert!(
+                !out.prefill_ids.contains(&2),
+                "prefill must be deferred when decode won arbitration under pressure"
+            );
+        }
     }
 }
