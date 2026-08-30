@@ -696,7 +696,7 @@ impl CausalLm for Qwen38FlashNext {
 
     fn forward(
         &self,
-        _session: &mut dyn SessionT,
+        session: &mut dyn SessionT,
         input_ids: &Tensor,
         positions: &Tensor,
         _adapters: &[AdapterHandle],
@@ -738,6 +738,7 @@ impl CausalLm for Qwen38FlashNext {
         }
 
         let normed = self.norm.forward(&h)?;
+        session.set_last_hidden_state(normed.clone());
         Ok(self.output.forward(&normed)?)
     }
 }
