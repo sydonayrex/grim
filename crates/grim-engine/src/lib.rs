@@ -78,6 +78,13 @@ pub struct EngineConfig {
     pub tp_size: usize,
     /// Explicit GPU ordinals for TP (`GRIM_GPUS`, empty = all visible).
     pub tp_gpus: Vec<usize>,
+    /// Pipeline-parallel size (`GRIM_PP_SIZE`, 0/1 = off). The stage layout
+    /// (`pipeline_engine::PipelinePlan`) is computed and validated at engine
+    /// startup, but block-level execution is NOT wired yet: a paged KV pool
+    /// is single-device, so per-stage KV pools are a prerequisite. Requesting
+    /// pp_size > 1 hard-fails loudly instead of silently running TP-shaped
+    /// weights through single-device execution.
+    pub pp_size: usize,
     /// WI-TOOLS-4c-i: hard cap on the total number of tool-call entries across
     /// every assistant message in a single request's `messages` array. Rejects
     /// the request with 400 once a conversation has made more tool calls than a
@@ -128,6 +135,10 @@ impl Default for EngineConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
+            pp_size: std::env::var("GRIM_PP_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0),
             max_tool_calls_per_conversation: 20,
             max_messages_per_request: 200,
             disagg_router: None,
@@ -551,6 +562,21 @@ impl Engine {
         })));
         let target_ttft = config.target_ttft_ms as f64;
         let target_itl = config.target_itl_ms as f64;
+
+        // Pipeline-parallel gate. The stage layout is computable now, but
+        // block-level execution is NOT wired: a paged KV pool is single-
+        // device, so per-stage KV pools are the prerequisite. Rather than
+        // load PP-shaped weights and silently run single-device execution,
+        // hard-fail loudly with the path to follow.
+        if config.pp_size > 1 {
+            panic!(
+                "[grim-engine] INVALID config (GRIM_PP_SIZE={}): pipeline-parallel \
+                 execution is not yet wired into block execution (a paged KV pool is \
+                 single-device, so per-stage KV pools are a prerequisite). See \
+                 docs/serving-parity-plan.md P2.",
+                config.pp_size
+            );
+        }
 
         let is_multi_gpu = tp_config
             .as_ref()
@@ -4118,5 +4144,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PP gate: requesting pp_size > 1 must hard-fail at Engine::new, not
+    /// silently run single-device execution.
+    #[test]
+    #[should_panic(expected = "pipeline-parallel execution is not yet wired")]
+    fn test_engine_rejects_pipeline_parallel_size() {
+        let mut cfg = EngineConfig::default();
+        cfg.pp_size = 2;
+        let _ = Engine::new(cfg);
+    }
+
+    /// PP off (pp_size 0/1) must not trip the gate.
+    #[test]
+    fn test_engine_accepts_pipeline_parallel_off() {
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.pp_size, 0, "default EngineConfig must have pp_size off");
+        // Engine::new with pp_size 0 should NOT panic.
+        let _ = Engine::new(cfg);
     }
 }

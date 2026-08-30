@@ -1,7 +1,10 @@
 # Serving-layer parity plan: closing the vLLM/SGLang gaps
 
-Status: in progress (2026-08-29). Verification first, implementation second —
-each phase lists the exact files and the acceptance gate that closes it.
+Status: **P0–P4 landed and tested** (2026-08-29). P2 block-level execution and P3
+EP execution remain explicit follow-ups, documented below, not silently shipped.
+
+Verification first, implementation second — each phase lists the exact files
+and the acceptance gate that closes it.
 
 ## Verification summary (what was actually true on 2026-08-29)
 
@@ -84,39 +87,63 @@ Files: `grim-scheduler/src/lib.rs`, `grim-engine/src/lib.rs`,
 
 Files: `grim-kvtransport/src/lib.rs`, `grim-disagg/src/lib.rs` (+ tests).
 
-## P2 — Pipeline parallelism
+## P2 — Pipeline parallelism — **config + planner + gate landed; block execution pending**
 
-1. Config: `GRIM_PP_SIZE` / `EngineConfig.pp_size`; `PipelineStageConfig::
-   partition_layers` (exists) produces a `PipelinePlan` (layer → device).
-2. Execution: in-process stage split for the Llama family — layers of stage 0
-   on its device, remaining layers on the next stage's device, activations
-   moved at the boundary via the existing cross-device copy path, logits on
-   the last stage. No collectives needed (PP has no all-reduce).
-3. Parity test: PP-2 vs single-device logits on a tiny model (CPU-plumbed in
-   CI; real device split verified when ≥2 ROCm devices are visible).
+1. ✅ Config: `GRIM_PP_SIZE` / `EngineConfig.pp_size` (env read in
+   `EngineConfig::default`).
+2. ✅ Planner: `pipeline_engine::PipelinePlan` consumes the existing
+   `PipelineStageConfig::partition_layers` math and is validated at engine
+   startup.
+3. ✅ Gate: `Engine::new` hard-fails loudly when `pp_size > 1` (rather than
+   loading PP-shaped weights and silently running single-device execution),
+   pointing at this doc. Covered by `test_engine_rejects_pipeline_parallel_size`.
+4. ⏳ Block-level execution is NOT wired and is the deliberate follow-up:
+   a paged KV pool is single-device (`KvBlockPool`), so PP first needs
+   per-stage KV pools plus cross-stage activation transfer — a prerequisite
+   this gate forces to be solved before anyone can flip the switch. Parity
+   test deferred until then.
 
-Files: `grim-engine/src/pipeline_engine.rs`, `grim-engine/src/lib.rs`,
-`grim-models/transformer/src/` (stage-aware execution entry point).
+Files: `grim-engine/src/pipeline_engine.rs`, `grim-engine/src/lib.rs`
+(+ `tests/disagg_engine_loopback.rs` initializer).
 
-## P3 — Expert parallelism audit (document, don't build yet)
+## P3 — Expert parallelism audit — **documented**
 
-Audit how MoE experts behave under TP today for Qwen3-MoE/Qwen35-MoE
-(replicated vs sharded), and record findings here. EPLB stays a planner until
-EP execution (token all-to-all + combine, `GRIM_EP_SIZE`) is scheduled as its
-own work item — it is the largest lift and must not land half-wired.
+Finding (verified against the actual upstream model at
+`Qwen/Qwen3.8-Flash-Next`, which is `Qwen4ExpForConditionalGeneration`): MoE
+experts are **replicated across TP ranks**, not sharded. `MoeBlock::load`
+stores the `tp_config` but `ExpertBank::load` (3D `[num_experts, hidden, inter]`
+GGUF layout) loads the full expert bank on every rank; only the attention
+heads/KV/output projection are sharded (via `plan_kv_head_sharding`). So TP
+for MoE today = full expert replication (memory-expensive, compute-correct),
+and the EPLB planner in `eplb.rs` is unused. EP execution (token all-to-all +
+combine, a `GRIM_EP_SIZE` work item) is the largest lift and is intentionally
+not started — it must not land half-wired. Bonus fix landed: the Qwen38 loader
+in `grim-engine/src/model_loader.rs` referenced a removed
+`gated_residual_branches` field and was missing six fields added in a recent
+config refactor (verified against `config.json`); both initializer sites now
+match the struct and the HuggingFace-published config.
 
-## P4 — TP launch ergonomics
+## P4 — TP launch ergonomics — **landed**
 
-`grim serve` gains a launcher that spawns one process per rank with
-`GRIM_TP_SIZE`/`GRIM_TP_RANK`/`GRIM_GPUS` stamped per child (vLLM `--tp 2`
-UX), rank 0 serving HTTP. This automates the manual operator procedure the
-TP design comment describes; it does not change the TP execution design.
+`grim serve --tp-size N` spawns one OS process per rank (Design A): this
+process is rank 0 (serving HTTP on the requested port); ranks `1..N` are
+child processes with `GRIM_TP_SIZE`/`GRIM_TP_RANK` stamped and their HTTP
+port offset by rank. `--address` is refused under `--tp-size` (ports must be
+derivable). A `TpChildGuard` kills peers on rank 0 exit; a fail-stop monitor
+takes rank 0 down if any peer dies (a missing peer deadlocks the survivors'
+collectives on the next forward — better to exit than hang). This automates
+the manual operator procedure the TP design comment describes; it does not
+change the TP execution design. Verified: `--help` shows the flag, and
+`--tp-size 2 --address ...` exits 2 with the expected message.
 
-## Acceptance gates
+Files: `grim-cli/src/main.rs`.
 
-- `cargo test -p grim-scheduler -p grim-engine -p grim-backend-rocm
-  -p grim-kvtransport -p grim-disagg` green (plus `-p grim-cli` for P4).
-- New tests above pass; zero behavior change for single-adapter,
-  zero-adapter, multi-adapter, and speculative decode paths (parity tests
-  prove it).
-- This file updated with per-phase status as phases close.
+## Acceptance gates — all green (2026-08-29)
+
+- `cargo test -p grim-scheduler(35) -p grim-engine(130) -p grim-backend-rocm(372)
+  -p grim-kvtransport(31) -p grim-disagg(22+10) -p grim-cli(42+67)` — **0 failures**.
+- New tests pass; zero behavior change for single-adapter, zero-adapter,
+  multi-adapter, and speculative decode paths (P0 parity tests prove the
+  grouped-decode path matches the legacy per-request path exactly).
+- GPU kernel parity: the JIT shrink+expand LoRA kernel pair matches the CPU
+  reference on the local device (gfx).

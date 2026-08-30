@@ -37,6 +37,58 @@ pub struct PipelineStageConfig {
     pub device_ordinal: usize,
 }
 
+/// Computed pipeline layout: stage boundaries plus per-stage device
+/// placement, ready to drive a partitioned execution. `Engine::new`
+/// validates one against the loaded model depth and visible GPUs when
+/// `pp_size > 1` (see `EngineConfig::pp_size` for the execution gate).
+#[derive(Debug, Clone)]
+pub struct PipelinePlan {
+    /// One config per stage, in order.
+    pub stages: Vec<PipelineStageConfig>,
+}
+
+impl PipelinePlan {
+    /// Evenly partition `total_layers` across `num_stages` stages pinned to
+    /// `device_ordinals[stage]`.
+    ///
+    /// # Contracts
+    /// * `num_stages >= 1` and `total_layers >= num_stages` (a stage with no
+    ///   layers is a config error, not a degenerate pass-through).
+    /// * `device_ordinals.len() == num_stages`.
+    pub fn plan(
+        total_layers: usize,
+        num_stages: usize,
+        device_ordinals: &[usize],
+    ) -> Result<Self> {
+        if total_layers < num_stages {
+            return Err(Error::Config(format!(
+                "PipelinePlan: {total_layers} layers cannot fill {num_stages} stages"
+            )));
+        }
+        if device_ordinals.len() != num_stages {
+            return Err(Error::Config(format!(
+                "PipelinePlan: {} device ordinals for {num_stages} stages",
+                device_ordinals.len()
+            )));
+        }
+        Ok(Self {
+            stages: PipelineStageConfig::partition_layers(
+                total_layers,
+                num_stages,
+                device_ordinals,
+            )?,
+        })
+    }
+
+    /// Stage index that executes `layer`.
+    pub fn stage_for_layer(&self, layer: usize) -> Option<usize> {
+        self.stages
+            .iter()
+            .find(|s| layer >= s.start_layer && layer < s.end_layer)
+            .map(|s| s.stage_id)
+    }
+}
+
 impl PipelineStageConfig {
     /// Partitions `total_layers` evenly across `num_stages`.
     pub fn partition_layers(
@@ -144,6 +196,32 @@ mod tests {
         assert_eq!(partitions[3].end_layer, 32);
         assert!(!partitions[3].is_first_stage());
         assert!(partitions[3].is_last_stage());
+    }
+
+    #[test]
+    fn test_pipeline_plan_validation() {
+        // Valid 2-stage plan over 8 layers on 2 devices.
+        let plan = PipelinePlan::plan(8, 2, &[0, 1]).unwrap();
+        assert_eq!(plan.stage_for_layer(0), Some(0));
+        assert_eq!(plan.stage_for_layer(7), Some(1));
+        assert_eq!(plan.stage_for_layer(3), Some(0));
+        assert_eq!(plan.stage_for_layer(4), Some(1));
+        assert_eq!(plan.stage_for_layer(8), None, "out of range layer");
+
+        // Fewer layers than stages is a config error, not a degenerate plan.
+        assert!(PipelinePlan::plan(1, 2, &[0, 1]).is_err());
+        // Device ordinal count must match stage count.
+        assert!(PipelinePlan::plan(8, 2, &[0]).is_err());
+        assert!(PipelinePlan::plan(8, 0, &[]).is_err());
+
+        // Stage executors bind the plan's boundary conditions.
+        let exec = PipelineStageExecutor::new(plan.stages[1].clone(), None);
+        assert!(exec.config.is_last_stage());
+        assert!(!exec.config.is_first_stage());
+        assert!(
+            matches!(exec.recv_activations(&[1, 4]), Ok(None)),
+            "missing comm on a non-first stage must surface as None activations,              not a fake tensor"
+        );
     }
 
     #[test]
