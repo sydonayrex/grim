@@ -75,7 +75,10 @@ fn replica1_weights_match_host_dequant() {
     assert_eq!(bad, 0, "{bad} mismatching elements in replica1 embed table");
     // The LM head is the only stage producing zeros in the rank-1 forward
     // (fwd-trace evidence); verify its weight bytes too.
-    let raw_out = provider.get_packed("output.weight").expect("packed out");
+    let raw_out = provider
+        .get_packed("output.weight")
+        .or_else(|_| provider.get_packed("token_embd.weight"))
+        .expect("packed out");
     let host_out = host_dequant(&raw_out);
     let dev_out = llama.output.weight().to_vec_f32().expect("out readback");
     println!(

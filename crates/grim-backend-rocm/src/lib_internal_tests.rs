@@ -2300,22 +2300,22 @@ mod tests {
         // ── Read back and verify ─────────────────────────────────────────
         let got = dx_storage.to_cpu_vec_f32().expect("dX to_cpu_vec_f32");
 
-        // CPU reference: same accumulation done in f32, then f16-rounded
-        let dequant: Vec<f32> = vec![1.0, 1.0 / 3.0, -1.0 / 3.0, -1.0]; // row 0 dequant
-        // row 1 has the same dequant pattern (codes [0,1,2,3])
-        let dequant2: Vec<f32> = vec![-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0];
-        let scales: Vec<f32> = vec![1.0, 1.0];
-        let dy: Vec<Vec<f32>> = vec![vec![2.0, 1.0], vec![4.0, 3.0]];
-        let b_deq: Vec<Vec<f32>> = vec![dequant, dequant2];
+        // CPU reference: B has shape [N, K] in row_bytes layout, so B[col, k_idx]
+        // Col 0: [1.0, 1.0/3.0, -1.0/3.0, -1.0]
+        // Col 1: [-1.0, -1.0/3.0, 1.0/3.0, 1.0]
+        let b_cols = [
+            vec![1.0f32, 1.0 / 3.0, -1.0 / 3.0, -1.0],
+            vec![-1.0f32, -1.0 / 3.0, 1.0 / 3.0, 1.0],
+        ];
+        let dy = [[2.0f32, 1.0], [4.0, 3.0]];
 
         let mut expected_f32 = Vec::with_capacity(m * k);
-        for dy_row in dy.iter() {
-            for (k_idx, b_col) in b_deq.iter().enumerate() {
+        for row in 0..m {
+            for k_idx in 0..k {
                 let mut acc = 0.0f32;
                 for col in 0..n {
-                    acc += dy_row[col] * b_col[k_idx] * scales[col];
+                    acc += dy[row][col] * b_cols[col][k_idx];
                 }
-                // The kernel casts the f32 accumulator to f16 before storing.
                 let f16_val = half::f16::from_f32(acc);
                 expected_f32.push(f16_val.to_f32());
             }
