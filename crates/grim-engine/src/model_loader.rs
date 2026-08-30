@@ -16,17 +16,20 @@ use grim_models_mamba::{
 };
 use grim_models_transformer::{
     Bloom, BloomConfig, Chameleon, ChameleonConfig, CogVlm, CogVlmConfig, CogVlmVisionConfig,
-    CommandRConfig, DeepSeek, DeepSeek2, DeepSeek2Config, DeepSeek4, DeepSeek4Config, DeepSeek32,
-    DeepSeek32Config, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig, DiffusionGemma,
-    DiffusionGemmaConfig, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma3n,
-    Gemma3nConfig, GemmaConfig, Glm52, Glm52Config, Gpt2, Gpt2Config, HunyuanVl, HunyuanVlConfig,
-    HunyuanVlVisionConfig, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
-    KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, Mellum,
-    MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen,
-    Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig,
-    Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext,
-    Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5,
-    T5Config, WavTokenizerDec, WavTokenizerDecConfig,
+    CommandR, CommandRConfig, Dbrx, DbrxConfig, DeepSeek, DeepSeek2, DeepSeek2Config, DeepSeek4,
+    DeepSeek4Config, DeepSeek32, DeepSeek32Config, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig,
+    DiffusionGemma, DiffusionGemmaConfig, Dots3Note, Dots3NoteConfig, Exaone45, Exaone45Config,
+    Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma2, Gemma2Config, Gemma3n,
+    Gemma3nConfig, GemmaConfig, Glm4MoeLite, Glm4MoeLiteConfig, Glm52, Glm52Config, Gpt2,
+    Gpt2Config, GptJ, GptJConfig, GptOss, GptOssConfig, GraniteMoeHybrid, GraniteMoeHybridConfig,
+    HunyuanVl, HunyuanVlConfig, HunyuanVlVisionConfig, HyV3, HyV3Config, HyV4, HyV4Config,
+    InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig, KimiK3, KimiK3Config,
+    Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, LongCatFlash, LongCatFlashConfig,
+    Mellum, MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig,
+    Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl,
+    Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig,
+    Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2,
+    SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -789,14 +792,9 @@ fn load_model_from_config(
             let bloom_cfg = BloomConfig {
                 vocab_size,
                 hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                num_layers,
-                intermediate_size,
-                rms_norm_eps,
-                rope_theta,
-                max_seq_len,
+                n_head: num_heads,
+                n_layer: num_layers,
+                layer_norm_epsilon: rms_norm_eps,
             };
             log::info!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
@@ -1424,7 +1422,6 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::Gemma
-        | ModelArchitecture::Gemma2
         | ModelArchitecture::Gemma3
         | ModelArchitecture::Gemma4 => {
             let cfg = GemmaConfig {
@@ -1438,6 +1435,26 @@ fn load_model_from_config(
                 rms_norm_eps,
             };
             let m = Gemma::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma2 => {
+            let cfg = Gemma2Config {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                attn_logit_softcapping: Some(50.0),
+                final_logit_softcapping: Some(30.0),
+                sliding_window: Some(4096),
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = Gemma2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek => {
@@ -1542,49 +1559,22 @@ fn load_model_from_config(
             let commandr_cfg = CommandRConfig {
                 vocab_size,
                 hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                num_layers,
                 intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                use_qk_norm: true,
                 rms_norm_eps,
                 rope_theta,
-                max_seq_len,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
             };
             log::info!(
                 "[grim] Loading CommandR model with config: {:?}",
                 commandr_cfg
             );
-            let llama_cfg = LlamaConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                num_layers,
-                intermediate_size,
-                rms_norm_eps,
-                rope_theta,
-                max_seq_len,
-
-                partial_rotary_factor: 1.0,
-                yarn: None,
-            };
-            let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-            // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
-            // when the GGUF carries the metadata key. ALiBi replaces RoPE.
-            if matches!(
-                model_arch,
-                ModelArchitecture::Baichuan
-                    | ModelArchitecture::Mpt
-                    | ModelArchitecture::Jais
-                    | ModelArchitecture::Jais2
-            ) {
-                log::info!("[grim] enabling ALiBi on {} blocks", m.layers.len());
-                for layer in m.layers.iter_mut() {
-                    *layer = std::mem::replace(layer, layer.clone()).with_alibi();
-                }
-            }
+            let m = CommandR::load_tp(device.clone(), &ws, commandr_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Chameleon => {
@@ -1969,6 +1959,193 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
 
+        ModelArchitecture::Dbrx => {
+            let cfg = DbrxConfig {
+                vocab_size,
+                d_model: hidden_size,
+                ffn_hidden_size: intermediate_size,
+                n_layers: num_layers,
+                n_heads: num_heads,
+                kv_n_heads: num_kv_heads,
+                head_dim,
+                moe_num_experts: 16,
+                moe_top_k: 4,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                yarn: None,
+            };
+            let m = Dbrx::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GptJ => {
+            let cfg = GptJConfig {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                head_dim,
+                rotary_dim: 64,
+                num_hidden_layers: num_layers,
+                layer_norm_epsilon: rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+            };
+            let m = GptJ::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::HyV3 => {
+            let cfg = HyV3Config {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_experts: 64,
+                num_experts_per_tok: 8,
+                shared_expert_intermediate_size: Some(intermediate_size),
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = HyV3::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::HyV4 => {
+            let cfg = HyV4Config {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = HyV4::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Dots3Note => {
+            let cfg = Dots3NoteConfig {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = Dots3Note::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GptOss => {
+            let cfg = GptOssConfig {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                num_experts: None,
+                num_experts_per_tok: None,
+                yarn: None,
+            };
+            let m = GptOss::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GraniteMoeHybrid => {
+            let cfg = GraniteMoeHybridConfig {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_local_experts: 32,
+                num_experts_per_tok: 8,
+                shared_intermediate_size: Some(intermediate_size),
+                residual_multiplier: 0.22,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = GraniteMoeHybrid::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Exaone45 => {
+            let cfg = Exaone45Config {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = Exaone45::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Glm4MoeLite => {
+            let cfg = Glm4MoeLiteConfig {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_hidden_layers: num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_experts: 64,
+                num_experts_per_tok: 4,
+                shared_expert_intermediate_size: Some(intermediate_size),
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = Glm4MoeLite::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::LongCatFlash => {
+            let cfg = LongCatFlashConfig {
+                vocab_size,
+                hidden_size,
+                intermediate_size,
+                num_layers,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                q_lora_rank: 1536,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: head_dim,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+                yarn: None,
+            };
+            let m = LongCatFlash::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+
         ModelArchitecture::Arcee
         | ModelArchitecture::Apertus
         | ModelArchitecture::Arctic
@@ -1977,7 +2154,6 @@ fn load_model_from_config(
         | ModelArchitecture::ChatGlm
         | ModelArchitecture::Codeshell
         | ModelArchitecture::Cohere2
-        | ModelArchitecture::Dbrx
         | ModelArchitecture::Deci
         | ModelArchitecture::DeepSeek2Ocr
         | ModelArchitecture::DFlash
@@ -1992,12 +2168,10 @@ fn load_model_from_config(
         | ModelArchitecture::GemmaEmbedding
         | ModelArchitecture::Glm4
         | ModelArchitecture::GlmDsa
-        | ModelArchitecture::GptJ
         | ModelArchitecture::GptNeoX
         | ModelArchitecture::Granite
         | ModelArchitecture::Grok
         | ModelArchitecture::HunyuanDense
-        | ModelArchitecture::HyV3
         | ModelArchitecture::InternLm2
         | ModelArchitecture::Jais
         | ModelArchitecture::Jais2
@@ -2280,14 +2454,9 @@ fn load_model_with_providers(
             let bloom_cfg = BloomConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
+                n_head: hparams.num_heads,
+                n_layer: hparams.num_layers,
+                layer_norm_epsilon: hparams.rms_norm_eps,
             };
             log::info!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
@@ -3018,7 +3187,6 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Gemma
-        | ModelArchitecture::Gemma2
         | ModelArchitecture::Gemma3
         | ModelArchitecture::Gemma4 => {
             let cfg = GemmaConfig {
@@ -3034,51 +3202,46 @@ fn load_model_with_providers(
             let m = Gemma::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Gemma2 => {
+            let cfg = Gemma2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                attn_logit_softcapping: Some(50.0),
+                final_logit_softcapping: Some(30.0),
+                sliding_window: Some(4096),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = Gemma2::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::CommandR => {
             let commandr_cfg = CommandRConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                use_qk_norm: true,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
             };
             log::info!(
                 "[grim] Loading CommandR model with config: {:?}",
                 commandr_cfg
             );
-            let llama_cfg = LlamaConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-
-                partial_rotary_factor: 1.0,
-                yarn: None,
-            };
-            let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-            // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
-            // when the GGUF carries the metadata key. ALiBi replaces RoPE.
-            if lookup
-                .get_f32("att.alibi.bias_max")
-                .or_else(|| lookup.get_f32("alibi.bias_max"))
-                .is_some()
-            {
-                log::info!("[grim] enabling ALiBi on {} blocks", m.layers.len());
-                for layer in m.layers.iter_mut() {
-                    *layer = std::mem::replace(layer, layer.clone()).with_alibi();
-                }
-            }
+            let m = CommandR::load_tp(device.clone(), &ws, commandr_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek => {
@@ -3648,6 +3811,193 @@ fn load_model_with_providers(
             let m = T5::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Dbrx => {
+            let cfg = DbrxConfig {
+                vocab_size: hparams.vocab_size,
+                d_model: hparams.hidden_size,
+                ffn_hidden_size: hparams.intermediate_size,
+                n_layers: hparams.num_layers,
+                n_heads: hparams.num_heads,
+                kv_n_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                moe_num_experts: 16,
+                moe_top_k: 4,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = Dbrx::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GptJ => {
+            let cfg = GptJConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                head_dim: hparams.head_dim,
+                rotary_dim: 64,
+                num_hidden_layers: hparams.num_layers,
+                layer_norm_epsilon: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+            };
+            let m = GptJ::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::HyV3 => {
+            let cfg = HyV3Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_experts: 64,
+                num_experts_per_tok: 8,
+                shared_expert_intermediate_size: Some(hparams.intermediate_size),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = HyV3::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::HyV4 => {
+            let cfg = HyV4Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = HyV4::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Dots3Note => {
+            let cfg = Dots3NoteConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = Dots3Note::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GptOss => {
+            let cfg = GptOssConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                num_experts: None,
+                num_experts_per_tok: None,
+                yarn: None,
+            };
+            let m = GptOss::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GraniteMoeHybrid => {
+            let cfg = GraniteMoeHybridConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_local_experts: 32,
+                num_experts_per_tok: 8,
+                shared_intermediate_size: Some(hparams.intermediate_size),
+                residual_multiplier: 0.22,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = GraniteMoeHybrid::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Exaone45 => {
+            let cfg = Exaone45Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = Exaone45::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Glm4MoeLite => {
+            let cfg = Glm4MoeLiteConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_hidden_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_experts: 64,
+                num_experts_per_tok: 4,
+                shared_expert_intermediate_size: Some(hparams.intermediate_size),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = Glm4MoeLite::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::LongCatFlash => {
+            let cfg = LongCatFlashConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                intermediate_size: hparams.intermediate_size,
+                num_layers: hparams.num_layers,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                q_lora_rank: 1536,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: hparams.head_dim,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+                yarn: None,
+            };
+            let m = LongCatFlash::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+
         ModelArchitecture::Arcee
         | ModelArchitecture::Apertus
         | ModelArchitecture::Arctic
@@ -3656,7 +4006,6 @@ fn load_model_with_providers(
         | ModelArchitecture::ChatGlm
         | ModelArchitecture::Codeshell
         | ModelArchitecture::Cohere2
-        | ModelArchitecture::Dbrx
         | ModelArchitecture::Deci
         | ModelArchitecture::DeepSeek2Ocr
         | ModelArchitecture::DFlash
@@ -3671,12 +4020,10 @@ fn load_model_with_providers(
         | ModelArchitecture::GemmaEmbedding
         | ModelArchitecture::Glm4
         | ModelArchitecture::GlmDsa
-        | ModelArchitecture::GptJ
         | ModelArchitecture::GptNeoX
         | ModelArchitecture::Granite
         | ModelArchitecture::Grok
         | ModelArchitecture::HunyuanDense
-        | ModelArchitecture::HyV3
         | ModelArchitecture::InternLm2
         | ModelArchitecture::Jais
         | ModelArchitecture::Jais2

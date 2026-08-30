@@ -31,32 +31,6 @@ impl ModelConfig for FalconConfig {
     }
 }
 
-/// Configuration for BLOOM model architecture family.
-#[derive(Debug, Clone)]
-pub struct BloomConfig {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub num_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub num_layers: usize,
-    pub intermediate_size: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub max_seq_len: usize,
-}
-
-impl ModelConfig for BloomConfig {
-    fn name(&self) -> &str {
-        "bloom"
-    }
-    fn modality(&self) -> ModalityHint {
-        ModalityHint::TextInTextOut
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
 
 /// Configuration for Phi (Phi-2/Phi-3/Phi-Moe) model architecture family.
 #[derive(Debug, Clone)]
