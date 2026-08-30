@@ -4287,10 +4287,11 @@ mod tests {
         let _ = Engine::new(cfg);
     }
 
-    /// R4 validation: the memory-sovereign admission gate rejects a request
-    /// whose footprint exceeds the current memory envelope, and admits it when
-    /// the envelope is large enough. Uses the GRIM_TEST_FREE_DEVICE_BYTES
-    /// override so the probe is deterministic without a live device.
+    /// R4 validation (deterministic, mock-probed): the admission gate rejects
+    /// a request whose footprint exceeds the current memory envelope and admits
+    /// it when the envelope is large enough. The GRIM_TEST_FREE_DEVICE_BYTES
+    /// override makes the probe deterministic; see
+    /// `test_memory_certificate_admission_gate_real_hw` for the live-probe case.
     #[test]
     fn test_memory_certificate_admission_gate() {
         use grim_scheduler::Request;
@@ -4300,9 +4301,8 @@ mod tests {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("tiny", small_llama());
 
-        // Tiny envelope: 1 MiB free device, 1 MiB host, 0 reserve. A request
-        // with a 4096-token prompt cannot fit -> admission must fail with an
-        // envelope error.
+        // Tiny envelope: 0.5 MiB free device, 0 host, 0 reserve. A 4096-token
+        // prompt cannot fit -> admission must fail with an envelope error.
         std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "500000");
         std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "0");
         std::env::set_var("GRIM_MEMORY_RESERVE_GB", "0");
@@ -4316,10 +4316,9 @@ mod tests {
         let err = engine
             .enqueue_request(big)
             .expect_err("oversize request must be rejected by the admission gate");
-        let msg = err.to_string();
         assert!(
-            msg.contains("exceeds current memory envelope"),
-            "unexpected error: {msg}"
+            err.to_string().contains("exceeds current memory envelope"),
+            "unexpected error: {err}"
         );
 
         // Large envelope: 128 GiB free device, 64 GiB host. Same request fits.
@@ -4337,10 +4336,60 @@ mod tests {
             .enqueue_request(ok)
             .expect("request must be admitted when envelope is large enough");
 
-        // Cleanup env so other tests are unaffected.
-        std::env::remove_var("GRIM_TEST_FREE_DEVICE_BYTES");
-        std::env::remove_var("GRIM_HOST_ALLOWANCE_GB");
-        std::env::remove_var("GRIM_MEMORY_RESERVE_GB");
+            // Cleanup env so other tests are unaffected.
+            std::env::remove_var("GRIM_TEST_FREE_DEVICE_BYTES");
+            std::env::remove_var("GRIM_HOST_ALLOWANCE_GB");
+            std::env::remove_var("GRIM_MEMORY_RESERVE_GB");
         } // unsafe
+    }
+
+    /// R4 real-hardware verification: exercises the actual ROCm `hipMemGetInfo` probe
+    /// (not the mock) on the live GPU and confirms the admission gate works
+    /// against real free-VRAM data. Skips (does not fail) when no ROCm device
+    /// is visible, so this is a no-op off-hardware and a real check on-hardware.
+    #[test]
+    fn test_memory_certificate_admission_gate_real_hw() {
+        use grim_scheduler::Request;
+
+        // Only run the real-probe path when a GPU is actually present AND the
+        // mock override is NOT set (otherwise we\'d test the mock, not the GPU).
+        if std::env::var("GRIM_TEST_FREE_DEVICE_BYTES").is_ok() {
+            return;
+        }
+        let has_gpu =
+            grim_backend_rocm::device::roc_device::RocmDevice::probe_one(0).unwrap_or(false);
+        if !has_gpu {
+            eprintln!("skipping R4 real-HW probe: no ROCm device visible");
+            return;
+        }
+
+        // Exercise the real hipMemGetInfo probe directly.
+        let probe = grim_backend_rocm::free_device_memory(0);
+        let (free, total) = grim_backend_rocm::device::capability_profiler::vram_info(0);
+        assert!(
+            total > 0,
+            "R4 HW: vram_info should report non-zero total VRAM on a real GPU"
+        );
+        assert_eq!(
+            probe,
+            Some(free),
+            "R4 HW: free_device_memory must match vram_info free"
+        );
+
+        // Register the model and let the engine build its baseline cert from the
+        // model\'s hyperparams. With a real multi-GB GPU, a small test request
+        // must be admitted against the genuine free-VRAM probe.
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_model("tiny", small_llama());
+        let tiny = Request {
+            id: 100,
+            prompt_tokens: 64,
+            max_new_tokens: 32,
+            model_id: Some("tiny".into()),
+            ..Default::default()
+        };
+        engine
+            .enqueue_request(tiny)
+            .expect("R4 HW: a small request must admit against real free VRAM");
     }
 }
