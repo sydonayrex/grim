@@ -21,3 +21,4 @@ package.lock.json
 
 # Autotuner on-disk tune caches (test/runtime artifacts)
 .autotune_cache/
+*.log
