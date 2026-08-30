@@ -6,6 +6,7 @@
 //! killing the UI thread.
 
 use std::any::Any;
+use std::path::PathBuf;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -33,6 +34,11 @@ pub enum WorkerCommand {
         temperature: Option<f32>,
         top_p: Option<f32>,
     },
+    /// UI → worker: the result of a tool call that the worker requested.
+    ToolResult {
+        call_id: String,
+        output: String,
+    },
     Cancel,
     Quit,
 }
@@ -55,6 +61,13 @@ pub enum WorkerEvent {
     },
     Token {
         text: String,
+    },
+    /// Worker → UI: the model emitted a tool call. The UI executes it and
+    /// replies with `WorkerCommand::ToolResult`.
+    ToolCall {
+        call_id: String,
+        name: String,
+        arguments: String,
     },
     TurnComplete {
         stats: TurnStats,
@@ -158,6 +171,10 @@ struct Worker {
     next_request_id: u64,
     max_tokens: usize,
     tx: Sender<WorkerEvent>,
+    /// When true, the agentic loop runs with tool calling.
+    tools_enabled: bool,
+    /// Sandbox root directory for tool execution.
+    sandbox_root: PathBuf,
 }
 
 impl Worker {
@@ -165,6 +182,9 @@ impl Worker {
         match cmd {
             WorkerCommand::Quit => WorkerOutcome::Quit,
             WorkerCommand::Cancel => WorkerOutcome::Ignored,
+            // ToolResult is consumed by agentic_generate's internal rx loop;
+            // if it reaches here (e.g. tools disabled), ignore it.
+            WorkerCommand::ToolResult { .. } => WorkerOutcome::Ignored,
             WorkerCommand::SetContextLimit { limit } => {
                 self.ctx_override = limit;
                 WorkerOutcome::Ignored
@@ -184,7 +204,12 @@ impl Worker {
             }
             WorkerCommand::LoadModel { name } => self.load_model(name),
             WorkerCommand::Generate { messages } => {
-                self.generate(messages, rx);
+                if self.tools_enabled {
+                    self.agentic_generate(messages, rx, &crate::tui::tools::coding_tools(), self.sandbox_root.clone());
+                } else {
+                    let (_text, stats) = self.generate(&messages, rx, None);
+                    let _ = self.tx.send(WorkerEvent::TurnComplete { stats });
+                }
                 WorkerOutcome::Ignored
             }
         }
@@ -331,22 +356,40 @@ impl Worker {
     }
 
     /// Run one turn of generation, streaming tokens and diagnostics.
-    fn generate(&mut self, messages: Vec<grim_format::ChatMessage>, rx: &Receiver<WorkerCommand>) {
+    /// Returns the collected assistant text and turn stats. When tools are
+    /// enabled, the caller is responsible for parsing tool calls and looping.
+    fn generate(
+        &mut self,
+        messages: &[grim_format::ChatMessage],
+        rx: &Receiver<WorkerCommand>,
+        tools: Option<&[grim_format::ToolDef]>,
+    ) -> (String, TurnStats) {
+        let mut generated_text = String::new();
+        let default_stats = TurnStats {
+            encode_ms: 0.0,
+            prompt_tokens: 0,
+            prefill_ms: None,
+            decode_tps: None,
+            tokens_generated: 0,
+            accepted_per_step: None,
+            cancelled: false,
+            context_used: 0,
+        };
         let Some(model_id) = self.current_id.clone() else {
             let _ = self.tx.send(WorkerEvent::Error {
                 message: "no model loaded; use /model first".into(),
             });
-            return;
+            return (generated_text, default_stats);
         };
         let Some(tok) = self.tokenizer.clone() else {
             let _ = self.tx.send(WorkerEvent::Error {
                 message: "tokenizer unavailable".into(),
             });
-            return;
+            return (generated_text, default_stats);
         };
 
         let t0 = Instant::now();
-        let prompt_ids = build_prompt_ids(&tok, &messages);
+        let prompt_ids = build_prompt_ids_with_tools(&tok, &messages, tools);
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let request_id = self.next_request_id;
@@ -387,7 +430,7 @@ impl Worker {
             let _ = self.tx.send(WorkerEvent::Error {
                 message: format!("enqueue failed: {e}"),
             });
-            return;
+            return (generated_text, default_stats);
         }
 
         loop {
@@ -459,6 +502,7 @@ impl Worker {
                 break;
             }
             let text = tok.decode(&[token]);
+            generated_text.push_str(&text);
             let _ = self.tx.send(WorkerEvent::Token { text });
 
             if last_diag.elapsed() >= Duration::from_millis(100) {
@@ -488,12 +532,141 @@ impl Worker {
         };
         let snap = self.make_snapshot(ctx_limit, stats.context_used);
         let _ = self.tx.send(WorkerEvent::Diagnostics { snap });
-        let _ = self.tx.send(WorkerEvent::TurnComplete { stats });
+        // Note: TurnComplete is now sent by the caller (agentic_generate) after
+        // the tool loop resolves, or directly by generate when tools are off.
+        (generated_text, stats)
     }
+
+    /// Run an agentic turn with tool calling. Loops: generate → parse tool
+    /// calls → emit ToolCall → wait for ToolResult → inject → re-generate.
+    /// Sends TurnComplete only when the model stops calling tools.
+    fn agentic_generate(
+        &mut self,
+        mut messages: Vec<grim_format::ChatMessage>,
+        rx: &Receiver<WorkerCommand>,
+        tools: &[grim_format::ToolDef],
+        sandbox_root: PathBuf,
+    ) {
+        use grim_server::tool_parse::{self, ToolFamily};
+        let max_iters = 10; // Prevent infinite loops.
+        let mut total_stats = TurnStats {
+            encode_ms: 0.0,
+            prompt_tokens: 0,
+            prefill_ms: None,
+            decode_tps: None,
+            tokens_generated: 0,
+            accepted_per_step: None,
+            cancelled: false,
+            context_used: 0,
+        };
+
+        for _ in 0..max_iters {
+            let (generated_text, stats) = self.generate(&messages, rx, Some(tools));
+            total_stats.tokens_generated += stats.tokens_generated;
+            total_stats.context_used = stats.context_used;
+
+            // Parse the generated text for tool calls.
+            let family = ToolFamily::Auto; // Try all conventions.
+            let outcome = tool_parse::parse_tool_calls(&generated_text, family);
+            let calls = match outcome.calls {
+                Some(calls) if !calls.is_empty() => calls,
+                _ => {
+                    // No tool calls — turn is complete.
+                    let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+                    return;
+                }
+            };
+
+            // Process each tool call.
+            for call in calls {
+                let call_id = call.id.clone();
+                let name = call.name.clone();
+
+                // Auto-execute read-only tools; request approval for mutations.
+                let is_read_only =
+                    matches!(name.as_str(), "read_file" | "list_files" | "search_files");
+                if is_read_only {
+                    let result = crate::tui::tools::execute_tool(
+                        &call,
+                        &crate::tui::tools::Sandbox::new(sandbox_root.clone()),
+                    );
+                    let output = match result {
+                        Ok(s) => s,
+                        Err(e) => format!("error: {e}"),
+                    };
+                    messages.push(grim_format::ChatMessage {
+                        role: "tool".to_string(),
+                        content: output,
+                        tool_call_id: Some(call_id),
+                        name: Some(name),
+                        tool_calls: None,
+                    });
+                } else {
+                    // Mutation tool — emit ToolCall, wait for UI approval/result.
+                    let _ = self.tx.send(WorkerEvent::ToolCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
+                    // Block waiting for ToolResult from the UI.
+                    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+                        Ok(WorkerCommand::ToolResult { call_id: resp_id, output })
+                            if resp_id == call_id =>
+                        {
+                            messages.push(grim_format::ChatMessage {
+                                role: "tool".to_string(),
+                                content: output,
+                                tool_call_id: Some(call_id),
+                                name: Some(name),
+                                tool_calls: None,
+                            });
+                        }
+                        _ => {
+                            let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+    }
+}
+
+/// Build prompt token ids with optional tool definitions exposed to the
+/// chat template via the `tools` Jinja variable.
+fn build_prompt_ids_with_tools(
+    tok: &GgufTokenizer,
+    messages: &[grim_format::ChatMessage],
+    tools: Option<&[grim_format::ToolDef]>,
+) -> Vec<u32> {
+    let mut ids = Vec::new();
+    if tok.add_bos_token {
+        if let Some(b) = tok.bos_token_id {
+            ids.push(b);
+        }
+    } else if let Some(&b) = bos_prefix(tok).first() {
+        ids.push(b);
+    }
+    let text = if tok.chat_template.is_some() {
+        if let Some(tools) = tools {
+            grim_format::render_messages_or_last_with_tools(tok, messages, Some(tools), None)
+        } else {
+            render_messages_or_last(tok, messages)
+        }
+    } else {
+        messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
+    };
+    ids.extend(tok.encode(&text));
+    ids
 }
 
 /// Build prompt token ids: BOS (when configured or a candidate exists) plus
 /// the chat-template rendered messages, mirroring run.rs:863-886.
+#[allow(dead_code)]
 fn build_prompt_ids(tok: &GgufTokenizer, messages: &[grim_format::ChatMessage]) -> Vec<u32> {
     let mut ids = Vec::new();
     if tok.add_bos_token {
@@ -571,6 +744,8 @@ pub fn spawn_worker(
             next_request_id: 1,
             max_tokens: params.max_tokens,
             tx,
+            tools_enabled: true, // Agentic coding mode enabled by default in TUI.
+            sandbox_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
 
         loop {

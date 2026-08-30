@@ -31,6 +31,24 @@ pub struct MessageNode {
     pub thought_folded: bool,
     /// Optional turn statistics line rendered under assistant responses.
     pub turn_stats: Option<String>,
+    /// Tool name for ToolCall/ToolResult roles.
+    pub tool_name: Option<String>,
+    /// Pretty-printed tool arguments (JSON) for ToolCall.
+    pub tool_arguments: Option<String>,
+}
+
+impl Default for MessageNode {
+    fn default() -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            thinking: None,
+            thought_folded: false,
+            turn_stats: None,
+            tool_name: None,
+            tool_arguments: None,
+        }
+    }
 }
 
 /// Structured transcript container managing message history and active streaming state.
@@ -62,9 +80,7 @@ impl Transcript {
         self.nodes.push(MessageNode {
             role: Role::User,
             content: text,
-            thinking: None,
-            thought_folded: false,
-            turn_stats: None,
+            ..Default::default()
         });
     }
 
@@ -73,9 +89,7 @@ impl Transcript {
         self.nodes.push(MessageNode {
             role: Role::System,
             content: text,
-            thinking: None,
-            thought_folded: false,
-            turn_stats: None,
+            ..Default::default()
         });
     }
 
@@ -84,20 +98,23 @@ impl Transcript {
         self.nodes.push(MessageNode {
             role: Role::Error,
             content: text,
-            thinking: None,
-            thought_folded: false,
-            turn_stats: None,
+            ..Default::default()
         });
     }
 
-    /// Add a tool call invocation message.
-    pub fn push_tool_call(&mut self, text: String) {
+    /// Add a tool call invocation message with structured name + arguments.
+    pub fn push_tool_call(&mut self, name: &str, arguments: &str) {
+        let pretty = serde_json::from_str::<serde_json::Value>(arguments)
+            .and_then(|v| serde_json::to_string_pretty(&v))
+            .unwrap_or_else(|_| arguments.to_string());
         self.nodes.push(MessageNode {
             role: Role::ToolCall,
-            content: text,
+            content: pretty,
             thinking: None,
             thought_folded: false,
             turn_stats: None,
+            tool_name: Some(name.to_string()),
+            tool_arguments: Some(arguments.to_string()),
         });
     }
 
@@ -109,6 +126,8 @@ impl Transcript {
             thinking: None,
             thought_folded: false,
             turn_stats: None,
+            tool_name: None,
+            tool_arguments: None,
         });
     }
 
@@ -126,6 +145,7 @@ impl Transcript {
             thinking,
             thought_folded: true,
             turn_stats: Some(summary_line),
+            ..Default::default()
         });
         self.streaming_raw.clear();
     }
@@ -180,7 +200,18 @@ impl Transcript {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     );
-                    lines.extend(format_content_lines(prefix, &node.content));
+                    // Render assistant content as markdown (code blocks, bold, etc.).
+                    let md_lines = crate::tui::markdown::render_markdown(&node.content);
+                    for (i, mut md_line) in md_lines.into_iter().enumerate() {
+                        if i == 0 && !md_line.spans.is_empty() {
+                            // Prepend the "assistant: " prefix to the first line.
+                            let mut spans = vec![prefix.clone()];
+                            spans.append(&mut md_line.spans);
+                            lines.push(Line::from(spans));
+                        } else {
+                            lines.push(md_line);
+                        }
+                    }
                     if let Some(stats) = &node.turn_stats {
                         lines.push(Line::from(vec![Span::styled(
                             stats.clone(),
@@ -364,7 +395,7 @@ mod tests {
     #[test]
     fn test_tool_call_and_result_rendering() {
         let mut transcript = Transcript::new();
-        transcript.push_tool_call("read_file(path: \"model.rs\")".into());
+        transcript.push_tool_call("read_file", r#"{"path": "model.rs"}"#);
         transcript.push_tool_result("pub struct Model...".into());
 
         assert_eq!(transcript.nodes.len(), 2);

@@ -166,6 +166,7 @@ struct MetalPipelines {
     quant_mxfp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_dequant_gemm_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_dequant_gemm_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     reduce_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     qkv_paged_dequant_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -330,6 +331,7 @@ impl MetalContext {
                 quant_mxfp8: get_pipeline("grim_quant_mxfp8")?,
                 fused_dequant_gemm_q4k: get_pipeline("grim_fused_dequant_gemm_q4k")?,
                 fused_dequant_gemm_fp8: get_pipeline("grim_fused_dequant_gemm_fp8")?,
+                fused_dequant_gemm_mxfp4: get_pipeline("grim_fused_dequant_gemm_mxfp4")?,
                 matmul_split_k: get_pipeline("grim_matmul_split_k")?,
                 reduce_split_k: get_pipeline("grim_reduce_split_k")?,
                 qkv_paged_dequant_attn: get_pipeline("grim_qkv_attention_paged_dequant")?,
@@ -4790,7 +4792,9 @@ impl QuantOps for MetalDevice {
                         }
 
                         // FP8 fast-path
-                        if let DTypeStorage::FloatPack(FloatPackScheme::Fp8) = b_packed.dtype().storage {
+                        if let DTypeStorage::FloatPack(FloatPackScheme::Fp8) =
+                            b_packed.dtype().storage
+                        {
                             let out_storage = self.zeros(out_shape, DType::F32)?;
                             let out_s =
                                 out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -4846,6 +4850,71 @@ impl QuantOps for MetalDevice {
                             ));
                         }
 
+                        // MXFP4 fast-path — fused dequant+INT8 GEMM via simdgroup_matrix
+                        if let DTypeStorage::FloatPack(
+                            FloatPackScheme::MxFp4,
+                        ) = b_packed.dtype().storage
+                        {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s =
+                                out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(
+                                || {
+                                    Error::from(MetalError::Ffi(
+                                        "Failed to create compute encoder".into(),
+                                    ))
+                                },
+                            )?;
+
+                            encoder
+                                .setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_mxfp4);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    6,
+                                );
+                            }
+
+                            // 16×16 threadgroup = 256 threads, matching CUDA block size.
+                            let threads_per_group = MTLSize::new(16, 16, 1);
+                            let groups =
+                                MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                                groups,
+                                threads_per_group,
+                            );
+                            encoder.endEncoding();
+
+                            return Ok((
+                                out_storage,
+                                Box::new(MetalHandle {
+                                    command_buffer: cmd_buffer,
+                                }),
+                            ));
+                        }
+
+                        // Q8_0 scaled-quantized fallback (k >= 32, k % 32 == 0)
                         if k >= 32 && k % 32 == 0 {
                             // Pad / truncate scales to exactly n * (k/32) entries.
                             let blocks_per_col = k / 32;

@@ -49,6 +49,8 @@ futures-util = "0.3"
 rand = { workspace = true }
 ratatui = "0.29"
 crossterm = "0.28"
+pulldown-cmark = "0.12"
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "plist-load"] }
 toml = "0.8"
 
 [dev-dependencies]
