@@ -7,8 +7,11 @@ use grim_tensor::{CoreTensorOps, DType, Shape};
 use grim_backend_vulkan::VulkanDevice;
 
 #[test]
-#[ignore = "GPU-only: GRIM_GPU_TEST=1"]
 fn softmax_backward_matches_cpu_reference() {
+    if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
+        eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+        return;
+    }
     let dev = VulkanDevice::new();
     // 4 rows × 8 cols, values that exercise the full softmax range
     let grad = vec![
