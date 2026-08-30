@@ -1013,4 +1013,114 @@ mod tests {
         let err = Qwen38FlashNext::load(Device::Cpu, &ws, cfg);
         assert!(err.is_err(), "load_tp must fail loudly when PLE weights are missing");
     }
+
+    #[test]
+    fn test_qwen38_real_safetensors_layout_weight_loading_and_forward() {
+        use std::collections::HashMap;
+        use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
+
+        let mut cfg = Qwen38FlashNextConfig::default();
+        cfg.vocab_size = 16;
+        cfg.hidden_size = 8;
+        cfg.num_heads = 2;
+        cfg.num_kv_heads = 1;
+        cfg.head_dim = 4;
+        cfg.num_layers = 1;
+        cfg.intermediate_size = 16;
+        cfg.num_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        cfg.shared_expert_intermediate_size = Some(16);
+        cfg.ngram_vocab_size = Some(20);
+        cfg.ngram_dim = Some(4);
+        cfg.split_ngram_parts = 2;
+        cfg.ngram_size = 3;
+
+        let q_dim = cfg.num_heads * cfg.head_dim; // 8
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 4
+        let ngram_vocab = 20;
+        let ngram_dim = 4;
+
+        fn raw_f32_tensor(val: f32, shape: Vec<usize>) -> (Vec<u8>, Vec<usize>, grim_tensor::DType, grim_tensor::QuantProvenance) {
+            let count: usize = shape.iter().product();
+            let mut bytes = Vec::with_capacity(count * 4);
+            for _ in 0..count {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            (bytes, shape, grim_tensor::DType::F32, grim_tensor::QuantProvenance::GrimNative)
+        }
+
+        let mut tensors = HashMap::new();
+        // Model embeddings & output (Linear::load_shape expects [out_features, in_features] or transposed)
+        tensors.insert("model.embed_tokens.weight".into(), raw_f32_tensor(0.05, vec![cfg.hidden_size, cfg.vocab_size]));
+        tensors.insert("lm_head.weight".into(), raw_f32_tensor(0.02, vec![cfg.vocab_size, cfg.hidden_size]));
+        tensors.insert("model.norm.weight".into(), raw_f32_tensor(1.0, vec![cfg.hidden_size]));
+
+        // PLE N-gram embedding table (matching HuggingFace / vLLM naming)
+        tensors.insert("model.layers.1.ple.ple_embedding.ngram_embedding.shard_0".into(), raw_f32_tensor(0.1, vec![ngram_vocab, ngram_dim]));
+        tensors.insert("model.layers.1.ple.key_proj.weight".into(), raw_f32_tensor(0.05, vec![cfg.hidden_size, ngram_dim]));
+
+        // Layer 0 Attention & MoE weights
+        tensors.insert("model.layers.0.self_attn.q_proj.weight".into(), raw_f32_tensor(0.01, vec![q_dim, cfg.hidden_size]));
+        tensors.insert("model.layers.0.self_attn.k_proj.weight".into(), raw_f32_tensor(0.01, vec![kv_dim, cfg.hidden_size]));
+        tensors.insert("model.layers.0.self_attn.v_proj.weight".into(), raw_f32_tensor(0.01, vec![kv_dim, cfg.hidden_size]));
+        tensors.insert("model.layers.0.self_attn.o_proj.weight".into(), raw_f32_tensor(0.01, vec![cfg.hidden_size, q_dim]));
+        tensors.insert("model.layers.0.input_layernorm.weight".into(), raw_f32_tensor(1.0, vec![cfg.hidden_size]));
+        tensors.insert("model.layers.0.post_attention_layernorm.weight".into(), raw_f32_tensor(1.0, vec![cfg.hidden_size]));
+
+        // MoE Router Gate
+        tensors.insert("model.layers.0.mlp.gate.weight".into(), raw_f32_tensor(0.01, vec![cfg.num_experts, cfg.hidden_size]));
+
+        // MoE Experts
+        for e in 0..cfg.num_experts {
+            tensors.insert(format!("model.layers.0.mlp.experts.{e}.gate_proj.weight"), raw_f32_tensor(0.01, vec![cfg.intermediate_size, cfg.hidden_size]));
+            tensors.insert(format!("model.layers.0.mlp.experts.{e}.up_proj.weight"), raw_f32_tensor(0.01, vec![cfg.intermediate_size, cfg.hidden_size]));
+            tensors.insert(format!("model.layers.0.mlp.experts.{e}.down_proj.weight"), raw_f32_tensor(0.01, vec![cfg.hidden_size, cfg.intermediate_size]));
+        }
+
+        // Shared Expert
+        tensors.insert("model.layers.0.mlp.shared_expert.gate_proj.weight".into(), raw_f32_tensor(0.01, vec![16, cfg.hidden_size]));
+        tensors.insert("model.layers.0.mlp.shared_expert.up_proj.weight".into(), raw_f32_tensor(0.01, vec![16, cfg.hidden_size]));
+        tensors.insert("model.layers.0.mlp.shared_expert.down_proj.weight".into(), raw_f32_tensor(0.01, vec![cfg.hidden_size, 16]));
+
+        struct SafeTensorsMockProvider {
+            tensors: HashMap<String, (Vec<u8>, Vec<usize>, grim_tensor::DType, grim_tensor::QuantProvenance)>,
+        }
+
+        impl TensorProvider for SafeTensorsMockProvider {
+            fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+                let (bytes, shape, dtype, provenance) = self.tensors.get(name).cloned().ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!("Tensor {name} not found in SafeTensors mock provider"))
+                })?;
+                Ok(RawTensor { bytes, shape, dtype, provenance })
+            }
+            fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
+                let (_, shape, dtype, provenance) = self.tensors.get(name).cloned().ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!("Tensor meta {name} not found in SafeTensors mock provider"))
+                })?;
+                Ok(TensorMeta { dtype, provenance, shape, fusion_mask: 0 })
+            }
+        }
+
+        let provider = SafeTensorsMockProvider { tensors };
+        let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+
+        // Load model completely through real SafeTensors WeightSource path
+        let model = Qwen38FlashNext::load(Device::Cpu, &ws, cfg).expect("Qwen38FlashNext must load completely from SafeTensors WeightSource");
+        assert!(model.ngram_embeddings.is_some(), "PLE N-gram embeddings must be loaded from weights");
+
+        let mut session = model.new_session();
+        let input_ids = cpu_tensor(vec![3.0, 7.0, 11.0], grim_tensor::Shape::new(vec![3]));
+        let positions = cpu_tensor(vec![0.0, 1.0, 2.0], grim_tensor::Shape::new(vec![3]));
+
+        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).expect("Forward pass on loaded model must succeed");
+        assert_eq!(logits.shape().dims(), &[3, 16], "Logits shape must match [seq_len, vocab_size]");
+
+        // Assert valid numeric output
+        let logits_vec = logits.to_vec_f32().unwrap();
+        assert!(!logits_vec.is_empty());
+        for &val in &logits_vec {
+            assert!(!val.is_nan(), "Logits must not contain NaN");
+            assert!(!val.is_infinite(), "Logits must not contain Inf");
+        }
+    }
 }
