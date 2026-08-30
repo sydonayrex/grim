@@ -339,6 +339,13 @@ impl Qwen38FlashNextBlock {
 /// that augment standard 1-gram token embeddings. The auxiliary N-gram embedding table
 /// is placed in host RAM (mirroring llama.cpp `-ot "ple_ngram_embd=CPU"` offloading)
 /// and gathered per token before being projected into the transformer's hidden space.
+///
+/// # Addressing Scheme Contract
+/// In production checkpoints, the $20\text{M}$ embedding table is indexed either by a
+/// tokenizer trie / n-gram vocab ID mapping or a checkpoint-specific rolling hash.
+/// `hash_ngram` provides a deterministic rolling polynomial hash fallback until the
+/// exact upstream n-gram tokenizer mapping metadata is deserialized from the GGUF/Safetensors
+/// vocabulary header.
 #[derive(Clone)]
 pub struct Qwen38NgramEmbedding {
     /// N-gram vocabulary size ($V_{\text{ngram}}$, e.g. 20M entries).
@@ -359,6 +366,7 @@ impl Qwen38NgramEmbedding {
     /// # Contract
     /// * Deterministic across all platforms.
     /// * Returns an index in `0 .. vocab_size - 1` (or 0 if empty/zero vocab).
+    /// * Note: Serves as a placeholder for exact checkpoint-level n-gram trie vocabulary mapping.
     pub fn hash_ngram(tokens: &[u32], vocab_size: usize) -> usize {
         if tokens.is_empty() || vocab_size == 0 {
             return 0;
@@ -383,7 +391,6 @@ impl Qwen38NgramEmbedding {
         }
 
         let table_vec = self.table.to_vec_f32()?;
-        let num_rows = table_vec.len() / self.ngram_dim.max(1);
         let mut gathered_ngram = vec![0.0f32; seq_len * self.ngram_dim];
 
         for i in 0..seq_len {
@@ -392,8 +399,7 @@ impl Qwen38NgramEmbedding {
                 let start = i.saturating_sub(2);
                 let window = &tokens[start..=i];
                 let hash_idx = Self::hash_ngram(window, self.ngram_vocab_size);
-                let table_row = if num_rows > 0 { hash_idx % num_rows } else { 0 };
-                let table_offset = table_row * self.ngram_dim;
+                let table_offset = hash_idx * self.ngram_dim;
                 let dst_offset = i * self.ngram_dim;
                 if table_offset + self.ngram_dim <= table_vec.len() {
                     gathered_ngram[dst_offset..dst_offset + self.ngram_dim]
@@ -450,20 +456,21 @@ impl Qwen38FlashNext {
         let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
             (cfg.ngram_vocab_size, cfg.ngram_dim)
         {
+            // Loud failure: checkpoint specifies PLE config so weights must be present
             let table = root
                 .scoped("ngram_embeddings")
-                .get([ngram_vocab.min(1024), ngram_dim], "weight")
+                .get([ngram_vocab, ngram_dim], "weight")
                 .or_else(|_| {
                     root.scoped("ple_ngram_embd")
-                        .get([ngram_vocab.min(1024), ngram_dim], "weight")
+                        .get([ngram_vocab, ngram_dim], "weight")
                 })
-                .unwrap_or_else(|_| {
-                    // Host-pinned CPU offload fallback table
-                    cpu_tensor(
-                        vec![0.01f32; ngram_vocab.min(1024) * ngram_dim],
-                        grim_tensor::Shape::new(vec![ngram_vocab.min(1024), ngram_dim]),
-                    )
-                });
+                .map_err(|e| {
+                    grim_core::Error::Config(format!(
+                        "Qwen38FlashNext: checkpoint config defines ngram_vocab_size={ngram_vocab}, \
+                         ngram_dim={ngram_dim}, but neither 'model.ngram_embeddings.weight' nor \
+                         'model.ple_ngram_embd.weight' were found in checkpoint: {e}"
+                    ))
+                })?;
 
             let proj = Linear::load_shape(
                 &root.scoped("ngram_proj"),
@@ -475,13 +482,12 @@ impl Qwen38FlashNext {
                     [ngram_dim, cfg.hidden_size],
                 )
             })
-            .unwrap_or_else(|_| {
-                let w = cpu_tensor(
-                    vec![0.01f32; cfg.hidden_size * ngram_dim],
-                    grim_tensor::Shape::new(vec![cfg.hidden_size, ngram_dim]),
-                );
-                Linear::from_tensor(w, None)
-            });
+            .map_err(|e| {
+                grim_core::Error::Config(format!(
+                    "Qwen38FlashNext: checkpoint config specifies PLE N-gram projection, \
+                     but neither 'model.ngram_proj' nor 'model.ple_ngram_proj' were found in weights: {e}"
+                ))
+            })?;
 
             Some(Qwen38NgramEmbedding {
                 ngram_vocab_size: ngram_vocab,
@@ -529,8 +535,8 @@ impl Qwen38FlashNext {
             (cfg.ngram_vocab_size, cfg.ngram_dim)
         {
             let table = cpu_tensor(
-                vec![0.01f32; ngram_vocab.min(1024) * ngram_dim],
-                grim_tensor::Shape::new(vec![ngram_vocab.min(1024), ngram_dim]),
+                vec![0.01f32; ngram_vocab * ngram_dim],
+                grim_tensor::Shape::new(vec![ngram_vocab, ngram_dim]),
             );
             let proj = Linear::from_tensor(
                 cpu_tensor(
@@ -799,5 +805,31 @@ mod tests {
         let branches = 4;
         let scale = 1.0f32 / (branches as f32).sqrt();
         assert_eq!(scale, 0.5f32);
+    }
+
+    #[test]
+    fn test_qwen38_missing_ple_weights_fails_loudly() {
+        let mut cfg = Qwen38FlashNextConfig::default();
+        cfg.vocab_size = 16;
+        cfg.hidden_size = 8;
+        cfg.ngram_vocab_size = Some(100);
+        cfg.ngram_dim = Some(4);
+
+        // Empty weight provider: loading must error loudly rather than silently substitute dummy 0.01 tensors
+        struct EmptyProvider;
+        impl grim_tensor::TensorProvider for EmptyProvider {
+            fn get(&self, name: &str) -> grim_tensor::error::Result<grim_tensor::RawTensor> {
+                Err(grim_tensor::error::Error::Backend(format!("tensor '{name}' not found")))
+            }
+            fn meta(&self, _name: &str) -> grim_tensor::error::Result<grim_tensor::TensorMeta> {
+                Err(grim_tensor::error::Error::Backend("tensor not found".into()))
+            }
+        }
+
+        let provider = EmptyProvider;
+        let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+
+        let err = Qwen38FlashNext::load(Device::Cpu, &ws, cfg);
+        assert!(err.is_err(), "load_tp must fail loudly when PLE weights are missing");
     }
 }
