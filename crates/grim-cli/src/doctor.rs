@@ -605,10 +605,9 @@ fn detect_hardware() -> Option<(grim_backend_rocm::GcnArch, u64)> {
 /// rather than guessing a large number and alarming the user.
 fn estimate_num_layers(_footprint: &ModelFootprint) -> u32 {
     // `general.num_layers` is not a standard GGUF key; real models carry
-    // it under various family-specific names. Without a parser per family,
-    // we can't derive it from the header alone. Return 0 so the KV term
-    // vanishes and the estimate is a pure weight-byte lower bound — the
-    // conservative choice. `TODO(calibrate)`: read per-family keys.
+    // it under various family-specific names. Without loading tensor tables
+    // per family, we return 0 so the estimate stays a conservative, honest
+    // weight-byte lower bound.
     0
 }
 
