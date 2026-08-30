@@ -84,6 +84,11 @@ impl HostStagingRing {
         }
         Self { buffers }
     }
+
+    /// Access the mutex-protected buffer for `rank`.
+    pub fn buffer(&self, rank: usize) -> &Mutex<Vec<f32>> {
+        &self.buffers[rank]
+    }
 }
 
 /// Parallel communicator managing collective operations across GPU devices.
@@ -100,6 +105,11 @@ pub struct ParallelCommunicator {
 }
 
 impl ParallelCommunicator {
+    /// Reference to the staging ring if configured.
+    pub fn staging_ring(&self) -> Option<&Arc<HostStagingRing>> {
+        self.staging_ring.as_ref()
+    }
+
     /// Constructs a single-device communicator (world_size = 1, no-op collectives).
     pub fn single_device(device_ordinal: usize) -> Self {
         Self {
@@ -437,6 +447,72 @@ impl ParallelCommunicator {
             Ok(())
         } else {
             let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
+            Ok(())
+        }
+    }
+
+    /// Reduces (SUM) equal-sized input buffers from all ranks and scatters the respective rank slice into `dst`.
+    ///
+    /// # Contract
+    /// * `src.len() == dst.len() * world_size`
+    pub fn reduce_scatter_sum_f32(&self, src: &[f32], dst: &mut [f32]) -> Result<()> {
+        let world_size = self.topology.world_size;
+        let chunk_size = dst.len();
+
+        if world_size <= 1 {
+            if src.len() != chunk_size {
+                return Err(Error::Backend(format!(
+                    "reduce_scatter_sum_f32: src len {} != dst len {}",
+                    src.len(),
+                    chunk_size
+                )));
+            }
+            dst.copy_from_slice(src);
+            return Ok(());
+        }
+
+        if src.len() != chunk_size * world_size {
+            return Err(Error::Backend(format!(
+                "reduce_scatter_sum_f32: src len {} != chunk_size {} * world_size {}",
+                src.len(),
+                chunk_size,
+                world_size
+            )));
+        }
+
+        let my_rank = self.topology.rank;
+
+        if let Some(ring) = &self.staging_ring {
+            // 1. Stage full src into our ring buffer slot
+            {
+                let mut slot = ring.buffers[my_rank]
+                    .lock()
+                    .map_err(|_| Error::Backend("Staging ring lock poisoned".into()))?;
+                slot.clear();
+                slot.extend_from_slice(src);
+            }
+
+            // 2. Reduce the chunk assigned to this rank (offset = my_rank * chunk_size)
+            let my_offset = my_rank * chunk_size;
+            dst.copy_from_slice(&src[my_offset..my_offset + chunk_size]);
+
+            for r in 0..world_size {
+                if r != my_rank {
+                    let other_slot = ring.buffers[r]
+                        .lock()
+                        .map_err(|_| Error::Backend("Staging ring lock poisoned".into()))?;
+                    if other_slot.len() >= my_offset + chunk_size {
+                        for i in 0..chunk_size {
+                            dst[i] += other_slot[my_offset + i];
+                        }
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
+            let my_offset = my_rank * chunk_size;
+            dst.copy_from_slice(&src[my_offset..my_offset + chunk_size]);
             Ok(())
         }
     }
