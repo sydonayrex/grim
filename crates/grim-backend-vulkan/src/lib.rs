@@ -1,5 +1,6 @@
 pub mod autotune;
 pub mod caps;
+pub mod graph_capture;
 pub mod hugepage;
 
 pub use autotune::{GemmOp, ShapeClass, VulkanAutotuner, VulkanTileConfig};
@@ -5909,36 +5910,29 @@ impl MemoryOps for VulkanDevice {
 
 
 impl GraphCaptureOps for VulkanDevice {
-    /// Tier C: graph-capture bookkeeping so callers don't hit
-    /// `Err(Unimplemented)` on Vulkan. Records captured-graph names in a
-    /// process-wide set; `replay_graph` reports success WITHOUT replaying
-    /// GPU work (true Vulkan graph replay needs VK_EXT_graph_capture, which
-    /// is not wired here). This makes the API non-failing and lets the
-    /// engine's capture/replay branches execute; replace with real capture
-    /// for the §4.3 decode-throughput win.
+    /// Graph-capture bookkeeping. Delegates to `VK_GRAPH_CACHE` (see
+    /// `graph_capture.rs`). Records captured-graph names so callers don't hit
+    /// `Err(Unimplemented)`; `replay_graph` reports success WITHOUT replaying
+    /// GPU work until `VK_EXT_graph_capture` is wired.
     fn begin_graph_capture(&self, key: &str) -> Result<()> {
-        let _ = key;
-        Ok(())
+        VK_GRAPH_CACHE.begin(key)
     }
 
     fn end_graph_capture(&self, key: &str) -> Result<()> {
-        CAPTURED_GRAPHS.lock().map_err(|e| Error::Backend(format!("{e}")))?.insert(key.to_string());
-        Ok(())
+        VK_GRAPH_CACHE.end(key)
     }
 
     fn replay_graph(&self, key: &str) -> Result<bool> {
-        Ok(CAPTURED_GRAPHS.lock().map_err(|e| Error::Backend(format!("{e}")))?.contains(key))
+        VK_GRAPH_CACHE.replay(key)
     }
 
     fn has_captured_graph(&self, key: &str) -> bool {
-        CAPTURED_GRAPHS.lock().map(|g| g.contains(key)).unwrap_or(false)
+        VK_GRAPH_CACHE.has(key)
     }
 }
 
-
-
 lazy_static::lazy_static! {
-    static ref CAPTURED_GRAPHS: std::sync::Mutex<std::collections::HashSet<String>> = std::sync::Mutex::new(std::collections::HashSet::new());
+    static ref VK_GRAPH_CACHE: graph_capture::VkGraphCache = graph_capture::VkGraphCache::new();
 }
 impl grim_tensor::BackendDevice for VulkanDevice {}
 
