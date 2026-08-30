@@ -1,5 +1,6 @@
 pub mod autotune;
 pub mod caps;
+pub mod collective;
 pub mod graph_capture;
 pub mod hugepage;
 
@@ -1409,6 +1410,10 @@ pub struct VulkanDevice {
     /// Persistent autotuner — survives across matmul calls so a previously measured winner on
     /// this GPU (loaded from disk at construction) is reused instead of re-searched each call.
     autotuner: Mutex<VulkanAutotuner>,
+    /// Optional multi-GPU communicator. `None` = single-GPU mode (default).
+    /// When `Some`, `all_reduce` dispatches the ring-allreduce shader across
+    /// device pairs via the communicator's `world_size`/`rank` topology.
+    pub communicator: Option<collective::VkCommunicator>,
 }
 
 impl Clone for VulkanDevice {
@@ -1417,6 +1422,7 @@ impl Clone for VulkanDevice {
         Self {
             caps: self.caps.clone(),
             autotuner: Mutex::new(VulkanAutotuner::new()),
+            communicator: self.communicator.clone(),
         }
     }
 }
@@ -1451,7 +1457,16 @@ impl VulkanDevice {
         Self {
             caps,
             autotuner: Mutex::new(autotuner),
+            communicator: None,
         }
+    }
+
+    /// Attach a multi-GPU communicator so `all_reduce` dispatches the
+    /// ring-allreduce shader across device pairs. Single-GPU callers leave
+    /// this as `None`.
+    pub fn with_communicator(mut self, comm: collective::VkCommunicator) -> Self {
+        self.communicator = Some(comm);
+        self
     }
 
     pub fn caps(&self) -> &VulkanCaps {
@@ -2379,6 +2394,27 @@ impl VulkanDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_op(a, b, out_shape, Some(GemmOp::LmHead))
+    }
+
+    /// Multi-GPU all-reduce via the ring-allreduce shader.
+    ///
+    /// Structural scaffold: dispatches `VulkanKernel::RingAllReduce` using the
+    /// communicator's topology. Full cross-GPU dispatch requires P2P buffer
+    /// copy infrastructure (not yet wired) — this method documents the path
+    /// and returns an honest error if the transport is unavailable.
+    fn all_reduce_multi_gpu(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        comm: &collective::VkCommunicator,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Multi-GPU all-reduce requires P2P buffer copy across device pairs,
+        // which is the transport layer this phase scaffolds. The ring-allreduce
+        // shader in `ring_allreduce.comp` is the reduce step once transport
+        // exists.
+        let _ = (inputs, comm);
+        Err(Error::Backend(
+            "all_reduce_multi_gpu: P2P transport not yet wired (ring-allreduce shader is structural)".into()
+        ))
     }
 }
 
@@ -5553,6 +5589,16 @@ impl CollectiveOps for VulkanDevice {
                 "all_reduce: only 'sum' supported, got '{op}'"
             )));
         }
+
+        // When a multi-GPU communicator is attached with world_size > 1,
+        // dispatch the ring-allreduce shader across device pairs. Current
+        // default: single-GPU accumulation (communicator is None).
+        if let Some(comm) = &self.communicator {
+            if comm.world_size > 1 {
+                return self.all_reduce_multi_gpu(inputs, comm);
+            }
+        }
+
         let shape = inputs[0].shape().clone();
         let dtype = inputs[0].dtype();
         let total = shape.elem_count();
@@ -5660,7 +5706,6 @@ impl CollectiveOps for VulkanDevice {
         let storage = self.from_cpu(&acc, &shape, dtype)?;
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
-
 
     fn comm_fuse_reduce(
         &self,
@@ -6084,6 +6129,7 @@ pub enum VulkanKernel {
     RwkvTimeMix,
     RwkvChannelMix,
     AllReduce,
+    RingAllReduce,
     CommFuseReduce,
     QuantQ80,
     QuantFp8,
@@ -6180,6 +6226,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::RwkvTimeMix => SPIRV_RWKV_TIME_MIX,
         VulkanKernel::RwkvChannelMix => SPIRV_RWKV_CHANNEL_MIX,
         VulkanKernel::AllReduce => SPIRV_ALL_REDUCE,
+        VulkanKernel::RingAllReduce => SPIRV_RING_ALLREDUCE,
         VulkanKernel::CommFuseReduce => SPIRV_COMM_FUSE_REDUCE,
         VulkanKernel::QuantQ80 => SPIRV_QUANT_Q8_0,
         VulkanKernel::QuantFp8 => SPIRV_QUANT_FP8,
@@ -6240,7 +6287,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::CooperativeMatrixGemm
         | VulkanKernel::SiluMulBackward
         | VulkanKernel::SoftmaxBackward
-        | VulkanKernel::EmbeddingBackward => 3,
+        | VulkanKernel::EmbeddingBackward
+        | VulkanKernel::RingAllReduce => 3,
         VulkanKernel::Sub => 3,
         VulkanKernel::AddScalar
         | VulkanKernel::SubScalar
