@@ -1,6 +1,7 @@
 //! CUDA kernel source definitions and submodules.
 
 pub mod charon;
+pub mod compressed_gemm;
 pub mod flash_decode;
 pub mod mla_decode;
 pub mod mxfp_gemm;
