@@ -8,6 +8,7 @@ pub mod env_config;
 pub mod error;
 pub mod hyperparams;
 pub mod kv_cache;
+pub mod disagg_placement;
 pub mod memory_certificate;
 pub mod model;
 pub mod paths;
@@ -23,6 +24,7 @@ pub use client::{
 pub use env_config::{Backend, RuntimeEnv};
 pub use error::{Error, Result, TensorError};
 pub use hyperparams::{ArchHyperparameters, HyperparameterExtractor, MetadataLookup};
+pub use disagg_placement::{GpuCapability, PlacementAdvice, advise_placement, bandwidth_split, validate};
 pub use memory_certificate::{
     AuthorityGrade, BoundaryVector, ExactnessContract, MemoryCertificate, ModelInventory,
 };
