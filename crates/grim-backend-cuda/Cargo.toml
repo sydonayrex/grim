@@ -22,6 +22,10 @@ libloading = { version = "0.8", optional = true }
 
 grim-backend-cpu = { workspace = true }
 grim-quant = { workspace = true }
+grim-core = { workspace = true }
+grim-engine = { workspace = true }
+grim-format = { workspace = true }
+grim-tensor = { workspace = true }
 
 [features]
 default = []

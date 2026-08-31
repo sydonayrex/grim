@@ -88,6 +88,7 @@ impl Composer {
 
     /// Set composer text explicitly and reposition cursor at end.
     pub fn set_text(&mut self, text: &str) {
+        self.push_undo();
         self.chars = text.chars().collect();
         self.cursor = self.chars.len();
     }
@@ -203,6 +204,11 @@ impl Composer {
         self.last_yank_span = Some((start, self.cursor));
         self.last_kill_was_cut = false;
         true
+    }
+
+    /// Peek the current yank text without inserting (for clipboard sync).
+    pub fn peek_yank_text(&self) -> Option<String> {
+        self.kill_ring.peek().map(|s| s.to_string())
     }
 
     /// Replace the last yank with the next kill-ring entry (Alt+Y after yank).

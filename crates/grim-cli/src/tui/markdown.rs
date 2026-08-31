@@ -4,11 +4,26 @@
 //! highlighting inside fenced code blocks. Produces styled Lines that
 //! the transcript widget can render directly.
 
+use std::sync::OnceLock;
+
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 
 const SYNTAX_THEME: &str = "base16-ocean.dark";
+
+static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+
+fn syntax_set() -> &'static SyntaxSet {
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn theme_set() -> &'static ThemeSet {
+    THEME_SET.get_or_init(ThemeSet::load_defaults)
+}
 
 /// Render a markdown string to styled Lines.
 pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
@@ -113,11 +128,10 @@ pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
 /// Highlight a code string using syntect. Falls back to plain white on error.
 fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
     use syntect::easy::HighlightLines;
-    use syntect::highlighting::{Style as SynStyle, ThemeSet};
-    use syntect::parsing::SyntaxSet;
+    use syntect::highlighting::Style as SynStyle;
 
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+    let ss = syntax_set();
+    let ts = theme_set();
     let syntax = ss
         .find_syntax_by_token(lang)
         .unwrap_or_else(|| ss.find_syntax_plain_text());

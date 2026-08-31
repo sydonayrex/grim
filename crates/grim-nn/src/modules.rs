@@ -164,7 +164,46 @@ pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
 /// panics ("storage is not CpuStorage") when called with ROCm tensors.
 pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = pick_device_for_tensor(a);
-    let (s, h) = CoreTensorOps::add(&*dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+
+    // Handle broadcasting: if b has fewer dimensions than a (e.g. b is
+    // [S, H] and a is [1, S, H]), repeat b to match a's shape so that
+    // backends without native broadcasting (e.g. CUDA) don't read past
+    // b's memory.
+    let b_adjusted = if a.shape().dims().len() != b.shape().dims().len() {
+        // Compute the broadcast shape (a's shape) and repeat b to fill it.
+        let out_shape = a.shape();
+        let out_elems = out_shape.elem_count();
+        let b_data = b.to_vec_f32()?;
+        let b_elems = b_data.len();
+        if out_elems % b_elems != 0 {
+            return Err(Error::Shape(format!(
+                "add_tensors: cannot broadcast b={:?} to a={:?}",
+                b.shape(), a.shape()
+            )));
+        }
+        let repeats = out_elems / b_elems;
+        let mut expanded = Vec::with_capacity(out_elems);
+        for _ in 0..repeats {
+            expanded.extend_from_slice(&b_data);
+        }
+        let storage = dev.from_cpu(&expanded, out_shape, DType::F32)?;
+        Tensor::new(
+            Arc::from(storage),
+            out_shape.clone(),
+            DType::F32,
+            b.provenance().clone(),
+            b.device().clone(),
+        )
+    } else {
+        b.clone()
+    };
+
+    let (s, h) = CoreTensorOps::add(
+        &*dev,
+        a.storage().as_ref(),
+        b_adjusted.storage().as_ref(),
+        a.shape(),
+    )?;
     h.synchronize()?;
     Ok(Tensor::new(
         Arc::from(s),

@@ -394,6 +394,7 @@ impl CudaDevice {
         packed_ptr: *const c_void,
         out_ptr: *mut c_void,
         n_blocks: usize,
+        weights_per_block: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
         let mut func: CUfunction = std::ptr::null_mut();
@@ -417,7 +418,15 @@ impl CudaDevice {
             ];
 
             const BLOCK_SIZE: u32 = 256;
-            let grid_size = ((n_blocks as u64) + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+            // The dequantization kernels (grim_dequant_q8_0, etc.) expect one
+            // thread per output weight, checking `id >= n_blocks * 32` (or
+            // weights_per_block). So the grid must cover n_blocks *
+            // weights_per_block threads, not just n_blocks.
+            let total_weights = n_blocks.checked_mul(weights_per_block).ok_or_else(|| {
+                Error::Backend("launch_dequant_generic: total weight count overflow".into())
+            })?;
+            let grid_size =
+                ((total_weights as u64) + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
             let launch_res = cuLaunchKernel(
                 func,
                 grid_size as u32,
@@ -720,7 +729,7 @@ impl CudaDevice {
         }
         let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
         let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(out)", &out)?;
-        let handle = self.launch_dequant_generic(kernel, packed_ptr, out_ptr, n_blocks)?;
+        let handle = self.launch_dequant_generic(kernel, packed_ptr, out_ptr, n_blocks, weights_per_block)?;
         handle.synchronize()?;
         Ok(out)
     }
