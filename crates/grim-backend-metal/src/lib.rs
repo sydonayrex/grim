@@ -334,6 +334,8 @@ impl MetalContext {
                 fused_dequant_gemm_q4k: get_pipeline("grim_fused_dequant_gemm_q4k")?,
                 fused_dequant_gemm_fp8: get_pipeline("grim_fused_dequant_gemm_fp8")?,
                 fused_dequant_gemm_mxfp4: get_pipeline("grim_fused_dequant_gemm_mxfp4")?,
+                fused_rmsnorm_mxfp4_gemm: get_pipeline("grim_fused_rmsnorm_mxfp4_gemm")?,
+                fused_rmsnorm_mxfp4_gemm_rope_kv: get_pipeline("grim_fused_rmsnorm_mxfp4_gemm_rope_kv")?,
                 matmul_split_k: get_pipeline("grim_matmul_split_k")?,
                 reduce_split_k: get_pipeline("grim_reduce_split_k")?,
                 qkv_paged_dequant_attn: get_pipeline("grim_qkv_attention_paged_dequant")?,
@@ -1474,6 +1476,212 @@ impl MetalDevice {
             let _grad_storage =
                 cpu.from_cpu(&grad, &Shape::new(vec![batch, hidden_dim]), DType::F32)?;
             Ok(Box::new(MetalHandle))
+        }
+    }
+
+    /// Fused RMSNorm + MXFP4 GEMM.
+    /// Mirrors ROCm's `fused_rmsnorm_mxfp4_gemm`: x @ MXFP4(W) with fused RMSNorm.
+    /// W is stored as per-row interleaved [codes...(K+1)/2 bytes][shared_exps...(K/32) bytes].
+    pub fn fused_rmsnorm_mxfp4_gemm(
+        &self,
+        x: &dyn BackendStorage,
+        gamma: &dyn BackendStorage,
+        w_packed: &dyn BackendStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        eps: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm: x not MetalStorage".into())
+            })?;
+            let gamma_s = gamma.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm: gamma not MetalStorage".into())
+            })?;
+            let w_s = w_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm: w_packed not MetalStorage".into())
+            })?;
+            let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x no buffer".into()))?;
+            let gamma_buf = gamma_s.buffer.as_ref().ok_or_else(|| Error::Backend("gamma no buffer".into()))?;
+            let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("w_packed no buffer".into()))?;
+            let out_storage = self.zeros(&Shape::new(vec![m, n]), DType::F32)?;
+            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+            let out_buf = out_s.buffer.as_ref().unwrap();
+            let ctx = MetalContext::get()?;
+            let cmd = self.get_or_create_command_buffer()?;
+            let enc = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
+            enc.setComputePipelineState(&ctx.pipelines.fused_rmsnorm_mxfp4_gemm);
+            enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(w_buf), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(out_buf), 0, 3);
+            let m_val = m as i32;
+            let n_val = n as i32;
+            let k_val = k as i32;
+            unsafe {
+                enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                enc.setBytes_length_atIndex(&n_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 6);
+                enc.setBytes(&eps as *const f32 as *const std::ffi::c_void, 4, 7);
+            }
+            let tpg = MTLSize::new(16, 16, 1);
+            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(groups, tpg);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let cpu = CpuDevice::new();
+            let x_cpu = x.to_cpu_vec_f32()?;
+            let gamma_cpu = gamma.to_cpu_vec_f32()?;
+            // w_packed is MXFP4: raw u8 bytes (codes + shared exps), not f32.
+            // Downcast to MetalStorage and read the data Mutex directly.
+            let w_s = w_packed.as_any().downcast_ref::<MetalStorage>()
+                .ok_or_else(|| Error::Backend("fused_rmsnorm_mxfp4_gemm CPU fallback: w_packed not MetalStorage".into()))?;
+            let w_data = w_s.data.lock().unwrap();
+            let w_bytes: &[u8] = w_data.as_slice();
+            let codes_bytes = (k + 1) / 2;
+            let exps_bytes = k / 32;
+            let row_bytes = codes_bytes + exps_bytes;
+            let eps = eps.max(1e-5f32);
+            let mut out = vec![0.0f32; m * n];
+            for row in 0..m {
+                let x_row = &x_cpu[row * k..(row + 1) * k];
+                let mut mean = 0.0f32;
+                for &v in x_row { mean += v; }
+                mean /= k as f32;
+                let mut sum_sq = 0.0f32;
+                for &v in x_row { let d = v - mean; sum_sq += d * d; }
+                let inv_rms = 1.0f32 / (sum_sq / k as f32 + eps).sqrt();
+                let _w_row = &w_bytes[row * row_bytes..(row + 1) * row_bytes];
+                for col in 0..n {
+                    let w_col = &w_bytes[col * row_bytes..(col + 1) * row_bytes];
+                    let mut acc = 0.0f32;
+                    for i in 0..k {
+                        let byte_idx = i / 2;
+                        let packed = w_col[byte_idx];
+                        let nib = if (i % 2) == 0 { packed & 0x0F } else { packed >> 4 };
+                        let shared_exp = w_col[codes_bytes + i / 32];
+                        // Replicate metal_mxfp4_to_float in host-side fallback:
+                        // MXFP4 = 4-bit mantissa (bits 3:0), shared exponent from exps table.
+                        let mant = (nib & 0x0F) as f32 / 15.0f32;
+                        let exp_delta = (shared_exp as i32) - 124; // E4M3 bias 124 → exponent補
+                        let w = (if (nib & 0x08) != 0 { -mant } else { mant }) * (1.0f32 + mant) * (1u32 << (exp_delta.max(0) as u32)) as f32;
+                        acc += (x_row[i] * inv_rms * gamma_cpu[i]) * w;
+                    }
+                    out[row * n + col] = acc;
+                }
+            }
+            let os = cpu.from_cpu(&out, &Shape::new(vec![m, n]), DType::F32)?;
+            Ok((os, Box::new(MetalHandle)))
+        }
+    }
+
+    /// Fused RMSNorm + MXFP4 GEMM + RoPE + KV cache scatter.
+    /// Mirrors ROCm's `fused_rmsnorm_mxfp4_gemm_rope_kv`.
+    pub fn fused_rmsnorm_mxfp4_gemm_rope_kv(
+        &self,
+        x: &dyn BackendStorage,
+        gamma: &dyn BackendStorage,
+        wq_packed: &dyn BackendStorage,
+        wk_packed: &dyn BackendStorage,
+        wv_packed: &dyn BackendStorage,
+        q_out: Option<&dyn BackendStorage>,
+        k_cache: Option<&dyn BackendStorage>,
+        v_cache: Option<&dyn BackendStorage>,
+        positions: Option<&dyn BackendStorage>,
+        m: usize,
+        k: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: x not MetalStorage".into())
+            })?;
+            let gamma_s = gamma.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: gamma not MetalStorage".into())
+            })?;
+            let wq_s = wq_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: wq_packed not MetalStorage".into())
+            })?;
+            let wk_s = wk_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: wk_packed not MetalStorage".into())
+            })?;
+            let wv_s = wv_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: wv_packed not MetalStorage".into())
+            })?;
+            let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x no buffer".into()))?;
+            let gamma_buf = gamma_s.buffer.as_ref().ok_or_else(|| Error::Backend("gamma no buffer".into()))?;
+            let wq_buf = wq_s.buffer.as_ref().ok_or_else(|| Error::Backend("wq_packed no buffer".into()))?;
+            let wk_buf = wk_s.buffer.as_ref().ok_or_else(|| Error::Backend("wk_packed no buffer".into()))?;
+            let wv_buf = wv_s.buffer.as_ref().ok_or_else(|| Error::Backend("wv_packed no buffer".into()))?;
+            let q_out_buf = q_out.and_then(|o| {
+                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
+            }).ok_or_else(|| Error::Backend("q_out no buffer".into()))?;
+            let k_cache_buf = k_cache.and_then(|o| {
+                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
+            }).ok_or_else(|| Error::Backend("k_cache no buffer".into()))?;
+            let v_cache_buf = v_cache.and_then(|o| {
+                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
+            }).ok_or_else(|| Error::Backend("v_cache no buffer".into()))?;
+            let pos_buf = positions.and_then(|o| {
+                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
+            }).ok_or_else(|| Error::Backend("positions no buffer".into()))?;
+            let ctx = MetalContext::get()?;
+            let cmd = self.get_or_create_command_buffer()?;
+            let enc = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
+            enc.setComputePipelineState(&ctx.pipelines.fused_rmsnorm_mxfp4_gemm_rope_kv);
+            enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(wq_buf), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(wk_buf), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(wv_buf), 0, 4);
+            enc.setBuffer_offset_atIndex(Some(q_out_buf), 0, 5);
+            enc.setBuffer_offset_atIndex(Some(k_cache_buf), 0, 6);
+            enc.setBuffer_offset_atIndex(Some(v_cache_buf), 0, 7);
+            enc.setBuffer_offset_atIndex(Some(pos_buf), 0, 8);
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let q_dim_val = q_dim as i32;
+            let kv_dim_val = kv_dim as i32;
+            let rotary_dim_val = rotary_dim as i32;
+            let rope_theta_val = rope_theta;
+            let num_kv_heads_val = num_kv_heads as i32;
+            let head_dim_val = head_dim as i32;
+            unsafe {
+                enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 9);
+                enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 10);
+                enc.setBytes_length_atIndex(&q_dim_val as *const i32 as *const std::ffi::c_void, 4, 11);
+                enc.setBytes_length_atIndex(&kv_dim_val as *const i32 as *const std::ffi::c_void, 4, 12);
+                enc.setBytes_length_atIndex(&rotary_dim_val as *const i32 as *const std::ffi::c_void, 4, 13);
+                enc.setBytes(&rope_theta_val as *const f32 as *const std::ffi::c_void, 4, 14);
+                enc.setBytes_length_atIndex(&num_kv_heads_val as *const i32 as *const std::ffi::c_void, 4, 15);
+                enc.setBytes_length_atIndex(&head_dim_val as *const i32 as *const std::ffi::c_void, 4, 16);
+            }
+            let out_dim = q_dim.max(kv_dim);
+            let tpg = MTLSize::new(16, 16, 1);
+            let groups = MTLSize::new(((out_dim + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(groups, tpg);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            return Ok(Box::new(MetalHandle { command_buffer: cmd }));
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (x, gamma, wq_packed, wk_packed, wv_packed, q_out, k_cache, v_cache, positions, m, k, q_dim, kv_dim, rotary_dim, rope_theta, num_kv_heads, head_dim);
+            Err(Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: CPU fallback not implemented".into()))
         }
     }
 
