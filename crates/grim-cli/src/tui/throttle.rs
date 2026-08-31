@@ -5,8 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-/// Minimum interval between rendered frames. 16ms gives 60 FPS.
-pub const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Minimum interval between rendered frames. 8ms gives ~120 FPS for
+/// snappy picker navigation and typing response while still avoiding
+/// excessive CPU use during idle streaming.
+pub const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Synchronous render scheduler. Lives on the UI thread, no background task.
 #[derive(Debug)]

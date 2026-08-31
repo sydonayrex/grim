@@ -87,6 +87,41 @@ impl CommandRegistry {
             description: "Show available commands and keybindings",
         });
         reg.register(CommandSpec {
+            name: "skill",
+            hint: "[name|off]",
+            description: "Activate a skill by name, or open the skill picker",
+        });
+        reg.register(CommandSpec {
+            name: "skills",
+            hint: "",
+            description: "List all discovered skills",
+        });
+        reg.register(CommandSpec {
+            name: "project",
+            hint: "<path>",
+            description: "Set the project directory (sandbox root for tools)",
+        });
+        reg.register(CommandSpec {
+            name: "cd",
+            hint: "<path>",
+            description: "Alias for /project — set the working directory",
+        });
+        reg.register(CommandSpec {
+            name: "pwd",
+            hint: "",
+            description: "Print the current project directory",
+        });
+        reg.register(CommandSpec {
+            name: "think",
+            hint: "[off|low|medium|high]",
+            description: "Set thinking/reasoning effort level (Ctrl+T to cycle)",
+        });
+        reg.register(CommandSpec {
+            name: "backend",
+            hint: "[rocm|cuda|metal|cpu|auto]",
+            description: "Select inference backend (auto-detect if unset)",
+        });
+        reg.register(CommandSpec {
             name: "exit",
             hint: "",
             description: "Quit GRIM TUI",

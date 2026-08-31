@@ -4239,69 +4239,83 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
         match s.as_str() {
             #[cfg(feature = "cuda")]
             "cuda" => {
-                if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
-                    if let Some(first) = cuda_devices.first() {
-                        log::info!(
-                            "[model_loader] Using CUDA device {} (forced)",
-                            first.ordinal()
-                        );
-                        let dev = Device::Cuda(first.ordinal());
-                        return if is_grim {
-                            load_model_from_grim(path, dev)
-                        } else if is_safetensors {
-                            load_model_from_safetensors(path, dev)
-                        } else {
-                            load_model_from_gguf(path, dev)
-                        };
-                    }
-                }
+                let cuda_devices = grim_backend_cuda::CudaDevice::probe().map_err(|e| {
+                    Error::Config(format!(
+                        "CUDA backend forced via GRIM_BACKEND but probe failed: {e}"
+                    ))
+                })?;
+                let first = cuda_devices.first().ok_or_else(|| {
+                    Error::Config(
+                        "CUDA backend forced via GRIM_BACKEND but no device found".into(),
+                    )
+                })?;
+                log::info!(
+                    "[model_loader] Using CUDA device {} (forced)",
+                    first.ordinal()
+                );
+                let dev = Device::Cuda(first.ordinal());
+                return if is_grim {
+                    load_model_from_grim(path, dev)
+                } else if is_safetensors {
+                    load_model_from_safetensors(path, dev)
+                } else {
+                    load_model_from_gguf(path, dev)
+                };
             }
             "rocm" => {
-                if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-                    // Under multi-process TP, pin this process to its own rank
-                    // ordinal (from GRIM_TP_RANK / GRIM_GPUS) rather than
-                    // always using the first visible device — otherwise every
-                    // rank would load onto the same GPU and the collective
-                    // would deadlock waiting for peers that never started.
-                    let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
-                    let rank = TensorParallelConfig::from_env()
-                        .map(|t| t.rank)
-                        .unwrap_or(0);
-                    let chosen = match my_ordinal {
-                        Some(ord) => {
-                            let d = rocm_devices
-                                .iter()
-                                .find(|dev| dev.ordinal() == ord)
-                                .ok_or_else(|| {
-                                    Error::Config(format!(
-                                        "TP rank {rank} needs ROCm ordinal {ord} but it is not \
-                                         visible (probe found {n} device(s))",
-                                        n = rocm_devices.len()
-                                    ))
-                                })?;
-                            log::info!(
-                                "[model_loader] Using ROCm device {ord} (forced, TP rank {rank})"
-                            );
-                            d.ordinal()
-                        }
-                        None => {
-                            let first = rocm_devices.first().expect("checked above");
-                            log::info!(
-                                "[model_loader] Using ROCm device {} (forced)",
-                                first.ordinal()
-                            );
-                            first.ordinal()
-                        }
-                    };
-                    let dev = Device::Rocm(chosen);
-                    return if is_grim {
-                        load_model_from_grim(path, dev)
-                    } else if is_safetensors {
-                        load_model_from_safetensors(path, dev)
-                    } else {
-                        load_model_from_gguf(path, dev)
-                    };
+                let rocm_devices = grim_backend_rocm::RocmDevice::probe().map_err(|e| {
+                    Error::Config(format!(
+                        "ROCm backend forced via GRIM_BACKEND but probe failed: {e}"
+                    ))
+                })?;
+                if rocm_devices.is_empty() {
+                    return Err(Error::Config(
+                        "ROCm backend forced via GRIM_BACKEND but no device found".into(),
+                    ));
                 }
+                // Under multi-process TP, pin this process to its own rank
+                // ordinal (from GRIM_TP_RANK / GRIM_GPUS) rather than
+                // always using the first visible device — otherwise every
+                // rank would load onto the same GPU and the collective
+                // would deadlock waiting for peers that never started.
+                let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
+                let rank = TensorParallelConfig::from_env()
+                    .map(|t| t.rank)
+                    .unwrap_or(0);
+                let chosen = match my_ordinal {
+                    Some(ord) => {
+                        let d = rocm_devices
+                            .iter()
+                            .find(|dev| dev.ordinal() == ord)
+                            .ok_or_else(|| {
+                                Error::Config(format!(
+                                    "TP rank {rank} needs ROCm ordinal {ord} but it is not \
+                                     visible (probe found {n} device(s))",
+                                    n = rocm_devices.len()
+                                ))
+                            })?;
+                        log::info!(
+                            "[model_loader] Using ROCm device {ord} (forced, TP rank {rank})"
+                        );
+                        d.ordinal()
+                    }
+                    None => {
+                        let first = rocm_devices.first().expect("checked above");
+                        log::info!(
+                            "[model_loader] Using ROCm device {} (forced)",
+                            first.ordinal()
+                        );
+                        first.ordinal()
+                    }
+                };
+                let dev = Device::Rocm(chosen);
+                return if is_grim {
+                    load_model_from_grim(path, dev)
+                } else if is_safetensors {
+                    load_model_from_safetensors(path, dev)
+                } else {
+                    load_model_from_gguf(path, dev)
+                };
             }
             "cpu" => {
                 log::info!("[model_loader] Using CPU (forced)");
@@ -4314,7 +4328,16 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                     load_model_from_gguf(path, dev)
                 };
             }
-            _ => {}
+            // Availability already verified above; this is unreachable for
+            // valid backends. If we reach it, the backend was somehow marked
+            // available but has no match arm — fail loudly rather than silently
+            // falling through to auto-detection.
+            other => {
+                return Err(Error::Config(format!(
+                    "backend '{other}' availability check passed but no match arm found — \
+                     this is a bug in the backend selection logic"
+                )));
+            }
         }
     }
 

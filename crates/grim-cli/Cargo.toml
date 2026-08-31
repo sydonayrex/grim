@@ -26,7 +26,7 @@ grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true }
 grim-backend-cuda = { workspace = true, optional = true }
 grim-backend-vulkan = { workspace = true }
-grim-backend-metal = { workspace = true }
+grim-backend-metal = { workspace = true, optional = true }
 grim-speculative = { workspace = true }
 grim-plugin = { workspace = true }
 grim-format = { workspace = true }
@@ -52,14 +52,22 @@ crossterm = "0.28"
 pulldown-cmark = "0.12"
 syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "plist-load"] }
 toml = "0.8"
+# Safely redirect stderr to a log file during TUI model loading so
+# backend debug output doesn't corrupt the raw-mode terminal display.
+gag = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
-default = ["rocm"]
+# All GPU backends enabled by default — the TUI's /backend command
+# switches between them at runtime. If a backend's SDK is missing at
+# build time (e.g. no CUDA toolkit), the build fails with a clear error
+# telling you to use --no-default-features.
+default = ["rocm", "cuda", "metal"]
 rocm = ["grim-backend-rocm/cubecl"]
-cuda = ["dep:grim-backend-cuda"]
+cuda = ["dep:grim-backend-cuda", "grim-nn/cuda-mem", "grim-engine/cuda", "grim-autograd/cuda-mem"]
+metal = ["dep:grim-backend-metal"]
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]
 
 [lints]

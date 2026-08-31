@@ -16,7 +16,7 @@
 | `src/kernels/*.rs` modules | 53 | n/a (uses `src/kernels.msl`, 63 `kernel void` functions) | different representation |
 | `BackendDevice` trait methods | ~70 | ~55 | ~15 missing |
 || Backward passes (`*_backward`) | 6 | 6 (`silu_mul_backward`, `quantized_matmul_backward_dx`, `rmsnorm_backward`, `rope_backward`, `softmax_backward`, `embedding_backward`) | **0 — parity** |
-|| Fused GEMM wrappers | `fused_mxfp4_gemm_qk_norm_rope_kv`, `fused_rmsnorm_mxfp4_gemm*`, `fused_linear_cross_entropy_*` | `fused_linear_cross_entropy_forward` + `_backward` dispatchers wired (5 of 5: kernel + pipeline + dispatch all present) | **4 remaining (mxfp4, rmsnorm_mxfp4)** |
+|| Fused GEMM wrappers | `fused_mxfp4_gemm_qk_norm_rope_kv`, `fused_rmsnorm_mxfp4_gemm*`, `fused_linear_cross_entropy_*` | `fused_linear_cross_entropy_forward` + `_backward` dispatchers wired (5 of 5: kernel + pipeline + dispatch all present); `fused_dequant_gemm_mxfp4` kernel in `kernels.msl:2535` + pipeline slot + dispatch branch in `quantized_matmul` (complete — MXFP4 fast-path mirrors FP8/Q4K structure) | **3 remaining (mxfp4_gemm_qk_norm_rope_kv, rmsnorm_mxfp4 ×2)** |
 || Attention decode | `flash_decode` (stage1+stage2) | `flash_decode` dispatcher in `lib.rs` wrapping `grim_flash_decode_split_k` + `grim_softmax_merge` (complete) | **parity** |
 | Quantized GEMM families | `q2k/q3k/q4k/q5k/q6k/q8_0/iq_*` + AWQ/GPTQ + `bf16`/`compressed` | `q4k/q5k/q6k/q8_0` + `iq2xxs/iq2xs/iq2s/iq3xxs/iq3s/iq4nl/iq4xs` dequant only | **−10 missing** |
 | Dequant wrappers (host) | full + `dequant_w4a16`, `dequant_wna16` | partial | partial |

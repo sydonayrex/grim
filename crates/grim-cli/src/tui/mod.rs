@@ -45,11 +45,17 @@ pub mod frecency;
 /// Markdown → ratatui rendering.
 pub mod markdown;
 
+/// Skill discovery and loading from SKILL.md files.
+pub mod skills;
+
 /// Speed history ring buffer for sparklines.
 pub mod sparkline;
 
 /// Structured transcript with reasoning trace folding.
 pub mod transcript;
+
+/// Agent task list panel for the sidebar.
+pub mod tasks;
 
 /// Keyboard-navigable selection menu.
 pub mod select_list;
@@ -80,12 +86,16 @@ pub use frecency::Frecency;
 pub use kill_ring::{KillPushOpts, KillRing};
 pub use layout::{Basis, HStack, LayoutNode, ScrollView, ScrollViewOptions, StackEntry, StackOptions, VStack};
 pub use select_list::{SelectAction, SelectItem, SelectList, SelectListTheme};
+pub use skills::{Skill, default_skills_dir, discover_skills, find_skill, load_skill_body};
 pub use sparkline::SpeedHistory;
 pub use toast::{Toast, ToastVariant, render_toast};
 pub use throttle::{RenderScheduler, MIN_FRAME_INTERVAL};
 pub use transcript::{MessageNode, Role, Transcript};
 pub use undo_stack::UndoStack;
 pub use worker::{DiagnosticsSnapshot, TurnStats, WorkerCommand, WorkerEvent, WorkerParams};
+
+/// Re-export of the task list types for convenience.
+pub use tasks::{Task, TaskList, TaskStatus};
 
 /// Slash commands parsed from the input line.
 #[derive(Debug, PartialEq)]
@@ -99,6 +109,18 @@ pub enum SlashCommand {
     Save(String),
     Edit,
     ShowEditor,
+    /// Activate a skill by name (or list skills if no name given).
+    Skill(Option<String>),
+    /// List all discovered skills.
+    Skills,
+    /// Set the project directory (sandbox root for tools + cwd for @file).
+    ProjectDir(String),
+    /// Print the current project directory.
+    Pwd,
+    /// Set the thinking/reasoning effort level (off, low, medium, high, max).
+    Thinking(Option<String>),
+    /// Select the inference backend (rocm, cuda, metal, cpu, auto).
+    Backend(Option<String>),
     Exit,
     Clear,
     Help,
@@ -136,6 +158,17 @@ pub fn parse_slash_command(input: &str) -> SlashCommand {
         "save" => SlashCommand::Save(after.trim().to_string()),
         "edit" => SlashCommand::Edit,
         "editor" => SlashCommand::ShowEditor,
+        "skill" if after.is_empty() => SlashCommand::Skill(None),
+        "skill" => SlashCommand::Skill(Some(after.trim().to_string())),
+        "skills" => SlashCommand::Skills,
+        "project" if after.is_empty() => SlashCommand::ProjectDir(String::new()),
+        "project" => SlashCommand::ProjectDir(after.trim().to_string()),
+        "cd" => SlashCommand::ProjectDir(after.trim().to_string()),
+        "pwd" => SlashCommand::Pwd,
+        "think" | "thinking" if after.is_empty() => SlashCommand::Thinking(None),
+        "think" | "thinking" => SlashCommand::Thinking(Some(after.trim().to_string())),
+        "backend" if after.is_empty() => SlashCommand::Backend(None),
+        "backend" => SlashCommand::Backend(Some(after.trim().to_string())),
         _ => SlashCommand::Unknown(first_word.to_string()),
     }
 }
@@ -179,6 +212,12 @@ pub enum InputMode {
     CommandPalette { selected: usize },
     /// Interactive session browser overlay.
     SessionBrowser { selected: usize },
+    /// Interactive skill picker overlay (Ctrl+G).
+    SkillPicker { selected: usize },
+    /// Interactive backend picker overlay (Ctrl+B).
+    BackendPicker { selected: usize },
+    /// Project directory input mode (type a path to set the sandbox root).
+    ProjectDir,
 }
 
 /// State driving the terminal render loop.
@@ -212,10 +251,30 @@ pub struct App {
     pub sandbox_root: PathBuf,
     /// Whether the user is being asked to approve a tool call.
     pub tool_approval_mode: bool,
+    /// Frame counter incremented each render cycle, used for spinner animation.
+    pub frame_count: u64,
+    /// Discovered skills from the skills directory.
+    pub skills: Vec<crate::tui::skills::Skill>,
+    /// Name of the currently active skill (body injected into system prompt).
+    pub active_skill_name: Option<String>,
+    /// Project directory set by /project or /cd; defaults to current_dir.
+    pub project_dir: PathBuf,
+    /// Current thinking/reasoning effort level.
+    pub thinking_level: grim_core::sampler::ThinkingLevel,
+    /// Agent task list rendered in the sidebar.
+    pub task_list: crate::tui::tasks::TaskList,
+    /// Selected inference backend (rocm, cuda, metal, cpu). None = auto-detect.
+    pub backend: Option<String>,
 }
 
 impl App {
     pub fn new(cmd_tx: Sender<WorkerCommand>) -> Self {
+        let project_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // Discover skills from the default skills directory.
+        let skills = crate::tui::skills::default_skills_dir()
+            .map(|dir| crate::tui::skills::discover_skills(&dir))
+            .unwrap_or_default();
         Self {
             composer: Composer::new(),
             transcript: Transcript::new(),
@@ -237,8 +296,15 @@ impl App {
             generation_complete_notified: false,
             pending_tool_call: None,
             tools: crate::tui::tools::coding_tools(),
-            sandbox_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            sandbox_root: project_dir.clone(),
             tool_approval_mode: false,
+            frame_count: 0,
+            skills,
+            active_skill_name: None,
+            project_dir,
+            thinking_level: grim_core::sampler::ThinkingLevel::Default,
+            task_list: crate::tui::tasks::TaskList::new(),
+            backend: std::env::var("GRIM_BACKEND").ok(),
         }
     }
 
@@ -346,6 +412,9 @@ impl App {
             InputMode::ModelPicker { selected } => self.handle_model_picker_key(key, selected),
             InputMode::CommandPalette { .. } => self.handle_palette_key(key),
             InputMode::SessionBrowser { .. } => self.handle_session_browser_key(key),
+            InputMode::SkillPicker { .. } => self.handle_skill_picker_key(key),
+            InputMode::BackendPicker { .. } => self.handle_backend_picker_key(key),
+            InputMode::ProjectDir => self.handle_project_dir_key(key),
         }
     }
 
@@ -435,7 +504,13 @@ impl App {
                 self.composer.move_cursor_left();
             }
             KeyCode::Right => {
-                self.composer.move_cursor_right();
+                // When the composer is empty and we have tasks, Right
+                // expands the selected task instead of moving the cursor.
+                if self.composer.text().is_empty() && !self.task_list.is_empty() {
+                    self.task_list.toggle_expand_selected();
+                } else {
+                    self.composer.move_cursor_right();
+                }
             }
             KeyCode::Home => {
                 self.composer.move_cursor_home();
@@ -444,10 +519,18 @@ impl App {
                 self.composer.move_cursor_end();
             }
             KeyCode::Up => {
-                self.composer.move_cursor_up();
+                if self.composer.text().is_empty() && !self.task_list.is_empty() {
+                    self.task_list.move_up();
+                } else {
+                    self.composer.move_cursor_up();
+                }
             }
             KeyCode::Down => {
-                self.composer.move_cursor_down();
+                if self.composer.text().is_empty() && !self.task_list.is_empty() {
+                    self.task_list.move_down();
+                } else {
+                    self.composer.move_cursor_down();
+                }
             }
             KeyCode::Char('a') if is_ctrl => {
                 self.composer.move_cursor_home();
@@ -487,10 +570,48 @@ impl App {
                 // Session browser: interactive session list.
                 self.input_mode = InputMode::SessionBrowser { selected: 0 };
             }
+            KeyCode::Char('g') if is_ctrl => {
+                // Skill picker: fuzzy-searchable list of discovered skills.
+                self.input_mode = InputMode::SkillPicker { selected: 0 };
+            }
+            KeyCode::Char('d') if is_ctrl => {
+                // Project directory: type or pick the sandbox root.
+                self.composer.set_text(&self.project_dir.to_string_lossy());
+                self.input_mode = InputMode::ProjectDir;
+            }
+            KeyCode::Char('b') if is_ctrl => {
+                // Backend picker: open the interactive backend selection.
+                self.input_mode = InputMode::BackendPicker { selected: 0 };
+            }
+            KeyCode::Char('t') if is_ctrl => {
+                // Cycle thinking level: Default → Low → Medium → High → Off → Default.
+                use grim_core::sampler::ThinkingLevel;
+                self.thinking_level = match self.thinking_level {
+                    ThinkingLevel::Off => ThinkingLevel::Default,
+                    ThinkingLevel::Default => ThinkingLevel::Low,
+                    ThinkingLevel::Low => ThinkingLevel::Medium,
+                    ThinkingLevel::Medium => ThinkingLevel::High,
+                    ThinkingLevel::High => ThinkingLevel::Off,
+                    ThinkingLevel::Custom(_) => ThinkingLevel::Default,
+                };
+                let _ = self.cmd_tx.send(WorkerCommand::SetThinking {
+                    level: self.thinking_level,
+                });
+                let level_label = thinking_level_label(&self.thinking_level);
+                self.transcript
+                    .push_system(format!("thinking level: {level_label}"));
+                self.show_toast(Toast::info(format!("Thinking: {level_label}")));
+            }
             KeyCode::Char(c) => {
                 self.composer.insert_char(c);
             }
+            KeyCode::Tab if is_shift => {
+                // Shift+Tab: cycle the selected task's status.
+                self.task_list.cycle_selected_status();
+            }
             KeyCode::Tab => {
+                // Plain Tab: try command/@file autocomplete first, then
+                // toggle the last task's expand state if no text.
                 let text = self.composer.text();
                 let cursor = self.composer.cursor_offset();
                 // Prefer @file completion when an @ trigger is active near the cursor.
@@ -552,6 +673,10 @@ impl App {
             }
             KeyCode::Esc => {
                 let _ = self.cmd_tx.send(WorkerCommand::Cancel);
+                // Immediate UI feedback: show cancelling state.
+                if self.generating {
+                    self.transcript.push_system("cancelling...".into());
+                }
             }
             KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
@@ -658,6 +783,226 @@ impl App {
         }
     }
 
+    fn handle_skill_picker_key(&mut self, key: KeyEvent) {
+        let filtered_count = self.filtered_skills().len();
+        let selected = match &self.input_mode {
+            InputMode::SkillPicker { selected } => *selected,
+            _ => return,
+        };
+        match key.code {
+            KeyCode::Up => {
+                self.input_mode = InputMode::SkillPicker {
+                    selected: selected.saturating_sub(1),
+                };
+            }
+            KeyCode::Down => {
+                let new_sel = if filtered_count == 0 {
+                    0
+                } else {
+                    (selected + 1).min(filtered_count - 1)
+                };
+                self.input_mode = InputMode::SkillPicker { selected: new_sel };
+            }
+            KeyCode::Enter => {
+                self.input_mode = InputMode::Chat;
+                if let Some(skill) = self.filtered_skills().get(selected) {
+                    self.activate_skill(&skill.id);
+                }
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Chat;
+            }
+            KeyCode::Backspace => {
+                let mut filter = self.composer.text().trim_start_matches('/').to_string();
+                filter.pop();
+                if filter.is_empty() {
+                    self.composer.clear();
+                    self.input_mode = InputMode::Chat;
+                } else {
+                    self.composer.set_text(&format!("/{filter}"));
+                    self.input_mode = InputMode::SkillPicker { selected: 0 };
+                }
+            }
+            KeyCode::Char(c) => {
+                let current = self.composer.text();
+                let filter = current.trim_start_matches('/');
+                self.composer.set_text(&format!("/{filter}{c}"));
+                self.input_mode = InputMode::SkillPicker { selected: 0 };
+            }
+            _ => {}
+        }
+    }
+
+    /// Return skills filtered by the current picker query.
+    fn filtered_skills(&self) -> Vec<crate::tui::skills::Skill> {
+        let query = self
+            .composer
+            .text()
+            .trim_start_matches('/')
+            .trim()
+            .to_lowercase();
+        if query.is_empty() {
+            return self.skills.clone();
+        }
+        let mut scored: Vec<(i32, crate::tui::skills::Skill)> = self
+            .skills
+            .iter()
+            .filter_map(|s| {
+                let id_lower = s.id.to_lowercase();
+                let name_lower = s.name.to_lowercase();
+                let id_score = crate::tui::fuzzy::fuzzy_match(&query, &id_lower);
+                let name_score = crate::tui::fuzzy::fuzzy_match(&query, &name_lower);
+                match (id_score, name_score) {
+                    (Some(id), Some(name)) => Some((id.score.max(name.score), s.clone())),
+                    (Some(id), None) => Some((id.score, s.clone())),
+                    (None, Some(name)) => Some((name.score, s.clone())),
+                    (None, None) => None,
+                }
+            })
+            .collect();
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// Activate a skill by id: load its body and inject into the system prompt.
+    fn activate_skill(&mut self, skill_id: &str) {
+        let Some(skill) = self.skills.iter().find(|s| s.id == skill_id) else {
+            self.transcript
+                .push_error(format!("skill '{skill_id}' not found"));
+            return;
+        };
+        match crate::tui::skills::load_skill_body(skill) {
+            Ok(body) => {
+                let body = body.trim().to_string();
+                // Build a system prompt that wraps the skill body.
+                let injected = if let Some(existing) = &self.system_prompt {
+                    format!("{existing}\n\n# Skill: {}\n{body}", skill.name)
+                } else {
+                    format!("# Skill: {}\n{}", skill.name, body)
+                };
+                self.system_prompt = Some(injected.clone());
+                // Inject or replace the system message at the head of the conversation.
+                if let Some(first) = self.messages.first_mut() {
+                    if first.role == "system" {
+                        first.content = injected;
+                    } else {
+                        self.messages.insert(0, grim_format::ChatMessage {
+                            role: "system".to_string(),
+                            content: injected,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                        });
+                    }
+                } else {
+                    self.messages.push(grim_format::ChatMessage {
+                        role: "system".to_string(),
+                        content: injected,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+                self.active_skill_name = Some(skill.name.clone());
+                self.transcript.push_system(format!(
+                    "skill activated: {} ({})",
+                    skill.name, skill.id
+                ));
+                self.show_toast(Toast::success(format!("Skill activated: {}", skill.name)));
+            }
+            Err(e) => {
+                self.transcript
+                    .push_error(format!("failed to load skill '{}': {e}", skill.id));
+            }
+        }
+    }
+
+    fn handle_backend_picker_key(&mut self, key: KeyEvent) {
+        let backends = self.available_backends();
+        let selected = match &self.input_mode {
+            InputMode::BackendPicker { selected } => *selected,
+            _ => return,
+        };
+        match key.code {
+            KeyCode::Up => {
+                self.input_mode = InputMode::BackendPicker {
+                    selected: selected.saturating_sub(1),
+                };
+            }
+            KeyCode::Down => {
+                let next = if backends.is_empty() {
+                    0
+                } else {
+                    (selected + 1).min(backends.len() - 1)
+                };
+                self.input_mode = InputMode::BackendPicker { selected: next };
+            }
+            KeyCode::Enter => {
+                self.input_mode = InputMode::Chat;
+                if let Some(name) = backends.get(selected) {
+                    self.activate_backend(name);
+                }
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Chat;
+            }
+            _ => {}
+        }
+    }
+
+    /// Return the list of available backend names (for the picker).
+    fn available_backends(&self) -> Vec<String> {
+        let mut backends = vec!["auto".to_string(), "cpu".to_string()];
+        #[cfg(feature = "rocm")]
+        backends.push("rocm".to_string());
+        #[cfg(feature = "cuda")]
+        backends.push("cuda".to_string());
+        #[cfg(feature = "metal")]
+        backends.push("metal".to_string());
+        backends
+    }
+
+    fn handle_project_dir_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                let text = self.composer.submit();
+                self.input_mode = InputMode::Chat;
+                let path = text.trim();
+                if path.is_empty() {
+                    // Reset to current_dir.
+                    self.project_dir = std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                } else {
+                    let p = std::path::PathBuf::from(path);
+                    if p.is_dir() {
+                        self.project_dir = p.canonicalize().unwrap_or(p);
+                    } else {
+                        self.transcript
+                            .push_error(format!("not a directory: {path}"));
+                        return;
+                    }
+                }
+                // Update sandbox root to match the project dir.
+                self.sandbox_root = self.project_dir.clone();
+                self.transcript.push_system(format!(
+                    "project directory: {}",
+                    self.project_dir.display()
+                ));
+            }
+            KeyCode::Backspace => {
+                self.composer.delete_prev_char();
+            }
+            KeyCode::Char(c) => {
+                self.composer.insert_char(c);
+            }
+            KeyCode::Esc => {
+                self.composer.clear();
+                self.input_mode = InputMode::Chat;
+            }
+            _ => {}
+        }
+    }
+
     /// Return commands filtered by the current palette query.
     fn palette_filtered_commands(&self) -> Vec<crate::tui::commands::CommandSpec> {
         let query = self
@@ -721,7 +1066,7 @@ impl App {
                     ));
                 }
                 help_msg.push_str(
-                    "\nShortcuts:\n  Tab: Autocomplete command or @file / Toggle reasoning\n  F2: Toggle sidebar | F3: Context override | Esc: Cancel turn\n  Ctrl+A / Ctrl+E: Line start/end | Ctrl+W: Delete word | Ctrl+K: Kill | Ctrl+Y: Yank | Alt+Y: Yank-pop | Ctrl+Z: Undo | Alt+F/B: Jump",
+                    "\nShortcuts:\n  Tab: Autocomplete command or @file / Toggle reasoning\n  Shift+Tab: Cycle selected task status | →: Expand task | ↑/↓: Navigate tasks\n  F2: Toggle sidebar | F3: Context override | Esc: Cancel turn\n  Ctrl+P: Command palette | Ctrl+O: Sessions | Ctrl+G: Skills | Ctrl+T: Thinking | Ctrl+D: Project dir\n  Ctrl+A / Ctrl+E: Line start/end | Ctrl+W: Delete word | Ctrl+K: Kill | Ctrl+Y: Yank | Alt+Y: Yank-pop | Ctrl+Z: Undo | Alt+F/B: Jump",
                 );
                 self.transcript.push_system(help_msg);
             }
@@ -870,9 +1215,123 @@ impl App {
                     .unwrap_or_else(|_| "(not set)".to_string());
                 self.show_toast(Toast::info(format!("Editor: {editor}")));
             }
+            SlashCommand::Skill(None) => {
+                // No name — open the interactive skill picker.
+                self.input_mode = InputMode::SkillPicker { selected: 0 };
+            }
+            SlashCommand::Skill(Some(name)) => {
+                let name = name.trim();
+                if name.eq_ignore_ascii_case("off") || name.eq_ignore_ascii_case("clear") {
+                    // Deactivate the current skill.
+                    if self.active_skill_name.take().is_some() {
+                        // Remove the system message so the skill body is no longer injected.
+                        if let Some(pos) = self
+                            .messages
+                            .iter()
+                            .position(|m| m.role == "system")
+                        {
+                            self.messages.remove(pos);
+                        }
+                        self.system_prompt = None;
+                        self.transcript.push_system("skill deactivated".into());
+                        self.show_toast(Toast::info("Skill deactivated"));
+                    } else {
+                        self.transcript.push_system("no active skill".into());
+                    }
+                } else {
+                    self.activate_skill(name);
+                }
+            }
+            SlashCommand::Skills => {
+                // List all discovered skills in the transcript.
+                if self.skills.is_empty() {
+                    let dir = crate::tui::skills::default_skills_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "~/.agents/skills".into());
+                    self.transcript
+                        .push_system(format!("no skills found (scan dir: {dir})"));
+                } else {
+                    let mut msg = format!("discovered {} skills:\n", self.skills.len());
+                    for s in &self.skills {
+                        let desc = if s.description.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", s.description)
+                        };
+                        let active = self
+                            .active_skill_name
+                            .as_ref()
+                            .map(|a| if a == &s.name { " [active]" } else { "" })
+                            .unwrap_or("");
+                        msg.push_str(&format!("  /skill {}{}{}\n", s.id, desc, active));
+                    }
+                    self.transcript.push_system(msg);
+                }
+            }
+            SlashCommand::ProjectDir(path) => {
+                if path.is_empty() {
+                    // No path — open the interactive project dir input.
+                    self.composer
+                        .set_text(&self.project_dir.to_string_lossy());
+                    self.input_mode = InputMode::ProjectDir;
+                } else {
+                    let p = std::path::PathBuf::from(&path);
+                    if p.is_dir() {
+                        self.project_dir = p.canonicalize().unwrap_or(p);
+                        self.sandbox_root = self.project_dir.clone();
+                        self.transcript
+                            .push_system(format!("project directory: {}", self.project_dir.display()));
+                    } else {
+                        self.transcript
+                            .push_error(format!("not a directory: {path}"));
+                    }
+                }
+            }
+            SlashCommand::Pwd => {
+                self.transcript
+                    .push_system(format!("project directory: {}", self.project_dir.display()));
+            }
+            SlashCommand::Thinking(None) => {
+                // Report current level.
+                let label = thinking_level_label(&self.thinking_level);
+                self.transcript
+                    .push_system(format!("thinking level: {label}"));
+            }
+            SlashCommand::Thinking(Some(level_str)) => {
+                use grim_core::sampler::ThinkingLevel;
+                let level = ThinkingLevel::parse(&level_str);
+                self.thinking_level = level;
+                let _ = self.cmd_tx.send(WorkerCommand::SetThinking { level });
+                let label = thinking_level_label(&self.thinking_level);
+                self.transcript
+                    .push_system(format!("thinking level: {label}"));
+                self.show_toast(Toast::info(format!("Thinking: {label}")));
+            }
+            SlashCommand::Backend(None) => {
+                // Report current backend and available backends.
+                let available = available_backends();
+                let current = match &self.backend {
+                    Some(b) => b.clone(),
+                    None => "auto".into(),
+                };
+                let msg = format!(
+                    "backend: {current} — available: {}\n  /backend <name> to switch\n  /backend auto to reset",
+                    available.join(", ")
+                );
+                self.transcript.push_system(msg);
+            }
+            SlashCommand::Backend(Some(name)) => {
+                self.activate_backend(&name);
+            }
             SlashCommand::NotACommand => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
+                    return;
+                }
+                // Block generation if no model is loaded.
+                if self.snap.model_name.is_none() {
+                    self.transcript
+                        .push_system("no model loaded — use /model <name> first".into());
                     return;
                 }
                 if self.generating {
@@ -980,6 +1439,93 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Activate a backend by name (used by /backend command and the picker).
+    fn activate_backend(&mut self, name: &str) {
+        let name = name.trim().to_lowercase();
+        match name.as_str() {
+            "rocm" | "cuda" | "metal" | "cpu" | "auto" => {
+                if name != "auto" && !is_backend_available(&name) {
+                    self.transcript.push_error(format!(
+                        "backend '{name}' unavailable — not compiled in or no device.\n  Rebuild with --features {name} or use /backend auto."
+                    ));
+                    return;
+                }
+                if name == "auto" {
+                    self.backend = None;
+                    // SAFETY: called from the UI thread before model load.
+                    unsafe {
+                        std::env::remove_var("GRIM_BACKEND");
+                    }
+                    self.transcript.push_system("backend: auto (default)".into());
+                } else {
+                    self.backend = Some(name.clone());
+                    // SAFETY: called from the UI thread before model load.
+                    unsafe {
+                        std::env::set_var("GRIM_BACKEND", &name);
+                    }
+                    self.transcript.push_system(format!("backend: {name}"));
+                }
+                self.show_toast(Toast::info(format!("Backend: {name}")));
+            }
+            other => {
+                self.transcript.push_error(format!(
+                    "unknown backend '{other}' — expected rocm|cuda|metal|cpu|auto"
+                ));
+            }
+        }
+    }
+}
+
+/// Check if a backend is available (compiled in + device present).
+fn is_backend_available(name: &str) -> bool {
+    match name {
+        "cpu" => true,
+        "rocm" => grim_backend_rocm::RocmDevice::probe()
+            .map(|d| !d.is_empty())
+            .unwrap_or(false),
+        "metal" => grim_backend_metal::MetalDevice::probe()
+            .map(|d| !d.is_empty())
+            .unwrap_or(false),
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                grim_backend_cuda::CudaDevice::probe()
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false)
+            }
+            #[cfg(not(feature = "cuda"))]
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Return a list of available backend names (for display).
+fn available_backends() -> Vec<&'static str> {
+    let mut backends = vec!["auto", "cpu"];
+    if is_backend_available("rocm") {
+        backends.push("rocm");
+    }
+    if is_backend_available("cuda") {
+        backends.push("cuda");
+    }
+    if is_backend_available("metal") {
+        backends.push("metal");
+    }
+    backends
+}
+
+/// Return a human-readable label for a thinking level.
+fn thinking_level_label(level: &grim_core::sampler::ThinkingLevel) -> String {
+    match level {
+        grim_core::sampler::ThinkingLevel::Off => "off".into(),
+        grim_core::sampler::ThinkingLevel::Default => "default".into(),
+        grim_core::sampler::ThinkingLevel::Low => "low".into(),
+        grim_core::sampler::ThinkingLevel::Medium => "medium".into(),
+        grim_core::sampler::ThinkingLevel::High => "high".into(),
+        grim_core::sampler::ThinkingLevel::Custom(n) => format!("custom ({n})"),
     }
 }
 
@@ -1157,49 +1703,68 @@ impl Drop for TerminalGuard {
 
 /// Render one frame via the constrained layout engine.
 ///
-/// Allocation uses the `VStack`/`HStack` engine in `crate::tui::layout` so
-/// remaining space is distributed by `grow`/`shrink` with deterministic
-/// integer rounding, and very small terminals preserve at least one
-/// transcript row and the focused input cursor. Widget construction
-/// (`Paragraph`, `Block`, `Sparkline`) is unchanged; only area allocation
-/// goes through the engine.
+/// Color contract:
+/// - Primary panel borders: `#a855f7` (neon purple) when focused/active.
+/// - Inactive panel borders: dim purple `#703264`.
+/// - Input border changes to amber (#f59e0b) while generating, magenta while in tool-approval.
+/// - Body text is always white. Purple is reserved for borders, chips, and key labels.
+/// - A 1-row status-bar footer sits below the input box with model/tps/ctx info.
 fn ui(f: &mut Frame, app: &App) {
     use crate::tui::layout::{Basis, StackEntry, StackOptions};
 
-    let area = f.area();
-    let input_height = (app.composer.line_count() as u16 + 2).clamp(3, 8);
+    // Brand colors — neon purple to match grim-garage.
+    let c_purple     = Color::Rgb(168, 85, 247);   // #a855f7 primary
+    let c_purple_dim = Color::Rgb(112, 50, 180);   // inactive border
+    let c_purple_soft = Color::Rgb(192, 132, 252); // soft purple titles
+    let c_cyan       = Color::Rgb(34, 211, 238);   // assistant / sparkline
+    let c_amber      = Color::Rgb(245, 158, 11);   // generating
+    let c_magenta    = Color::Rgb(232, 121, 249);  // tool call
+    let c_green      = Color::Rgb(16, 185, 129);   // success
+    let _c_red       = Color::Rgb(239, 68, 68);    // error (used in transcript, not ui)
+    let c_muted      = Color::Rgb(136, 136, 136);  // muted text
 
-    // Outer vertical split: content (grow) vs input (fixed). This mirrors the
-    // previous `Layout::vertical([Min(3), Length(input_height)])` but via the
-    // engine so `VStack` semantics (grow/shrink, min/max clamping) apply.
-    let outer_content_height = area.height.saturating_sub(input_height).max(3);
-    let outer_input_height = input_height.min(area.height.saturating_sub(3).max(input_height));
-    let outer = [
-        Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: outer_content_height,
-        },
-        Rect {
-            x: area.x,
-            y: area.y + outer_content_height,
-            width: area.width,
-            height: area.height.saturating_sub(outer_content_height),
-        },
-    ];
-    // Keep a dummy VStack construction so the engine is exercised and
-    // `cargo test` covers the allocation path. The actual sizes are the
-    // `outer` rects above, which are equivalent to:
-    // `VStack([content grow:1 min:3, input Fixed(input_height) min:3 max:8])`
-    // but computed without allocating `Box<dyn LayoutNode>` for the hot path.
+    // Braille spinner frames.
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner_char = SPINNER[(app.frame_count as usize) % SPINNER.len()];
+
+    let area = f.area();
+
+    // Layout: content_area | input_bar (dynamic) | status_bar (1 row).
+    let input_height = (app.composer.line_count() as u16 + 2).clamp(3, 8);
+    let status_height: u16 = 1;
+    let content_height = area
+        .height
+        .saturating_sub(input_height + status_height)
+        .max(3);
+
+    let content_rect = Rect { x: area.x, y: area.y, width: area.width, height: content_height };
+    let input_rect   = Rect { x: area.x, y: area.y + content_height, width: area.width, height: input_height };
+    let status_rect  = Rect {
+        x: area.x,
+        y: area.y + content_height + input_height,
+        width: area.width,
+        height: status_height,
+    };
+
+    // Sidebar split.
+    let (chat_area, side_area) = if app.show_sidebar {
+        let total_w = content_rect.width;
+        let chat_w = ((total_w as u32 * 68) / 100) as u16;
+        let side_w = total_w.saturating_sub(chat_w).max(1).min(total_w.saturating_sub(1).max(1));
+        let chat_w = total_w.saturating_sub(side_w);
+        (
+            Rect { x: content_rect.x, y: content_rect.y, width: chat_w, height: content_rect.height },
+            Some(Rect { x: content_rect.x + chat_w, y: content_rect.y, width: side_w, height: content_rect.height }),
+        )
+    } else {
+        (content_rect, None)
+    };
+
+    // Engine layout check (keeps the layout engine exercised by tests).
     let _engine_check = crate::tui::layout::VStack::new(
         vec![
             StackEntry {
-                node: Box::new(crate::tui::layout::VStack::new(
-                    vec![],
-                    StackOptions { gap: 0 },
-                )),
+                node: Box::new(crate::tui::layout::VStack::new(vec![], StackOptions { gap: 0 })),
                 basis: Basis::Fixed(0),
                 grow: 1,
                 shrink: 1,
@@ -1207,11 +1772,8 @@ fn ui(f: &mut Frame, app: &App) {
                 max_size: None,
             },
             StackEntry {
-                node: Box::new(crate::tui::layout::VStack::new(
-                    vec![],
-                    StackOptions { gap: 0 },
-                )),
-                basis: Basis::Fixed(outer_input_height),
+                node: Box::new(crate::tui::layout::VStack::new(vec![], StackOptions { gap: 0 })),
+                basis: Basis::Fixed(input_height),
                 grow: 0,
                 shrink: 0,
                 min_size: 3,
@@ -1221,96 +1783,202 @@ fn ui(f: &mut Frame, app: &App) {
         StackOptions { gap: 0 },
     );
 
-    // Content horizontal split: chat vs sidebar. Previously
-    // `Layout::horizontal([Percentage(68), Percentage(32)])`; now via
-    // engine with proportional `grow` so `HStack` semantics apply.
-    let (chat_area, side_area) = if app.show_sidebar {
-        let total_w = outer[0].width;
-        // 68/32 split, clamped to at least 1 col for sidebar when visible.
-        let chat_w = ((total_w as u32 * 68) / 100) as u16;
-        let side_w = total_w.saturating_sub(chat_w).max(1).min(total_w.saturating_sub(1).max(1));
-        let chat_w = total_w.saturating_sub(side_w);
-        // Engine check: same split via HStack allocation.
-        let _hstack_check = crate::tui::layout::HStack::new(
-            vec![
-                StackEntry {
-                    node: Box::new(crate::tui::layout::VStack::new(vec![], StackOptions { gap: 0 })),
-                    basis: Basis::Fixed(chat_w),
-                    grow: 1,
-                    shrink: 1,
-                    min_size: 1,
-                    max_size: None,
-                },
-                StackEntry {
-                    node: Box::new(crate::tui::layout::VStack::new(vec![], StackOptions { gap: 0 })),
-                    basis: Basis::Fixed(side_w),
-                    grow: 0,
-                    shrink: 1,
-                    min_size: 1,
-                    max_size: None,
-                },
-            ],
-            StackOptions { gap: 0 },
-        );
-        (
-            Rect {
-                x: outer[0].x,
-                y: outer[0].y,
-                width: chat_w,
-                height: outer[0].height,
-            },
-            Some(Rect {
-                x: outer[0].x + chat_w,
-                y: outer[0].y,
-                width: side_w,
-                height: outer[0].height,
-            }),
-        )
-    } else {
-        (outer[0], None)
-    };
-
+    // -----------------------------------------------------------------------
+    // Chat panel — active purple border, dim title.
+    // -----------------------------------------------------------------------
+    let chat_border_color = if app.show_sidebar { c_purple } else { c_purple };
     let chat_items = app.transcript.render_lines();
     let chat = Paragraph::new(chat_items)
         .wrap(Wrap { trim: false })
         .scroll((app.scroll_offset as u16, 0))
-        .block(Block::bordered().title("Chat (Tab: reasoning fold | F2: sidebar | Esc: cancel)"));
+        .block(
+            Block::bordered()
+                .title(Span::styled(" GRIM ", Style::default().fg(c_purple_soft).add_modifier(Modifier::BOLD)))
+                .border_style(Style::default().fg(chat_border_color)),
+        );
     f.render_widget(chat, chat_area);
 
+    // -----------------------------------------------------------------------
+    // Sidebar panels — dim purple border.
+    //
+    // Three zones stacked vertically:
+    //   1. Diagnostics (top, flexible)
+    //   2. Agent task list (middle, flexible — shared space for tasks/todos)
+    //   3. tok/s sparkline (bottom, fixed 4 rows)
+    // -----------------------------------------------------------------------
     if let Some(area) = side_area {
-        let side_chunks = Layout::vertical([Constraint::Min(12), Constraint::Length(4)]).split(area);
-        let lines: Vec<Line> = diagnostics::sidebar_lines(&app.snap)
-            .into_iter()
-            .map(Line::from)
-            .collect();
-        let side = Paragraph::new(lines).block(Block::bordered().title("Diagnostics"));
+        let side_chunks = Layout::vertical([
+            Constraint::Min(8),      // diagnostics
+            Constraint::Min(4),      // task list
+            Constraint::Length(4),   // sparkline
+        ])
+        .split(area);
+
+        // 1) Diagnostics panel with styled key/value lines.
+        let styled_lines = diagnostics::sidebar_styled_lines(&app.snap);
+        let side = Paragraph::new(styled_lines).block(
+            Block::bordered()
+                .title(Span::styled(" diagnostics ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple_dim)),
+        );
         f.render_widget(side, side_chunks[0]);
 
+        // 2) Agent task list panel.
+        let task_max_rows = side_chunks[1].height.saturating_sub(2) as usize;
+        let task_lines = app.task_list.render(task_max_rows.max(3));
+        let task_panel = Paragraph::new(task_lines).block(
+            Block::bordered()
+                .title(Span::styled(" tasks ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple_dim)),
+        );
+        f.render_widget(task_panel, side_chunks[1]);
+
+        // 3) Sparkline with cyan bars.
         let spark_data = app.speed_history.as_slice();
         let spark = Sparkline::default()
-            .block(Block::bordered().title("Decode Speed (tok/s)"))
+            .block(
+                Block::bordered()
+                    .title(Span::styled(" tok/s ", Style::default().fg(c_purple_soft)))
+                    .border_style(Style::default().fg(c_purple_dim)),
+            )
             .data(spark_data)
-            .style(Style::default().fg(Color::Cyan));
-        f.render_widget(spark, side_chunks[1]);
+            .style(Style::default().fg(c_cyan));
+        f.render_widget(spark, side_chunks[2]);
     }
 
+    // -----------------------------------------------------------------------
+    // Input bar — border color and title reflect current mode.
+    // -----------------------------------------------------------------------
     let input_text = app.composer.text();
-    let title = match app.input_mode {
-        InputMode::Chat => "Input (/help · /model · /temp · /topp · /save · /edit · /exit · Ctrl+P palette · Ctrl+O sessions · F4 model picker)",
-        InputMode::CtxOverride => {
-            "Context limit override (Enter applies, empty = auto, Esc cancels)"
-        }
-        InputMode::ModelPicker { .. } => "Select model using arrow keys, press Enter to load",
-        InputMode::CommandPalette { .. } => "Filter commands (type to search, Enter to select, Esc to cancel)",
-        InputMode::SessionBrowser { .. } => "Select session to load (Enter loads, Esc cancels)",
+    let (input_border_color, input_title) = match &app.input_mode {
+        _ if app.tool_approval_mode => (
+            c_magenta,
+            format!(" ⚠  approve tool call?  Enter = yes   Esc = deny "),
+        ),
+        _ if app.generating => (
+            c_amber,
+            format!(" {} generating...  Esc to cancel ", spinner_char),
+        ),
+        InputMode::CtxOverride => (
+            c_green,
+            " ctx override  Enter applies, empty = auto, Esc cancels ".into(),
+        ),
+        InputMode::ModelPicker { .. } => (
+            c_green,
+            " model picker  arrow keys + Enter to load, Esc cancels ".into(),
+        ),
+        InputMode::CommandPalette { .. } => (
+            c_purple_soft,
+            " command palette  type to filter, Enter to run, Esc cancels ".into(),
+        ),
+        InputMode::SessionBrowser { .. } => (
+            c_purple_soft,
+            " sessions  Enter to load, Esc cancels ".into(),
+        ),
+        InputMode::SkillPicker { .. } => (
+            c_purple_soft,
+            " skills  type to filter, Enter to activate, Esc cancels ".into(),
+        ),
+        InputMode::BackendPicker { .. } => (
+            c_purple_soft,
+            " backend  arrow keys + Enter to select, Esc cancels ".into(),
+        ),
+        InputMode::ProjectDir => (
+            c_green,
+            " project directory  Enter to set, Esc cancels ".into(),
+        ),
+        InputMode::Chat => (
+            c_purple_dim,
+            " /  commands   @  files   Tab  autocomplete   F2  sidebar ".into(),
+        ),
     };
+
     f.render_widget(
-        Paragraph::new(input_text.as_str()).block(Block::bordered().title(title)),
-        outer[1],
+        Paragraph::new(input_text.as_str()).block(
+            Block::bordered()
+                .title(Span::styled(input_title, Style::default().fg(input_border_color)))
+                .border_style(Style::default().fg(input_border_color)),
+        ),
+        input_rect,
     );
 
-    // Render autocomplete popups. Slash commands and @file are mutually exclusive.
-    // Uses fuzzy matching via SelectList for typo tolerance.
+    // -----------------------------------------------------------------------
+    // Status bar — 1-row footer with model/tps/ctx info and key hints.
+    // -----------------------------------------------------------------------
+    {
+        let model_str = app
+            .snap
+            .model_name
+            .as_deref()
+            .unwrap_or("no model");
+        let tps_str = app
+            .snap
+            .decode_tps
+            .map(|v| format!("{:.0} tok/s", v))
+            .unwrap_or_default();
+        let ctx_str = if app.snap.ctx_limit > 0 {
+            format!("ctx {}/{}", app.snap.ctx_used, app.snap.ctx_limit)
+        } else {
+            String::new()
+        };
+        // Show the project directory basename (or full path if short).
+        let proj_str = if let Some(name) = app.project_dir.file_name().and_then(|n| n.to_str()) {
+            format!("dir:{name}")
+        } else {
+            format!("dir:{}", app.project_dir.display())
+        };
+        // Show active skill name if any.
+        let skill_str = app
+            .active_skill_name
+            .as_ref()
+            .map(|s| format!("skill:{s}"))
+            .unwrap_or_default();
+        // Show thinking level (compact).
+        let thinking_str = {
+            let label = thinking_level_label(&app.thinking_level);
+            format!("think:{label}")
+        };
+        // Show backend (compact).
+        let backend_str = match &app.backend {
+            Some(b) => b.clone(),
+            None => "auto".into(),
+        };
+        let hints = "Ctrl+P palette  Ctrl+G skills  Ctrl+B backend  Ctrl+T think  Ctrl+D project  F4 model  /help";
+
+        let mut status_spans = vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(model_str.to_string(), Style::default().fg(c_purple_soft).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default()),
+            Span::styled(tps_str, Style::default().fg(c_cyan)),
+            Span::styled("  ", Style::default()),
+            Span::styled(ctx_str, Style::default().fg(c_muted)),
+            Span::styled("  ", Style::default()),
+            Span::styled(proj_str, Style::default().fg(c_muted)),
+        ];
+        // Color thinking level: amber when off, green when enabled.
+        let thinking_color = matches!(app.thinking_level, grim_core::sampler::ThinkingLevel::Off)
+            .then(|| c_muted)
+            .unwrap_or(c_green);
+        status_spans.push(Span::styled("  ", Style::default()));
+        status_spans.push(Span::styled(thinking_str, Style::default().fg(thinking_color)));
+        // Backend indicator.
+        status_spans.push(Span::styled("  ", Style::default()));
+        status_spans.push(Span::styled(
+            format!("dev:{backend_str}"),
+            Style::default().fg(c_muted),
+        ));
+        if !skill_str.is_empty() {
+            status_spans.push(Span::styled("  ", Style::default()));
+            status_spans.push(Span::styled(skill_str, Style::default().fg(c_green)));
+        }
+        status_spans.push(Span::styled("  ", Style::default()));
+        status_spans.push(Span::styled(hints, Style::default().fg(c_muted)));
+        f.render_widget(Paragraph::new(Line::from(status_spans)), status_rect);
+    }
+
+    // -----------------------------------------------------------------------
+    // Autocomplete popups — slash commands and @file.
+    // -----------------------------------------------------------------------
     if app.input_mode == InputMode::Chat && input_text.starts_with('/') && !input_text.contains(' ') {
         let query = input_text.trim_start_matches('/').trim_start();
         let all_items: Vec<crate::tui::select_list::SelectItem> = app
@@ -1329,11 +1997,9 @@ fn ui(f: &mut Frame, app: &App) {
             crate::tui::select_list::SelectListTheme::default(),
         );
         if query.is_empty() {
-            // Show all commands when only "/" has been typed.
             menu.set_filter("");
         } else {
             menu.set_filter(query);
-            // Move selection to match the previously selected index for continuity.
             for _ in 0..(app.selected_completion % 6) {
                 menu.move_down();
             }
@@ -1342,18 +2008,20 @@ fn ui(f: &mut Frame, app: &App) {
         if filtered_count > 0 {
             let height = (filtered_count as u16 + 2).min(8);
             let popup_area = Rect {
-                x: outer[1].x + 1,
-                y: outer[1].y.saturating_sub(height),
-                width: 48.min(outer[1].width.saturating_sub(2)),
+                x: input_rect.x + 1,
+                y: input_rect.y.saturating_sub(height),
+                width: 52.min(input_rect.width.saturating_sub(2)),
                 height,
             };
             let completion_lines = menu.render(popup_area.width.saturating_sub(2));
-            let popup = Paragraph::new(completion_lines)
-                .block(Block::bordered().title("Autocomplete (Tab selects)"));
+            let popup = Paragraph::new(completion_lines).block(
+                Block::bordered()
+                    .title(Span::styled(" commands ", Style::default().fg(c_purple_soft)))
+                    .border_style(Style::default().fg(c_purple_dim)),
+            );
             f.render_widget(popup, popup_area);
         }
     } else if app.input_mode == InputMode::Chat {
-        // Check for @file trigger at the cursor position.
         let cursor = app.composer.cursor_offset();
         if let Some((_start, prefix)) =
             crate::tui::file_complete::extract_at_prefix(&input_text, cursor)
@@ -1361,12 +2029,7 @@ fn ui(f: &mut Frame, app: &App) {
             let after_at = prefix.trim_start_matches('@');
             let base = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let suggestions =
-                crate::tui::file_complete::get_file_suggestions_ranked(
-                    after_at,
-                    &base,
-                    50,
-                    &app.frecency,
-                );
+                crate::tui::file_complete::get_file_suggestions_ranked(after_at, &base, 50, &app.frecency);
             if !suggestions.is_empty() {
                 let items: Vec<crate::tui::select_list::SelectItem> = suggestions
                     .iter()
@@ -1385,21 +2048,26 @@ fn ui(f: &mut Frame, app: &App) {
                 if count > 0 {
                     let height = (count as u16 + 2).min(8);
                     let popup_area = Rect {
-                        x: outer[1].x + 1,
-                        y: outer[1].y.saturating_sub(height),
-                        width: 48.min(outer[1].width.saturating_sub(2)),
+                        x: input_rect.x + 1,
+                        y: input_rect.y.saturating_sub(height),
+                        width: 52.min(input_rect.width.saturating_sub(2)),
                         height,
                     };
                     let completion_lines = menu.render(popup_area.width.saturating_sub(2));
-                    let popup = Paragraph::new(completion_lines)
-                        .block(Block::bordered().title("Files (Tab selects)"));
+                    let popup = Paragraph::new(completion_lines).block(
+                        Block::bordered()
+                            .title(Span::styled(" files ", Style::default().fg(c_purple_soft)))
+                            .border_style(Style::default().fg(c_purple_dim)),
+                    );
                     f.render_widget(popup, popup_area);
                 }
             }
         }
     }
 
-    // Render model selection modal when in ModelPicker mode
+    // -----------------------------------------------------------------------
+    // Model picker modal.
+    // -----------------------------------------------------------------------
     if let InputMode::ModelPicker { selected } = app.input_mode {
         let models = grim_core::catalog::list_local_models();
         let height = (models.len() as u16 + 4).clamp(5, 16);
@@ -1410,33 +2078,35 @@ fn ui(f: &mut Frame, app: &App) {
 
         let mut lines = Vec::new();
         if models.is_empty() {
-            lines.push(Line::from("  No local models discovered in catalog."));
+            lines.push(Line::from(Span::styled("  No local models discovered in catalog.", Style::default().fg(c_muted))));
         } else {
             for (idx, m) in models.iter().enumerate() {
                 let is_sel = idx == selected;
                 let prefix = if is_sel { "▶ " } else { "  " };
-                let style = if is_sel {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                let _row_style = if is_sel {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let ctx_str = if m.context_length > 0 {
-                    format!("ctx {}", m.context_length)
-                } else {
-                    "ctx ?".into()
-                };
+                let name_color = if is_sel { c_purple } else { Color::White };
+                let ctx_str = if m.context_length > 0 { format!("ctx {}", m.context_length) } else { "ctx ?".into() };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}{:<24}", prefix, m.name), style),
-                    Span::styled(format!(" {:<8} {}", m.quant, ctx_str), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}{:<24}", prefix, m.name), Style::default().fg(name_color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
+                    Span::styled(format!(" {:<8} {}", m.quant, ctx_str), Style::default().fg(c_muted)),
                 ]));
             }
         }
-        let modal = Paragraph::new(lines)
-            .block(Block::bordered().title("Select Model to Hot-Swap (Enter loads, Esc cancels)"));
+        let modal = Paragraph::new(lines).block(
+            Block::bordered()
+                .title(Span::styled(" model picker  Enter to load ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
         f.render_widget(modal, modal_area);
     }
 
-    // Render command palette overlay.
+    // -----------------------------------------------------------------------
+    // Command palette modal.
+    // -----------------------------------------------------------------------
     if let InputMode::CommandPalette { selected } = app.input_mode {
         let filtered = app.palette_filtered_commands();
         let height = (filtered.len() as u16 + 4).clamp(5, 20);
@@ -1446,43 +2116,35 @@ fn ui(f: &mut Frame, app: &App) {
         let modal_area = Rect { x, y, width, height };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled(
-            "Type to filter commands, Enter to select, Esc to cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  type to filter  Enter to run  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::raw(""));
         for (idx, cmd) in filtered.iter().enumerate() {
             let is_sel = idx == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
-            let style = if is_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let hint_str = if cmd.hint.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", cmd.hint)
-            };
+            let name_color = if is_sel { c_purple } else { Color::White };
+            let hint_str = if cmd.hint.is_empty() { String::new() } else { format!(" {}", cmd.hint) };
             lines.push(Line::from(vec![
-                Span::styled(format!("{}{}{}", prefix, cmd.name, hint_str), style),
                 Span::styled(
-                    format!("  {}", cmd.description),
-                    Style::default().fg(Color::DarkGray),
+                    format!("{}{}{}", prefix, cmd.name, hint_str),
+                    Style::default().fg(name_color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
                 ),
+                Span::styled(format!("  {}", cmd.description), Style::default().fg(c_muted)),
             ]));
         }
         if filtered.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  No matching commands",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(Span::styled("  no matching commands", Style::default().fg(c_muted))));
         }
-        let modal = Paragraph::new(lines).block(Block::bordered().title("Command Palette (Ctrl+P)"));
+        let modal = Paragraph::new(lines).block(
+            Block::bordered()
+                .title(Span::styled(" command palette  Ctrl+P ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
         f.render_widget(modal, modal_area);
     }
 
-    // Render session browser overlay.
+    // -----------------------------------------------------------------------
+    // Session browser modal.
+    // -----------------------------------------------------------------------
     if let InputMode::SessionBrowser { selected } = app.input_mode {
         let sessions = app.discover_session_files();
         let height = (sessions.len() as u16 + 4).clamp(5, 20);
@@ -1492,42 +2154,173 @@ fn ui(f: &mut Frame, app: &App) {
         let modal_area = Rect { x, y, width, height };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled(
-            "Select a session to load, Enter to load, Esc to cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Enter to load  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::raw(""));
         for (idx, path) in sessions.iter().enumerate() {
             let is_sel = idx == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
-            let style = if is_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
+            let color = if is_sel { c_purple } else { Color::White };
             lines.push(Line::from(Span::styled(
                 format!("{}{}", prefix, path),
-                style,
+                Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
             )));
         }
         if sessions.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  No .jsonl session files found in current directory",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(Span::styled("  no .jsonl session files found", Style::default().fg(c_muted))));
         }
-        let modal = Paragraph::new(lines).block(Block::bordered().title("Session Browser (Ctrl+O)"));
+        let modal = Paragraph::new(lines).block(
+            Block::bordered()
+                .title(Span::styled(" sessions  Ctrl+O ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
         f.render_widget(modal, modal_area);
     }
 
+    // -----------------------------------------------------------------------
+    // Skill picker modal.
+    // -----------------------------------------------------------------------
+    if let InputMode::SkillPicker { selected } = app.input_mode {
+        // Recompute filtered skills using the same logic as the handler.
+        let query = app
+            .composer
+            .text()
+            .trim_start_matches('/')
+            .trim()
+            .to_lowercase();
+        let filtered: Vec<&crate::tui::skills::Skill> = if query.is_empty() {
+            app.skills.iter().collect()
+        } else {
+            let mut scored: Vec<(i32, &crate::tui::skills::Skill)> = app
+                .skills
+                .iter()
+                .filter_map(|s| {
+                    let id_lower = s.id.to_lowercase();
+                    let name_lower = s.name.to_lowercase();
+                    let id_score = crate::tui::fuzzy::fuzzy_match(&query, &id_lower);
+                    let name_score = crate::tui::fuzzy::fuzzy_match(&query, &name_lower);
+                    match (id_score, name_score) {
+                        (Some(id), Some(name)) => Some((id.score.max(name.score), s)),
+                        (Some(id), None) => Some((id.score, s)),
+                        (None, Some(name)) => Some((name.score, s)),
+                        (None, None) => None,
+                    }
+                })
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            scored.into_iter().map(|(_, s)| s).collect()
+        };
+
+        let height = (filtered.len() as u16 + 4).clamp(5, 20);
+        let width = 72.min(f.area().width.saturating_sub(4));
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled("  type to filter  Enter to activate  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::raw(""));
+        for (idx, skill) in filtered.iter().enumerate() {
+            let is_sel = idx == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let color = if is_sel { c_purple } else { Color::White };
+            let active_marker = if app.active_skill_name.as_ref() == Some(&skill.name) {
+                " ●"
+            } else {
+                ""
+            };
+            let desc_str = if skill.description.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", skill.description)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{}{}", prefix, skill.id, desc_str),
+                    Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(active_marker.to_string(), Style::default().fg(c_green)),
+            ]));
+        }
+        if filtered.is_empty() {
+            let dir = crate::tui::skills::default_skills_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "~/.agents/skills".into());
+            lines.push(Line::from(Span::styled(
+                format!("  no skills found (scan dir: {dir})"),
+                Style::default().fg(c_muted),
+            )));
+        }
+        let modal = Paragraph::new(lines).block(
+            Block::bordered()
+                .title(Span::styled(" skills  Ctrl+G ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend picker modal.
+    // -----------------------------------------------------------------------
+    if let InputMode::BackendPicker { selected } = app.input_mode {
+        let backends = app.available_backends();
+        let height = (backends.len() as u16 + 4).clamp(5, 12);
+        let width = 48.min(f.area().width.saturating_sub(4));
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled("  Enter to select  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::raw(""));
+        for (idx, name) in backends.iter().enumerate() {
+            let is_sel = idx == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let color = if is_sel { c_purple } else { Color::White };
+            // Mark the currently active backend.
+            let active_marker = if app.backend.as_deref() == Some(name.as_str())
+                || (name == "auto" && app.backend.is_none())
+            {
+                " ●"
+            } else {
+                ""
+            };
+            let desc = match name.as_str() {
+                "auto" => "auto-detect",
+                "cpu" => "CPU only",
+                "rocm" => "AMD GPU (ROCm)",
+                "cuda" => "NVIDIA GPU (CUDA)",
+                "metal" => "Apple GPU (Metal)",
+                _ => "",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{}", prefix, name),
+                    Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(format!(" — {desc}"), Style::default().fg(c_muted)),
+                Span::styled(active_marker.to_string(), Style::default().fg(c_green)),
+            ]));
+        }
+        let modal = Paragraph::new(lines).block(
+            Block::bordered()
+                .title(Span::styled(" backend  Ctrl+B ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor position.
+    // -----------------------------------------------------------------------
     let (c_row, c_col) = app.composer.cursor_row_col();
     f.set_cursor_position(Position::new(
-        outer[1].x + 1 + c_col as u16,
-        outer[1].y + 1 + c_row as u16,
+        input_rect.x + 1 + c_col as u16,
+        input_rect.y + 1 + c_row as u16,
     ));
 
-    // Render toast overlay in the top-right corner.
-    // Render tool-call approval overlay.
+    // -----------------------------------------------------------------------
+    // Tool-call approval modal.
+    // -----------------------------------------------------------------------
     if let Some((call_id, name, arguments)) = &app.pending_tool_call {
         let width = 72.min(f.area().width.saturating_sub(4));
         let height = 12u16;
@@ -1540,40 +2333,37 @@ fn ui(f: &mut Frame, app: &App) {
             .unwrap_or_else(|_| arguments.clone());
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled(
-            format!("⚙ Tool Call: {}", name),
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!("  id: {}", call_id),
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Arguments:",
-            Style::default().fg(Color::White),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("  tool: ", Style::default().fg(c_muted)),
+            Span::styled(name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  id: {}", call_id), Style::default().fg(c_muted)),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("  arguments:", Style::default().fg(c_purple_soft))));
         for arg_line in pretty.lines().take(5) {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", arg_line),
-                Style::default().fg(Color::LightMagenta),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("    + ", Style::default().fg(c_green)),
+                Span::styled(arg_line.to_string(), Style::default().fg(Color::White)),
+            ]));
         }
-        lines.push(Line::from(""));
+        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "  Enter/y = approve · Esc/n = deny",
-            Style::default().fg(Color::Yellow),
+            "  Enter / y = approve     Esc / n = deny",
+            Style::default().fg(c_amber).add_modifier(Modifier::BOLD),
         )));
         let modal = Paragraph::new(lines).block(
             Block::bordered()
-                .title("Tool Approval")
-                .border_style(Style::default().fg(Color::Magenta)),
+                .title(Span::styled(" tool approval ", Style::default().fg(c_magenta).add_modifier(Modifier::BOLD)))
+                .border_style(Style::default().fg(c_magenta)),
         );
         f.render_widget(modal, modal_area);
     }
 
+    // -----------------------------------------------------------------------
+    // Toast notification — top-right corner.
+    // -----------------------------------------------------------------------
     if let Some(toast) = &app.toast {
-        let toast_width = 40.min(f.area().width.saturating_sub(4));
+        let toast_width = 44.min(f.area().width.saturating_sub(4));
         let toast_lines = render_toast(toast, toast_width);
         let toast_height = toast_lines.len() as u16 + 2;
         let toast_area = Rect {
@@ -1582,14 +2372,18 @@ fn ui(f: &mut Frame, app: &App) {
             width: toast_width,
             height: toast_height,
         };
+        let toast_border_color = toast.variant.color();
         let toast_widget = Paragraph::new(toast_lines).block(
             Block::bordered()
-                .title("Notice")
-                .border_style(Style::default().fg(toast.variant.color())),
+                .title(Span::styled(" notice ", Style::default().fg(toast_border_color)))
+                .border_style(Style::default().fg(toast_border_color)),
         );
         f.render_widget(toast_widget, toast_area);
     }
 }
+
+
+
 
 /// Entry point for the `grim tui` command.
 ///
@@ -1644,7 +2438,9 @@ pub async fn cmd_tui(
             scheduler.request_render();
         }
         // Handle terminal resize as a full redraw trigger.
-        if crossterm::event::poll(Duration::from_millis(50))
+        // Short poll timeout (10ms) keeps input latency low for snappy picker
+        // navigation and typing response.
+        if crossterm::event::poll(Duration::from_millis(10))
             .map_err(|e| Error::Config(format!("terminal poll failed: {e}")))?
         {
             let event = crossterm::event::read()
@@ -1669,6 +2465,7 @@ pub async fn cmd_tui(
             }
         }
         if scheduler.should_render() {
+            app.frame_count = app.frame_count.wrapping_add(1);
             term.draw(|f| ui(f, &app))
                 .map_err(|e| Error::Config(format!("render failed: {e}")))?;
         }
@@ -1747,6 +2544,38 @@ mod tests {
         assert!(matches!(
             parse_slash_command("  /model x "),
             SlashCommand::Model(Some(m)) if m == "x"
+        ));
+        assert!(matches!(
+            parse_slash_command("/skill"),
+            SlashCommand::Skill(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/skill caveman"),
+            SlashCommand::Skill(Some(s)) if s == "caveman"
+        ));
+        assert!(matches!(
+            parse_slash_command("/skill off"),
+            SlashCommand::Skill(Some(s)) if s == "off"
+        ));
+        assert!(matches!(
+            parse_slash_command("/skills"),
+            SlashCommand::Skills
+        ));
+        assert!(matches!(
+            parse_slash_command("/project"),
+            SlashCommand::ProjectDir(p) if p.is_empty()
+        ));
+        assert!(matches!(
+            parse_slash_command("/project /tmp"),
+            SlashCommand::ProjectDir(p) if p == "/tmp"
+        ));
+        assert!(matches!(
+            parse_slash_command("/cd /tmp"),
+            SlashCommand::ProjectDir(p) if p == "/tmp"
+        ));
+        assert!(matches!(
+            parse_slash_command("/pwd"),
+            SlashCommand::Pwd
         ));
     }
 
@@ -1995,5 +2824,405 @@ mod tests {
             result,
             Ok(WorkerCommand::ToolResult { call_id, output }) if call_id == "call_3" && output.contains("denied")
         ));
+    }
+
+    #[test]
+    fn test_skill_picker_key_handling() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Seed at least one skill so the picker has something to show.
+        app.skills.push(crate::tui::skills::Skill {
+            id: "caveman".into(),
+            name: "Caveman".into(),
+            description: "terse mode".into(),
+            path: std::path::PathBuf::from("/fake/caveman/SKILL.md"),
+        });
+
+        // Open picker with Ctrl+G.
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            app.input_mode,
+            InputMode::SkillPicker { selected: 0 }
+        ));
+
+        // Escape returns to chat.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.input_mode, InputMode::Chat);
+    }
+
+    #[test]
+    fn test_activate_skill_by_name() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Create a temp skill directory with a SKILL.md.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_md,
+            "---\nname: Test Skill\ndescription: A test skill\n---\n\nYou are a test assistant.",
+        )
+        .unwrap();
+
+        app.skills.push(crate::tui::skills::Skill {
+            id: "test-skill".into(),
+            name: "Test Skill".into(),
+            description: "A test skill".into(),
+            path: skill_md,
+        });
+
+        app.activate_skill("test-skill");
+
+        assert_eq!(app.active_skill_name.as_deref(), Some("Test Skill"));
+        assert!(app.system_prompt.is_some());
+        assert!(app
+            .system_prompt
+            .as_ref()
+            .unwrap()
+            .contains("You are a test assistant."));
+        // A system message should be injected.
+        assert!(app.messages.iter().any(|m| m.role == "system"));
+    }
+
+    #[test]
+    fn test_deactivate_skill() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Set up an active skill state.
+        app.active_skill_name = Some("Caveman".into());
+        app.system_prompt = Some("skill body".into());
+        app.messages.push(grim_format::ChatMessage {
+            role: "system".to_string(),
+            content: "skill body".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+
+        app.submit_chat("/skill off");
+
+        assert!(app.active_skill_name.is_none());
+        assert!(app.system_prompt.is_none());
+        assert!(!app.messages.iter().any(|m| m.role == "system"));
+    }
+
+    #[test]
+    fn test_project_dir_sets_sandbox_root() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        app.submit_chat(&format!("/project {path}"));
+
+        assert_eq!(app.project_dir, std::path::PathBuf::from(dir.path().canonicalize().unwrap()));
+        assert_eq!(app.sandbox_root, app.project_dir);
+    }
+
+    #[test]
+    fn test_pwd_reports_current_dir() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.submit_chat("/pwd");
+        // Transcript should have a system message containing "project directory:".
+        assert!(app
+            .transcript
+            .nodes
+            .iter()
+            .any(|n| n.content.contains("project directory:")));
+    }
+
+    #[test]
+    fn test_project_dir_mode_enter_and_set() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = dir.path().to_string_lossy().to_string();
+
+        // Enter project dir mode with Ctrl+D.
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(app.input_mode, InputMode::ProjectDir));
+
+        // Replace the composer text with our target path and submit.
+        app.composer.set_text(&path_str);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert_eq!(app.input_mode, InputMode::Chat);
+        assert_eq!(app.project_dir, dir.path().canonicalize().unwrap());
+        assert_eq!(app.sandbox_root, app.project_dir);
+    }
+
+    #[test]
+    fn test_thinking_slash_command_parse() {
+        assert!(matches!(
+            parse_slash_command("/thinking"),
+            SlashCommand::Thinking(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/thinking high"),
+            SlashCommand::Thinking(Some(s)) if s == "high"
+        ));
+        assert!(matches!(
+            parse_slash_command("/think off"),
+            SlashCommand::Thinking(Some(s)) if s == "off"
+        ));
+        assert!(matches!(
+            parse_slash_command("/think medium"),
+            SlashCommand::Thinking(Some(s)) if s == "medium"
+        ));
+    }
+
+    #[test]
+    fn test_thinking_sets_level_and_sends_command() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.submit_chat("/thinking high");
+
+        assert_eq!(
+            app.thinking_level,
+            grim_core::sampler::ThinkingLevel::High
+        );
+        // Verify the worker was notified.
+        let result = rx.try_recv();
+        assert!(matches!(
+            result,
+            Ok(WorkerCommand::SetThinking { level }) if level == grim_core::sampler::ThinkingLevel::High
+        ));
+    }
+
+    #[test]
+    fn test_thinking_report_current_level() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.thinking_level = grim_core::sampler::ThinkingLevel::Medium;
+        app.submit_chat("/thinking");
+
+        // Transcript should report the current level.
+        assert!(app
+            .transcript
+            .nodes
+            .iter()
+            .any(|n| n.content.contains("thinking level: medium")));
+    }
+
+    #[test]
+    fn test_thinking_ctrl_t_cycles() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Start at Default, cycle → Low.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.thinking_level,
+            grim_core::sampler::ThinkingLevel::Low
+        );
+        // Drain the command.
+        let _ = rx.try_recv();
+
+        // Cycle → Medium.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.thinking_level,
+            grim_core::sampler::ThinkingLevel::Medium
+        );
+        let _ = rx.try_recv();
+
+        // Cycle → High.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.thinking_level,
+            grim_core::sampler::ThinkingLevel::High
+        );
+        let _ = rx.try_recv();
+
+        // Cycle → Off.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.thinking_level,
+            grim_core::sampler::ThinkingLevel::Off
+        );
+        let _ = rx.try_recv();
+
+        // Cycle → Default (wraps around).
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.thinking_level,
+            grim_core::sampler::ThinkingLevel::Default
+        );
+    }
+
+    #[test]
+    fn test_task_list_add_and_render() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        assert!(app.task_list.is_empty());
+
+        app.task_list.upsert(crate::tui::tasks::Task::new("1", "Read config file"));
+        app.task_list
+            .upsert(crate::tui::tasks::Task::new("2", "Run tests").with_status(crate::tui::tasks::TaskStatus::Completed));
+
+        assert_eq!(app.task_list.len(), 2);
+        assert_eq!(
+            app.task_list.count_by_status(crate::tui::tasks::TaskStatus::Pending),
+            1
+        );
+        assert_eq!(
+            app.task_list.count_by_status(crate::tui::tasks::TaskStatus::Completed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_task_list_navigation_with_arrows() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.task_list
+            .upsert(crate::tui::tasks::Task::new("1", "First task"));
+        app.task_list
+            .upsert(crate::tui::tasks::Task::new("2", "Second task"));
+        app.task_list
+            .upsert(crate::tui::tasks::Task::new("3", "Third task"));
+
+        // Down navigates tasks.
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.task_list.selected, 1);
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.task_list.selected, 2);
+
+        // Up navigates back.
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.task_list.selected, 1);
+    }
+
+    #[test]
+    fn test_task_shift_tab_cycles_status() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.task_list
+            .upsert(crate::tui::tasks::Task::new("1", "First task"));
+        assert_eq!(
+            app.task_list.tasks[0].status,
+            crate::tui::tasks::TaskStatus::Pending
+        );
+
+        // Shift+Tab cycles status.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.task_list.tasks[0].status,
+            crate::tui::tasks::TaskStatus::InProgress
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.task_list.tasks[0].status,
+            crate::tui::tasks::TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn test_task_expand_with_right_arrow() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.task_list.upsert(
+            crate::tui::tasks::Task::new("1", "Task with details")
+                .with_description("This is a detailed description"),
+        );
+
+        assert!(!app.task_list.tasks[0].expanded);
+
+        // Right arrow expands.
+        app.handle_key(KeyEvent::from(KeyCode::Right));
+        assert!(app.task_list.tasks[0].expanded);
+
+        // Right arrow again collapses.
+        app.handle_key(KeyEvent::from(KeyCode::Right));
+        assert!(!app.task_list.tasks[0].expanded);
+    }
+
+    #[test]
+    fn test_backend_slash_command_parse() {
+        assert!(matches!(
+            parse_slash_command("/backend"),
+            SlashCommand::Backend(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/backend metal"),
+            SlashCommand::Backend(Some(s)) if s == "metal"
+        ));
+        assert!(matches!(
+            parse_slash_command("/backend cpu"),
+            SlashCommand::Backend(Some(s)) if s == "cpu"
+        ));
+        assert!(matches!(
+            parse_slash_command("/backend auto"),
+            SlashCommand::Backend(Some(s)) if s == "auto"
+        ));
+    }
+
+    #[test]
+    fn test_backend_sets_value() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // CPU is always available.
+        app.submit_chat("/backend cpu");
+        assert_eq!(app.backend.as_deref(), Some("cpu"));
+
+        // Auto resets to None.
+        app.submit_chat("/backend auto");
+        assert!(app.backend.is_none());
+    }
+
+    #[test]
+    fn test_backend_rejects_unavailable() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        // Pick a backend that's compiled in but has no device available.
+        // In CI/test environments, CUDA is typically compiled in but no GPU is present.
+        // The availability check should reject it.
+        if grim_backend_cuda::CudaDevice::probe()
+            .map(|d| d.is_empty())
+            .unwrap_or(true)
+        {
+            // CUDA compiled in but no device — should be rejected.
+            app.submit_chat("/backend cuda");
+            assert!(app.backend.is_none(), "unavailable backend should not be set");
+            assert!(app
+                .transcript
+                .nodes
+                .iter()
+                .any(|n| n.content.contains("unavailable")));
+        }
+        // Otherwise (CUDA has a device), skip — availability check passed correctly.
+    }
+
+    #[test]
+    fn test_backend_rejects_unknown() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+
+        app.submit_chat("/backend unknown");
+        // Backend should remain unchanged (None from default).
+        assert!(app.backend.is_none());
+        // Error should be in transcript.
+        assert!(app
+            .transcript
+            .nodes
+            .iter()
+            .any(|n| n.content.contains("unknown backend")));
     }
 }

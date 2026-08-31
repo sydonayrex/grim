@@ -6,7 +6,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear, RmsNorm, add_tensors};
+use grim_nn::{Embedding, Linear, RmsNorm, add_tensors, broadcast_bias};
 use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 use std::sync::Arc;
@@ -473,18 +473,22 @@ impl Lfm2Block {
                 let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
                 let v = self.wv.as_ref().unwrap().forward(&norm_x)?;
 
-                let q_2d = device_tensor(
-                    q.to_vec_f32()?,
+                let q_2d = Tensor::new(
+                    q.storage().clone(),
                     Shape::new(vec![steps * self.num_heads, self.head_dim]),
-                    norm_x.device(),
-                )?;
+                    q.dtype(),
+                    q.provenance().clone(),
+                    q.device().clone(),
+                );
                 let q_norm = self.attn_q_norm.as_ref().unwrap().forward(&q_2d)?;
 
-                let k_2d = device_tensor(
-                    k.to_vec_f32()?,
+                let k_2d = Tensor::new(
+                    k.storage().clone(),
                     Shape::new(vec![steps * self.num_kv_heads, self.head_dim]),
-                    norm_x.device(),
-                )?;
+                    k.dtype(),
+                    k.provenance().clone(),
+                    k.device().clone(),
+                );
                 let k_norm = self.attn_k_norm.as_ref().unwrap().forward(&k_2d)?;
 
                 let dev = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
@@ -1141,13 +1145,10 @@ impl CausalLm for Lfm2 {
         let h_final = if let Some(ref d2o) = self.dense_2_out {
             let projected = d2o.forward(&h_normed)?;
             if let Some(ref bias) = self.dense_2_out_bias {
-                let bias_vec = bias.to_vec_f32()?;
-                let proj_vec = projected.to_vec_f32()?;
-                let mut out = proj_vec;
-                for i in 0..out.len() {
-                    out[i] += bias_vec[i % bias_vec.len()];
-                }
-                device_tensor(out, projected.shape().clone(), projected.device())?
+                let out_dim = projected.shape().dims().last().copied().unwrap_or(0);
+                let steps = projected.shape().elem_count() / out_dim.max(1);
+                let broadcast_b = broadcast_bias(bias, steps, out_dim).map_err(grim_core::Error::Tensor)?;
+                add_tensors(&projected, &broadcast_b).map_err(grim_core::Error::Tensor)?
             } else {
                 projected
             }
@@ -1204,14 +1205,28 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
 }
 
 fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-    let g = gate.to_vec_f32()?;
-    let u = up.to_vec_f32()?;
-    let mut out = vec![0.0f32; g.len()];
-    for i in 0..g.len() {
-        let silu = g[i] / (1.0 + (-g[i]).exp());
-        out[i] = silu * u[i];
+    if gate.device() == &Device::Cpu {
+        let g = gate.to_vec_f32()?;
+        let u = up.to_vec_f32()?;
+        let mut out = vec![0.0f32; g.len()];
+        for i in 0..g.len() {
+            let silu = g[i] / (1.0 + (-g[i]).exp());
+            out[i] = silu * u[i];
+        }
+        device_tensor(out, gate.shape().clone(), gate.device())
+    } else {
+        let dev = grim_nn::modules::pick_device_for_storage_device(gate.device());
+        let (storage, _h) = dev
+            .silu_mul(gate.storage().as_ref(), up.storage().as_ref(), gate.shape())
+            .map_err(grim_core::Error::Tensor)?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            gate.shape().clone(),
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            gate.device().clone(),
+        ))
     }
-    device_tensor(out, gate.shape().clone(), gate.device())
 }
 
 #[cfg(test)]

@@ -1043,10 +1043,27 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     // Only matches the method-call form `.items()`, not the filter `| items`.
     let result = result.replace(".items()", " | items");
 
-    // In Jinja, `+` fails on string + undefined. `~` is Jinja's string concatenation
-    // operator which automatically coerces undefined variables to empty strings.
+    // In Jinja, `+` fails on string + undefined. `~` is Jinja's string
+    // concatenation operator which coerces undefined to empty string.
+    let result = result.replace(" + ", " ~ ");
 
-    result.replace(" + ", " ~ ")
+    // Transform `is string` → a permissive test that's true for strings.
+    // MiniCPM5 and other templates use `is string` which minijinja may not
+    // support directly.
+    let result = result.replace("is string", "is matching(\".*\")");
+
+    // Strip filter keyword arguments like `tojson(ensure_ascii=False)`.
+    // minijinja filters don't support keyword args; strip them so the filter
+    // name resolves correctly.
+    while let Some(pos) = result.find("tojson(") {
+        if let Some(end) = result[pos..].find(')') {
+            result.replace_range(pos..pos + end + 1, "tojson");
+        } else {
+            break;
+        }
+    }
+
+    result
 }
 
 /// Renders an OpenAI-style `messages` array through a model's Jinja chat
@@ -1078,13 +1095,21 @@ pub fn render_chat_template(
     // Most GGUF chat templates are self-contained; disable autoescaping and treat undefined variables gracefully.
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    // HuggingFace templates call `raise_exception("msg")` (and sometimes with
+    // extra args). Accept any number of arguments and return empty string so
+    // tool-aware templates that validate input don't abort the render.
     env.add_function(
         "raise_exception",
-        |_msg: Option<&str>| -> std::result::Result<String, minijinja::Error> { Ok(String::new()) },
+        |args: &[minijinja::Value]| -> std::result::Result<String, minijinja::Error> {
+            let _ = args;
+            Ok(String::new())
+        },
     );
+    // Some templates pass extra args to `tojson` filter; accept and ignore them.
     env.add_filter(
         "tojson",
-        |v: minijinja::Value| -> std::result::Result<String, minijinja::Error> {
+        |v: minijinja::Value, _args: &[minijinja::Value]|
+         -> std::result::Result<String, minijinja::Error> {
             serde_json::to_string(&v).map_err(|e| {
                 minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
             })
@@ -1117,9 +1142,13 @@ pub fn render_chat_template(
         system => empty_str,
         extra_context => empty_str,
     };
-    let rendered = tmpl
-        .render(ctx)
-        .map_err(|e| Error::Backend(format!("chat template render error: {e}")))?;
+    let rendered = tmpl.render(ctx).map_err(|e| {
+        // Include the sanitized template in the error so operators can see
+        // which line caused the failure (minijinja reports "(in <string>:N)").
+        Error::Backend(format!(
+            "chat template render error: {e}\n--- sanitized template ---\n{sanitized}"
+        ))
+    })?;
     // If the caller supplied tools but the rendered output made no use of
     // them (i.e. the model's template isn't tool-capable), surface a loud
     // diagnostic so operators understand why no tool calls will be produced,
@@ -1545,6 +1574,31 @@ mod chat_template_tests {
         );
     }
 
+    /// HuggingFace templates call `raise_exception` with varying arity
+    /// (sometimes 1 arg, sometimes 2+). The function must accept any number
+    /// of arguments without failing the render. This reproduces the
+    /// "too many arguments (in <string>:6)" error seen with MiniCPM5.
+    #[test]
+    fn renders_template_with_raise_exception_multi_arg() {
+        let tpl = r#"{%- if messages | length > 100 -%}
+    {{- raise_exception("too many messages", "truncate") -}}
+{%- endif -%}
+{%- for m in messages -%}
+{{ m['role'] }}: {{ m['content'] }}
+{%- endfor -%}"#
+            .to_string();
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("raise_exception with multiple args must not fail");
+        assert!(rendered.contains("user: hi"));
+    }
+
     /// HuggingFace templates (e.g. MiniCPM5, Ternary-Bonsai) use Python string
     /// methods `.startswith()` and `.endswith()` which minijinja does not
     /// implement. The sanitizer must transform them into slice comparisons.
@@ -1567,6 +1621,32 @@ mod chat_template_tests {
         assert!(rendered.contains("START"), "startswith match failed");
         assert!(rendered.contains("END"), "endswith match failed");
         assert!(rendered.contains("NOTXYZ"), "startswith non-match failed");
+    }
+
+    /// MiniCPM5 and other HF templates use `messages[loop.index0 + 1]` for lookahead.
+    /// Arithmetic addition `+` must not be converted to `~` string concatenation.
+    #[test]
+    fn renders_template_with_loop_index_arithmetic() {
+        let tpl = r#"{%- for message in messages -%}
+{%- if message.role == "user" -%}
+<|im_start|>user
+{{ message.content }}<|im_end|>
+{%- if loop.last or (messages[loop.index0 + 1].role != "tool") -%}
+<|im_start|>assistant
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}"#
+            .to_string();
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("template with loop.index0 + 1 must render");
+        assert!(rendered.contains("<|im_start|>user\nhello<|im_end|><|im_start|>assistant"));
     }
 }
 

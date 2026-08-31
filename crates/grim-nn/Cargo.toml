@@ -21,7 +21,7 @@ parking_lot = { workspace = true }
 
 
 [features]
-default = ["rocm-mem", "metal-mem", "vulkan-mem"]
+default = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 cuda-mem = ["dep:grim-backend-cuda"]
 rocm-mem = []
 metal-mem = []

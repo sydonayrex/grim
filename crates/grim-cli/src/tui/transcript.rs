@@ -157,144 +157,270 @@ impl Transcript {
         }
     }
 
-    /// Build styled Ratatui Lines for rendering in the main chat viewport.
+/// Build styled ratatui Lines for rendering in the main chat viewport.
+    ///
+    /// Visual contract:
+    /// - Role chips use box-drawing (top-left corner + label) in role color.
+    /// - Body text is always white so purple borders never clash with content.
+    /// - Thinking blocks have a dim italic style with a left-gutter `╎ ` marker.
+    /// - Tool calls render as a diff-like block with a magenta header.
+    /// - Streaming output appends a block cursor `▋`.
+    ///
+    /// Lines longer than `max_width` chars are hard-wrapped so that model
+    /// output containing raw template syntax or other long content cannot
+    /// corrupt the TUI layout.
     pub fn render_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+        self.render_lines_wrapped(200)
+    }
+
+    /// Same as `render_lines` but with a configurable max line width.
+    pub fn render_lines_wrapped(&self, max_width: usize) -> Vec<Line<'static>> {
+        // Brand colors (mirrored from grim-garage palette).
+        let c_purple     = Color::Rgb(168, 85, 247);   // #a855f7 — user chip
+        let c_purple_dim = Color::Rgb(112, 50, 180);   // dim purple — borders
+        let c_cyan       = Color::Rgb(34, 211, 238);    // assistant chip
+        let c_magenta    = Color::Rgb(232, 121, 249);   // tool chip
+        let c_green      = Color::Rgb(16, 185, 129);    // tool result / success
+        let c_red        = Color::Rgb(239, 68, 68);     // error
+        let c_amber      = Color::Rgb(245, 158, 11);    // system / warning
+        let c_muted      = Color::Rgb(136, 136, 136);   // stats / dim text
+        let c_thinking   = Color::Rgb(180, 140, 255);   // thinking gutter
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
         for node in &self.nodes {
             match node.role {
                 Role::User => {
+                    // ╭─ you ──────────
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "you: ",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(node.content.clone()),
+                        Span::styled("╭─ ", Style::default().fg(c_purple_dim)),
+                        Span::styled("you", Style::default().fg(c_purple).add_modifier(Modifier::BOLD)),
+                        Span::styled(" ─────────────────────────────────", Style::default().fg(c_purple_dim)),
+                    ]));
+                    // Indented content lines.
+                    for content_line in node.content.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("│ ", Style::default().fg(c_purple_dim)),
+                            Span::raw(content_line.to_string()),
+                        ]));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("╰───────────────────────────────────", Style::default().fg(c_purple_dim)),
                     ]));
                     lines.push(Line::raw(""));
                 }
                 Role::Assistant => {
+                    // Thinking block (folded or expanded accordion).
                     if let Some(think) = &node.thinking {
                         if node.thought_folded {
-                            lines.push(Line::from(vec![Span::styled(
-                                "▶ [thought collapsed - press Tab/Space to expand]",
-                                Style::default().fg(Color::DarkGray),
-                            )]));
+                            lines.push(Line::from(vec![
+                                Span::styled("  ▶ ", Style::default().fg(c_muted)),
+                                Span::styled(
+                                    "[reasoning — Tab to expand]",
+                                    Style::default().fg(c_muted).add_modifier(Modifier::ITALIC),
+                                ),
+                            ]));
                         } else {
-                            lines.push(Line::from(vec![Span::styled(
-                                "▼ [thought]:",
-                                Style::default().fg(Color::DarkGray),
-                            )]));
+                            lines.push(Line::from(vec![
+                                Span::styled("  ▼ ", Style::default().fg(c_thinking)),
+                                Span::styled(
+                                    "reasoning",
+                                    Style::default().fg(c_thinking).add_modifier(Modifier::ITALIC),
+                                ),
+                                Span::styled(" — Tab to collapse", Style::default().fg(c_muted)),
+                            ]));
                             for tline in think.lines() {
-                                lines.push(Line::from(vec![Span::styled(
-                                    format!("  {}", tline),
-                                    Style::default().fg(Color::DarkGray),
-                                )]));
+                                lines.push(Line::from(vec![
+                                    Span::styled("  ╎ ", Style::default().fg(c_thinking)),
+                                    Span::styled(
+                                        tline.to_string(),
+                                        Style::default()
+                                            .fg(c_muted)
+                                            .add_modifier(Modifier::ITALIC),
+                                    ),
+                                ]));
                             }
+                            lines.push(Line::from(vec![
+                                Span::styled("  ╎", Style::default().fg(c_thinking)),
+                            ]));
                         }
                     }
-                    let prefix = Span::styled(
-                        "assistant: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                    // Render assistant content as markdown (code blocks, bold, etc.).
+
+                    // ╭─ grim ──────────
+                    lines.push(Line::from(vec![
+                        Span::styled("╭─ ", Style::default().fg(c_purple_dim)),
+                        Span::styled("grim", Style::default().fg(c_cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(" ─────────────────────────────────", Style::default().fg(c_purple_dim)),
+                    ]));
+
+                    // Markdown-rendered content with gutter.
                     let md_lines = crate::tui::markdown::render_markdown(&node.content);
-                    for (i, mut md_line) in md_lines.into_iter().enumerate() {
-                        if i == 0 && !md_line.spans.is_empty() {
-                            // Prepend the "assistant: " prefix to the first line.
-                            let mut spans = vec![prefix.clone()];
-                            spans.append(&mut md_line.spans);
+                    if md_lines.is_empty() || md_lines.iter().all(|l| l.spans.is_empty()) {
+                        // Blank assistant turn (e.g. thinking-only).
+                    } else {
+                        for md_line in md_lines {
+                            let mut spans = vec![Span::styled("│ ", Style::default().fg(c_purple_dim))];
+                            spans.extend(md_line.spans);
                             lines.push(Line::from(spans));
-                        } else {
-                            lines.push(md_line);
                         }
                     }
+
+                    // Turn stats footer.
                     if let Some(stats) = &node.turn_stats {
-                        lines.push(Line::from(vec![Span::styled(
-                            stats.clone(),
-                            Style::default().fg(Color::Yellow),
-                        )]));
+                        lines.push(Line::from(vec![
+                            Span::styled("│ ", Style::default().fg(c_purple_dim)),
+                            Span::styled(stats.clone(), Style::default().fg(c_muted)),
+                        ]));
                     }
+                    lines.push(Line::from(vec![
+                        Span::styled("╰───────────────────────────────────", Style::default().fg(c_purple_dim)),
+                    ]));
                     lines.push(Line::raw(""));
                 }
                 Role::ToolCall => {
+                    // ╭─ tool: <name> ──
+                    let name = node.tool_name.as_deref().unwrap_or("unknown");
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "⚙ [tool call]: ",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(node.content.clone(), Style::default().fg(Color::LightMagenta)),
+                        Span::styled("╭─ ", Style::default().fg(c_purple_dim)),
+                        Span::styled("tool", Style::default().fg(c_magenta).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(": {} ", name), Style::default().fg(Color::White)),
+                        Span::styled("────────────────────────────", Style::default().fg(c_purple_dim)),
+                    ]));
+                    // Arguments as diff-like green lines.
+                    for arg_line in node.content.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("│ + ", Style::default().fg(c_green)),
+                            Span::styled(arg_line.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("╰───────────────────────────────────", Style::default().fg(c_purple_dim)),
                     ]));
                 }
                 Role::ToolResult => {
+                    // Compact result block indented under the tool call.
                     lines.push(Line::from(vec![
+                        Span::styled("  ✓ ", Style::default().fg(c_green)),
+                        Span::styled("result: ", Style::default().fg(c_muted)),
                         Span::styled(
-                            "✓ [tool result]: ",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
+                            // Truncate long results to first line.
+                            node.content.lines().next().unwrap_or("(empty)").to_string(),
+                            Style::default().fg(Color::White),
                         ),
-                        Span::styled(node.content.clone(), Style::default().fg(Color::DarkGray)),
                     ]));
+                    // If multi-line, show remaining lines indented.
+                    for extra in node.content.lines().skip(1).take(3) {
+                        lines.push(Line::from(vec![
+                            Span::styled("       ", Style::default()),
+                            Span::styled(extra.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                    lines.push(Line::raw(""));
                 }
                 Role::System => {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("[system] {}", node.content),
-                        Style::default().fg(Color::Blue),
-                    )]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  ℹ ", Style::default().fg(c_amber)),
+                        Span::styled(node.content.clone(), Style::default().fg(Color::White)),
+                    ]));
                 }
                 Role::Error => {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("[error] {}", node.content),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
-                    )]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  ✖ ", Style::default().fg(c_red).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            node.content.clone(),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
                 }
                 Role::Hint => {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("[hint] {}", node.content),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  ─ ", Style::default().fg(c_muted)),
+                        Span::styled(node.content.clone(), Style::default().fg(c_muted)),
+                    ]));
                 }
             }
         }
 
-        // Active streaming output
+        // Active streaming output — show thinking gutter + content + blinking cursor.
         if !self.streaming_raw.is_empty() {
             let (thinking, content) = parse_thinking_tags(&self.streaming_raw);
-            if let Some(think) = thinking {
-                lines.push(Line::from(vec![Span::styled(
-                    "▼ [thinking...]:",
-                    Style::default().fg(Color::DarkGray),
-                )]));
+
+            if let Some(ref think) = thinking {
+                lines.push(Line::from(vec![
+                    Span::styled("  ▼ ", Style::default().fg(c_thinking)),
+                    Span::styled("reasoning...", Style::default().fg(c_thinking).add_modifier(Modifier::ITALIC)),
+                ]));
                 for tline in think.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", tline),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  ╎ ", Style::default().fg(c_thinking)),
+                        Span::styled(tline.to_string(), Style::default().fg(c_muted).add_modifier(Modifier::ITALIC)),
+                    ]));
                 }
             }
+
             if !content.is_empty() {
+                // Role chip for in-progress assistant message.
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "assistant: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(content),
+                    Span::styled("╭─ ", Style::default().fg(c_purple_dim)),
+                    Span::styled("grim", Style::default().fg(c_cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ─────────────────────────────────", Style::default().fg(c_purple_dim)),
+                ]));
+                let md_lines = crate::tui::markdown::render_markdown(&content);
+                let last_idx = md_lines.len().saturating_sub(1);
+                for (i, md_line) in md_lines.into_iter().enumerate() {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(c_purple_dim))];
+                    spans.extend(md_line.spans);
+                    // Append streaming cursor on the final line.
+                    if i == last_idx {
+                        spans.push(Span::styled("▋", Style::default().fg(c_cyan)));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            } else if thinking.is_some() {
+                // Pure thinking state (no content yet): show a cursor line under the gutter.
+                lines.push(Line::from(vec![
+                    Span::styled("  ╎ ", Style::default().fg(c_thinking)),
+                    Span::styled("▋", Style::default().fg(c_thinking)),
                 ]));
             }
         }
 
-        lines
+        // Hard-wrap any lines that exceed max_width chars so that model
+        // output containing raw template syntax or other long content
+        // cannot corrupt the TUI layout.
+        wrap_lines(lines, max_width)
     }
+}
+
+/// Hard-wrap a Vec<Line> at `max_width` chars. Lines already shorter than
+/// the limit are passed through unchanged.
+fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let width = line.width();
+        if width <= max_width {
+            out.push(line);
+            continue;
+        }
+        // Split the line's spans into chunks that fit within max_width.
+        let mut current_spans: Vec<Span<'static>> = Vec::new();
+        let mut current_width = 0;
+        for span in line.spans {
+            let span_width = span.width();
+            if current_width + span_width <= max_width || current_spans.is_empty() {
+                current_spans.push(span);
+                current_width += span_width;
+            } else {
+                out.push(Line::from(current_spans));
+                current_spans = vec![span];
+                current_width = span_width;
+            }
+        }
+        if !current_spans.is_empty() {
+            out.push(Line::from(current_spans));
+        }
+    }
+    out
 }
 
 /// Format content with fenced code block syntax framing.
@@ -402,8 +528,11 @@ mod tests {
         assert_eq!(transcript.nodes[0].role, Role::ToolCall);
         assert_eq!(transcript.nodes[1].role, Role::ToolResult);
 
+        // New rendering: ToolCall = chip header + arg line(s) + footer border,
+        // ToolResult = result line + blank separator.
+        // {"path": "model.rs"} is 1 line, so: 3 + 2 = 5 lines minimum.
         let lines = transcript.render_lines();
-        assert_eq!(lines.len(), 2);
+        assert!(lines.len() >= 5, "expected at least 5 lines, got {}", lines.len());
     }
 
     #[test]

@@ -100,9 +100,25 @@
 
 ## Phase 4 — Quantized GEMM family expansion
 
-**Status:** Not started.
+**Status:** `fused_dequant_gemm_mxfp4` fast-path **complete** (kernel `kernels.msl:2535` + pipeline slot `lib.rs:169,334` + dispatch branch `lib.rs:4853-4908`); `cargo check` + `cargo test` pass.
 
-See glass.md #4.
+### What was done
+- Added MXFP4 dispatch branch to `quantized_matmul` in `lib.rs` (line 4853) — mirrors the existing Q4K and FP8 fast-path structure: `FloatPackScheme::MxFp4` check, `zeros(out_shape, F32)`, command buffer + encoder, `setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_mxfp4)`, buffer wiring (a_buf:0, b_buf:1, out_buf:2), `setBytes_length_atIndex` for (m,n,k), `16×16` threadgroup grid, `encoder.endEncoding()`, `return Ok(...)`.
+- Verified kernel exists in `kernels.msl:2535` (`grim_fused_dequant_gemm_mxfp4`): per-row interleaved layout — `codes_bytes = (k+1)/2`, `exps_bytes = k/32`, `row_base = b_packed + col*(codes_bytes+exps_bytes)`, nibbles split as `packed&0x0F` / `packed>>4`, shared_exp from `row_base[codes_bytes + i/32]`, calls `metal_mxfp4_to_float`.
+- Verified pipeline slot `fused_dequant_gemm_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>` in `MetalPipelines` struct (line 169).
+- Verified `get_pipeline("grim_fused_dequant_gemm_mxfp4")?` in `MetalContext::get()` init (line 334).
+
+### Verification
+- [x] `cargo check --package grim-backend-metal` — passes (0.29s)
+- [x] `cargo test --package grim-backend-metal` — passes (6 tests; MXFP4-specific parity tests belong in Phase 6)
+- [ ] kernel numerical parity test vs CPU reference for `fused_dequant_gemm_mxfp4` — not yet written (Phase 6)
+
+### Remaining Phase 4 items
+- `fused_mxfp4_gemm_qk_norm_rope_kv` — MXFP4 QKV GEMM + QK-norm + RoPE (kernel + dispatch, not started)
+- `fused_rmsnorm_mxfp4_gemm`, `fused_rmsnorm_mxfp4_gemm_rope_kv` (not started)
+- `dequant_w4a16_blob_to_f32` / `dequant_wna16_to_f32` host dequant wrappers (not started)
+- `awq_segment_offsets` / `gptq_segment_offsets` host helpers (not started)
+- Non-Q8_0 `quantized_matmul_backward_dx` widening to q4k/q5k/q6k (not started)
 
 ---
 

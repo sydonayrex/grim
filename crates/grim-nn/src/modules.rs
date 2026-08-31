@@ -817,9 +817,8 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
 /// target for the deferred native HIP kernel replacement. The current
 /// implementation round-trips through `to_vec_f32()` → CPU tile →
 /// `from_cpu()` on every `Linear::forward` call with a bias — the plan's
-/// WI-Host-1 #2 calls for replacing this with a native on-device broadcast.
-/// Marked `pub(crate)` so the parity test can target it directly.
-pub(crate) fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
+/// Broadcast a 1-D bias tensor to a 2-D batch shape on CPU or device.
+pub fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
     let new_shape = Shape::new(vec![batch, out_dim]);
     if b.device().is_cpu() {
         let b_vec = b.to_vec_f32()?;

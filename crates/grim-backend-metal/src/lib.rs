@@ -167,6 +167,8 @@ struct MetalPipelines {
     fused_dequant_gemm_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_dequant_gemm_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_dequant_gemm_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_rmsnorm_mxfp4_gemm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_rmsnorm_mxfp4_gemm_rope_kv: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     reduce_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     qkv_paged_dequant_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,

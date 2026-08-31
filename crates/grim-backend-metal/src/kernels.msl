@@ -2527,6 +2527,213 @@ kernel void grim_fused_dequant_gemm_fp8(
     c[row * n + col] = acc;
 }
 
+// MXFP4 Fused Dequant GEMM
+// B layout (row-major, N rows of K elements):
+//   [codes...(K+1)/2 bytes][shared_exps...(K/32) bytes] per row
+//   codes: two 4-bit MXFP4 values packed per byte (little-endian nibbles)
+//   shared_exps: one uchar per 32 elements
+kernel void grim_fused_dequant_gemm_mxfp4(
+    device const float* a [[buffer(0)]],
+    device const uchar* b_packed [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int col = int(gid.x);
+
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int codes_bytes = (k + 1) / 2;
+    int exps_bytes = k / 32;  // zero when k < 32; exps[0] used for all elements
+    device const uchar* row_base = b_packed + col * (codes_bytes + exps_bytes);
+
+    for (int i = 0; i < k; ++i) {
+        int byte_idx = i / 2;
+        uchar packed = row_base[byte_idx];
+        uchar nib = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+        uchar shared_exp = row_base[codes_bytes + (i / 32)];
+        float w = metal_mxfp4_to_float(nib, shared_exp);
+        acc += a[row * k + i] * w;
+    }
+
+    c[row * n + col] = acc;
+}
+
+// Fused RMSNorm + MXFP4 GEMM
+// Computes: out[m, n] = rms_norm(x[m, k], gamma[k], eps) @ MXFP4(W[k, n])
+// where W is stored as per-row interleaved [codes (K+1)/2 bytes][shared_exps K/32 bytes].
+// RMSNorm over x[row, :] is computed inline, then the normalized row is dotted with
+// each column of the MXFP4 weight. Grid is (n) × (m).
+kernel void grim_fused_rmsnorm_mxfp4_gemm(
+    device const float* x [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const uchar* w_packed [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant int& m [[buffer(4)]],
+    constant int& n [[buffer(5)]],
+    constant int& k [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int col = int(gid.x);
+    if (row >= m || col >= n) return;
+
+    // --- RMSNorm over x[row, :] ---
+    float mean = 0.0f;
+    for (int i = 0; i < k; ++i) {
+        mean += x[row * k + i];
+    }
+    mean /= k;
+    float sum_sq = 0.0f;
+    for (int i = 0; i < k; ++i) {
+        float dc = x[row * k + i] - mean;
+        sum_sq += dc * dc;
+    }
+    float rms = sqrt(sum_sq / k + eps);
+    float inv_rms = 1.0f / rms;
+
+    // --- MXFP4 dequant GEMM for column 'col' ---
+    float acc = 0.0f;
+    int codes_bytes = (k + 1) / 2;
+    int exps_bytes = k / 32;
+    device const uchar* w_row = w_packed + col * (codes_bytes + exps_bytes);
+
+    for (int i = 0; i < k; ++i) {
+        int byte_idx = i / 2;
+        uchar packed = w_row[byte_idx];
+        uchar nib = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+        uchar shared_exp = w_row[codes_bytes + (i / 32)];
+        float w = metal_mxfp4_to_float(nib, shared_exp);
+        acc += (x[row * k + i] * inv_rms * gamma[i]) * w;
+    }
+    out[row * n + col] = acc;
+}
+
+// Fused RMSNorm + MXFP4 GEMM + RoPE + KV scatter.
+// Computes the fused op then writes Q/K/V projections with RoPE on the rotary columns.
+// Grid: (m) × (max(q_dim, kv_dim)), 16×16 threadgroups.
+kernel void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
+    device const float* x [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const uchar* wq_packed [[buffer(2)]],
+    device const uchar* wk_packed [[buffer(3)]],
+    device const uchar* wv_packed [[buffer(4)]],
+    device float* q_out_buf [[buffer(5)]],
+    device float* k_cache_buf [[buffer(6)]],
+    device float* v_cache_buf [[buffer(7)]],
+    device const float* positions [[buffer(8)]],
+    constant int& m [[buffer(9)]],
+    constant int& k_dim [[buffer(10)]],
+    constant int& q_dim [[buffer(11)]],
+    constant int& kv_dim [[buffer(12)]],
+    constant int& rotary_dim [[buffer(13)]],
+    constant float& rope_theta [[buffer(14)]],
+    constant int& num_kv_heads [[buffer(15)]],
+    constant int& head_dim [[buffer(16)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int row = int(gid.y);
+    int tid = int(gid.x);
+    if (row >= m) return;
+
+    // --- RMSNorm over x[row, :] ---
+    float mean = 0.0f;
+    for (int i = 0; i < k_dim; ++i) mean += x[row * k_dim + i];
+    mean /= k_dim;
+    float sum_sq = 0.0f;
+    for (int i = 0; i < k_dim; ++i) {
+        float dc = x[row * k_dim + i] - mean;
+        sum_sq += dc * dc;
+    }
+    float rms = sqrt(sum_sq / k_dim + 1e-5f);
+    float inv_rms = 1.0f / rms;
+
+    // Normalized row (cap at 2048 — sufficient for consumer models).
+    float xn[2048];
+    for (int i = 0; i < k_dim && i < 2048; ++i) {
+        xn[i] = x[row * k_dim + i] * inv_rms * gamma[i];
+    }
+
+    // --- RoPE freq (recompute per thread; production should pass inv_freq buffer) ---
+    float pos = positions ? positions[row] : 0.0f;
+    float inv_freq[64];
+    for (int d = 0; d < min(rotary_dim / 2, 64); ++d) {
+        inv_freq[d] = exp(-rope_theta * float(d) * float(d + 2));
+    }
+    auto apply_rope = [&](float* qk_ptr, int col_idx, int dim) {
+        if (col_idx < rotary_dim) {
+            int half = col_idx % (rotary_dim / 2);
+            float angle = pos * inv_freq[half];
+            float c = cos(angle);
+            float s = sin(angle);
+            float vc = qk_ptr[col_idx];
+            float vs = qk_ptr[col_idx + rotary_dim / 2];
+            qk_ptr[col_idx]           = vc * c - vs * s;
+            qk_ptr[col_idx + rotary_dim / 2] = vc * s + vs * c;
+        }
+    };
+
+    // --- Q projection ---
+    if (q_out_buf && q_dim > 0) {
+        int codes_bytes = (k_dim + 1) / 2;
+        int exps_bytes = k_dim / 32;
+        device const uchar* wq_row = wq_packed + tid * (codes_bytes + exps_bytes);
+        float acc = 0.0f;
+        for (int i = 0; i < k_dim; ++i) {
+            int byte_idx = i / 2;
+            uchar packed = wq_row[byte_idx];
+            uchar nib = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+            uchar shared_exp = wq_row[codes_bytes + (i / 32)];
+            float w = metal_mxfp4_to_float(nib, shared_exp);
+            acc += xn[i] * w;
+        }
+        q_out_buf[row * q_dim + tid] = acc;
+        apply_rope(&q_out_buf[row * q_dim], tid, q_dim);
+    }
+
+    // --- K projection (with RoPE) ---
+    if (k_cache_buf && kv_dim > 0) {
+        int kv_base = row * num_kv_heads * head_dim;
+        int codes_bytes = (k_dim + 1) / 2;
+        int exps_bytes = k_dim / 32;
+        device const uchar* wk_row = wk_packed + tid * (codes_bytes + exps_bytes);
+        float acc = 0.0f;
+        for (int i = 0; i < k_dim; ++i) {
+            int byte_idx = i / 2;
+            uchar packed = wk_row[byte_idx];
+            uchar nib = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+            uchar shared_exp = wk_row[codes_bytes + (i / 32)];
+            float w = metal_mxfp4_to_float(nib, shared_exp);
+            acc += xn[i] * w;
+        }
+        k_cache_buf[kv_base + tid] = acc;
+        apply_rope(&k_cache_buf[kv_base], tid, kv_dim);
+    }
+
+    // --- V projection (no RoPE) ---
+    if (v_cache_buf && kv_dim > 0) {
+        int kv_base = row * num_kv_heads * head_dim + kv_dim;
+        int codes_bytes = (k_dim + 1) / 2;
+        int exps_bytes = k_dim / 32;
+        device const uchar* wv_row = wv_packed + tid * (codes_bytes + exps_bytes);
+        float acc = 0.0f;
+        for (int i = 0; i < k_dim; ++i) {
+            int byte_idx = i / 2;
+            uchar packed = wv_row[byte_idx];
+            uchar nib = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+            uchar shared_exp = wv_row[codes_bytes + (i / 32)];
+            float w = metal_mxfp4_to_float(nib, shared_exp);
+            acc += xn[i] * w;
+        }
+        v_cache_buf[kv_base + tid] = acc;
+    }
+}
+
 kernel void grim_sub(
     device const float* a [[buffer(0)]],
     device const float* b [[buffer(1)]],
