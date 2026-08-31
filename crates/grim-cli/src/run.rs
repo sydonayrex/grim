@@ -95,7 +95,7 @@ fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
                     let ord_req = s
                         .split(':')
                         .nth(1)
-                        .and_then(|x| x.parse::<u32>().ok())
+                        .and_then(|x| x.parse::<usize>().ok())
                         .unwrap_or(0);
                     if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
                         if let Some(dev) = cuda_devices

@@ -60,16 +60,17 @@ pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
+                // Code block border: purple-soft header, purple-dim gutter footer.
                 lines.push(Line::from(vec![Span::styled(
                     format!("  ┌── [{}]", if code_lang.is_empty() { "code" } else { &code_lang }),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Rgb(192, 132, 252)),  // #c084fc purple-soft
                 )]));
                 for hl_line in highlight_code(&code_buf, &code_lang) {
                     lines.push(hl_line);
                 }
                 lines.push(Line::from(vec![Span::styled(
                     "  └────".to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Rgb(112, 50, 180)),  // dim purple
                 )]));
             }
             Event::Start(Tag::Emphasis) => italic = true,
@@ -130,7 +131,7 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
         };
         let mut spans = vec![Span::styled(
             "  │ ".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(112, 50, 180)),  // dim purple gutter
         )];
         for (style, text) in ranges {
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);

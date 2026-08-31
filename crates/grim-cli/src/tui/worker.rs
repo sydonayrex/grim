@@ -39,6 +39,10 @@ pub enum WorkerCommand {
         call_id: String,
         output: String,
     },
+    /// UI → worker: change the thinking/reasoning effort level.
+    SetThinking {
+        level: grim_core::sampler::ThinkingLevel,
+    },
     Cancel,
     Quit,
 }
@@ -109,6 +113,30 @@ pub struct WorkerParams {
     pub repeat_penalty: f32,
 }
 
+/// RAII guard that redirects stderr to a temporary log file for the
+/// duration of a model load. Uses the `gag` crate which safely handles
+/// the platform-specific details of stderr redirection without
+/// corrupting the C runtime's FILE* buffering.
+///
+/// The log file is written to the system temp directory as
+/// `grim-model-load.log` and is appended to on each load.
+struct StderrRedirect {
+    _gag: gag::Redirect<std::fs::File>,
+}
+
+impl StderrRedirect {
+    fn new() -> Self {
+        let log_path = std::env::temp_dir().join("grim-model-load.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap_or_else(|_| std::fs::File::open("/dev/null").expect("failed to open /dev/null"));
+        let gag = gag::Redirect::stderr(file).expect("failed to redirect stderr");
+        Self { _gag: gag }
+    }
+}
+
 /// True if the token id is an end-of-stream token for this tokenizer.
 /// Mirrors the EOS check in run.rs:931-939.
 pub fn is_eos_token(tok: &GgufTokenizer, id: u32) -> bool {
@@ -175,16 +203,29 @@ struct Worker {
     tools_enabled: bool,
     /// Sandbox root directory for tool execution.
     sandbox_root: PathBuf,
+    /// Set by Cancel command; checked in the generate loop to abort early.
+    cancel_requested: bool,
+    /// Active backend name for diagnostics display (rocm, cuda, metal, cpu).
+    backend: String,
 }
 
 impl Worker {
     fn handle(&mut self, cmd: WorkerCommand, rx: &Receiver<WorkerCommand>) -> WorkerOutcome {
         match cmd {
             WorkerCommand::Quit => WorkerOutcome::Quit,
-            WorkerCommand::Cancel => WorkerOutcome::Ignored,
+            WorkerCommand::Cancel => {
+                self.cancel_requested = true;
+                WorkerOutcome::Ignored
+            }
             // ToolResult is consumed by agentic_generate's internal rx loop;
             // if it reaches here (e.g. tools disabled), ignore it.
             WorkerCommand::ToolResult { .. } => WorkerOutcome::Ignored,
+            WorkerCommand::SetThinking { level } => {
+                self.sampling_params.thinking_level = level;
+                // Rebuild the sampler so the new thinking level takes effect.
+                self.sampler = self.sampling_params.clone().into_sampler(self.seed);
+                WorkerOutcome::Ignored
+            }
             WorkerCommand::SetContextLimit { limit } => {
                 self.ctx_override = limit;
                 WorkerOutcome::Ignored
@@ -241,6 +282,9 @@ impl Worker {
         let path_str = resolved.to_string_lossy().to_string();
 
         // 1. new load (old model stays resident so a failure keeps it usable).
+        // Redirect stderr to a log file during loading so the backend's
+        // verbose debug output doesn't corrupt the TUI's raw-mode display.
+        let _stderr_redirect = StderrRedirect::new();
         let model = match grim_engine::model_loader::load_from_path(&path_str) {
             Ok(m) => m,
             Err(e) => {
@@ -264,7 +308,6 @@ impl Worker {
                 }
             }
         };
-
         let id = resolved
             .file_stem()
             .and_then(|s| s.to_str())
@@ -273,6 +316,8 @@ impl Worker {
 
         // 2. register new, then unload old (brief coexistence; the serial
         // worker prevents any Generate from interleaving).
+        // Stderr redirect stays active through engine registration/unload
+        // because those operations also emit debug logging.
         self.engine.register_model(&id, model);
         if let Some(old) = self.current_id.clone() {
             if old != id {
@@ -311,8 +356,13 @@ impl Worker {
             .to_string();
 
         self.current_id = Some(id.clone());
+        // Update active backend for diagnostics display.
+        self.backend = std::env::var("GRIM_BACKEND")
+            .unwrap_or_else(|_| "rocm".into());
         let snapshot = self.make_snapshot(context_length, 0);
         let _ = self.tx.send(WorkerEvent::Diagnostics { snap: snapshot });
+        // Restore stderr after all engine operations complete.
+        drop(_stderr_redirect);
         WorkerOutcome::ModelLoadOk {
             name,
             quant,
@@ -331,7 +381,7 @@ impl Worker {
         DiagnosticsSnapshot {
             model_name: self.current_id.clone(),
             quant: None,
-            backend: "rocm".into(),
+            backend: self.backend.clone(),
             strategy: None,
             encode_ms: None,
             prompt_tokens: 0,
@@ -434,6 +484,13 @@ impl Worker {
         }
 
         loop {
+            // Check for cancel flag (set by Cancel command in handle) or
+            // cancel command in the channel.
+            if self.cancel_requested {
+                self.cancel_requested = false;
+                cancelled = true;
+                break;
+            }
             match rx.try_recv() {
                 Ok(WorkerCommand::Cancel) => {
                     cancelled = true;
@@ -549,6 +606,8 @@ impl Worker {
     ) {
         use grim_server::tool_parse::{self, ToolFamily};
         let max_iters = 10; // Prevent infinite loops.
+        // Clear any stale cancel request at the start of a new turn.
+        self.cancel_requested = false;
         let mut total_stats = TurnStats {
             encode_ms: 0.0,
             prompt_tokens: 0,
@@ -564,6 +623,14 @@ impl Worker {
             let (generated_text, stats) = self.generate(&messages, rx, Some(tools));
             total_stats.tokens_generated += stats.tokens_generated;
             total_stats.context_used = stats.context_used;
+
+            // Check for cancel between generation iterations.
+            if self.cancel_requested {
+                self.cancel_requested = false;
+                total_stats.cancelled = true;
+                let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+                return;
+            }
 
             // Parse the generated text for tool calls.
             let family = ToolFamily::Auto; // Try all conventions.
@@ -746,6 +813,8 @@ pub fn spawn_worker(
             tx,
             tools_enabled: true, // Agentic coding mode enabled by default in TUI.
             sandbox_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            cancel_requested: false,
+            backend: "rocm".into(), // Updated when a model is loaded.
         };
 
         loop {

@@ -39,7 +39,7 @@ grim-quant = { workspace = true }
 
 [features]
 default = []
-cuda = ["dep:grim-backend-cuda"]
+cuda = ["dep:grim-backend-cuda", "grim-nn/cuda-mem", "grim-autograd/cuda-mem"]
 rocm-mem = []
 
 [[bench]]

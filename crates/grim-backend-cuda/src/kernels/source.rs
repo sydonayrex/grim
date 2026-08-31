@@ -1579,4 +1579,34 @@ extern "C" __global__ void grim_speculative_rejection_sample(
         accepted_lens[b] = accepted_count;
     }
 }
+
+extern "C" __global__ void grim_short_conv1d_causal_step(
+    const float* x, const float* weight, const float* bias,
+    float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+
+    float val = x[idx];
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+    float sum = val * weight[c * kernel_size + (kernel_size - 1)];
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        sum += conv_state[state_offset + k] * weight[c * kernel_size + k];
+    }
+    if (bias != 0) {
+        sum += bias[c];
+    }
+    out[idx] = sum;
+
+    // Shift state buffer left and insert new input
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
 "#;

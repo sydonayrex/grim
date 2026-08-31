@@ -3885,54 +3885,12 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         if !rocm_devs.is_empty() {
             probe_vram_and_gpus(rocm_devs.len())
         } else {
-            #[cfg(feature = "cuda")]
-            if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
-                if !cuda_devs.is_empty() {
-                    return (
-                        probe_cuda_vram(cuda_devs.len()).0,
-                        probe_cuda_vram(cuda_devs.len()).1,
-                        probe_cuda_vram(cuda_devs.len()).2,
-                    );
-                }
-            }
-            if let Some((free, total)) = grim_backend_metal::vram_info(0) {
-                (
-                    total - free,
-                    total,
-                    vec![serde_json::json!({
-                        "name": "Metal GPU",
-                        "index": 0u32,
-                        "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
-                    })],
-                )
-            } else {
-                (0, 0, vec![])
-            }
+            // Try CUDA first (if compiled in), then Metal, then CPU.
+            probe_gpu_or_cpu()
         }
     } else {
-        #[cfg(feature = "cuda")]
-        if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
-            if !cuda_devs.is_empty() {
-                return (
-                    probe_cuda_vram(cuda_devs.len()).0,
-                    probe_cuda_vram(cuda_devs.len()).1,
-                    probe_cuda_vram(cuda_devs.len()).2,
-                );
-            }
-        }
-        if let Some((free, total)) = grim_backend_metal::vram_info(0) {
-            (
-                total - free,
-                total,
-                vec![serde_json::json!({
-                    "name": "Metal GPU",
-                    "index": 0u32,
-                    "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
-                })],
-            )
-        } else {
-            (0, 0, vec![])
-        }
+        // No ROCm devices: try CUDA (if compiled in), then Metal, then CPU.
+        probe_gpu_or_cpu()
     };
 
     let has_gpu = total_vram_max > 0;
@@ -5461,6 +5419,41 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
     }
 
     (total_vram_used, total_vram_max, gpus_json)
+}
+
+/// Probe GPU VRAM, trying CUDA first (if compiled in), then Metal, then CPU.
+/// Returns `(used_bytes, max_bytes, gpu_info_json)`.
+#[cfg(feature = "cuda")]
+fn probe_gpu_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
+    if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
+        if !cuda_devs.is_empty() {
+            return probe_cuda_vram(cuda_devs.len());
+        }
+    }
+    probe_metal_or_cpu()
+}
+
+/// Non-CUDA fallback: Metal or CPU.
+#[cfg(not(feature = "cuda"))]
+fn probe_gpu_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
+    probe_metal_or_cpu()
+}
+
+/// Metal or CPU fallback used by both CUDA and non-CUDA paths.
+fn probe_metal_or_cpu() -> (u64, u64, Vec<serde_json::Value>) {
+    if let Some((free, total)) = grim_backend_metal::vram_info(0) {
+        (
+            total - free,
+            total,
+            vec![serde_json::json!({
+                "name": "Metal GPU",
+                "index": 0u32,
+                "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
+            })],
+        )
+    } else {
+        (0, 0, vec![])
+    }
 }
 
 /// Probe CUDA VRAM usage for N GPUs.

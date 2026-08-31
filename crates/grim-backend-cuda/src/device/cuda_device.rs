@@ -180,17 +180,36 @@ impl CudaDevice {
         // SAFETY: `cudaGetDeviceCount` reads the number of available CUDA devices
         // into `count`. The pointer is valid and initialized; this is a read-only query.
         let res = unsafe { cudaGetDeviceCount(&mut count) };
-        if res == cudaSuccess && count > 0 {
-            let mut devices = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                if let Ok(dev) = CudaDevice::new(i as usize) {
-                    devices.push(dev);
-                }
-            }
-            return Ok(devices);
+        if res != cudaSuccess {
+            // Log the error so operators can diagnose CUDA init failures
+            // (e.g. driver/runtime version mismatch, no GPU, exclusive mode).
+            // Common codes: 35=cudaErrorInsufficientDriver, 100=cudaErrorNoDevice.
+            eprintln!(
+                "[grim-backend-cuda] cudaGetDeviceCount failed (error code: {res}). \
+                 Common causes: driver/runtime mismatch (code 35), no GPU (code 100), \
+                 or GPU in exclusive mode."
+            );
+            return Ok(vec![]);
         }
-
-        Ok(vec![])
+        if count == 0 {
+            eprintln!("[grim-backend-cuda] cudaGetDeviceCount returned 0 devices");
+            return Ok(vec![]);
+        }
+        let mut devices = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            match CudaDevice::new(i as usize) {
+                Ok(dev) => devices.push(dev),
+                Err(e) => eprintln!(
+                    "[grim-backend-cuda] CudaDevice::new({i}) failed: {e}"
+                ),
+            }
+        }
+        if devices.is_empty() {
+            eprintln!(
+                "[grim-backend-cuda] cudaGetDeviceCount={count} but CudaDevice::new() failed for all devices"
+            );
+        }
+        Ok(devices)
     }
 
     /// Returns the raw cuBLAS handle pointer for this device, lazily initializing if needed.
@@ -990,14 +1009,31 @@ impl CudaDevice {
         };
 
         let out_dims = out.dims();
-        if out_dims.len() != 3 {
+        let (seq_len, num_heads, head_dim) = if out_dims.len() == 3 {
+            (out_dims[0], out_dims[1], out_dims[2])
+        } else if out_dims.len() == 2 {
+            let seq_len = out_dims[0];
+            let hidden_dim = out_dims[1];
+            let q_dims = q.shape().dims();
+            let head_dim = if q_dims.len() == 3 {
+                q_dims[2]
+            } else if q_dims.len() == 2 && num_kv_heads > 0 {
+                q_dims[1] / num_kv_heads
+            } else {
+                hidden_dim / num_kv_heads.max(1)
+            };
+            if head_dim == 0 {
+                return Err(Error::Shape(
+                    "qkv_attention head_dim resolved to zero; malformed model dimension".into(),
+                ));
+            }
+            let num_heads = hidden_dim / head_dim;
+            (seq_len, num_heads, head_dim)
+        } else {
             return Err(Error::Shape(
-                "qkv_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into(),
+                "qkv_attention expects 2-D [seq_len, hidden_dim] or 3-D [seq_len, num_heads, head_dim] output shape".into(),
             ));
-        }
-        let seq_len = out_dims[0];
-        let num_heads = out_dims[1];
-        let head_dim = out_dims[2];
+        };
         if num_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
             return Err(Error::Shape(
                 "qkv_attention: zero-sized num_heads / num_kv_heads / head_dim".into(),
@@ -1258,6 +1294,42 @@ impl CudaDevice {
             completed: Arc::new(Mutex::new(false)),
         });
         Ok((Box::new(out_storage), compute_handle))
+    }
+
+    /// Fused MoE dispatch against resident weights.
+    ///
+    /// Provides parity with resident MoE dispatch entry points on other backend devices.
+    pub fn moe_fused_dispatch_resident(
+        &self,
+        x: &dyn BackendStorage,
+        gate_w: &dyn BackendStorage,
+        up_w: &dyn BackendStorage,
+        down_w: &dyn BackendStorage,
+        router_tokens: &dyn BackendStorage,
+        router_experts: &dyn BackendStorage,
+        router_weights: &dyn BackendStorage,
+        out_shape: &Shape,
+        hidden: u32,
+        inter: u32,
+        num_experts: u32,
+        batch: u32,
+        routed_scaling_factor: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.moe_fused_dispatch(
+            x,
+            gate_w,
+            up_w,
+            down_w,
+            router_tokens,
+            router_experts,
+            router_weights,
+            out_shape,
+            hidden,
+            inter,
+            num_experts,
+            batch,
+            routed_scaling_factor,
+        )
     }
 
     pub fn matmul_op(
@@ -2418,6 +2490,7 @@ impl AttentionOps for CudaDevice {
             let handle = self.launch_rank1_kernel("grim_rope_yarn", &mut args, total)?;
 
             unsafe {
+                let _ = cudaDeviceSynchronize();
                 cudaFree(pos_dev_ptr);
                 cudaFree(freq_dev_ptr);
             }
@@ -2476,6 +2549,7 @@ impl AttentionOps for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_rope", &mut args, total_pairs)?;
 
         unsafe {
+            let _ = cudaDeviceSynchronize();
             cudaFree(pos_dev_ptr);
         }
 
@@ -3434,6 +3508,73 @@ impl RecurrentOps for CudaDevice {
             }),
         ))
     }
+
+    /// Depthwise 1D causal convolution step on CUDA GPU.
+    ///
+    /// Executes the causal convolution step kernel against resident GPU state buffers.
+    fn short_conv1d_causal_step(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        conv_state: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("short_conv1d: x is not CudaStorage".into()))?;
+        let w_s = weight
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("short_conv1d: weight is not CudaStorage".into()))?;
+        let st_s = conv_state
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("short_conv1d: conv_state is not CudaStorage".into()))?;
+
+        Self::ensure_f32_input("short_conv1d x", x_s)?;
+        Self::ensure_f32_input("short_conv1d weight", w_s)?;
+        Self::ensure_f32_input("short_conv1d conv_state", st_s)?;
+
+        let mut x_ptr = Self::dev_ptr_or_err("short_conv1d x", x_s)?;
+        let mut w_ptr = Self::dev_ptr_or_err("short_conv1d weight", w_s)?;
+        let mut b_ptr = match bias {
+            Some(b) => {
+                let b_s = b
+                    .as_any()
+                    .downcast_ref::<CudaStorage>()
+                    .ok_or_else(|| Error::Backend("short_conv1d: bias is not CudaStorage".into()))?;
+                Self::ensure_f32_input("short_conv1d bias", b_s)?;
+                Self::dev_ptr_or_err("short_conv1d bias", b_s)?
+            }
+            None => std::ptr::null_mut(),
+        };
+        let mut st_ptr = Self::dev_ptr_or_err("short_conv1d conv_state", st_s)?;
+
+        let out = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let mut out_ptr = Self::dev_ptr_or_err("short_conv1d out", &out)?;
+
+        let dims = out_shape.dims();
+        let mut batch = dims[0] as i32;
+        let mut channels = *dims.last().unwrap_or(&1) as i32;
+        let mut k_size = (w_s.bytes() / (channels as usize * 4)) as i32;
+        let total = (batch * channels) as usize;
+
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut w_ptr as *mut *mut c_void as *mut c_void,
+            &mut b_ptr as *mut *mut c_void as *mut c_void,
+            &mut st_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut batch as *mut i32 as *mut c_void,
+            &mut channels as *mut i32 as *mut c_void,
+            &mut k_size as *mut i32 as *mut c_void,
+        ];
+
+        let handle = self.launch_rank1_kernel("grim_short_conv1d_causal_step", &mut args, total)?;
+        Ok((Box::new(out), handle))
+    }
 }
 
 impl CollectiveOps for CudaDevice {
@@ -3497,6 +3638,11 @@ impl MemoryOps for CudaDevice {
 
 impl GraphCaptureOps for CudaDevice {
 }
+
+/// Implement umbrella `BackendDevice` trait for `CudaDevice`.
+///
+/// Ties together all granular sub-traits to allow `Arc<dyn BackendDevice>` dispatch across the engine.
+impl grim_tensor::BackendDevice for CudaDevice {}
 
 
 impl CudaDevice {

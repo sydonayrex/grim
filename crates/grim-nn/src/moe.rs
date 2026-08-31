@@ -1205,7 +1205,7 @@ impl CudaResidentWeights {
             down_flat.extend_from_slice(&experts.down[e].weight.to_vec_f32()?);
         }
 
-        let dev = crate::backend_cuda::CudaDevice::new(ordinal)?;
+        let _dev = CudaDevice::new(ordinal)?;
         let gate = Arc::new(CudaStorage::copy_from_host(
             &gate_flat,
             &Shape::new(vec![gate_flat.len()]),
