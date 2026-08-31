@@ -1040,21 +1040,16 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     }
 
     // Transform `.items()` → `| items`.
-    // Only matches the method-call form `.items()`, not the filter `| items`.
-    let result = result.replace(".items()", " | items");
+    let mut result = result.replace(".items()", " | items");
 
-    // In Jinja, `+` fails on string + undefined. `~` is Jinja's string
-    // concatenation operator which coerces undefined to empty string.
-    let result = result.replace(" + ", " ~ ");
+    // NOTE: We do NOT replace ` + ` with ` ~ ` because `+` is arithmetic
+    // in Jinja and `~` is string concatenation. Replacing arithmetic `+`
+    // breaks expressions like `loop.index0 + 1`.
 
-    // Transform `is string` → a permissive test that's true for strings.
-    // MiniCPM5 and other templates use `is string` which minijinja may not
-    // support directly.
-    let result = result.replace("is string", "is matching(\".*\")");
+    // Transform `is string` → a permissive test for string values.
+    result = result.replace("is string", "is matching(\".*\")");
 
     // Strip filter keyword arguments like `tojson(ensure_ascii=False)`.
-    // minijinja filters don't support keyword args; strip them so the filter
-    // name resolves correctly.
     while let Some(pos) = result.find("tojson(") {
         if let Some(end) = result[pos..].find(')') {
             result.replace_range(pos..pos + end + 1, "tojson");
@@ -1062,6 +1057,88 @@ pub fn sanitize_jinja_template(template: &str) -> String {
             break;
         }
     }
+
+    // Transform Python string methods to minijinja filter equivalents.
+    result = result.replace(".split(", " | split(");
+    result = result.replace(".rstrip(", " | trim_end_matches(");
+    result = result.replace(".lstrip(", " | trim_start_matches(");
+    // `.strip('x')` with an argument -> trim both ends; minijinja `trim` takes no arg,
+    // but for the newline-only uses in MiniCPM5 `strip('\n')` the arg-free `trim`
+    // is equivalent for whitespace and avoids a parse error from an unknown filter.
+    // Handle both single and double quoted forms.
+    while let Some(pos) = result.find(".strip('") {
+        if let Some(end) = result[pos..].find("')") {
+            result.replace_range(pos..pos + end + 2, " | trim");
+        } else {
+            break;
+        }
+    }
+    while let Some(pos) = result.find(".strip(\"") {
+        if let Some(end) = result[pos..].find("\")") {
+            result.replace_range(pos..pos + end + 2, " | trim");
+        } else {
+            break;
+        }
+    }
+    // Bare `.strip()` -> trim
+    result = result.replace(".strip()", " | trim");
+
+    // ---- MiniCPM5 / advanced template compat ----
+    // MiniCPM5 uses Python slice/split idioms that minijinja 2.x does not parse:
+    //   messages[::-1]              -> messages | reverse
+    //   x.split(d)[-1] / x.split(d)[0] -> x | split(d) | last / first
+    // Direct textual replaces for the concrete patterns seen in MiniCPM5.
+    // These must run after the `.split(` -> `| split(` transform above.
+    result = result.replace("[::-1]", " | reverse");
+    result = result.replace(" | split('</think>')[-1]", " | split('</think>') | last");
+    result = result.replace(" | split('<think>')[-1]", " | split('<think>') | last");
+    result = result.replace(" | split('</think>')[0]", " | split('</think>') | first");
+    result = result.replace(" | split('<think>')[0]", " | split('<think>') | first");
+    // Generic fallback for any remaining ` | split('x')[-1]` / `[0]` that wasn't one of the above
+    while let Some(pos) = result.find(" | split(") {
+        if result[pos..].contains(")[-1]") {
+            result = result.replacen(")[-1]", ") | last", 1);
+            continue;
+        }
+        if let Some(idx) = result[pos..].find(")[0]") {
+            let after = &result[pos..][idx + 4..];
+            if !after.starts_with(':') {
+                result = result.replacen(")[0]", ") | first", 1);
+                continue;
+            }
+        }
+        break;
+    }
+    // The two slice-equality checks on message.content are not reliably handled by
+    // the generic endswith/startswith loop below due to nested `not(... and ...)` parens.
+    // Patch them directly to the custom tests we register in render_chat_template.
+    result = result.replace(
+        "message.content[0:15] == '<tool_response>'",
+        "message.content is startingwith('<tool_response>')",
+    );
+    result = result.replace(
+        "message.content[-16:] == '</tool_response>'",
+        "message.content is endingwith('</tool_response>')",
+    );
+    result = result.replace(
+        "message.content[0:15] == \"<tool_response>\"",
+        "message.content is startingwith('<tool_response>')",
+    );
+    result = result.replace(
+        "message.content[-16:] == \"</tool_response>\"",
+        "message.content is endingwith('</tool_response>')",
+    );
+    // Tool arguments in grim are stored as a JSON-encoded string, but MiniCPM5
+    // iterates `args_dict.items()` expecting a dict. Insert a `fromjson` parse
+    // so the subsequent `| items` sees an object, not a string.
+    result = result.replace(
+        "{%- set args_dict = tool_call.arguments %}",
+        "{%- set args_dict = tool_call.arguments | fromjson %}",
+    );
+    result = result.replace(
+        "{% set args_dict = tool_call.arguments %}",
+        "{% set args_dict = tool_call.arguments | fromjson %}",
+    );
 
     result
 }
@@ -1105,6 +1182,29 @@ pub fn render_chat_template(
             Ok(String::new())
         },
     );
+    // Add `matching` test for templates that use `is string` or regex matches.
+    // Our sanitize rewrites `is string` -> `is matching(".*")`, so the test receives
+    // the value under test plus the regex pattern string. Only true for actual
+    // strings (so `1 is string` is false and we don't attempt `'<' in 1`).
+    let _ = env.add_test("matching", |v: minijinja::Value, _pat: String| {
+        v.as_str().is_some()
+    });
+    // MiniCPM5 uses `is startingwith('x')` / `is endingwith('x')` via our sanitize.
+    let _ = env.add_test(
+        "startingwith",
+        |v: String, prefix: String| v.starts_with(&prefix),
+    );
+    let _ = env.add_test(
+        "endingwith",
+        |v: String, suffix: String| v.ends_with(&suffix),
+    );
+    // MiniCPM5 uses `messages | reverse` for the `messages[::-1]` reverse iteration.
+    // minijinja 2.23 does not ship a `reverse` filter by default, so we provide one.
+    let _ = env.add_filter("reverse", |v: Vec<minijinja::Value>| {
+        let mut out = v;
+        out.reverse();
+        out
+    });
     // Some templates pass extra args to `tojson` filter; accept and ignore them.
     env.add_filter(
         "tojson",
@@ -1115,6 +1215,30 @@ pub fn render_chat_template(
             })
         },
     );
+    // Add `split` filter for Python `.split()` method compatibility.
+    let _ = env.add_filter("split", |s: &str, sep: &str| -> Vec<String> {
+        s.split(sep).map(String::from).collect()
+    });
+    // Add `trim_end_matches` / `trim_start_matches` filters for `.rstrip()` / `.lstrip()`.
+    let _ = env.add_filter("trim_end_matches", |s: &str, pat: &str| -> String {
+        s.trim_end_matches(pat).to_string()
+    });
+    let _ = env.add_filter("trim_start_matches", |s: &str, pat: &str| -> String {
+        s.trim_start_matches(pat).to_string()
+    });
+    // MiniCPM5 tool calls store `arguments` as a JSON-encoded string (e.g. '{"x":1}').
+    // The template does `{% set args_dict = tool_call.arguments %}` then
+    // `{% for k,v in args_dict | items %}` which fails when args_dict is a string
+    // ("cannot convert value into pairs"). Provide a `fromjson` filter that parses
+    // a JSON string into an object, passing through objects unchanged.
+    let _ = env.add_filter("fromjson", |v: minijinja::Value| -> minijinja::Value {
+        if let Some(s) = v.as_str() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                return minijinja::Value::from_serialize(&parsed);
+            }
+        }
+        v
+    });
     // P1-3.3: Some GGUF-embedded Jinja templates use block directives that
     // minijinja does not support (e.g. `{% generation %}…{% endgeneration %}`).
     // Strip those unsupported tags (keeping their inner content) so the
@@ -1208,12 +1332,43 @@ pub fn render_messages_or_last_with_tools(
         )
         .unwrap_or_else(|e| {
             eprintln!(
-                "[grim-format] chat template render failed, falling back to last message: {e}"
+                "[grim-format] chat template render failed, falling back to structured ChatML: {e}"
             );
-            messages
-                .last()
-                .map(|m| m.content.clone())
-                .unwrap_or_default()
+            // Structured fallback: preserve role framing and BOS instead of returning
+            // raw last-message content. This avoids the TUI feeding an unformatted
+            // prompt that confuses instruction-tuned models, and it avoids leaking
+            // raw Jinja source ("a lot of garbage chat template text") when
+            // sanitize missed an unrecognized block.
+            let bos = tokenizer
+                .bos_token_id
+                .and_then(|id| tokenizer.tokens.get(id as usize))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let mut out = String::new();
+            out.push_str(bos);
+            for m in messages {
+                // MiniCPM5 / ChatML style: <|im_start|>role\ncontent<|im_end|>\n
+                // Keep it model-agnostic: this framing is understood by most
+                // instruction models and matches MiniCPM5's non-tool branch.
+                let role = if m.role == "tool" { "user" } else { &m.role };
+                out.push_str("<|im_start|>");
+                out.push_str(role);
+                out.push('\n');
+                out.push_str(&m.content);
+                if !m.content.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("<|im_end|>\n");
+            }
+            out.push_str("<|im_start|>assistant\n");
+            if out == "<|im_start|>assistant\n" {
+                // No messages at all — fall back to last message if empty somehow
+                return messages
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+            }
+            out
         }),
         None => messages
             .last()

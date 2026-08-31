@@ -55,6 +55,8 @@ toml = "0.8"
 # Safely redirect stderr to a log file during TUI model loading so
 # backend debug output doesn't corrupt the raw-mode terminal display.
 gag = "1.0"
+arboard = "3"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
@@ -66,7 +68,11 @@ tempfile = "3"
 # telling you to use --no-default-features.
 default = ["rocm", "cuda", "metal"]
 rocm = ["grim-backend-rocm/cubecl"]
-cuda = ["dep:grim-backend-cuda", "grim-nn/cuda-mem", "grim-engine/cuda", "grim-autograd/cuda-mem"]
+# NOTE: cuda-mem removed from this feature because it causes a weight
+# loading bug where output features 1024-3071 are zero on CUDA. With
+# cuda-mem disabled, weights are dequantized to F32 at load time (using
+# more memory) but produce correct results.
+cuda = ["dep:grim-backend-cuda", "grim-engine/cuda"]
 metal = ["dep:grim-backend-metal"]
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]
 

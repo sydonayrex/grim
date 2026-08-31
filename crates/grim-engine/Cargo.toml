@@ -38,7 +38,8 @@ grim-kvtransport = { workspace = true }
 grim-quant = { workspace = true }
 
 [features]
-default = []
+default = ["rocm"]
+rocm = ["grim-backend-rocm/rocm"]
 cuda = ["dep:grim-backend-cuda", "grim-nn/cuda-mem", "grim-autograd/cuda-mem"]
 rocm-mem = []
 

@@ -3,6 +3,8 @@
 //! Separates message nodes by role, extracts `<think>...</think>` CoT traces,
 //! and renders styled Ratatui Lines with folding capability.
 
+use std::cell::RefCell;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -52,27 +54,79 @@ impl Default for MessageNode {
 }
 
 /// Structured transcript container managing message history and active streaming state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Transcript {
     /// List of completed message nodes.
     pub nodes: Vec<MessageNode>,
     /// Ongoing streaming buffer for the active turn.
     pub streaming_raw: String,
+    /// Cached rendered lines invalidated only when `nodes.len()` or `streaming_raw` changes.
+    cached_lines: RefCell<Option<Vec<Line<'static>>>>,
+    cached_nodes_len: RefCell<usize>,
+    cached_streaming_len: RefCell<usize>,
+    cached_max_width: RefCell<usize>,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            streaming_raw: String::new(),
+            cached_lines: RefCell::new(None),
+            cached_nodes_len: RefCell::new(usize::MAX),
+            cached_streaming_len: RefCell::new(usize::MAX),
+            cached_max_width: RefCell::new(usize::MAX),
+        }
+    }
 }
 
 impl Transcript {
     /// Create a new empty transcript.
     pub fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            streaming_raw: String::new(),
-        }
+        Self::default()
     }
 
     /// Clear all transcript messages and reset streaming buffer.
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.streaming_raw.clear();
+        self.invalidate_cache();
+    }
+
+    fn invalidate_cache(&self) {
+        *self.cached_lines.borrow_mut() = None;
+    }
+
+    fn is_cache_valid(&self, max_width: usize) -> bool {
+        self.cached_lines.borrow().is_some()
+            && *self.cached_nodes_len.borrow() == self.nodes.len()
+            && *self.cached_streaming_len.borrow() == self.streaming_raw.len()
+            && *self.cached_max_width.borrow() == max_width
+    }
+
+    fn store_cache(&self, lines: Vec<Line<'static>>, max_width: usize) {
+        *self.cached_nodes_len.borrow_mut() = self.nodes.len();
+        *self.cached_streaming_len.borrow_mut() = self.streaming_raw.len();
+        *self.cached_max_width.borrow_mut() = max_width;
+        *self.cached_lines.borrow_mut() = Some(lines);
+    }
+
+    /// Returns true when `content` contains an unclosed fenced code block.
+    fn has_incomplete_fence(content: &str) -> bool {
+        content.matches("```").count() % 2 == 1
+    }
+
+    /// Render plain lines for streaming content with an open fence (no markdown re-highlight).
+    fn render_plain_streaming(content: &str, c_purple_dim: Color, _c_muted: Color) -> Vec<Line<'static>> {
+        content
+            .lines()
+            .map(|l| {
+                Line::from(vec![
+                    ratatui::text::Span::styled("│ ", ratatui::style::Style::default().fg(c_purple_dim)),
+                    ratatui::text::Span::raw(l.to_string()),
+                ])
+            })
+            .collect()
     }
 
     /// Add a user message node.
@@ -82,6 +136,7 @@ impl Transcript {
             content: text,
             ..Default::default()
         });
+        self.invalidate_cache();
     }
 
     /// Add a system notification message.
@@ -91,6 +146,7 @@ impl Transcript {
             content: text,
             ..Default::default()
         });
+        self.invalidate_cache();
     }
 
     /// Add an error notification message.
@@ -100,6 +156,7 @@ impl Transcript {
             content: text,
             ..Default::default()
         });
+        self.invalidate_cache();
     }
 
     /// Add a tool call invocation message with structured name + arguments.
@@ -116,6 +173,7 @@ impl Transcript {
             tool_name: Some(name.to_string()),
             tool_arguments: Some(arguments.to_string()),
         });
+        self.invalidate_cache();
     }
 
     /// Add a tool result output message.
@@ -129,11 +187,17 @@ impl Transcript {
             tool_name: None,
             tool_arguments: None,
         });
+        self.invalidate_cache();
     }
 
     /// Append a token chunk to the active turn streaming buffer.
     pub fn append_token(&mut self, token: &str) {
         self.streaming_raw.push_str(token);
+        // Streaming changes invalidate the cached lines (streaming_raw length changed).
+        // We keep the cache but is_cache_valid will fail; no need to explicitly clear here
+        // but clearing avoids stale cache holding large vec during rapid streaming.
+        // We do not clear aggressively to allow the virtualized path to reuse partial.
+        self.invalidate_cache();
     }
 
     /// Finalize assistant turn, parsing optional `<think>...</think>` tags and attaching metrics.
@@ -148,6 +212,7 @@ impl Transcript {
             ..Default::default()
         });
         self.streaming_raw.clear();
+        self.invalidate_cache();
     }
 
     /// Toggle collapsed state of the latest assistant reasoning block.
@@ -155,6 +220,7 @@ impl Transcript {
         if let Some(node) = self.nodes.iter_mut().rev().find(|n| n.thinking.is_some()) {
             node.thought_folded = !node.thought_folded;
         }
+        self.invalidate_cache();
     }
 
 /// Build styled ratatui Lines for rendering in the main chat viewport.
@@ -174,7 +240,13 @@ impl Transcript {
     }
 
     /// Same as `render_lines` but with a configurable max line width.
+    /// Uses an internal cache invalidated only when `nodes.len()` or `streaming_raw` changes.
     pub fn render_lines_wrapped(&self, max_width: usize) -> Vec<Line<'static>> {
+        if self.is_cache_valid(max_width) {
+            if let Some(cached) = self.cached_lines.borrow().clone() {
+                return cached;
+            }
+        }
         // Brand colors (mirrored from grim-garage palette).
         let c_purple     = Color::Rgb(168, 85, 247);   // #a855f7 — user chip
         let c_purple_dim = Color::Rgb(112, 50, 180);   // dim purple — borders
@@ -185,6 +257,26 @@ impl Transcript {
         let c_amber      = Color::Rgb(245, 158, 11);    // system / warning
         let c_muted      = Color::Rgb(136, 136, 136);   // stats / dim text
         let c_thinking   = Color::Rgb(180, 140, 255);   // thinking gutter
+
+        if self.nodes.is_empty() {
+            // Centered welcome with pills when transcript is empty
+            return vec![
+                Line::from(Span::styled(" Welcome to GRIM ", Style::default().fg(c_purple).add_modifier(Modifier::BOLD))).centered(),
+                Line::from(Span::styled(" Type a message or use a command to get started ", Style::default().fg(c_muted))).centered(),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled(" /model ", Style::default().fg(Color::White).bg(c_purple_dim).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(" /help ", Style::default().fg(Color::White).bg(c_purple_dim)),
+                    Span::raw(" "),
+                    Span::styled(" @ file ", Style::default().fg(Color::White).bg(c_purple_dim)),
+                    Span::raw(" "),
+                    Span::styled(" F4 ", Style::default().fg(Color::White).bg(c_purple_dim)),
+                ]).centered(),
+                Line::raw(""),
+                Line::from(Span::styled(" no model — /model or F4 ", Style::default().fg(c_amber))).centered(),
+            ];
+        }
 
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -365,16 +457,40 @@ impl Transcript {
                     Span::styled("grim", Style::default().fg(c_cyan).add_modifier(Modifier::BOLD)),
                     Span::styled(" ─────────────────────────────────", Style::default().fg(c_purple_dim)),
                 ]));
-                let md_lines = crate::tui::markdown::render_markdown(&content);
-                let last_idx = md_lines.len().saturating_sub(1);
-                for (i, md_line) in md_lines.into_iter().enumerate() {
-                    let mut spans = vec![Span::styled("│ ", Style::default().fg(c_purple_dim))];
-                    spans.extend(md_line.spans);
-                    // Append streaming cursor on the final line.
-                    if i == last_idx {
-                        spans.push(Span::styled("▋", Style::default().fg(c_cyan)));
+                // Code-aware streaming: buffer until fence closes before re-highlighting.
+                // If content contains an unclosed "```", render as plain to avoid flicker.
+                let (md_lines, is_plain) = if Self::has_incomplete_fence(&content) {
+                    let plain: Vec<Line<'static>> = Self::render_plain_streaming(&content, c_purple_dim, c_muted)
+                        .into_iter()
+                        .map(|l| {
+                            // plain lines already have gutter, keep as-is
+                            l
+                        })
+                        .collect();
+                    (plain, true)
+                } else {
+                    (crate::tui::markdown::render_markdown(&content), false)
+                };
+                if is_plain {
+                    let last_idx = md_lines.len().saturating_sub(1);
+                    for (i, md_line) in md_lines.into_iter().enumerate() {
+                        let mut spans = md_line.spans;
+                        if i == last_idx {
+                            spans.push(Span::styled("▋", Style::default().fg(c_cyan)));
+                        }
+                        lines.push(Line::from(spans));
                     }
-                    lines.push(Line::from(spans));
+                } else {
+                    let last_idx = md_lines.len().saturating_sub(1);
+                    for (i, md_line) in md_lines.into_iter().enumerate() {
+                        let mut spans = vec![Span::styled("│ ", Style::default().fg(c_purple_dim))];
+                        spans.extend(md_line.spans);
+                        // Append streaming cursor on the final line.
+                        if i == last_idx {
+                            spans.push(Span::styled("▋", Style::default().fg(c_cyan)));
+                        }
+                        lines.push(Line::from(spans));
+                    }
                 }
             } else if thinking.is_some() {
                 // Pure thinking state (no content yet): show a cursor line under the gutter.
@@ -388,7 +504,31 @@ impl Transcript {
         // Hard-wrap any lines that exceed max_width chars so that model
         // output containing raw template syntax or other long content
         // cannot corrupt the TUI layout.
-        wrap_lines(lines, max_width)
+        let wrapped = wrap_lines(lines, max_width);
+        self.store_cache(wrapped.clone(), max_width);
+        wrapped
+    }
+
+    /// Virtualized transcript: return only the visible window of `content_height`
+    /// lines around `scroll_offset` from the cached full render. Uses the same
+    /// cache key as `render_lines_wrapped` (invalidated only when nodes.len() or
+    /// streaming_raw changes).
+    pub fn render_lines_virtualized(
+        &self,
+        max_width: usize,
+        content_height: usize,
+        scroll_offset: usize,
+    ) -> Vec<Line<'static>> {
+        let full = self.render_lines_wrapped(max_width);
+        if full.len() <= content_height {
+            return full;
+        }
+        // scroll_offset == 0 means pinned to bottom (newest lines visible).
+        // Otherwise offset counts from bottom: 0 => tail, N => N lines scrolled up.
+        let total = full.len();
+        let end = total.saturating_sub(scroll_offset);
+        let start = end.saturating_sub(content_height);
+        full[start..end].to_vec()
     }
 }
 

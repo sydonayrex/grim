@@ -402,6 +402,41 @@ impl Lfm2Block {
             let h_dim = norm_x.shape().dims().last().copied().unwrap_or(0);
             let steps = proj_v.len() / (3 * h_dim);
 
+            // Debug: compare projection output between CPU and CUDA.
+            if std::env::var_os("GRIM_DEBUG_SHORTCONV").is_some() {
+                eprintln!(
+                    "[shortconv-dbg] proj_v: len={} steps={} h_dim={} head={:?}",
+                    proj_v.len(),
+                    steps,
+                    h_dim,
+                    &proj_v[..4.min(proj_v.len())]
+                );
+                // Check the c and x_val components.
+                let c = &proj_v[h_dim..2 * h_dim];
+                let x_val = &proj_v[2 * h_dim..3 * h_dim];
+                eprintln!(
+                    "[shortconv-dbg] c[0..4]={:?} x_val[0..4]={:?}",
+                    &c[..4.min(c.len())],
+                    &x_val[..4.min(x_val.len())]
+                );
+                // Check the weight tensor shape and values.
+                let w_t = &self.shortconv_in_proj.as_ref().unwrap().w_t;
+                eprintln!(
+                    "[shortconv-dbg] in_proj w_t shape={:?} dtype={:?}",
+                    w_t.shape(),
+                    w_t.dtype()
+                );
+                // Check weight values for different output features.
+                let w_t_vec = w_t.to_vec_f32().expect("w_t to_vec");
+                // w_t is [1024, 3072]. Check features 0, 1024, 2048.
+                eprintln!(
+                    "[shortconv-dbg] w_t[0][0..4]={:?} w_t[0][1024..1028]={:?} w_t[0][2048..2052]={:?}",
+                    &w_t_vec[..4],
+                    &w_t_vec[1024..1028.min(w_t_vec.len())],
+                    &w_t_vec[2048..2052.min(w_t_vec.len())]
+                );
+            }
+
             let mut y_out = vec![0.0f32; steps * h_dim];
 
             let conv_kernel_vec = self.shortconv_conv_vec.as_ref().unwrap();
@@ -447,11 +482,44 @@ impl Lfm2Block {
                 }
             }
 
+            // Debug: compare convolution output between CPU and CUDA.
+            if std::env::var_os("GRIM_DEBUG_SHORTCONV").is_some() {
+                eprintln!(
+                    "[shortconv-dbg] y_out: len={} head={:?}",
+                    y_out.len(),
+                    &y_out[..4.min(y_out.len())]
+                );
+                // Check intermediate values.
+                let c_head = &proj_v[h_dim..2 * h_dim];
+                let bx_head: Vec<f32> = proj_v[..h_dim]
+                    .iter()
+                    .zip(&proj_v[2 * h_dim..3 * h_dim])
+                    .map(|(a, b)| a * b)
+                    .collect();
+                eprintln!(
+                    "[shortconv-dbg] c_head={:?} bx_head={:?} conv_kernel_head={:?}",
+                    &c_head[..4.min(c_head.len())],
+                    &bx_head[..4.min(bx_head.len())],
+                    &conv_kernel_vec[..4.min(conv_kernel_vec.len())]
+                );
+            }
+
             let y_tensor = device_tensor(y_out, Shape::new(vec![steps, h_dim]), norm_x.device())?;
-            self.shortconv_out_proj
+            let block_out_2d = self
+                .shortconv_out_proj
                 .as_ref()
                 .unwrap()
-                .forward(&y_tensor)?
+                .forward(&y_tensor)?;
+            // Reshape from [steps, h_dim] to [1, steps, h_dim] so the
+            // residual add works correctly on backends without broadcasting
+            // (e.g. CUDA). The input x is [1, steps, hidden_size].
+            Tensor::new(
+                block_out_2d.storage().clone(),
+                Shape::new(vec![1, steps, h_dim]),
+                block_out_2d.dtype(),
+                block_out_2d.provenance().clone(),
+                block_out_2d.device().clone(),
+            )
         } else if self.is_moe {
             self.forward_moe_ffn(&norm_x)?
         } else {
