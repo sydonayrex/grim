@@ -1,5 +1,17 @@
 //! Dense CausalLm transformer implementations (Llama, Mistral, Qwen, DeepSeek, Gemma, T5, MTP).
 
+/// True when a backend error means "this backend lacks the kernel" — callers
+/// may degrade to the documented host fallback. Any other error must
+/// propagate. GPU-first rule: forwards try the device kernel first and only
+/// take the host path through this guard.
+pub fn is_unimplemented(e: &grim_core::error::Error) -> bool {
+    matches!(
+        e,
+        grim_core::error::Error::Unimplemented(_)
+            | grim_core::error::Error::Tensor(grim_tensor::Error::Unimplemented(_))
+    )
+}
+
 pub mod afmoe;
 pub mod apertus;
 pub mod arcee;

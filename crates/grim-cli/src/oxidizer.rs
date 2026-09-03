@@ -14,9 +14,9 @@ use grim_format::gguf::{
     GrimRocmlProfile, GrimTrainQuantMode, read_gguf, read_tensor_bytes,
 };
 use grim_quant::{
-    EvoPressConfig, FisherCalibrationSample, ImportanceScores, QuantFormat, RewrittenTensorData,
-    TensorRewritePlan, compute_fisher_diagonal, compute_importance_scores, dequant_q4k,
-    dequant_q80, evopress_search, rewrite_tensor_data,
+    FisherCalibrationSample, ImportanceScores, QuantFormat, RcoConfig,
+    RewrittenTensorData, TensorRewritePlan, compute_fisher_diagonal, compute_importance_scores,
+    dequant_q4k, dequant_q80, rco_search, rewrite_tensor_data,
 };
 use grim_tensor::provider::TensorProvider;
 use grim_format::fusion::build_transformer_ir;
@@ -242,10 +242,10 @@ pub fn cmd_oxidizer_search(
     generations: usize,
     progress: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Vec<u32> {
-    evopress_search(
-        &EvoPressConfig {
+    rco_search(
+        &RcoConfig {
             target_bpw,
-            generations,
+            steps: generations.max(20),
             ..Default::default()
         },
         &importance_scores.layer_scores,

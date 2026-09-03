@@ -21,8 +21,8 @@ pub use modules::{
     ColumnParallelLinear, Conv1d, ConvTranspose1d, Embedding, ExpertParallelConfig, KdaAttention,
     KdaLayerCache, LayerCache, LayerNorm, Linear, LinearAttentionBlock, LinearAttentionLayerCache,
     MlaAttention, MlaKvCache, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig, add_tensors,
-    broadcast_bias, pick_device_for_storage_device, pick_device_for_tensor, require_single_device,
-    short_conv1d,
+    broadcast_bias, embedding_gather_on_device, is_kernel_unimplemented,
+    pick_device_for_storage_device, pick_device_for_tensor, require_single_device, short_conv1d,
 };
 
 pub use moe_deterministic::{DeterministicTokenMap, ScoreboardSync};
