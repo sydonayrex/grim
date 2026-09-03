@@ -107,6 +107,8 @@ impl Glm52Expert {
         })
     }
 
+    /// Kernel gap: GELU (tanh approximation) has no device kernel, so this
+    /// activation stays host-side.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.dense_h_to_4h.forward(x)?;
         let hv = h.to_vec_f32()?;
@@ -243,6 +245,12 @@ impl Glm52Block {
         })
     }
 
+    /// GPU-first forward for the fused-QKV attention path.
+    ///
+    /// Kernel gap: the fused `query_key_value` projection has no device
+    /// column-split primitive, so the Q/K/V split stays host-side (one pull of
+    /// the fused activation per forward). RoPE, KV-cache concat, attention and
+    /// the residual adds all run on the tensor's device.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -274,72 +282,59 @@ impl Glm52Block {
                 .copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
         }
 
-        crate::qwen35::apply_rope_neox(
-            &mut q_data,
-            positions,
-            self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_data,
-            positions,
-            self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
-
         let q_rot = cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim]));
         let v_tensor = cpu_tensor(v_data, Shape::new(vec![seq_len, v_dim]));
 
+        let q_rot = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q_rot,
+            self.num_heads,
+            positions,
+        )?;
+        let k_rot = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k_rot,
+            self.num_kv_heads,
+            positions,
+        )?;
+
+        // Device-side history: prev rows stay resident, only the new rows
+        // are appended (D2D arena copy when the backend supports it).
         let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
-            let mut new_k = prev_k.to_vec_f32()?;
-            let mut new_v = prev_v.to_vec_f32()?;
-            new_k.extend(k_rot.to_vec_f32()?);
-            new_v.extend(v_tensor.to_vec_f32()?);
-            let total_seq = new_k.len() / k_dim;
-            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, k_dim]));
-            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, v_dim]));
+            let full_k = crate::shared_attention::concat_rows_on_device(prev_k, &k_rot)?;
+            let full_v = crate::shared_attention::concat_rows_on_device(prev_v, &v_tensor)?;
             *kv_cache = Some((full_k.clone(), full_v.clone()));
             (full_k, full_v)
         } else {
             *kv_cache = Some((k_rot.clone(), v_tensor.clone()));
             (k_rot, v_tensor)
         };
-
-        let q_heads = q_rot.to_vec_f32()?;
-        let k_heads = k_all.to_vec_f32()?;
-        let v_heads = v_all.to_vec_f32()?;
+        let kv_len = k_all.shape().dims()[0];
 
         // Shared helper applies the causal mask at cache_offset + s (fixes
         // future-token leakage during multi-token prefill).
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_heads,
-            &k_heads,
-            &v_heads,
+        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+            &q_rot,
+            &k_all,
+            &v_all,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             seq_len,
+            kv_len,
             None,
-            &Device::Cpu,
         )?;
         let attn_proj = self.dense.forward(&attn_tensor)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_proj.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
-
-        let normed_ffn = self.post_attention_layernorm.forward(&res1_t)?;
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        let normed_ffn = self.post_attention_layernorm.forward(&res1)?;
         let mlp_out = self.mlp.forward(&normed_ffn)?;
+        // Routing stays host-side, so the MoE output lands on the host; stage
+        // it back next to `res1` before the residual add.
+        let mlp_out = grim_nn::modules::move_to_device(&mlp_out, x.device())?;
 
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -443,26 +438,23 @@ impl CausalLm for Glm52 {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let ids = input_ids.to_vec_f32()?;
-        let seq_len = ids.len();
+        let ids_f32 = input_ids.to_vec_f32()?;
+        let seq_len = ids_f32.len();
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
         let pos_v: Vec<u32> = positions
             .to_vec_f32()
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.word_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
 
-        let embed_w = self.word_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
-            }
-        }
-
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
         let mut kv_caches = vec![None; self.layers.len()];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
