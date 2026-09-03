@@ -163,6 +163,8 @@ pub enum SlashCommand {
     Compact,
     /// Restore files changed by the last agent tool call.
     Undo,
+    /// List configured MCP servers and their status.
+    Mcp,
     /// Select the inference backend (rocm, cuda, metal, cpu, auto).
     Backend(Option<String>),
     Exit,
@@ -214,6 +216,7 @@ pub fn parse_slash_command(input: &str) -> SlashCommand {
         "plan" if after.is_empty() => SlashCommand::Plan(None),
         "compact" => SlashCommand::Compact,
         "undo" => SlashCommand::Undo,
+        "mcp" => SlashCommand::Mcp,
         "plan" => SlashCommand::Plan(Some(after.trim().to_string())),
         "backend" if after.is_empty() => SlashCommand::Backend(None),
         "backend" => SlashCommand::Backend(Some(after.trim().to_string())),
@@ -358,6 +361,8 @@ pub struct App {
     pub pending_compaction: Option<compact::CompactionPlan>,
     /// File-store checkpoints for agent edits (capture/restore).
     pub checkpoints: checkpoints::CheckpointStore,
+    /// MCP servers shared with the worker; routes `mcp_*` tool calls.
+    pub mcp: mcp::manager::SharedMcp,
 }
 
 impl App {
@@ -413,6 +418,7 @@ impl App {
             compacting: false,
             pending_compaction: None,
             checkpoints: checkpoints::CheckpointStore::open(&project_dir),
+            mcp: std::sync::Arc::new(std::sync::Mutex::new(mcp::manager::McpManager::load())),
         }
     }
 
@@ -1992,6 +1998,21 @@ impl App {
                     self.input_mode = InputMode::CheckpointPicker { selected: 0 };
                 }
             }
+            SlashCommand::Mcp => match self.mcp.lock() {
+                Ok(mgr) => {
+                    let lines = mgr.status_lines();
+                    if lines.is_empty() {
+                        self.transcript.push_system(
+                            "no MCP servers configured (~/.config/grim/mcp.toml)".into(),
+                        );
+                    } else {
+                        for l in lines {
+                            self.transcript.push_system(format!("mcp: {l}"));
+                        }
+                    }
+                }
+                Err(_) => self.transcript.push_error("mcp manager unavailable".into()),
+            },
             SlashCommand::NotACommand => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -2097,6 +2118,7 @@ impl App {
                 &call,
                 &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
                 &self.checkpoints,
+                &self.mcp.clone(),
             );
             let output = match result {
                 Ok(s) => s,
@@ -3701,13 +3723,40 @@ pub async fn cmd_tui(
     // One permissions store shared by worker (checks before prompting) and
     // the App (adds rules on "always allow").
     let perms = permissions::shared(permissions::PermissionRules::load());
-    let worker = worker::spawn_worker(params, cmd_rx, evt_tx, perms.clone());
+    // One MCP manager shared by worker (tool routing) and the App (/mcp).
+    let mcp: mcp::manager::SharedMcp = std::sync::Arc::new(std::sync::Mutex::new(
+        mcp::manager::McpManager::load(),
+    ));
+    let worker = worker::spawn_worker(params, cmd_rx, evt_tx, perms.clone(), mcp.clone());
     if let Some(m) = &model {
         let _ = cmd_tx.send(WorkerCommand::LoadModel { name: m.clone() });
     }
 
     let mut app = App::new(cmd_tx.clone());
     app.permissions = perms;
+
+    // Connect configured MCP servers before the first frame; report status
+    // and extend the model's tool list with the prefixed MCP tools.
+    {
+        let status = match mcp.lock() {
+            Ok(mut mgr) => {
+                let status = mgr.connect_all();
+                // Worker and UI must agree on the SAME merged tool list:
+                // built-ins + prefixed MCP tools.
+                let mut all = crate::tui::tools::coding_tools();
+                all.extend(mgr.tool_defs());
+                drop(mgr);
+                let _ = cmd_tx.send(WorkerCommand::SetTools { tools: all.clone() });
+                app.tools = all;
+                status
+            }
+            Err(_) => Vec::new(),
+        };
+        for line in status {
+            app.transcript.push_system(format!("mcp: {line}"));
+        }
+    }
+    app.mcp = mcp;
 
     // Session resume: --resume <path> uses that file; --continue picks the
     // most recently modified *.jsonl in the current directory, falling back

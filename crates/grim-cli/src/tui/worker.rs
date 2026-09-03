@@ -46,6 +46,11 @@ pub enum WorkerCommand {
     SetPlanMode {
         enabled: bool,
     },
+    /// UI → worker: replace the tool list offered to the model
+    /// (built-ins + MCP tools after servers connect).
+    SetTools {
+        tools: Vec<grim_format::ToolDef>,
+    },
     /// UI → worker: summarize these older messages with the same engine
     /// (compaction). Reply is WorkerEvent::CompactionDone.
     Compact {
@@ -229,6 +234,10 @@ struct Worker {
     plan_mode: bool,
     /// File-store checkpoints captured before mutating tool calls.
     checkpoint_store: crate::tui::checkpoints::CheckpointStore,
+    /// MCP servers shared with the UI thread; routes `mcp_*` tool calls.
+    mcp: crate::tui::mcp::manager::SharedMcp,
+    /// Tool definitions offered to the model (built-ins + MCP).
+    tools: Vec<grim_format::ToolDef>,
 }
 
 /// System preamble injected when plan mode is active. Read-only tools stay
@@ -258,6 +267,10 @@ impl Worker {
             }
             WorkerCommand::SetPlanMode { enabled } => {
                 self.plan_mode = enabled;
+                WorkerOutcome::Ignored
+            }
+            WorkerCommand::SetTools { tools } => {
+                self.tools = tools;
                 WorkerOutcome::Ignored
             }
             WorkerCommand::SetContextLimit { limit } => {
@@ -306,7 +319,7 @@ impl Worker {
                     messages
                 };
                 if self.tools_enabled {
-                    self.agentic_generate(messages, rx, &crate::tui::tools::coding_tools(), self.sandbox_root.clone());
+                    self.agentic_generate(messages, rx, &self.tools.clone(), self.sandbox_root.clone());
                 } else {
                     let (_text, stats) = self.generate(&messages, rx, None);
                     let _ = self.tx.send(WorkerEvent::TurnComplete { stats });
@@ -791,7 +804,9 @@ impl Worker {
                     continue;
                 }
 
-                // Auto-execute read-only tools; request approval for mutations.
+                // Auto-execute read-only built-in tools; everything else
+                // (mutations and ALL mcp_* tools, since they are not in this
+                // match) requires either an always-allow rule or approval.
                 let is_read_only =
                     matches!(name.as_str(), "read_file" | "list_files" | "search_files");
                 let allowed = is_read_only || {
@@ -805,6 +820,7 @@ impl Worker {
                         &call,
                         &crate::tui::tools::Sandbox::new(sandbox_root.clone()),
                         &self.checkpoint_store,
+                        &self.mcp.clone(),
                     );
                     let output = match result {
                         Ok(s) => s,
@@ -948,6 +964,7 @@ pub fn spawn_worker(
     rx: Receiver<WorkerCommand>,
     tx: Sender<WorkerEvent>,
     permissions: crate::tui::permissions::SharedPermissions,
+    mcp: crate::tui::mcp::manager::SharedMcp,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let sampling = SamplingParams {
@@ -978,6 +995,8 @@ pub fn spawn_worker(
             checkpoint_store: crate::tui::checkpoints::CheckpointStore::open(
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
+            mcp,
+            tools: crate::tui::tools::coding_tools(),
         };
 
         loop {
