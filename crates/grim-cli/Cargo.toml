@@ -47,7 +47,7 @@ zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 rand = { workspace = true }
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 pulldown-cmark = "0.12"
 syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "plist-load"] }
