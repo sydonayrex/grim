@@ -4,6 +4,7 @@ use crate::catalog::resolve_model_path;
 use grim_backend_cpu;
 #[cfg(feature = "cuda")]
 use grim_backend_cuda;
+#[cfg(feature = "metal")]
 use grim_backend_metal;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
@@ -140,20 +141,25 @@ fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
                 Err(backend_unavailable("rocm", "no ROCm devices probed"))
             }
             "metal" => {
-                let ord_req = s
-                    .split(':')
-                    .nth(1)
-                    .and_then(|x| x.parse::<usize>().ok())
-                    .unwrap_or(0);
-                match grim_backend_metal::vram_info(ord_req) {
-                    Some((_free, total)) if total > 0 => {
-                        Ok((Device::Metal(ord_req), format!("metal:{ord_req}")))
+                #[cfg(feature = "metal")]
+                {
+                    let ord_req = s
+                        .split(':')
+                        .nth(1)
+                        .and_then(|x| x.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    match grim_backend_metal::vram_info(ord_req) {
+                        Some((_free, total)) if total > 0 => {
+                            Ok((Device::Metal(ord_req), format!("metal:{ord_req}")))
+                        }
+                        _ => Err(backend_unavailable(
+                            "metal",
+                            "host unsupported or no Metal device found",
+                        )),
                     }
-                    _ => Err(backend_unavailable(
-                        "metal",
-                        "host unsupported or no Metal device found",
-                    )),
                 }
+                #[cfg(not(feature = "metal"))]
+                Err(backend_unavailable("metal", "not compiled in"))
             }
             "vulkan" => {
                 if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
@@ -183,7 +189,7 @@ fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
             Ok((Device::Rocm(ordinal), format!("rocm:{}", ordinal)))
         } else {
             // ROCm available but no devices; check Metal → CUDA → Vulkan fallback.
-            #[cfg(target_vendor = "apple")]
+            #[cfg(all(target_vendor = "apple", feature = "metal"))]
             {
                 if let Some((_free, total)) = grim_backend_metal::vram_info(0) {
                     if total > 0 {
@@ -215,7 +221,7 @@ fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
         }
     } else {
         // Check Metal on Apple platforms first, then Vulkan as fallback
-        #[cfg(target_vendor = "apple")]
+        #[cfg(all(target_vendor = "apple", feature = "metal"))]
         {
             let Some((_free, total)) = grim_backend_metal::vram_info(0) else {
                 return Ok((Device::Cpu, "cpu".into()));
@@ -225,7 +231,7 @@ fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
                 return Ok((Device::Metal(0), "metal:0".into()));
             }
         }
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(all(target_vendor = "apple", feature = "metal")))]
         {
             if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
                 if !vulkan_devices.is_empty() {
@@ -761,9 +767,16 @@ fn build_tensor(
             let dev = grim_backend_vulkan::VulkanDevice::new();
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
         }
+        #[cfg(feature = "metal")]
         grim_tensor::Device::Metal(ordinal) => {
             let dev = grim_backend_metal::MetalDevice::try_new(*ordinal)?;
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+        #[cfg(not(feature = "metal"))]
+        grim_tensor::Device::Metal(_) => {
+            return Err(grim_core::error::Error::Unimplemented(
+                "Metal backend is not enabled in this build".into(),
+            ));
         }
     };
     Ok(grim_tensor::Tensor::new(

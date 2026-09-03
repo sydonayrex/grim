@@ -110,15 +110,9 @@ impl MiniMaxM3Expert {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.w1.forward(x)?;
         let up = self.w3.forward(x)?;
-        let gv = gate.to_vec_f32()?;
-        let uv = up.to_vec_f32()?;
-        let swiglu: Vec<f32> = gv
-            .iter()
-            .zip(uv.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
-        Ok(self.w2.forward(&swiglu_t)?)
+        let swiglu = grim_nn::modules::silu_mul_on_device(&gate, &up)
+            .map_err(grim_core::error::Error::from)?;
+        Ok(self.w2.forward(&swiglu)?)
     }
 }
 
@@ -157,7 +151,6 @@ impl MiniMaxM3BlockSparseMoe {
         let logits_v = logits.to_vec_f32()?;
         let num_exp = self.experts.len();
 
-        let xv = x.to_vec_f32()?;
         let mut out = vec![0.0f32; seq_len * hidden_dim];
 
         for s in 0..seq_len {
@@ -175,7 +168,10 @@ impl MiniMaxM3BlockSparseMoe {
             let weights: Vec<f32> = exps.iter().map(|e| e / (sum_e + 1e-12)).collect();
 
             let token_x = cpu_tensor(
-                xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
+                {
+                    let xv = x.to_vec_f32()?;
+                    xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec()
+                },
                 Shape::new(vec![1, hidden_dim]),
             );
 

@@ -334,31 +334,20 @@ impl MiniCpmBlock {
             )));
         };
         let head_dim = self.cfg.head_dim;
-        let data = x.to_vec_f32()?;
-        let mut reshaped = vec![0.0f32; b * s * num_heads * head_dim];
-        for bi in 0..b {
-            for si in 0..s {
-                for hi in 0..num_heads {
-                    for di in 0..head_dim {
-                        let src = (bi * s + si) * d + hi * head_dim + di;
-                        let dst = (bi * s * num_heads + si * num_heads + hi) * head_dim + di;
-                        reshaped[dst] = data[src];
-                    }
-                }
-            }
-        }
-        let dev = pick_device_for_storage_device(&self.dev);
-        let storage = dev.from_cpu(
-            &reshaped,
-            &Shape::new(vec![b, s * num_heads, head_dim]),
-            DType::F32,
-        )?;
-        let reshaped_tensor = Tensor::new(
-            Arc::from(storage),
-            Shape::new(vec![b, s * num_heads, head_dim]),
-            DType::F32,
+        debug_assert_eq!(d, num_heads * head_dim);
+
+        // Perf (WI-rope): the old path round-tripped through host memory —
+        // to_vec_f32 → CPU repack → from_cpu → rope → to_vec_f32 → CPU repack
+        // → from_cpu (six crossings per layer per step). [b, s, H·D] and
+        // [b, s·H, D] are the SAME contiguous layout, so the repack is a
+        // zero-copy relabel; rope runs device-side on the relabeled view.
+        let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
+        let relabeled = Tensor::new(
+            x.storage().clone(),
+            rope_shape.clone(),
+            x.dtype().clone(),
             x.provenance().clone(),
-            self.dev.clone(),
+            x.device().clone(),
         );
 
         let mut ext_positions = Vec::with_capacity(s * num_heads);
@@ -373,29 +362,35 @@ impl MiniCpmBlock {
             }
         }
 
-        let rope_out = self.rope.forward(&reshaped_tensor, &ext_positions)?;
-        let rope_data = rope_out.to_vec_f32()?;
-        let mut result = vec![0.0f32; b * s * d];
-        for bi in 0..b {
-            for si in 0..s {
-                for hi in 0..num_heads {
-                    for di in 0..head_dim {
-                        let src = (bi * s * num_heads + si * num_heads + hi) * head_dim + di;
-                        let dst = (bi * s + si) * d + hi * head_dim + di;
-                        result[dst] = rope_data[src];
-                    }
-                }
-            }
-        }
+        // Device rope first (no host roundtrip); fall back to the generic
+        // Rope module (also [b, s·H, D]-shaped) for backends without a rope
+        // launcher. Output storage already carries rope_shape.
+        let dev = pick_device_for_storage_device(&self.dev);
+        let rope_out = match dev.rope(
+            relabeled.storage().as_ref(),
+            &ext_positions,
+            &self.rope.config,
+            &rope_shape,
+        ) {
+            Ok((storage, _handle)) => Tensor::new(
+                Arc::from(storage),
+                rope_shape,
+                x.dtype().clone(),
+                x.provenance().clone(),
+                x.device().clone(),
+            ),
+            Err(_) => self.rope.forward(&relabeled, &ext_positions)?,
+        };
 
-        let storage = dev.from_cpu(&result, &Shape::new(vec![b, s, d]), DType::F32)?;
-        Ok(Tensor::new(
-            Arc::from(storage),
+        // Relabel back to [b, s, H·D] — zero-copy.
+        let result = Tensor::new(
+            rope_out.storage().clone(),
             Shape::new(vec![b, s, d]),
-            DType::F32,
-            x.provenance().clone(),
-            self.dev.clone(),
-        ))
+            rope_out.dtype().clone(),
+            rope_out.provenance().clone(),
+            rope_out.device().clone(),
+        );
+        Ok(result)
     }
 
     fn prefilled_self_attention(
@@ -710,6 +705,7 @@ impl CausalLm for MiniCpmModel {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
+        eprintln!("[minicpm] forward: self.device={:?} session.has_paged_kv={}", self.device, session.has_paged_kv());
         let ids: Vec<u32> = match input_ids.dtype() {
             d if d == DType::F32 => {
                 let v = input_ids.to_vec_f32()?;

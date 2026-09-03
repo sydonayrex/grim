@@ -753,7 +753,7 @@ impl WhisperDecoderBlock {
         ordinal: usize,
     ) -> Result<Vec<f32>> {
         use grim_backend_rocm::RocmDevice;
-        use grim_tensor::BackendDevice;
+        use grim_tensor::{CoreTensorOps, AttentionOps};
 
         let dev = RocmDevice::try_new(ordinal)?;
 

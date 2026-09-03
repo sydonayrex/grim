@@ -21,7 +21,9 @@ parking_lot = { workspace = true }
 
 
 [features]
-default = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
+# Default: ROCm only. CUDA is optional — enable with --features cuda-mem.
+# This avoids requiring the CUDA toolkit/SDK at build time for ROCm-only hosts.
+default = ["rocm-mem"]
 cuda-mem = ["dep:grim-backend-cuda"]
 rocm-mem = []
 metal-mem = []

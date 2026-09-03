@@ -1,5 +1,7 @@
 //! Transformer block: pre-norm, GQA attention, SwiGLU FFN.
 
+use std::sync::Arc;
+
 use grim_core::error::{Error, Result};
 use grim_nn::{
     ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
@@ -555,30 +557,56 @@ impl LlamaBlock {
 
         let paged_attn_out = if let Some(sess) = session {
             if sess.has_paged_kv() {
-                // Append this layer's K/V into the paged store BEFORE attending
-                // so the current token is visible to the attention kernel
-                // (which reads up to `cache_offset + total_tokens`). The K
-                // stored must be POST-RoPE — the classic `LlamaLayerCache`
-                // path caches `k_rot` and the dense attention reads it
-                // directly, so the paged pages must match exactly.
-                let k_rot =
-                    self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
-                // A FAILED append must skip the paged read — attending over
-                // pages missing this call's K/V silently corrupts output
-                // (the `.ok()` here used to swallow the error and read the
-                // stale pages anyway). The classic-cache fallback is always
-                // correct.
-                let appended = sess.append_kv_layer(layer, &k_rot, &v).is_ok();
-                if appended {
-                    if let (Some(bt), Some((k_pages, v_pages, page_size))) =
-                        (sess.block_table(), sess.paged_kv_handles(layer))
-                    {
-                        self.paged_self_attention(&q, bt, &k_pages, &v_pages, page_size, positions)
+                // The GPU `grim_qkv_attention_paged` kernel computes attention
+                // for a SINGLE query position (abs_i = cache_offset) and
+                // indexes the block table as `block_tables + batch_idx *
+                // max_blocks` with batch_idx = grid.x. Passing a multi-token
+                // prefill as "batch" walks the table far past the upload —
+                // observed as GPU page faults on MiniCPM5 (622-token prompt)
+                // while short-sequence models never crossed the page boundary.
+                // The paged kernel is therefore decode-only: multi-token
+                // queries fall back to the dense path below (K/V are still
+                // appended to the pages first so subsequent decode is correct).
+                let seq_tokens = x_2d.shape().dims().first().copied().unwrap_or(0);
+                if seq_tokens == 1 {
+                    // Append this layer's K/V into the paged store BEFORE attending
+                    // so the current token is visible to the attention kernel
+                    // (which reads up to `cache_offset + total_tokens`). The K
+                    // stored must be POST-RoPE — the classic `LlamaLayerCache`
+                    // path caches `k_rot` and the dense attention reads it
+                    // directly, so the paged pages must match exactly.
+                    let k_rot =
+                        self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
+                    // A FAILED append must skip the paged read — attending over
+                    // pages missing this call's K/V silently corrupts output
+                    // (the `.ok()` here used to swallow the error and read the
+                    // stale pages anyway). The classic-cache fallback is always
+                    // correct.
+                    let appended = sess.append_kv_layer(layer, &k_rot, &v).is_ok();
+                    if appended {
+                        if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                            (sess.block_table(), sess.paged_kv_handles(layer))
+                        {
+                            // WI-kv: reuse the session-cached device block table
+                            // (rebuilt only when the table grows) instead of a
+                            // per-layer-per-token H2D upload.
+                            let bt_gpu = sess.block_table_gpu_handle();
+                            self.paged_self_attention(
+                                &q, bt, &k_pages, &v_pages, page_size, positions, bt_gpu,
+                            )
                             .ok()
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 } else {
+                    // Multi-token (prefill): append POST-RoPE K/V to the pages
+                    // so the cache stays complete, then attend densely.
+                    let k_rot =
+                        self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
+                    let _ = sess.append_kv_layer(layer, &k_rot, &v);
                     None
                 }
             } else {
@@ -1040,6 +1068,7 @@ impl LlamaBlock {
         v_pages: &Tensor,
         page_size: usize,
         positions: &[u32],
+        bt_gpu: Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>,
     ) -> Result<Tensor> {
         let cfg = &self._cfg;
         let q_rot = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
@@ -1064,9 +1093,25 @@ impl LlamaBlock {
         let q_3d = relabel_3d(&q_rot, total_tokens, cfg.local_num_heads, cfg.head_dim)?;
         let _ = q_3d_shape;
 
-        let bt_f32: Vec<f32> = block_table.iter().map(|&b| b as f32).collect();
-        let bt_shape = Shape::new(vec![block_table.len()]);
-        let bt_storage = dev.from_cpu(&bt_f32, &bt_shape, grim_tensor::DType::F32)?;
+        // Kernel ABI: `grim_qkv_attention_paged` reads the block table as
+        // `BlockTableEntry { block_id: u32, page_size: u32 }` — two words per
+        // entry. Upload raw u32 bit patterns (f32::from_bits keeps the bytes
+        // intact through the f32-typed host->device copy); a plain
+        // `b as f32` array made the kernel decode garbage ids and walk past
+        // the buffer (MiniCPM5 page fault). WI-kv: prefer the session-cached
+        // device table — upload only on cache miss (table changed).
+        let bt_storage: std::sync::Arc<dyn grim_tensor::BackendStorage> =
+            match bt_gpu {
+                Some(a) => a,
+                None => {
+                    let bt_f32: Vec<f32> = block_table
+                        .iter()
+                        .flat_map(|&b| [f32::from_bits(b), f32::from_bits(page_size as u32)])
+                        .collect();
+                    let bt_shape = Shape::new(vec![block_table.len() * 2]);
+                    Arc::from(dev.from_cpu(&bt_f32, &bt_shape, grim_tensor::DType::F32)?)
+                }
+            };
 
         let out_shape_3d = Shape::new(vec![total_tokens, cfg.local_num_heads, cfg.head_dim]);
         let cache_offset = positions.first().copied().unwrap_or(0);
@@ -1316,7 +1361,7 @@ mod tests {
         // applies RoPE internally (mirroring the runtime call in
         // `forward_with_kv_paged`), so feeding it `q_rot` would rotate twice.
         let paged_attn = block
-            .paged_self_attention(&q, &bt, &kp, &vp, ps, &positions)
+            .paged_self_attention(&q, &bt, &kp, &vp, ps, &positions, None)
             .unwrap();
         assert_eq!(
             classic_attn.to_vec_f32().unwrap(),

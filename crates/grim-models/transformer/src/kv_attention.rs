@@ -14,7 +14,8 @@
 //! block-addressed, so neither fits a naive full-history reference loop — hence
 //! this per-layer buffer parked in `session.model_state` (mirroring `lfm2.rs`).
 
-use grim_tensor::{Device, Shape, Tensor};
+use grim_tensor::{DType, Device, Shape, Tensor};
+use std::sync::Arc;
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -159,6 +160,91 @@ pub fn f32_tensor(data: Vec<f32>, shape: Shape) -> Tensor {
 /// Re-export the CPU device marker for callers that build tensors directly.
 pub fn cpu() -> Device {
     Device::Cpu
+}
+
+/// Device-resident KV arena: appends stay on the GPU, so the host never
+/// rebuilds the full history. The arena grows geometrically to bound realloc.
+pub struct DevKvArena {
+    /// Device storage for K rows. `None` until the first token is appended.
+    pub k_dev: Option<Arc<dyn grim_tensor::BackendStorage>>,
+    /// Device storage for V rows. `None` until the first token is appended.
+    pub v_dev: Option<Arc<dyn grim_tensor::BackendStorage>>,
+    /// Rows committed so far.
+    pub tokens: usize,
+    /// Rows the arena is sized for.
+    pub capacity_rows: usize,
+    /// Flat row width (`num_kv_heads * head_dim`).
+    pub row_elems: usize,
+}
+
+impl DevKvArena {
+    pub fn new(row_elems: usize) -> Self {
+        Self {
+            k_dev: None,
+            v_dev: None,
+            tokens: 0,
+            capacity_rows: 0,
+            row_elems,
+        }
+    }
+}
+
+/// Append one step's K/V to the arena entirely on-device. Returns the arena
+/// K/V storages (shared; callers read, never free) and the new token count.
+///
+/// On CPU this degrades to the same behavior via vector-push; correctness is
+/// preserved because the arena is just a flat [tokens, row_elems] tensor.
+pub fn arena_append(
+    arena: &mut DevKvArena,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    dev: &dyn grim_tensor::BackendDevice,
+    tokens_this_step: usize,
+) -> Result<(Arc<dyn grim_tensor::BackendStorage>, Arc<dyn grim_tensor::BackendStorage>, usize)> {
+    let row_elems = arena.row_elems;
+    let total = arena.tokens + tokens_this_step;
+
+    // Grow if needed — geometric to amortize.
+    if total > arena.capacity_rows {
+        let new_cap = total.next_power_of_two().max(64);
+        let shape = Shape::new(vec![new_cap, row_elems]);
+        let k_new = dev.alloc_storage(&shape, DType::F32)?;
+        let v_new = dev.alloc_storage(&shape, DType::F32)?;
+        if let Some(ref k_old) = arena.k_dev {
+            dev.copy_slice_range(
+                &*k_new, 0, &**k_old, 0,
+                arena.tokens * row_elems,
+            )?;
+        }
+        if let Some(ref v_old) = arena.v_dev {
+            dev.copy_slice_range(
+                &*v_new, 0, &**v_old, 0,
+                arena.tokens * row_elems,
+            )?;
+        }
+        arena.k_dev = Some(Arc::from(k_new));
+        arena.v_dev = Some(Arc::from(v_new));
+        arena.capacity_rows = new_cap;
+    }
+
+    // Append the new rows at the tail offset, no host round-trip.
+    let tail_off = arena.tokens * row_elems;
+    dev.copy_slice_range(
+        arena.k_dev.as_ref().unwrap().as_ref(), tail_off,
+        k_new.storage().as_ref(), 0,
+        tokens_this_step * row_elems,
+    )?;
+    dev.copy_slice_range(
+        arena.v_dev.as_ref().unwrap().as_ref(), tail_off,
+        v_new.storage().as_ref(), 0,
+        tokens_this_step * row_elems,
+    )?;
+    arena.tokens = total;
+    Ok((
+        arena.k_dev.as_ref().unwrap().clone(),
+        arena.v_dev.as_ref().unwrap().clone(),
+        total,
+    ))
 }
 
 #[cfg(test)]

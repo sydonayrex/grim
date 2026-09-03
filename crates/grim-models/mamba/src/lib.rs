@@ -194,7 +194,7 @@ impl MambaBlock {
     #[cfg(feature = "rocm")]
     fn step_block_gpu(&self, x: &Tensor, state: &mut MambaState, ordinal: usize) -> Result<Tensor> {
         use grim_backend_rocm::RocmDevice;
-        use grim_tensor::BackendDevice;
+        use grim_tensor::{CoreTensorOps, RecurrentOps};
 
         let dev = RocmDevice::try_new(ordinal)?;
         let h_in = x.shape().dims().last().copied().unwrap_or(0);

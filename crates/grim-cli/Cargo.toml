@@ -57,21 +57,17 @@ toml = "0.8"
 gag = "1.0"
 arboard = "3"
 base64 = "0.22"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
-# All GPU backends enabled by default — the TUI's /backend command
-# switches between them at runtime. If a backend's SDK is missing at
-# build time (e.g. no CUDA toolkit), the build fails with a clear error
-# telling you to use --no-default-features.
-default = ["rocm", "cuda", "metal"]
+# ROCm only by default. CUDA and Metal are optional — enable with
+# --features cuda or --features metal. This avoids requiring the CUDA
+# toolkit/SDK at build time for ROCm-only hosts.
+default = ["rocm"]
 rocm = ["grim-backend-rocm/cubecl"]
-# NOTE: cuda-mem removed from this feature because it causes a weight
-# loading bug where output features 1024-3071 are zero on CUDA. With
-# cuda-mem disabled, weights are dequantized to F32 at load time (using
-# more memory) but produce correct results.
 cuda = ["dep:grim-backend-cuda", "grim-engine/cuda"]
 metal = ["dep:grim-backend-metal"]
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]

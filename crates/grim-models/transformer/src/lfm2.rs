@@ -884,6 +884,105 @@ impl Lfm2Block {
         Ok(q_rot_vec)
     }
 
+    /// Device-side per-token expert compute: extract the winning expert's
+    /// weight block from the stacked `[E, F, H]` tensor, transpose on-device,
+    /// matmul the token row, silu-gate with the up projection, then the down
+    /// projection. All of it on the device; the host only sees the tiny
+    /// gate-logit vector. Falls back to the host loop only when a backend
+    /// lacks one of the required ops (allocsilce/transpose/matmul/silu_mul).
+    fn forward_moe_ffn_device(
+        &self,
+        x: &Tensor,
+        probs: &[f32],
+        steps: usize,
+        hidden: usize,
+    ) -> Result<Tensor> {
+        let n_expert = self.n_expert;
+        let gate_w = self.ffn_gate_exps.as_ref().unwrap();
+        let up_w = self.ffn_up_exps.as_ref().unwrap();
+        let down_w = self.ffn_down_exps.as_ref().unwrap();
+
+        let gate_dims = gate_w.shape().dims().to_vec();
+        let n_ff = gate_dims[1];
+        let n_hidden = gate_dims[2];
+
+        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+        let out_shape = Shape::new(vec![steps, hidden]);
+        let out_storage = dev.alloc_storage(&out_shape, DType::F32)?;
+        let out_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(out_storage);
+        let x_st = x.storage().clone();
+
+        let row_shape = Shape::new(vec![1, n_hidden]);
+        let ffxh = Shape::new(vec![n_ff, n_hidden]);
+        let row_ff = Shape::new(vec![1, n_ff]);
+
+        for s in 0..steps {
+            let (mut best_e, mut best_p) = (0usize, probs[s * n_expert]);
+            for e in 1..n_expert {
+                if probs[s * n_expert + e] > best_p {
+                    best_p = probs[s * n_expert + e];
+                    best_e = e;
+                }
+            }
+
+            let xr = dev.alloc_storage(&row_shape, DType::F32)?;
+            dev.copy_slice_range(xr.as_ref(), 0, x_st.as_ref(), s * n_hidden, n_hidden)?;
+
+            let wg = dev.alloc_storage(&ffxh, DType::F32)?;
+            dev.copy_slice_range(
+                wg.as_ref(),
+                0,
+                gate_w.storage().as_ref(),
+                best_e * n_ff * n_hidden,
+                n_ff * n_hidden,
+            )?;
+            let wu = dev.alloc_storage(&ffxh, DType::F32)?;
+            dev.copy_slice_range(
+                wu.as_ref(),
+                0,
+                up_w.storage().as_ref(),
+                best_e * n_ff * n_hidden,
+                n_ff * n_hidden,
+            )?;
+            let wd = dev.alloc_storage(&ffxh, DType::F32)?;
+            dev.copy_slice_range(
+                wd.as_ref(),
+                0,
+                down_w.storage().as_ref(),
+                best_e * n_ff * n_hidden,
+                n_ff * n_hidden,
+            )?;
+
+            let hxf = Shape::new(vec![n_hidden, n_ff]);
+            let wg_t = dev
+                .transpose_2d(wg.as_ref(), n_ff, n_hidden, &hxf)?
+                .0;
+            let wu_t = dev
+                .transpose_2d(wu.as_ref(), n_ff, n_hidden, &hxf)?
+                .0;
+            // out_f[s] = Σ_h x[h] · W[f, h]  ←  x_row[1,H] @ W^T [H→F]
+            let (g_st, _) = dev.matmul(xr.as_ref(), wg_t.as_ref(), &row_ff)?;
+            let (u_st, _) = dev.matmul(xr.as_ref(), wu_t.as_ref(), &row_ff)?;
+            let (a_st, _) = dev.silu_mul(g_st.as_ref(), u_st.as_ref(), &row_ff)?;
+            // out_d = Σ_f act[f] · Wd[f, d]  ←  act[1,F] @ Wd [F,H]
+            let (o_st, _) = dev.matmul(a_st.as_ref(), wd.as_ref(), &row_shape)?;
+            let scaled = dev.mul_scalar(o_st.as_ref(), best_p, &row_shape);
+            let final_st: Arc<dyn grim_tensor::backend::BackendStorage> = match scaled {
+                Ok((st, _)) => Arc::from(st),
+                Err(_) => Arc::from(o_st),
+            };
+            dev.copy_slice_range(out_arc.as_ref(), s * n_hidden, final_st.as_ref(), 0, n_hidden)?;
+        }
+
+        Ok(Tensor::new(
+            out_arc,
+            out_shape,
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            x.device().clone(),
+        ))
+    }
+
     /// Top-1 routed MoE feed-forward.
     /// Matches llama.cpp's `build_moe_ffn` gate/probs semantics with silu-gated experts.
     fn forward_moe_ffn(&self, x: &Tensor) -> Result<Tensor> {
@@ -921,6 +1020,15 @@ impl Lfm2Block {
                 for e in 0..n_expert {
                     probs[s * n_expert + e] /= sum_s;
                 }
+            }
+        }
+
+        // Device-side MoE: weights stay on the GPU; only the tiny gate logits
+        // cross to host. Old path round-tripped the full expert stacks
+        // (gate/up/down) per forward — multi-MB D2H per token.
+        if x.device() != &Device::Cpu {
+            if let Ok(t) = self.forward_moe_ffn_device(x, &probs, steps, hidden) {
+                return Ok(t);
             }
         }
 

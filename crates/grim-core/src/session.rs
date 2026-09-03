@@ -49,6 +49,16 @@ pub trait SessionT: Send {
     fn paged_kv_handles(&self, _layer: usize) -> Option<(Tensor, Tensor, usize)> {
         None
     }
+    /// Device-resident block table in the `grim_qkv_attention_paged` kernel's
+    /// `BlockTableEntry { block_id, page_size }` ABI, cached across decode
+    /// steps. Perf (WI-kv): uploading the table per layer per token was a
+    /// redundant H2D per forward; caching keyed on (len, first, last) makes it
+    /// a no-op until the table actually grows. `None` → caller uploads fresh.
+    fn block_table_gpu_handle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
+        None
+    }
     fn rollback_kv_to(&mut self, len: usize) -> Result<()>;
     // Graph capture / replay hooks for §4.1 ROCm execution optimization
     fn get_hip_graph_handle(&self) -> Option<u64> {
@@ -193,6 +203,13 @@ impl SessionT for Inner {
     }
     fn paged_kv_handles(&self, layer: usize) -> Option<(Tensor, Tensor, usize)> {
         self.kv.as_deref().and_then(|kv| kv.paged_kv_handles(layer))
+    }
+    fn block_table_gpu_handle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
+        self.kv
+            .as_deref()
+            .and_then(|kv| kv.block_table_gpu_handle())
     }
     fn rollback_kv_to(&mut self, len: usize) -> Result<()> {
         if let Some(kv) = self.kv.as_deref_mut() {

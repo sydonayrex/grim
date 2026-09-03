@@ -257,36 +257,38 @@ impl KimiK3Mla {
             }
         }
 
-        let (k_all, v_all, k_rope_all) = if let Some((prev_k, prev_v, prev_rope)) = kv_cache {
+        let total_k_dim = self.num_heads * self.qk_nope_head_dim;
+        let total_v_dim = self.num_heads * self.v_head_dim;
+        let (k_all_v, v_all_v, k_rope_all_v) = if let Some((prev_k, prev_v, prev_rope)) = kv_cache {
             let mut new_k = prev_k.to_vec_f32()?;
             let mut new_v = prev_v.to_vec_f32()?;
             let mut new_rope = prev_rope.to_vec_f32()?;
-            new_k.extend(k_nope_v);
-            new_v.extend(v_v);
-            new_rope.extend(k_rope_v);
-            let total_k_dim = self.num_heads * self.qk_nope_head_dim;
-            let total_v_dim = self.num_heads * self.v_head_dim;
+            new_k.extend_from_slice(&k_nope_v);
+            new_v.extend_from_slice(&v_v);
+            new_rope.extend_from_slice(&k_rope_v);
             let total_seq = new_k.len() / total_k_dim;
-            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, total_k_dim]));
-            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, total_v_dim]));
-            let full_rope =
-                cpu_tensor(new_rope, Shape::new(vec![total_seq, self.qk_rope_head_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone(), full_rope.clone()));
-            (full_k, full_v, full_rope)
+            *kv_cache = Some((
+                cpu_tensor(new_k.clone(), Shape::new(vec![total_seq, total_k_dim])),
+                cpu_tensor(new_v.clone(), Shape::new(vec![total_seq, total_v_dim])),
+                cpu_tensor(
+                    new_rope.clone(),
+                    Shape::new(vec![total_seq, self.qk_rope_head_dim]),
+                ),
+            ));
+            (new_k, new_v, new_rope)
         } else {
-            let total_k_dim = self.num_heads * self.qk_nope_head_dim;
-            let total_v_dim = self.num_heads * self.v_head_dim;
-            let full_k = cpu_tensor(k_nope_v, Shape::new(vec![seq_len, total_k_dim]));
-            let full_v = cpu_tensor(v_v, Shape::new(vec![seq_len, total_v_dim]));
-            let full_rope = cpu_tensor(k_rope_v, Shape::new(vec![seq_len, self.qk_rope_head_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone(), full_rope.clone()));
-            (full_k, full_v, full_rope)
+            *kv_cache = Some((
+                cpu_tensor(k_nope_v.clone(), Shape::new(vec![seq_len, total_k_dim])),
+                cpu_tensor(v_v.clone(), Shape::new(vec![seq_len, total_v_dim])),
+                cpu_tensor(
+                    k_rope_v.clone(),
+                    Shape::new(vec![seq_len, self.qk_rope_head_dim]),
+                ),
+            ));
+            (k_nope_v, v_v, k_rope_v)
         };
 
-        let total_kv_len = k_all.shape().dims()[0];
-        let k_all_v = k_all.to_vec_f32()?;
-        let v_all_v = v_all.to_vec_f32()?;
-        let k_rope_all_v = k_rope_all.to_vec_f32()?;
+        let total_kv_len = k_all_v.len() / total_k_dim;
         // Causal mask: query s (absolute position cache_offset + s) must not
         // see future in-chunk keys.
         let cache_offset = total_kv_len.saturating_sub(seq_len);
@@ -382,15 +384,8 @@ impl KimiK3Expert {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let gv = gate.to_vec_f32()?;
-        let uv = up.to_vec_f32()?;
-        let swiglu: Vec<f32> = gv
-            .iter()
-            .zip(uv.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
-        Ok(self.down_proj.forward(&swiglu_t)?)
+        let swiglu = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+        Ok(self.down_proj.forward(&swiglu)?)
     }
 }
 
@@ -513,19 +508,13 @@ impl KimiK3Block {
         let normed_attn = self.attn_norm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed_attn, positions, kv_cache)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_out.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
+        let res1 = grim_nn::modules::add_on_device(x, &attn_out)?;
 
-        let normed_ffn = self.ffn_norm.forward(&res1_t)?;
+        let normed_ffn = self.ffn_norm.forward(&res1)?;
         let mlp_out = self.moe.forward(&normed_ffn)?;
 
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &mlp_out)
+            .map_err(grim_core::error::Error::from)
     }
 }
 

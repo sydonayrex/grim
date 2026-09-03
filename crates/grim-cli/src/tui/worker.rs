@@ -16,7 +16,6 @@ use grim_core::sampler::{Sampler, SamplingParams, ThinkingLevel};
 use grim_engine::{Engine, EngineConfig, Request};
 use grim_format::{GgufProvider, GgufTokenizer, render_messages_or_last};
 use grim_speculative::Strategy;
-use grim_tensor::Device;
 
 /// Command sent from the UI thread to the worker.
 #[derive(Debug)]
@@ -118,24 +117,10 @@ pub struct WorkerParams {
 /// the platform-specific details of stderr redirection without
 /// corrupting the C runtime's FILE* buffering.
 ///
-/// The log file is written to the system temp directory as
-/// `grim-model-load.log` and is appended to on each load.
-struct StderrRedirect {
-    _gag: gag::Redirect<std::fs::File>,
-}
-
-impl StderrRedirect {
-    fn new() -> Self {
-        let log_path = std::env::temp_dir().join("grim-model-load.log");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .unwrap_or_else(|_| std::fs::File::open("/dev/null").expect("failed to open /dev/null"));
-        let gag = gag::Redirect::stderr(file).expect("failed to redirect stderr");
-        Self { _gag: gag }
-    }
-}
+/// Stderr is redirected globally in mod.rs::cmd_tui (to GRIM_TUI_LOG or
+/// /tmp/grim-tui.log). This per-load redirect is removed — gag only allows
+/// one process-wide stderr redirect, and the global one covers worker threads
+/// too. Kept as a comment so future readers don't re-add it.
 
 /// True if the token id is an end-of-stream token for this tokenizer.
 /// Mirrors the EOS check in run.rs:931-939.
@@ -282,9 +267,8 @@ impl Worker {
         let path_str = resolved.to_string_lossy().to_string();
 
         // 1. new load (old model stays resident so a failure keeps it usable).
-        // Redirect stderr to a log file during loading so the backend's
-        // verbose debug output doesn't corrupt the TUI's raw-mode display.
-        let _stderr_redirect = StderrRedirect::new();
+        // Stderr is already redirected globally in cmd_tui (mod.rs) to the
+        // log file, so all backend debug output during load goes there.
         let model = match grim_engine::model_loader::load_from_path(&path_str) {
             Ok(m) => m,
             Err(e) => {
@@ -361,8 +345,6 @@ impl Worker {
             .unwrap_or_else(|_| "rocm".into());
         let snapshot = self.make_snapshot(context_length, 0);
         let _ = self.tx.send(WorkerEvent::Diagnostics { snap: snapshot });
-        // Restore stderr after all engine operations complete.
-        drop(_stderr_redirect);
         WorkerOutcome::ModelLoadOk {
             name,
             quant,
@@ -374,7 +356,11 @@ impl Worker {
     /// Build a snapshot from engine telemetry + turn fields.
     fn make_snapshot(&self, context_length: u64, context_used: u64) -> DiagnosticsSnapshot {
         let (kv_used, kv_total, kv_used_blk, kv_total_blk) = self.engine.kv_cache_telemetry();
-        let n = grim_engine::model_loader::resolve_discrete_rocm_devices(&Device::Cpu).len();
+        // Probe for actual ROCm GPUs (not limited by the model loader's
+        // fallback logic which returns only CPU when given Device::Cpu).
+        let n = grim_backend_rocm::RocmDevice::probe()
+            .map(|d| d.len())
+            .unwrap_or(0);
         let (vram_used, vram_total, _) = grim_server::probe_vram_and_gpus(n);
         let (ram_used, ram_total) = grim_server::probe_sys_ram();
 

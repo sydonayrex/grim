@@ -158,7 +158,7 @@ impl CapabilityProfiler {
 /// by `(gcn_arch, clock_mhz)` in [`calibrate_capability`]. The static
 /// architecture table is the fallback for GPU-less/ROCm-absent builds and any
 /// calibration error; a failed measurement never fabricates zeros here.
-fn measure_capability(ordinal: usize) -> GpuCapability {
+pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
     // Base probe from the existing infrastructure.
     let host_cap = match probe_host_gpu(ordinal) {
         Ok(c) => c,

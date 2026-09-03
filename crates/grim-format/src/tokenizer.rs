@@ -564,24 +564,26 @@ impl GgufTokenizer {
         // word boundaries using a regex-like approach.
         let mut ids: Vec<u32> = Vec::new();
 
-        // Byte-encode the entire text: map each byte to its unicode char
-        let byte_str: String = text
-            .bytes()
-            .map(|b| encoder.get(&b).copied().unwrap_or(b as char))
-            .collect();
+        // Pretokenize the ORIGINAL text per the GPT-2 regex (words, digits,
+        // punctuation runs, whitespace — newlines split correctly), then
+        // byte-encode each piece. Byte-encoding the entire text first and
+        // splitting on Ġ glued newline-adjacent words together and produced
+        // wrong tokens for any prompt containing newlines.
+        let pieces = split_on_gpt2_pretokenize(text);
 
-        // Split into "words" at spaces (Ġ in byte-level encoding).
-        // GPT-2 splits as: ' word1 word2 ...' → ['Ġword1', 'Ġword2', ...]
-        // We pre-tokenize by splitting after each Ġ (space).
-        let words: Vec<&str> = split_on_gpt2_pretokenize(&byte_str);
-
-        for word in words {
-            if word.is_empty() {
+        for piece in pieces {
+            if piece.is_empty() {
                 continue;
             }
 
+            // Byte-encode the piece: map each byte to its unicode char
+            let word: String = piece
+                .bytes()
+                .map(|b| encoder.get(&b).copied().unwrap_or(b as char))
+                .collect();
+
             // Check if the whole word is a single token
-            if let Some(&id) = self.token_to_id.get(word) {
+            if let Some(&id) = self.token_to_id.get(&word) {
                 ids.push(id);
                 continue;
             }
@@ -1220,16 +1222,21 @@ pub fn render_chat_template(
         s.split(sep).map(String::from).collect()
     });
     // Add `trim_end_matches` / `trim_start_matches` filters for `.rstrip()` / `.lstrip()`.
-    let _ = env.add_filter("trim_end_matches", |s: &str, pat: &str| -> String {
-        s.trim_end_matches(pat).to_string()
+    let _ = env.add_filter("trim_end_matches", |s: &str, pat: Option<&str>| -> String {
+        match pat {
+            Some(p) => s.trim_end_matches(p).to_string(),
+            None => s.trim_end().to_string(),
+        }
     });
-    let _ = env.add_filter("trim_start_matches", |s: &str, pat: &str| -> String {
-        s.trim_start_matches(pat).to_string()
+    let _ = env.add_filter("trim_start_matches", |s: &str, pat: Option<&str>| -> String {
+        match pat {
+            Some(p) => s.trim_start_matches(p).to_string(),
+            None => s.trim_start().to_string(),
+        }
     });
     // MiniCPM5 tool calls store `arguments` as a JSON-encoded string (e.g. '{"x":1}').
-    // The template does `{% set args_dict = tool_call.arguments %}` then
-    // `{% for k,v in args_dict | items %}` which fails when args_dict is a string
-    // ("cannot convert value into pairs"). Provide a `fromjson` filter that parses
+    // The template does `{% set args_dict = tool_call.arguments | fromjson %}` then
+    // `{% for k,v in args_dict | items %}`. Provide a `fromjson` filter that parses
     // a JSON string into an object, passing through objects unchanged.
     let _ = env.add_filter("fromjson", |v: minijinja::Value| -> minijinja::Value {
         if let Some(s) = v.as_str() {
@@ -1238,6 +1245,48 @@ pub fn render_chat_template(
             }
         }
         v
+    });
+    // Add `items` filter for iterating over object key-value pairs (Python dict style).
+    // MiniCPM5 uses `{% for k,v in dict | items %}`.
+    let _ = env.add_filter("items", |v: minijinja::Value| -> minijinja::Value {
+        // Serialize to JSON, extract key-value pairs, return as list of [k, v].
+        match serde_json::to_value(&v) {
+            Ok(serde_json::Value::Object(map)) => {
+                let pairs: Vec<minijinja::Value> = map
+                    .into_iter()
+                    .map(|(k, val)| {
+                        minijinja::Value::from(vec![
+                            minijinja::Value::from(k),
+                            minijinja::Value::from_serialize(&val),
+                        ])
+                    })
+                    .collect();
+                minijinja::Value::from(pairs)
+            }
+            _ => minijinja::Value::from(Vec::<minijinja::Value>::new()),
+        }
+    });
+    // Add `first` / `last` filters for Python-style list indexing (`list[0]` / `list[-1]`).
+    let _ = env.add_filter("first", |v: minijinja::Value| -> minijinja::Value {
+        // Serialize to JSON array, get first element.
+        if let Ok(json) = serde_json::to_value(&v) {
+            if let Some(arr) = json.as_array() {
+                if let Some(first) = arr.first() {
+                    return minijinja::Value::from_serialize(first);
+                }
+            }
+        }
+        minijinja::Value::UNDEFINED
+    });
+    let _ = env.add_filter("last", |v: minijinja::Value| -> minijinja::Value {
+        if let Ok(json) = serde_json::to_value(&v) {
+            if let Some(arr) = json.as_array() {
+                if let Some(last) = arr.last() {
+                    return minijinja::Value::from_serialize(last);
+                }
+            }
+        }
+        minijinja::Value::UNDEFINED
     });
     // P1-3.3: Some GGUF-embedded Jinja templates use block directives that
     // minijinja does not support (e.g. `{% generation %}…{% endgeneration %}`).
@@ -1461,29 +1510,103 @@ fn chunk_bounds(text: &str, target: usize) -> Vec<(usize, usize)> {
     bounds
 }
 
-fn split_on_gpt2_pretokenize(s: &str) -> Vec<&str> {
-    // WI-E3: the old version collected chars then called char_byte_offset
-    // (an O(n) scan) inside the split loop — O(n^2) total, 9.6 s for a 33 KB
-    // corpus. Ġ (U+0120) is exactly the two bytes 0xC4 0xA0 in UTF-8, so scan
-    // bytes and split on that pattern: single O(n) pass.
-    const G_BYTES: [u8; 2] = [0xC4, 0xA0];
-    let bytes = s.as_bytes();
-    let mut words = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] == G_BYTES[0] && bytes[i + 1] == G_BYTES[1] {
-            if i > start {
-                words.push(&s[start..i]);
+fn split_on_gpt2_pretokenize(s: &str) -> Vec<String> {
+    // GPT-2 pretokenizer regex, implemented as a scanner (grim has no regex
+    // dep). Pattern:
+    //   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+    // The old version split ONLY on Ġ, so newline-adjacent words glued into a
+    // single "word" ("systemĊYou") and BPE merged across line boundaries —
+    // chat-template prompts encoded to garbage tokens (MiniCPM5 gibberish).
+    // Returns ORIGINAL-text pieces; caller byte-encodes each piece separately.
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let is_letter = |c: char| c.is_alphabetic();
+    let is_num = |c: char| c.is_numeric();
+    let is_ws = |c: char| c.is_whitespace();
+
+    let contraction = |i: usize| -> Option<usize> {
+        // Returns new index if a contraction matches at i.
+        for cand in ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"] {
+            let cl: Vec<char> = cand.chars().collect();
+            if i + cl.len() <= n && chars[i..i + cl.len()] == cl[..] {
+                return Some(i + cl.len());
             }
-            start = i;
-            i += 2;
-        } else {
-            i += 1;
         }
-    }
-    if start < s.len() {
-        words.push(&s[start..]);
+        None
+    };
+
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = chars[i];
+
+        if c == '\'' {
+            if let Some(j) = contraction(i) {
+                words.push(chars[i..j].iter().collect());
+                i = j;
+                continue;
+            }
+        }
+
+        // ` ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+` — the space prefix form.
+        if c == ' ' && i + 1 < n && !is_ws(chars[i + 1]) {
+            let j0 = i + 1;
+            let j = if is_letter(chars[j0]) {
+                let mut j = j0;
+                while j < n && is_letter(chars[j]) { j += 1; }
+                j
+            } else if is_num(chars[j0]) {
+                let mut j = j0;
+                while j < n && is_num(chars[j]) { j += 1; }
+                j
+            } else {
+                let mut j = j0;
+                while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) { j += 1; }
+                j
+            };
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        if is_letter(c) {
+            let mut j = i;
+            while j < n && is_letter(chars[j]) { j += 1; }
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        if is_num(c) {
+            let mut j = i;
+            while j < n && is_num(chars[j]) { j += 1; }
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        if !is_ws(c) {
+            let mut j = i;
+            while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) { j += 1; }
+            words.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        // Whitespace run.
+        let mut j = i;
+        while j < n && is_ws(chars[j]) { j += 1; }
+        if j == n {
+            words.push(chars[i..j].iter().collect());
+            i = j;
+        } else if j - i > 1 {
+            // `\s+(?!\S)`: all but the last whitespace char.
+            words.push(chars[i..j - 1].iter().collect());
+            i = j - 1;
+        } else {
+            // Single whitespace char that isn't a space prefix (e.g. "\nYou")
+            // forms its own token via the final `\s+` alternative.
+            words.push(chars[i..j].iter().collect());
+            i = j;
+        }
     }
     words
 }

@@ -1799,9 +1799,16 @@ fn is_backend_available(name: &str) -> bool {
         "rocm" => grim_backend_rocm::RocmDevice::probe()
             .map(|d| !d.is_empty())
             .unwrap_or(false),
-        "metal" => grim_backend_metal::MetalDevice::probe()
-            .map(|d| !d.is_empty())
-            .unwrap_or(false),
+        "metal" => {
+            #[cfg(feature = "metal")]
+            {
+                grim_backend_metal::MetalDevice::probe()
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false)
+            }
+            #[cfg(not(feature = "metal"))]
+            false
+        }
         "cuda" => {
             #[cfg(feature = "cuda")]
             {
@@ -2024,26 +2031,11 @@ pub fn osc52_copy(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", encoded)
 }
 
-/// Terminal lifecycle guard: restores the alternate screen on drop and on
-/// panic, so the user's shell is never left in raw mode.
-pub struct TerminalGuard;
-
-impl TerminalGuard {
-    pub fn new() -> Self {
-        let prior = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let _ = ratatui::restore();
-            prior(info);
-        }));
-        TerminalGuard
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = ratatui::restore();
-    }
-}
+/// Terminal lifecycle: the alternate screen is restored by the panic hook
+/// (see `run_tui`) on crash, or by the explicit `ratatui::restore()` call
+/// on the normal exit path. Kept as a placeholder comment — if you need a
+/// guard-based restore in the future, wrap the body in a struct whose Drop
+/// calls `ratatui::restore()`.
 
 /// Render one frame via the constrained layout engine.
 ///
@@ -2368,13 +2360,12 @@ fn ui(f: &mut Frame, app: &App) {
     // Chat mode: ghost text + split title via left/right alignment (Layout-like)
     let is_chat = matches!(app.input_mode, InputMode::Chat) && !app.tool_approval_mode && !app.generating;
     if is_chat {
-        // Slash param ghost hint: when input is "/cmd " show CommandSpec.hint in muted after cursor
-        let ghost_hint: Option<String> = if let Some(space_idx) = input_text.find(' ') {
-            let cmd_name = input_text[1..space_idx].to_lowercase();
-            if let Some(spec) = app.registry.all_commands().iter().find(|s| s.name == cmd_name) {
-                if !spec.hint.is_empty() && app.composer.cursor_offset() == input_text.chars().count() {
-                    let after = &input_text[space_idx + 1..];
-                    if after.is_empty() {
+        // Slash param ghost hint: when input is "/cmd " show CommandSpec.hint in muted after cursor.
+        // Use split_once to safely handle multibyte UTF-8 characters.
+        let ghost_hint: Option<String> = if input_text.starts_with('/') {
+            if let Some((cmd_name, rest)) = input_text[1..].split_once(' ') {
+                if let Some(spec) = app.registry.all_commands().iter().find(|s| s.name == cmd_name) {
+                    if !spec.hint.is_empty() && app.composer.cursor_offset() == input_text.chars().count() && rest.is_empty() {
                         Some(spec.hint.to_string())
                     } else {
                         None
@@ -2920,6 +2911,21 @@ pub async fn cmd_tui(
         ));
     }
 
+    // Redirect stderr to a log file so all debug output (eprintln! from
+    // backend code) is captured even if the process crashes. Without this,
+    // the raw-mode terminal swallows stderr and the debug lines are lost.
+    // The file is created/truncated here; the Redirect guard restores the
+    // original stderr on drop. Users can `tail -f` it in another terminal.
+    let log_path = std::env::var("GRIM_TUI_LOG").unwrap_or_else(|_| "/tmp/grim-tui.log".to_string());
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .map_err(|e| Error::Config(format!("cannot open log file {log_path}: {e}")))?;
+    let _stderr_redirect = gag::Redirect::stderr(log_file)
+        .map_err(|e| Error::Config(format!("stderr redirect failed: {e}")))?;
+
     // Enable kitty keyboard protocol for sixel-adjacent input fidelity and
     // accurate modifier reporting. Best-effort: terminals that do not support
     // it ignore the sequence. Restored on drop via Pop.
@@ -2930,11 +2936,51 @@ pub async fn cmd_tui(
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     );
-    // Mouse support: enable capture so we can handle Down/ScrollUp/ScrollDown
-    // to focus chat vs side vs input (sets was_at_bottom / scroll_offset).
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Mouse support: enable capture only when opted in via GRIM_MOUSE=1.
+    // Capture intercepts all mouse events, which disables the terminal's
+    // native text selection/copy. Default off so users can select text.
+    let mouse_capture = std::env::var("GRIM_MOUSE").as_deref() == Ok("1");
+    if mouse_capture {
+        let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    }
+
+    // Panic hook: restore the terminal so the panic message lands in the
+    // terminal scrollback (and the redirected log file). The stderr redirect
+    // above already captures all eprintln! output to the log file.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = ratatui::restore();
+        eprintln!(
+            "[grim-tui CRASH] {}\nbacktrace:\n{:?}",
+            info,
+            std::backtrace::Backtrace::force_capture()
+        );
+        prev_hook(info);
+    }));
+
+    // Signal handlers: GPU faults (SIGSEGV/SIGABRT/SIGBUS) kill the process
+    // without running the panic hook. Restore the terminal before re-raising
+    // so the user's shell isn't left in raw mode. The eprintln! goes to the
+    // redirected stderr (log file) automatically.
+    unsafe extern "C" fn fatal_signal_handler(sig: libc::c_int) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = ratatui::restore();
+        eprintln!("[grim-tui SIGNAL] fatal signal {} — terminal restored, re-raising", sig);
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGSEGV, fatal_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, fatal_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, fatal_signal_handler as *const () as libc::sighandler_t);
+    }
+
     let mut term = ratatui::init();
-    let _guard = TerminalGuard::new();
 
     let (cmd_tx, cmd_rx): (Sender<WorkerCommand>, Receiver<WorkerCommand>) =
         std::sync::mpsc::channel();
@@ -3037,7 +3083,9 @@ pub async fn cmd_tui(
     let _ = cmd_tx.send(WorkerCommand::Quit);
     let _ = worker.join();
     let _ = ratatui::restore();
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    if std::env::var("GRIM_MOUSE").as_deref() == Ok("1") {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
     let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     Ok(())
 }

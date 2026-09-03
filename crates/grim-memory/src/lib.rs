@@ -1109,6 +1109,16 @@ pub struct PagedKvCache {
     /// F10: dirty-block device KV mirror state (interior-mutable; the KvCache
     /// trait hands out `&self`).
     mirror_state: std::sync::Mutex<DeviceKvMirror>,
+    /// WI-kv: cached device-resident block table (`BlockTableEntry` ABI),
+    /// keyed on (len, first id, last id). Skips the per-layer-per-token H2D
+    /// upload of the table in the paged-attention decode path.
+    gpu_block_table: std::sync::Mutex<Option<GpuBlockTableCache>>,
+}
+
+/// Cached device block table + the fingerprint it was built from.
+struct GpuBlockTableCache {
+    fingerprint: (usize, u32, u32),
+    storage: Arc<dyn grim_tensor::BackendStorage>,
 }
 
 /// F10: per-block device-resident K/V mirror. Appended KV history is
@@ -1133,6 +1143,12 @@ pub struct DeviceKvMirror {
     pub total_uploads: u64,
     /// Distinct blocks ever uploaded.
     pub uploaded_elems: u64,
+    /// F10: persistent full-layer K/V device buffers. Keyed by layer, shared
+    /// into every returned Tensor — new K/V land via device-side region writes
+    /// of just the dirty tail block instead of whole-layer host re-uploads
+    /// (16 MB · 24 layers · every token → KB-scale).
+    pub k_full: HashMap<usize, Arc<dyn grim_tensor::BackendStorage>>,
+    pub v_full: HashMap<usize, Arc<dyn grim_tensor::BackendStorage>>,
 }
 
 impl PagedKvCache {
@@ -1185,6 +1201,7 @@ impl PagedKvCache {
             backend: None,
             gpu_paged_k: Vec::new(),
             mirror_state: std::sync::Mutex::new(DeviceKvMirror::default()),
+            gpu_block_table: std::sync::Mutex::new(None),
             gpu_paged_v: Vec::new(),
         }
     }
@@ -1441,12 +1458,57 @@ impl KvCache for PagedKvCache {
                 pool.write_layer_keys(physical, layer, &k_flat[tok_start..tok_start + stride], 1);
                 pool.write_layer_values(physical, layer, &v_flat[tok_start..tok_start + stride]);
             }
-            // F10: mark the touched (layer, block) dirty. Per-block device
-            // upload happens lazily in paged_kv_handles — once per block
-            // lifetime for sealed history, only the active tail block while
-            // it receives tokens. The old eager path re-uploaded the FULL
-            // layer on every single token.
-            {
+
+            // WI-perf (decode fast path): when the persistent full-layer device
+            // buffer already exists and this append is a single token (decode),
+            // push the K/V row device-to-device straight into it. The device
+            // copy stays current without the host→device dirty-region upload in
+            // `paged_kv_handles`, so steady-state decode issues zero H2D traffic.
+            // Prefill (seq > 1) keeps the host-page + dirty-marking path: the
+            // first `paged_kv_handles` call materializes `k_full`/`v_full` and
+            // back-fills only the touched blocks.
+            let mut device_appended = false;
+            if seq == 1 {
+                let m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+                if let (Some(k_arc), Some(v_arc)) = (m.k_full.get(&layer), m.v_full.get(&layer)) {
+                    let (k_arc, v_arc) = (k_arc.clone(), v_arc.clone());
+                    drop(m);
+                    if let Some(dev) = self.backend.as_ref() {
+                        let ok_k = dev
+                            .copy_slice_into(
+                                &*k_arc,
+                                k.storage().as_ref(),
+                                offset,
+                                stride,
+                            )
+                            .is_ok();
+                        let ok_v = dev
+                            .copy_slice_into(
+                                &*v_arc,
+                                v.storage().as_ref(),
+                                offset,
+                                stride,
+                            )
+                            .is_ok();
+                        device_appended = ok_k && ok_v;
+                        if device_appended {
+                            // Count the D2D tail refresh as a block upload for
+                            // the ITL gate stats (same semantics as the H2D
+                            // dirty-region refresh it replaces).
+                            let mut m =
+                                self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+                            m.total_uploads += 1;
+                            m.uploaded_elems += (stride * 2) as u64;
+                        }
+                    }
+                }
+            }
+            if !device_appended {
+                // F10: mark the touched (layer, block) dirty. Per-block device
+                // upload happens lazily in paged_kv_handles — once per block
+                // lifetime for sealed history, only the active tail block while
+                // it receives tokens. The old eager path re-uploaded the FULL
+                // layer on every single token.
                 let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
                 m.dirty.insert((layer, physical));
             }
@@ -1460,6 +1522,42 @@ impl KvCache for PagedKvCache {
         } else {
             Some(&self.block_table_u32)
         }
+    }
+
+    fn block_table_gpu_handle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
+        let bt = self.block_table()?;
+        let fingerprint = (
+            bt.len(),
+            bt.first().copied().unwrap_or(0),
+            *bt.last().unwrap(),
+        );
+        let mut g = self.gpu_block_table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = g.as_ref() {
+            if cached.fingerprint == fingerprint {
+                return Some(cached.storage.clone());
+            }
+        }
+        // Rebuild: `BlockTableEntry { block_id: u32, page_size: u32 }` pairs,
+        // same ABI as the kernel — see block.rs::paged_self_attention.
+        let pairs: Vec<f32> = bt
+            .iter()
+            .flat_map(|&b| [f32::from_bits(b), f32::from_bits(self.page_size as u32)])
+            .collect();
+        let dev = self.backend.as_ref()?;
+        let storage = dev.from_cpu(
+            &pairs,
+            &Shape::new(vec![pairs.len()]),
+            DType::F32,
+        )
+        .ok()?;
+        let arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(storage);
+        *g = Some(GpuBlockTableCache {
+            fingerprint,
+            storage: arc.clone(),
+        });
+        Some(arc)
     }
 
     fn paged_kv_handles(&self, layer: usize) -> Option<(Tensor, Tensor, usize)> {
@@ -1480,10 +1578,11 @@ impl KvCache for PagedKvCache {
             .next()
             .is_some();
         if !layer_dirty {
-            if let (Some(dev_enum), Some(Some(k_storage)), Some(Some(v_storage))) = (
+            let m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+            if let (Some(dev_enum), Some(k_storage), Some(v_storage)) = (
                 self.device.as_ref(),
-                self.gpu_paged_k.get(layer),
-                self.gpu_paged_v.get(layer),
+                m.k_full.get(&layer),
+                m.v_full.get(&layer),
             ) {
                 return Some((
                     Tensor::new(
@@ -1506,63 +1605,78 @@ impl KvCache for PagedKvCache {
         } // F10: end !layer_dirty fast path
 
         if let (Some(dev), Some(dev_enum)) = (self.backend.as_ref(), self.device.as_ref()) {
-            let k_storage = dev
-                .from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32)
-                .ok()?;
-            let v_storage = dev
-                .from_cpu(&self.v_pages[layer], &Shape::new(dims.clone()), DType::F32)
-                .ok()?;
+            let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+            let dirty_here: Vec<usize> = m
+                .dirty
+                .range((layer, 0)..(layer + 1, 0))
+                .map(|&(_, b)| b)
+                .collect();
 
-            // F10: sync per-block mirror entries for this layer's dirty
-            // blocks, then clear the layer's dirty set. Sealed history blocks
-            // never re-upload; only the active tail block does.
-            {
-                let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
-                let dirty_here: Vec<usize> = m
-                    .dirty
-                    .range((layer, 0)..(layer + 1, 0))
-                    .map(|&(_, b)| b)
-                    .collect();
-                for &b in dirty_here.iter() {
-                    let off = b * self.page_size * stride;
-                    let take = |page: &Vec<f32>| page[off..off + self.page_size * stride].to_vec();
-                    if let (Ok(ks), Ok(vs)) = (
-                        dev.from_cpu(
-                            &take(&self.k_pages[layer]),
-                            &Shape::new(vec![self.page_size, stride]),
-                            DType::F32,
-                        ),
-                        dev.from_cpu(
-                            &take(&self.v_pages[layer]),
-                            &Shape::new(vec![self.page_size, stride]),
-                            DType::F32,
-                        ),
-                    ) {
-                        m.blocks.insert((layer, b), (Arc::from(ks), Arc::from(vs)));
-                        m.total_uploads += 1;
-                        m.uploaded_elems += (self.page_size * stride * 2) as u64;
-                    }
+            // F10: persistent full-layer device buffers. First call uploads the
+            // whole layer once; later calls push ONLY dirty tail blocks into the
+            // same buffer via host→device slice uploads. The old path re-uploaded
+            // the full [capacity·page_size, stride] layer (16 MB for 2×128 head
+            // config) on every call — that was the per-token H2D flood.
+            let k_arc = match m.k_full.get(&layer) {
+                Some(a) => a.clone(),
+                None => {
+                    let k_storage = dev
+                        .from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32)
+                        .ok()?;
+                    let a: Arc<dyn grim_tensor::BackendStorage> = Arc::from(k_storage);
+                    m.k_full.insert(layer, a.clone());
+                    a
                 }
-                for &b in dirty_here.iter() {
-                    m.dirty.remove(&(layer, b));
+            };
+            let v_arc = match m.v_full.get(&layer) {
+                Some(a) => a.clone(),
+                None => {
+                    let v_storage = dev
+                        .from_cpu(&self.v_pages[layer], &Shape::new(dims.clone()), DType::F32)
+                        .ok()?;
+                    let a: Arc<dyn grim_tensor::BackendStorage> = Arc::from(v_storage);
+                    m.v_full.insert(layer, a.clone());
+                    a
                 }
-                // Tiering-integrated eviction: drop mirror entries whose
-                // physical block left the table (freed/demoted upstream).
-                let live: std::collections::HashSet<usize> =
-                    self.table.physical_ids().iter().copied().collect();
-                m.blocks.retain(|(l, b), _| *l != layer || live.contains(b));
+            };
+
+            let block_elems = self.page_size * stride;
+            for &b in dirty_here.iter() {
+                let off = b * block_elems;
+                let k_slice: Vec<f32> = self.k_pages[layer][off..off + block_elems].to_vec();
+                let v_slice: Vec<f32> = self.v_pages[layer][off..off + block_elems].to_vec();
+                let small_shape = Shape::new(vec![self.page_size, stride]);
+                if let (Ok(ks), Ok(vs)) = (
+                    dev.from_cpu(&k_slice, &small_shape, DType::F32),
+                    dev.from_cpu(&v_slice, &small_shape, DType::F32),
+                ) {
+                    let _ = dev.copy_slice_into(&*k_arc, ks.as_ref(), off, block_elems);
+                    let _ = dev.copy_slice_into(&*v_arc, vs.as_ref(), off, block_elems);
+                    m.blocks
+                        .insert((layer, b), (Arc::from(ks), Arc::from(vs)));
+                    m.total_uploads += 1;
+                    m.uploaded_elems += (block_elems * 2) as u64;
+                }
             }
+            for &b in dirty_here.iter() {
+                m.dirty.remove(&(layer, b));
+            }
+            // Tiering-integrated eviction: drop mirror entries whose
+            // physical block left the table (freed/demoted upstream).
+            let live: std::collections::HashSet<usize> =
+                self.table.physical_ids().iter().copied().collect();
+            m.blocks.retain(|(l, b), _| *l != layer || live.contains(b));
 
             Some((
                 Tensor::new(
-                    Arc::from(k_storage),
+                    k_arc,
                     Shape::new(dims.clone()),
                     DType::F32,
                     grim_tensor::QuantProvenance::default(),
                     dev_enum.clone(),
                 ),
                 Tensor::new(
-                    Arc::from(v_storage),
+                    v_arc,
                     Shape::new(dims),
                     DType::F32,
                     grim_tensor::QuantProvenance::default(),

@@ -4,7 +4,14 @@
 
 fn main() {
     // CUDA library search path.
-    for path in &["/opt/cuda/lib64", "/opt/cuda/lib", "/usr/local/cuda/lib64"] {
+    for path in &[
+        "/opt/cuda/lib64",
+        "/opt/cuda/lib",
+        "/usr/local/cuda/lib64",
+        "/opt/resolve/libs",
+        "/usr/local/lib/ollama/cuda_v12",
+        "/usr/local/lib/ollama/cuda_v13",
+    ] {
         if std::path::Path::new(path).exists() {
             println!("cargo:rustc-link-search=native={}", path);
         }

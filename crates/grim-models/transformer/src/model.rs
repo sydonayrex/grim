@@ -478,6 +478,26 @@ impl Llama {
         // their weights must be loaded onto that device.
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
+        // TEMP-DIAG (MiniCPM5 gibberish hunt): dump top-5 logits of the LAST
+        // position per forward when GRIM_FORWARD_TRACE=1.
+        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() {
+            let dims = logits.shape().dims().to_vec();
+            let last: Vec<f32> = if dims.len() >= 2 {
+                let v = logits.to_vec_f32().unwrap_or_default();
+                let row = dims[dims.len() - 1];
+                v[v.len().saturating_sub(row)..].to_vec()
+            } else {
+                logits.to_vec_f32().unwrap_or_default()
+            };
+            let mut idx: Vec<usize> = (0..last.len()).collect();
+            idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!(
+                "[forward-trace] pos={:?} dims={:?} top5={:?}",
+                positions.last(),
+                dims,
+                idx.iter().take(5).map(|&i| (i, last[i])).collect::<Vec<_>>()
+            );
+        }
         Ok((logits, h, kv_pairs))
     }
 }
@@ -648,6 +668,26 @@ impl CausalLm for Llama {
 /// RMS-norm weights of exactly 1.0 are legitimate and ship in real
 /// checkpoints — the old unconditional `all_same` check false-rejected them.
 pub fn weights_look_broken(name: &str, tensor: &grim_tensor::Tensor) -> Result<()> {
+    // Perf (WI-load): the old gate called `to_vec_f32` on EVERY weight, which
+    // on quantized GGUF loads triggers a full GPU dequant + DTOH download per
+    // tensor (the long `[Q4K]/[Q6K] dequant` + copy storms in load logs). The
+    // gate exists to catch structurally-corrupt checkpoints where MANY tensors
+    // are zero/constant at once — that signal survives sampling. Large tensors
+    // are checked deterministically ~1/4 (rank-2) or ~1/16 (rank-1) by name
+    // hash; small tensors (norms, biases ≤ 256 KiB of f32) are always checked.
+    let dims = tensor.shape().dims();
+    let elem_count: usize = dims.iter().product();
+    if elem_count > 1 << 16 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in name.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let stride = if dims.len() >= 2 { 4 } else { 16 };
+        if h % stride != 0 {
+            return Ok(());
+        }
+    }
     let Ok(data) = tensor.to_vec_f32() else {
         return Ok(()); // non-f32 (quantized) weights skip this f32 heuristic
     };
@@ -657,7 +697,7 @@ pub fn weights_look_broken(name: &str, tensor: &grim_tensor::Tensor) -> Result<(
         ))
         .into());
     }
-    if tensor.shape().dims().len() >= 2 && data.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10) {
+    if dims.len() >= 2 && data.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10) {
         return Err(grim_tensor::Error::Backend(format!(
             "{name}: weights appear to be constant — model may be structurally broken"
         ))

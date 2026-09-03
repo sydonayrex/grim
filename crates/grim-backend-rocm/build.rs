@@ -35,6 +35,7 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib=dylib=amdhip64");
             println!("cargo:rustc-link-lib=dylib=rocblas");
+            println!("cargo:rustc-link-lib=dylib=hiprtc");
         }
         println!("cargo:rerun-if-env-changed=HIP_PATH");
         println!("cargo:rerun-if-env-changed=ROCM_PATH");
