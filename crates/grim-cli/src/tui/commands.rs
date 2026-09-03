@@ -127,6 +127,11 @@ impl CommandRegistry {
             description: "Summarize older context now to free tokens (auto-runs at 85% context)",
         });
         reg.register(CommandSpec {
+            name: "undo",
+            hint: "",
+            description: "Restore files changed by the last agent tool call (checkpoint)",
+        });
+        reg.register(CommandSpec {
             name: "backend",
             hint: "[rocm|cuda|metal|cpu|auto]",
             description: "Select inference backend (auto-detect if unset)",
