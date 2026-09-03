@@ -81,6 +81,9 @@ pub mod paths;
 /// Central session store: autosave, titles, listing.
 pub mod sessions;
 
+/// Context compaction planning (pure logic).
+pub mod compact;
+
 /// Keyboard-navigable selection menu.
 pub mod select_list;
 
@@ -3652,6 +3655,7 @@ mod tests {
 
     #[test]
     fn turn_complete_sends_queued_message() {
+        let (_dir, _guard) = isolated_data_dir();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx);
         app.snap.model_name = Some("test-model".into());
@@ -3711,6 +3715,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx);
         app.snap.model_name = Some("test-model".into());
+        app.history.entries.clear(); // isolate from any loaded disk state
         app.submit_chat("remember this prompt");
         assert_eq!(app.history.entries.len(), 1);
         assert_eq!(app.history.entries[0].text, "remember this prompt");
