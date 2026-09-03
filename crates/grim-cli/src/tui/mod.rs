@@ -48,6 +48,9 @@ pub mod kill_ring;
 /// Frecency-based file ranking for autocomplete.
 pub mod frecency;
 
+/// Persistent searchable prompt history (Ctrl+R).
+pub mod history;
+
 /// Markdown → ratatui rendering.
 pub mod markdown;
 
@@ -246,6 +249,12 @@ pub enum InputMode {
         matches: Vec<(usize, usize)>,
         selected: usize,
     },
+    /// Prompt history search overlay (Ctrl+R).
+    HistorySearch {
+        query: String,
+        selected: usize,
+        matches: Vec<String>,
+    },
 }
 
 /// State driving the terminal render loop.
@@ -314,6 +323,8 @@ pub struct App {
     pub permissions: permissions::SharedPermissions,
     /// Messages typed while generating; drained on TurnComplete.
     pub queue: crate::tui::queue::MessageQueue,
+    /// Persistent prompt history searched by Ctrl+R.
+    pub history: crate::tui::history::PromptHistory,
 }
 
 impl App {
@@ -364,6 +375,7 @@ impl App {
             flash_until: None,
             permissions: permissions::shared(permissions::PermissionRules::load()),
             queue: crate::tui::queue::MessageQueue::default(),
+            history: crate::tui::history::PromptHistory::load(),
         }
     }
 
@@ -579,6 +591,7 @@ impl App {
             InputMode::Find { query, matches, selected } => {
                 self.handle_find_key(key, query, matches, selected)
             }
+            InputMode::HistorySearch { .. } => self.handle_history_search_key(key),
         }
     }
 
@@ -958,6 +971,15 @@ impl App {
                 // Command palette: fuzzy-searchable command list.
                 self.input_mode = InputMode::CommandPalette { selected: 0 };
             }
+            KeyCode::Char('r') if is_ctrl => {
+                // Prompt history search over all persisted prompts.
+                let matches = self.history.search("", 50);
+                self.input_mode = InputMode::HistorySearch {
+                    query: String::new(),
+                    selected: 0,
+                    matches,
+                };
+            }
             KeyCode::Char('o') if is_ctrl => {
                 // Session browser: interactive session list.
                 self.input_mode = InputMode::SessionBrowser { selected: 0 };
@@ -1185,6 +1207,54 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Prompt history search (Ctrl+R): type to filter, Enter fills the composer.
+    fn handle_history_search_key(&mut self, key: KeyEvent) {
+        if let InputMode::HistorySearch { query, selected, .. } = &mut self.input_mode {
+            match key.code {
+                KeyCode::Esc => self.input_mode = InputMode::Chat,
+                KeyCode::Enter => {
+                    let text = self.history_search_selected();
+                    self.input_mode = InputMode::Chat;
+                    if let Some(t) = text {
+                        self.composer.set_text(&t);
+                    }
+                    return;
+                }
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected += 1,
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    *selected = 0;
+                }
+                _ => {}
+            }
+        }
+        let n = self.history_search_matches().len();
+        if let InputMode::HistorySearch { selected, .. } = &mut self.input_mode {
+            if *selected >= n {
+                *selected = n.saturating_sub(1);
+            }
+        }
+    }
+
+    fn history_search_matches(&self) -> Vec<String> {
+        match &self.input_mode {
+            InputMode::HistorySearch { query, .. } => self.history.search(query, 50),
+            _ => Vec::new(),
+        }
+    }
+
+    fn history_search_selected(&self) -> Option<String> {
+        let InputMode::HistorySearch { selected, .. } = &self.input_mode else {
+            return None;
+        };
+        self.history_search_matches().get(*selected).cloned()
     }
 
     fn handle_skill_picker_key(&mut self, key: KeyEvent) {
@@ -1775,6 +1845,8 @@ impl App {
                     ));
                     return;
                 }
+                self.history.append(trimmed);
+                self.history.save();
                 self.messages.push(grim_format::ChatMessage {
                     role: "user".to_string(),
                     content: trimmed.to_string(),
@@ -2608,6 +2680,10 @@ fn ui(f: &mut Frame, app: &App) {
             c_purple_dim,
             " /  commands   @  files   Tab  autocomplete   F2  sidebar ".into(),
         ),
+        InputMode::HistorySearch { .. } => (
+            c_cyan,
+            " history search  Enter fills composer, Esc cancels ".into(),
+        ),
     };
 
     // Find bar above input when in Find mode
@@ -2970,6 +3046,51 @@ fn ui(f: &mut Frame, app: &App) {
         let modal = Paragraph::new(lines).block(
             Block::bordered().border_type(BorderType::Rounded)
                 .title(Span::styled(" sessions  Ctrl+O ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompt history search modal (Ctrl+R).
+    // -----------------------------------------------------------------------
+    if let InputMode::HistorySearch { selected, .. } = app.input_mode {
+        let matches = app.history_search_matches();
+        let query = match &app.input_mode {
+            InputMode::HistorySearch { query, .. } => query.clone(),
+            _ => String::new(),
+        };
+        let height = (matches.len() as u16 + 5).clamp(5, 20);
+        let width = 72.min(f.area().width.saturating_sub(4));
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  query: \"{query}\"  —  Enter to fill composer  Esc to cancel"),
+            Style::default().fg(c_muted),
+        )));
+        lines.push(Line::raw(""));
+        for (idx, text) in matches.iter().enumerate() {
+            let is_sel = idx == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let color = if is_sel { c_purple } else { Color::White };
+            let shown: String = text.chars().take(width.saturating_sub(6) as usize).collect();
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{shown}"),
+                Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+            )));
+        }
+        if matches.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no matching prompts in history",
+                Style::default().fg(c_muted),
+            )));
+        }
+        let modal = Paragraph::new(lines).block(
+            Block::bordered().border_type(BorderType::Rounded)
+                .title(Span::styled(" history  Ctrl+R ", Style::default().fg(c_purple_soft)))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
@@ -3499,6 +3620,45 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(app.queue.is_empty());
+    }
+
+    /// Isolate App tests from the real `~/.local/share/grim` state: point
+    /// XDG_DATA_HOME at a throwaway dir. Guard must be held for the test body.
+    fn isolated_data_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::tui::paths::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path()) };
+        (dir, guard)
+    }
+
+    #[test]
+    fn ctrl_r_opens_history_search_and_enter_fills_composer() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.history.append("write me a parser");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(matches!(app.input_mode, InputMode::HistorySearch { .. }));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.composer.text(), "write me a parser");
+        assert!(matches!(app.input_mode, InputMode::Chat));
+    }
+
+    #[test]
+    fn submit_records_prompt_history() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        app.submit_chat("remember this prompt");
+        assert_eq!(app.history.entries.len(), 1);
+        assert_eq!(app.history.entries[0].text, "remember this prompt");
     }
 
     #[test]
