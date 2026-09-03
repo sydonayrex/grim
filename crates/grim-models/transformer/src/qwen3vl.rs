@@ -5,12 +5,11 @@
 //! - **Interleaved Multimodal RoPE (M-RoPE)**: Rotary frequencies partitioned across interleaved sections `[24, 20, 20]`.
 //! - **GQA SwiGLU Transformer**: 36-layer decoder-only transformer with grouped query attention and RMSNorm.
 
-use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, Tensor};
 
 // ---------------------------------------------------------------------------
 // Vision Config & Encoder
