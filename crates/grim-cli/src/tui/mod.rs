@@ -84,6 +84,9 @@ pub mod sessions;
 /// Context compaction planning (pure logic).
 pub mod compact;
 
+/// File-store checkpoints for agent edits.
+pub mod checkpoints;
+
 /// Keyboard-navigable selection menu.
 pub mod select_list;
 
