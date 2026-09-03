@@ -120,16 +120,8 @@ impl GptOssMlp {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let g_vec = g.to_vec_f32()?;
-        let u_vec = u.to_vec_f32()?;
-        let mut act = vec![0.0f32; g_vec.len()];
-        for i in 0..act.len() {
-            let val = g_vec[i];
-            let sig = 1.0 / (1.0 + (-val).exp());
-            act[i] = val * sig * u_vec[i];
-        }
-        let act_tensor = cpu_tensor(act, g.shape().clone());
-        Ok(self.down_proj.forward(&act_tensor)?)
+        let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
+        Ok(self.down_proj.forward(&act)?)
     }
 }
 
@@ -229,29 +221,14 @@ impl GptOssBlock {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        let x_vec = x.to_vec_f32()?;
-        let ap_vec = attn_proj.to_vec_f32()?;
-        let mut res1 = vec![0.0f32; x_vec.len()];
-        for i in 0..res1.len() {
-            res1[i] = x_vec[i] + ap_vec[i];
-        }
-        let res1_tensor = cpu_tensor(res1, x.shape().clone());
-
-        let normed_ffn = self.ffn_norm.forward(&res1_tensor)?;
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        let normed_ffn = self.ffn_norm.forward(&res1)?;
         let mlp_out = self.mlp.forward(&normed_ffn)?;
-
-        let r1_vec = res1_tensor.to_vec_f32()?;
-        let m_vec = mlp_out.to_vec_f32()?;
-        let mut res2 = vec![0.0f32; r1_vec.len()];
-        for i in 0..res2.len() {
-            res2[i] = r1_vec[i] + m_vec[i];
-        }
-
-        Ok(cpu_tensor(res2, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -283,7 +260,7 @@ impl GptOss {
             [cfg.vocab_size, cfg.hidden_size],
         )?;
 
-        let num_layers_to_load = cfg.num_hidden_layers.min(2);
+        let num_layers_to_load = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("layers").scoped(&i.to_string());

@@ -223,31 +223,16 @@ impl Gemma2Block {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
         let post_attn = self.post_attention_layernorm.forward(&attn_proj)?;
 
-        let x_vec = x.to_vec_f32()?;
-        let pa_vec = post_attn.to_vec_f32()?;
-        let mut res1 = vec![0.0f32; x_vec.len()];
-        for i in 0..res1.len() {
-            res1[i] = x_vec[i] + pa_vec[i];
-        }
-        let res1_tensor = cpu_tensor(res1, x.shape().clone());
-
-        let pre_ffn = self.pre_feedforward_layernorm.forward(&res1_tensor)?;
+        let res1 = grim_nn::modules::add_on_device(x, &post_attn)?;
+        let pre_ffn = self.pre_feedforward_layernorm.forward(&res1)?;
         let mlp_out = self.mlp.forward(&pre_ffn)?;
         let post_ffn = self.post_feedforward_layernorm.forward(&mlp_out)?;
-
-        let r1_vec = res1_tensor.to_vec_f32()?;
-        let pf_vec = post_ffn.to_vec_f32()?;
-        let mut res2 = vec![0.0f32; r1_vec.len()];
-        for i in 0..res2.len() {
-            res2[i] = r1_vec[i] + pf_vec[i];
-        }
-
-        Ok(cpu_tensor(res2, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &post_ffn).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -277,7 +262,7 @@ impl Gemma2 {
             [cfg.vocab_size, cfg.hidden_size],
         )?;
 
-        let num_layers_to_load = cfg.num_hidden_layers.min(2);
+        let num_layers_to_load = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("layers").scoped(&i.to_string());

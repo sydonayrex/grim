@@ -46,6 +46,16 @@ pub enum WorkerCommand {
     SetPlanMode {
         enabled: bool,
     },
+    /// UI → worker: replace the tool list offered to the model
+    /// (built-ins + MCP tools after servers connect).
+    SetTools {
+        tools: Vec<grim_format::ToolDef>,
+    },
+    /// UI → worker: summarize these older messages with the same engine
+    /// (compaction). Reply is WorkerEvent::CompactionDone.
+    Compact {
+        to_summarize: Vec<grim_format::ChatMessage>,
+    },
     Cancel,
     Quit,
 }
@@ -98,6 +108,12 @@ pub enum WorkerEvent {
     },
     Error {
         message: String,
+    },
+    /// Worker → UI: compaction summary finished generating. The UI splices
+    /// the summary into its canonical message history.
+    CompactionDone {
+        summary: String,
+        compacted_tokens: u64,
     },
 }
 
@@ -216,6 +232,12 @@ struct Worker {
     /// Plan mode: mutations are hard-blocked and a plan-first system
     /// preamble is injected into each prompt.
     plan_mode: bool,
+    /// File-store checkpoints captured before mutating tool calls.
+    checkpoint_store: crate::tui::checkpoints::CheckpointStore,
+    /// MCP servers shared with the UI thread; routes `mcp_*` tool calls.
+    mcp: crate::tui::mcp::manager::SharedMcp,
+    /// Tool definitions offered to the model (built-ins + MCP).
+    tools: Vec<grim_format::ToolDef>,
 }
 
 /// System preamble injected when plan mode is active. Read-only tools stay
@@ -247,8 +269,22 @@ impl Worker {
                 self.plan_mode = enabled;
                 WorkerOutcome::Ignored
             }
+            WorkerCommand::SetTools { tools } => {
+                self.tools = tools;
+                WorkerOutcome::Ignored
+            }
             WorkerCommand::SetContextLimit { limit } => {
                 self.ctx_override = limit;
+                WorkerOutcome::Ignored
+            }
+            WorkerCommand::Compact { to_summarize } => {
+                // Same-engine summarization, quiet run (no Token events).
+                let msgs = crate::tui::compact::summary_messages(&to_summarize);
+                let (summary, stats) = self.generate_inner(&msgs, rx, None, false);
+                let _ = self.tx.send(WorkerEvent::CompactionDone {
+                    summary,
+                    compacted_tokens: stats.context_used,
+                });
                 WorkerOutcome::Ignored
             }
             WorkerCommand::SetSamplingParams {
@@ -283,7 +319,7 @@ impl Worker {
                     messages
                 };
                 if self.tools_enabled {
-                    self.agentic_generate(messages, rx, &crate::tui::tools::coding_tools(), self.sandbox_root.clone());
+                    self.agentic_generate(messages, rx, &self.tools.clone(), self.sandbox_root.clone());
                 } else {
                     let (_text, stats) = self.generate(&messages, rx, None);
                     let _ = self.tx.send(WorkerEvent::TurnComplete { stats });
@@ -452,6 +488,18 @@ impl Worker {
         rx: &Receiver<WorkerCommand>,
         tools: Option<&[grim_format::ToolDef]>,
     ) -> (String, TurnStats) {
+        self.generate_inner(messages, rx, tools, true)
+    }
+
+    /// Like `generate`, but can suppress Token/Diagnostics streaming — used
+    /// by compaction so the summary is not rendered into the transcript.
+    fn generate_inner(
+        &mut self,
+        messages: &[grim_format::ChatMessage],
+        rx: &Receiver<WorkerCommand>,
+        tools: Option<&[grim_format::ToolDef]>,
+        emit_tokens: bool,
+    ) -> (String, TurnStats) {
         let mut generated_text = String::new();
         let default_stats = TurnStats {
             encode_ms: 0.0,
@@ -598,12 +646,16 @@ impl Worker {
             }
             let text = tok.decode(&[token]);
             generated_text.push_str(&text);
-            let _ = self.tx.send(WorkerEvent::Token { text });
+            if emit_tokens {
+                let _ = self.tx.send(WorkerEvent::Token { text });
+            }
 
             if last_diag.elapsed() >= Duration::from_millis(100) {
-                let snap =
-                    self.make_snapshot(ctx_limit, (prompt_ids.len() + generated_count) as u64);
-                let _ = self.tx.send(WorkerEvent::Diagnostics { snap });
+                if emit_tokens {
+                    let snap =
+                        self.make_snapshot(ctx_limit, (prompt_ids.len() + generated_count) as u64);
+                    let _ = self.tx.send(WorkerEvent::Diagnostics { snap });
+                }
                 last_diag = Instant::now();
             }
         }
@@ -752,7 +804,9 @@ impl Worker {
                     continue;
                 }
 
-                // Auto-execute read-only tools; request approval for mutations.
+                // Auto-execute read-only built-in tools; everything else
+                // (mutations and ALL mcp_* tools, since they are not in this
+                // match) requires either an always-allow rule or approval.
                 let is_read_only =
                     matches!(name.as_str(), "read_file" | "list_files" | "search_files");
                 let allowed = is_read_only || {
@@ -762,9 +816,11 @@ impl Worker {
                         .unwrap_or(false)
                 };
                 if allowed {
-                    let result = crate::tui::tools::execute_tool(
+                    let result = crate::tui::tools::execute_tool_checked(
                         &call,
                         &crate::tui::tools::Sandbox::new(sandbox_root.clone()),
+                        &self.checkpoint_store,
+                        &self.mcp.clone(),
                     );
                     let output = match result {
                         Ok(s) => s,
@@ -908,6 +964,7 @@ pub fn spawn_worker(
     rx: Receiver<WorkerCommand>,
     tx: Sender<WorkerEvent>,
     permissions: crate::tui::permissions::SharedPermissions,
+    mcp: crate::tui::mcp::manager::SharedMcp,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let sampling = SamplingParams {
@@ -935,6 +992,11 @@ pub fn spawn_worker(
             backend: "rocm".into(), // Updated when a model is loaded.
             permissions,
             plan_mode: false,
+            checkpoint_store: crate::tui::checkpoints::CheckpointStore::open(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
+            mcp,
+            tools: crate::tui::tools::coding_tools(),
         };
 
         loop {

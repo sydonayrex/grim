@@ -241,29 +241,13 @@ impl DbrxBlock {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
-
-        let x_vec = x.to_vec_f32()?;
-        let ap_vec = attn_proj.to_vec_f32()?;
-        let mut res1 = vec![0.0f32; x_vec.len()];
-        for i in 0..res1.len() {
-            res1[i] = x_vec[i] + ap_vec[i];
-        }
-        let res1_tensor = cpu_tensor(res1, x.shape().clone());
-
-        let normed_ffn = self.post_attention_layernorm.forward(&res1_tensor)?;
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        let normed_ffn = self.post_attention_layernorm.forward(&res1)?;
         let moe_out = self.moe.forward(&normed_ffn)?;
-
-        let r1_vec = res1_tensor.to_vec_f32()?;
-        let m_vec = moe_out.to_vec_f32()?;
-        let mut res2 = vec![0.0f32; r1_vec.len()];
-        for i in 0..res2.len() {
-            res2[i] = r1_vec[i] + m_vec[i];
-        }
-
-        Ok(cpu_tensor(res2, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &moe_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -293,7 +277,7 @@ impl Dbrx {
             [cfg.vocab_size, cfg.d_model],
         )?;
 
-        let num_layers_to_load = cfg.n_layers.min(2);
+        let num_layers_to_load = cfg.n_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("blocks").scoped(&i.to_string());

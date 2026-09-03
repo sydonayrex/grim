@@ -4004,6 +4004,7 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
 
+
         ModelArchitecture::Arcee
         | ModelArchitecture::Apertus
         | ModelArchitecture::Arctic

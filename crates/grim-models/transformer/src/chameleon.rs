@@ -242,7 +242,7 @@ impl ChameleonBlock {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
@@ -365,7 +365,15 @@ impl CausalLm for Chameleon {
         }
 
         let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
-        let mut kv_caches = vec![None; self.layers.len()];
+        if session.model_state().is_none() {
+            let fresh: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
+            session.set_model_state(Box::new(fresh));
+        }
+
+        let kv_caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
+            .expect("Chameleon::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_v, &mut kv_caches[layer_idx])?;
@@ -387,5 +395,101 @@ mod tests {
         let cfg = ChameleonConfig::default();
         assert_eq!(cfg.hidden_size, 8192);
         assert!(cfg.swin_norm);
+    }
+
+    #[test]
+    fn test_chameleon_session_kv_cache_persistence() {
+        let mut cfg = ChameleonConfig::default();
+        cfg.vocab_size = 32;
+        cfg.hidden_size = 16;
+        cfg.intermediate_size = 32;
+        cfg.num_layers = 1;
+        cfg.num_heads = 2;
+        cfg.num_kv_heads = 1;
+        cfg.head_dim = 8;
+        cfg.swin_norm = false;
+
+        let tok_embeddings = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 32 * 16], Shape::new(vec![32, 16])),
+            None,
+        );
+        let norm = RmsNorm {
+            weight: cpu_tensor(vec![1.0f32; 16], Shape::new(vec![16])),
+            eps: 1e-5,
+        };
+        let output = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 32 * 16], Shape::new(vec![32, 16])),
+            None,
+        );
+        let lin_16_16 = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 256], Shape::new(vec![16, 16])),
+            None,
+        );
+        let lin_16_8 = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 128], Shape::new(vec![8, 16])),
+            None,
+        );
+        let lin_16_32 = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 512], Shape::new(vec![32, 16])),
+            None,
+        );
+        let lin_32_16 = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 512], Shape::new(vec![16, 32])),
+            None,
+        );
+
+        let block = ChameleonBlock {
+            wq: lin_16_16.clone(),
+            wk: lin_16_8.clone(),
+            wv: lin_16_8.clone(),
+            wo: lin_16_16.clone(),
+            q_norm: None,
+            k_norm: None,
+            attn_norm: norm.clone(),
+            ffn_norm: norm.clone(),
+            w_gate: lin_16_32.clone(),
+            w_up: lin_16_32.clone(),
+            w_down: lin_32_16.clone(),
+            rope: Rope::new(8, 10000.0),
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 8,
+            swin_norm: false,
+        };
+
+        let model = Chameleon {
+            cfg,
+            device: Device::Cpu,
+            tok_embeddings,
+            layers: vec![block],
+            norm,
+            output,
+        };
+
+        let mut session = model.new_session();
+        let tok0 = cpu_tensor(vec![1.0f32], Shape::new(vec![1]));
+        let pos0 = cpu_tensor(vec![0.0f32], Shape::new(vec![1]));
+        let _ = model.forward(session.as_mut(), &tok0, &pos0, &[]).unwrap();
+
+        // KV cache must persist in session model_state
+        let caches = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<(Tensor, Tensor)>>>())
+            .expect("session model_state holds kv caches");
+        assert!(caches[0].is_some(), "Layer 0 cache must be populated");
+        let (k, _v) = caches[0].as_ref().unwrap();
+        assert_eq!(k.shape().dims()[0], 1, "Cache length after 1 token is 1");
+
+        // Second decode token
+        let tok1 = cpu_tensor(vec![2.0f32], Shape::new(vec![1]));
+        let pos1 = cpu_tensor(vec![1.0f32], Shape::new(vec![1]));
+        let _ = model.forward(session.as_mut(), &tok1, &pos1, &[]).unwrap();
+
+        let caches2 = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<(Tensor, Tensor)>>>())
+            .unwrap();
+        let (k2, _v2) = caches2[0].as_ref().unwrap();
+        assert_eq!(k2.shape().dims()[0], 2, "Cache length after 2 tokens is 2");
     }
 }
