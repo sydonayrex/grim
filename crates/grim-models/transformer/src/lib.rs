@@ -123,6 +123,8 @@ pub mod qwen2moe;
 pub mod qwen2vl;
 pub mod qwen3;
 pub mod qwen35;
+#[cfg(test)]
+pub mod qwen35_perf;
 pub mod qwen35moe;
 pub mod qwen38_flash_next;
 pub mod qwen3moe;

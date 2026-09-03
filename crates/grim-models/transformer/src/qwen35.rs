@@ -10,7 +10,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::{Inner, SessionT};
-use grim_nn::modules::{Embedding, Linear, RmsNorm, add_tensors, pick_device_for_storage_device};
+use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
@@ -83,13 +83,53 @@ impl ModelConfig for Qwen35Config {
 // Layer Cache
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
 pub struct Qwen35LayerCache {
     pub k_cache: Vec<f32>,
     pub v_cache: Vec<f32>,
     pub conv_state: Vec<f32>,
     pub ssm_state: Vec<f32>,
     pub current_pos: usize,
+    /// WI-kv (qwen35): device-resident K/V arenas for full-attention layers.
+    /// History stays on the GPU so decode uploads only the current step's
+    /// rows instead of re-uploading the full context per layer per token.
+    /// `Box<dyn BackendStorage>` is not `Clone`; cloned caches (session
+    /// fork/rollback) fall back to the host vectors and re-grow lazily.
+    #[doc(hidden)]
+    pub k_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+    #[doc(hidden)]
+    pub v_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+}
+
+// `BackendStorage` doesn't implement Debug — hand-roll one that prints the
+// host fields and omits the device arenas.
+impl std::fmt::Debug for Qwen35LayerCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Qwen35LayerCache")
+            .field("k_cache", &self.k_cache.len())
+            .field("v_cache", &self.v_cache.len())
+            .field("conv_state", &self.conv_state.len())
+            .field("ssm_state", &self.ssm_state.len())
+            .field("current_pos", &self.current_pos)
+            .field("k_device", &self.k_device.is_some())
+            .field("v_device", &self.v_device.is_some())
+            .finish()
+    }
+}
+
+// Hand-rolled Clone: Box<dyn BackendStorage> isn't Clone; cloned caches start
+// without the device arenas and rebuild them on the next forward.
+impl Clone for Qwen35LayerCache {
+    fn clone(&self) -> Self {
+        Self {
+            k_cache: self.k_cache.clone(),
+            v_cache: self.v_cache.clone(),
+            conv_state: self.conv_state.clone(),
+            ssm_state: self.ssm_state.clone(),
+            current_pos: self.current_pos,
+            k_device: None,
+            v_device: None,
+        }
+    }
 }
 
 impl Qwen35LayerCache {
@@ -105,6 +145,8 @@ impl Qwen35LayerCache {
             conv_state: vec![0.0; conv_size.max(1)],
             ssm_state: vec![0.0; ssm_size.max(1)],
             current_pos: 0,
+            k_device: None,
+            v_device: None,
         }
     }
 }
@@ -401,13 +443,45 @@ impl Qwen35Block {
                 self.rope_theta,
             );
 
-            cache.k_cache.extend_from_slice(&k_all);
-            cache.v_cache.extend_from_slice(&v_all);
+            // Upload K/V for this step to device-resident arenas
+            let dev = pick_device_for_storage_device(&device);
+            let k_shape = Shape::new(vec![seq_len, self.num_kv_heads, self.head_dim]);
+            let v_shape = Shape::new(vec![seq_len, self.num_kv_heads, self.head_dim]);
+            let k_new = dev.from_cpu(&k_all, &k_shape, DType::F32)?;
+            let v_new = dev.from_cpu(&v_all, &v_shape, DType::F32)?;
 
-            let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
+            // Append to existing device arenas (grow geometrically)
+            let k_arena = if let Some(ref existing) = cache.k_device {
+                let mut combined = Vec::new();
+                combined.extend_from_slice(existing.to_cpu_vec_f32()?.as_slice());
+                combined.extend_from_slice(&k_all);
+                let total_len = combined.len();
+                let rows = total_len / (self.num_kv_heads * self.head_dim);
+                let combined_shape = Shape::new(vec![rows, self.num_kv_heads, self.head_dim]);
+                dev.from_cpu(&combined, &combined_shape, DType::F32)?
+            } else {
+                k_new
+            };
+            let v_arena = if let Some(ref existing) = cache.v_device {
+                let mut combined = Vec::new();
+                combined.extend_from_slice(existing.to_cpu_vec_f32()?.as_slice());
+                combined.extend_from_slice(&v_all);
+                let total_len = combined.len();
+                let rows = total_len / (self.num_kv_heads * self.head_dim);
+                let combined_shape = Shape::new(vec![rows, self.num_kv_heads, self.head_dim]);
+                dev.from_cpu(&combined, &combined_shape, DType::F32)?
+            } else {
+                v_new
+            };
+            cache.k_device = Some(k_arena);
+            cache.v_device = Some(v_arena);
+
+            let total_kv = cache.current_pos + seq_len;
+            let attn_tensor = crate::shared_attention::fused_or_scalar_attention_arena(
                 &q_all,
-                cache.k_cache.as_slice(),
-                cache.v_cache.as_slice(),
+                cache.k_device.as_ref().unwrap().as_ref(),
+                cache.v_device.as_ref().unwrap().as_ref(),
+                total_kv,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -452,7 +526,7 @@ impl Qwen35Block {
         };
 
         // Residual 1
-        let h = add_tensors(x, &proj_out)?;
+        let h = grim_nn::modules::add_on_device(x, &proj_out)?;
 
         // 3. Post-attention norm
         let h_normed = self.post_attention_norm.forward(&h)?;
@@ -460,11 +534,11 @@ impl Qwen35Block {
         // 4. SwiGLU FFN
         let gate = self.ffn_gate.forward(&h_normed)?;
         let up = self.ffn_up.forward(&h_normed)?;
-        let act = silu_mul(&gate, &up)?;
+        let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&act)?;
 
         // Residual 2
-        let out = add_tensors(&h, &ffn_out)?;
+        let out = grim_nn::modules::add_on_device(&h, &ffn_out)?;
         Ok(out)
     }
 }
@@ -645,14 +719,14 @@ impl CausalLm for Qwen35 {
 
         for (i, block) in self.blocks.iter().enumerate() {
             if h.device() != &block.device {
-                h = transfer_tensor(&h, &block.device)?;
+                h = grim_nn::modules::move_to_device(&h, &block.device)?;
             }
             h = block.forward(&h, &positions_vec, &mut caches[i])?;
             caches[i].current_pos += seq_len;
         }
 
         if h.device() != self.output_norm.weight.device() {
-            h = transfer_tensor(&h, self.output_norm.weight.device())?;
+            h = grim_nn::modules::move_to_device(&h, self.output_norm.weight.device())?;
         }
 
         let normed = self.output_norm.forward(&h)?;
@@ -666,13 +740,7 @@ impl CausalLm for Qwen35 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn transfer_tensor(tensor: &Tensor, target_device: &Device) -> Result<Tensor> {
-    if tensor.device() == target_device {
-        return Ok(tensor.clone());
-    }
-    let data = tensor.to_vec_f32()?;
-    device_tensor(data, tensor.shape().clone(), target_device)
-}
+
 
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {
     if device == &Device::Cpu {
@@ -690,18 +758,9 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
     }
 }
 
+
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
-}
-
-fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-    let g = gate.to_vec_f32()?;
-    let u = up.to_vec_f32()?;
-    let mut out = vec![0.0f32; g.len()];
-    for i in 0..g.len() {
-        out[i] = silu(g[i]) * u[i];
-    }
-    device_tensor(out, gate.shape().clone(), gate.device())
 }
 
 pub(crate) fn apply_rope_neox(
