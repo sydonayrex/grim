@@ -5,7 +5,7 @@
 //! `WorkerCommand`s and drains `WorkerEvent`s over `std::sync::mpsc` channels.
 //! GPU and model code runs only on the worker.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -23,6 +23,9 @@ use ratatui::widgets::{Block, BorderType, Gauge, Paragraph, Sparkline, Wrap};
 
 /// Slash command descriptors and registry.
 pub mod commands;
+
+/// Text clipboard: arboard with OSC52 fallback.
+pub mod clipboard;
 
 /// Input composer with cursor navigation and history ring buffer.
 pub mod composer;
@@ -863,13 +866,28 @@ impl App {
                 if let Some(text) = self.selected_transcript_text() {
                     copy_to_clipboard(&text);
                     self.show_toast(Toast::success("Copied to clipboard"));
-                } else if let Some(last) = self.transcript.nodes.last().map(|n| n.content.clone()) {
-                    if !last.is_empty() {
-                        copy_to_clipboard(&last);
-                        self.show_toast(Toast::success("Copied to clipboard"));
-                    }
                 } else {
-                    self.composer.insert_char('y');
+                    // Prefer the last fenced code block of the last assistant reply.
+                    let last_assistant = self
+                        .transcript
+                        .nodes
+                        .iter()
+                        .rev()
+                        .find(|n| n.role == Role::Assistant && !n.content.is_empty())
+                        .map(|n| n.content.clone());
+                    if let Some((_, code)) =
+                        last_assistant.as_deref().and_then(markdown::last_fenced_code_block)
+                    {
+                        copy_to_clipboard(&code);
+                        self.show_toast(Toast::success("Code block copied to clipboard"));
+                    } else if let Some(last) = self.transcript.nodes.last().map(|n| n.content.clone()) {
+                        if !last.is_empty() {
+                            copy_to_clipboard(&last);
+                            self.show_toast(Toast::success("Copied to clipboard"));
+                        }
+                    } else {
+                        self.composer.insert_char('y');
+                    }
                 }
                 return;
             }
@@ -2279,31 +2297,7 @@ fn send_desktop_notification(title: &str, body: &str) {
 /// Tries `arboard::Clipboard::new().set_text()` first; if that fails (e.g. headless
 /// or missing display server) falls back to writing an OSC52 sequence to stdout
 /// so the terminal emulator can place the text in the system clipboard.
-pub fn copy_to_clipboard(text: &str) {
-    // Try arboard first (requires display server).
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        if cb.set_text(text.to_string()).is_ok() {
-            return;
-        }
-    }
-    // Fallback: OSC52 — encode as base64 and emit "\x1b]52;c;{}\x07".
-    let encoded = base64_encoded(text);
-    let seq = format!("\x1b]52;c;{}\x07", encoded);
-    let _ = std::io::stdout().write_all(seq.as_bytes());
-    let _ = std::io::stdout().flush();
-}
-
-fn base64_encoded(input: &str) -> String {
-    // Use base64 crate if available; otherwise minimal manual encode.
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input.as_bytes())
-}
-
-/// Emit OSC52 copy without attempting arboard (useful for tests).
-pub fn osc52_copy(text: &str) -> String {
-    let encoded = base64_encoded(text);
-    format!("\x1b]52;c;{}\x07", encoded)
-}
-
+pub use clipboard::{copy_to_clipboard, osc52_copy};
 /// Terminal lifecycle: the alternate screen is restored by the panic hook
 /// (see `run_tui`) on crash, or by the explicit `ratatui::restore()` call
 /// on the normal exit path. Kept as a placeholder comment — if you need a
