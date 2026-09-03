@@ -151,6 +151,8 @@ impl HyV4Block {
         })
     }
 
+    /// GPU-first: Q/K/V, RoPE and attention run on the tensor's device; the
+    /// host path is only reached through the fused-kernel fallback guard.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -159,35 +161,45 @@ impl HyV4Block {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let mut q_vec = q.to_vec_f32()?;
-        let mut k_vec = k.to_vec_f32()?;
-
-        crate::qwen35::apply_rope_neox(
-            &mut q_vec,
-            positions,
+        let q = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_vec,
             positions,
+        )?;
+        let k = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k,
             self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
+            positions,
+        )?;
 
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_vec,
-            &k_vec,
-            &v.to_vec_f32()?,
+        // GPU-first; on backends that reject the kernel call fall back to the
+        // host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k,
+            &v,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             seq_len,
+            seq_len,
             None,
-            x.device(),
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k.to_vec_f32()?,
+                &v.to_vec_f32()?,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
         let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
@@ -306,22 +318,16 @@ impl CausalLm for HyV4 {
 
         let ids_f32 = input_ids.to_vec_f32()?;
         let seq_len = ids_f32.len();
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
 
-        for (i, &tok_f) in ids_f32.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                let src_start = tok * self.cfg.hidden_size;
-                let dst_start = i * self.cfg.hidden_size;
-                if src_start + self.cfg.hidden_size <= embed_w.len() {
-                    h_vec[dst_start..dst_start + self.cfg.hidden_size]
-                        .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
-                }
-            }
-        }
-
-        let mut h = cpu_tensor(h_vec, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather: only the gathered rows exist as a new
+        // device tensor; the vocab×hidden table never crosses to host.
+        let mut h = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
         for layer in &self.layers {
             h = layer.forward(&h, &pos_u32)?;
         }

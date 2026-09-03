@@ -140,6 +140,40 @@ impl MtpLayer {
         )?;
         Ok((h_t, l_t))
     }
+
+    /// One autoregressive MTP step: returns `(h_next, argmax(logits))`.
+    ///
+    /// GPU-first: the vocabulary logits never cross to host — the argmax
+    /// runs on the device over the final logits tensor; only the
+    /// hidden-size `h_next` row is pulled (needed as the next step's host
+    /// input). Host fallbacks cover backends without the `argmax` kernel.
+    pub fn forward_step(&self, h: &[f32], e: &[f32]) -> Result<(Vec<f32>, u32)> {
+        if h.len() != self.hidden_size || e.len() != self.hidden_size {
+            return Err(Error::Session(format!(
+                "MtpLayer::forward dimension mismatch: expected h={}, e={}, got h={}, e={}",
+                self.hidden_size,
+                self.hidden_size,
+                h.len(),
+                e.len()
+            )));
+        }
+
+        let mut concat = Vec::with_capacity(self.hidden_size * 2);
+        concat.extend_from_slice(h);
+        concat.extend_from_slice(e);
+
+        let concat_cpu = cpu_tensor(concat, Shape::new(vec![1, self.hidden_size * 2]));
+        let target_dev = self.proj.weight.device();
+        let concat_t = grim_nn::modules::move_to_device(&concat_cpu, target_dev)?;
+
+        let projected = self.proj.forward(&concat_t)?;
+        let normed = self.norm.forward(&projected)?;
+        let logits = self.lm_head.forward(&normed)?;
+
+        let next_token = argmax_last_row_device(&logits, self.vocab_size)?;
+        let h_next = normed.to_vec_f32()?;
+        Ok((h_next, next_token))
+    }
 }
 
 /// Llama model with genuine Multi-Token Prediction (MTP) layers.
@@ -207,34 +241,41 @@ impl MtpDepthProvider for LlamaMtp {
         positions: &Tensor,
     ) -> Result<Vec<u32>> {
         let base_logits = self.base.forward(session, input_ids, positions, &[])?;
-        let logits_vec = base_logits.to_vec_f32()?;
         let vocab_size = self.base.cfg.vocab_size;
         let hidden_size = self.base.cfg.hidden_size;
 
-        if logits_vec.is_empty() || vocab_size == 0 {
+        if base_logits.shape().elem_count() == 0 || vocab_size == 0 {
             return Ok(vec![]);
         }
 
-        // Extract trunk token prediction for final position
-        let last_logits_offset = logits_vec.len().saturating_sub(vocab_size);
-        let last_logits = &logits_vec[last_logits_offset..];
-        let mut curr_token = argmax(last_logits) as u32;
+        // Device-side argmax over the final position's vocab row — the
+        // [seq, vocab] logits tensor never crosses to host.
+        let mut curr_token = argmax_last_row_device(&base_logits, vocab_size)?;
 
-        // Retrieve last hidden state from session or approximate from normalized embedding
-        let embed_w = self.base.tok_embeddings.weight.to_vec_f32()?;
+        // Retrieve last hidden state from session or approximate from a
+        // single-row embedding gather (never the whole table).
         let mut curr_h = if let Some(last_h) = session.get_last_hidden_state() {
             let vec = last_h.to_vec_f32()?;
             let offset = vec.len().saturating_sub(hidden_size);
             vec[offset..].to_vec()
         } else {
-            get_embedding_row(&embed_w, curr_token as usize, hidden_size, vocab_size)
+            embedding_row_device(
+                &self.base.tok_embeddings.weight,
+                curr_token,
+                hidden_size,
+                vocab_size,
+            )?
         };
 
         let mut tokens = Vec::with_capacity(self.mtp_layers.len());
         for layer in &self.mtp_layers {
-            let curr_e = get_embedding_row(&embed_w, curr_token as usize, hidden_size, vocab_size);
-            let (next_h, next_logits) = layer.forward(&curr_h, &curr_e)?;
-            let next_token = argmax(&next_logits) as u32;
+            let curr_e = embedding_row_device(
+                &self.base.tok_embeddings.weight,
+                curr_token,
+                hidden_size,
+                vocab_size,
+            )?;
+            let (next_h, next_token) = layer.forward_step(&curr_h, &curr_e)?;
             tokens.push(next_token);
             curr_h = next_h;
             curr_token = next_token;
@@ -309,32 +350,37 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
         positions: &Tensor,
     ) -> Result<Vec<u32>> {
         let base_logits = self.base.forward(session, input_ids, positions, &[])?;
-        let logits_vec = base_logits.to_vec_f32()?;
         let vocab_size = self.base.cfg.vocab_size;
         let hidden_size = self.base.cfg.hidden_size;
 
-        if logits_vec.is_empty() || vocab_size == 0 {
+        if base_logits.shape().elem_count() == 0 || vocab_size == 0 {
             return Ok(vec![]);
         }
 
-        let last_logits_offset = logits_vec.len().saturating_sub(vocab_size);
-        let last_logits = &logits_vec[last_logits_offset..];
-        let mut curr_token = argmax(last_logits) as u32;
+        let mut curr_token = argmax_last_row_device(&base_logits, vocab_size)?;
 
-        let embed_w = self.base.tok_embeddings.weight.to_vec_f32()?;
         let mut curr_h = if let Some(last_h) = session.get_last_hidden_state() {
             let vec = last_h.to_vec_f32()?;
             let offset = vec.len().saturating_sub(hidden_size);
             vec[offset..].to_vec()
         } else {
-            get_embedding_row(&embed_w, curr_token as usize, hidden_size, vocab_size)
+            embedding_row_device(
+                &self.base.tok_embeddings.weight,
+                curr_token,
+                hidden_size,
+                vocab_size,
+            )?
         };
 
         let mut tokens = Vec::with_capacity(self.mtp_layers.len());
         for layer in &self.mtp_layers {
-            let curr_e = get_embedding_row(&embed_w, curr_token as usize, hidden_size, vocab_size);
-            let (next_h, next_logits) = layer.forward(&curr_h, &curr_e)?;
-            let next_token = argmax(&next_logits) as u32;
+            let curr_e = embedding_row_device(
+                &self.base.tok_embeddings.weight,
+                curr_token,
+                hidden_size,
+                vocab_size,
+            )?;
+            let (next_h, next_token) = layer.forward_step(&curr_h, &curr_e)?;
             tokens.push(next_token);
             curr_h = next_h;
             curr_token = next_token;
@@ -360,14 +406,64 @@ fn argmax(slice: &[f32]) -> usize {
     best_idx
 }
 
-fn get_embedding_row(embed_w: &[f32], tok: usize, hidden_size: usize, vocab_size: usize) -> Vec<f32> {
-    let tok_idx = if tok < vocab_size { tok } else { 0 };
-    let start = tok_idx * hidden_size;
-    if start + hidden_size <= embed_w.len() {
-        embed_w[start..start + hidden_size].to_vec()
-    } else {
-        vec![0.0f32; hidden_size]
+/// Argmax of the LAST `[*, vocab]` row of `logits`, on the tensor's device.
+/// Stages only that row D2D (`copy_slice_range`) and runs the `argmax`
+/// kernel; falls back to a single-row host pull when the backend lacks the
+/// primitives. Never pulls the whole `[seq, vocab]` tensor.
+fn argmax_last_row_device(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+    if vocab_size == 0 {
+        return Err(Error::Session("argmax over empty vocabulary".into()));
     }
+    let total = logits.shape().elem_count();
+    if total == 0 || total < vocab_size {
+        return Err(Error::Session(format!(
+            "argmax_last_row_device: logits has {total} elements, vocab {vocab_size}"
+        )));
+    }
+    let rows = total / vocab_size;
+    let dev = grim_nn::modules::pick_device_for_storage_device(logits.device());
+    if let Ok(scratch) = dev.alloc_storage(
+        &Shape::new(vec![1, vocab_size]),
+        grim_tensor::DType::F32,
+    ) {
+        if dev
+            .copy_slice_range(
+                scratch.as_ref(),
+                0,
+                logits.storage().as_ref(),
+                (rows - 1) * vocab_size,
+                vocab_size,
+            )
+            .is_ok()
+        {
+            if let Ok(idx) = dev.argmax(scratch.as_ref()) {
+                return Ok(idx);
+            }
+        }
+    }
+    // Fallback: pull only the final vocab row.
+    let all = logits.to_vec_f32()?;
+    let offset = all.len().saturating_sub(vocab_size);
+    Ok(argmax(&all[offset..]) as u32)
+}
+
+/// Single-row embedding gather: pulls exactly one hidden-size row from the
+/// table (via the device gather kernel), never the whole vocab×hidden
+/// table. OOV tokens clamp to row 0 (matches the legacy host helper).
+fn embedding_row_device(
+    weight: &Tensor,
+    tok: u32,
+    hidden_size: usize,
+    vocab_size: usize,
+) -> Result<Vec<f32>> {
+    let tok = if (tok as usize) < vocab_size { tok } else { 0 };
+    let row = grim_nn::embedding_gather_on_device(
+        weight,
+        &[tok],
+        1,
+        hidden_size,
+    )?;
+    Ok(row.to_vec_f32()?)
 }
 
 // ---------------------------------------------------------------------------

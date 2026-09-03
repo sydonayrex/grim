@@ -259,75 +259,57 @@ impl Eagle3DecoderLayer {
         let k = self.wk.forward(&concat_t)?;
         let v = self.wv.forward(&concat_t)?;
 
-        // Apply RoPE formatted for 3D tensor [1, seq_len * num_heads, head_dim]
+        // RoPE stays on the projection's device: relabel to the per-head row
+        // layout the Rope module's kernel contract expects.
         let mut q_ext_pos = Vec::with_capacity(seq_len * self.num_heads);
         for &pos in positions {
             for _ in 0..self.num_heads {
                 q_ext_pos.push(pos);
             }
         }
-        let q_3d = cpu_tensor(
-            q.to_vec_f32()?,
-            Shape::new(vec![1, seq_len * self.num_heads, self.head_dim]),
-        );
-        let q_rope = self.rope.forward(&q_3d, &q_ext_pos)?;
-
         let mut k_ext_pos = Vec::with_capacity(seq_len * self.num_kv_heads);
         for &pos in positions {
             for _ in 0..self.num_kv_heads {
                 k_ext_pos.push(pos);
             }
         }
-        let k_3d = cpu_tensor(
-            k.to_vec_f32()?,
-            Shape::new(vec![1, seq_len * self.num_kv_heads, self.head_dim]),
-        );
+        let q_3d = crate::block::reshaped_view(
+            &q,
+            &Shape::new(vec![1, seq_len * self.num_heads, self.head_dim]),
+        )?;
+        let q_rope = self.rope.forward(&q_3d, &q_ext_pos)?;
+
+        let k_3d = crate::block::reshaped_view(
+            &k,
+            &Shape::new(vec![1, seq_len * self.num_kv_heads, self.head_dim]),
+        )?;
         let k_rope = self.rope.forward(&k_3d, &k_ext_pos)?;
 
-        // Dense causal self-attention
-        let q_v = q_rope.to_vec_f32()?;
-        let k_v = k_rope.to_vec_f32()?;
-        let v_v = v.to_vec_f32()?;
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-        let mut attn_out = vec![0.0f32; seq_len * self.num_heads * self.head_dim];
-        let kv_group = self.num_heads / self.num_kv_heads.max(1);
-
-        for h in 0..self.num_heads {
-            let kv_h = h / kv_group;
-            for i in 0..seq_len {
-                let q_off = (i * self.num_heads + h) * self.head_dim;
-                let q_slice = &q_v[q_off..q_off + self.head_dim];
-
-                let mut scores = Vec::with_capacity(i + 1);
-                for j in 0..=i {
-                    let k_off = (j * self.num_kv_heads + kv_h) * self.head_dim;
-                    let k_slice = &k_v[k_off..k_off + self.head_dim];
-                    let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
-                    scores.push(dot * scale);
-                }
-
-                // Softmax
-                let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let exp_s: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
-                let sum_exp: f32 = exp_s.iter().sum::<f32>().max(1e-12);
-                let probs: Vec<f32> = exp_s.iter().map(|s| s / sum_exp).collect();
-
-                let out_off = i * self.num_heads * self.head_dim + h * self.head_dim;
-                for (j, &p) in probs.iter().enumerate() {
-                    let v_off = j * self.num_kv_heads * self.head_dim + kv_h * self.head_dim;
-                    let v_slice = &v_v[v_off..v_off + self.head_dim];
-                    for d in 0..self.head_dim {
-                        attn_out[out_off + d] += p * v_slice[d];
-                    }
-                }
-            }
-        }
-
-        let attn_t = cpu_tensor(
-            attn_out,
-            Shape::new(vec![seq_len, self.num_heads * self.head_dim]),
-        );
+        // Dense causal self-attention on device (host scalar loop only via
+        // the fused-kernel fallback guard).
+        let q_flat = crate::block::reshaped_view(
+            &q_rope,
+            &Shape::new(vec![seq_len, self.num_heads * self.head_dim]),
+        )?;
+        let k_flat = crate::block::reshaped_view(
+            &k_rope,
+            &Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]),
+        )?;
+        let v_flat = crate::block::reshaped_view(
+            &v,
+            &Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]),
+        )?;
+        let attn_t = crate::shared_attention::fused_attention_tensors(
+            &q_flat,
+            &k_flat,
+            &v_flat,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            seq_len,
+            seq_len,
+            None,
+        )?;
         let o_proj = self.wo.forward(&attn_t)?;
 
         // Residual add with hidden_states
@@ -337,19 +319,8 @@ impl Eagle3DecoderLayer {
         let norm_mlp = self.post_attn_norm.forward(&attn_res)?;
         let gate = self.w_gate.forward(&norm_mlp)?;
         let up = self.w_up.forward(&norm_mlp)?;
-
-        let g_v = gate.to_vec_f32()?;
-        let u_v = up.to_vec_f32()?;
-        let silu_up: Vec<f32> = g_v
-            .iter()
-            .zip(u_v.iter())
-            .map(|(&g, &u)| {
-                let silu = g / (1.0 + (-g).exp());
-                silu * u
-            })
-            .collect();
-        let silu_t = cpu_tensor(silu_up, gate.shape().clone());
-        let down = self.w_down.forward(&silu_t)?;
+        let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+        let down = self.w_down.forward(&act)?;
 
         Ok(grim_nn::modules::add_on_device(&attn_res, &down)?)
     }
@@ -493,16 +464,23 @@ impl Eagle3 {
             .unwrap_or(1);
         let num_fusion = self.cfg.num_target_fusion_layers.max(1);
 
-        let mut flattened_fusion =
-            Vec::with_capacity(seq_len * self.cfg.target_hidden_size * num_fusion);
-        for t in 0..seq_len {
-            for layer_idx in 0..num_fusion {
+        // Pull each target hidden ONCE — the old loop re-downloaded every
+        // layer tensor `seq_len` times from inside the per-token loop.
+        let layer_rows: Vec<Vec<f32>> = (0..num_fusion)
+            .map(|layer_idx| {
                 let layer_tensor = if layer_idx < target_layer_hiddens.len() {
                     target_layer_hiddens[layer_idx]
                 } else {
                     target_layer_hiddens[target_layer_hiddens.len() - 1]
                 };
-                let vec = layer_tensor.to_vec_f32()?;
+                layer_tensor.to_vec_f32().map_err(grim_core::error::Error::from)
+            })
+            .collect::<Result<_>>()?;
+
+        let mut flattened_fusion =
+            Vec::with_capacity(seq_len * self.cfg.target_hidden_size * num_fusion);
+        for t in 0..seq_len {
+            for vec in &layer_rows {
                 let start = t * self.cfg.target_hidden_size;
                 let end = (start + self.cfg.target_hidden_size).min(vec.len());
                 flattened_fusion.extend_from_slice(&vec[start..end]);

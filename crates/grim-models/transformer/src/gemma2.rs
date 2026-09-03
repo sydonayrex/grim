@@ -112,7 +112,7 @@ impl Gemma2Mlp {
             let gelu = 0.5 * x_val * (1.0 + tanh_in.tanh());
             act[i] = gelu * u_vec[i];
         }
-        let act_tensor = reupload_to_device(&cpu_tensor(act, g.shape().clone()), x.device())?;
+        let act_tensor = grim_nn::modules::move_to_device(&cpu_tensor(act, g.shape().clone()), x.device())?;
         Ok(self.down_proj.forward(&act_tensor)?)
     }
 }
@@ -216,7 +216,9 @@ impl Gemma2Block {
             positions,
         )?;
 
-        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+        // GPU-first; on backends that reject the kernel call fall back to the
+        // host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q,
             &k,
             &v,
@@ -226,7 +228,20 @@ impl Gemma2Block {
             seq_len,
             seq_len,
             None,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k.to_vec_f32()?,
+                &v.to_vec_f32()?,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.wo.forward(&attn_tensor)?;
         let post_attn = self.post_attention_layernorm.forward(&attn_proj)?;
 
@@ -378,25 +393,6 @@ impl CausalLm for Gemma2 {
             Ok(logits)
         }
     }
-}
-
-/// Move a host-produced tensor (the GeLU kernel-gap output) onto `device`
-/// when it is not already resident there.
-fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
-    if t.device() == device {
-        return Ok(t.clone());
-    }
-    let data = t.to_vec_f32()?;
-    let shape = t.shape().clone();
-    let dev = grim_nn::modules::pick_device_for_storage_device(device);
-    let storage = dev.from_cpu(&data, &shape, grim_tensor::DType::F32)?;
-    Ok(Tensor::new(
-        std::sync::Arc::from(storage),
-        shape,
-        grim_tensor::DType::F32,
-        t.provenance().clone(),
-        device.clone(),
-    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -535,7 +535,16 @@ impl Lfm2Block {
             // `arena_total` is Some when the new K/V rows were mirrored into
             // the device arenas (WI-X2), enabling arena-resident attention.
             let (q_rot_vec, arena_total): (Vec<f32>, Option<usize>) = if use_fused {
-                (self.fused_qkv(&norm_x, cache, steps, hidden)?, None)
+                // The fused kernel appended the new K/V rows directly into
+                // the device arenas — attention can stay arena-resident.
+                let past = match cache {
+                    Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / (self.num_kv_heads * self.head_dim),
+                    _ => 0,
+                };
+                (
+                    self.fused_qkv(&norm_x, cache, steps, hidden)?,
+                    Some(past + steps),
+                )
             } else {
                 let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
                 let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
@@ -837,7 +846,7 @@ impl Lfm2Block {
         let pos_shape = Shape::new(vec![steps]);
         let pos_storage = dev.from_cpu_bytes(as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
-        let handle = dev.fused_mxfp4_gemm_qk_norm_rope_kv(
+        let _handle = dev.fused_mxfp4_gemm_qk_norm_rope_kv(
             norm_x.storage().as_ref(),
             self.gamma_q.as_ref().unwrap().storage().as_ref(),
             self.gamma_k.as_ref().unwrap().storage().as_ref(),
@@ -860,12 +869,56 @@ impl Lfm2Block {
             self.eps,
             max_seq,
         )?;
-        handle.synchronize()?;
+        // No explicit synchronize: the storages sync lazily on first host
+        // read (WI-Host-1 rationale); an eager sync here would stall the
+        // pipeline every decode step.
 
         let q_rot_vec = q_out.to_vec_f32()?;
-        let k_cache_vec = k_dev.as_ref().unwrap().to_vec_f32()?;
-        let v_cache_vec = v_dev.as_ref().unwrap().to_vec_f32()?;
 
+        // Mirror ONLY the new K/V rows into the host history: stage them via
+        // a D2D range-copy into a `[steps, row_len]` scratch, then one small
+        // D2H. The old path downloaded the ENTIRE device arena per token
+        // (O(context) D2H + O(context) H2D when attention re-uploaded it).
+        let stage = |arena: &Tensor, row_len: usize| -> Result<Vec<f32>> {
+            let stage_shape = Shape::new(vec![steps, row_len]);
+            let scratch = dev.alloc_storage(&stage_shape, DType::F32)?;
+            dev.copy_slice_range(
+                scratch.as_ref(),
+                0,
+                arena.storage().as_ref(),
+                cache_offset * row_len,
+                steps * row_len,
+            )?;
+            let staged = Tensor::new(
+                Arc::from(scratch),
+                stage_shape,
+                DType::F32,
+                QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            );
+            staged.to_vec_f32().map_err(grim_core::error::Error::from)
+        };
+        let (new_k_rows, new_v_rows) = match (
+            stage(k_dev.as_ref().unwrap(), n_k),
+            stage(v_dev.as_ref().unwrap(), n_v),
+        ) {
+            (Ok(k), Ok(v)) => (k, v),
+            // Backend lacks the range-copy primitives: fall back to reading
+            // the arenas whole (correct, O(context) — degraded path only).
+            (Err(e), _) | (_, Err(e)) if crate::is_unimplemented(&e) => (
+                k_dev
+                    .as_ref()
+                    .unwrap()
+                    .to_vec_f32()
+                    .map_err(grim_core::error::Error::from)?,
+                v_dev
+                    .as_ref()
+                    .unwrap()
+                    .to_vec_f32()
+                    .map_err(grim_core::error::Error::from)?,
+            ),
+            (Err(e), _) | (_, Err(e)) => return Err(e),
+        };
         let (k_hist, v_hist) = match cache.as_mut().unwrap() {
             Lfm2LayerCache::Attention { k, v, .. } => (k, v),
             _ => {
@@ -874,13 +927,8 @@ impl Lfm2Block {
                 ));
             }
         };
-        for t in 0..steps {
-            let pos = cache_offset + t;
-            let koff = pos * n_k;
-            k_hist.extend_from_slice(&k_cache_vec[koff..koff + n_k]);
-            let voff = pos * n_v;
-            v_hist.extend_from_slice(&v_cache_vec[voff..voff + n_v]);
-        }
+        k_hist.extend_from_slice(&new_k_rows);
+        v_hist.extend_from_slice(&new_v_rows);
         Ok(q_rot_vec)
     }
 

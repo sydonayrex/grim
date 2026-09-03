@@ -399,56 +399,105 @@ impl Qwen35Block {
         let mut out_branch = vec![0.0f32; seq_len * q_dim];
 
         if self.is_full_attention {
-            // Attention path with separated wq, wk, wv
-            let mut q_all = if let Some(ref wq) = self.wq {
-                let q_t = wq.forward(&x_normed)?;
-                let mut q_v = q_t.to_vec_f32()?;
-                q_v.truncate(seq_len * q_dim);
-                q_v
-            } else {
-                vec![0.0f32; seq_len * q_dim]
-            };
-
-            let mut k_all = if let Some(ref wk) = self.wk {
-                let k_t = wk.forward(&x_normed)?;
-                let mut k_v = k_t.to_vec_f32()?;
-                k_v.truncate(seq_len * kv_dim);
-                k_v
-            } else {
-                vec![0.0f32; seq_len * kv_dim]
-            };
-
-            let v_all = if let Some(ref wv) = self.wv {
-                let v_t = wv.forward(&x_normed)?;
-                let mut v_v = v_t.to_vec_f32()?;
-                v_v.truncate(seq_len * kv_dim);
-                v_v
-            } else {
-                vec![0.0f32; seq_len * kv_dim]
-            };
-
-            // Apply RoPE to Q and K
-            apply_rope_neox(
-                &mut q_all,
-                positions,
-                self.num_heads,
-                self.head_dim,
-                self.rope_theta,
-            );
-            apply_rope_neox(
-                &mut k_all,
-                positions,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rope_theta,
-            );
-
-            // Upload K/V for this step to device-resident arenas
+            // Attention path with separated wq, wk, wv.
+            // GPU-first: projections stay on-device; RoPE runs through the
+            // device kernel; K/V are appended into the device arenas D2D.
+            // Only the (small) per-step Q rows cross to host for the
+            // arena-attention entry point.
             let dev = pick_device_for_storage_device(&device);
-            let k_shape = Shape::new(vec![seq_len, self.num_kv_heads, self.head_dim]);
-            let v_shape = Shape::new(vec![seq_len, self.num_kv_heads, self.head_dim]);
-            let k_new = dev.from_cpu(&k_all, &k_shape, DType::F32)?;
-            let v_new = dev.from_cpu(&v_all, &v_shape, DType::F32)?;
+            // Some TP-sharded projections emit padded rows — cut to the
+            // exact [seq, width] extent via a D2D staging copy when needed.
+            let exact = |t: Tensor, rows: usize, width: usize| -> Result<Tensor> {
+                let want = Shape::new(vec![rows, width]);
+                if t.shape().elem_count() == rows * width {
+                    return Ok(crate::block::reshaped_view(&t, &want)?);
+                }
+                let scratch = dev.alloc_storage(&want, DType::F32)?;
+                dev.copy_slice_range(
+                    scratch.as_ref(),
+                    0,
+                    t.storage().as_ref(),
+                    0,
+                    rows * width,
+                )?;
+                Ok(Tensor::new(
+                    scratch.into(),
+                    want,
+                    DType::F32,
+                    t.provenance().clone(),
+                    t.device().clone(),
+                ))
+            };
+
+            let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+            let rope_ext =
+                |t: &Tensor, heads: usize| -> Result<Tensor> {
+                    let mut pos_ext = Vec::with_capacity(seq_len * heads);
+                    for &pos in positions {
+                        for _ in 0..heads {
+                            pos_ext.push(pos);
+                        }
+                    }
+                    let t3 = crate::block::reshaped_view(
+                        t,
+                        &Shape::new(vec![1, seq_len * heads, self.head_dim]),
+                    )?;
+                    let (rope_s, _) = dev.rope(
+                        t3.storage().as_ref(),
+                        &pos_ext,
+                        &rope_cfg,
+                        t3.shape(),
+                    )?;
+                    let roped = Tensor::new(
+                        rope_s.into(),
+                        t3.shape().clone(),
+                        DType::F32,
+                        t.provenance().clone(),
+                        t.device().clone(),
+                    );
+                    crate::block::reshaped_view(
+                        &roped,
+                        &Shape::new(vec![seq_len, heads * self.head_dim]),
+                    )
+                };
+
+            let q_dev = match self.wq.as_ref() {
+                Some(wq) => exact(wq.forward(&x_normed)?, seq_len, q_dim)?,
+                None => Tensor::new(
+                    dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?.into(),
+                    Shape::new(vec![seq_len, q_dim]),
+                    DType::F32,
+                    x_normed.provenance().clone(),
+                    x_normed.device().clone(),
+                ),
+            };
+            let k_dev_t = match self.wk.as_ref() {
+                Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
+                None => Tensor::new(
+                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?.into(),
+                    Shape::new(vec![seq_len, kv_dim]),
+                    DType::F32,
+                    x_normed.provenance().clone(),
+                    x_normed.device().clone(),
+                ),
+            };
+            let v_dev_t = match self.wv.as_ref() {
+                Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
+                None => Tensor::new(
+                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?.into(),
+                    Shape::new(vec![seq_len, kv_dim]),
+                    DType::F32,
+                    x_normed.provenance().clone(),
+                    x_normed.device().clone(),
+                ),
+            };
+
+            let q_rope = rope_ext(&q_dev, self.num_heads)?;
+            let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
+
+            // Per-step Q crosses to host for the arena attention entry
+            // point; K/V history never leaves the device.
+            let q_all = q_rope.to_vec_f32()?;
 
             // Append to the device arena via copy_slice_range (device-side).
             // K/V history stays on the GPU — never round-trips to host.
@@ -471,14 +520,14 @@ impl Qwen35Block {
                 dev.copy_slice_range(
                     &**cache.k_device.as_ref().unwrap(),
                     cache.current_pos * self.num_kv_heads * self.head_dim,
-                    k_new.as_ref(),
+                    k_rope.storage().as_ref(),
                     0,
                     kv_elems,
                 )?;
                 dev.copy_slice_range(
                     &**cache.v_device.as_ref().unwrap(),
                     cache.current_pos * self.num_kv_heads * self.head_dim,
-                    v_new.as_ref(),
+                    v_dev_t.storage().as_ref(),
                     0,
                     kv_elems,
                 )?;
@@ -510,14 +559,14 @@ impl Qwen35Block {
                 dev.copy_slice_range(
                     k_grown.as_ref(),
                     cache.current_pos * k_idx,
-                    k_new.as_ref(),
+                    k_rope.storage().as_ref(),
                     0,
                     kv_elems,
                 )?;
                 dev.copy_slice_range(
                     v_grown.as_ref(),
                     cache.current_pos * k_idx,
-                    v_new.as_ref(),
+                    v_dev_t.storage().as_ref(),
                     0,
                     kv_elems,
                 )?;

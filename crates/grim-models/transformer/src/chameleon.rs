@@ -4,7 +4,6 @@
 //! - **Per-Head Q/K Normalization (`swin_norm`)**: LayerNorm / RMSNorm applied to each attention head's Q and K independently prior to RoPE.
 //! - **GQA Attention & SwiGLU MLP**: Standard Grouped Query Attention with RoPE and SwiGLU feed-forward networks.
 
-use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
@@ -182,7 +181,7 @@ impl ChameleonBlock {
                     &q,
                     &Shape::new(vec![seq_len * self.num_heads, self.head_dim]),
                 )?;
-                reupload_to_device(&qn.forward(&relabeled)?, x.device())?
+                grim_nn::modules::move_to_device(&qn.forward(&relabeled)?, x.device())?
             }
             None => q,
         };
@@ -192,7 +191,7 @@ impl ChameleonBlock {
                     &k,
                     &Shape::new(vec![seq_len * self.num_kv_heads, self.head_dim]),
                 )?;
-                reupload_to_device(&kn.forward(&relabeled)?, x.device())?
+                grim_nn::modules::move_to_device(&kn.forward(&relabeled)?, x.device())?
             }
             None => k,
         };
@@ -224,8 +223,10 @@ impl ChameleonBlock {
         let kv_len = k_all.shape().dims()[0];
 
         // Shared helper applies the causal mask at cache_offset + s (fixes
-        // future-token leakage during multi-token prefill).
-        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+        // future-token leakage during multi-token prefill). GPU-first; on
+        // backends that reject the kernel call fall back to the
+        // host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q,
             &k_all,
             &v_all,
@@ -235,7 +236,20 @@ impl ChameleonBlock {
             seq_len,
             kv_len,
             None,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k_all.to_vec_f32()?,
+                &v_all.to_vec_f32()?,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
         let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
@@ -249,29 +263,6 @@ impl ChameleonBlock {
 
         grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Move a host-produced tensor (e.g. the host LayerNorm kernel gap output)
-/// onto `device` when it is not already resident there.
-fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
-    if t.device() == device {
-        return Ok(t.clone());
-    }
-    let data = t.to_vec_f32()?;
-    let shape = t.shape().clone();
-    let dev = grim_nn::modules::pick_device_for_storage_device(device);
-    let storage = dev.from_cpu(&data, &shape, grim_tensor::DType::F32)?;
-    Ok(Tensor::new(
-        std::sync::Arc::from(storage),
-        shape,
-        grim_tensor::DType::F32,
-        t.provenance().clone(),
-        device.clone(),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +392,7 @@ impl CausalLm for Chameleon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_backend_cpu::cpu_tensor;
 
     #[test]
     fn test_chameleon_config() {
