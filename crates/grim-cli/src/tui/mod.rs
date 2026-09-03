@@ -78,6 +78,9 @@ pub mod tasks;
 /// XDG base dirs for persisted TUI state.
 pub mod paths;
 
+/// Central session store: autosave, titles, listing.
+pub mod sessions;
+
 /// Keyboard-navigable selection menu.
 pub mod select_list;
 
@@ -325,6 +328,8 @@ pub struct App {
     pub queue: crate::tui::queue::MessageQueue,
     /// Persistent prompt history searched by Ctrl+R.
     pub history: crate::tui::history::PromptHistory,
+    /// Autosave target for this conversation; set on first user submit.
+    pub session_path: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -376,12 +381,23 @@ impl App {
             permissions: permissions::shared(permissions::PermissionRules::load()),
             queue: crate::tui::queue::MessageQueue::default(),
             history: crate::tui::history::PromptHistory::load(),
+            session_path: None,
         }
     }
 
     /// Show a toast notification, replacing any existing one.
     pub fn show_toast(&mut self, toast: Toast) {
         self.toast = Some(toast);
+    }
+
+    /// Rewrite the session autosave file from the current transcript.
+    /// No-op when no session exists yet (no user message sent).
+    fn autosave_now(&mut self) {
+        if let Some(p) = &self.session_path {
+            if let Err(e) = sessions::autosave(&self.transcript, p) {
+                self.show_toast(Toast::warning(format!("autosave failed: {e}")));
+            }
+        }
     }
 
     /// Clear the current toast if it has expired. Returns true if a toast was
@@ -471,6 +487,8 @@ impl App {
                 )));
                 // Border flash delight: green border for 300ms on turn complete.
                 self.flash_until = Some(Instant::now() + Duration::from_millis(300));
+                // Persist the completed turn before any queued message starts.
+                self.autosave_now();
                 // Send the next queued message, if any.
                 if let Some(next) = self.queue.pop() {
                     self.transcript
@@ -484,6 +502,7 @@ impl App {
             WorkerEvent::Error { message } => {
                 self.transcript.push_error(message);
                 self.generating = false;
+                self.autosave_now();
             }
             WorkerEvent::ModelLoadStarted { name } => {
                 self.snap.loading = true;
@@ -1847,6 +1866,9 @@ impl App {
                 }
                 self.history.append(trimmed);
                 self.history.save();
+                if self.session_path.is_none() {
+                    self.session_path = sessions::new_session_path(trimmed);
+                }
                 self.messages.push(grim_format::ChatMessage {
                     role: "user".to_string(),
                     content: trimmed.to_string(),
@@ -2151,7 +2173,7 @@ fn latest_session_file(dir: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Helper exporting transcript nodes to a text file or JSONL.
-fn export_transcript(transcript: &Transcript, path: &str) -> std::io::Result<usize> {
+pub(crate) fn export_transcript(transcript: &Transcript, path: &str) -> std::io::Result<usize> {
     use std::io::Write;
     let mut file = std::fs::File::create(path)?;
     let mut count = 0;
@@ -3450,12 +3472,14 @@ pub async fn cmd_tui(
     app.permissions = perms;
 
     // Session resume: --resume <path> uses that file; --continue picks the
-    // most recently modified *.jsonl in the current directory.
+    // most recently modified *.jsonl in the current directory, falling back
+    // to the newest autosaved session in the central store.
     let resume_target = match (&resume, continue_last) {
         (Some(path), _) => Some(path.clone()),
         (None, true) => latest_session_file(
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )
+        .or_else(|| sessions::list_sessions().first().map(|s| s.path.clone()))
         .map(|p| p.to_string_lossy().into_owned()),
         (None, false) => None,
     };
@@ -3659,6 +3683,18 @@ mod tests {
         app.submit_chat("remember this prompt");
         assert_eq!(app.history.entries.len(), 1);
         assert_eq!(app.history.entries[0].text, "remember this prompt");
+    }
+
+    #[test]
+    fn first_submit_assigns_titled_session_path() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        assert!(app.session_path.is_none());
+        app.submit_chat("debug kv cache eviction");
+        let p = app.session_path.as_ref().unwrap();
+        assert!(p.to_string_lossy().contains("debug-kv-cache-eviction"));
     }
 
     #[test]
