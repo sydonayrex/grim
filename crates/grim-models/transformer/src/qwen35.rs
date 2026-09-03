@@ -545,22 +545,64 @@ impl Qwen35Block {
                 let qkv = qkv_lin.forward(&x_normed)?;
                 let qkv_vec = qkv.to_vec_f32()?;
                 let qkv_total_per_tok = qkv_vec.len() / seq_len;
+                let conv_w = self.ssm_conv_vec.as_deref();
+
                 for t in 0..seq_len {
                     let base = t * qkv_total_per_tok;
-                    for d in 0..q_dim.min(qkv_total_per_tok) {
-                        out_branch[t * q_dim + d] = silu(qkv_vec[base + d]);
+                    let num_feats = q_dim.min(qkv_total_per_tok);
+
+                    // If short-conv kernel weights are present and state is allocated,
+                    // apply causal 1D convolution and roll state.
+                    if let Some(w) = conv_w {
+                        let l_conv = (w.len() / num_feats.max(1)).max(1);
+                        let state = &mut cache.conv_state;
+                        let state_len_per_feat = l_conv.saturating_sub(1);
+
+                        for d in 0..num_feats {
+                            let curr_val = qkv_vec[base + d];
+                            let w_base = d * l_conv;
+                            let mut sum = w.get(w_base + l_conv.saturating_sub(1)).copied().unwrap_or(1.0) * curr_val;
+
+                            if state_len_per_feat > 0 && state.len() >= num_feats * state_len_per_feat {
+                                for k in 0..state_len_per_feat {
+                                    let st_val = state[k * num_feats + d];
+                                    sum += w.get(w_base + k).copied().unwrap_or(0.0) * st_val;
+                                }
+                            }
+                            out_branch[t * q_dim + d] = silu(sum);
+                        }
+
+                        // Roll state: shift older steps and append current input
+                        if state_len_per_feat > 0 && state.len() >= num_feats * state_len_per_feat {
+                            if state_len_per_feat > 1 {
+                                state.copy_within(num_feats..num_feats * state_len_per_feat, 0);
+                            }
+                            let last_offset = (state_len_per_feat - 1) * num_feats;
+                            for d in 0..num_feats {
+                                state[last_offset + d] = qkv_vec[base + d];
+                            }
+                        }
+                    } else {
+                        for d in 0..num_feats {
+                            out_branch[t * q_dim + d] = silu(qkv_vec[base + d]);
+                        }
                     }
                 }
             }
         }
 
-        // Apply attention gate if present
+        // Apply attention gate if present (aligned per token across seq_len)
         if let Some(ref gate_lin) = self.attn_gate {
             let gate_tensor = gate_lin.forward(&x_normed)?;
             let gate_vec = gate_tensor.to_vec_f32()?;
-            for i in 0..out_branch.len() {
-                let g = gate_vec[i % gate_vec.len()];
-                out_branch[i] *= 1.0 / (1.0 + (-g).exp()); // sigmoid gate
+            let gate_len_per_tok = gate_vec.len() / seq_len.max(1);
+            for t in 0..seq_len {
+                let gate_base = t * gate_len_per_tok;
+                let out_base = t * q_dim;
+                for d in 0..q_dim.min(gate_len_per_tok) {
+                    let g = gate_vec[gate_base + d];
+                    out_branch[out_base + d] *= 1.0 / (1.0 + (-g).exp()); // sigmoid gate
+                }
             }
         }
 
@@ -838,5 +880,72 @@ pub(crate) fn apply_rope_neox(
                 v[base + i + half] = x0 * sin + x1 * cos;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qwen35_shortconv_recurrent_state_advances() {
+        let mut cfg = Qwen35Config::default();
+        cfg.vocab_size = 32;
+        cfg.hidden_size = 16;
+        cfg.num_heads = 2;
+        cfg.num_kv_heads = 1;
+        cfg.head_dim = 8;
+        cfg.num_layers = 2;
+        cfg.full_attention_interval = 4; // Layer 0 is recurrent SSM
+        cfg.ssm_d_conv = 4;
+        cfg.ssm_d_inner = 16;
+
+        let mut cache = Qwen35LayerCache::new(&cfg);
+        let conv_initial = cache.conv_state.clone();
+
+        // Create synthetic block with short-conv kernel
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let l_conv = 4;
+        let conv_w = vec![0.25f32; q_dim * l_conv];
+
+        let block = Qwen35Block {
+            device: Device::Cpu,
+            attn_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            attn_qkv: Some(Linear::from_tensor(cpu_tensor(vec![0.1; (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size], Shape::new(vec![q_dim + 2 * cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size])), None)),
+            attn_gate: Some(Linear::from_tensor(cpu_tensor(vec![0.1; q_dim * cfg.hidden_size], Shape::new(vec![q_dim, cfg.hidden_size])), None)),
+            ssm_out: Some(Linear::from_tensor(cpu_tensor(vec![0.1; cfg.hidden_size * q_dim], Shape::new(vec![cfg.hidden_size, q_dim])), None)),
+            ssm_conv1d: None,
+            ssm_conv_vec: Some(conv_w),
+            ssm_a: None,
+            ssm_alpha: None,
+            ssm_beta: None,
+            ssm_dt_bias: None,
+            ssm_norm: None,
+            post_attention_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
+            ffn_gate: Linear::from_tensor(cpu_tensor(vec![0.1; cfg.intermediate_size * cfg.hidden_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
+            ffn_up: Linear::from_tensor(cpu_tensor(vec![0.1; cfg.intermediate_size * cfg.hidden_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
+            ffn_down: Linear::from_tensor(cpu_tensor(vec![0.1; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.hidden_size, cfg.intermediate_size])), None),
+            is_full_attention: false,
+            layer_idx: 0,
+            num_heads: cfg.num_heads,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta,
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+        };
+
+        let x = cpu_tensor(vec![1.0; 2 * cfg.hidden_size], Shape::new(vec![2, cfg.hidden_size]));
+        let out = block.forward(&x, &[0, 1], &mut cache).expect("forward recurrent layer");
+        assert_eq!(out.shape().dims(), &[2, cfg.hidden_size]);
+
+        // State must not be all zeroes after forward pass with non-zero inputs
+        assert_ne!(cache.conv_state, conv_initial, "conv_state must be updated across steps");
     }
 }

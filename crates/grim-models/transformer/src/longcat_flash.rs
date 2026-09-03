@@ -255,7 +255,7 @@ impl LongCatFlash {
             [cfg.vocab_size, cfg.hidden_size],
         )?;
 
-        let num_layers_to_load = cfg.num_layers.min(2);
+        let num_layers_to_load = cfg.num_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("layers").scoped(&i.to_string());

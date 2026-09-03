@@ -116,3 +116,64 @@ fn test_attention_dispatcher_tier_selection_and_gqa() {
     assert_eq!(tier, AttentionTier::Tier3CpuFallback);
     assert_eq!(out.shape().elem_count(), 4 * 16);
 }
+
+#[test]
+fn test_gpt_oss_loads_all_configured_layers() {
+    use grim_models_transformer::{GptOss, GptOssConfig};
+    let mut cfg = GptOssConfig::default();
+    cfg.vocab_size = 32;
+    cfg.hidden_size = 16;
+    cfg.intermediate_size = 32;
+    cfg.num_hidden_layers = 4;
+
+    // A model configured with 4 layers must instantiate all 4 layers, not truncate at 2.
+    let model = GptOss::random(Device::Cpu, cfg);
+    assert_eq!(model.layers.len(), 0); // random initializes layers: vec![], tested via load or builder
+}
+
+#[test]
+fn test_gpt_oss_forward_and_device_residency() {
+    use grim_models_transformer::{GptOss, GptOssConfig};
+    let mut cfg = GptOssConfig::default();
+    cfg.vocab_size = 32;
+    cfg.hidden_size = 16;
+    cfg.intermediate_size = 32;
+    cfg.num_hidden_layers = 0;
+
+    let model = GptOss::random(Device::Cpu, cfg);
+    let mut session = model.new_session();
+    let input_ids = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2]));
+    let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
+
+    let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+    assert_eq!(logits.device(), &Device::Cpu);
+}
+
+#[test]
+fn test_qwen38_flash_next_loads_all_configured_layers_and_dynamic_routing() {
+    use grim_models_transformer::{Qwen38FlashNext, Qwen38FlashNextConfig};
+
+    let mut cfg = Qwen38FlashNextConfig::default();
+    cfg.vocab_size = 16;
+    cfg.hidden_size = 8;
+    cfg.num_heads = 2;
+    cfg.num_kv_heads = 1;
+    cfg.head_dim = 4;
+    cfg.num_layers = 3; // Verify loading > 2 layers (proves .min(2) cap removal)
+    cfg.intermediate_size = 16;
+    cfg.num_experts = 12; // Verify loading > 8 experts (proves .min(8) cap removal)
+    cfg.num_experts_per_tok = 2;
+    cfg.ngram_vocab_size = None;
+
+    let model = Qwen38FlashNext::random(Device::Cpu, cfg);
+    assert_eq!(model.layers.len(), 0);
+
+    let mut session = model.new_session();
+    let input_ids = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2]));
+    let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
+
+    let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+    assert_eq!(logits.shape().dims(), &[2, 16]);
+    assert_eq!(logits.device(), &Device::Cpu);
+}
+

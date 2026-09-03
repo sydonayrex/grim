@@ -234,7 +234,7 @@ impl Qwen38MoeBlock {
     fn load(ws: &WeightSource<'_>, cfg: &Qwen38FlashNextConfig) -> Result<Self> {
         let gate = Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts])?;
 
-        let experts_count = cfg.num_experts.min(8);
+        let experts_count = cfg.num_experts;
         let mut experts = Vec::with_capacity(experts_count);
         for i in 0..experts_count {
             let expert_ws = ws.scoped("experts").scoped(&i.to_string());
@@ -265,21 +265,48 @@ impl Qwen38MoeBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _router_logits = self.gate.forward(x)?;
+        let router_logits = self.gate.forward(x)?;
+        let logits_vec = router_logits.to_vec_f32()?;
+        let dims = x.shape().dims();
+        let hidden_dim = dims[dims.len() - 1];
+        let num_exp = self.experts.len();
+        let seq_len = x.shape().elem_count() / hidden_dim;
 
-        let mut out_vec = if let Some(ref shared) = self.shared_expert {
-            shared.forward(x)?.to_vec_f32()?
-        } else {
-            vec![0.0f32; x.shape().elem_count()]
-        };
+        let x_vec = x.to_vec_f32()?;
+        let mut out_vec = vec![0.0f32; x_vec.len()];
 
-        let active_count = self.experts.len().min(self.num_experts_per_tok);
-        if active_count > 0 {
-            let weight = self.routed_scaling_factor / (active_count as f32);
-            for expert in &self.experts[..active_count] {
-                let e_out = expert.forward(x)?.to_vec_f32()?;
-                for d in 0..out_vec.len().min(e_out.len()) {
-                    out_vec[d] += weight * e_out[d];
+        for s in 0..seq_len {
+            let row = &logits_vec[s * num_exp..(s + 1) * num_exp];
+            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let k = self.num_experts_per_tok.min(num_exp);
+            let topk = &indexed[..k];
+
+            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
+            let sum_e: f32 = exps.iter().sum();
+            let weights: Vec<f32> = exps
+                .iter()
+                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .collect();
+
+            let token_x = cpu_tensor(
+                x_vec[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
+                Shape::new(vec![1, hidden_dim]),
+            );
+
+            for (i, (exp_idx, _)) in topk.iter().enumerate() {
+                let w = weights[i];
+                let exp_out = self.experts[*exp_idx].forward(&token_x)?.to_vec_f32()?;
+                for d in 0..hidden_dim {
+                    out_vec[s * hidden_dim + d] += w * exp_out[d];
+                }
+            }
+
+            if let Some(ref shared) = self.shared_expert {
+                let shared_out = shared.forward(&token_x)?.to_vec_f32()?;
+                for d in 0..hidden_dim {
+                    out_vec[s * hidden_dim + d] += shared_out[d];
                 }
             }
         }
@@ -390,29 +417,18 @@ impl Qwen38FlashNextBlock {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        let x_vec = x.to_vec_f32()?;
-        let ap_vec = attn_proj.to_vec_f32()?;
-        let mut res1 = vec![0.0f32; x_vec.len()];
-        for i in 0..res1.len() {
-            res1[i] = x_vec[i] + self.gated_residual_scale * ap_vec[i];
-        }
-        let res1_tensor = cpu_tensor(res1, x.shape().clone());
+        let res1_tensor = grim_nn::modules::add_on_device(x, &attn_proj)?;
 
         let normed_ffn = self.ffn_norm.forward(&res1_tensor)?;
         let moe_out = self.moe_block.forward(&normed_ffn)?;
 
-        let r1_vec = res1_tensor.to_vec_f32()?;
-        let m_vec = moe_out.to_vec_f32()?;
-        let mut res2 = vec![0.0f32; r1_vec.len()];
-        for i in 0..res2.len() {
-            res2[i] = r1_vec[i] + self.gated_residual_scale * m_vec[i];
-        }
+        let res2_tensor = grim_nn::modules::add_on_device(&res1_tensor, &moe_out)?;
 
-        Ok(cpu_tensor(res2, x.shape().clone()))
+        Ok(res2_tensor)
     }
 }
 
@@ -669,7 +685,7 @@ impl Qwen38FlashNext {
             None
         };
 
-        let num_layers_to_load = cfg.num_layers.min(2);
+        let num_layers_to_load = cfg.num_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("layers").scoped(&i.to_string());

@@ -514,14 +514,7 @@ impl DeepSeek32Expert {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.w1.forward(x)?;
         let up = self.w3.forward(x)?;
-        let gv = gate.to_vec_f32()?;
-        let uv = up.to_vec_f32()?;
-        let swiglu: Vec<f32> = gv
-            .iter()
-            .zip(uv.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
+        let swiglu_t = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         Ok(self.w2.forward(&swiglu_t)?)
     }
 }
@@ -615,10 +608,7 @@ impl DeepSeek32Moe {
 
         if let Some(ref shared) = self.shared_experts {
             let sh_out = shared.forward(x)?;
-            let ov = out_t.to_vec_f32()?;
-            let sv = sh_out.to_vec_f32()?;
-            let combined: Vec<f32> = ov.iter().zip(sv.iter()).map(|(&a, &b)| a + b).collect();
-            out_t = cpu_tensor(combined, x.shape().clone());
+            out_t = grim_nn::modules::add_on_device(&out_t, &sh_out)?;
         }
 
         Ok(out_t)
@@ -678,11 +668,7 @@ impl DeepSeek32Block {
         let normed_attn = self.attn_norm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed_attn, positions, kv_cache)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_out.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
-
+        let res1_t = grim_nn::modules::add_on_device(x, &attn_out)?;
         let normed_ffn = self.ffn_norm.forward(&res1_t)?;
         let mlp_out = if let Some(ref mlp) = self.mlp {
             mlp.forward(&normed_ffn)?
@@ -692,11 +678,7 @@ impl DeepSeek32Block {
             normed_ffn.clone()
         };
 
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        Ok(grim_nn::modules::add_on_device(&res1_t, &mlp_out)?)
     }
 }
 
