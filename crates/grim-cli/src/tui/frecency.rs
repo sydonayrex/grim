@@ -21,10 +21,16 @@ pub struct Frecency {
     entries: HashMap<String, FrecencyEntry>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct FrecencyEntry {
     frequency: u64,
     last_open: u64, // unix millis
+}
+
+/// Wire format for frecency.json persistence.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedFrecency {
+    entries: HashMap<String, FrecencyEntry>,
 }
 
 impl Frecency {
@@ -84,6 +90,37 @@ impl Frecency {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Load from `$XDG_DATA_HOME/grim/frecency.json`; empty tracker on any error.
+    pub fn load() -> Self {
+        let Some(dir) = crate::tui::paths::data_dir() else {
+            return Self::new();
+        };
+        match std::fs::read_to_string(dir.join("frecency.json")) {
+            Ok(text) => serde_json::from_str::<PersistedFrecency>(&text)
+                .map(|p| Self { entries: p.entries })
+                .unwrap_or_default(),
+            Err(_) => Self::new(),
+        }
+    }
+
+    /// Atomic write; returns false when there is no data dir (non-fatal).
+    pub fn save(&self) -> bool {
+        let Some(dir) = crate::tui::paths::data_dir() else {
+            return false;
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let Ok(json) = serde_json::to_string(&PersistedFrecency {
+            entries: self.entries.clone(),
+        }) else {
+            return false;
+        };
+        let path = dir.join("frecency.json");
+        let tmp = dir.join("frecency.json.tmp");
+        std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+    }
 }
 
 /// Calculate frecency score: frequency / (1 + days_since_open).
@@ -142,5 +179,20 @@ mod tests {
             f.record_open(format!("file_{i}.txt"));
         }
         assert!(f.len() <= MAX_ENTRIES);
+    }
+
+    #[test]
+    fn json_roundtrip_preserves_entries() {
+        let mut f = Frecency::new();
+        f.record_open("a.rs");
+        f.record_open("a.rs");
+        f.record_open("b.rs");
+        let json = serde_json::to_string(&PersistedFrecency {
+            entries: f.entries.clone(),
+        })
+        .unwrap();
+        let back: PersistedFrecency = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.entries["a.rs"].frequency, 2);
     }
 }

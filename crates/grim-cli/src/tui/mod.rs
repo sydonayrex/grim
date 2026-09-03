@@ -72,6 +72,9 @@ pub mod transcript;
 /// Agent task list panel for the sidebar.
 pub mod tasks;
 
+/// XDG base dirs for persisted TUI state.
+pub mod paths;
+
 /// Keyboard-navigable selection menu.
 pub mod select_list;
 
@@ -338,7 +341,7 @@ impl App {
             selected_completion: 0,
             jump_mode: JumpMode::None,
             toast: None,
-            frecency: Frecency::new(),
+            frecency: Frecency::load(),
             generation_complete_notified: false,
             pending_tool_call: None,
             pending_tool_diff: None,
@@ -1020,6 +1023,7 @@ impl App {
                         // Record frecency for the selected file.
                         let selected = &suggestions[0];
                         self.frecency.record_open(&selected.value);
+                        self.frecency.save();
                         crate::tui::file_complete::apply_file_completion(
                             &mut self.composer,
                             start,
