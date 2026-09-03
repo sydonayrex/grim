@@ -311,7 +311,7 @@ impl DeepSeekBlock {
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
         let up = self.ffn_up.forward(&norm_x2)?;
-        let activated = silu_mul(&gate, &up)?;
+        let activated = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
@@ -446,17 +446,6 @@ impl CausalLm for DeepSeek {
         session.advance_pos(seq_len);
         Ok(logits)
     }
-}
-
-fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
-    let g = gate.to_vec_f32()?;
-    let u = up.to_vec_f32()?;
-    let mut out = vec![0.0f32; g.len()];
-    for i in 0..g.len() {
-        let silu = g[i] / (1.0 + (-g[i]).exp());
-        out[i] = silu * u[i];
-    }
-    Ok(cpu_tensor(out, gate.shape().clone()))
 }
 
 #[cfg(test)]

@@ -66,7 +66,10 @@ pub fn apply_adapters_to_logits(
     let is_cpu = matches!(logits_2d.device(), grim_tensor::Device::Cpu);
 
     if !is_cpu {
-        // GPU path: performing matmuls on-device using BackendDevice
+        // GPU path: the fused `lora_accumulate` kernel computes
+        // `out = base + scale * (x @ A^T) @ B^T` entirely on-device — no
+        // transposes, no eager syncs, no host roundtrips. Backends without
+        // the kernel degrade to the staged matmul chain below.
         let mut running_logits = logits_2d.clone();
         for adapter in adapters {
             let rank = adapter
@@ -98,21 +101,40 @@ pub fn apply_adapters_to_logits(
             // scale is alpha / rank
             let scale = adapter.alpha / rank as f32;
 
-            // adapter.a is [rank, hidden_size]
-            // We want last_hidden @ A^T -> last_hidden is logits [seq_len, hidden_size]
-            // A^T is [hidden_size, rank]. Let's transpose adapter.a [rank, hidden_size]
-            let a_t = transpose_last_two(&adapter.a)?;
+            let fused = dev.lora_accumulate(
+                running_logits.storage().as_ref(),
+                logits_2d.storage().as_ref(),
+                adapter.a.storage().as_ref(),
+                adapter.b.storage().as_ref(),
+                scale,
+                logits_2d.shape(),
+            );
+            match fused {
+                Ok((s, _handle)) => {
+                    running_logits = Tensor::new(
+                        std::sync::Arc::from(s),
+                        logits_2d.shape().clone(),
+                        grim_tensor::dtype::DType::F32,
+                        logits_2d.provenance().clone(),
+                        logits_2d.device().clone(),
+                    );
+                    continue;
+                }
+                Err(e) if !grim_nn::is_kernel_unimplemented(&e) => {
+                    return Err(Error::from(e));
+                }
+                Err(_) => {} // kernel missing — staged fallback below
+            }
 
-            // 1. Matmul 1: temp = logits @ a_t
-            // logits is [seq_len, hidden_size]
-            // a_t is [hidden_size, rank]
-            // out_shape is [seq_len, rank]
-            let (temp_s, h1) = dev.matmul(
+            // Staged fallback: matmul → matmul → scale → add, all on-device.
+            // No eager `synchronize()` calls: intermediates are consumed by
+            // further device ops and sync lazily on first host read.
+            let a_t = transpose_last_two(&adapter.a)?;
+            let (temp_s, _h1) = dev.matmul(
                 running_logits.storage().as_ref(),
                 a_t.storage().as_ref(),
                 &Shape::new(vec![seq_len, rank]),
             )?;
-            h1.synchronize()?;
             let temp_tensor = Tensor::new(
                 std::sync::Arc::from(temp_s),
                 Shape::new(vec![seq_len, rank]),
@@ -121,21 +143,12 @@ pub fn apply_adapters_to_logits(
                 logits_2d.device().clone(),
             );
 
-            // adapter.b is [vocab, rank]
-            // We want temp @ B^T -> temp is [seq_len, rank]
-            // B^T is [rank, vocab]. Let's transpose adapter.b [vocab, rank]
             let b_t = transpose_last_two(&adapter.b)?;
-
-            // 2. Matmul 2: delta = temp @ b_t
-            // temp_tensor is [seq_len, rank]
-            // b_t is [rank, vocab]
-            // out_shape is [seq_len, vocab]
-            let (delta_s, h2) = dev.matmul(
+            let (delta_s, _h2) = dev.matmul(
                 temp_tensor.storage().as_ref(),
                 b_t.storage().as_ref(),
                 &Shape::new(vec![seq_len, vocab]),
             )?;
-            h2.synchronize()?;
             let delta_tensor = Tensor::new(
                 std::sync::Arc::from(delta_s),
                 Shape::new(vec![seq_len, vocab]),
@@ -144,34 +157,48 @@ pub fn apply_adapters_to_logits(
                 logits_2d.device().clone(),
             );
 
-            // 3. Scale and Add: running_logits = running_logits + scale * delta_tensor
-            // We can scale delta_tensor values or do scale addition.
-            // On CPU/GPU, we can scale the inputs or multiply afterwards.
-            // Let's copy delta back to host, scale, and copy to device for add. Or we can just multiply by scale.
-            // Since it's GPU, let's load delta_tensor to CPU, multiply by scale, copy back, and add on device:
-            let mut delta_vec = delta_tensor.to_vec_f32()?;
-            for val in &mut delta_vec {
-                *val *= scale;
-            }
-            let scaled_delta_s = dev.from_cpu(
-                &delta_vec,
+            // Scale on-device; host roundtrip only if the backend lacks the
+            // scalar kernel.
+            let scaled_delta_tensor = match dev.mul_scalar(
+                delta_tensor.storage().as_ref(),
+                scale,
                 delta_tensor.shape(),
-                grim_tensor::dtype::DType::F32,
-            )?;
-            let scaled_delta_tensor = Tensor::new(
-                std::sync::Arc::from(scaled_delta_s),
-                delta_tensor.shape().clone(),
-                grim_tensor::dtype::DType::F32,
-                logits_2d.provenance().clone(),
-                logits_2d.device().clone(),
-            );
+            ) {
+                Ok((s, _h)) => Tensor::new(
+                    std::sync::Arc::from(s),
+                    delta_tensor.shape().clone(),
+                    grim_tensor::dtype::DType::F32,
+                    logits_2d.provenance().clone(),
+                    logits_2d.device().clone(),
+                ),
+                Err(e) if !grim_nn::is_kernel_unimplemented(&e) => {
+                    return Err(Error::from(e));
+                }
+                Err(_) => {
+                    let mut delta_vec = delta_tensor.to_vec_f32()?;
+                    for val in &mut delta_vec {
+                        *val *= scale;
+                    }
+                    let scaled_delta_s = dev.from_cpu(
+                        &delta_vec,
+                        delta_tensor.shape(),
+                        grim_tensor::dtype::DType::F32,
+                    )?;
+                    Tensor::new(
+                        std::sync::Arc::from(scaled_delta_s),
+                        delta_tensor.shape().clone(),
+                        grim_tensor::dtype::DType::F32,
+                        logits_2d.provenance().clone(),
+                        logits_2d.device().clone(),
+                    )
+                }
+            };
 
-            let (added_s, h3) = dev.add(
+            let (added_s, _h3) = dev.add(
                 running_logits.storage().as_ref(),
                 scaled_delta_tensor.storage().as_ref(),
                 logits_2d.shape(),
             )?;
-            h3.synchronize()?;
             running_logits = Tensor::new(
                 std::sync::Arc::from(added_s),
                 logits_2d.shape().clone(),
@@ -180,11 +207,13 @@ pub fn apply_adapters_to_logits(
                 logits_2d.device().clone(),
             );
         }
-        // Reshape back to original shape if we flattened
+        // Reshape back to original shape if we flattened — stays on-device
+        // via a zero-copy/D2D relabel instead of a host roundtrip.
         if needs_reshape {
-            let data = running_logits.to_vec_f32()?;
-            let shape = Shape::new(original_dims);
-            return Ok(cpu_tensor(data, shape));
+            return Ok(crate::block::reshaped_view(
+                &running_logits,
+                &Shape::new(original_dims),
+            )?);
         }
         return Ok(running_logits);
     }

@@ -76,6 +76,8 @@ impl GptJMlp {
         Ok(Self { fc_in, fc_out })
     }
 
+    /// GeLU-exact activation — host kernel gap (no device GELU kernel),
+    /// pulled once and re-uploaded onto the input's device.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.fc_in.forward(x)?;
         let h_vec = h.to_vec_f32()?;
@@ -85,7 +87,7 @@ impl GptJMlp {
             let cdf = 0.5 * (1.0 + (val * 0.7071067811865475).tanh());
             act[i] = val * cdf;
         }
-        let act_tensor = cpu_tensor(act, h.shape().clone());
+        let act_tensor = grim_nn::modules::move_to_device(&cpu_tensor(act, h.shape().clone()), x.device())?;
         Ok(self.fc_out.forward(&act_tensor)?)
     }
 }
@@ -140,6 +142,9 @@ impl GptJBlock {
     }
 
     /// Parallel block forward: $\text{out} = x + \text{Attn}(\text{Norm}(x)) + \text{MLP}(\text{Norm}(x))$.
+    ///
+    /// GPU-first: RoPE and attention run on the tensor's device; host paths
+    /// are only reached through the fused-kernel fallback guards.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed = self.ln_1.forward(x)?;
@@ -148,35 +153,49 @@ impl GptJBlock {
         let k = self.k_proj.forward(&normed)?;
         let v = self.v_proj.forward(&normed)?;
 
-        let mut q_vec = q.to_vec_f32()?;
-        let mut k_vec = k.to_vec_f32()?;
-
-        crate::qwen35::apply_rope_neox(
-            &mut q_vec,
-            positions,
+        // GPT-J is partial-rotary (block `rope` carries rotary_dim), but this
+        // loader always rotated the FULL head_dim at theta 10000 — mirror that
+        // with a full-width rope on-device.
+        let full_rope = Rope::new(self.head_dim, 10000.0);
+        let q = crate::shared_attention::rope_2d_on_device(
+            &full_rope,
+            &q,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_vec,
             positions,
+        )?;
+        let k = crate::shared_attention::rope_2d_on_device(
+            &full_rope,
+            &k,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
+            positions,
+        )?;
 
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_vec,
-            &k_vec,
-            &v.to_vec_f32()?,
+        // GPU-first; on backends that reject the kernel call fall back to the
+        // host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k,
+            &v,
             self.num_heads,
             self.num_heads,
             self.head_dim,
             seq_len,
+            seq_len,
             None,
-            x.device(),
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k.to_vec_f32()?,
+                &v.to_vec_f32()?,
+                self.num_heads,
+                self.num_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.out_proj.forward(&attn_tensor)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
@@ -294,22 +313,16 @@ impl CausalLm for GptJ {
 
         let ids_f32 = input_ids.to_vec_f32()?;
         let seq_len = ids_f32.len();
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
 
-        for (i, &tok_f) in ids_f32.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                let src_start = tok * self.cfg.hidden_size;
-                let dst_start = i * self.cfg.hidden_size;
-                if src_start + self.cfg.hidden_size <= embed_w.len() {
-                    h_vec[dst_start..dst_start + self.cfg.hidden_size]
-                        .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
-                }
-            }
-        }
-
-        let mut h = cpu_tensor(h_vec, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut h = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
         for layer in &self.layers {
             h = layer.forward(&h, &pos_u32)?;
         }

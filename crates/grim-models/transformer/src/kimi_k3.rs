@@ -10,7 +10,22 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, DType, QuantProvenance, Shape, Tensor};
+use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// GPU fallback guard
+// ---------------------------------------------------------------------------
+
+/// `Ok(None)` marks "backend lacks the kernel — use the host fallback";
+/// other errors are real failures and propagate.
+fn or_host_fallback<T>(r: std::result::Result<T, grim_tensor::Error>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if grim_nn::is_kernel_unimplemented(&e) => Ok(None),
+        Err(e) => Err(grim_core::error::Error::from(e)),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -293,6 +308,16 @@ impl KimiK3Mla {
         // see future in-chunk keys.
         let cache_offset = total_kv_len.saturating_sub(seq_len);
 
+        // KERNEL GAP: this loader materializes per-head K/V through kv_b_proj
+        // and attends UNCOMPRESSED (per-head `k_nope[h]` + a rope key shared
+        // across heads, `v_head_dim != qk_nope_head_dim`). None of the device
+        // kernels map onto that: `qkv_attention` has no shared-rope MQA mixing
+        // or mismatched v-dim, and `mla_absorbed_decode` needs a compressed
+        // latent cache this loader deliberately does not keep (the session
+        // cache layout `(k, v, rope)` is load-bearing). The scalar loop below
+        // is therefore the reference path on every device, reached by explicit
+        // host-materialized caches rather than an unguarded free-running
+        // device path.
         let scale = 1.0 / ((self.qk_nope_head_dim + self.qk_rope_head_dim) as f32).sqrt();
         let mut attn_out = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
 
@@ -420,11 +445,133 @@ impl KimiK3Moe {
         })
     }
 
+    /// GPU-first MoE forward: routing stays on host (small gate-logits pull),
+    /// but on non-CPU devices the experts run on-device and the routing
+    /// weighted sum accumulates with scalar-mul/add kernels so per-expert
+    /// outputs never cross to host. Falls back to [`Self::forward_moe_host`]
+    /// on CPU devices or when the backend lacks a needed primitive.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let seq_len = x.shape().dims()[0];
-        let hidden_dim = x.shape().dims()[1];
         let logits = self.gate.forward(x)?;
         let logits_v = logits.to_vec_f32()?;
+
+        if x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device(x, &logits_v)? {
+                return Ok(out);
+            }
+        }
+        self.forward_moe_host(x, &logits_v)
+    }
+
+    /// Device-resident MoE: token rows are extracted D2D, experts run
+    /// on-device (Linear + `silu_mul_on_device`), and the weighted sum
+    /// accumulates on-device. `Ok(None)` = backend lacks a needed kernel
+    /// (`is_kernel_unimplemented`); caller uses the host path.
+    fn forward_moe_device(&self, x: &Tensor, logits_v: &[f32]) -> Result<Option<Tensor>> {
+        let seq_len = x.shape().dims()[0];
+        let hidden_dim = x.shape().dims()[1];
+        let num_exp = self.experts.len();
+        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+
+        let Some(out_st) = or_host_fallback(dev.zeros(x.shape(), DType::F32))? else {
+            return Ok(None);
+        };
+
+        for s in 0..seq_len {
+            let row = &logits_v[s * num_exp..(s + 1) * num_exp];
+            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
+
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
+            let sum_e: f32 = exps.iter().sum();
+            let weights: Vec<f32> = exps
+                .iter()
+                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .collect();
+
+            // Token row stays on-device (D2D extraction).
+            let tok_shape = Shape::new(vec![1, hidden_dim]);
+            let Some(token_st) = or_host_fallback(dev.alloc_storage(&tok_shape, DType::F32))?
+            else {
+                return Ok(None);
+            };
+            if or_host_fallback(dev.copy_slice_range(
+                token_st.as_ref(),
+                0,
+                x.storage().as_ref(),
+                s * hidden_dim,
+                hidden_dim,
+            ))?
+            .is_none()
+            {
+                return Ok(None);
+            }
+            let token_x = Tensor::new(
+                Arc::from(token_st),
+                tok_shape,
+                DType::F32,
+                QuantProvenance::default(),
+                x.device().clone(),
+            );
+
+            let mut acc: Option<Tensor> = None;
+            for (i, (exp_idx, _)) in topk.iter().enumerate() {
+                let w = weights[i];
+                let exp_out = self.experts[*exp_idx].forward(&token_x)?;
+                let Some((scaled_st, _h)) = or_host_fallback(dev.mul_scalar(
+                    exp_out.storage().as_ref(),
+                    w,
+                    exp_out.shape(),
+                ))?
+                else {
+                    return Ok(None);
+                };
+                let scaled = Tensor::new(
+                    Arc::from(scaled_st),
+                    exp_out.shape().clone(),
+                    DType::F32,
+                    QuantProvenance::default(),
+                    exp_out.device().clone(),
+                );
+                acc = Some(match acc {
+                    Some(a) => grim_nn::modules::add_on_device(&a, &scaled)?,
+                    None => scaled,
+                });
+            }
+            if let Some(acc) = acc {
+                if or_host_fallback(dev.copy_slice_into(
+                    out_st.as_ref(),
+                    acc.storage().as_ref(),
+                    s * hidden_dim,
+                    hidden_dim,
+                ))?
+                .is_none()
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(Tensor::new(
+            Arc::from(out_st),
+            x.shape().clone(),
+            DType::F32,
+            QuantProvenance::default(),
+            x.device().clone(),
+        )))
+    }
+
+    /// Host routing reference path — the documented FALLBACK (CPU device, or
+    /// GPU backends missing the copy/mul primitives). Identical math to the
+    /// device path: per-token top-k routing on the gate logits, expert
+    /// forward, routed-scaling weighted sum.
+    fn forward_moe_host(&self, x: &Tensor, logits_v: &[f32]) -> Result<Tensor> {
+        let seq_len = x.shape().dims()[0];
+        let hidden_dim = x.shape().dims()[1];
         let num_exp = self.experts.len();
 
         let xv = x.to_vec_f32()?;
@@ -597,26 +744,22 @@ impl CausalLm for KimiK3 {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let ids = input_ids.to_vec_f32()?;
-        let seq_len = ids.len();
+        let ids_f32 = input_ids.to_vec_f32()?;
+        let seq_len = ids_f32.len();
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
         let pos_v: Vec<u32> = positions
             .to_vec_f32()
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
-
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
-            }
-        }
-
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
         let mut kv_caches = vec![None; self.layers.len()];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

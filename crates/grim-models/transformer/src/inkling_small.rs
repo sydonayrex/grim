@@ -4,12 +4,34 @@
 //! - **GQA Attention**: Grouped query self-attention with RoPE positional embeddings.
 //! - **SwiGLU FFN**: RMSNorm pre-layer normalization and SwiGLU feed-forward network.
 
+use std::sync::Arc;
+
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+
+// ---------------------------------------------------------------------------
+// Device helpers
+// ---------------------------------------------------------------------------
+
+/// Upload host f32 rows onto `device` (GPU-first). Used to hand results of
+/// documented kernel-gap host loops back to the device residency of their
+/// inputs instead of leaving the residual stream on CPU.
+fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -> Result<Tensor> {
+    let shape = Shape::new(vec![rows, cols]);
+    let dev = grim_nn::modules::pick_device_for_storage_device(device);
+    let storage = dev.from_cpu(data, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -153,6 +175,12 @@ impl InklingSmallBlock {
         })
     }
 
+    /// Forward pass. NOTE: the hand-rolled attention loop is BIDIRECTIONAL
+    /// (no causal mask, epsilon-weighted softmax), which the causal-only
+    /// device `qkv_attention` kernel cannot express — so the attention core,
+    /// RoPE and the KV history stay host-side (documented kernel gap, kept
+    /// byte-for-byte for semantics). Embedding, residual adds and the SwiGLU
+    /// MLP run device-first around it.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -169,8 +197,11 @@ impl InklingSmallBlock {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
 
+        // Kernel gap: bidirectional attention runs host-side, so Q/K/V cross
+        // to the host here and RoPE keeps its host NeoX loop.
         let mut q_vec = q.to_vec_f32()?;
         let mut k_vec = k.to_vec_f32()?;
+        let v_vec = v.to_vec_f32()?;
 
         crate::qwen35::apply_rope_neox(
             &mut q_vec,
@@ -189,20 +220,21 @@ impl InklingSmallBlock {
 
         let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
         let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, kv_dim]));
+        let v_t = cpu_tensor(v_vec, Shape::new(vec![seq_len, kv_dim]));
 
         let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
             let mut new_k = prev_k.to_vec_f32()?;
             let mut new_v = prev_v.to_vec_f32()?;
             new_k.extend(k_rot.to_vec_f32()?);
-            new_v.extend(v.to_vec_f32()?);
+            new_v.extend(v_t.to_vec_f32()?);
             let total_seq = new_k.len() / kv_dim;
             let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, kv_dim]));
             let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, kv_dim]));
             *kv_cache = Some((full_k.clone(), full_v.clone()));
             (full_k, full_v)
         } else {
-            *kv_cache = Some((k_rot.clone(), v.clone()));
-            (k_rot, v)
+            *kv_cache = Some((k_rot.clone(), v_t.clone()));
+            (k_rot, v_t)
         };
 
         let total_kv_len = k_all.shape().dims()[0];
@@ -245,33 +277,18 @@ impl InklingSmallBlock {
             }
         }
 
-        let attn_tensor = cpu_tensor(attn_out, Shape::new(vec![seq_len, q_dim]));
+        // Return the attention output to the device residency of x.
+        let attn_tensor = f32_rows_on_device(x.device(), &attn_out, seq_len, q_dim)?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_proj.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
-
-        let normed_ffn = self.post_attention_layernorm.forward(&res1_t)?;
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        let normed_ffn = self.post_attention_layernorm.forward(&res1)?;
         let gate = self.gate_proj.forward(&normed_ffn)?;
         let up = self.up_proj.forward(&normed_ffn)?;
+        let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+        let mlp_out = self.down_proj.forward(&act)?;
 
-        let g_v = gate.to_vec_f32()?;
-        let u_v = up.to_vec_f32()?;
-        let swiglu: Vec<f32> = g_v
-            .iter()
-            .zip(u_v.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
-        let mlp_out = self.down_proj.forward(&swiglu_t)?;
-
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -358,26 +375,23 @@ impl CausalLm for InklingSmall {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let ids = input_ids.to_vec_f32()?;
-        let seq_len = ids.len();
+        let ids_f32 = input_ids.to_vec_f32()?;
+        let seq_len = ids_f32.len();
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
         let pos_v: Vec<u32> = positions
             .to_vec_f32()
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
 
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
-            }
-        }
-
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
         let mut kv_caches = vec![None; self.layers.len()];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

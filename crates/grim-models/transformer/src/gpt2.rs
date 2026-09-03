@@ -60,16 +60,18 @@ impl LayerNorm {
         let xv = x.to_vec_f32()?;
         let dim = x.shape().dims().last().copied().unwrap_or(1);
         let mut out = vec![0.0f32; xv.len()];
+        // Host kernel gap (no device LayerNorm kernel): pull weight/bias ONCE
+        // per call, never per row.
+        let w = self.weight.to_vec_f32()?;
+        let b_vec = self.bias.as_ref().map(|b| b.to_vec_f32()).transpose()?;
         for chunk in xv.chunks(dim).enumerate() {
             let (i, c) = chunk;
             let mean = c.iter().sum::<f32>() / dim as f32;
             let variance = c.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / dim as f32;
             let inv_std = 1.0 / (variance + self.eps).sqrt();
-            let w = self.weight.to_vec_f32()?;
-            if let Some(b) = &self.bias {
-                let b_vec = b.to_vec_f32()?;
+            if let Some(b) = &b_vec {
                 for j in 0..dim {
-                    out[i * dim + j] = ((c[j] - mean) * inv_std) * w[j] + b_vec[j];
+                    out[i * dim + j] = ((c[j] - mean) * inv_std) * w[j] + b[j];
                 }
             } else {
                 for j in 0..dim {
@@ -170,9 +172,10 @@ impl Gpt2Block {
             }
         }
 
-        let k_t = cpu_tensor(k, grim_tensor::Shape::new(vec![new_tokens, hidden_size]));
         let past_len = cache.past_len;
-        cache.k.extend_from_slice(&k_t.to_vec_f32()?);
+        // `k`/`v` are the freshly split host buffers — extend directly, no
+        // tensor roundtrip.
+        cache.k.extend_from_slice(&k);
         cache.v.extend_from_slice(&v);
         let total_len = cache.past_len + new_tokens;
         cache.past_len = total_len;
@@ -207,6 +210,108 @@ impl Gpt2Block {
         let gate = gelu(&gate)?;
         let ffn_out = self.ffn_down.forward(&gate)?;
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
+    }
+
+    /// Device-first cache-aware forward used by `CausalLm::forward`: the KV
+    /// history stays resident on-device (`concat_rows_on_device`) and the
+    /// attention runs via `fused_attention_tensors` — no per-step full-cache
+    /// re-download. The fused-QKV per-head interleave split and the GELU
+    /// activation stay host-side (no device kernels); each pulls once per
+    /// call and re-uploads only the split pieces / activation output.
+    pub fn forward_kv(
+        &self,
+        x: &Tensor,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        // LayerNorm is a host kernel gap; re-upload its output.
+        let norm_x = grim_nn::modules::move_to_device(&self.ln_1.forward(x)?, x.device())?;
+        let qkv = self.wqkv.forward(&norm_x)?;
+
+        // Split QKV into separate Q, K, V (host kernel gap).
+        let qkv_data = qkv.to_vec_f32()?;
+        let new_tokens = qkv.shape().dims()[0];
+        let hidden_size = self.num_heads * self.head_dim;
+        let mut q = vec![0.0f32; new_tokens * hidden_size];
+        let mut k = vec![0.0f32; new_tokens * hidden_size];
+        let mut v = vec![0.0f32; new_tokens * hidden_size];
+
+        for pos in 0..new_tokens {
+            for h in 0..self.num_heads {
+                for d in 0..self.head_dim {
+                    let idx = pos * 3 * hidden_size + h * self.head_dim + d;
+                    q[pos * hidden_size + h * self.head_dim + d] = qkv_data[idx];
+                    k[pos * hidden_size + h * self.head_dim + d] = qkv_data[idx + hidden_size];
+                    v[pos * hidden_size + h * self.head_dim + d] = qkv_data[idx + 2 * hidden_size];
+                }
+            }
+        }
+
+        // Host copies double as the kernel-fallback attention input, so the
+        // fallback needs no extra device→host pull.
+        let q_host = q.clone();
+        let k_host = k.clone();
+        let v_host = v.clone();
+        let q = grim_nn::modules::move_to_device(
+            &cpu_tensor(q, grim_tensor::Shape::new(vec![new_tokens, hidden_size])),
+            x.device(),
+        )?;
+        let k = grim_nn::modules::move_to_device(
+            &cpu_tensor(k, grim_tensor::Shape::new(vec![new_tokens, hidden_size])),
+            x.device(),
+        )?;
+        let v = grim_nn::modules::move_to_device(
+            &cpu_tensor(v, grim_tensor::Shape::new(vec![new_tokens, hidden_size])),
+            x.device(),
+        )?;
+
+        // Device-side history: prev rows stay resident, only the new rows are
+        // appended. MHA: kv heads == q heads.
+        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
+            let full_k = crate::shared_attention::concat_rows_on_device(prev_k, &k)?;
+            let full_v = crate::shared_attention::concat_rows_on_device(prev_v, &v)?;
+            *kv_cache = Some((full_k.clone(), full_v.clone()));
+            (full_k, full_v)
+        } else {
+            *kv_cache = Some((k.clone(), v.clone()));
+            (k.clone(), v.clone())
+        };
+        let kv_len = k_all.shape().dims()[0];
+
+        // GPU-first; on backends that reject the kernel call fall back to the
+        // host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k_all,
+            &v_all,
+            self.num_heads,
+            self.num_heads,
+            self.head_dim,
+            new_tokens,
+            kv_len,
+            None,
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q_host,
+                &k_host,
+                &v_host,
+                self.num_heads,
+                self.num_heads,
+                self.head_dim,
+                new_tokens,
+                None,
+                x.device(),
+            )?,
+        };
+        let attn_out = self.c_proj.forward(&attn_tensor)?;
+        let x_res1 = grim_nn::modules::add_on_device(x, &attn_out)?;
+
+        let norm_x2 = grim_nn::modules::move_to_device(&self.ln_2.forward(&x_res1)?, x.device())?;
+        let gate = self.ffn_gate.forward(&norm_x2)?;
+        // GELU: host kernel gap, re-uploaded once.
+        let gate = grim_nn::modules::move_to_device(&gelu(&gate)?, x.device())?;
+        let ffn_out = self.ffn_down.forward(&gate)?;
+        grim_nn::modules::add_on_device(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -302,7 +407,7 @@ impl Model for Gpt2 {
 impl CausalLm for Gpt2 {
     fn new_session(&self) -> Box<dyn SessionT> {
         let mut session = Inner::new(self.device.clone());
-        let caches: Vec<Option<crate::kv_attention::RefKvCache>> = vec![None; self.layers.len()];
+        let caches: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
         session.set_model_state(Box::new(caches));
         Box::new(session)
     }
@@ -326,26 +431,27 @@ impl CausalLm for Gpt2 {
         let pos_ids: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
         let pos_emb = self.wpe.forward(&pos_ids, seq_len, self.cfg.hidden_size)?;
 
-        let mut h = add_tensors(&tok_emb, &pos_emb).map_err(grim_core::Error::Tensor)?;
+        let mut h = grim_nn::modules::add_on_device(&tok_emb, &pos_emb)
+            .map_err(grim_core::Error::Tensor)?;
 
-        // Per-layer KV caches live on the session so decode steps see the full
-        // prior context (Group B fix).
+        // Per-layer device-resident KV caches live on the session so decode
+        // steps see the full prior context (Group B fix); only the new K/V
+        // rows are appended each step.
         if session.model_state().is_none() {
             session.set_model_state(Box::new(vec![
-                None::<crate::kv_attention::RefKvCache>;
+                None::<(Tensor, Tensor)>;
                 self.layers.len()
             ]));
         }
         let caches = session
             .model_state_mut()
-            .and_then(|s| s.downcast_mut::<Vec<Option<crate::kv_attention::RefKvCache>>>())
-            .expect("Gpt2::forward: model_state must be Vec<Option<RefKvCache>>");
+            .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
+            .expect("Gpt2::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
         if caches.len() < self.layers.len() {
             caches.resize(self.layers.len(), None);
         }
         for (i, layer) in self.layers.iter().enumerate() {
-            let cache = caches[i].get_or_insert_with(crate::kv_attention::RefKvCache::new);
-            h = layer.forward_cached(&h, cache)?;
+            h = layer.forward_kv(&h, &mut caches[i])?;
         }
         let h = self.ln_f.forward(&h)?;
         let logits = self.lm_head.forward(&h)?;
