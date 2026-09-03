@@ -91,6 +91,7 @@ pub mod maincoder;
 pub mod maple;
 pub mod mellum;
 pub mod mimo2;
+pub mod mla_common;
 pub mod minicpm;
 pub mod minimax_m2;
 pub mod minimax_m3;

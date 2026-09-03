@@ -2437,6 +2437,7 @@ dependencies = [
  "grim-server",
  "grim-speculative",
  "grim-tensor",
+ "libc",
  "pulldown-cmark",
  "rand",
  "ratatui",

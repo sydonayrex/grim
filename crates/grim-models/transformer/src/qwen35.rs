@@ -450,31 +450,80 @@ impl Qwen35Block {
             let k_new = dev.from_cpu(&k_all, &k_shape, DType::F32)?;
             let v_new = dev.from_cpu(&v_all, &v_shape, DType::F32)?;
 
-            // Append to existing device arenas (grow geometrically)
-            let k_arena = if let Some(ref existing) = cache.k_device {
-                let mut combined = Vec::new();
-                combined.extend_from_slice(existing.to_cpu_vec_f32()?.as_slice());
-                combined.extend_from_slice(&k_all);
-                let total_len = combined.len();
-                let rows = total_len / (self.num_kv_heads * self.head_dim);
-                let combined_shape = Shape::new(vec![rows, self.num_kv_heads, self.head_dim]);
-                dev.from_cpu(&combined, &combined_shape, DType::F32)?
+            // Append to the device arena via copy_slice_range (device-side).
+            // K/V history stays on the GPU — never round-trips to host.
+            let k_new_rows = seq_len * self.num_kv_heads;
+            let kv_elems = k_new_rows * self.head_dim;
+            let k_cap_rows = cache
+                .k_device
+                .as_ref()
+                .map(|s| s.shape().dims()[0])
+                .unwrap_or(0);
+            let v_cap_rows = cache
+                .v_device
+                .as_ref()
+                .map(|s| s.shape().dims()[0])
+                .unwrap_or(0);
+            let need_rows = cache.current_pos + k_new_rows;
+            let _ = v_cap_rows;
+
+            if k_cap_rows >= need_rows {
+                dev.copy_slice_range(
+                    &**cache.k_device.as_ref().unwrap(),
+                    cache.current_pos * self.num_kv_heads * self.head_dim,
+                    k_new.as_ref(),
+                    0,
+                    kv_elems,
+                )?;
+                dev.copy_slice_range(
+                    &**cache.v_device.as_ref().unwrap(),
+                    cache.current_pos * self.num_kv_heads * self.head_dim,
+                    v_new.as_ref(),
+                    0,
+                    kv_elems,
+                )?;
             } else {
-                k_new
-            };
-            let v_arena = if let Some(ref existing) = cache.v_device {
-                let mut combined = Vec::new();
-                combined.extend_from_slice(existing.to_cpu_vec_f32()?.as_slice());
-                combined.extend_from_slice(&v_all);
-                let total_len = combined.len();
-                let rows = total_len / (self.num_kv_heads * self.head_dim);
-                let combined_shape = Shape::new(vec![rows, self.num_kv_heads, self.head_dim]);
-                dev.from_cpu(&combined, &combined_shape, DType::F32)?
-            } else {
-                v_new
-            };
-            cache.k_device = Some(k_arena);
-            cache.v_device = Some(v_arena);
+                // Arena full — grow geometrically and re-copy via D2D.
+                let new_rows = ((need_rows * 2) + 64).next_power_of_two();
+                let k_idx = self.num_kv_heads * self.head_dim;
+                let full_shape = Shape::new(vec![new_rows, self.num_kv_heads, self.head_dim]);
+                let k_grown = dev.alloc_storage(&full_shape, DType::F32)?;
+                let v_grown = dev.alloc_storage(&full_shape, DType::F32)?;
+                if let Some(ref old_k) = cache.k_device {
+                    dev.copy_slice_range(
+                        k_grown.as_ref(),
+                        0,
+                        old_k.as_ref(),
+                        0,
+                        cache.current_pos * self.num_kv_heads * self.head_dim,
+                    )?;
+                }
+                if let Some(ref old_v) = cache.v_device {
+                    dev.copy_slice_range(
+                        v_grown.as_ref(),
+                        0,
+                        old_v.as_ref(),
+                        0,
+                        cache.current_pos * self.num_kv_heads * self.head_dim,
+                    )?;
+                }
+                dev.copy_slice_range(
+                    k_grown.as_ref(),
+                    cache.current_pos * k_idx,
+                    k_new.as_ref(),
+                    0,
+                    kv_elems,
+                )?;
+                dev.copy_slice_range(
+                    v_grown.as_ref(),
+                    cache.current_pos * k_idx,
+                    v_new.as_ref(),
+                    0,
+                    kv_elems,
+                )?;
+                cache.k_device = Some(k_grown.into());
+                cache.v_device = Some(v_grown.into());
+            }
 
             let total_kv = cache.current_pos + seq_len;
             let attn_tensor = crate::shared_attention::fused_or_scalar_attention_arena(

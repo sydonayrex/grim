@@ -177,23 +177,13 @@ impl DeepSeek4Mla {
         // weight ([num_heads * (nope + v), rank], GGUF row-major) so queries
         // can absorb w_kc and attention can run in latent space.
         let kv_b_w = kv_b_proj.weight.to_vec_f32()?;
-        let kv_b_head = cfg.qk_nope_head_dim + cfg.v_head_dim;
-        let rank = cfg.kv_lora_rank;
-        let mut w_kc = vec![0.0f32; cfg.num_heads * cfg.qk_nope_head_dim * rank];
-        let mut w_vc = vec![0.0f32; cfg.num_heads * cfg.v_head_dim * rank];
-        for h in 0..cfg.num_heads {
-            let hb = h * kv_b_head;
-            for d in 0..cfg.qk_nope_head_dim {
-                let src = (hb + d) * rank;
-                let dst = (h * cfg.qk_nope_head_dim + d) * rank;
-                w_kc[dst..dst + rank].copy_from_slice(&kv_b_w[src..src + rank]);
-            }
-            for d in 0..cfg.v_head_dim {
-                let src = (hb + cfg.qk_nope_head_dim + d) * rank;
-                let dst = (h * cfg.v_head_dim + d) * rank;
-                w_vc[dst..dst + rank].copy_from_slice(&kv_b_w[src..src + rank]);
-            }
-        }
+        let (w_kc, w_vc) = crate::mla_common::extract_kv_b_up_projs(
+            &kv_b_w,
+            cfg.num_heads,
+            cfg.qk_nope_head_dim,
+            cfg.v_head_dim,
+            cfg.kv_lora_rank,
+        );
 
         Ok(Self {
             q_a_proj,
@@ -235,26 +225,16 @@ impl DeepSeek4Mla {
             return Err(Error::Config("DeepSeek4: no valid Q projection".into()));
         };
         let q_full_v = q_full.to_vec_f32()?;
-        let total_q_head = self.qk_nope_head_dim + self.qk_rope_head_dim;
+        let _total_q_head = self.qk_nope_head_dim + self.qk_rope_head_dim;
 
-        let mut q_nope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_nope_head_dim];
-        let mut q_rope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_rope_head_dim];
-
-        for s in 0..seq_len {
-            for h in 0..self.num_heads {
-                let in_off = s * self.num_heads * total_q_head + h * total_q_head;
-                let nope_off =
-                    s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
-                let rope_off =
-                    s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim;
-
-                q_nope_v[nope_off..nope_off + self.qk_nope_head_dim]
-                    .copy_from_slice(&q_full_v[in_off..in_off + self.qk_nope_head_dim]);
-                q_rope_v[rope_off..rope_off + self.qk_rope_head_dim].copy_from_slice(
-                    &q_full_v[in_off + self.qk_nope_head_dim..in_off + total_q_head],
-                );
-            }
-        }
+        // Split q/kv via the shared MLA helper (same as old per-head loops).
+        let (q_nope_v, mut q_rope_v) = crate::mla_common::split_q_nope_rope(
+            &q_full_v,
+            seq_len,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+        );
 
         crate::qwen35::apply_rope_neox(
             &mut q_rope_v,
@@ -269,17 +249,12 @@ impl DeepSeek4Mla {
         let kv_latent_v = kv_latent.to_vec_f32()?;
         let kv_rank = self.kv_a_layernorm.weight.shape().dims()[0];
 
-        let mut kv_a_v = vec![0.0f32; seq_len * kv_rank];
-        let mut k_rope_v = vec![0.0f32; seq_len * self.qk_rope_head_dim];
-
-        for s in 0..seq_len {
-            let in_off = s * (kv_rank + self.qk_rope_head_dim);
-            kv_a_v[s * kv_rank..(s + 1) * kv_rank]
-                .copy_from_slice(&kv_latent_v[in_off..in_off + kv_rank]);
-            k_rope_v[s * self.qk_rope_head_dim..(s + 1) * self.qk_rope_head_dim].copy_from_slice(
-                &kv_latent_v[in_off + kv_rank..in_off + kv_rank + self.qk_rope_head_dim],
-            );
-        }
+        let (kv_a_v, mut k_rope_v) = crate::mla_common::split_kv_latent(
+            &kv_latent_v,
+            seq_len,
+            kv_rank,
+            self.qk_rope_head_dim,
+        );
 
         let kv_a_t = cpu_tensor(kv_a_v, Shape::new(vec![seq_len, kv_rank]));
         let kv_a_normed = self.kv_a_layernorm.forward(&kv_a_t)?;
@@ -297,28 +272,23 @@ impl DeepSeek4Mla {
         let vd = self.v_head_dim;
         let nh = self.num_heads;
 
-        let mut q_absorbed = vec![0.0f32; seq_len * nh * rank];
-        for s in 0..seq_len {
-            for h in 0..nh {
-                for d in 0..nope {
-                    let qv = q_nope_v[(s * nh + h) * nope + d];
-                    let wrow = &self.w_kc[(h * nope + d) * rank..(h * nope + d + 1) * rank];
-                    let dst = &mut q_absorbed[(s * nh + h) * rank..(s * nh + h + 1) * rank];
-                    for (o, w) in dst.iter_mut().zip(wrow.iter()) {
-                        *o += qv * w;
-                    }
-                }
-            }
-        }
+        let q_absorbed = crate::mla_common::absorb_query_wkc(
+            &q_nope_v,
+            &self.w_kc,
+            seq_len,
+            nh,
+            nope,
+            rank,
+        );
 
-        // 4. Compressed latent rows for this step: [normed c_kv || roped k_pe].
-        let mut latent_new = vec![0.0f32; seq_len * (rank + rope_d)];
-        for s in 0..seq_len {
-            let dst = s * (rank + rope_d);
-            latent_new[dst..dst + rank].copy_from_slice(&kv_a_normed_v[s * rank..(s + 1) * rank]);
-            latent_new[dst + rank..dst + rank + rope_d]
-                .copy_from_slice(&k_rope_v[s * rope_d..(s + 1) * rope_d]);
-        }
+        // 4. Compressed latent rows — [normed c_kv || roped k_pe].
+        let latent_new = crate::mla_common::pack_latent_rows(
+            &kv_a_normed_v,
+            &k_rope_v,
+            seq_len,
+            rank,
+            rope_d,
+        );
 
         // 5. Append to the latent KV cache. Format: `.0` holds the compressed
         //    latent `[total_kv, rank + rope_d]`; `.1` is unused (kept only for

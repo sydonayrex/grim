@@ -1730,6 +1730,28 @@ pub trait MemoryOps {
             "copy_slice_into not implemented for this backend".into(),
         ))
     }
+
+    /// Device-to-device copy of `count` contiguous F32 elements starting at
+    /// flat element `src_elem_offset` within `src`, into `dst` starting at
+    /// flat element `dst_elem_offset`.
+    ///
+    /// The two-offset form is the per-expert extraction primitive: expert
+    /// weight blocks are contiguous rows of a stacked `[E, F, H]` tensor, so
+    /// pulling the winning expert's block for a device-matmul needs a source
+    /// offset, not just a destination one. Default: unimplemented (safe fall
+    /// back for backends without a range-copy path).
+    fn copy_slice_range(
+        &self,
+        _dst: &dyn BackendStorage,
+        _dst_elem_offset: usize,
+        _src: &dyn BackendStorage,
+        _src_elem_offset: usize,
+        _count: usize,
+    ) -> Result<()> {
+        Err(crate::error::Error::Unimplemented(
+            "copy_slice_range not implemented for this backend".into(),
+        ))
+    }
 }
 
 /// Hardware compute-graph capture/replay (e.g. HIP graphs).

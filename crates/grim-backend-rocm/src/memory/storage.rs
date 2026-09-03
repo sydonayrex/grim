@@ -161,8 +161,19 @@ impl RocmStorage {
                 shape.dims()
             );
         }
+        eprintln!(
+            "[grim-backend-rocm] copy_from_host: ENTER ordinal={} bytes={} shape={:?}",
+            ordinal, host_data.len() * 4, shape.dims()
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
         let arith = dtype.arith;
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
+        eprintln!(
+            "[grim-backend-rocm] copy_from_host: ALLOC OK storage.ordinal={} device_ptr={:?}",
+            storage.ordinal, storage.device_ptr
+        );
+        let _ = std::io::stderr().flush();
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
 
         // WI-M1 context discipline: a synchronous `hipMemcpy` executes in the
@@ -208,6 +219,11 @@ impl RocmStorage {
             },
         };
 
+        eprintln!(
+            "[grim-backend-rocm] copy_from_host: MEMCPY DONE ordinal={} result={}",
+            ordinal, upload_result
+        );
+        let _ = std::io::stderr().flush();
         if upload_result != hipSuccess {
             storage.allocator.free(dev_ptr_void, storage.bytes);
             storage.device_ptr = None;
@@ -415,13 +431,17 @@ impl RocmStorage {
 impl Drop for RocmStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
-            // NOTE: deliberately NO DeviceGuard here. Pool returns do no HIP
-            // work, and real driver releases are pinned inside
-            // `RocmCachingAllocator::free` / `empty_cache`. An extra
-            // hipGetDevice+hipSetDevice pair per drop measurably widened a
-            // host-timing window in fused stream pipelines (mxfp4
+            // Pool returns (managed == false) do no HIP work, and real driver
+            // releases are pinned inside `RocmCachingAllocator::free` /
+            // `empty_cache` — so that branch stays guard-free to avoid an
+            // extra hipGetDevice+hipSetDevice pair per drop (which once
+            // widened a host-timing window in fused stream pipelines: mxfp4
             // rmsnorm→gemm→rope_kv parity flaked to all-zero outputs).
+            // The managed branch issues a real `hipFree` and MUST pin the
+            // owning ordinal — a drifted thread would otherwise free into
+            // the wrong device's context.
             if self.managed {
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 unsafe {
                     let _ = crate::hipFree(ptr_val as *mut c_void);
                 }
@@ -455,6 +475,12 @@ impl BackendStorage for RocmStorage {
                 "RocmStorage has no valid device pointer".into(),
             ));
         }
+        eprintln!(
+            "[grim-backend-rocm] RocmStorage::to_cpu_vec_f32: ENTER self.ordinal={} bytes={} dtype={:?} ptr={:?}",
+            self.ordinal, self.bytes, self.dtype, self.device_ptr
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
         let elem_count = self.shape.elem_count();
 
@@ -523,7 +549,7 @@ impl BackendStorage for RocmStorage {
         }
 
         // F16/BF16 storage: the device buffer holds 2-byte elements, but the
-        match self.dtype.arith {
+        let result_f32 = match self.dtype.arith {
             grim_tensor::ArithType::F16 => {
                 let mut raw = vec![0u8; elem_count * 2];
                 check_hip("hipMemcpyDtoH (f16)", unsafe {
@@ -580,7 +606,14 @@ impl BackendStorage for RocmStorage {
                 })?;
                 Ok(host_data)
             }
-        }
+        };
+        eprintln!(
+            "[grim-backend-rocm] RocmStorage::to_cpu_vec_f32: EXIT ok self.ordinal={} out_len={}",
+            self.ordinal,
+            result_f32.as_ref().map(|v| v.len()).unwrap_or(0)
+        );
+        let _ = std::io::stderr().flush();
+        result_f32
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

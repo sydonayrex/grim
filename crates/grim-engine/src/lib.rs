@@ -2414,6 +2414,7 @@ impl Engine {
                     .unwrap_or(grim_tensor::Device::Cpu),
             }
         };
+        log::info!("[grim-engine] admit_placed_request: request {} model_id={:?} resolved device={:?}", request.id, request.model_id, device);
         // R4 — memory-sovereign admission gate. If the model reported
         // hyperparameters and the backend can probe current free device
         // memory, certify this request's footprint (prompt + max_tokens) fits

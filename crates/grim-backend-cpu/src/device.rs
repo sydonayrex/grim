@@ -1841,26 +1841,37 @@ impl MemoryOps for CpuDevice {
         dst_elem_offset: usize,
         count: usize,
     ) -> Result<()> {
+        self.copy_slice_range(dst, dst_elem_offset, src, 0, count)
+    }
+
+    fn copy_slice_range(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_elem_offset: usize,
+        src: &dyn BackendStorage,
+        src_elem_offset: usize,
+        count: usize,
+    ) -> Result<()> {
         let dst_st = a_storage(dst)?;
         let src_st = a_storage(src)?;
         let src_data = src_st.data();
-        if src_data.len() < count {
+        if src_elem_offset + count > src_data.len() {
             return Err(Error::ShapeMismatch {
-                expected: vec![count],
+                expected: vec![src_elem_offset + count],
                 got: vec![src_data.len()],
             });
         }
         let dst_len = dst_st.data.len();
         if dst_elem_offset + count > dst_len {
             return Err(Error::IndexOutOfBounds(format!(
-                "copy_slice_into: offset {} + count {} > dst len {}",
+                "copy_slice_range: offset {} + count {} > dst len {}",
                 dst_elem_offset, count, dst_len
             )));
         }
         unsafe {
             let dst_ptr = dst_st.data.as_ptr() as *mut f32;
             let dst_slice = std::slice::from_raw_parts_mut(dst_ptr.add(dst_elem_offset), count);
-            dst_slice.copy_from_slice(&src_data[..count]);
+            dst_slice.copy_from_slice(&src_data[src_elem_offset..src_elem_offset + count]);
         }
         Ok(())
     }

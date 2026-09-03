@@ -2,7 +2,6 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::device::capability_profiler::CapabilityProfiler;
 use crate::device::probe;
 use crate::device::roc_device::RocmDevice;
 use crate::peer_access::{LinkType, P2PTopology};
@@ -64,16 +63,17 @@ impl From<&RocmDevice> for HardwareSpec {
         let max_threads = probe::max_threads_per_block(ordinal);
         let cus = probe::active_cu_count(ordinal);
 
-        let (bandwidth, peak_flops) = CapabilityProfiler::new()
-            .capabilities()
-            .get(ordinal)
-            .map(|cap| {
-                (
-                    cap.hbm_bandwidth_gbps as f64,
-                    (cap.tflops_fp16 as f64) * 1e12,
-                )
-            })
-            .unwrap_or((500.0, 8.0e12));
+        // WI-M1: probe ONLY this device's capability. Constructing a fresh
+        // CapabilityProfiler::new() probes ALL GPUs and leaves the calling
+        // thread's HIP context parked on the last probed device — observed as
+        // GPU page faults when the next kernel launches on the wrong device.
+        // `measure_capability(ordinal)` pins each probe internally and restores
+        // the caller's context on drop, so the thread's context is unchanged.
+        let cap = crate::device::capability_profiler::measure_capability(ordinal);
+        let (bandwidth, peak_flops) = (
+            cap.hbm_bandwidth_gbps as f64,
+            (cap.tflops_fp16 as f64) * 1e12,
+        );
 
         HardwareSpec {
             gcn_arch: arch,

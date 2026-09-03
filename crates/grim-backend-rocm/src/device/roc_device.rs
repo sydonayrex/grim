@@ -6093,6 +6093,17 @@ impl MemoryOps for RocmDevice {
         dst_elem_offset: usize,
         count: usize,
     ) -> Result<()> {
+        self.copy_slice_range(dst, dst_elem_offset, src, 0, count)
+    }
+
+    fn copy_slice_range(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_elem_offset: usize,
+        src: &dyn BackendStorage,
+        src_elem_offset: usize,
+        count: usize,
+    ) -> Result<()> {
         // P1-3: raw HIP ops below bind to the calling thread's current
         // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
@@ -6100,17 +6111,12 @@ impl MemoryOps for RocmDevice {
         let src_s = as_rocm(src)?;
         if !dst_s.device_ptr_is_valid() || !src_s.device_ptr_is_valid() {
             return Err(Error::Backend(
-                "copy_slice_into: inputs lack a valid device pointer".into(),
+                "copy_slice_range: inputs lack a valid device pointer".into(),
             ));
         }
-        // Fail loud on cross-device D2D: this plain `hipMemcpyAsync` is only
-        // valid when both storages share an ordinal (peer access is not
-        // established here — use `copy_via_route` for routed cross-device
-        // transfers). Silently proceeding was a correctness hazard beyond
-        // the context pin (2026-08-23e audit).
         if dst_s.device_ordinal() != src_s.device_ordinal() {
             return Err(Error::Backend(format!(
-                "copy_slice_into: cross-device D2D (dst ordinal {}, src ordinal {}) — \
+                "copy_slice_range: cross-device D2D (dst ordinal {}, src ordinal {}) — \
                  use copy_via_route for routed transfers",
                 dst_s.device_ordinal(),
                 src_s.device_ordinal()
@@ -6118,8 +6124,14 @@ impl MemoryOps for RocmDevice {
         }
         if dst_elem_offset + count > dst_s.shape().elem_count() {
             return Err(Error::Shape(format!(
-                "copy_slice_into: overflow (dst_elem_offset={dst_elem_offset} + count={count} > dst elems={}",
+                "copy_slice_range: dst overflow (offset={dst_elem_offset} + count={count} > {})",
                 dst_s.shape().elem_count()
+            )));
+        }
+        if src_elem_offset + count > src_s.shape().elem_count() {
+            return Err(Error::Shape(format!(
+                "copy_slice_range: src overflow (offset={src_elem_offset} + count={count} > {})",
+                src_s.shape().elem_count()
             )));
         }
         let bytes = count * std::mem::size_of::<f32>();
@@ -6127,8 +6139,11 @@ impl MemoryOps for RocmDevice {
             (dst_s.device_ptr_checked()? as *mut c_void)
                 .add(dst_elem_offset * std::mem::size_of::<f32>())
         };
-        let src_ptr = src_s.device_ptr_checked()? as *const c_void;
-        check_hip("copy_slice_into: hipMemcpyAsync D2D", unsafe {
+        let src_ptr = unsafe {
+            (src_s.device_ptr_checked()? as *const c_void)
+                .add(src_elem_offset * std::mem::size_of::<f32>())
+        };
+        check_hip("copy_slice_range: hipMemcpyAsync D2D", unsafe {
             hipMemcpyAsync(
                 dst_ptr,
                 src_ptr,

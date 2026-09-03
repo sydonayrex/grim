@@ -170,41 +170,27 @@ impl ChameleonBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q_dim = self.num_heads * self.head_dim;
+        let _q_dim = self.num_heads * self.head_dim;
         let k_dim = self.num_kv_heads * self.head_dim;
 
         let mut q_vec = if let Some(ref qn) = self.q_norm {
-            let q_v = q.to_vec_f32()?;
-            let mut q_normed = vec![0.0f32; seq_len * q_dim];
-            for s in 0..seq_len {
-                for h in 0..self.num_heads {
-                    let slice =
-                        &q_v[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim];
-                    let head_t = cpu_tensor(slice.to_vec(), Shape::new(vec![1, self.head_dim]));
-                    let head_out = qn.forward(&head_t)?.to_vec_f32()?;
-                    q_normed[s * q_dim + h * self.head_dim..s * q_dim + (h + 1) * self.head_dim]
-                        .copy_from_slice(&head_out);
-                }
-            }
-            q_normed
+            let relabeled = crate::block::reshaped_view(
+                &q,
+                &Shape::new(vec![seq_len * self.num_heads, self.head_dim]),
+            )?;
+            let normed = qn.forward(&relabeled)?;
+            normed.to_vec_f32()?
         } else {
             q.to_vec_f32()?
         };
 
         let mut k_vec = if let Some(ref kn) = self.k_norm {
-            let kv_vec = k.to_vec_f32()?;
-            let mut k_normed = vec![0.0f32; seq_len * k_dim];
-            for s in 0..seq_len {
-                for h in 0..self.num_kv_heads {
-                    let slice =
-                        &kv_vec[s * k_dim + h * self.head_dim..s * k_dim + (h + 1) * self.head_dim];
-                    let head_t = cpu_tensor(slice.to_vec(), Shape::new(vec![1, self.head_dim]));
-                    let head_out = kn.forward(&head_t)?.to_vec_f32()?;
-                    k_normed[s * k_dim + h * self.head_dim..s * k_dim + (h + 1) * self.head_dim]
-                        .copy_from_slice(&head_out);
-                }
-            }
-            k_normed
+            let relabeled = crate::block::reshaped_view(
+                &k,
+                &Shape::new(vec![seq_len * self.num_kv_heads, self.head_dim]),
+            )?;
+            let normed = kn.forward(&relabeled)?;
+            normed.to_vec_f32()?
         } else {
             k.to_vec_f32()?
         };
@@ -224,32 +210,31 @@ impl ChameleonBlock {
             10000.0,
         );
 
-        let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
-        let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, k_dim]));
+        let v_vec = v.to_vec_f32()?;
 
-        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
+        let (k_heads, v_heads) = if let Some((prev_k, prev_v)) = kv_cache {
             let mut new_k = prev_k.to_vec_f32()?;
             let mut new_v = prev_v.to_vec_f32()?;
-            new_k.extend(k_rot.to_vec_f32()?);
-            new_v.extend(v.to_vec_f32()?);
+            new_k.extend_from_slice(&k_vec);
+            new_v.extend_from_slice(&v_vec);
             let total_seq = new_k.len() / k_dim;
-            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, k_dim]));
-            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, k_dim]));
-            *kv_cache = Some((full_k.clone(), full_v.clone()));
-            (full_k, full_v)
+            *kv_cache = Some((
+                cpu_tensor(new_k.clone(), Shape::new(vec![total_seq, k_dim])),
+                cpu_tensor(new_v.clone(), Shape::new(vec![total_seq, k_dim])),
+            ));
+            (new_k, new_v)
         } else {
-            *kv_cache = Some((k_rot.clone(), v.clone()));
-            (k_rot, v)
+            *kv_cache = Some((
+                cpu_tensor(k_vec.clone(), Shape::new(vec![seq_len, k_dim])),
+                v.clone(),
+            ));
+            (k_vec, v_vec)
         };
-
-        let q_heads = q_rot.to_vec_f32()?;
-        let k_heads = k_all.to_vec_f32()?;
-        let v_heads = v_all.to_vec_f32()?;
 
         // Shared helper applies the causal mask at cache_offset + s (fixes
         // future-token leakage during multi-token prefill).
         let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_heads,
+            &q_vec,
             &k_heads,
             &v_heads,
             self.num_heads,
@@ -261,30 +246,16 @@ impl ChameleonBlock {
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_proj.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
 
-        let normed_ffn = self.ffn_norm.forward(&res1_t)?;
+        let normed_ffn = self.ffn_norm.forward(&res1)?;
         let gate = self.w_gate.forward(&normed_ffn)?;
         let up = self.w_up.forward(&normed_ffn)?;
 
-        let g_v = gate.to_vec_f32()?;
-        let u_v = up.to_vec_f32()?;
-        let swiglu: Vec<f32> = g_v
-            .iter()
-            .zip(u_v.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
-        let mlp_out = self.w_down.forward(&swiglu_t)?;
+        let swiglu = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+        let mlp_out = self.w_down.forward(&swiglu)?;
 
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 

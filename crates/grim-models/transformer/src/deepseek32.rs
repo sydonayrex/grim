@@ -228,26 +228,17 @@ impl DeepSeek32Mla {
             return Err(Error::Config("DeepSeek32: no valid Q projection".into()));
         };
         let q_full_v = q_full.to_vec_f32()?;
-        let total_q_head = self.qk_nope_head_dim + self.qk_rope_head_dim;
+        let _total_q_head = self.qk_nope_head_dim + self.qk_rope_head_dim;
 
-        let mut q_nope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_nope_head_dim];
-        let mut q_rope_v = vec![0.0f32; seq_len * self.num_heads * self.qk_rope_head_dim];
-
-        for s in 0..seq_len {
-            for h in 0..self.num_heads {
-                let in_off = s * self.num_heads * total_q_head + h * total_q_head;
-                let nope_off =
-                    s * self.num_heads * self.qk_nope_head_dim + h * self.qk_nope_head_dim;
-                let rope_off =
-                    s * self.num_heads * self.qk_rope_head_dim + h * self.qk_rope_head_dim;
-
-                q_nope_v[nope_off..nope_off + self.qk_nope_head_dim]
-                    .copy_from_slice(&q_full_v[in_off..in_off + self.qk_nope_head_dim]);
-                q_rope_v[rope_off..rope_off + self.qk_rope_head_dim].copy_from_slice(
-                    &q_full_v[in_off + self.qk_nope_head_dim..in_off + total_q_head],
-                );
-            }
-        }
+        // Split q into (q_nope, q_rope) via the shared MLA helper — identical
+        // to the per-head loop the old inline code ran.
+        let (q_nope_v, mut q_rope_v) = crate::mla_common::split_q_nope_rope(
+            &q_full_v,
+            seq_len,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+        );
 
         crate::qwen35::apply_rope_neox(
             &mut q_rope_v,
@@ -262,17 +253,14 @@ impl DeepSeek32Mla {
         let kv_latent_v = kv_latent.to_vec_f32()?;
         let kv_rank = self.kv_a_layernorm.weight.shape().dims()[0];
 
-        let mut kv_a_v = vec![0.0f32; seq_len * kv_rank];
-        let mut k_rope_v = vec![0.0f32; seq_len * self.qk_rope_head_dim];
-
-        for s in 0..seq_len {
-            let in_off = s * (kv_rank + self.qk_rope_head_dim);
-            kv_a_v[s * kv_rank..(s + 1) * kv_rank]
-                .copy_from_slice(&kv_latent_v[in_off..in_off + kv_rank]);
-            k_rope_v[s * self.qk_rope_head_dim..(s + 1) * self.qk_rope_head_dim].copy_from_slice(
-                &kv_latent_v[in_off + kv_rank..in_off + kv_rank + self.qk_rope_head_dim],
-            );
-        }
+        // Split kv_latent into (kv_a, k_rope) via the shared MLA helper — same
+        // as the old per-step copy loop.
+        let (kv_a_v, mut k_rope_v) = crate::mla_common::split_kv_latent(
+            &kv_latent_v,
+            seq_len,
+            kv_rank,
+            self.qk_rope_head_dim,
+        );
 
         let kv_a_t = cpu_tensor(kv_a_v, Shape::new(vec![seq_len, kv_rank]));
         let kv_a_normed = self.kv_a_layernorm.forward(&kv_a_t)?;

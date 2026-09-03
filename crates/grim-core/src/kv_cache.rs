@@ -82,6 +82,17 @@ pub trait KvCache: Send {
         None
     }
 
+    /// Device-resident block table matching the `grim_qkv_attention_paged`
+    /// kernel's `BlockTableEntry` ABI, cached across decode steps so the
+    /// paged-attention path doesn't re-upload it per layer per token.
+    /// Default `None` — implementors without a device buffer fall back to the
+    /// host-side upload each call.
+    fn block_table_gpu_handle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
+        None
+    }
+
     /// Seed the start of the cache with already-computed prefix blocks from
     /// a shared pool (RadixAttention-style prefix reuse, §5.1). The default
     /// is a no-op for caches that don't support cross-sequence sharing.
