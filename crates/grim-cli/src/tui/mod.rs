@@ -54,6 +54,9 @@ pub mod diff;
 /// Persisted always-allow rules for tool approvals.
 pub mod permissions;
 
+/// Queue of user messages typed while the worker is generating.
+pub mod queue;
+
 /// Skill discovery and loading from SKILL.md files.
 pub mod skills;
 
@@ -303,6 +306,8 @@ pub struct App {
     /// Always-allow tool rules, shared with the worker thread. The worker
     /// checks them before prompting; the UI adds to them on "always allow".
     pub permissions: permissions::SharedPermissions,
+    /// Messages typed while generating; drained on TurnComplete.
+    pub queue: crate::tui::queue::MessageQueue,
 }
 
 impl App {
@@ -352,6 +357,7 @@ impl App {
             find_selected: 0,
             flash_until: None,
             permissions: permissions::shared(permissions::PermissionRules::load()),
+            queue: crate::tui::queue::MessageQueue::default(),
         }
     }
 
@@ -447,6 +453,12 @@ impl App {
                 )));
                 // Border flash delight: green border for 300ms on turn complete.
                 self.flash_until = Some(Instant::now() + Duration::from_millis(300));
+                // Send the next queued message, if any.
+                if let Some(next) = self.queue.pop() {
+                    self.transcript
+                        .push_system("sending queued message...".into());
+                    self.submit_chat(&next);
+                }
             }
             WorkerEvent::Diagnostics { snap } => {
                 self.snap = snap;
@@ -1031,10 +1043,16 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                let _ = self.cmd_tx.send(WorkerCommand::Cancel);
-                // Immediate UI feedback: show cancelling state.
-                if self.generating {
-                    self.transcript.push_system("cancelling...".into());
+                // First Esc while generating clears the queue; the next cancels.
+                if self.generating && !self.queue.is_empty() {
+                    self.queue.clear();
+                    self.transcript.push_system("cleared queued messages".into());
+                } else {
+                    let _ = self.cmd_tx.send(WorkerCommand::Cancel);
+                    // Immediate UI feedback: show cancelling state.
+                    if self.generating {
+                        self.transcript.push_system("cancelling...".into());
+                    }
                 }
             }
             KeyCode::PageUp => {
@@ -1728,8 +1746,11 @@ impl App {
                     return;
                 }
                 if self.generating {
-                    self.transcript
-                        .push_system("generation in progress; Esc to cancel first".into());
+                    self.queue.push(trimmed.to_string());
+                    self.transcript.push_system(format!(
+                        "queued ({} in queue); sent automatically when this turn finishes",
+                        self.queue.len()
+                    ));
                     return;
                 }
                 self.messages.push(grim_format::ChatMessage {
@@ -2529,6 +2550,13 @@ fn ui(f: &mut Frame, app: &App) {
         _ if app.tool_approval_mode => (
             c_magenta,
             format!(" ⚠  approve tool call?  Enter = yes   Esc = deny "),
+        ),
+        _ if app.generating && !app.queue.is_empty() => (
+            c_amber,
+            format!(
+                " {} generating...  {} queued — Esc clears queue ",
+                spinner_char, app.queue.len()
+            ),
         ),
         _ if app.generating => (
             c_amber,
@@ -3422,6 +3450,58 @@ pub async fn cmd_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zeroed TurnStats for event-driven tests.
+    fn zero_stats() -> TurnStats {
+        TurnStats {
+            encode_ms: 0.0,
+            prompt_tokens: 0,
+            prefill_ms: None,
+            decode_tps: None,
+            tokens_generated: 0,
+            accepted_per_step: None,
+            cancelled: false,
+            context_used: 0,
+        }
+    }
+
+    #[test]
+    fn submit_while_generating_enqueues() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        app.generating = true;
+        app.submit_chat("hello while busy");
+        assert_eq!(app.queue.len(), 1);
+        assert!(app.messages.iter().all(|m| m.content != "hello while busy"));
+    }
+
+    #[test]
+    fn turn_complete_sends_queued_message() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        app.generating = true;
+        app.submit_chat("queued msg");
+        assert_eq!(app.queue.len(), 1);
+        app.handle_event(WorkerEvent::TurnComplete { stats: zero_stats() });
+        assert!(app.generating, "queued submit restarts generation");
+        assert!(app.queue.is_empty());
+        assert!(app.messages.iter().any(|m| m.content == "queued msg"));
+    }
+
+    #[test]
+    fn esc_clears_queue_before_cancelling() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.generating = true;
+        app.queue.push("pending");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.queue.is_empty());
+    }
 
     #[test]
     fn module_loads() {
