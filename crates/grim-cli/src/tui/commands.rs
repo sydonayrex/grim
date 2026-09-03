@@ -132,6 +132,11 @@ impl CommandRegistry {
             description: "Restore files changed by the last agent tool call (checkpoint)",
         });
         reg.register(CommandSpec {
+            name: "mcp",
+            hint: "",
+            description: "List configured MCP servers and their connection status",
+        });
+        reg.register(CommandSpec {
             name: "backend",
             hint: "[rocm|cuda|metal|cpu|auto]",
             description: "Select inference backend (auto-detect if unset)",
@@ -192,7 +197,7 @@ mod tests {
     fn test_autocomplete_candidates() {
         let registry = CommandRegistry::default_commands();
         let matches = registry.find_completions("/m");
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.len(), 2); // model, mcp
         assert_eq!(matches[0].name, "model");
 
         let all = registry.find_completions("/");
