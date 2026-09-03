@@ -12,7 +12,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, BackendDevice, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
 
 // ---------------------------------------------------------------------------
 // Device helpers

@@ -93,6 +93,8 @@ impl BloomMlp {
         })
     }
 
+    /// GeLU activation — host kernel gap (no device GELU kernel), pulled
+    /// once and re-uploaded onto the input's device.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.dense_h_to_4h.forward(x)?;
         let h_vec = h.to_vec_f32()?;
@@ -102,7 +104,7 @@ impl BloomMlp {
             let cdf = 0.5 * (1.0 + (val * 0.7071067811865475).tanh());
             act[i] = val * cdf;
         }
-        let act_tensor = cpu_tensor(act, h.shape().clone());
+        let act_tensor = grim_nn::modules::move_to_device(&cpu_tensor(act, h.shape().clone()), x.device())?;
         Ok(self.dense_4h_to_h.forward(&act_tensor)?)
     }
 }
@@ -158,6 +160,9 @@ impl BloomBlock {
         })
     }
 
+    /// GPU-first forward. The fused-QKV column split has no device kernel,
+    /// so it pulls once per call and uploads only the q/k/v pieces; the
+    /// attention itself runs on-device via `fused_attention_tensors`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -182,17 +187,54 @@ impl BloomBlock {
                 .copy_from_slice(&qkv_vec[row_offset + 2 * chunk..row_offset + 3 * chunk]);
         }
 
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_vec,
-            &k_vec,
-            &v_vec,
+        let q = grim_nn::modules::move_to_device(
+            &cpu_tensor(
+                q_vec,
+                Shape::new(vec![seq_len, self.num_heads * self.head_dim]),
+            ),
+            x.device(),
+        )?;
+        let k = grim_nn::modules::move_to_device(
+            &cpu_tensor(
+                k_vec,
+                Shape::new(vec![seq_len, self.num_heads * self.head_dim]),
+            ),
+            x.device(),
+        )?;
+        let v = grim_nn::modules::move_to_device(
+            &cpu_tensor(
+                v_vec,
+                Shape::new(vec![seq_len, self.num_heads * self.head_dim]),
+            ),
+            x.device(),
+        )?;
+
+        // GPU-first; on backends that reject the kernel call fall back to the
+        // host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k,
+            &v,
             self.num_heads,
             self.num_heads,
             self.head_dim,
             seq_len,
+            seq_len,
             None,
-            x.device(),
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k.to_vec_f32()?,
+                &v.to_vec_f32()?,
+                self.num_heads,
+                self.num_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.dense.forward(&attn_tensor)?;
 
         let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
@@ -308,22 +350,16 @@ impl CausalLm for Bloom {
     ) -> Result<Tensor> {
         let ids_f32 = input_ids.to_vec_f32()?;
         let seq_len = ids_f32.len();
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
 
-        for (i, &tok_f) in ids_f32.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                let src_start = tok * self.cfg.hidden_size;
-                let dst_start = i * self.cfg.hidden_size;
-                if src_start + self.cfg.hidden_size <= embed_w.len() {
-                    h_vec[dst_start..dst_start + self.cfg.hidden_size]
-                        .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
-                }
-            }
-        }
-
-        let mut h = cpu_tensor(h_vec, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut h = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
         for layer in &self.layers {
             h = layer.forward(&h)?;
         }

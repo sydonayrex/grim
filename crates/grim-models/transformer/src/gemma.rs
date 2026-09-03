@@ -243,7 +243,9 @@ impl GemmaBlock {
         };
         let kv_len = k_all.shape().dims()[0];
 
-        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+        // GPU-first fused attention; on backends that reject the kernel call
+        // fall back to the host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q,
             &k_all,
             &v_all,
@@ -253,7 +255,20 @@ impl GemmaBlock {
             new_tokens,
             kv_len,
             None,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k_all.to_vec_f32()?,
+                &v_all.to_vec_f32()?,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                new_tokens,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_out = self.wo.forward(&attn_tensor)?;
         let x_res1 = grim_nn::modules::add_on_device(x, &attn_out)?;
 
@@ -261,7 +276,7 @@ impl GemmaBlock {
         let gate = self.ffn_gate.forward(&norm_x2)?;
         let up = self.ffn_up.forward(&norm_x2)?;
         // GeGLU: gelu-tanh has no device kernel — host loop, re-uploaded once.
-        let activated = reupload_to_device(&geglu(&gate, &up)?, x.device())?;
+        let activated = grim_nn::modules::move_to_device(&geglu(&gate, &up)?, x.device())?;
         let ffn_out = self.ffn_down.forward(&activated)?;
         grim_nn::modules::add_on_device(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
@@ -405,25 +420,6 @@ impl CausalLm for Gemma {
     }
 }
 
-/// Move a host-produced tensor (the GeGLU kernel-gap output) onto `device`
-/// when it is not already resident there.
-fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
-    if t.device() == device {
-        return Ok(t.clone());
-    }
-    let data = t.to_vec_f32()?;
-    let shape = t.shape().clone();
-    let dev = grim_nn::modules::pick_device_for_storage_device(device);
-    let storage = dev.from_cpu(&data, &shape, DType::F32)?;
-    Ok(Tensor::new(
-        std::sync::Arc::from(storage),
-        shape,
-        DType::F32,
-        t.provenance().clone(),
-        device.clone(),
-    ))
-}
-
 fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     let g = gate.to_vec_f32()?;
     let u = up.to_vec_f32()?;
@@ -438,13 +434,17 @@ fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 }
 
 /// Reshape a `(S, H*D)` projection into `(S, H, D)` for per-head RoPE.
+/// The data is already in `(S, H, D)` row-major order; just relabel.
 fn reshape_heads(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
-    let v = x.to_vec_f32()?;
-    // Already in (S, H, D) row-major order; just relabel.
-    Ok(cpu_tensor(v, grim_tensor::Shape::new(vec![s, h, d])))
+    crate::block::reshaped_view(x, &grim_tensor::Shape::new(vec![s, h, d]))
 }
 
 /// Apply `rope` to each head of a `(S, H, D)` tensor, returning `(S, H*D)`.
+///
+/// The shared `rope_2d_on_device` helper relabels to one `head_dim`-wide row
+/// per head with positions repeated per head — mathematically identical to
+/// rotating each head independently — and dispatches the device rope kernel
+/// when available.
 fn apply_rope_per_head(
     x: &Tensor,
     positions: &[u32],
@@ -452,27 +452,9 @@ fn apply_rope_per_head(
     h: usize,
     d: usize,
 ) -> Result<Tensor> {
-    let v = x.to_vec_f32()?;
-    let s = v.len() / (h * d);
-    let mut out = vec![0.0f32; v.len()];
-    for head in 0..h {
-        // RoPE wants (B=1, S, D).
-        let head_slice: Vec<f32> = (0..s)
-            .flat_map(|t| {
-                let base = (t * h + head) * d;
-                v[base..base + d].to_vec()
-            })
-            .collect();
-        let t3 = cpu_tensor(head_slice, grim_tensor::Shape::new(vec![1, s, d]));
-        let rotated = rope.forward(&t3, positions)?;
-        let rv = rotated.to_vec_f32()?;
-        for t in 0..s {
-            let out_base = (t * h + head) * d;
-            let r_base = t * d;
-            out[out_base..out_base + d].copy_from_slice(&rv[r_base..r_base + d]);
-        }
-    }
-    Ok(cpu_tensor(out, grim_tensor::Shape::new(vec![s, h * d])))
+    let s = x.shape().dims()[0];
+    let x2 = crate::block::reshaped_view(x, &grim_tensor::Shape::new(vec![s, h * d]))?;
+    crate::shared_attention::rope_2d_on_device(rope, &x2, h, positions)
 }
 
 #[cfg(test)]

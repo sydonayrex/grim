@@ -520,6 +520,41 @@ impl MiniCpmBlock {
         let kv_stride = num_kv_heads * head_dim;
         let cache_offset = positions.first().copied().unwrap_or(0) as usize;
         let kv_seq_len = cache_offset + s;
+        let row_elems = num_heads * head_dim;
+
+        // Single-token decode: run the paged kernel directly over the
+        // device-resident page arenas — the pages never cross to host.
+        // Multi-token prefill keeps the host gather path below (the paged
+        // kernel contract is one query token).
+        if b == 1 && s == 1 && q.shape().elem_count() == row_elems {
+            let dev = pick_device_for_storage_device(&self.dev);
+            let bt_f32: Vec<f32> = block_table.iter().map(|&v| v as f32).collect();
+            let bt_storage = dev.from_cpu(
+                &bt_f32,
+                &Shape::new(vec![block_table.len().max(1)]),
+                DType::F32,
+            )?;
+            let q_data = q.to_vec_f32()?;
+            let attn = crate::shared_attention::fused_or_scalar_attention_paged(
+                &q_data,
+                bt_storage.as_ref(),
+                k_pages.storage().as_ref(),
+                v_pages.storage().as_ref(),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_table.len(),
+                page_size,
+                kv_seq_len,
+                cache_offset as u32,
+                None,
+                &self.dev,
+            )?;
+            return Ok(crate::block::reshaped_view(
+                &attn,
+                &Shape::new(vec![b, s, row_elems]),
+            )?);
+        }
 
         let bt: Vec<usize> = block_table.iter().map(|&v| v as usize).collect();
         let k_flat = k_pages.to_vec_f32()?;
@@ -532,7 +567,7 @@ impl MiniCpmBlock {
         )?;
 
         let q_data = q.to_vec_f32()?;
-        let row_elems = num_heads * head_dim;
+        
         let kv_head: Vec<usize> = (0..num_heads)
             .map(|h| h * num_kv_heads / num_heads)
             .collect();
