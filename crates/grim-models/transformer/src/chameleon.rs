@@ -157,6 +157,11 @@ impl ChameleonBlock {
     }
 
     /// Evaluates one transformer block: Pre-RMSNorm -> Q/K norm -> RoPE -> GQA -> Post-RMSNorm -> SwiGLU.
+    ///
+    /// GPU-first: RoPE, KV-cache concat, attention and the SwiGLU MLP all run
+    /// on the tensor's device. The per-head Q/K LayerNorms stay host-side
+    /// (LayerNorm has no device kernel); their output is re-uploaded to the
+    /// tensor's device before RoPE.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -170,79 +175,66 @@ impl ChameleonBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let _q_dim = self.num_heads * self.head_dim;
-        let k_dim = self.num_kv_heads * self.head_dim;
-
-        let mut q_vec = if let Some(ref qn) = self.q_norm {
-            let relabeled = crate::block::reshaped_view(
-                &q,
-                &Shape::new(vec![seq_len * self.num_heads, self.head_dim]),
-            )?;
-            let normed = qn.forward(&relabeled)?;
-            normed.to_vec_f32()?
-        } else {
-            q.to_vec_f32()?
+        // Per-head Q/K norm before RoPE (host kernel gap, re-uploaded once).
+        let q = match self.q_norm {
+            Some(ref qn) => {
+                let relabeled = crate::block::reshaped_view(
+                    &q,
+                    &Shape::new(vec![seq_len * self.num_heads, self.head_dim]),
+                )?;
+                reupload_to_device(&qn.forward(&relabeled)?, x.device())?
+            }
+            None => q,
+        };
+        let k = match self.k_norm {
+            Some(ref kn) => {
+                let relabeled = crate::block::reshaped_view(
+                    &k,
+                    &Shape::new(vec![seq_len * self.num_kv_heads, self.head_dim]),
+                )?;
+                reupload_to_device(&kn.forward(&relabeled)?, x.device())?
+            }
+            None => k,
         };
 
-        let mut k_vec = if let Some(ref kn) = self.k_norm {
-            let relabeled = crate::block::reshaped_view(
-                &k,
-                &Shape::new(vec![seq_len * self.num_kv_heads, self.head_dim]),
-            )?;
-            let normed = kn.forward(&relabeled)?;
-            normed.to_vec_f32()?
-        } else {
-            k.to_vec_f32()?
-        };
-
-        crate::qwen35::apply_rope_neox(
-            &mut q_vec,
-            positions,
+        let q = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_vec,
             positions,
+        )?;
+        let k = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k,
             self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
+            positions,
+        )?;
 
-        let v_vec = v.to_vec_f32()?;
-
-        let (k_heads, v_heads) = if let Some((prev_k, prev_v)) = kv_cache {
-            let mut new_k = prev_k.to_vec_f32()?;
-            let mut new_v = prev_v.to_vec_f32()?;
-            new_k.extend_from_slice(&k_vec);
-            new_v.extend_from_slice(&v_vec);
-            let total_seq = new_k.len() / k_dim;
-            *kv_cache = Some((
-                cpu_tensor(new_k.clone(), Shape::new(vec![total_seq, k_dim])),
-                cpu_tensor(new_v.clone(), Shape::new(vec![total_seq, k_dim])),
-            ));
-            (new_k, new_v)
+        // Device-side history: prev rows stay resident, only the new rows
+        // are appended (D2D arena copy when the backend supports it).
+        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
+            let full_k = crate::shared_attention::concat_rows_on_device(prev_k, &k)?;
+            let full_v = crate::shared_attention::concat_rows_on_device(prev_v, &v)?;
+            *kv_cache = Some((full_k.clone(), full_v.clone()));
+            (full_k, full_v)
         } else {
-            *kv_cache = Some((
-                cpu_tensor(k_vec.clone(), Shape::new(vec![seq_len, k_dim])),
-                v.clone(),
-            ));
-            (k_vec, v_vec)
+            *kv_cache = Some((k.clone(), v.clone()));
+            (k.clone(), v.clone())
         };
+        let kv_len = k_all.shape().dims()[0];
 
         // Shared helper applies the causal mask at cache_offset + s (fixes
         // future-token leakage during multi-token prefill).
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_vec,
-            &k_heads,
-            &v_heads,
+        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k_all,
+            &v_all,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             seq_len,
+            kv_len,
             None,
-            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
@@ -257,6 +249,29 @@ impl ChameleonBlock {
 
         grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Move a host-produced tensor (e.g. the host LayerNorm kernel gap output)
+/// onto `device` when it is not already resident there.
+fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
+    if t.device() == device {
+        return Ok(t.clone());
+    }
+    let data = t.to_vec_f32()?;
+    let shape = t.shape().clone();
+    let dev = grim_nn::modules::pick_device_for_storage_device(device);
+    let storage = dev.from_cpu(&data, &shape, grim_tensor::DType::F32)?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        grim_tensor::DType::F32,
+        t.provenance().clone(),
+        device.clone(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -352,19 +367,16 @@ impl CausalLm for Chameleon {
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids_u32: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
 
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
-            }
-        }
-
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids_u32,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
         if session.model_state().is_none() {
             let fresh: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
             session.set_model_state(Box::new(fresh));

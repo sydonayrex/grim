@@ -144,6 +144,9 @@ impl MiniMaxM3BlockSparseMoe {
         })
     }
 
+    /// Host routing stays by design: gate logits (steps×n_expert) are tiny and
+    /// top-k selection is host logic. The per-token input rows are pulled once
+    /// (hoisted out of the loop — was re-downloading `x` per token).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -151,6 +154,7 @@ impl MiniMaxM3BlockSparseMoe {
         let logits_v = logits.to_vec_f32()?;
         let num_exp = self.experts.len();
 
+        let xv = x.to_vec_f32()?;
         let mut out = vec![0.0f32; seq_len * hidden_dim];
 
         for s in 0..seq_len {
@@ -168,10 +172,7 @@ impl MiniMaxM3BlockSparseMoe {
             let weights: Vec<f32> = exps.iter().map(|e| e / (sum_e + 1e-12)).collect();
 
             let token_x = cpu_tensor(
-                {
-                    let xv = x.to_vec_f32()?;
-                    xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec()
-                },
+                xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
                 Shape::new(vec![1, hidden_dim]),
             );
 
@@ -246,6 +247,10 @@ impl MiniMaxM3Block {
         })
     }
 
+    /// GPU-first forward: Q/K RoPE, KV-cache concat, attention and the
+    /// residual adds run on the tensor's device. Host paths are only reached
+    /// through the fused-kernel fallback guards and the (host-side) MoE
+    /// routing pull.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -259,77 +264,55 @@ impl MiniMaxM3Block {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q_dim = self.num_heads * self.head_dim;
-        let kv_dim = self.num_kv_heads * self.head_dim;
-
-        let mut q_vec = q.to_vec_f32()?;
-        let mut k_vec = k.to_vec_f32()?;
-
-        crate::qwen35::apply_rope_neox(
-            &mut q_vec,
-            positions,
+        let q = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_vec,
             positions,
+        )?;
+        let k = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k,
             self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
+            positions,
+        )?;
 
-        let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
-        let k_rot = cpu_tensor(k_vec, Shape::new(vec![seq_len, kv_dim]));
-
+        // Device-side history: prev rows stay resident, only the new rows
+        // are appended (D2D arena copy when the backend supports it).
         let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
-            let mut new_k = prev_k.to_vec_f32()?;
-            let mut new_v = prev_v.to_vec_f32()?;
-            new_k.extend(k_rot.to_vec_f32()?);
-            new_v.extend(v.to_vec_f32()?);
-            let total_seq = new_k.len() / kv_dim;
-            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, kv_dim]));
-            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, kv_dim]));
+            let full_k = crate::shared_attention::concat_rows_on_device(prev_k, &k)?;
+            let full_v = crate::shared_attention::concat_rows_on_device(prev_v, &v)?;
             *kv_cache = Some((full_k.clone(), full_v.clone()));
             (full_k, full_v)
         } else {
-            *kv_cache = Some((k_rot.clone(), v.clone()));
-            (k_rot, v)
+            *kv_cache = Some((k.clone(), v.clone()));
+            (k.clone(), v.clone())
         };
-
-        let q_heads = q_rot.to_vec_f32()?;
-        let k_heads = k_all.to_vec_f32()?;
-        let v_heads = v_all.to_vec_f32()?;
+        let kv_len = k_all.shape().dims()[0];
 
         // Shared helper applies the causal mask at cache_offset + s (fixes
         // future-token leakage during multi-token prefill).
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_heads,
-            &k_heads,
-            &v_heads,
+        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k_all,
+            &v_all,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             seq_len,
+            kv_len,
             None,
-            &Device::Cpu,
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_proj.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
-
-        let normed_ffn = self.post_attention_layernorm.forward(&res1_t)?;
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        let normed_ffn = self.post_attention_layernorm.forward(&res1)?;
         let mlp_out = self.block_sparse_moe.forward(&normed_ffn)?;
+        // Routing stays host-side, so the MoE output lands on the host; stage
+        // it back next to `res1` before the residual add.
+        let mlp_out = grim_nn::modules::move_to_device(&mlp_out, x.device())?;
 
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -416,26 +399,23 @@ impl CausalLm for MiniMaxM3 {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        let ids = input_ids.to_vec_f32()?;
-        let seq_len = ids.len();
+        let ids_f32 = input_ids.to_vec_f32()?;
+        let seq_len = ids_f32.len();
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
         let pos_v: Vec<u32> = positions
             .to_vec_f32()
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
 
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
-            }
-        }
-
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
         let mut kv_caches = vec![None; self.layers.len()];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

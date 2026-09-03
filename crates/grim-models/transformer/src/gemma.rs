@@ -126,6 +126,9 @@ impl GemmaBlock {
     /// `cache` before attending, so a single-token decode step sees the full
     /// prior context rather than only itself. [Group B fix: decode was
     /// stateless.]
+    ///
+    /// Legacy host-cache path kept for callers holding a `RefKvCache`;
+    /// the model-level decode path uses the device-first [`GemmaBlock::forward_kv`].
     pub fn forward_cached(
         &self,
         x: &Tensor,
@@ -195,6 +198,72 @@ impl GemmaBlock {
         let activated = geglu(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
+    }
+
+    /// Device-first cache-aware forward: ONE `rope_2d_on_device` call per
+    /// tensor (no per-head host loop), device-resident KV history via
+    /// `concat_rows_on_device`, and fused `fused_attention_tensors` — no
+    /// host roundtrip on GPU backends. The GeGLU activation stays host-side
+    /// (gelu-tanh has no device kernel) and is re-uploaded once.
+    pub fn forward_kv(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let norm_x = self.attn_norm.forward(x)?;
+        let q = self.wq.forward(&norm_x)?;
+        let k = self.wk.forward(&norm_x)?;
+        let v = self.wv.forward(&norm_x)?;
+
+        let new_tokens = q.shape().dims()[0];
+        let q = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q,
+            self.num_heads,
+            positions,
+        )?;
+        let k = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k,
+            self.num_kv_heads,
+            positions,
+        )?;
+
+        // Device-side history: prev rows stay resident, only the new rows
+        // are appended (D2D arena copy when the backend supports it).
+        let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
+            let full_k = crate::shared_attention::concat_rows_on_device(prev_k, &k)?;
+            let full_v = crate::shared_attention::concat_rows_on_device(prev_v, &v)?;
+            *kv_cache = Some((full_k.clone(), full_v.clone()));
+            (full_k, full_v)
+        } else {
+            *kv_cache = Some((k.clone(), v.clone()));
+            (k.clone(), v.clone())
+        };
+        let kv_len = k_all.shape().dims()[0];
+
+        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k_all,
+            &v_all,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            new_tokens,
+            kv_len,
+            None,
+        )?;
+        let attn_out = self.wo.forward(&attn_tensor)?;
+        let x_res1 = grim_nn::modules::add_on_device(x, &attn_out)?;
+
+        let norm_x2 = self.ffn_norm.forward(&x_res1)?;
+        let gate = self.ffn_gate.forward(&norm_x2)?;
+        let up = self.ffn_up.forward(&norm_x2)?;
+        // GeGLU: gelu-tanh has no device kernel — host loop, re-uploaded once.
+        let activated = reupload_to_device(&geglu(&gate, &up)?, x.device())?;
+        let ffn_out = self.ffn_down.forward(&activated)?;
+        grim_nn::modules::add_on_device(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -278,7 +347,7 @@ impl Model for Gemma {
 impl CausalLm for Gemma {
     fn new_session(&self) -> Box<dyn SessionT> {
         let mut session = Inner::new(self.device.clone());
-        let caches: Vec<Option<crate::kv_attention::RefKvCache>> = vec![None; self.layers.len()];
+        let caches: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
         session.set_model_state(Box::new(caches));
         Box::new(session)
     }
@@ -309,24 +378,24 @@ impl CausalLm for Gemma {
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
 
-        // Per-layer KV caches live on the session so decode steps see the full
-        // prior context (Group B fix).
+        // Per-layer device-resident KV caches live on the session so decode
+        // steps see the full prior context (Group B fix); only the new K/V
+        // rows are appended each step.
         if session.model_state().is_none() {
             session.set_model_state(Box::new(vec![
-                None::<crate::kv_attention::RefKvCache>;
+                None::<(Tensor, Tensor)>;
                 self.layers.len()
             ]));
         }
         let caches = session
             .model_state_mut()
-            .and_then(|s| s.downcast_mut::<Vec<Option<crate::kv_attention::RefKvCache>>>())
-            .expect("Gemma::forward: model_state must be Vec<Option<RefKvCache>>");
+            .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
+            .expect("Gemma::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
         if caches.len() < self.layers.len() {
             caches.resize(self.layers.len(), None);
         }
         for (i, layer) in self.layers.iter().enumerate() {
-            let cache = caches[i].get_or_insert_with(crate::kv_attention::RefKvCache::new);
-            h = layer.forward_cached(&h, &pos_ids, cache)?;
+            h = layer.forward_kv(&h, &pos_ids, &mut caches[i])?;
         }
         let h = self.norm.forward(&h)?;
         // Gemma uses tied embeddings via Linear layer
@@ -334,6 +403,25 @@ impl CausalLm for Gemma {
         session.advance_pos(seq_len);
         Ok(logits)
     }
+}
+
+/// Move a host-produced tensor (the GeGLU kernel-gap output) onto `device`
+/// when it is not already resident there.
+fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
+    if t.device() == device {
+        return Ok(t.clone());
+    }
+    let data = t.to_vec_f32()?;
+    let shape = t.shape().clone();
+    let dev = grim_nn::modules::pick_device_for_storage_device(device);
+    let storage = dev.from_cpu(&data, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        DType::F32,
+        t.provenance().clone(),
+        device.clone(),
+    ))
 }
 
 fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {

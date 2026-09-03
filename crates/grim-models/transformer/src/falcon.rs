@@ -18,6 +18,11 @@ use grim_tensor::{ArithType, Device, Shape, Tensor};
 // ---------------------------------------------------------------------------
 
 /// Standard LayerNorm with learnable scale and bias.
+///
+/// Host-side kernel gap: no backend currently exposes a LayerNorm device
+/// kernel (grim-nn's own `LayerNorm` is host-bound too), so `forward` pulls
+/// the input and weight/bias once per call and returns a host tensor.
+/// Callers re-upload the result onto the activation's device.
 #[derive(Clone)]
 pub struct LayerNorm {
     pub weight: Tensor,
@@ -34,6 +39,7 @@ impl LayerNorm {
     }
 
     /// Normalizes input across the innermost dimension with mean and variance scaling.
+    /// Weight/bias are pulled once per call (never per row).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let xv = x.to_vec_f32()?;
         let dim = x.shape().dims().last().copied().unwrap_or(1);
@@ -56,6 +62,29 @@ impl LayerNorm {
         }
         Ok(cpu_tensor(out, x.shape().clone()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Move a host-produced tensor (QKV split pieces, GELU / LayerNorm kernel-gap
+/// outputs) onto `device` when it is not already resident there.
+fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
+    if t.device() == device {
+        return Ok(t.clone());
+    }
+    let data = t.to_vec_f32()?;
+    let shape = t.shape().clone();
+    let dev = grim_nn::modules::pick_device_for_storage_device(device);
+    let storage = dev.from_cpu(&data, &shape, grim_tensor::DType::F32)?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        grim_tensor::DType::F32,
+        t.provenance().clone(),
+        device.clone(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +220,11 @@ impl FalconBlock {
     }
 
     /// Evaluates forward pass over input hidden states, returning the output activations.
+    ///
+    /// GPU-first: RoPE, KV-cache concat and attention run on the tensor's
+    /// device. The fused-QKV split and the GELU activation stay host-side
+    /// (no device column-slice / GELU kernels); each pulls once per call and
+    /// re-uploads only the split pieces.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -200,12 +234,13 @@ impl FalconBlock {
         let seq_len = x.shape().dims()[0];
         let attn_normed = self.ln_attn.forward(x)?;
         let mlp_normed = if let Some(ref ln) = self.ln_mlp {
-            ln.forward(x)?
+            reupload_to_device(&ln.forward(x)?, x.device())?
         } else {
             attn_normed.clone()
         };
 
-        // 1. QKV projection
+        // 1. QKV projection. The fused column split has no device kernel, so
+        // pull once and upload only the q/k/v pieces (kernel gap).
         let qkv = self.fused_qkv.forward(&attn_normed)?;
         let qkv_vec = qkv.to_vec_f32()?;
 
@@ -228,61 +263,62 @@ impl FalconBlock {
                 .copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
         }
 
-        // Apply RoPE
-        crate::qwen35::apply_rope_neox(
-            &mut q_data,
-            positions,
+        let q_rot = reupload_to_device(
+            &cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim])),
+            x.device(),
+        )?;
+        let k_rot = reupload_to_device(
+            &cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim])),
+            x.device(),
+        )?;
+        let v_tensor = reupload_to_device(
+            &cpu_tensor(v_data, Shape::new(vec![seq_len, v_dim])),
+            x.device(),
+        )?;
+
+        // Apply RoPE on-device.
+        let q_rot = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q_rot,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_data,
             positions,
+        )?;
+        let k_rot = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k_rot,
             self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
+            positions,
+        )?;
 
-        let q_rot = cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim]));
-        let k_rot = cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim]));
-        let v_tensor = cpu_tensor(v_data, Shape::new(vec![seq_len, v_dim]));
-
-        // Cache update
+        // Device-side cache update: prev rows stay resident, only the new
+        // rows are appended (D2D arena copy when the backend supports it).
         let (k_all, v_all) = if let Some((prev_k, prev_v)) = kv_cache {
-            let mut new_k = prev_k.to_vec_f32()?;
-            let mut new_v = prev_v.to_vec_f32()?;
-            new_k.extend(k_rot.to_vec_f32()?);
-            new_v.extend(v_tensor.to_vec_f32()?);
-            let total_seq = new_k.len() / k_dim;
-            let full_k = cpu_tensor(new_k, Shape::new(vec![total_seq, k_dim]));
-            let full_v = cpu_tensor(new_v, Shape::new(vec![total_seq, v_dim]));
+            let full_k = crate::shared_attention::concat_rows_on_device(prev_k, &k_rot)?;
+            let full_v = crate::shared_attention::concat_rows_on_device(prev_v, &v_tensor)?;
             *kv_cache = Some((full_k.clone(), full_v.clone()));
             (full_k, full_v)
         } else {
             *kv_cache = Some((k_rot.clone(), v_tensor.clone()));
             (k_rot, v_tensor)
         };
+        let kv_len = k_all.shape().dims()[0];
 
-        // GQA Attention calculation
-        let q_heads = q_rot.to_vec_f32()?;
-        let k_heads = k_all.to_vec_f32()?;
-        let v_heads = v_all.to_vec_f32()?;
-
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_heads,
-            &k_heads,
-            &v_heads,
+        // GQA attention on-device; the shared helper applies the causal mask
+        // at cache_offset + s.
+        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+            &q_rot,
+            &k_all,
+            &v_all,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             seq_len,
+            kv_len,
             None,
-            x.device(),
         )?;
         let attn_proj = self.dense.forward(&attn_tensor)?;
 
-        // 2. MLP branch (GELU)
+        // 2. MLP branch (GELU — host kernel gap, pulled once, re-uploaded).
         let mlp_mid = self.dense_h_to_4h.forward(&mlp_normed)?;
         let mlp_mid_v = mlp_mid.to_vec_f32()?;
         let gelu_v: Vec<f32> = mlp_mid_v
@@ -292,7 +328,10 @@ impl FalconBlock {
                 0.5 * v * (1.0 + c.tanh())
             })
             .collect();
-        let mlp_act = cpu_tensor(gelu_v, mlp_mid.shape().clone());
+        let mlp_act = reupload_to_device(
+            &cpu_tensor(gelu_v, mlp_mid.shape().clone()),
+            x.device(),
+        )?;
         let mlp_proj = self.dense_4h_to_h.forward(&mlp_act)?;
 
         // 3. Parallel residual combination
@@ -410,19 +449,16 @@ impl CausalLm for Falcon {
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids_u32: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
 
-        let embed_w = self.word_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                    &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-                );
-            }
-        }
-
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.word_embeddings.weight,
+            &ids_u32,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
         if session.model_state().is_none() {
             let fresh: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
             session.set_model_state(Box::new(fresh));
