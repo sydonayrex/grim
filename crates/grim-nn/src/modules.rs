@@ -93,6 +93,57 @@ pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Row gather `weight[indices, :]` dispatched on-device without copying the
+/// embedding table to the host. The `embedding` kernel is a required
+/// `BackendStorage` trait method, so every backend implements it; the host
+/// fallback only covers kernel errors on exotic storages.
+pub fn embedding_gather_on_device(
+    weight: &Tensor,
+    indices: &[u32],
+    seq_len: usize,
+    dim: usize,
+) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(weight);
+    let out_shape = Shape::new(vec![seq_len, dim]);
+    match CoreTensorOps::embedding(&*dev, weight.storage().as_ref(), indices, &out_shape) {
+        Ok((s, _handle)) => Ok(Tensor::new(
+            Arc::from(s),
+            out_shape,
+            DType::F32,
+            weight.provenance().clone(),
+            weight.device().clone(),
+        )),
+        Err(e) if is_kernel_unimplemented(&e) => {
+            // Host fallback: gather rows on the CPU and upload once.
+            let table = weight.to_vec_f32()?;
+            let mut h = vec![0.0f32; seq_len * dim];
+            for (i, &tok) in indices.iter().enumerate() {
+                let tok = tok as usize;
+                let src = tok * dim;
+                let dst = i * dim;
+                if src + dim <= table.len() && dst + dim <= h.len() {
+                    h[dst..dst + dim].copy_from_slice(&table[src..src + dim]);
+                }
+            }
+            let storage = dev.from_cpu(&h, &out_shape, DType::F32)?;
+            Ok(Tensor::new(
+                Arc::from(storage),
+                out_shape,
+                DType::F32,
+                weight.provenance().clone(),
+                weight.device().clone(),
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// True when the error means "this backend lacks the kernel" (as opposed to
+/// a real failure, which must propagate).
+pub fn is_kernel_unimplemented(e: &Error) -> bool {
+    matches!(e, Error::Unimplemented(_))
+}
+
 /// WI-SB4a: stage an activation onto `target` for contiguous layer-pipeline
 /// execution. Same-device calls are free clones; cross-device moves stage
 /// through host memory (`from_cpu`) so no backend-specific peer support is

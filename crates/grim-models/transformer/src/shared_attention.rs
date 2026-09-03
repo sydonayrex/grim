@@ -342,6 +342,154 @@ pub fn fused_or_scalar_attention_scaled(
     )
 }
 
+/// Tensor-level fused attention (GPU-first): q/k/v stay on their device and
+/// only the fused `qkv_attention` kernel runs — no host roundtrip on GPU
+/// backends. `k`/`v` carry the full history (`kv_len` rows, layout
+/// `[kv_len, num_kv_heads * head_dim]`); the kernel applies the causal mask
+/// at `cache_offset + i` (`cache_offset = kv_len - steps`), with an optional
+/// sliding `window`. Falls back to the scalar host path only when the
+/// backend lacks the kernel, matching the `fused_or_scalar_attention`
+/// contract without forcing per-call H2D uploads of Q/K/V.
+///
+/// `q` is `[steps, num_heads * head_dim]` (post-RoPE); storage layouts are
+/// relabeled zero-copy where possible (D2D otherwise).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_tensors(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    kv_len: usize,
+    window: Option<usize>,
+) -> Result<Tensor> {
+    let device = q.device().clone();
+    let dev = pick_device_for_storage_device(&device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let q3 = crate::block::reshaped_view(q, &Shape::new(vec![steps, num_heads, head_dim]))?;
+    let k3 = crate::block::reshaped_view(k, &Shape::new(vec![kv_len, num_kv_heads, head_dim]))?;
+    let v3 = crate::block::reshaped_view(v, &Shape::new(vec![kv_len, num_kv_heads, head_dim]))?;
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    match dev.qkv_attention(
+        q3.storage().as_ref(),
+        k3.storage().as_ref(),
+        v3.storage().as_ref(),
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+        None,
+        None,
+    ) {
+        Ok((storage, _handle)) => Ok(Tensor::new(
+            Arc::from(storage),
+            out_shape,
+            DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            device.clone(),
+        )),
+        Err(e) if grim_nn::is_kernel_unimplemented(&e) => {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            scalar_attention(
+                &q.to_vec_f32()?,
+                &k.to_vec_f32()?,
+                &v.to_vec_f32()?,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                steps,
+                kv_len,
+                cache_offset,
+                window,
+                scale,
+                &dev,
+                &device,
+            )
+        }
+        Err(e) => Err(grim_core::error::Error::from(e)),
+    }
+}
+
+/// Concatenate two `[rows_a, width]` / `[rows_b, width]` tensors along rows
+/// (GPU-first). Device path: fresh arena + two D2D copies (the
+/// `block.rs::cache_append_kv` primitive pair); host fallback only when the
+/// backend lacks `alloc_storage`/`copy_slice_into`.
+pub fn concat_rows_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let rows = a.shape().dims()[0] + b.shape().dims()[0];
+    let width = *a.shape().dims().last().expect("non-empty tensor");
+    let out_shape = Shape::new(vec![rows, width]);
+    let dev = pick_device_for_storage_device(a.device());
+    if let Ok(fresh) = dev.alloc_storage(&out_shape, DType::F32) {
+        let a_ok = dev.copy_slice_into(
+            fresh.as_ref(),
+            a.storage().as_ref(),
+            0,
+            a.shape().elem_count(),
+        );
+        let b_ok = a_ok.and_then(|_| {
+            dev.copy_slice_into(
+                fresh.as_ref(),
+                b.storage().as_ref(),
+                a.shape().elem_count(),
+                b.shape().elem_count(),
+            )
+        });
+        if b_ok.is_ok() {
+            return Ok(Tensor::new(
+                Arc::from(fresh),
+                out_shape,
+                DType::F32,
+                a.provenance().clone(),
+                a.device().clone(),
+            ));
+        }
+    }
+    // Host fallback.
+    let mut data = a.to_vec_f32()?;
+    data.extend_from_slice(&b.to_vec_f32()?);
+    let storage = dev.from_cpu(&data, &out_shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        a.provenance().clone(),
+        a.device().clone(),
+    ))
+}
+
+/// NeoX RoPE for `[steps, num_heads * head_dim]` tensors (GPU-first).
+/// Relabels to one head_dim-wide row per head (`(1, steps * num_heads, D)`,
+/// positions repeated per head — the `block.rs`/`muse_glimmer` kernel
+/// contract), runs the grim-nn `Rope` module (device kernel on GPU, host
+/// loop on the CPU fallback backend), relabels back to `[steps, width]`.
+/// `x.width() == num_heads * rope.config.dim` must hold.
+pub fn rope_2d_on_device(
+    rope: &grim_nn::Rope,
+    x: &Tensor,
+    num_heads: usize,
+    positions: &[u32],
+) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    let (steps, width) = (dims[0], dims[1]);
+    debug_assert_eq!(width, num_heads * rope.config.dim);
+    let head_dim = rope.config.dim;
+
+    let mut ext_positions = Vec::with_capacity(steps * num_heads);
+    for si in 0..steps {
+        let pos = positions.get(si).copied().unwrap_or(si as u32);
+        for _ in 0..num_heads {
+            ext_positions.push(pos);
+        }
+    }
+
+    let rows3 = crate::block::reshaped_view(x, &Shape::new(vec![1, steps * num_heads, head_dim]))?;
+    let roped3 = rope.forward(&rows3, &ext_positions)?;
+    crate::block::reshaped_view(&roped3, &Shape::new(vec![steps, width]))
+}
+
 /// Reference scalar attention with causal + sliding-window masking.
 /// Direct port of `block.rs::cpu_attention_fallback`, taking explicit dims
 /// so loaders without a `BlockConfig` can use it.

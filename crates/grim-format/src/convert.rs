@@ -5,7 +5,6 @@ use crate::gguf::{
     GGUF_MAGIC, GGUF_VERSION, GgufValue, GrimFusionOp, GrimRocmlProfile, read_gguf,
     read_tensor_bytes,
 };
-use grim_quant::evopress_search;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::TensorProvider;
 
@@ -561,16 +560,16 @@ fn convert_to_grim_inner(
         }
         let importance_scores = grim_quant::compute_importance_scores(&tensor_data);
         let tensor_sizes: Vec<usize> = tensor_data.iter().map(|(_, _, r, c)| r * c).collect();
-        let config = grim_quant::EvoPressConfig {
-            generations,
+        let config = grim_quant::RcoConfig {
+            steps: generations.max(20),
             target_bpw,
-            ..grim_quant::EvoPressConfig::default()
+            ..grim_quant::RcoConfig::default()
         };
-        let genes = evopress_search(
+        let genes = grim_quant::rco_search(
             &config,
             &importance_scores,
             &tensor_sizes,
-            None, // EvoPress runs inline here; the CLI runs it separately.
+            None, // RCO runs inline here; the CLI runs it separately.
         );
         Some(genes)
     } else {

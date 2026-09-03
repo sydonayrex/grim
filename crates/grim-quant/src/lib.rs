@@ -3,8 +3,10 @@
 use grim_tensor::error::{Error, Result};
 
 pub mod accuracy_gate;
+pub mod gsq;
 mod packed_gemm;
 pub mod qat_mxfp4;
+pub mod rco;
 pub mod soul_eater;
 pub mod spqr;
 
@@ -12,6 +14,8 @@ pub use accuracy_gate::{
     AccuracyGate, AccuracyTolerance, AccuracyVerdict, compute_cosine_similarity,
     compute_cross_entropy_ppl, compute_relative_l2_error,
 };
+pub use gsq::{GsqBlockFit, GsqConfig, gsq_fit_block};
+pub use rco::{RcoConfig, rco_search};
 pub use spqr::{SpqrSalientResidual, spqr_identify_salient};
 
 /// Re-exported from `grim_tensor` so the `BackendDevice::quantize` trait method
@@ -3567,25 +3571,19 @@ pub fn refined_scale_fit(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3: EvoPress Evolutionary Search
+// ---------------------------------------------------------------------------
+// Phase 3: RCO (Riemannian Constrained Optimization) Bitwidth Search
 // ---------------------------------------------------------------------------
 
-/// Configuration for the EvoPress evolutionary bitwidth search.
+/// Legacy configuration alias for EvoPress, routed directly into RCO.
 #[derive(Debug, Clone)]
 pub struct EvoPressConfig {
-    /// Number of individuals in the population.
     pub population_size: usize,
-    /// Number of generations to run.
     pub generations: usize,
-    /// Target average bits-per-weight across all tensors.
     pub target_bpw: f32,
-    /// Tournament size for selection.
     pub tournament_size: usize,
-    /// Crossover probability.
     pub crossover_prob: f32,
-    /// Mutation probability per gene.
     pub mutation_prob: f32,
-    /// Available bitwidth choices per tensor (e.g. [2, 3, 4, 5, 6] for K-quants).
     pub available_bpws: Vec<u32>,
 }
 
@@ -3593,7 +3591,7 @@ impl Default for EvoPressConfig {
     fn default() -> Self {
         Self {
             population_size: 128,
-            generations: 50,
+            generations: 40,
             target_bpw: 4.0,
             tournament_size: 3,
             crossover_prob: 0.8,
@@ -3603,232 +3601,20 @@ impl Default for EvoPressConfig {
     }
 }
 
-/// One individual in the EvoPress population. `genes[i]` is the bitwidth
-/// assigned to tensor `i`.
-#[derive(Debug, Clone)]
-pub struct Individual {
-    pub genes: Vec<u32>,
-    pub fitness: f32,
-}
-
-/// Run EvoPress evolutionary search to find optimal per-tensor bitwidths.
-///
-/// The search respects the `target_bpw` constraint while maximizing a
-/// quality proxy derived from importance scores. The returned vector maps
-/// each tensor index to its assigned bitwidth.
-///
-/// When `progress` is provided, it is invoked once per generation with
-/// `(generations_done, total_generations)` so the CLI can render a
-/// conversion progress bar. This is a pure drain callback; it must not
-/// consume arguments and has no effect on the search result.
+/// Backwards-compatible bitwidth search function, now driven by RCO (Riemannian Constrained Optimization).
 pub fn evopress_search(
     config: &EvoPressConfig,
     importance_scores: &[f32],
     tensor_sizes: &[usize],
-    mut progress: Option<&mut dyn FnMut(usize, usize)>,
+    progress: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Vec<u32> {
-    let n_tensors = importance_scores.len();
-    if n_tensors == 0 {
-        return Vec::new();
-    }
-
-    let mut rng = SimpleRng::new(0x9E37_79B9_7F4A_7C15);
-    let total_size: usize = tensor_sizes.iter().sum();
-    if total_size == 0 {
-        return vec![config.target_bpw as u32; n_tensors];
-    }
-
-    // Build initial population.
-    let mut population: Vec<Individual> = (0..config.population_size)
-        .map(|i| {
-            let genes = if i == 0 {
-                // First individual: greedy baseline matching target_bpw
-                let mut genes = Vec::with_capacity(n_tensors);
-                let mut budget = (config.target_bpw * total_size as f32) as usize;
-                for (ti, sz) in tensor_sizes.iter().enumerate() {
-                    let imp = importance_scores[ti];
-                    // Higher importance → higher bitwidth (bias toward important layers)
-                    let imp_sum = importance_scores.iter().sum::<f32>().max(1e-9);
-                    let imp_ratio = imp / imp_sum;
-                    let target_bpw_for_tensor =
-                        (config.target_bpw * imp_ratio * 2.0).clamp(2.0, 8.0);
-                    let gene = *config
-                        .available_bpws
-                        .iter()
-                        .min_by(|a, b| {
-                            let da = ((**a) as f32 - target_bpw_for_tensor).abs();
-                            let db = ((**b) as f32 - target_bpw_for_tensor).abs();
-                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .unwrap_or(&4);
-                    genes.push(gene);
-                    budget = budget.saturating_sub(gene as usize * sz);
-                }
-                genes
-            } else {
-                (0..n_tensors)
-                    .map(|_| *config.available_bpws.choose(&mut rng).unwrap_or(&4))
-                    .collect()
-            };
-            let fitness = eval_individual(
-                &genes,
-                importance_scores,
-                tensor_sizes,
-                config.target_bpw,
-                total_size,
-            );
-            Individual { genes, fitness }
-        })
-        .collect();
-
-    // Evolutionary loop.
-    let total_generations = config.generations;
-    for generation in 0..total_generations {
-        if let Some(cb) = progress.as_deref_mut() {
-            cb(generation + 1, total_generations);
-        }
-        let mut next_gen = Vec::with_capacity(config.population_size);
-
-        // Elitism: keep top-2.
-        population.sort_by(|a, b| {
-            b.fitness
-                .partial_cmp(&a.fitness)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if config.population_size >= 2 {
-            next_gen.push(population[0].clone());
-            next_gen.push(population[1].clone());
-        }
-
-        while next_gen.len() < config.population_size {
-            // Tournament selection.
-            let p1 = tournament_select(&population, config.tournament_size, &mut rng);
-            let p2 = tournament_select(&population, config.tournament_size, &mut rng);
-
-            // Crossover.
-            let mut child_genes = if rng.next_f32() < config.crossover_prob {
-                crossover(&p1.genes, &p2.genes, &mut rng)
-            } else {
-                p1.genes.clone()
-            };
-
-            // Mutation.
-            for gene in &mut child_genes {
-                if rng.next_f32() < config.mutation_prob {
-                    *gene = *config.available_bpws.choose(&mut rng).unwrap_or(gene);
-                }
-            }
-
-            let fitness = eval_individual(
-                &child_genes,
-                importance_scores,
-                tensor_sizes,
-                config.target_bpw,
-                total_size,
-            );
-            next_gen.push(Individual {
-                genes: child_genes,
-                fitness,
-            });
-        }
-
-        population = next_gen;
-    }
-
-    population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
-    population[0].genes.clone()
-}
-
-fn tournament_select<'a>(pop: &'a [Individual], k: usize, rng: &mut SimpleRng) -> &'a Individual {
-    ((0..k)
-        .map(|_| {
-            let idx = (rng.next_u64() as usize) % pop.len().max(1);
-            &pop[idx]
-        })
-        .max_by(|a, b| {
-            a.fitness
-                .partial_cmp(&b.fitness)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap()) as _
-}
-
-fn crossover(p1: &[u32], p2: &[u32], rng: &mut SimpleRng) -> Vec<u32> {
-    let min_len = p1.len().min(p2.len());
-    let cut = rng.next_u64() as usize % (min_len + 1);
-    let mut child = p1[..cut].to_vec();
-    child.extend_from_slice(&p2[cut..]);
-    child
-}
-
-fn eval_individual(
-    genes: &[u32],
-    importance_scores: &[f32],
-    tensor_sizes: &[usize],
-    target_bpw: f32,
-    total_size: usize,
-) -> f32 {
-    if genes.is_empty() || total_size == 0 {
-        return 0.0;
-    }
-    // Weighted quality score: higher importance + correct BPW = better
-    let mut quality: f32 = 0.0;
-    for (ti, (&gene, &_sz)) in genes.iter().zip(tensor_sizes.iter()).enumerate() {
-        if ti < importance_scores.len() {
-            let imp = importance_scores[ti];
-            // Reward matching target BPW; reward higher bits for high-importance tensors
-            let bpw_error = (gene as f32 - target_bpw).abs();
-            quality += imp / (bpw_error + 0.1);
-        }
-    }
-
-    // Penalty for deviation from target average BPW.
-    let total_bits: usize = genes
-        .iter()
-        .zip(tensor_sizes.iter())
-        .map(|(g, s)| (*g as usize) * s)
-        .sum();
-    let actual_bpw = total_bits as f32 / total_size as f32;
-    let bpw_penalty = (actual_bpw - target_bpw).abs() * 100.0;
-
-    quality - bpw_penalty
-}
-
-// ---------------------------------------------------------------------------
-// Simple deterministic RNG for EvoPress (no external crate dependency)
-// ---------------------------------------------------------------------------
-
-struct SimpleRng {
-    seed: u64,
-}
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self { seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        self.seed
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / 16777216.0
-    }
-}
-
-trait Choose<T> {
-    fn choose(&self, rng: &mut SimpleRng) -> Option<&T>;
-}
-
-impl<T> Choose<T> for [T] {
-    fn choose(&self, rng: &mut SimpleRng) -> Option<&T> {
-        if self.is_empty() {
-            return None;
-        }
-        let idx = (rng.next_u64() as usize) % self.len();
-        Some(&self[idx])
-    }
+    let rco_config = RcoConfig {
+        steps: config.generations.max(20),
+        target_bpw: config.target_bpw,
+        available_bpws: config.available_bpws.clone(),
+        ..Default::default()
+    };
+    rco_search(&rco_config, importance_scores, tensor_sizes, progress)
 }
 
 // ===========================================================================

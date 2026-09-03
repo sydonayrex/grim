@@ -806,7 +806,7 @@ enum OxidizerCommands {
         #[arg(long)]
         dataset: Option<String>,
     },
-    /// Run EvoPress evolutionary search on pre-computed importance scores.
+    /// Run RCO (Riemannian Constrained Optimization) bitwidth search on pre-computed importance scores.
     Search {
         /// Path to importance scores JSON (from `calibrate`).
         scores_path: String,
@@ -815,8 +815,8 @@ enum OxidizerCommands {
         /// Target average bits-per-weight.
         #[arg(long, default_value = "4.0")]
         target_bpw: f32,
-        /// Number of EvoPress generations.
-        #[arg(long, default_value = "50")]
+        /// Number of RCO optimization steps (legacy flag: generations).
+        #[arg(long, default_value = "40", alias = "steps")]
         generations: usize,
     },
     /// Full convert pipeline: calibrate → search → write .grim.
@@ -828,8 +828,8 @@ enum OxidizerCommands {
         /// Target average bits-per-weight.
         #[arg(long, default_value = "4.0")]
         target_bpw: f32,
-        /// Number of EvoPress generations.
-        #[arg(long, default_value = "50")]
+        /// Number of RCO optimization steps (legacy flag: generations).
+        #[arg(long, default_value = "40", alias = "steps")]
         generations: usize,
         /// Target ROCm profile (cdna2, rdna3, mi300x).
         #[arg(long)]
