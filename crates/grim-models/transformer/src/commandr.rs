@@ -205,7 +205,7 @@ impl CommandRBlock {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
         let mlp_out = self.mlp.forward(&normed)?;
@@ -249,7 +249,7 @@ impl CommandR {
             [cfg.vocab_size, cfg.hidden_size],
         )?;
 
-        let num_layers_to_load = cfg.num_hidden_layers.min(2);
+        let num_layers_to_load = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("layers").scoped(&i.to_string());

@@ -18,6 +18,7 @@ use grim_tensor::{ArithType, Device, Shape, Tensor};
 // ---------------------------------------------------------------------------
 
 /// Standard LayerNorm with learnable scale and bias.
+#[derive(Clone)]
 pub struct LayerNorm {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
@@ -295,16 +296,8 @@ impl FalconBlock {
         let mlp_proj = self.dense_4h_to_h.forward(&mlp_act)?;
 
         // 3. Parallel residual combination
-        let xv = x.to_vec_f32()?;
-        let av = attn_proj.to_vec_f32()?;
-        let mv = mlp_proj.to_vec_f32()?;
-
-        let mut out_v = vec![0.0f32; xv.len()];
-        for i in 0..xv.len() {
-            out_v[i] = xv[i] + av[i] + mv[i];
-        }
-
-        Ok(cpu_tensor(out_v, x.shape().clone()))
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        grim_nn::modules::add_on_device(&res1, &mlp_proj).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -430,7 +423,15 @@ impl CausalLm for Falcon {
         }
 
         let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
-        let mut kv_caches = vec![None; self.layers.len()];
+        if session.model_state().is_none() {
+            let fresh: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
+            session.set_model_state(Box::new(fresh));
+        }
+
+        let kv_caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
+            .expect("Falcon::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_v, &mut kv_caches[layer_idx])?;
@@ -454,5 +455,97 @@ mod tests {
         let parsed: FalconConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.hidden_size, cfg.hidden_size);
         assert_eq!(parsed.num_heads, cfg.num_heads);
+    }
+
+    #[test]
+    fn test_falcon_session_kv_cache_persistence() {
+        let mut cfg = FalconConfig::default();
+        cfg.vocab_size = 32;
+        cfg.hidden_size = 16;
+        cfg.intermediate_size = 32;
+        cfg.num_layers = 1;
+        cfg.num_heads = 2;
+        cfg.num_kv_heads = 1;
+        cfg.head_dim = 8;
+        cfg.parallel_attn = true;
+        cfg.new_decoder_architecture = true;
+
+        let word_embeddings = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 32 * 16], Shape::new(vec![32, 16])),
+            None,
+        );
+        let ln = LayerNorm {
+            weight: cpu_tensor(vec![1.0f32; 16], Shape::new(vec![16])),
+            bias: Some(cpu_tensor(vec![0.0f32; 16], Shape::new(vec![16]))),
+            eps: 1e-5,
+        };
+        let lm_head = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 32 * 16], Shape::new(vec![32, 16])),
+            None,
+        );
+        let qkv_out_dim = (2 + 2 * 1) * 8; // 32
+        let fused_qkv = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 16 * qkv_out_dim], Shape::new(vec![qkv_out_dim, 16])),
+            None,
+        );
+        let dense = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 16 * 16], Shape::new(vec![16, 16])),
+            None,
+        );
+        let dense_h_to_4h = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 16 * 32], Shape::new(vec![32, 16])),
+            None,
+        );
+        let dense_4h_to_h = Linear::from_tensor(
+            cpu_tensor(vec![0.01f32; 32 * 16], Shape::new(vec![16, 32])),
+            None,
+        );
+
+        let block = FalconBlock {
+            fused_qkv,
+            dense,
+            ln_attn: ln.clone(),
+            ln_mlp: None,
+            dense_h_to_4h,
+            dense_4h_to_h,
+            rope: Rope::new(8, 10000.0),
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 8,
+            parallel_attn: true,
+        };
+
+        let model = Falcon {
+            cfg,
+            device: Device::Cpu,
+            word_embeddings,
+            layers: vec![block],
+            ln_f: ln,
+            lm_head,
+        };
+
+        let mut session = model.new_session();
+        let tok0 = cpu_tensor(vec![1.0f32], Shape::new(vec![1]));
+        let pos0 = cpu_tensor(vec![0.0f32], Shape::new(vec![1]));
+        let _ = model.forward(session.as_mut(), &tok0, &pos0, &[]).unwrap();
+
+        let caches = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<(Tensor, Tensor)>>>())
+            .expect("session model_state holds kv caches");
+        assert!(caches[0].is_some(), "Layer 0 cache must be populated");
+        let (k, _v) = caches[0].as_ref().unwrap();
+        assert_eq!(k.shape().dims()[0], 1, "Cache length after 1 token is 1");
+
+        let tok1 = cpu_tensor(vec![2.0f32], Shape::new(vec![1]));
+        let pos1 = cpu_tensor(vec![1.0f32], Shape::new(vec![1]));
+        let _ = model.forward(session.as_mut(), &tok1, &pos1, &[]).unwrap();
+
+        let caches2 = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<(Tensor, Tensor)>>>())
+            .unwrap();
+        let (k2, _v2) = caches2[0].as_ref().unwrap();
+        assert_eq!(k2.shape().dims()[0], 2, "Cache length after 2 tokens is 2");
     }
 }

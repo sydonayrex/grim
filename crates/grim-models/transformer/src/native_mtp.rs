@@ -111,7 +111,10 @@ impl MtpLayer {
         concat.extend_from_slice(h);
         concat.extend_from_slice(e);
 
-        let concat_t = cpu_tensor(concat, Shape::new(vec![1, self.hidden_size * 2]));
+        let concat_cpu = cpu_tensor(concat, Shape::new(vec![1, self.hidden_size * 2]));
+        let target_dev = self.proj.weight.device();
+        let concat_t = grim_nn::modules::move_to_device(&concat_cpu, target_dev)?;
+
         let projected = self.proj.forward(&concat_t)?;
         let normed = self.norm.forward(&projected)?;
         let logits = self.lm_head.forward(&normed)?;
@@ -119,6 +122,23 @@ impl MtpLayer {
         let h_next = normed.to_vec_f32()?;
         let logits_vec = logits.to_vec_f32()?;
         Ok((h_next, logits_vec))
+    }
+
+    /// Device-native forward pass through the MTP stage:
+    /// computes $h_{\text{next}} = \text{Norm}(W_{\text{proj}} \cdot [h, e])$
+    /// and $\text{logits} = W_{\text{head}} \cdot h_{\text{next}}$.
+    pub fn forward_tensor(&self, h: &[f32], e: &[f32]) -> Result<(Tensor, Tensor)> {
+        let (h_next_vec, logits_vec) = self.forward(h, e)?;
+        let target_dev = self.proj.weight.device();
+        let h_t = grim_nn::modules::move_to_device(
+            &cpu_tensor(h_next_vec, Shape::new(vec![1, self.hidden_size])),
+            target_dev,
+        )?;
+        let l_t = grim_nn::modules::move_to_device(
+            &cpu_tensor(logits_vec, Shape::new(vec![1, self.vocab_size])),
+            target_dev,
+        )?;
+        Ok((h_t, l_t))
     }
 }
 
