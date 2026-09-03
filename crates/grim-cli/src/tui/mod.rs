@@ -48,6 +48,12 @@ pub mod frecency;
 /// Markdown → ratatui rendering.
 pub mod markdown;
 
+/// Line-based diff for edit previews.
+pub mod diff;
+
+/// Persisted always-allow rules for tool approvals.
+pub mod permissions;
+
 /// Skill discovery and loading from SKILL.md files.
 pub mod skills;
 
@@ -122,6 +128,8 @@ pub enum SlashCommand {
     Pwd,
     /// Set the thinking/reasoning effort level (off, low, medium, high, max).
     Thinking(Option<String>),
+    /// Toggle plan mode (read-only tools, model presents a plan first).
+    Plan(Option<String>),
     /// Select the inference backend (rocm, cuda, metal, cpu, auto).
     Backend(Option<String>),
     Exit,
@@ -170,6 +178,8 @@ pub fn parse_slash_command(input: &str) -> SlashCommand {
         "pwd" => SlashCommand::Pwd,
         "think" | "thinking" if after.is_empty() => SlashCommand::Thinking(None),
         "think" | "thinking" => SlashCommand::Thinking(Some(after.trim().to_string())),
+        "plan" if after.is_empty() => SlashCommand::Plan(None),
+        "plan" => SlashCommand::Plan(Some(after.trim().to_string())),
         "backend" if after.is_empty() => SlashCommand::Backend(None),
         "backend" => SlashCommand::Backend(Some(after.trim().to_string())),
         _ => SlashCommand::Unknown(first_word.to_string()),
@@ -254,6 +264,8 @@ pub struct App {
     pub generation_complete_notified: bool,
     /// Pending tool call awaiting UI approval (call_id, name, arguments).
     pub pending_tool_call: Option<(String, String, String)>,
+    /// Precomputed edit diff for the pending call (edit_file / write_file).
+    pub pending_tool_diff: Option<Vec<diff::DiffLine>>,
     /// Tool definitions exposed to the model (empty = tools disabled).
     pub tools: Vec<grim_format::ToolDef>,
     /// Sandbox root for tool execution.
@@ -270,6 +282,8 @@ pub struct App {
     pub project_dir: PathBuf,
     /// Current thinking/reasoning effort level.
     pub thinking_level: grim_core::sampler::ThinkingLevel,
+    /// Plan mode: mutating tools are blocked; the model presents a plan.
+    pub plan_mode: bool,
     /// Agent task list rendered in the sidebar.
     pub task_list: crate::tui::tasks::TaskList,
     /// Selected inference backend (rocm, cuda, metal, cpu). None = auto-detect.
@@ -286,6 +300,9 @@ pub struct App {
     pub find_selected: usize,
     /// Border flash until this instant (300ms delight on TurnComplete).
     pub flash_until: Option<Instant>,
+    /// Always-allow tool rules, shared with the worker thread. The worker
+    /// checks them before prompting; the UI adds to them on "always allow".
+    pub permissions: permissions::SharedPermissions,
 }
 
 impl App {
@@ -316,6 +333,7 @@ impl App {
             frecency: Frecency::new(),
             generation_complete_notified: false,
             pending_tool_call: None,
+            pending_tool_diff: None,
             tools: crate::tui::tools::coding_tools(),
             sandbox_root: project_dir.clone(),
             tool_approval_mode: false,
@@ -324,6 +342,7 @@ impl App {
             active_skill_name: None,
             project_dir,
             thinking_level: grim_core::sampler::ThinkingLevel::Default,
+            plan_mode: false,
             task_list: crate::tui::tasks::TaskList::new(),
             backend: std::env::var("GRIM_BACKEND").ok(),
             was_at_bottom: true,
@@ -332,6 +351,7 @@ impl App {
             find_matches: Vec::new(),
             find_selected: 0,
             flash_until: None,
+            permissions: permissions::shared(permissions::PermissionRules::load()),
         }
     }
 
@@ -352,6 +372,33 @@ impl App {
         false
     }
 
+    /// Finalize the current streaming buffer as an assistant message — in the
+    /// transcript (rendered segment) and in `messages` (model history). A
+    /// tool call arriving mid-turn splits the stream into segments; `tool`
+    /// attaches this segment's tool call to the message so the next turn's
+    /// history preserves the full exchange.
+    fn close_stream_segment(&mut self, call_id: Option<&str>, tool: Option<(&str, &str)>) {
+        let text = self.transcript.streaming_text_clean();
+        self.transcript.finish_segment();
+        let tool_calls = tool.map(|(tname, args)| {
+            vec![grim_format::ToolCallMsg {
+                id: call_id.unwrap_or_default().to_string(),
+                name: tname.to_string(),
+                arguments: args.to_string(),
+            }]
+        });
+        if text.is_empty() && tool_calls.is_none() {
+            return;
+        }
+        self.messages.push(grim_format::ChatMessage {
+            role: "assistant".to_string(),
+            content: text,
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
     /// Apply a worker event to app state.
     pub fn handle_event(&mut self, evt: WorkerEvent) {
         match evt {
@@ -370,6 +417,10 @@ impl App {
                 }
             }
             WorkerEvent::TurnComplete { stats } => {
+                // Capture the final assistant segment into history so the
+                // next turn sees what the model said (and, across the loop,
+                // the tool exchanges).
+                self.close_stream_segment(None, None);
                 if let Some(tps) = stats.decode_tps {
                     self.speed_history.record(tps as u64);
                 }
@@ -433,13 +484,63 @@ impl App {
                 name,
                 arguments,
             } => {
-                // Show the tool call in the transcript and enter approval mode.
-                self.transcript.push_tool_call(&name, &arguments);
+                // Close the current text segment so transcript and message
+                // history read: text → tool call → result → more text.
+                self.close_stream_segment(Some(&call_id), Some((&name, &arguments)));
+                // Preview the diff for edit tools before the user approves.
+                let preview = crate::tui::diff::preview_edit(
+                    &name,
+                    &arguments,
+                    &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
+                );
+                self.transcript
+                    .push_tool_call_with_diff(&name, Some(&call_id), &arguments, preview.clone());
                 self.pending_tool_call = Some((call_id, name.clone(), arguments));
+                self.pending_tool_diff = preview;
                 self.tool_approval_mode = true;
                 self.show_toast(Toast::info(format!(
-                    "Tool: {name} — press Enter to approve, Esc to deny"
+                    "Tool: {name} — y: approve, a: always allow, n: deny"
                 )));
+            }
+            WorkerEvent::ToolExec {
+                call_id,
+                name,
+                arguments,
+                output,
+            } => {
+                // A tool the worker auto-executed: mirror it into the
+                // transcript and the message history we own.
+                self.close_stream_segment(Some(&call_id), Some((&name, &arguments)));
+                self.transcript
+                    .push_tool_call_with_diff(&name, Some(&call_id), &arguments, None);
+                self.transcript
+                    .push_tool_result_for(output.clone(), Some(call_id.clone()));
+                self.messages.push(grim_format::ChatMessage {
+                    role: "tool".to_string(),
+                    content: output,
+                    tool_call_id: Some(call_id),
+                    name: Some(name),
+                    tool_calls: None,
+                });
+            }
+            WorkerEvent::TaskSync { tasks } => {
+                let converted: Vec<Task> = tasks
+                    .into_iter()
+                    .map(|t| {
+                        let status = t
+                            .status
+                            .parse::<TaskStatus>()
+                            .unwrap_or(TaskStatus::Pending);
+                        let mut task = Task::new(t.id, t.title).with_status(status);
+                        if let Some(d) = t.description {
+                            task = task.with_description(d);
+                        }
+                        task
+                    })
+                    .collect();
+                let n = converted.len();
+                self.task_list.set_tasks(converted);
+                self.show_toast(Toast::info(format!("Tasks updated ({n})")));
             }
         }
     }
@@ -1588,6 +1689,30 @@ impl App {
             SlashCommand::Backend(Some(name)) => {
                 self.activate_backend(&name);
             }
+            SlashCommand::Plan(arg) => {
+                // /plan toggles; /plan on|off sets explicitly.
+                let enable = match arg.as_deref().map(|s| s.to_ascii_lowercase()) {
+                    None => !self.plan_mode,
+                    Some(s) if s == "on" || s == "true" || s == "1" => true,
+                    Some(s) if s == "off" || s == "false" || s == "0" => false,
+                    Some(other) => {
+                        self.transcript
+                            .push_error(format!("usage: /plan [on|off] (got '{other}')"));
+                        return;
+                    }
+                };
+                self.plan_mode = enable;
+                let _ = self
+                    .cmd_tx
+                    .send(WorkerCommand::SetPlanMode { enabled: enable });
+                let state = if enable { "on" } else { "off" };
+                self.transcript.push_system(if enable {
+                    "plan mode on — mutations blocked; the model will research and propose a plan".into()
+                } else {
+                    "plan mode off — write tools re-enabled".into()
+                });
+                self.show_toast(Toast::info(format!("Plan mode: {state}")));
+            }
             SlashCommand::NotACommand => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -1665,40 +1790,83 @@ impl App {
         }
     }
 
+    /// Execute the pending tool call and forward the result to the worker.
+    fn approve_pending_tool(&mut self) {
+        self.pending_tool_diff = None;
+        if let Some((call_id, name, arguments)) = self.pending_tool_call.take() {
+            let call = grim_format::ToolCallMsg {
+                id: call_id,
+                name: name.clone(),
+                arguments,
+            };
+            let result = crate::tui::tools::execute_tool(
+                &call,
+                &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
+            );
+            let output = match result {
+                Ok(s) => s,
+                Err(e) => format!("error: {e}"),
+            };
+            self.transcript
+                .push_tool_result_for(output.clone(), Some(call.id.clone()));
+            self.messages.push(grim_format::ChatMessage {
+                role: "tool".to_string(),
+                content: output.clone(),
+                tool_call_id: Some(call.id.clone()),
+                name: Some(name),
+                tool_calls: None,
+            });
+            let _ = self.cmd_tx.send(WorkerCommand::ToolResult {
+                call_id: call.id,
+                output,
+            });
+        }
+        self.tool_approval_mode = false;
+    }
+
     /// Handle key presses during tool-call approval mode.
     fn handle_tool_approval_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
-                // Approve: execute the tool and send the result to the worker.
-                if let Some((call_id, name, arguments)) = self.pending_tool_call.take() {
-                    let call = grim_format::ToolCallMsg {
-                        id: call_id,
-                        name: name.clone(),
-                        arguments,
+                // Approve once.
+                self.approve_pending_tool();
+            }
+            KeyCode::Char('a') => {
+                // Always allow: persist a rule so future matching calls skip
+                // the prompt, then run this one.
+                if let Some((_, name, arguments)) = &self.pending_tool_call {
+                    let rule =
+                        permissions::rule_for_tool_call(name, arguments);
+                    let mut rules = self.permissions.lock().unwrap();
+                    rules.add(rule.clone());
+                    let summary = match &rule.command_prefix {
+                        Some(prefix) => format!("{} '{}…'", rule.tool, prefix),
+                        None => format!("'{}'", rule.tool),
                     };
-                    let result = crate::tui::tools::execute_tool(
-                        &call,
-                        &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
-                    );
-                    let output = match result {
-                        Ok(s) => s,
-                        Err(e) => format!("error: {e}"),
-                    };
-                    self.transcript.push_tool_result(output.clone());
-                    let _ = self.cmd_tx.send(WorkerCommand::ToolResult {
-                        call_id: call.id,
-                        output,
-                    });
+                    match rules.save() {
+                        Ok(()) => self
+                            .transcript
+                            .push_system(format!("always allowing {summary}")),
+                        Err(e) => self
+                            .transcript
+                            .push_system(format!("rule kept for this session; save failed: {e}")),
+                    }
                 }
-                self.tool_approval_mode = false;
+                self.approve_pending_tool();
             }
             KeyCode::Esc | KeyCode::Char('n') => {
                 // Deny: send an error result so the model knows the tool was rejected.
-                if let Some((call_id, _name, _arguments)) = self.pending_tool_call.take() {
-                    let _ = self.cmd_tx.send(WorkerCommand::ToolResult {
-                        call_id,
-                        output: "tool call denied by user".to_string(),
+                self.pending_tool_diff = None;
+                if let Some((call_id, name, _arguments)) = self.pending_tool_call.take() {
+                    let output = "tool call denied by user".to_string();
+                    self.messages.push(grim_format::ChatMessage {
+                        role: "tool".to_string(),
+                        content: output.clone(),
+                        tool_call_id: Some(call_id.clone()),
+                        name: Some(name),
+                        tool_calls: None,
                     });
+                    let _ = self.cmd_tx.send(WorkerCommand::ToolResult { call_id, output });
                 }
                 self.tool_approval_mode = false;
                 self.transcript
@@ -1850,12 +2018,33 @@ fn thinking_level_label(level: &grim_core::sampler::ThinkingLevel) -> String {
     }
 }
 
+/// Find the most recently modified *.jsonl session file in `dir`
+/// (--continue semantics). Ignores hidden files and errors: no sessions
+/// found returns None.
+fn latest_session_file(dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .filter_map(|p| {
+            let mtime = p.metadata().ok()?.modified().ok()?;
+            Some((mtime, p))
+        })
+        .max_by_key(|(mtime, _)| *mtime)
+        .map(|(_, p)| p)
+}
+
 /// Helper exporting transcript nodes to a text file or JSONL.
 fn export_transcript(transcript: &Transcript, path: &str) -> std::io::Result<usize> {
     use std::io::Write;
     let mut file = std::fs::File::create(path)?;
     let mut count = 0;
     if path.ends_with(".jsonl") {
+        // Map call id → tool name so tool result lines can carry the name
+        // (tool results appear after their calls in the node stream).
+        let mut call_names: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
         for node in &transcript.nodes {
             let role_str = match node.role {
                 Role::User => "user",
@@ -1866,11 +2055,27 @@ fn export_transcript(transcript: &Transcript, path: &str) -> std::io::Result<usi
                 Role::Error => "error",
                 Role::Hint => "hint",
             };
+            if node.role == Role::ToolCall {
+                if let (Some(id), Some(name)) = (&node.tool_call_id, &node.tool_name) {
+                    call_names.insert(id.as_str(), name.as_str());
+                }
+            }
+            let result_name = node
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| call_names.get(id).copied());
+            let tool_name_out = node
+                .tool_name
+                .clone()
+                .or_else(|| result_name.map(|s| s.to_string()));
             let obj = serde_json::json!({
                 "role": role_str,
                 "content": node.content,
                 "thinking": node.thinking,
                 "stats": node.turn_stats,
+                "tool_name": tool_name_out,
+                "tool_arguments": node.tool_arguments,
+                "tool_call_id": node.tool_call_id,
             });
             writeln!(file, "{}", obj)?;
             count += 1;
@@ -1931,6 +2136,18 @@ fn import_transcript(
                 .get("stats")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let tool_name = val
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let tool_args = val
+                .get("tool_arguments")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let tool_id = val
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let role = match role_str {
                 "user" => Role::User,
@@ -1942,14 +2159,46 @@ fn import_transcript(
                 _ => Role::Hint,
             };
 
-            if matches!(role, Role::User | Role::Assistant | Role::System) {
-                messages.push(grim_format::ChatMessage {
-                    role: role_str.to_string(),
-                    content: content.clone(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
+            match role {
+                Role::User | Role::Assistant | Role::System => {
+                    messages.push(grim_format::ChatMessage {
+                        role: role_str.to_string(),
+                        content: content.clone(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+                // Rebuild the canonical OpenAI sequence: tool_call lines
+                // become assistant messages carrying structured tool_calls…
+                Role::ToolCall => {
+                    if let (Some(id), Some(name), Some(args)) =
+                        (&tool_id, &tool_name, &tool_args)
+                    {
+                        messages.push(grim_format::ChatMessage {
+                            role: "assistant".to_string(),
+                            content: String::new(),
+                            tool_calls: Some(vec![grim_format::ToolCallMsg {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: args.clone(),
+                            }]),
+                            tool_call_id: None,
+                            name: None,
+                        });
+                    }
+                }
+                // …and tool_result lines become tool messages keyed by id.
+                Role::ToolResult => {
+                    messages.push(grim_format::ChatMessage {
+                        role: "tool".to_string(),
+                        content: content.clone(),
+                        tool_calls: None,
+                        tool_call_id: tool_id.clone(),
+                        name: tool_name.clone(),
+                    });
+                }
+                Role::Error | Role::Hint => {}
             }
 
             nodes.push(MessageNode {
@@ -1958,6 +2207,9 @@ fn import_transcript(
                 thinking,
                 thought_folded: true,
                 turn_stats: stats,
+                tool_name,
+                tool_arguments: tool_args,
+                tool_call_id: tool_id,
                 ..Default::default()
             });
         }
@@ -2056,7 +2308,7 @@ fn ui(f: &mut Frame, app: &App) {
     let c_amber      = Color::Rgb(245, 158, 11);   // generating
     let c_magenta    = Color::Rgb(232, 121, 249);  // tool call
     let c_green      = Color::Rgb(16, 185, 129);   // success
-    let _c_red       = Color::Rgb(239, 68, 68);    // error (used in transcript, not ui)
+    let c_red        = Color::Rgb(239, 68, 68);    // error, diff removals
     let c_muted      = Color::Rgb(136, 136, 136);  // muted text
 
     // 20-line gradient helper: lerp between two Rgb colors per char.
@@ -2450,7 +2702,11 @@ fn ui(f: &mut Frame, app: &App) {
             Some(b) => b.clone(),
             None => "auto".into(),
         };
-        let hints = "Ctrl+P palette  Ctrl+G skills  Ctrl+B backend  Ctrl+T think  Ctrl+D project  F4 model  /help";
+        let hints = if app.plan_mode {
+            "PLAN MODE · /plan off to resume editing"
+        } else {
+            "Ctrl+P palette  Ctrl+G skills  Ctrl+B backend  Ctrl+T think  Ctrl+D project  F4 model  /help"
+        };
 
         let mut status_spans = vec![
             Span::styled(" ", Style::default()),
@@ -2477,6 +2733,16 @@ fn ui(f: &mut Frame, app: &App) {
         if !skill_str.is_empty() {
             status_spans.push(Span::styled("  ", Style::default()));
             status_spans.push(Span::styled(skill_str, Style::default().fg(c_green)));
+        }
+        if app.plan_mode {
+            status_spans.push(Span::styled("  ", Style::default()));
+            status_spans.push(Span::styled(
+                " PLAN ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(c_amber)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         status_spans.push(Span::styled("  ", Style::default()));
         status_spans.push(Span::styled(hints, Style::default().fg(c_muted)));
@@ -2830,14 +3096,12 @@ fn ui(f: &mut Frame, app: &App) {
     // -----------------------------------------------------------------------
     if let Some((call_id, name, arguments)) = &app.pending_tool_call {
         let width = 72.min(f.area().width.saturating_sub(4));
-        let height = 12u16;
+        // Taller modal when an edit diff is available.
+        let diff = app.pending_tool_diff.as_ref();
+        let height: u16 = if diff.is_some() { 18 } else { 12 };
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
         let modal_area = Rect { x, y, width, height };
-
-        let pretty = serde_json::from_str::<serde_json::Value>(arguments)
-            .and_then(|v| serde_json::to_string_pretty(&v))
-            .unwrap_or_else(|_| arguments.clone());
 
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
@@ -2846,16 +3110,47 @@ fn ui(f: &mut Frame, app: &App) {
             Span::styled(format!("  id: {}", call_id), Style::default().fg(c_muted)),
         ]));
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("  arguments:", Style::default().fg(c_purple_soft))));
-        for arg_line in pretty.lines().take(5) {
+        if let Some(diff) = diff {
+            // Real diff view for edit tools.
+            let (added, removed) = diff::count_changes(diff);
             lines.push(Line::from(vec![
-                Span::styled("    + ", Style::default().fg(c_green)),
-                Span::styled(arg_line.to_string(), Style::default().fg(Color::White)),
+                Span::styled("  changes: ", Style::default().fg(c_purple_soft)),
+                Span::styled(format!("+{added}"), Style::default().fg(c_green)),
+                Span::styled(" / ", Style::default().fg(c_muted)),
+                Span::styled(format!("−{removed}"), Style::default().fg(c_red)),
             ]));
+            for dl in diff.iter().take(10) {
+                let (marker, style) = match dl.kind {
+                    diff::DiffKind::Added => ("+", Style::default().fg(c_green)),
+                    diff::DiffKind::Removed => ("−", Style::default().fg(c_red)),
+                    diff::DiffKind::Context => (" ", Style::default().fg(c_muted)),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {marker} "), Style::default().fg(c_muted)),
+                    Span::styled(dl.text.clone(), style),
+                ]));
+            }
+            if diff.len() > 10 {
+                lines.push(Line::from(Span::styled(
+                    format!("    … ({} more)", diff.len() - 10),
+                    Style::default().fg(c_muted),
+                )));
+            }
+        } else {
+            let pretty = serde_json::from_str::<serde_json::Value>(arguments)
+                .and_then(|v| serde_json::to_string_pretty(&v))
+                .unwrap_or_else(|_| arguments.clone());
+            lines.push(Line::from(Span::styled("  arguments:", Style::default().fg(c_purple_soft))));
+            for arg_line in pretty.lines().take(5) {
+                lines.push(Line::from(vec![
+                    Span::styled("    + ", Style::default().fg(c_green)),
+                    Span::styled(arg_line.to_string(), Style::default().fg(Color::White)),
+                ]));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "  Enter / y = approve     Esc / n = deny",
+            "  y/Enter: approve   a: always allow   n/Esc: deny",
             Style::default().fg(c_amber).add_modifier(Modifier::BOLD),
         )));
         let modal = Paragraph::new(lines).block(
@@ -2904,6 +3199,8 @@ pub async fn cmd_tui(
     max_tokens: usize,
     seed: u64,
     repeat_penalty: f32,
+    resume: Option<String>,
+    continue_last: bool,
 ) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(Error::Config(
@@ -2994,12 +3291,44 @@ pub async fn cmd_tui(
         seed,
         repeat_penalty,
     };
-    let worker = worker::spawn_worker(params, cmd_rx, evt_tx);
+    // One permissions store shared by worker (checks before prompting) and
+    // the App (adds rules on "always allow").
+    let perms = permissions::shared(permissions::PermissionRules::load());
+    let worker = worker::spawn_worker(params, cmd_rx, evt_tx, perms.clone());
     if let Some(m) = &model {
         let _ = cmd_tx.send(WorkerCommand::LoadModel { name: m.clone() });
     }
 
     let mut app = App::new(cmd_tx.clone());
+    app.permissions = perms;
+
+    // Session resume: --resume <path> uses that file; --continue picks the
+    // most recently modified *.jsonl in the current directory.
+    let resume_target = match (&resume, continue_last) {
+        (Some(path), _) => Some(path.clone()),
+        (None, true) => latest_session_file(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+        .map(|p| p.to_string_lossy().into_owned()),
+        (None, false) => None,
+    };
+    if let Some(path) = resume_target {
+        match import_transcript(&path) {
+            Ok((nodes, chat_msgs)) => {
+                let count = nodes.len();
+                app.transcript.nodes = nodes;
+                app.messages = chat_msgs;
+                app.transcript
+                    .push_system(format!("resumed session {path} ({count} nodes)"));
+            }
+            Err(e) => app
+                .transcript
+                .push_error(format!("failed to resume {path}: {e}")),
+        }
+    } else if continue_last {
+        app.transcript
+            .push_system("no saved session found to continue (no *.jsonl in cwd)".into());
+    }
     let mut scheduler = RenderScheduler::new();
     // Initial frame should render immediately.
     scheduler.request_render();
@@ -3097,6 +3426,111 @@ mod tests {
     #[test]
     fn module_loads() {
         assert!(!diagnostics::format_bytes(0).is_empty());
+    }
+
+    #[test]
+    fn test_session_roundtrip_preserves_tool_history() {
+        // Build a transcript with a tool exchange: user, assistant text,
+        // tool call, tool result, final assistant text.
+        let mut tr = Transcript::new();
+        tr.push_user("read main.rs".into());
+        tr.append_token("Sure, reading it now.");
+        tr.finish_segment();
+        tr.push_tool_call_with_diff(
+            "read_file",
+            Some("call_1"),
+            r#"{"path":"main.rs"}"#,
+            None,
+        );
+        tr.push_tool_result_for("fn main() {}".to_string(), Some("call_1".into()));
+        tr.append_token("It defines main().");
+        tr.finish_turn("done".into());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        export_transcript(&tr, path.to_str().unwrap()).unwrap();
+
+        let (nodes, messages) = import_transcript(path.to_str().unwrap()).unwrap();
+        assert_eq!(nodes.len(), 5);
+
+        // Message sequence must be a valid OpenAI tool exchange:
+        // user, assistant, assistant(tool_calls), tool(result), assistant.
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "Sure, reading it now.");
+        assert_eq!(messages[2].role, "assistant");
+        let calls = messages[2].tool_calls.as_ref().expect("tool_calls preserved");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "read_file");
+        assert!(calls[0].arguments.contains("main.rs"));
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[3].name.as_deref(), Some("read_file"));
+        assert_eq!(messages[4].role, "assistant");
+        assert_eq!(messages[4].content, "It defines main().");
+    }
+
+    #[test]
+    fn test_close_stream_segment_records_history() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.transcript.append_token("Here is the answer.");
+        app.close_stream_segment(None, None);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].role, "assistant");
+        assert_eq!(app.messages[0].content, "Here is the answer.");
+
+        // Streaming markup is stripped from stored content.
+        app.transcript
+            .append_token("Checking. <tool_call>{\"name\":\"read_file\"}</tool_call>");
+        app.close_stream_segment(Some("c9"), Some(("read_file", "{\"path\":\"x\"}")));
+        assert_eq!(app.messages[1].content, "Checking.");
+        assert_eq!(
+            app.messages[1].tool_calls.as_ref().unwrap()[0].id,
+            "c9"
+        );
+
+        // Empty segments are skipped.
+        let before = app.messages.len();
+        app.close_stream_segment(None, None);
+        assert_eq!(app.messages.len(), before);
+    }
+
+    #[test]
+    fn test_latest_session_file_picks_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("old.jsonl");
+        let b = dir.path().join("new.jsonl");
+        std::fs::write(&a, "{}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&b, "{}\n").unwrap();
+        std::fs::write(dir.path().join("not-a-session.txt"), "x").unwrap();
+        assert_eq!(latest_session_file(dir.path()), Some(b));
+        assert!(latest_session_file(&dir.path().join("empty")).is_none());
+    }
+
+    #[test]
+    fn test_plan_mode_toggles_and_notifies_worker() {
+        assert!(matches!(parse_slash_command("/plan"), SlashCommand::Plan(None)));
+        assert!(matches!(
+            parse_slash_command("/plan on"),
+            SlashCommand::Plan(Some(s)) if s == "on"
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        assert!(!app.plan_mode);
+        app.submit_chat("/plan");
+        assert!(app.plan_mode);
+        match rx.try_recv().unwrap() {
+            WorkerCommand::SetPlanMode { enabled } => assert!(enabled),
+            other => panic!("expected SetPlanMode, got {other:?}"),
+        }
+        app.submit_chat("/plan off");
+        assert!(!app.plan_mode);
+        match rx.try_recv().unwrap() {
+            WorkerCommand::SetPlanMode { enabled } => assert!(!enabled),
+            other => panic!("expected SetPlanMode, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3796,6 +4230,9 @@ mod tests {
         assert!(app.backend.is_none());
     }
 
+    /// Only compiles with --features cuda: the test pokes the optional
+    /// CUDA crate directly.
+    #[cfg(feature = "cuda")]
     #[test]
     fn test_backend_rejects_unavailable() {
         let (tx, _rx) = std::sync::mpsc::channel();

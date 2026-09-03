@@ -232,6 +232,12 @@ enum Commands {
         /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama.
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
+        /// Resume a saved session (JSONL transcript, as written by /save).
+        #[arg(long, value_name = "PATH")]
+        resume: Option<String>,
+        /// Continue the most recently saved session (*.jsonl in the current directory).
+        #[arg(short = 'c', long = "continue")]
+        continue_last: bool,
     },
     /// Delete a model from local cache.
     Rm {
@@ -1223,6 +1229,8 @@ async fn main() -> Result<()> {
             max_tokens,
             seed,
             repeat_penalty,
+            resume,
+            continue_last,
         } => {
             tui::cmd_tui(
                 model,
@@ -1232,6 +1240,8 @@ async fn main() -> Result<()> {
                 max_tokens,
                 seed,
                 repeat_penalty,
+                resume,
+                continue_last,
             )
             .await?;
         }

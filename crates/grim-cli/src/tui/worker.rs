@@ -42,6 +42,10 @@ pub enum WorkerCommand {
     SetThinking {
         level: grim_core::sampler::ThinkingLevel,
     },
+    /// UI → worker: toggle plan mode (read-only tools only, plan prompt).
+    SetPlanMode {
+        enabled: bool,
+    },
     Cancel,
     Quit,
 }
@@ -71,6 +75,20 @@ pub enum WorkerEvent {
         call_id: String,
         name: String,
         arguments: String,
+    },
+    /// Worker → UI: a tool the worker auto-executed (read-only or covered by
+    /// an always-allow rule). The UI mirrors it into the transcript and the
+    /// message history it owns, so the next turn sees the tool exchange.
+    ToolExec {
+        call_id: String,
+        name: String,
+        arguments: String,
+        output: String,
+    },
+    /// Worker → UI: the model emitted `update_tasks`; the UI replaces its
+    /// sidebar task list with these items.
+    TaskSync {
+        tasks: Vec<crate::tui::tools::TaskItem>,
     },
     TurnComplete {
         stats: TurnStats,
@@ -192,7 +210,21 @@ struct Worker {
     cancel_requested: bool,
     /// Active backend name for diagnostics display (rocm, cuda, metal, cpu).
     backend: String,
+    /// Persisted always-allow rules shared with the UI thread. A mutation
+    /// tool covered by a rule runs without the approval prompt.
+    permissions: crate::tui::permissions::SharedPermissions,
+    /// Plan mode: mutations are hard-blocked and a plan-first system
+    /// preamble is injected into each prompt.
+    plan_mode: bool,
 }
+
+/// System preamble injected when plan mode is active. Read-only tools stay
+/// available so the model can research the codebase before writing the plan.
+const PLAN_MODE_PREAMBLE: &str = "PLAN MODE ACTIVE. You are exploring and planning only. \
+You may use read_file, list_files, search_files, and update_tasks to research the codebase. \
+write_file, edit_file, and run_command are DISABLED in this mode — any call to them is rejected. \
+Research thoroughly, then present a concrete implementation plan: files to change, what to change, \
+and in what order. End the plan with a question asking the user whether to proceed with implementation.";
 
 impl Worker {
     fn handle(&mut self, cmd: WorkerCommand, rx: &Receiver<WorkerCommand>) -> WorkerOutcome {
@@ -209,6 +241,10 @@ impl Worker {
                 self.sampling_params.thinking_level = level;
                 // Rebuild the sampler so the new thinking level takes effect.
                 self.sampler = self.sampling_params.clone().into_sampler(self.seed);
+                WorkerOutcome::Ignored
+            }
+            WorkerCommand::SetPlanMode { enabled } => {
+                self.plan_mode = enabled;
                 WorkerOutcome::Ignored
             }
             WorkerCommand::SetContextLimit { limit } => {
@@ -230,6 +266,22 @@ impl Worker {
             }
             WorkerCommand::LoadModel { name } => self.load_model(name),
             WorkerCommand::Generate { messages } => {
+                // Plan mode prepends its preamble without touching the UI's
+                // copy of the history.
+                let messages = if self.plan_mode {
+                    let mut m = Vec::with_capacity(messages.len() + 1);
+                    m.push(grim_format::ChatMessage {
+                        role: "system".to_string(),
+                        content: PLAN_MODE_PREAMBLE.to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                    m.extend(messages);
+                    m
+                } else {
+                    messages
+                };
                 if self.tools_enabled {
                     self.agentic_generate(messages, rx, &crate::tui::tools::coding_tools(), self.sandbox_root.clone());
                 } else {
@@ -630,15 +682,86 @@ impl Worker {
                 }
             };
 
+            // Record the assistant message that produced these calls BEFORE
+            // appending tool results, so the message history matches the
+            // canonical sequence (assistant with tool_calls, then one tool
+            // message per call) on the next render.
+            messages.push(grim_format::ChatMessage {
+                role: "assistant".to_string(),
+                content: crate::tui::tools::strip_tool_markup(&generated_text),
+                tool_calls: Some(calls.clone()),
+                tool_call_id: None,
+                name: None,
+            });
+
             // Process each tool call.
             for call in calls {
                 let call_id = call.id.clone();
                 let name = call.name.clone();
 
+                // update_tasks targets the UI sidebar, not the filesystem:
+                // parse it here, push the new list to the UI, and reply with
+                // a summary — no approval needed, it mutates no user data.
+                if name == "update_tasks" {
+                    let output = match crate::tui::tools::parse_update_tasks(&call.arguments)
+                    {
+                        Ok(items) => {
+                            let summary = crate::tui::tools::summarize_tasks(&items);
+                            let _ = self.tx.send(WorkerEvent::TaskSync { tasks: items });
+                            summary
+                        }
+                        Err(e) => format!("error: {e}"),
+                    };
+                    let _ = self.tx.send(WorkerEvent::ToolExec {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: call.arguments.clone(),
+                        output: output.clone(),
+                    });
+                    messages.push(grim_format::ChatMessage {
+                        role: "tool".to_string(),
+                        content: output,
+                        tool_call_id: Some(call_id),
+                        name: Some(name),
+                        tool_calls: None,
+                    });
+                    continue;
+                }
+
+                // Plan mode hard-blocks mutations: answer the model with a
+                // rejection instead of prompting the user, so the loop keeps
+                // going and the model must present a plan as text.
+                if self.plan_mode {
+                    let output = format!(
+                        "rejected: plan mode is active. {name} is disabled; \
+                         present the plan and ask the user to exit plan mode."
+                    );
+                    let _ = self.tx.send(WorkerEvent::ToolExec {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: call.arguments.clone(),
+                        output: output.clone(),
+                    });
+                    messages.push(grim_format::ChatMessage {
+                        role: "tool".to_string(),
+                        content: output,
+                        tool_call_id: Some(call_id),
+                        name: Some(name),
+                        tool_calls: None,
+                    });
+                    continue;
+                }
+
                 // Auto-execute read-only tools; request approval for mutations.
                 let is_read_only =
                     matches!(name.as_str(), "read_file" | "list_files" | "search_files");
-                if is_read_only {
+                let allowed = is_read_only || {
+                    self.permissions
+                        .lock()
+                        .map(|p| p.permits(&name, &call.arguments))
+                        .unwrap_or(false)
+                };
+                if allowed {
                     let result = crate::tui::tools::execute_tool(
                         &call,
                         &crate::tui::tools::Sandbox::new(sandbox_root.clone()),
@@ -647,6 +770,14 @@ impl Worker {
                         Ok(s) => s,
                         Err(e) => format!("error: {e}"),
                     };
+                    // Mirror the exchange to the UI so the transcript shows
+                    // the call and the next turn's history includes it.
+                    let _ = self.tx.send(WorkerEvent::ToolExec {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: call.arguments.clone(),
+                        output: output.clone(),
+                    });
                     messages.push(grim_format::ChatMessage {
                         role: "tool".to_string(),
                         content: output,
@@ -776,6 +907,7 @@ pub fn spawn_worker(
     params: WorkerParams,
     rx: Receiver<WorkerCommand>,
     tx: Sender<WorkerEvent>,
+    permissions: crate::tui::permissions::SharedPermissions,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let sampling = SamplingParams {
@@ -801,6 +933,8 @@ pub fn spawn_worker(
             sandbox_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             cancel_requested: false,
             backend: "rocm".into(), // Updated when a model is loaded.
+            permissions,
+            plan_mode: false,
         };
 
         loop {

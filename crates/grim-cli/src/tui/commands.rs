@@ -117,6 +117,11 @@ impl CommandRegistry {
             description: "Set thinking/reasoning effort level (Ctrl+T to cycle)",
         });
         reg.register(CommandSpec {
+            name: "plan",
+            hint: "[on|off]",
+            description: "Toggle plan mode: read-only tools, model proposes a plan first",
+        });
+        reg.register(CommandSpec {
             name: "backend",
             hint: "[rocm|cuda|metal|cpu|auto]",
             description: "Select inference backend (auto-detect if unset)",
