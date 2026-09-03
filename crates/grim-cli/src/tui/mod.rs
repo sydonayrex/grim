@@ -87,6 +87,9 @@ pub mod compact;
 /// File-store checkpoints for agent edits.
 pub mod checkpoints;
 
+/// MCP (Model Context Protocol) client support.
+pub mod mcp;
+
 /// Keyboard-navigable selection menu.
 pub mod select_list;
 
