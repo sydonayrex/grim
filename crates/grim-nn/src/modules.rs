@@ -105,37 +105,44 @@ pub fn embedding_gather_on_device(
 ) -> Result<Tensor> {
     let dev = pick_device_for_tensor(weight);
     let out_shape = Shape::new(vec![seq_len, dim]);
-    match CoreTensorOps::embedding(&*dev, weight.storage().as_ref(), indices, &out_shape) {
-        Ok((s, _handle)) => Ok(Tensor::new(
-            Arc::from(s),
-            out_shape,
-            DType::F32,
-            weight.provenance().clone(),
-            weight.device().clone(),
-        )),
-        Err(e) if is_kernel_unimplemented(&e) => {
-            // Host fallback: gather rows on the CPU and upload once.
-            let table = weight.to_vec_f32()?;
-            let mut h = vec![0.0f32; seq_len * dim];
-            for (i, &tok) in indices.iter().enumerate() {
-                let tok = tok as usize;
-                let src = tok * dim;
-                let dst = i * dim;
-                if src + dim <= table.len() && dst + dim <= h.len() {
-                    h[dst..dst + dim].copy_from_slice(&table[src..src + dim]);
-                }
-            }
-            let storage = dev.from_cpu(&h, &out_shape, DType::F32)?;
-            Ok(Tensor::new(
-                Arc::from(storage),
+    // Kernel contract: a 2-D `[vocab, dim]` table. Some legacy loaders (and
+    // tests) build Linear-shaped embeddings whose storage is transposed —
+    // those keep the flat host-gather semantics below.
+    let table_is_kernel_shaped = weight.shape().rank() == 2
+        && weight.shape().dim(1).map(|d| d == dim).unwrap_or(false);
+    if table_is_kernel_shaped {
+        if let Ok((s, _handle)) =
+            CoreTensorOps::embedding(&*dev, weight.storage().as_ref(), indices, &out_shape)
+        {
+            return Ok(Tensor::new(
+                Arc::from(s),
                 out_shape,
                 DType::F32,
                 weight.provenance().clone(),
                 weight.device().clone(),
-            ))
+            ));
         }
-        Err(e) => Err(e),
     }
+    // Host fallback: flat row-major gather over the raw table (bounds-
+    // checked; missing rows stay zero), uploaded once.
+    let table = weight.to_vec_f32()?;
+    let mut h = vec![0.0f32; seq_len * dim];
+    for (i, &tok) in indices.iter().enumerate() {
+        let tok = tok as usize;
+        let src = tok * dim;
+        let dst = i * dim;
+        if src + dim <= table.len() && dst + dim <= h.len() {
+            h[dst..dst + dim].copy_from_slice(&table[src..src + dim]);
+        }
+    }
+    let storage = dev.from_cpu(&h, &out_shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        weight.provenance().clone(),
+        weight.device().clone(),
+    ))
 }
 
 /// True when the error means "this backend lacks the kernel" (as opposed to

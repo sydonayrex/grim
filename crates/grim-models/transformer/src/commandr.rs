@@ -189,7 +189,10 @@ impl CommandRBlock {
             positions,
         )?;
 
-        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+        // GPU-first: fused tensor-level attention; on backends that reject the
+        // kernel call (e.g. no fused kernel) fall back to the host-history
+        // entry, which degrades to the scalar reference on CPU.
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q,
             &k,
             &v,
@@ -199,7 +202,20 @@ impl CommandRBlock {
             seq_len,
             seq_len,
             None,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q.to_vec_f32()?,
+                &k.to_vec_f32()?,
+                &v.to_vec_f32()?,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.wo.forward(&attn_tensor)?;
         let mlp_out = self.mlp.forward(&normed)?;
 

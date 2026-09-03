@@ -65,29 +65,6 @@ impl LayerNorm {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Move a host-produced tensor (QKV split pieces, GELU / LayerNorm kernel-gap
-/// outputs) onto `device` when it is not already resident there.
-fn reupload_to_device(t: &Tensor, device: &Device) -> Result<Tensor> {
-    if t.device() == device {
-        return Ok(t.clone());
-    }
-    let data = t.to_vec_f32()?;
-    let shape = t.shape().clone();
-    let dev = grim_nn::modules::pick_device_for_storage_device(device);
-    let storage = dev.from_cpu(&data, &shape, grim_tensor::DType::F32)?;
-    Ok(Tensor::new(
-        std::sync::Arc::from(storage),
-        shape,
-        grim_tensor::DType::F32,
-        t.provenance().clone(),
-        device.clone(),
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -234,7 +211,7 @@ impl FalconBlock {
         let seq_len = x.shape().dims()[0];
         let attn_normed = self.ln_attn.forward(x)?;
         let mlp_normed = if let Some(ref ln) = self.ln_mlp {
-            reupload_to_device(&ln.forward(x)?, x.device())?
+            grim_nn::modules::move_to_device(&ln.forward(x)?, x.device())?
         } else {
             attn_normed.clone()
         };
@@ -263,15 +240,15 @@ impl FalconBlock {
                 .copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
         }
 
-        let q_rot = reupload_to_device(
+        let q_rot = grim_nn::modules::move_to_device(
             &cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim])),
             x.device(),
         )?;
-        let k_rot = reupload_to_device(
+        let k_rot = grim_nn::modules::move_to_device(
             &cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim])),
             x.device(),
         )?;
-        let v_tensor = reupload_to_device(
+        let v_tensor = grim_nn::modules::move_to_device(
             &cpu_tensor(v_data, Shape::new(vec![seq_len, v_dim])),
             x.device(),
         )?;
@@ -304,8 +281,9 @@ impl FalconBlock {
         let kv_len = k_all.shape().dims()[0];
 
         // GQA attention on-device; the shared helper applies the causal mask
-        // at cache_offset + s.
-        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+        // at cache_offset + s. On backends that reject the kernel call fall
+        // back to the host-history entry (scalar reference on CPU).
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q_rot,
             &k_all,
             &v_all,
@@ -315,7 +293,20 @@ impl FalconBlock {
             seq_len,
             kv_len,
             None,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                &q_rot.to_vec_f32()?,
+                &k_all.to_vec_f32()?,
+                &v_all.to_vec_f32()?,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                seq_len,
+                None,
+                x.device(),
+            )?,
+        };
         let attn_proj = self.dense.forward(&attn_tensor)?;
 
         // 2. MLP branch (GELU — host kernel gap, pulled once, re-uploaded).
@@ -328,7 +319,7 @@ impl FalconBlock {
                 0.5 * v * (1.0 + c.tanh())
             })
             .collect();
-        let mlp_act = reupload_to_device(
+        let mlp_act = grim_nn::modules::move_to_device(
             &cpu_tensor(gelu_v, mlp_mid.shape().clone()),
             x.device(),
         )?;

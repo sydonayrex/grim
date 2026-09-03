@@ -2,7 +2,6 @@
 
 /// Decode outputs: `(hidden_after_blocks, logits, per-layer (key, value) KV pairs)`.
 type DecodeOutputs = (Tensor, Tensor, Vec<(Tensor, Tensor)>);
-use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
 use grim_core::error::Result;
@@ -12,7 +11,6 @@ use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::RmsNorm;
 use grim_nn::Rope;
-use grim_nn::pick_device_for_storage_device;
 use grim_nn::{ColumnParallelLinear, Embedding, Linear, RowParallelLinear, TensorParallelConfig};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
@@ -577,22 +575,13 @@ impl CausalLm for Llama {
             }
         };
         let seq_len = ids.len();
-        let hidden: Vec<f32> = self
+        // Device-first: `Embedding::forward` gathers rows on the weight's
+        // device and already allocates the storage at rank-2
+        // [seq_len, hidden] — exactly what backend matmuls require. No
+        // host roundtrip needed here.
+        let hidden_t = self
             .tok_embeddings
-            .forward(&ids, seq_len, self.cfg.hidden_size)?
-            .to_vec_f32()?;
-        // 2-D [seq_len, hidden] (batch=1): block layers feed this straight
-        // into backend matmuls, which require storage rank 2.
-        let hidden_shape = Shape::new(vec![seq_len, self.cfg.hidden_size]);
-        let dev = pick_device_for_storage_device(&self.device);
-        let hidden_storage = dev.from_cpu(&hidden, &hidden_shape, DType::F32)?;
-        let hidden_t = Tensor::new(
-            Arc::from(hidden_storage),
-            hidden_shape.clone(),
-            DType::F32,
-            self.tok_embeddings.weight.provenance().clone(),
-            self.device.clone(),
-        );
+            .forward(&ids, seq_len, self.cfg.hidden_size)?;
         // MAJ-3: use the positions tensor passed by the engine instead of
         // hardcoding 0..seq_len. During decode the engine passes the actual
         // current_pos so RoPE sees the correct absolute position.

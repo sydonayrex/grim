@@ -1,6 +1,6 @@
 //! T5 family — Encoder-Decoder architecture using relative position bias.
 
-use grim_backend_cpu::{add_tensors, cpu_tensor};
+use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, EncoderDecoderLm, ModalityHint};
 use grim_core::{Model, ModelConfig};
@@ -108,14 +108,16 @@ impl T5Block {
         let _k = self.wk.forward(&norm_x)?;
         let _v = self.wv.forward(&norm_x)?;
         let attn_out = self.wo.forward(&q)?;
-        let x_res1 = add_tensors(x, &attn_out).map_err(grim_core::Error::Tensor)?;
+        let x_res1 = grim_nn::modules::add_on_device(x, &attn_out)
+            .map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let up = self.ffn_up.forward(&norm_x2)?;
+        // ReLU: host kernel gap (no device ReLU kernel).
         let relu_up = relu(&up)?;
         let ffn_out = self.ffn_down.forward(&relu_up)?;
 
-        add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
+        grim_nn::modules::add_on_device(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -247,6 +249,7 @@ impl CausalLm for T5 {
     }
 }
 
+/// ReLU activation — host kernel gap (no device ReLU kernel).
 fn relu(t: &Tensor) -> Result<Tensor> {
     let v = t.to_vec_f32()?;
     let mut out = vec![0.0f32; v.len()];

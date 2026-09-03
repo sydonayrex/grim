@@ -372,45 +372,69 @@ pub fn fused_attention_tensors(
     let k3 = crate::block::reshaped_view(k, &Shape::new(vec![kv_len, num_kv_heads, head_dim]))?;
     let v3 = crate::block::reshaped_view(v, &Shape::new(vec![kv_len, num_kv_heads, head_dim]))?;
     let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
-    match dev.qkv_attention(
-        q3.storage().as_ref(),
-        k3.storage().as_ref(),
-        v3.storage().as_ref(),
-        num_kv_heads,
-        kv_len,
-        cache_offset as u32,
-        window,
-        &out_shape,
-        None,
-        None,
-    ) {
-        Ok((storage, _handle)) => Ok(Tensor::new(
-            Arc::from(storage),
-            out_shape,
-            DType::F32,
-            grim_tensor::QuantProvenance::default(),
-            device.clone(),
-        )),
-        Err(e) if grim_nn::is_kernel_unimplemented(&e) => {
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            scalar_attention(
-                &q.to_vec_f32()?,
-                &k.to_vec_f32()?,
-                &v.to_vec_f32()?,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                steps,
-                kv_len,
-                cache_offset,
-                window,
-                scale,
-                &dev,
-                &device,
-            )
-        }
-        Err(e) => Err(grim_core::error::Error::from(e)),
-    }
+    let q3s = q3.storage().as_ref();
+    let k3s = k3.storage().as_ref();
+    let v3s = v3.storage().as_ref();
+    // Kernel contracts differ per backend: ROCm/CUDA allocate the flat
+    // `[steps, heads*dim]` output directly; the CPU kernel requires a 3-D
+    // `[steps, heads, dim]` out_shape. Try flat, retry 3-D, relabel the
+    // storage to the flat consumer shape (zero-copy) when needed.
+    let fused = |out: &Shape| {
+        dev.qkv_attention(
+            q3s,
+            k3s,
+            v3s,
+            num_kv_heads,
+            kv_len,
+            cache_offset as u32,
+            window,
+            out,
+            None,
+            None,
+        )
+    };
+    let dim3 = Shape::new(vec![steps, num_heads, head_dim]);
+    let storage = match fused(&out_shape) {
+        Ok((s, _handle)) => s,
+        Err(flat_err) => match fused(&dim3) {
+            Ok((s, _handle)) => {
+                let t = Tensor::new(
+                    Arc::from(s),
+                    dim3,
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    device.clone(),
+                );
+                return crate::block::reshaped_view(&t, &out_shape);
+            }
+            Err(e) if grim_nn::is_kernel_unimplemented(&e) => {
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                return scalar_attention(
+                    &q.to_vec_f32()?,
+                    &k.to_vec_f32()?,
+                    &v.to_vec_f32()?,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    steps,
+                    kv_len,
+                    cache_offset,
+                    window,
+                    scale,
+                    &dev,
+                    &device,
+                );
+            }
+            Err(_) => return Err(grim_core::error::Error::from(flat_err)),
+        },
+    };
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
 }
 
 /// Concatenate two `[rows_a, width]` / `[rows_b, width]` tensors along rows

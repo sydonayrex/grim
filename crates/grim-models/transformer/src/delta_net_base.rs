@@ -218,30 +218,18 @@ impl DeltaNetBlock {
         let normed_attn = self.attn_norm.forward(x)?;
         let attn_out = self.attn.forward(&normed_attn, state)?;
 
-        let xv = x.to_vec_f32()?;
-        let av = attn_out.to_vec_f32()?;
-        let res1: Vec<f32> = xv.iter().zip(av.iter()).map(|(&a, &b)| a + b).collect();
-        let res1_t = cpu_tensor(res1, x.shape().clone());
+        // Residual adds and SwiGLU on-device; only the delta-rule scan
+        // above stays host-side (no device kernel for the recurrence).
+        let res1_t = grim_nn::modules::add_on_device(x, &attn_out)?;
 
         let normed_ffn = self.ffn_norm.forward(&res1_t)?;
         let gate = self.w_gate.forward(&normed_ffn)?;
         let up = self.w_up.forward(&normed_ffn)?;
+        let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+        let mlp_out = self.w_down.forward(&act)?;
 
-        let gv = gate.to_vec_f32()?;
-        let uv = up.to_vec_f32()?;
-        let swiglu: Vec<f32> = gv
-            .iter()
-            .zip(uv.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let swiglu_t = cpu_tensor(swiglu, gate.shape().clone());
-        let mlp_out = self.w_down.forward(&swiglu_t)?;
-
-        let r1v = res1_t.to_vec_f32()?;
-        let mv = mlp_out.to_vec_f32()?;
-        let out_vec: Vec<f32> = r1v.iter().zip(mv.iter()).map(|(&a, &b)| a + b).collect();
-
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        grim_nn::modules::add_on_device(&res1_t, &mlp_out)
+            .map_err(grim_core::error::Error::from)
     }
 }
 
@@ -331,26 +319,33 @@ impl CausalLm for DeltaNetBase {
     ) -> Result<Tensor> {
         let ids = input_ids.to_vec_f32()?;
         let seq_len = ids.len();
-        let mut hidden = vec![0.0f32; seq_len * self.cfg.hidden_size];
 
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        for (i, &tok_f) in ids.iter().enumerate() {
-            let tok = tok_f as usize;
-            // An out-of-vocab token id is a tokenizer contract violation:
-            // silently embedding a zero row would feed garbage through every
-            // downstream layer with no signal — error instead.
-            if tok >= self.cfg.vocab_size {
-                return Err(Error::Session(format!(
-                    "delta_net: token id {tok} at position {i} is out of vocab (vocab_size = {})",
-                    self.cfg.vocab_size
-                )));
-            }
-            hidden[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size].copy_from_slice(
-                &embed_w[tok * self.cfg.hidden_size..(tok + 1) * self.cfg.hidden_size],
-            );
-        }
+        // An out-of-vocab token id is a tokenizer contract violation:
+        // silently embedding a zero row would feed garbage through every
+        // downstream layer with no signal — error instead.
+        let ids_u32: Vec<u32> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &tok_f)| {
+                let tok = tok_f as usize;
+                if tok >= self.cfg.vocab_size {
+                    return Err(Error::Session(format!(
+                        "delta_net: token id {tok} at position {i} is out of vocab (vocab_size = {})",
+                        self.cfg.vocab_size
+                    )));
+                }
+                Ok(tok as u32)
+            })
+            .collect::<Result<Vec<u32>>>()?;
 
-        let mut x = cpu_tensor(hidden, Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        // GPU-first embedding gather — the vocab×hidden table never crosses
+        // to host.
+        let mut x = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids_u32,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
 
         // Audit fix (grim-models): the per-layer delta-rule states used to be
         // a LOCAL vec — every forward started from zeroed delta-state, so
