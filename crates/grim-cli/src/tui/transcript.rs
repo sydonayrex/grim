@@ -22,7 +22,7 @@ pub enum Role {
 
 /// One structured node in the chat history.
 #[derive(Debug, Clone)]
-pub struct MessageNode {
+    pub struct MessageNode {
     /// Author role determining visual styling and prefix.
     pub role: Role,
     /// Message textual content.
@@ -37,6 +37,11 @@ pub struct MessageNode {
     pub tool_name: Option<String>,
     /// Pretty-printed tool arguments (JSON) for ToolCall.
     pub tool_arguments: Option<String>,
+    /// Precomputed edit preview for edit_file / write_file tool calls.
+    pub tool_diff: Option<Vec<crate::tui::diff::DiffLine>>,
+    /// Tool call id (survives export/import so resumed sessions keep
+    /// matching tool_calls ↔ tool results).
+    pub tool_call_id: Option<String>,
 }
 
 impl Default for MessageNode {
@@ -49,6 +54,8 @@ impl Default for MessageNode {
             turn_stats: None,
             tool_name: None,
             tool_arguments: None,
+            tool_diff: None,
+            tool_call_id: None,
         }
     }
 }
@@ -161,6 +168,17 @@ impl Transcript {
 
     /// Add a tool call invocation message with structured name + arguments.
     pub fn push_tool_call(&mut self, name: &str, arguments: &str) {
+        self.push_tool_call_with_diff(name, None, arguments, None);
+    }
+
+    /// Add a tool call with an optional edit preview (edit_file / write_file).
+    pub fn push_tool_call_with_diff(
+        &mut self,
+        name: &str,
+        call_id: Option<&str>,
+        arguments: &str,
+        diff: Option<Vec<crate::tui::diff::DiffLine>>,
+    ) {
         let pretty = serde_json::from_str::<serde_json::Value>(arguments)
             .and_then(|v| serde_json::to_string_pretty(&v))
             .unwrap_or_else(|_| arguments.to_string());
@@ -172,12 +190,20 @@ impl Transcript {
             turn_stats: None,
             tool_name: Some(name.to_string()),
             tool_arguments: Some(arguments.to_string()),
+            tool_diff: diff,
+            tool_call_id: call_id.map(|s| s.to_string()),
         });
         self.invalidate_cache();
     }
 
     /// Add a tool result output message.
     pub fn push_tool_result(&mut self, text: String) {
+        self.push_tool_result_for(text, None);
+    }
+
+    /// Add a tool result attributed to a specific call id (needed so the
+    /// exported session can rebuild valid tool-message sequences).
+    pub fn push_tool_result_for(&mut self, text: String, call_id: Option<String>) {
         self.nodes.push(MessageNode {
             role: Role::ToolResult,
             content: text,
@@ -186,6 +212,8 @@ impl Transcript {
             turn_stats: None,
             tool_name: None,
             tool_arguments: None,
+            tool_diff: None,
+            tool_call_id: call_id,
         });
         self.invalidate_cache();
     }
@@ -198,6 +226,29 @@ impl Transcript {
         // but clearing avoids stale cache holding large vec during rapid streaming.
         // We do not clear aggressively to allow the virtualized path to reuse partial.
         self.invalidate_cache();
+    }
+
+    /// Finalize the current streaming buffer as an assistant node with no
+    /// stats footer. Used mid-turn when a tool call interrupts the stream so
+    /// the transcript reads: text → tool call → result → more text.
+    /// A no-op when nothing has streamed yet.
+    pub fn finish_segment(&mut self) {
+        if self.streaming_raw.is_empty() {
+            return;
+        }
+        self.finish_turn(String::new());
+        // Drop the empty stats line finish_turn just attached.
+        if let Some(last) = self.nodes.last_mut() {
+            last.turn_stats = None;
+        }
+    }
+
+    /// Content of the streaming buffer with tool-call markup and think tags
+    /// removed — what should be stored as the assistant's message content in
+    /// the history the next turn is built from.
+    pub fn streaming_text_clean(&self) -> String {
+        let (_thinking, content) = parse_thinking_tags(&self.streaming_raw);
+        crate::tui::tools::strip_tool_markup(&content)
     }
 
     /// Finalize assistant turn, parsing optional `<think>...</think>` tags and attaching metrics.
@@ -372,18 +423,75 @@ impl Transcript {
                 Role::ToolCall => {
                     // ╭─ tool: <name> ──
                     let name = node.tool_name.as_deref().unwrap_or("unknown");
-                    lines.push(Line::from(vec![
+                    let target = node
+                        .tool_arguments
+                        .as_deref()
+                        .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                        .and_then(|v| {
+                            v["path"]
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| v["command"].as_str().map(|s| s.to_string()))
+                        });
+                    let mut header = vec![
                         Span::styled("╭─ ", Style::default().fg(c_purple_dim)),
                         Span::styled("tool", Style::default().fg(c_magenta).add_modifier(Modifier::BOLD)),
                         Span::styled(format!(": {} ", name), Style::default().fg(Color::White)),
-                        Span::styled("────────────────────────────", Style::default().fg(c_purple_dim)),
-                    ]));
-                    // Arguments as diff-like green lines.
-                    for arg_line in node.content.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("│ + ", Style::default().fg(c_green)),
-                            Span::styled(arg_line.to_string(), Style::default().fg(Color::White)),
-                        ]));
+                    ];
+                    if let Some(ref t) = target {
+                        header.push(Span::styled(
+                            format!("({t}) "),
+                            Style::default().fg(c_muted),
+                        ));
+                    }
+                    if let Some(diff) = &node.tool_diff {
+                        let (added, removed) = crate::tui::diff::count_changes(diff);
+                        header.push(Span::styled(
+                            format!("+{added} −{removed} "),
+                            Style::default().fg(c_amber),
+                        ));
+                    }
+                    header.push(Span::styled("────────────────────────────", Style::default().fg(c_purple_dim)));
+                    lines.push(Line::from(header));
+
+                    if let Some(diff) = &node.tool_diff {
+                        // Edit preview as a real diff: red removals, green
+                        // additions, dim context. Cap display length.
+                        const MAX_DIFF_LINES: usize = 60;
+                        for dl in diff.iter().take(MAX_DIFF_LINES) {
+                            let (gutter, style) = match dl.kind {
+                                crate::tui::diff::DiffKind::Added => (
+                                    "│ + ",
+                                    Style::default().fg(c_green),
+                                ),
+                                crate::tui::diff::DiffKind::Removed => (
+                                    "│ − ",
+                                    Style::default().fg(c_red),
+                                ),
+                                crate::tui::diff::DiffKind::Context => (
+                                    "│   ",
+                                    Style::default().fg(c_muted),
+                                ),
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(gutter, Style::default().fg(c_purple_dim)),
+                                Span::styled(dl.text.clone(), style),
+                            ]));
+                        }
+                        if diff.len() > MAX_DIFF_LINES {
+                            lines.push(Line::from(Span::styled(
+                                format!("│   … ({} more diff lines)", diff.len() - MAX_DIFF_LINES),
+                                Style::default().fg(c_muted),
+                            )));
+                        }
+                    } else {
+                        // Non-edit tools: arguments as diff-like green lines.
+                        for arg_line in node.content.lines() {
+                            lines.push(Line::from(vec![
+                                Span::styled("│ + ", Style::default().fg(c_green)),
+                                Span::styled(arg_line.to_string(), Style::default().fg(Color::White)),
+                            ]));
+                        }
                     }
                     lines.push(Line::from(vec![
                         Span::styled("╰───────────────────────────────────", Style::default().fg(c_purple_dim)),
