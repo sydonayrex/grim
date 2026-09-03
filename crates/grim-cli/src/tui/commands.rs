@@ -122,6 +122,11 @@ impl CommandRegistry {
             description: "Toggle plan mode: read-only tools, model proposes a plan first",
         });
         reg.register(CommandSpec {
+            name: "compact",
+            hint: "",
+            description: "Summarize older context now to free tokens (auto-runs at 85% context)",
+        });
+        reg.register(CommandSpec {
             name: "backend",
             hint: "[rocm|cuda|metal|cpu|auto]",
             description: "Select inference backend (auto-detect if unset)",

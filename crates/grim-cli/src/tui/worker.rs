@@ -46,6 +46,11 @@ pub enum WorkerCommand {
     SetPlanMode {
         enabled: bool,
     },
+    /// UI → worker: summarize these older messages with the same engine
+    /// (compaction). Reply is WorkerEvent::CompactionDone.
+    Compact {
+        to_summarize: Vec<grim_format::ChatMessage>,
+    },
     Cancel,
     Quit,
 }
@@ -98,6 +103,12 @@ pub enum WorkerEvent {
     },
     Error {
         message: String,
+    },
+    /// Worker → UI: compaction summary finished generating. The UI splices
+    /// the summary into its canonical message history.
+    CompactionDone {
+        summary: String,
+        compacted_tokens: u64,
     },
 }
 
@@ -249,6 +260,16 @@ impl Worker {
             }
             WorkerCommand::SetContextLimit { limit } => {
                 self.ctx_override = limit;
+                WorkerOutcome::Ignored
+            }
+            WorkerCommand::Compact { to_summarize } => {
+                // Same-engine summarization, quiet run (no Token events).
+                let msgs = crate::tui::compact::summary_messages(&to_summarize);
+                let (summary, stats) = self.generate_inner(&msgs, rx, None, false);
+                let _ = self.tx.send(WorkerEvent::CompactionDone {
+                    summary,
+                    compacted_tokens: stats.context_used,
+                });
                 WorkerOutcome::Ignored
             }
             WorkerCommand::SetSamplingParams {
@@ -452,6 +473,18 @@ impl Worker {
         rx: &Receiver<WorkerCommand>,
         tools: Option<&[grim_format::ToolDef]>,
     ) -> (String, TurnStats) {
+        self.generate_inner(messages, rx, tools, true)
+    }
+
+    /// Like `generate`, but can suppress Token/Diagnostics streaming — used
+    /// by compaction so the summary is not rendered into the transcript.
+    fn generate_inner(
+        &mut self,
+        messages: &[grim_format::ChatMessage],
+        rx: &Receiver<WorkerCommand>,
+        tools: Option<&[grim_format::ToolDef]>,
+        emit_tokens: bool,
+    ) -> (String, TurnStats) {
         let mut generated_text = String::new();
         let default_stats = TurnStats {
             encode_ms: 0.0,
@@ -598,12 +631,16 @@ impl Worker {
             }
             let text = tok.decode(&[token]);
             generated_text.push_str(&text);
-            let _ = self.tx.send(WorkerEvent::Token { text });
+            if emit_tokens {
+                let _ = self.tx.send(WorkerEvent::Token { text });
+            }
 
             if last_diag.elapsed() >= Duration::from_millis(100) {
-                let snap =
-                    self.make_snapshot(ctx_limit, (prompt_ids.len() + generated_count) as u64);
-                let _ = self.tx.send(WorkerEvent::Diagnostics { snap });
+                if emit_tokens {
+                    let snap =
+                        self.make_snapshot(ctx_limit, (prompt_ids.len() + generated_count) as u64);
+                    let _ = self.tx.send(WorkerEvent::Diagnostics { snap });
+                }
                 last_diag = Instant::now();
             }
         }

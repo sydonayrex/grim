@@ -121,6 +121,11 @@ pub use transcript::{MessageNode, Role, Transcript};
 pub use undo_stack::UndoStack;
 pub use worker::{DiagnosticsSnapshot, TurnStats, WorkerCommand, WorkerEvent, WorkerParams};
 
+/// Fraction of the context window that triggers auto-compaction.
+pub const COMPACT_THRESHOLD: f32 = 0.85;
+/// Number of recent turns kept verbatim during compaction.
+pub const COMPACT_KEEP_TURNS: usize = 2;
+
 /// Re-export of the task list types for convenience.
 pub use tasks::{Task, TaskList, TaskStatus};
 
@@ -148,6 +153,8 @@ pub enum SlashCommand {
     Thinking(Option<String>),
     /// Toggle plan mode (read-only tools, model presents a plan first).
     Plan(Option<String>),
+    /// Summarize older context now to free tokens.
+    Compact,
     /// Select the inference backend (rocm, cuda, metal, cpu, auto).
     Backend(Option<String>),
     Exit,
@@ -197,6 +204,7 @@ pub fn parse_slash_command(input: &str) -> SlashCommand {
         "think" | "thinking" if after.is_empty() => SlashCommand::Thinking(None),
         "think" | "thinking" => SlashCommand::Thinking(Some(after.trim().to_string())),
         "plan" if after.is_empty() => SlashCommand::Plan(None),
+        "compact" => SlashCommand::Compact,
         "plan" => SlashCommand::Plan(Some(after.trim().to_string())),
         "backend" if after.is_empty() => SlashCommand::Backend(None),
         "backend" => SlashCommand::Backend(Some(after.trim().to_string())),
@@ -333,6 +341,10 @@ pub struct App {
     pub history: crate::tui::history::PromptHistory,
     /// Autosave target for this conversation; set on first user submit.
     pub session_path: Option<std::path::PathBuf>,
+    /// True while the worker generates the compaction summary.
+    pub compacting: bool,
+    /// Plan for the in-flight compaction, applied on CompactionDone.
+    pub pending_compaction: Option<compact::CompactionPlan>,
 }
 
 impl App {
@@ -385,6 +397,8 @@ impl App {
             queue: crate::tui::queue::MessageQueue::default(),
             history: crate::tui::history::PromptHistory::load(),
             session_path: None,
+            compacting: false,
+            pending_compaction: None,
         }
     }
 
@@ -442,6 +456,33 @@ impl App {
         });
     }
 
+    /// Start compaction unconditionally (when a plan exists).
+    fn start_compaction(&mut self) {
+        if self.compacting || self.generating {
+            return;
+        }
+        let Some(plan) = compact::plan(&self.messages, COMPACT_KEEP_TURNS) else {
+            return;
+        };
+        let to_summarize = self.messages[..plan.cut].to_vec();
+        self.pending_compaction = Some(plan);
+        self.compacting = true;
+        self.transcript
+            .push_system("context nearly full; compacting...".into());
+        let _ = self.cmd_tx.send(WorkerCommand::Compact { to_summarize });
+    }
+
+    /// Auto-trigger compaction near the context limit.
+    fn maybe_start_compaction(&mut self) {
+        if self.compacting || self.generating || self.snap.ctx_limit == 0 {
+            return;
+        }
+        if (self.snap.ctx_used as f32) < COMPACT_THRESHOLD * self.snap.ctx_limit as f32 {
+            return;
+        }
+        self.start_compaction();
+    }
+
     /// Apply a worker event to app state.
     pub fn handle_event(&mut self, evt: WorkerEvent) {
         match evt {
@@ -490,13 +531,32 @@ impl App {
                 )));
                 // Border flash delight: green border for 300ms on turn complete.
                 self.flash_until = Some(Instant::now() + Duration::from_millis(300));
+                // Compact near the context limit BEFORE sending a queued message.
+                self.maybe_start_compaction();
                 // Persist the completed turn before any queued message starts.
                 self.autosave_now();
-                // Send the next queued message, if any.
-                if let Some(next) = self.queue.pop() {
-                    self.transcript
-                        .push_system("sending queued message...".into());
-                    self.submit_chat(&next);
+                // Send the next queued message, if any (held back while compacting).
+                if !self.compacting {
+                    if let Some(next) = self.queue.pop() {
+                        self.transcript
+                            .push_system("sending queued message...".into());
+                        self.submit_chat(&next);
+                    }
+                }
+            }
+            WorkerEvent::CompactionDone { summary, .. } => {
+                if let Some(plan) = self.pending_compaction.take() {
+                    self.messages = compact::apply(&self.messages, &plan, &summary);
+                }
+                self.compacting = false;
+                self.transcript.push_system("context compacted".into());
+                self.autosave_now();
+                if !self.generating {
+                    if let Some(next) = self.queue.pop() {
+                        self.transcript
+                            .push_system("sending queued message...".into());
+                        self.submit_chat(&next);
+                    }
                 }
             }
             WorkerEvent::Diagnostics { snap } => {
@@ -1855,9 +1915,26 @@ impl App {
                 });
                 self.show_toast(Toast::info(format!("Plan mode: {state}")));
             }
+            SlashCommand::Compact => {
+                if self.compacting {
+                    self.transcript.push_system("compaction already running".into());
+                } else {
+                    self.start_compaction();
+                    if !self.compacting {
+                        self.transcript.push_system("nothing to compact yet".into());
+                    }
+                }
+            }
             SlashCommand::NotACommand => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
+                    return;
+                }
+                // Queue input while a compaction summary is generating.
+                if self.compacting {
+                    self.queue.push(trimmed.to_string());
+                    self.transcript
+                        .push_system("compacting; message queued".into());
                     return;
                 }
                 // Reset the notification flag at the start of any new turn
@@ -2655,6 +2732,10 @@ fn ui(f: &mut Frame, app: &App) {
         _ if app.tool_approval_mode => (
             c_magenta,
             format!(" ⚠  approve tool call?  Enter = yes   Esc = deny "),
+        ),
+        _ if app.compacting => (
+            c_amber,
+            " compacting context... ".to_string(),
         ),
         _ if app.generating && !app.queue.is_empty() => (
             c_amber,
@@ -3731,6 +3812,68 @@ mod tests {
         app.submit_chat("debug kv cache eviction");
         let p = app.session_path.as_ref().unwrap();
         assert!(p.to_string_lossy().contains("debug-kv-cache-eviction"));
+    }
+
+    fn cmsg(role: &str, content: &str) -> grim_format::ChatMessage {
+        grim_format::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn compaction_triggers_only_above_threshold_and_applies_summary() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.messages = vec![
+            cmsg("system", "sys"),
+            cmsg("user", "t1"),
+            cmsg("assistant", "a1"),
+            cmsg("user", "t2"),
+            cmsg("assistant", "a2"),
+            cmsg("user", "t3"),
+            cmsg("assistant", "a3"),
+        ];
+        app.snap.ctx_limit = 1000;
+        app.snap.ctx_used = 500;
+        app.maybe_start_compaction();
+        assert!(!app.compacting, "below threshold");
+        app.snap.ctx_used = 900;
+        app.maybe_start_compaction();
+        assert!(app.compacting);
+        let cut = app.pending_compaction.as_ref().unwrap().cut;
+        assert_eq!(app.messages[cut].content, "t2"); // last 2 turns kept
+        app.handle_event(WorkerEvent::CompactionDone {
+            summary: "the summary".into(),
+            compacted_tokens: 900,
+        });
+        assert!(!app.compacting);
+        assert!(app.messages.len() < 7);
+        assert!(app.messages.iter().any(|m| m.content.contains("the summary")));
+        assert_eq!(app.messages.last().unwrap().content, "a3");
+        assert!(app.pending_compaction.is_none());
+    }
+
+    #[test]
+    fn submit_during_compaction_is_queued() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.compacting = true;
+        app.submit_chat("during compact");
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn compact_command_when_nothing_to_compact() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.messages = vec![cmsg("user", "only one turn")];
+        app.submit_chat("/compact");
+        assert!(!app.compacting);
+        assert!(matches!(parse_slash_command("/compact"), SlashCommand::Compact));
     }
 
     #[test]
