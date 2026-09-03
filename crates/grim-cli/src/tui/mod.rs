@@ -238,8 +238,8 @@ pub enum InputMode {
     ModelPicker { selected: usize },
     /// Fuzzy-searchable command palette overlay (borrowed from opencode-dev).
     CommandPalette { selected: usize },
-    /// Interactive session browser overlay.
-    SessionBrowser { selected: usize },
+    /// Interactive session browser overlay (type-to-filter).
+    SessionBrowser { query: String, selected: usize },
     /// Interactive skill picker overlay (Ctrl+G).
     SkillPicker { selected: usize },
     /// Interactive backend picker overlay (Ctrl+B).
@@ -1001,7 +1001,10 @@ impl App {
             }
             KeyCode::Char('o') if is_ctrl => {
                 // Session browser: interactive session list.
-                self.input_mode = InputMode::SessionBrowser { selected: 0 };
+                self.input_mode = InputMode::SessionBrowser {
+                    query: String::new(),
+                    selected: 0,
+                };
             }
             KeyCode::Char('g') if is_ctrl => {
                 // Skill picker: fuzzy-searchable list of discovered skills.
@@ -1196,36 +1199,62 @@ impl App {
     }
 
     fn handle_session_browser_key(&mut self, key: KeyEvent) {
-        let sessions = self.discover_session_files();
         let selected = match &self.input_mode {
-            InputMode::SessionBrowser { selected } => *selected,
+            InputMode::SessionBrowser { selected, .. } => *selected,
             _ => return,
         };
         match key.code {
             KeyCode::Up => {
                 self.input_mode = InputMode::SessionBrowser {
+                    query: self.session_browser_query(),
                     selected: selected.saturating_sub(1),
                 };
             }
             KeyCode::Down => {
-                let new_sel = if sessions.is_empty() {
-                    0
-                } else {
-                    (selected + 1).min(sessions.len() - 1)
+                let n = self.session_browser_items().len();
+                let new_sel = if n == 0 { 0 } else { (selected + 1).min(n - 1) };
+                self.input_mode = InputMode::SessionBrowser {
+                    query: self.session_browser_query(),
+                    selected: new_sel,
                 };
-                self.input_mode = InputMode::SessionBrowser { selected: new_sel };
             }
             KeyCode::Enter => {
                 self.input_mode = InputMode::Chat;
-                if let Some(path) = sessions.get(selected) {
-                    self.submit_chat(&format!("/load {path}"));
+                if let Some(meta) = self.session_browser_items().get(selected).cloned() {
+                    self.submit_chat(&format!("/load {}", meta.path.display()));
                 }
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Chat;
             }
+            KeyCode::Backspace => {
+                let mut query = self.session_browser_query();
+                query.pop();
+                self.input_mode = InputMode::SessionBrowser { query, selected: 0 };
+            }
+            KeyCode::Char(c) => {
+                let mut query = self.session_browser_query();
+                query.push(c);
+                self.input_mode = InputMode::SessionBrowser { query, selected: 0 };
+            }
             _ => {}
         }
+    }
+
+    fn session_browser_query(&self) -> String {
+        match &self.input_mode {
+            InputMode::SessionBrowser { query, .. } => query.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Sessions currently visible in the browser (store + cwd, query-filtered).
+    fn session_browser_items(&self) -> Vec<sessions::SessionMeta> {
+        let q = self.session_browser_query().to_lowercase();
+        sessions::list_sessions()
+            .into_iter()
+            .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
+            .collect()
     }
 
     /// Prompt history search (Ctrl+R): type to filter, Enter fills the composer.
@@ -1518,25 +1547,6 @@ impl App {
             .collect();
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         scored.into_iter().map(|(_, spec)| spec).collect()
-    }
-
-    /// Discover session files in the current directory.
-    fn discover_session_files(&self) -> Vec<String> {
-        let base =
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut sessions = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    if let Some(s) = path.to_str() {
-                        sessions.push(s.to_string());
-                    }
-                }
-            }
-        }
-        sessions.sort();
-        sessions
     }
 
     fn submit_chat(&mut self, text: &str) {
@@ -3042,28 +3052,49 @@ fn ui(f: &mut Frame, app: &App) {
     // -----------------------------------------------------------------------
     // Session browser modal.
     // -----------------------------------------------------------------------
-    if let InputMode::SessionBrowser { selected } = app.input_mode {
-        let sessions = app.discover_session_files();
-        let height = (sessions.len() as u16 + 4).clamp(5, 20);
-        let width = 64.min(f.area().width.saturating_sub(4));
+    if let InputMode::SessionBrowser { selected, .. } = app.input_mode {
+        let session_items = app.session_browser_items();
+        let height = (session_items.len() as u16 + 5).clamp(5, 20);
+        let width = 72.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
         let modal_area = Rect { x, y, width, height };
 
+        let query = app.session_browser_query();
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled("  Enter to load  Esc to cancel", Style::default().fg(c_muted))));
+        let filter_note = if query.is_empty() {
+            String::from("  type to filter  ·  Enter to load  ·  Esc to cancel")
+        } else {
+            format!("  filter: \"{query}\"  ·  Enter to load  ·  Esc to cancel")
+        };
+        lines.push(Line::from(Span::styled(filter_note, Style::default().fg(c_muted))));
         lines.push(Line::raw(""));
-        for (idx, path) in sessions.iter().enumerate() {
+        for (idx, meta) in session_items.iter().enumerate() {
             let is_sel = idx == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let color = if is_sel { c_purple } else { Color::White };
-            lines.push(Line::from(Span::styled(
-                format!("{}{}", prefix, path),
-                Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
-            )));
+            let when = chrono::DateTime::from_timestamp(meta.modified as i64, 0)
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let shown: String =
+                meta.title.chars().take(width.saturating_sub(24) as usize).collect();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{prefix}{shown}"),
+                    Style::default().fg(color).add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(format!("  {when}"), Style::default().fg(c_muted)),
+            ]));
         }
-        if sessions.is_empty() {
-            lines.push(Line::from(Span::styled("  no .jsonl session files found", Style::default().fg(c_muted))));
+        if session_items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no sessions found",
+                Style::default().fg(c_muted),
+            )));
         }
         let modal = Paragraph::new(lines).block(
             Block::bordered().border_type(BorderType::Rounded)
@@ -4026,7 +4057,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(matches!(
             app.input_mode,
-            InputMode::SessionBrowser { selected: 0 }
+            InputMode::SessionBrowser { selected: 0, .. }
         ));
 
         // Escape returns to chat.
@@ -4051,7 +4082,20 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let app = App::new(tx);
         // Just verify the function doesn't panic; actual files depend on CWD.
-        let _sessions = app.discover_session_files();
+        let _sessions = app.session_browser_items();
+    }
+
+    #[test]
+    fn session_browser_filters_by_query() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.input_mode = InputMode::SessionBrowser {
+            query: String::new(),
+            selected: 0,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let items = app.session_browser_items();
+        assert!(items.iter().all(|s| s.title.contains('z')));
     }
 
     #[test]
