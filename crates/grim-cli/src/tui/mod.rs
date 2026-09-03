@@ -5,7 +5,7 @@
 //! `WorkerCommand`s and drains `WorkerEvent`s over `std::sync::mpsc` channels.
 //! GPU and model code runs only on the worker.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -23,6 +23,9 @@ use ratatui::widgets::{Block, BorderType, Gauge, Paragraph, Sparkline, Wrap};
 
 /// Slash command descriptors and registry.
 pub mod commands;
+
+/// Text clipboard: arboard with OSC52 fallback.
+pub mod clipboard;
 
 /// Input composer with cursor navigation and history ring buffer.
 pub mod composer;
@@ -45,6 +48,9 @@ pub mod kill_ring;
 /// Frecency-based file ranking for autocomplete.
 pub mod frecency;
 
+/// Persistent searchable prompt history (Ctrl+R).
+pub mod history;
+
 /// Markdown → ratatui rendering.
 pub mod markdown;
 
@@ -53,6 +59,9 @@ pub mod diff;
 
 /// Persisted always-allow rules for tool approvals.
 pub mod permissions;
+
+/// Queue of user messages typed while the worker is generating.
+pub mod queue;
 
 /// Skill discovery and loading from SKILL.md files.
 pub mod skills;
@@ -65,6 +74,21 @@ pub mod transcript;
 
 /// Agent task list panel for the sidebar.
 pub mod tasks;
+
+/// XDG base dirs for persisted TUI state.
+pub mod paths;
+
+/// Central session store: autosave, titles, listing.
+pub mod sessions;
+
+/// Context compaction planning (pure logic).
+pub mod compact;
+
+/// File-store checkpoints for agent edits.
+pub mod checkpoints;
+
+/// MCP (Model Context Protocol) client support.
+pub mod mcp;
 
 /// Keyboard-navigable selection menu.
 pub mod select_list;
@@ -103,6 +127,11 @@ pub use transcript::{MessageNode, Role, Transcript};
 pub use undo_stack::UndoStack;
 pub use worker::{DiagnosticsSnapshot, TurnStats, WorkerCommand, WorkerEvent, WorkerParams};
 
+/// Fraction of the context window that triggers auto-compaction.
+pub const COMPACT_THRESHOLD: f32 = 0.85;
+/// Number of recent turns kept verbatim during compaction.
+pub const COMPACT_KEEP_TURNS: usize = 2;
+
 /// Re-export of the task list types for convenience.
 pub use tasks::{Task, TaskList, TaskStatus};
 
@@ -130,6 +159,12 @@ pub enum SlashCommand {
     Thinking(Option<String>),
     /// Toggle plan mode (read-only tools, model presents a plan first).
     Plan(Option<String>),
+    /// Summarize older context now to free tokens.
+    Compact,
+    /// Restore files changed by the last agent tool call.
+    Undo,
+    /// List configured MCP servers and their status.
+    Mcp,
     /// Select the inference backend (rocm, cuda, metal, cpu, auto).
     Backend(Option<String>),
     Exit,
@@ -179,6 +214,9 @@ pub fn parse_slash_command(input: &str) -> SlashCommand {
         "think" | "thinking" if after.is_empty() => SlashCommand::Thinking(None),
         "think" | "thinking" => SlashCommand::Thinking(Some(after.trim().to_string())),
         "plan" if after.is_empty() => SlashCommand::Plan(None),
+        "compact" => SlashCommand::Compact,
+        "undo" => SlashCommand::Undo,
+        "mcp" => SlashCommand::Mcp,
         "plan" => SlashCommand::Plan(Some(after.trim().to_string())),
         "backend" if after.is_empty() => SlashCommand::Backend(None),
         "backend" => SlashCommand::Backend(Some(after.trim().to_string())),
@@ -223,8 +261,10 @@ pub enum InputMode {
     ModelPicker { selected: usize },
     /// Fuzzy-searchable command palette overlay (borrowed from opencode-dev).
     CommandPalette { selected: usize },
-    /// Interactive session browser overlay.
-    SessionBrowser { selected: usize },
+    /// Interactive session browser overlay (type-to-filter).
+    SessionBrowser { query: String, selected: usize },
+    /// Checkpoint restore picker (/undo).
+    CheckpointPicker { selected: usize },
     /// Interactive skill picker overlay (Ctrl+G).
     SkillPicker { selected: usize },
     /// Interactive backend picker overlay (Ctrl+B).
@@ -236,6 +276,12 @@ pub enum InputMode {
         query: String,
         matches: Vec<(usize, usize)>,
         selected: usize,
+    },
+    /// Prompt history search overlay (Ctrl+R).
+    HistorySearch {
+        query: String,
+        selected: usize,
+        matches: Vec<String>,
     },
 }
 
@@ -303,6 +349,20 @@ pub struct App {
     /// Always-allow tool rules, shared with the worker thread. The worker
     /// checks them before prompting; the UI adds to them on "always allow".
     pub permissions: permissions::SharedPermissions,
+    /// Messages typed while generating; drained on TurnComplete.
+    pub queue: crate::tui::queue::MessageQueue,
+    /// Persistent prompt history searched by Ctrl+R.
+    pub history: crate::tui::history::PromptHistory,
+    /// Autosave target for this conversation; set on first user submit.
+    pub session_path: Option<std::path::PathBuf>,
+    /// True while the worker generates the compaction summary.
+    pub compacting: bool,
+    /// Plan for the in-flight compaction, applied on CompactionDone.
+    pub pending_compaction: Option<compact::CompactionPlan>,
+    /// File-store checkpoints for agent edits (capture/restore).
+    pub checkpoints: checkpoints::CheckpointStore,
+    /// MCP servers shared with the worker; routes `mcp_*` tool calls.
+    pub mcp: mcp::manager::SharedMcp,
 }
 
 impl App {
@@ -330,7 +390,7 @@ impl App {
             selected_completion: 0,
             jump_mode: JumpMode::None,
             toast: None,
-            frecency: Frecency::new(),
+            frecency: Frecency::load(),
             generation_complete_notified: false,
             pending_tool_call: None,
             pending_tool_diff: None,
@@ -340,7 +400,7 @@ impl App {
             frame_count: 0,
             skills,
             active_skill_name: None,
-            project_dir,
+            project_dir: project_dir.clone(),
             thinking_level: grim_core::sampler::ThinkingLevel::Default,
             plan_mode: false,
             task_list: crate::tui::tasks::TaskList::new(),
@@ -352,12 +412,36 @@ impl App {
             find_selected: 0,
             flash_until: None,
             permissions: permissions::shared(permissions::PermissionRules::load()),
+            queue: crate::tui::queue::MessageQueue::default(),
+            history: crate::tui::history::PromptHistory::load(),
+            session_path: None,
+            compacting: false,
+            pending_compaction: None,
+            checkpoints: checkpoints::CheckpointStore::open(&project_dir),
+            mcp: std::sync::Arc::new(std::sync::Mutex::new(mcp::manager::McpManager::load())),
         }
+    }
+
+    /// Change the project (sandbox) directory and reopen its checkpoint store.
+    pub fn set_project_dir(&mut self, dir: PathBuf) {
+        self.project_dir = dir;
+        self.sandbox_root = self.project_dir.clone();
+        self.checkpoints = checkpoints::CheckpointStore::open(&self.project_dir);
     }
 
     /// Show a toast notification, replacing any existing one.
     pub fn show_toast(&mut self, toast: Toast) {
         self.toast = Some(toast);
+    }
+
+    /// Rewrite the session autosave file from the current transcript.
+    /// No-op when no session exists yet (no user message sent).
+    fn autosave_now(&mut self) {
+        if let Some(p) = &self.session_path {
+            if let Err(e) = sessions::autosave(&self.transcript, p) {
+                self.show_toast(Toast::warning(format!("autosave failed: {e}")));
+            }
+        }
     }
 
     /// Clear the current toast if it has expired. Returns true if a toast was
@@ -397,6 +481,33 @@ impl App {
             tool_call_id: None,
             name: None,
         });
+    }
+
+    /// Start compaction unconditionally (when a plan exists).
+    fn start_compaction(&mut self) {
+        if self.compacting || self.generating {
+            return;
+        }
+        let Some(plan) = compact::plan(&self.messages, COMPACT_KEEP_TURNS) else {
+            return;
+        };
+        let to_summarize = self.messages[..plan.cut].to_vec();
+        self.pending_compaction = Some(plan);
+        self.compacting = true;
+        self.transcript
+            .push_system("context nearly full; compacting...".into());
+        let _ = self.cmd_tx.send(WorkerCommand::Compact { to_summarize });
+    }
+
+    /// Auto-trigger compaction near the context limit.
+    fn maybe_start_compaction(&mut self) {
+        if self.compacting || self.generating || self.snap.ctx_limit == 0 {
+            return;
+        }
+        if (self.snap.ctx_used as f32) < COMPACT_THRESHOLD * self.snap.ctx_limit as f32 {
+            return;
+        }
+        self.start_compaction();
     }
 
     /// Apply a worker event to app state.
@@ -447,6 +558,33 @@ impl App {
                 )));
                 // Border flash delight: green border for 300ms on turn complete.
                 self.flash_until = Some(Instant::now() + Duration::from_millis(300));
+                // Compact near the context limit BEFORE sending a queued message.
+                self.maybe_start_compaction();
+                // Persist the completed turn before any queued message starts.
+                self.autosave_now();
+                // Send the next queued message, if any (held back while compacting).
+                if !self.compacting {
+                    if let Some(next) = self.queue.pop() {
+                        self.transcript
+                            .push_system("sending queued message...".into());
+                        self.submit_chat(&next);
+                    }
+                }
+            }
+            WorkerEvent::CompactionDone { summary, .. } => {
+                if let Some(plan) = self.pending_compaction.take() {
+                    self.messages = compact::apply(&self.messages, &plan, &summary);
+                }
+                self.compacting = false;
+                self.transcript.push_system("context compacted".into());
+                self.autosave_now();
+                if !self.generating {
+                    if let Some(next) = self.queue.pop() {
+                        self.transcript
+                            .push_system("sending queued message...".into());
+                        self.submit_chat(&next);
+                    }
+                }
             }
             WorkerEvent::Diagnostics { snap } => {
                 self.snap = snap;
@@ -454,6 +592,7 @@ impl App {
             WorkerEvent::Error { message } => {
                 self.transcript.push_error(message);
                 self.generating = false;
+                self.autosave_now();
             }
             WorkerEvent::ModelLoadStarted { name } => {
                 self.snap.loading = true;
@@ -555,12 +694,14 @@ impl App {
             InputMode::ModelPicker { selected } => self.handle_model_picker_key(key, selected),
             InputMode::CommandPalette { .. } => self.handle_palette_key(key),
             InputMode::SessionBrowser { .. } => self.handle_session_browser_key(key),
+            InputMode::CheckpointPicker { .. } => self.handle_checkpoint_picker_key(key),
             InputMode::SkillPicker { .. } => self.handle_skill_picker_key(key),
             InputMode::BackendPicker { .. } => self.handle_backend_picker_key(key),
             InputMode::ProjectDir => self.handle_project_dir_key(key),
             InputMode::Find { query, matches, selected } => {
                 self.handle_find_key(key, query, matches, selected)
             }
+            InputMode::HistorySearch { .. } => self.handle_history_search_key(key),
         }
     }
 
@@ -851,13 +992,28 @@ impl App {
                 if let Some(text) = self.selected_transcript_text() {
                     copy_to_clipboard(&text);
                     self.show_toast(Toast::success("Copied to clipboard"));
-                } else if let Some(last) = self.transcript.nodes.last().map(|n| n.content.clone()) {
-                    if !last.is_empty() {
-                        copy_to_clipboard(&last);
-                        self.show_toast(Toast::success("Copied to clipboard"));
-                    }
                 } else {
-                    self.composer.insert_char('y');
+                    // Prefer the last fenced code block of the last assistant reply.
+                    let last_assistant = self
+                        .transcript
+                        .nodes
+                        .iter()
+                        .rev()
+                        .find(|n| n.role == Role::Assistant && !n.content.is_empty())
+                        .map(|n| n.content.clone());
+                    if let Some((_, code)) =
+                        last_assistant.as_deref().and_then(markdown::last_fenced_code_block)
+                    {
+                        copy_to_clipboard(&code);
+                        self.show_toast(Toast::success("Code block copied to clipboard"));
+                    } else if let Some(last) = self.transcript.nodes.last().map(|n| n.content.clone()) {
+                        if !last.is_empty() {
+                            copy_to_clipboard(&last);
+                            self.show_toast(Toast::success("Copied to clipboard"));
+                        }
+                    } else {
+                        self.composer.insert_char('y');
+                    }
                 }
                 return;
             }
@@ -925,9 +1081,21 @@ impl App {
                 // Command palette: fuzzy-searchable command list.
                 self.input_mode = InputMode::CommandPalette { selected: 0 };
             }
+            KeyCode::Char('r') if is_ctrl => {
+                // Prompt history search over all persisted prompts.
+                let matches = self.history.search("", 50);
+                self.input_mode = InputMode::HistorySearch {
+                    query: String::new(),
+                    selected: 0,
+                    matches,
+                };
+            }
             KeyCode::Char('o') if is_ctrl => {
                 // Session browser: interactive session list.
-                self.input_mode = InputMode::SessionBrowser { selected: 0 };
+                self.input_mode = InputMode::SessionBrowser {
+                    query: String::new(),
+                    selected: 0,
+                };
             }
             KeyCode::Char('g') if is_ctrl => {
                 // Skill picker: fuzzy-searchable list of discovered skills.
@@ -990,6 +1158,7 @@ impl App {
                         // Record frecency for the selected file.
                         let selected = &suggestions[0];
                         self.frecency.record_open(&selected.value);
+                        self.frecency.save();
                         crate::tui::file_complete::apply_file_completion(
                             &mut self.composer,
                             start,
@@ -1031,10 +1200,16 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                let _ = self.cmd_tx.send(WorkerCommand::Cancel);
-                // Immediate UI feedback: show cancelling state.
-                if self.generating {
-                    self.transcript.push_system("cancelling...".into());
+                // First Esc while generating clears the queue; the next cancels.
+                if self.generating && !self.queue.is_empty() {
+                    self.queue.clear();
+                    self.transcript.push_system("cleared queued messages".into());
+                } else {
+                    let _ = self.cmd_tx.send(WorkerCommand::Cancel);
+                    // Immediate UI feedback: show cancelling state.
+                    if self.generating {
+                        self.transcript.push_system("cancelling...".into());
+                    }
                 }
             }
             KeyCode::PageUp => {
@@ -1115,35 +1290,147 @@ impl App {
     }
 
     fn handle_session_browser_key(&mut self, key: KeyEvent) {
-        let sessions = self.discover_session_files();
         let selected = match &self.input_mode {
-            InputMode::SessionBrowser { selected } => *selected,
+            InputMode::SessionBrowser { selected, .. } => *selected,
             _ => return,
         };
         match key.code {
             KeyCode::Up => {
                 self.input_mode = InputMode::SessionBrowser {
+                    query: self.session_browser_query(),
                     selected: selected.saturating_sub(1),
                 };
             }
             KeyCode::Down => {
-                let new_sel = if sessions.is_empty() {
-                    0
-                } else {
-                    (selected + 1).min(sessions.len() - 1)
+                let n = self.session_browser_items().len();
+                let new_sel = if n == 0 { 0 } else { (selected + 1).min(n - 1) };
+                self.input_mode = InputMode::SessionBrowser {
+                    query: self.session_browser_query(),
+                    selected: new_sel,
                 };
-                self.input_mode = InputMode::SessionBrowser { selected: new_sel };
             }
             KeyCode::Enter => {
                 self.input_mode = InputMode::Chat;
-                if let Some(path) = sessions.get(selected) {
-                    self.submit_chat(&format!("/load {path}"));
+                if let Some(meta) = self.session_browser_items().get(selected).cloned() {
+                    self.submit_chat(&format!("/load {}", meta.path.display()));
                 }
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Chat;
             }
+            KeyCode::Backspace => {
+                let mut query = self.session_browser_query();
+                query.pop();
+                self.input_mode = InputMode::SessionBrowser { query, selected: 0 };
+            }
+            KeyCode::Char(c) => {
+                let mut query = self.session_browser_query();
+                query.push(c);
+                self.input_mode = InputMode::SessionBrowser { query, selected: 0 };
+            }
             _ => {}
+        }
+    }
+
+    fn session_browser_query(&self) -> String {
+        match &self.input_mode {
+            InputMode::SessionBrowser { query, .. } => query.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Sessions currently visible in the browser (store + cwd, query-filtered).
+    fn session_browser_items(&self) -> Vec<sessions::SessionMeta> {
+        let q = self.session_browser_query().to_lowercase();
+        sessions::list_sessions()
+            .into_iter()
+            .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Prompt history search (Ctrl+R): type to filter, Enter fills the composer.
+    fn handle_history_search_key(&mut self, key: KeyEvent) {
+        if let InputMode::HistorySearch { query, selected, .. } = &mut self.input_mode {
+            match key.code {
+                KeyCode::Esc => self.input_mode = InputMode::Chat,
+                KeyCode::Enter => {
+                    let text = self.history_search_selected();
+                    self.input_mode = InputMode::Chat;
+                    if let Some(t) = text {
+                        self.composer.set_text(&t);
+                    }
+                    return;
+                }
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected += 1,
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    *selected = 0;
+                }
+                _ => {}
+            }
+        }
+        let n = self.history_search_matches().len();
+        if let InputMode::HistorySearch { selected, .. } = &mut self.input_mode {
+            if *selected >= n {
+                *selected = n.saturating_sub(1);
+            }
+        }
+    }
+
+    fn history_search_matches(&self) -> Vec<String> {
+        match &self.input_mode {
+            InputMode::HistorySearch { query, .. } => self.history.search(query, 50),
+            _ => Vec::new(),
+        }
+    }
+
+    fn history_search_selected(&self) -> Option<String> {
+        let InputMode::HistorySearch { selected, .. } = &self.input_mode else {
+            return None;
+        };
+        self.history_search_matches().get(*selected).cloned()
+    }
+
+    /// Checkpoint restore picker (/undo): pick a checkpoint, Enter restores.
+    fn handle_checkpoint_picker_key(&mut self, key: KeyEvent) {
+        let mut close = false;
+        if let InputMode::CheckpointPicker { selected } = &mut self.input_mode {
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected += 1,
+                KeyCode::Enter => {
+                    let items = self.checkpoints.list();
+                    if let Some(cp) = items.get(*selected).cloned() {
+                        match self.checkpoints.restore(cp.id) {
+                            Ok(msg) => {
+                                self.transcript.push_system(msg);
+                                self.show_toast(Toast::success("checkpoint restored"));
+                            }
+                            Err(e) => {
+                                self.show_toast(Toast::error(format!("restore failed: {e}")))
+                            }
+                        }
+                        close = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.input_mode = InputMode::Chat;
+            return;
+        }
+        if let InputMode::CheckpointPicker { selected } = &mut self.input_mode {
+            let n = self.checkpoints.list().len();
+            if *selected >= n {
+                *selected = n.saturating_sub(1);
+            }
         }
     }
 
@@ -1334,20 +1621,20 @@ impl App {
                 let path = text.trim();
                 if path.is_empty() {
                     // Reset to current_dir.
-                    self.project_dir = std::env::current_dir()
-                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    self.set_project_dir(
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    );
                 } else {
                     let p = std::path::PathBuf::from(path);
                     if p.is_dir() {
-                        self.project_dir = p.canonicalize().unwrap_or(p);
+                        self.set_project_dir(p.canonicalize().unwrap_or(p));
                     } else {
                         self.transcript
                             .push_error(format!("not a directory: {path}"));
                         return;
                     }
                 }
-                // Update sandbox root to match the project dir.
-                self.sandbox_root = self.project_dir.clone();
                 self.transcript.push_system(format!(
                     "project directory: {}",
                     self.project_dir.display()
@@ -1389,25 +1676,6 @@ impl App {
             .collect();
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         scored.into_iter().map(|(_, spec)| spec).collect()
-    }
-
-    /// Discover session files in the current directory.
-    fn discover_session_files(&self) -> Vec<String> {
-        let base =
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut sessions = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    if let Some(s) = path.to_str() {
-                        sessions.push(s.to_string());
-                    }
-                }
-            }
-        }
-        sessions.sort();
-        sessions
     }
 
     fn submit_chat(&mut self, text: &str) {
@@ -1643,8 +1911,7 @@ impl App {
                 } else {
                     let p = std::path::PathBuf::from(&path);
                     if p.is_dir() {
-                        self.project_dir = p.canonicalize().unwrap_or(p);
-                        self.sandbox_root = self.project_dir.clone();
+                        self.set_project_dir(p.canonicalize().unwrap_or(p));
                         self.transcript
                             .push_system(format!("project directory: {}", self.project_dir.display()));
                     } else {
@@ -1713,9 +1980,49 @@ impl App {
                 });
                 self.show_toast(Toast::info(format!("Plan mode: {state}")));
             }
+            SlashCommand::Compact => {
+                if self.compacting {
+                    self.transcript.push_system("compaction already running".into());
+                } else {
+                    self.start_compaction();
+                    if !self.compacting {
+                        self.transcript.push_system("nothing to compact yet".into());
+                    }
+                }
+            }
+            SlashCommand::Undo => {
+                if self.checkpoints.list().is_empty() {
+                    self.transcript
+                        .push_system("no checkpoints yet".into());
+                } else {
+                    self.input_mode = InputMode::CheckpointPicker { selected: 0 };
+                }
+            }
+            SlashCommand::Mcp => match self.mcp.lock() {
+                Ok(mgr) => {
+                    let lines = mgr.status_lines();
+                    if lines.is_empty() {
+                        self.transcript.push_system(
+                            "no MCP servers configured (~/.config/grim/mcp.toml)".into(),
+                        );
+                    } else {
+                        for l in lines {
+                            self.transcript.push_system(format!("mcp: {l}"));
+                        }
+                    }
+                }
+                Err(_) => self.transcript.push_error("mcp manager unavailable".into()),
+            },
             SlashCommand::NotACommand => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
+                    return;
+                }
+                // Queue input while a compaction summary is generating.
+                if self.compacting {
+                    self.queue.push(trimmed.to_string());
+                    self.transcript
+                        .push_system("compacting; message queued".into());
                     return;
                 }
                 // Reset the notification flag at the start of any new turn
@@ -1728,9 +2035,17 @@ impl App {
                     return;
                 }
                 if self.generating {
-                    self.transcript
-                        .push_system("generation in progress; Esc to cancel first".into());
+                    self.queue.push(trimmed.to_string());
+                    self.transcript.push_system(format!(
+                        "queued ({} in queue); sent automatically when this turn finishes",
+                        self.queue.len()
+                    ));
                     return;
+                }
+                self.history.append(trimmed);
+                self.history.save();
+                if self.session_path.is_none() {
+                    self.session_path = sessions::new_session_path(trimmed);
                 }
                 self.messages.push(grim_format::ChatMessage {
                     role: "user".to_string(),
@@ -1799,9 +2114,11 @@ impl App {
                 name: name.clone(),
                 arguments,
             };
-            let result = crate::tui::tools::execute_tool(
+            let result = crate::tui::tools::execute_tool_checked(
                 &call,
                 &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
+                &self.checkpoints,
+                &self.mcp.clone(),
             );
             let output = match result {
                 Ok(s) => s,
@@ -2036,7 +2353,7 @@ fn latest_session_file(dir: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Helper exporting transcript nodes to a text file or JSONL.
-fn export_transcript(transcript: &Transcript, path: &str) -> std::io::Result<usize> {
+pub(crate) fn export_transcript(transcript: &Transcript, path: &str) -> std::io::Result<usize> {
     use std::io::Write;
     let mut file = std::fs::File::create(path)?;
     let mut count = 0;
@@ -2258,31 +2575,7 @@ fn send_desktop_notification(title: &str, body: &str) {
 /// Tries `arboard::Clipboard::new().set_text()` first; if that fails (e.g. headless
 /// or missing display server) falls back to writing an OSC52 sequence to stdout
 /// so the terminal emulator can place the text in the system clipboard.
-pub fn copy_to_clipboard(text: &str) {
-    // Try arboard first (requires display server).
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        if cb.set_text(text.to_string()).is_ok() {
-            return;
-        }
-    }
-    // Fallback: OSC52 — encode as base64 and emit "\x1b]52;c;{}\x07".
-    let encoded = base64_encoded(text);
-    let seq = format!("\x1b]52;c;{}\x07", encoded);
-    let _ = std::io::stdout().write_all(seq.as_bytes());
-    let _ = std::io::stdout().flush();
-}
-
-fn base64_encoded(input: &str) -> String {
-    // Use base64 crate if available; otherwise minimal manual encode.
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input.as_bytes())
-}
-
-/// Emit OSC52 copy without attempting arboard (useful for tests).
-pub fn osc52_copy(text: &str) -> String {
-    let encoded = base64_encoded(text);
-    format!("\x1b]52;c;{}\x07", encoded)
-}
-
+pub use clipboard::{copy_to_clipboard, osc52_copy};
 /// Terminal lifecycle: the alternate screen is restored by the panic hook
 /// (see `run_tui`) on crash, or by the explicit `ratatui::restore()` call
 /// on the normal exit path. Kept as a placeholder comment — if you need a
@@ -2530,6 +2823,17 @@ fn ui(f: &mut Frame, app: &App) {
             c_magenta,
             format!(" ⚠  approve tool call?  Enter = yes   Esc = deny "),
         ),
+        _ if app.compacting => (
+            c_amber,
+            " compacting context... ".to_string(),
+        ),
+        _ if app.generating && !app.queue.is_empty() => (
+            c_amber,
+            format!(
+                " {} generating...  {} queued — Esc clears queue ",
+                spinner_char, app.queue.len()
+            ),
+        ),
         _ if app.generating => (
             c_amber,
             format!(" {} generating...  Esc to cancel ", spinner_char),
@@ -2549,6 +2853,10 @@ fn ui(f: &mut Frame, app: &App) {
         InputMode::SessionBrowser { .. } => (
             c_purple_soft,
             " sessions  Enter to load, Esc cancels ".into(),
+        ),
+        InputMode::CheckpointPicker { .. } => (
+            c_green,
+            " checkpoints  Enter restores, Esc cancels ".into(),
         ),
         InputMode::SkillPicker { .. } => (
             c_purple_soft,
@@ -2581,6 +2889,10 @@ fn ui(f: &mut Frame, app: &App) {
         InputMode::Chat => (
             c_purple_dim,
             " /  commands   @  files   Tab  autocomplete   F2  sidebar ".into(),
+        ),
+        InputMode::HistorySearch { .. } => (
+            c_cyan,
+            " history search  Enter fills composer, Esc cancels ".into(),
         ),
     };
 
@@ -2918,32 +3230,149 @@ fn ui(f: &mut Frame, app: &App) {
     // -----------------------------------------------------------------------
     // Session browser modal.
     // -----------------------------------------------------------------------
-    if let InputMode::SessionBrowser { selected } = app.input_mode {
-        let sessions = app.discover_session_files();
-        let height = (sessions.len() as u16 + 4).clamp(5, 20);
-        let width = 64.min(f.area().width.saturating_sub(4));
+    if let InputMode::SessionBrowser { selected, .. } = app.input_mode {
+        let session_items = app.session_browser_items();
+        let height = (session_items.len() as u16 + 5).clamp(5, 20);
+        let width = 72.min(f.area().width.saturating_sub(4));
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let query = app.session_browser_query();
+        let mut lines = Vec::new();
+        let filter_note = if query.is_empty() {
+            String::from("  type to filter  ·  Enter to load  ·  Esc to cancel")
+        } else {
+            format!("  filter: \"{query}\"  ·  Enter to load  ·  Esc to cancel")
+        };
+        lines.push(Line::from(Span::styled(filter_note, Style::default().fg(c_muted))));
+        lines.push(Line::raw(""));
+        for (idx, meta) in session_items.iter().enumerate() {
+            let is_sel = idx == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let color = if is_sel { c_purple } else { Color::White };
+            let when = chrono::DateTime::from_timestamp(meta.modified as i64, 0)
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let shown: String =
+                meta.title.chars().take(width.saturating_sub(24) as usize).collect();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{prefix}{shown}"),
+                    Style::default().fg(color).add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(format!("  {when}"), Style::default().fg(c_muted)),
+            ]));
+        }
+        if session_items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no sessions found",
+                Style::default().fg(c_muted),
+            )));
+        }
+        let modal = Paragraph::new(lines).block(
+            Block::bordered().border_type(BorderType::Rounded)
+                .title(Span::styled(" sessions  Ctrl+O ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint picker modal (/undo).
+    // -----------------------------------------------------------------------
+    if let InputMode::CheckpointPicker { selected } = app.input_mode {
+        let cps = app.checkpoints.list();
+        let height = (cps.len() as u16 + 4).clamp(5, 20);
+        let width = 76.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
         let modal_area = Rect { x, y, width, height };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled("  Enter to load  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::from(Span::styled(
+            "  Enter restores files  ·  Esc cancels",
+            Style::default().fg(c_muted),
+        )));
         lines.push(Line::raw(""));
-        for (idx, path) in sessions.iter().enumerate() {
+        for (idx, cp) in cps.iter().enumerate() {
             let is_sel = idx == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
-            let color = if is_sel { c_purple } else { Color::White };
+            let color = if is_sel { c_green } else { Color::White };
+            let when = chrono::DateTime::parse_from_rfc3339(&cp.ts)
+                .map(|d| d.format("%H:%M:%S").to_string())
+                .unwrap_or_else(|_| cp.ts.clone());
+            let file = cp
+                .files
+                .first()
+                .map(|f| {
+                    f.path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
             lines.push(Line::from(Span::styled(
-                format!("{}{}", prefix, path),
-                Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                format!("{prefix}#{idx}  {when}  {}  {file}", cp.tool),
+                Style::default().fg(color).add_modifier(if is_sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
             )));
-        }
-        if sessions.is_empty() {
-            lines.push(Line::from(Span::styled("  no .jsonl session files found", Style::default().fg(c_muted))));
         }
         let modal = Paragraph::new(lines).block(
             Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" sessions  Ctrl+O ", Style::default().fg(c_purple_soft)))
+                .title(Span::styled(" checkpoints  /undo ", Style::default().fg(c_green)))
+                .border_style(Style::default().fg(c_purple)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompt history search modal (Ctrl+R).
+    // -----------------------------------------------------------------------
+    if let InputMode::HistorySearch { selected, .. } = app.input_mode {
+        let matches = app.history_search_matches();
+        let query = match &app.input_mode {
+            InputMode::HistorySearch { query, .. } => query.clone(),
+            _ => String::new(),
+        };
+        let height = (matches.len() as u16 + 5).clamp(5, 20);
+        let width = 72.min(f.area().width.saturating_sub(4));
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  query: \"{query}\"  —  Enter to fill composer  Esc to cancel"),
+            Style::default().fg(c_muted),
+        )));
+        lines.push(Line::raw(""));
+        for (idx, text) in matches.iter().enumerate() {
+            let is_sel = idx == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let color = if is_sel { c_purple } else { Color::White };
+            let shown: String = text.chars().take(width.saturating_sub(6) as usize).collect();
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{shown}"),
+                Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+            )));
+        }
+        if matches.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no matching prompts in history",
+                Style::default().fg(c_muted),
+            )));
+        }
+        let modal = Paragraph::new(lines).block(
+            Block::bordered().border_type(BorderType::Rounded)
+                .title(Span::styled(" history  Ctrl+R ", Style::default().fg(c_purple_soft)))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
@@ -3294,7 +3723,11 @@ pub async fn cmd_tui(
     // One permissions store shared by worker (checks before prompting) and
     // the App (adds rules on "always allow").
     let perms = permissions::shared(permissions::PermissionRules::load());
-    let worker = worker::spawn_worker(params, cmd_rx, evt_tx, perms.clone());
+    // One MCP manager shared by worker (tool routing) and the App (/mcp).
+    let mcp: mcp::manager::SharedMcp = std::sync::Arc::new(std::sync::Mutex::new(
+        mcp::manager::McpManager::load(),
+    ));
+    let worker = worker::spawn_worker(params, cmd_rx, evt_tx, perms.clone(), mcp.clone());
     if let Some(m) = &model {
         let _ = cmd_tx.send(WorkerCommand::LoadModel { name: m.clone() });
     }
@@ -3302,13 +3735,38 @@ pub async fn cmd_tui(
     let mut app = App::new(cmd_tx.clone());
     app.permissions = perms;
 
+    // Connect configured MCP servers before the first frame; report status
+    // and extend the model's tool list with the prefixed MCP tools.
+    {
+        let status = match mcp.lock() {
+            Ok(mut mgr) => {
+                let status = mgr.connect_all();
+                // Worker and UI must agree on the SAME merged tool list:
+                // built-ins + prefixed MCP tools.
+                let mut all = crate::tui::tools::coding_tools();
+                all.extend(mgr.tool_defs());
+                drop(mgr);
+                let _ = cmd_tx.send(WorkerCommand::SetTools { tools: all.clone() });
+                app.tools = all;
+                status
+            }
+            Err(_) => Vec::new(),
+        };
+        for line in status {
+            app.transcript.push_system(format!("mcp: {line}"));
+        }
+    }
+    app.mcp = mcp;
+
     // Session resume: --resume <path> uses that file; --continue picks the
-    // most recently modified *.jsonl in the current directory.
+    // most recently modified *.jsonl in the current directory, falling back
+    // to the newest autosaved session in the central store.
     let resume_target = match (&resume, continue_last) {
         (Some(path), _) => Some(path.clone()),
         (None, true) => latest_session_file(
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )
+        .or_else(|| sessions::list_sessions().first().map(|s| s.path.clone()))
         .map(|p| p.to_string_lossy().into_owned()),
         (None, false) => None,
     };
@@ -3422,6 +3880,183 @@ pub async fn cmd_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zeroed TurnStats for event-driven tests.
+    fn zero_stats() -> TurnStats {
+        TurnStats {
+            encode_ms: 0.0,
+            prompt_tokens: 0,
+            prefill_ms: None,
+            decode_tps: None,
+            tokens_generated: 0,
+            accepted_per_step: None,
+            cancelled: false,
+            context_used: 0,
+        }
+    }
+
+    #[test]
+    fn submit_while_generating_enqueues() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        app.generating = true;
+        app.submit_chat("hello while busy");
+        assert_eq!(app.queue.len(), 1);
+        assert!(app.messages.iter().all(|m| m.content != "hello while busy"));
+    }
+
+    #[test]
+    fn turn_complete_sends_queued_message() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        app.generating = true;
+        app.submit_chat("queued msg");
+        assert_eq!(app.queue.len(), 1);
+        app.handle_event(WorkerEvent::TurnComplete { stats: zero_stats() });
+        assert!(app.generating, "queued submit restarts generation");
+        assert!(app.queue.is_empty());
+        assert!(app.messages.iter().any(|m| m.content == "queued msg"));
+    }
+
+    #[test]
+    fn esc_clears_queue_before_cancelling() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.generating = true;
+        app.queue.push("pending");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.queue.is_empty());
+    }
+
+    /// Isolate App tests from the real `~/.local/share/grim` state: point
+    /// XDG_DATA_HOME at a throwaway dir. Guard must be held for the test body.
+    fn isolated_data_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::tui::paths::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.path()) };
+        (dir, guard)
+    }
+
+    #[test]
+    fn ctrl_r_opens_history_search_and_enter_fills_composer() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.history.append("write me a parser");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(matches!(app.input_mode, InputMode::HistorySearch { .. }));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.composer.text(), "write me a parser");
+        assert!(matches!(app.input_mode, InputMode::Chat));
+    }
+
+    #[test]
+    fn submit_records_prompt_history() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        app.history.entries.clear(); // isolate from any loaded disk state
+        app.submit_chat("remember this prompt");
+        assert_eq!(app.history.entries.len(), 1);
+        assert_eq!(app.history.entries[0].text, "remember this prompt");
+    }
+
+    #[test]
+    fn first_submit_assigns_titled_session_path() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.snap.model_name = Some("test-model".into());
+        assert!(app.session_path.is_none());
+        app.submit_chat("debug kv cache eviction");
+        let p = app.session_path.as_ref().unwrap();
+        assert!(p.to_string_lossy().contains("debug-kv-cache-eviction"));
+    }
+
+    fn cmsg(role: &str, content: &str) -> grim_format::ChatMessage {
+        grim_format::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn compaction_triggers_only_above_threshold_and_applies_summary() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.messages = vec![
+            cmsg("system", "sys"),
+            cmsg("user", "t1"),
+            cmsg("assistant", "a1"),
+            cmsg("user", "t2"),
+            cmsg("assistant", "a2"),
+            cmsg("user", "t3"),
+            cmsg("assistant", "a3"),
+        ];
+        app.snap.ctx_limit = 1000;
+        app.snap.ctx_used = 500;
+        app.maybe_start_compaction();
+        assert!(!app.compacting, "below threshold");
+        app.snap.ctx_used = 900;
+        app.maybe_start_compaction();
+        assert!(app.compacting);
+        let cut = app.pending_compaction.as_ref().unwrap().cut;
+        assert_eq!(app.messages[cut].content, "t2"); // last 2 turns kept
+        app.handle_event(WorkerEvent::CompactionDone {
+            summary: "the summary".into(),
+            compacted_tokens: 900,
+        });
+        assert!(!app.compacting);
+        assert!(app.messages.len() < 7);
+        assert!(app.messages.iter().any(|m| m.content.contains("the summary")));
+        assert_eq!(app.messages.last().unwrap().content, "a3");
+        assert!(app.pending_compaction.is_none());
+    }
+
+    #[test]
+    fn submit_during_compaction_is_queued() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.compacting = true;
+        app.submit_chat("during compact");
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn compact_command_when_nothing_to_compact() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.messages = vec![cmsg("user", "only one turn")];
+        app.submit_chat("/compact");
+        assert!(!app.compacting);
+        assert!(matches!(parse_slash_command("/compact"), SlashCommand::Compact));
+    }
+
+    #[test]
+    fn undo_with_no_checkpoints_stays_in_chat() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.submit_chat("/undo");
+        assert!(matches!(app.input_mode, InputMode::Chat));
+        assert!(matches!(parse_slash_command("/undo"), SlashCommand::Undo));
+    }
 
     #[test]
     fn module_loads() {
@@ -3752,7 +4387,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(matches!(
             app.input_mode,
-            InputMode::SessionBrowser { selected: 0 }
+            InputMode::SessionBrowser { selected: 0, .. }
         ));
 
         // Escape returns to chat.
@@ -3777,7 +4412,20 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let app = App::new(tx);
         // Just verify the function doesn't panic; actual files depend on CWD.
-        let _sessions = app.discover_session_files();
+        let _sessions = app.session_browser_items();
+    }
+
+    #[test]
+    fn session_browser_filters_by_query() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.input_mode = InputMode::SessionBrowser {
+            query: String::new(),
+            selected: 0,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let items = app.session_browser_items();
+        assert!(items.iter().all(|s| s.title.contains('z')));
     }
 
     #[test]

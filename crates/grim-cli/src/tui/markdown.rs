@@ -25,6 +25,34 @@ fn theme_set() -> &'static ThemeSet {
     THEME_SET.get_or_init(ThemeSet::load_defaults)
 }
 
+/// Returns (lang, code) of the last fenced code block in raw markdown text.
+/// An unterminated final fence (mid-stream) still counts.
+pub fn last_fenced_code_block(src: &str) -> Option<(String, String)> {
+    let mut last: Option<(String, String)> = None;
+    let mut lang = String::new();
+    let mut buf: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if !in_block {
+            if let Some(rest) = trimmed.strip_prefix("```") {
+                in_block = true;
+                lang = rest.trim().to_string();
+                buf.clear();
+            }
+        } else if trimmed.starts_with("```") {
+            last = Some((lang.clone(), buf.join("\n")));
+            in_block = false;
+        } else {
+            buf.push(line);
+        }
+    }
+    if in_block && !buf.is_empty() {
+        last = Some((lang, buf.join("\n")));
+    }
+    last
+}
+
 /// Render a markdown string to styled Lines.
 pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
     let parser = Parser::new(src);
@@ -196,5 +224,25 @@ mod tests {
             .collect();
         assert!(joined.contains("bold"));
         assert!(joined.contains("code"));
+    }
+
+    #[test]
+    fn last_fenced_block_returns_last_complete_block() {
+        let src = "```python\na = 1\n```\ntext\n```rust\nfn main() {}\nlet x = 2;\n```\n";
+        let (lang, code) = last_fenced_code_block(src).unwrap();
+        assert_eq!(lang, "rust");
+        assert_eq!(code, "fn main() {}\nlet x = 2;");
+    }
+
+    #[test]
+    fn last_fenced_block_none_without_blocks() {
+        assert!(last_fenced_code_block("plain text only").is_none());
+    }
+
+    #[test]
+    fn last_fenced_block_unterminated_still_returned() {
+        let (lang, code) = last_fenced_code_block("intro\n```js\nconsole.log(1);").unwrap();
+        assert_eq!(lang, "js");
+        assert_eq!(code, "console.log(1);");
     }
 }

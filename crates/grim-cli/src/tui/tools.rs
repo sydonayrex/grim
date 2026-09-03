@@ -493,6 +493,36 @@ pub fn execute_tool(call: &ToolCallMsg, sandbox: &Sandbox) -> Result<String, Str
     }
 }
 
+/// Execute a tool call with a pre-execution checkpoint of every file the call
+/// will modify. The snapshot persists only when the tool succeeds, so a
+/// failed call never pollutes the checkpoint list. `mcp_*` tool names are
+/// routed to the MCP manager instead of the sandbox. This is the single choke
+/// point for tool execution from both the worker (auto-exec) and the UI
+/// (approval) paths.
+pub fn execute_tool_checked(
+    call: &ToolCallMsg,
+    sandbox: &Sandbox,
+    store: &crate::tui::checkpoints::CheckpointStore,
+    mcp: &crate::tui::mcp::manager::SharedMcp,
+) -> Result<String, String> {
+    if call.name.starts_with("mcp_") {
+        // Untrusted remote tool: no checkpoint capture (file effects unknown),
+        // output already truncated by the manager.
+        return mcp
+            .lock()
+            .map_err(|_| "mcp manager poisoned".to_string())?
+            .call(&call.name, &call.arguments);
+    }
+    let pending = store.capture(call, sandbox);
+    let result = execute_tool(call, sandbox);
+    if result.is_ok() {
+        if let Some(p) = pending {
+            store.persist(p);
+        }
+    }
+    result
+}
+
 /// Run `sh -c <command>` with a wall-clock timeout. Stdout/stderr are drained
 /// on reader threads so a chatty child can't deadlock on a full pipe, and the
 /// combined result is truncated past MAX_CMD_BYTES keeping head and tail.
@@ -589,6 +619,56 @@ fn cap_head_tail(s: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_handle() -> std::sync::Arc<std::sync::Mutex<crate::tui::mcp::manager::McpManager>> {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tui::mcp::manager::McpManager::load(),
+        ))
+    }
+
+    #[test]
+    fn checked_tool_snapshots_on_success_only() {
+        let _guard = crate::tui::paths::env_lock();
+        let proj = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", data.path()) };
+        fs::write(proj.path().join("f.txt"), "v1").unwrap();
+        let sandbox = Sandbox::new(proj.path().to_path_buf());
+        let store = crate::tui::checkpoints::CheckpointStore::open(proj.path());
+        let call = ToolCallMsg {
+            id: "x".into(),
+            name: "write_file".into(),
+            arguments: format!(
+                "{{\"path\":\"f.txt\",\"content\":{}}}",
+                serde_json::to_string("v2").unwrap()
+            ),
+        };
+        execute_tool_checked(&call, &sandbox, &store, &mcp_handle()).unwrap();
+        assert_eq!(fs::read_to_string(proj.path().join("f.txt")).unwrap(), "v2");
+        assert_eq!(store.list().len(), 1);
+        store.restore(store.list()[0].id).unwrap();
+        assert_eq!(fs::read_to_string(proj.path().join("f.txt")).unwrap(), "v1");
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+    }
+
+    #[test]
+    fn mcp_tools_route_through_manager() {
+        let mcp = mcp_handle();
+        let proj = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(proj.path().to_path_buf());
+        let store = crate::tui::checkpoints::CheckpointStore::open(proj.path());
+        let call = ToolCallMsg {
+            id: "m1".into(),
+            name: "mcp_gone_tool".into(),
+            arguments: "{}".into(),
+        };
+        // Unknown MCP tool errors through the manager instead of hitting the
+        // built-in "unknown tool" sandbox path.
+        let err = execute_tool_checked(&call, &sandbox, &store, &mcp).unwrap_err();
+        assert!(err.contains("unknown mcp tool"));
+        // And nothing was checkpointed for the remote call.
+        assert!(store.list().is_empty());
+    }
 
     #[test]
     fn sandbox_rejects_escape() {

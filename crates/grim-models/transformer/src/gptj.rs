@@ -175,21 +175,13 @@ impl GptJBlock {
             self.head_dim,
             seq_len,
             None,
-            &Device::Cpu,
+            x.device(),
         )?;
         let attn_proj = self.out_proj.forward(&attn_tensor)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
-        let x_vec = x.to_vec_f32()?;
-        let ap_vec = attn_proj.to_vec_f32()?;
-        let mlp_vec = mlp_out.to_vec_f32()?;
-
-        let mut res = vec![0.0f32; x_vec.len()];
-        for i in 0..res.len() {
-            res[i] = x_vec[i] + ap_vec[i] + mlp_vec[i];
-        }
-
-        Ok(cpu_tensor(res, x.shape().clone()))
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -219,7 +211,7 @@ impl GptJ {
             [cfg.vocab_size, cfg.hidden_size],
         )?;
 
-        let num_layers_to_load = cfg.num_hidden_layers.min(2);
+        let num_layers_to_load = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("h").scoped(&i.to_string());
