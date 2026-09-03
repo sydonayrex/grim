@@ -88,19 +88,13 @@ impl CommandRMlp {
         })
     }
 
+    /// GPU-first: the gated activation runs through the fused `silu_mul`
+    /// device kernel; host paths are only reached through its fallback guard.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let g_vec = g.to_vec_f32()?;
-        let u_vec = u.to_vec_f32()?;
-        let mut act = vec![0.0f32; g_vec.len()];
-        for i in 0..act.len() {
-            let val = g_vec[i];
-            let sig = 1.0 / (1.0 + (-val).exp());
-            act[i] = val * sig * u_vec[i];
-        }
-        let act_tensor = cpu_tensor(act, g.shape().clone());
-        Ok(self.down_proj.forward(&act_tensor)?)
+        let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
+        Ok(self.down_proj.forward(&act)?)
     }
 }
 
@@ -170,6 +164,10 @@ impl CommandRBlock {
 
     /// Forward pass executing parallel Attention + MLP branches:
     /// $\text{out} = x + \text{Attn}(\text{Norm}(x)) + \text{MLP}(\text{Norm}(x))$.
+    ///
+    /// GPU-first: Q/K/V, RoPE, attention and both residual adds run on the
+    /// tensor's device; host paths are only reached through the fused-kernel
+    /// fallback guards.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed = self.input_layernorm.forward(x)?;
@@ -178,48 +176,36 @@ impl CommandRBlock {
         let k = self.wk.forward(&normed)?;
         let v = self.wv.forward(&normed)?;
 
-        let mut q_vec = q.to_vec_f32()?;
-        let mut k_vec = k.to_vec_f32()?;
-
-        crate::qwen35::apply_rope_neox(
-            &mut q_vec,
-            positions,
+        let q = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &q,
             self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_vec,
             positions,
+        )?;
+        let k = crate::shared_attention::rope_2d_on_device(
+            &self.rope,
+            &k,
             self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
+            positions,
+        )?;
 
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_vec,
-            &k_vec,
-            &v.to_vec_f32()?,
+        let attn_tensor = crate::shared_attention::fused_attention_tensors(
+            &q,
+            &k,
+            &v,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             seq_len,
+            seq_len,
             None,
-            x.device(),
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
-        let x_vec = x.to_vec_f32()?;
-        let ap_vec = attn_proj.to_vec_f32()?;
-        let mlp_vec = mlp_out.to_vec_f32()?;
-
-        let mut res = vec![0.0f32; x_vec.len()];
-        for i in 0..res.len() {
-            res[i] = x_vec[i] + ap_vec[i] + mlp_vec[i];
-        }
-
-        Ok(cpu_tensor(res, x.shape().clone()))
+        // Parallel residual: x + attn + mlp as two device-side adds.
+        let res1 = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -332,22 +318,17 @@ impl CausalLm for CommandR {
 
         let ids_f32 = input_ids.to_vec_f32()?;
         let seq_len = ids_f32.len();
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids: Vec<u32> = ids_f32.iter().map(|&t| t as u32).collect();
 
-        for (i, &tok_f) in ids_f32.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                let src_start = tok * self.cfg.hidden_size;
-                let dst_start = i * self.cfg.hidden_size;
-                if src_start + self.cfg.hidden_size <= embed_w.len() {
-                    h_vec[dst_start..dst_start + self.cfg.hidden_size]
-                        .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
-                }
-            }
-        }
+        // GPU-first embedding gather: rows land on the weight's device; the
+        // vocab×hidden table never crosses to host.
+        let mut h = grim_nn::embedding_gather_on_device(
+            &self.tok_embeddings.weight,
+            &ids,
+            seq_len,
+            self.cfg.hidden_size,
+        )?;
 
-        let mut h = cpu_tensor(h_vec, Shape::new(vec![seq_len, self.cfg.hidden_size]));
         for layer in &self.layers {
             h = layer.forward(&h, &pos_u32)?;
         }
