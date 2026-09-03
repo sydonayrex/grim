@@ -493,6 +493,26 @@ pub fn execute_tool(call: &ToolCallMsg, sandbox: &Sandbox) -> Result<String, Str
     }
 }
 
+/// Execute a tool call with a pre-execution checkpoint of every file the call
+/// will modify. The snapshot persists only when the tool succeeds, so a
+/// failed call never pollutes the checkpoint list. This is the single choke
+/// point for tool execution from both the worker (auto-exec) and the UI
+/// (approval) paths.
+pub fn execute_tool_checked(
+    call: &ToolCallMsg,
+    sandbox: &Sandbox,
+    store: &crate::tui::checkpoints::CheckpointStore,
+) -> Result<String, String> {
+    let pending = store.capture(call, sandbox);
+    let result = execute_tool(call, sandbox);
+    if result.is_ok() {
+        if let Some(p) = pending {
+            store.persist(p);
+        }
+    }
+    result
+}
+
 /// Run `sh -c <command>` with a wall-clock timeout. Stdout/stderr are drained
 /// on reader threads so a chatty child can't deadlock on a full pipe, and the
 /// combined result is truncated past MAX_CMD_BYTES keeping head and tail.

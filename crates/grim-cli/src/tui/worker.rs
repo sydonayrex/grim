@@ -227,6 +227,8 @@ struct Worker {
     /// Plan mode: mutations are hard-blocked and a plan-first system
     /// preamble is injected into each prompt.
     plan_mode: bool,
+    /// File-store checkpoints captured before mutating tool calls.
+    checkpoint_store: crate::tui::checkpoints::CheckpointStore,
 }
 
 /// System preamble injected when plan mode is active. Read-only tools stay
@@ -799,9 +801,10 @@ impl Worker {
                         .unwrap_or(false)
                 };
                 if allowed {
-                    let result = crate::tui::tools::execute_tool(
+                    let result = crate::tui::tools::execute_tool_checked(
                         &call,
                         &crate::tui::tools::Sandbox::new(sandbox_root.clone()),
+                        &self.checkpoint_store,
                     );
                     let output = match result {
                         Ok(s) => s,
@@ -972,6 +975,9 @@ pub fn spawn_worker(
             backend: "rocm".into(), // Updated when a model is loaded.
             permissions,
             plan_mode: false,
+            checkpoint_store: crate::tui::checkpoints::CheckpointStore::open(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
         };
 
         loop {

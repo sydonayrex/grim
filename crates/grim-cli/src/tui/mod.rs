@@ -158,6 +158,8 @@ pub enum SlashCommand {
     Plan(Option<String>),
     /// Summarize older context now to free tokens.
     Compact,
+    /// Restore files changed by the last agent tool call.
+    Undo,
     /// Select the inference backend (rocm, cuda, metal, cpu, auto).
     Backend(Option<String>),
     Exit,
@@ -208,6 +210,7 @@ pub fn parse_slash_command(input: &str) -> SlashCommand {
         "think" | "thinking" => SlashCommand::Thinking(Some(after.trim().to_string())),
         "plan" if after.is_empty() => SlashCommand::Plan(None),
         "compact" => SlashCommand::Compact,
+        "undo" => SlashCommand::Undo,
         "plan" => SlashCommand::Plan(Some(after.trim().to_string())),
         "backend" if after.is_empty() => SlashCommand::Backend(None),
         "backend" => SlashCommand::Backend(Some(after.trim().to_string())),
@@ -254,6 +257,8 @@ pub enum InputMode {
     CommandPalette { selected: usize },
     /// Interactive session browser overlay (type-to-filter).
     SessionBrowser { query: String, selected: usize },
+    /// Checkpoint restore picker (/undo).
+    CheckpointPicker { selected: usize },
     /// Interactive skill picker overlay (Ctrl+G).
     SkillPicker { selected: usize },
     /// Interactive backend picker overlay (Ctrl+B).
@@ -348,6 +353,8 @@ pub struct App {
     pub compacting: bool,
     /// Plan for the in-flight compaction, applied on CompactionDone.
     pub pending_compaction: Option<compact::CompactionPlan>,
+    /// File-store checkpoints for agent edits (capture/restore).
+    pub checkpoints: checkpoints::CheckpointStore,
 }
 
 impl App {
@@ -385,7 +392,7 @@ impl App {
             frame_count: 0,
             skills,
             active_skill_name: None,
-            project_dir,
+            project_dir: project_dir.clone(),
             thinking_level: grim_core::sampler::ThinkingLevel::Default,
             plan_mode: false,
             task_list: crate::tui::tasks::TaskList::new(),
@@ -402,7 +409,15 @@ impl App {
             session_path: None,
             compacting: false,
             pending_compaction: None,
+            checkpoints: checkpoints::CheckpointStore::open(&project_dir),
         }
+    }
+
+    /// Change the project (sandbox) directory and reopen its checkpoint store.
+    pub fn set_project_dir(&mut self, dir: PathBuf) {
+        self.project_dir = dir;
+        self.sandbox_root = self.project_dir.clone();
+        self.checkpoints = checkpoints::CheckpointStore::open(&self.project_dir);
     }
 
     /// Show a toast notification, replacing any existing one.
@@ -670,6 +685,7 @@ impl App {
             InputMode::ModelPicker { selected } => self.handle_model_picker_key(key, selected),
             InputMode::CommandPalette { .. } => self.handle_palette_key(key),
             InputMode::SessionBrowser { .. } => self.handle_session_browser_key(key),
+            InputMode::CheckpointPicker { .. } => self.handle_checkpoint_picker_key(key),
             InputMode::SkillPicker { .. } => self.handle_skill_picker_key(key),
             InputMode::BackendPicker { .. } => self.handle_backend_picker_key(key),
             InputMode::ProjectDir => self.handle_project_dir_key(key),
@@ -1371,6 +1387,44 @@ impl App {
         self.history_search_matches().get(*selected).cloned()
     }
 
+    /// Checkpoint restore picker (/undo): pick a checkpoint, Enter restores.
+    fn handle_checkpoint_picker_key(&mut self, key: KeyEvent) {
+        let mut close = false;
+        if let InputMode::CheckpointPicker { selected } = &mut self.input_mode {
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected += 1,
+                KeyCode::Enter => {
+                    let items = self.checkpoints.list();
+                    if let Some(cp) = items.get(*selected).cloned() {
+                        match self.checkpoints.restore(cp.id) {
+                            Ok(msg) => {
+                                self.transcript.push_system(msg);
+                                self.show_toast(Toast::success("checkpoint restored"));
+                            }
+                            Err(e) => {
+                                self.show_toast(Toast::error(format!("restore failed: {e}")))
+                            }
+                        }
+                        close = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.input_mode = InputMode::Chat;
+            return;
+        }
+        if let InputMode::CheckpointPicker { selected } = &mut self.input_mode {
+            let n = self.checkpoints.list().len();
+            if *selected >= n {
+                *selected = n.saturating_sub(1);
+            }
+        }
+    }
+
     fn handle_skill_picker_key(&mut self, key: KeyEvent) {
         let filtered_count = self.filtered_skills().len();
         let selected = match &self.input_mode {
@@ -1558,20 +1612,20 @@ impl App {
                 let path = text.trim();
                 if path.is_empty() {
                     // Reset to current_dir.
-                    self.project_dir = std::env::current_dir()
-                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    self.set_project_dir(
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    );
                 } else {
                     let p = std::path::PathBuf::from(path);
                     if p.is_dir() {
-                        self.project_dir = p.canonicalize().unwrap_or(p);
+                        self.set_project_dir(p.canonicalize().unwrap_or(p));
                     } else {
                         self.transcript
                             .push_error(format!("not a directory: {path}"));
                         return;
                     }
                 }
-                // Update sandbox root to match the project dir.
-                self.sandbox_root = self.project_dir.clone();
                 self.transcript.push_system(format!(
                     "project directory: {}",
                     self.project_dir.display()
@@ -1848,8 +1902,7 @@ impl App {
                 } else {
                     let p = std::path::PathBuf::from(&path);
                     if p.is_dir() {
-                        self.project_dir = p.canonicalize().unwrap_or(p);
-                        self.sandbox_root = self.project_dir.clone();
+                        self.set_project_dir(p.canonicalize().unwrap_or(p));
                         self.transcript
                             .push_system(format!("project directory: {}", self.project_dir.display()));
                     } else {
@@ -1926,6 +1979,14 @@ impl App {
                     if !self.compacting {
                         self.transcript.push_system("nothing to compact yet".into());
                     }
+                }
+            }
+            SlashCommand::Undo => {
+                if self.checkpoints.list().is_empty() {
+                    self.transcript
+                        .push_system("no checkpoints yet".into());
+                } else {
+                    self.input_mode = InputMode::CheckpointPicker { selected: 0 };
                 }
             }
             SlashCommand::NotACommand => {
@@ -2029,9 +2090,10 @@ impl App {
                 name: name.clone(),
                 arguments,
             };
-            let result = crate::tui::tools::execute_tool(
+            let result = crate::tui::tools::execute_tool_checked(
                 &call,
                 &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
+                &self.checkpoints,
             );
             let output = match result {
                 Ok(s) => s,
@@ -2767,6 +2829,10 @@ fn ui(f: &mut Frame, app: &App) {
             c_purple_soft,
             " sessions  Enter to load, Esc cancels ".into(),
         ),
+        InputMode::CheckpointPicker { .. } => (
+            c_green,
+            " checkpoints  Enter restores, Esc cancels ".into(),
+        ),
         InputMode::SkillPicker { .. } => (
             c_purple_soft,
             " skills  type to filter, Enter to activate, Esc cancels ".into(),
@@ -3186,6 +3252,57 @@ fn ui(f: &mut Frame, app: &App) {
         let modal = Paragraph::new(lines).block(
             Block::bordered().border_type(BorderType::Rounded)
                 .title(Span::styled(" sessions  Ctrl+O ", Style::default().fg(c_purple_soft)))
+                .border_style(Style::default().fg(c_purple)),
+        );
+        f.render_widget(modal, modal_area);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint picker modal (/undo).
+    // -----------------------------------------------------------------------
+    if let InputMode::CheckpointPicker { selected } = app.input_mode {
+        let cps = app.checkpoints.list();
+        let height = (cps.len() as u16 + 4).clamp(5, 20);
+        let width = 76.min(f.area().width.saturating_sub(4));
+        let x = (f.area().width.saturating_sub(width)) / 2;
+        let y = (f.area().height.saturating_sub(height)) / 2;
+        let modal_area = Rect { x, y, width, height };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "  Enter restores files  ·  Esc cancels",
+            Style::default().fg(c_muted),
+        )));
+        lines.push(Line::raw(""));
+        for (idx, cp) in cps.iter().enumerate() {
+            let is_sel = idx == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let color = if is_sel { c_green } else { Color::White };
+            let when = chrono::DateTime::parse_from_rfc3339(&cp.ts)
+                .map(|d| d.format("%H:%M:%S").to_string())
+                .unwrap_or_else(|_| cp.ts.clone());
+            let file = cp
+                .files
+                .first()
+                .map(|f| {
+                    f.path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}#{idx}  {when}  {}  {file}", cp.tool),
+                Style::default().fg(color).add_modifier(if is_sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            )));
+        }
+        let modal = Paragraph::new(lines).block(
+            Block::bordered().border_type(BorderType::Rounded)
+                .title(Span::styled(" checkpoints  /undo ", Style::default().fg(c_green)))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
@@ -3877,6 +3994,16 @@ mod tests {
         app.submit_chat("/compact");
         assert!(!app.compacting);
         assert!(matches!(parse_slash_command("/compact"), SlashCommand::Compact));
+    }
+
+    #[test]
+    fn undo_with_no_checkpoints_stays_in_chat() {
+        let (_dir, _guard) = isolated_data_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx);
+        app.submit_chat("/undo");
+        assert!(matches!(app.input_mode, InputMode::Chat));
+        assert!(matches!(parse_slash_command("/undo"), SlashCommand::Undo));
     }
 
     #[test]
