@@ -33,13 +33,13 @@ fn roundtrip_budget_not_exceeded() {
         ("deepseek4.rs", 10),
         ("deepseek32.rs", 10),
         ("falcon.rs", 10),
-        ("falcon_h1.rs", 21),
+        ("falcon_h1.rs", 25), // WI-A: +4 test-module asserts; ratchet down in WI-G
         ("gemma.rs", 15),
         ("gemma2.rs", 8),
         ("glm5_2.rs", 7),
         ("gpt2.rs", 11),
         ("kv_attention.rs", 1),
-        ("lfm2.rs", 25),
+        ("lfm2.rs", 27), // WI-F: +2 (device-path bx fetch + decode test); decode no longer pulls proj
         ("lib.rs", 4),
         ("mellum.rs", 0),
         ("minicpm.rs", 17),
