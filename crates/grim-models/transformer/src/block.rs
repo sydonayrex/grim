@@ -878,10 +878,12 @@ impl LlamaBlock {
                 Err(e) => return Err(e),
             }
         } else {
-            // One-shot prefill without a cache: upload current K/V directly.
-            let kv_shape = Shape::new(vec![q_len, cfg.local_num_kv_heads, cfg.head_dim]);
-            owned_k = Some(dev.from_cpu(&k_3d.to_vec_f32()?, &kv_shape, DType::F32)?);
-            owned_v = Some(dev.from_cpu(&v_3d.to_vec_f32()?, &kv_shape, DType::F32)?);
+            // One-shot prefill without a cache: K/V are already device-resident
+            // (RoPE ran on-device above), so borrow their storages directly
+            // instead of round-tripping through the host. The attention kernels
+            // read flat rows + kv_len, not the storage shape.
+            k_borrowed = Some(k_3d.storage().as_ref());
+            v_borrowed = Some(v_3d.storage().as_ref());
             kv_len = q_len;
         }
 

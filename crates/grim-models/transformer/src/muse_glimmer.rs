@@ -402,25 +402,112 @@ impl GlimmerBlock {
         let k_rot = self.apply_rope_multi_head(&k, positions, cfg.local_num_kv_heads)?;
 
         let s = q_rot.shape().dims()[0];
+        let row_elems = cfg.local_num_kv_heads * cfg.head_dim;
+        let dev = grim_nn::modules::pick_device_for_storage_device(x_2d.device());
 
-        let v_vec = v.to_vec_f32()?;
-        let (full_k, full_v) = match cache.as_deref_mut() {
-            Some(c) => {
-                c.k_cache.extend_from_slice(&k_rot.to_vec_f32()?);
-                c.v_cache.extend_from_slice(&v_vec);
-                let total = c.past_len + s;
-                c.past_len = total;
-                (c.k_cache.clone(), c.v_cache.clone())
+        // Device-first: append the step's K/V rows to the device arena (D2D)
+        // and run the fused attention kernel over the arena. Only valid when
+        // `qk_scale_factor` is unity — the device kernel contract carries no
+        // custom scale (see `shared_attention::fused_or_scalar_attention_scaled`).
+        // `Ok(None)` means the backend lacks the device kernels; the caller
+        // then runs the host-mirror path via `host_mirror_attention`.
+        let device_attempt: Result<Option<Tensor>> = if cfg.qk_scale_factor == 1.0 {
+            match cache.as_deref_mut() {
+                Some(c) => match crate::block::cache_append_kv(
+                    dev.as_ref(),
+                    &mut c.k_device,
+                    &mut c.v_device,
+                    k_rot.storage().as_ref(),
+                    v.storage().as_ref(),
+                    c.past_len,
+                    s,
+                    row_elems,
+                ) {
+                    Ok((k_st, v_st, total)) => {
+                        c.past_len = total;
+                        let out_shape =
+                            Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]);
+                        match dev.qkv_attention(
+                            q_rot.storage().as_ref(),
+                            k_st,
+                            v_st,
+                            cfg.local_num_kv_heads,
+                            total,
+                            (total - s) as u32,
+                            cfg.sliding_window,
+                            &out_shape,
+                            None,
+                            None,
+                        ) {
+                            Ok((st, _h)) => Ok(Some(Tensor::new(
+                                Arc::from(st),
+                                out_shape,
+                                DType::F32,
+                                grim_tensor::QuantProvenance::default(),
+                                x_2d.device().clone(),
+                            ))),
+                            // Arena already holds this step's K/V — fetch it
+                            // to host once instead of re-extending the mirror.
+                            // The arena buffer is capacity-sized; only
+                            // `total` rows are valid — truncate or the scalar
+                            // kernel reads garbage rows.
+                            Err(_) => {
+                                let mut hk = k_st.to_cpu_vec_f32()?;
+                                hk.truncate(total * row_elems);
+                                let mut hv = v_st.to_cpu_vec_f32()?;
+                                hv.truncate(total * row_elems);
+                                Ok(Some(self.hybrid_attention(
+                                    &q_rot, &hk, &hv, total - s, s, total,
+                                )?))
+                            }
+                        }
+                    }
+                    Err(
+                        Error::Unimplemented(_)
+                        | Error::Tensor(grim_tensor::Error::Unimplemented(_)),
+                    ) => Ok(None),
+                    Err(e) => Err(e),
+                },
+                None => {
+                    // No cache: attend over the current step's K/V directly.
+                    let out_shape =
+                        Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]);
+                    match dev.qkv_attention(
+                        q_rot.storage().as_ref(),
+                        k_rot.storage().as_ref(),
+                        v.storage().as_ref(),
+                        cfg.local_num_kv_heads,
+                        s,
+                        0,
+                        cfg.sliding_window,
+                        &out_shape,
+                        None,
+                        None,
+                    ) {
+                        Ok((st, _h)) => Ok(Some(Tensor::new(
+                            Arc::from(st),
+                            out_shape,
+                            DType::F32,
+                            grim_tensor::QuantProvenance::default(),
+                            x_2d.device().clone(),
+                        ))),
+                        Err(_) => Ok(None),
+                    }
+                }
             }
-            None => (k_rot.to_vec_f32()?, v_vec),
+        } else {
+            // Non-unit qk_scale_factor: device kernel can't apply the custom
+            // scale — go straight to the host path.
+            Ok(None)
         };
-        let kv_len = match cache.as_ref() {
-            Some(c) => c.past_len,
-            None => s,
-        };
-        let past_len = kv_len - s;
 
-        let attn_out = self.hybrid_attention(&q_rot, &full_k, &full_v, past_len, s, kv_len)?;
+        let attn_out = match device_attempt {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.host_mirror_attention(&q_rot, &k_rot, &v, cache.as_deref_mut(), s)?
+            }
+            Err(e) => return Err(e),
+        };
         let attn_out = reshaped_view(
             &attn_out,
             &Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]),
@@ -437,6 +524,36 @@ impl GlimmerBlock {
         let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
 
         Ok((out, k_rot, v))
+    }
+
+    /// Legacy host path: extend the host-mirror KV cache and run the scalar
+    /// attention loop. Only reached when the backend lacks the device cache /
+    /// attention kernels or the layer carries a non-unit `qk_scale_factor`.
+    fn host_mirror_attention(
+        &self,
+        q_rot: &Tensor,
+        k_rot: &Tensor,
+        v: &Tensor,
+        mut cache: Option<&mut LlamaLayerCache>,
+        s: usize,
+    ) -> Result<Tensor> {
+        let v_vec = v.to_vec_f32()?;
+        let (full_k, full_v) = match cache.as_deref_mut() {
+            Some(c) => {
+                c.k_cache.extend_from_slice(&k_rot.to_vec_f32()?);
+                c.v_cache.extend_from_slice(&v_vec);
+                let total = c.past_len + s;
+                c.past_len = total;
+                (c.k_cache.clone(), c.v_cache.clone())
+            }
+            None => (k_rot.to_vec_f32()?, v_vec),
+        };
+        let kv_len = match cache.as_ref() {
+            Some(c) => c.past_len,
+            None => s,
+        };
+        let past_len = kv_len - s;
+        self.hybrid_attention(q_rot, &full_k, &full_v, past_len, s, kv_len)
     }
 
     /// RoPE a (B, S, num_heads*head_dim) tensor, staying on-device via a

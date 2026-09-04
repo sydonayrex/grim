@@ -174,13 +174,9 @@ impl Qwen38HyperConnection {
         let normed = self.hc_norm.forward(x)?;
         let down = self.input_mix_down.forward(&normed)?;
         let up = self.input_mix_up.forward(&down)?;
-        let x_vec = x.to_vec_f32()?;
-        let up_vec = up.to_vec_f32()?;
-        let mut mixed = vec![0.0f32; x_vec.len()];
-        for i in 0..mixed.len() {
-            mixed[i] = x_vec[i] + up_vec[i];
-        }
-        Ok(cpu_tensor(mixed, x.shape().clone()))
+        // `up` output width is hidden_size (weight [hc_lowrank, hidden_size]),
+        // so it matches `x` element-for-element; stay on-device.
+        Ok(grim_nn::modules::add_on_device(x, &up)?)
     }
 }
 
@@ -209,16 +205,9 @@ impl Qwen38MoeExpert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let g_vec = g.to_vec_f32()?;
-        let u_vec = u.to_vec_f32()?;
-        let mut act = vec![0.0f32; g_vec.len()];
-        for i in 0..act.len() {
-            let val = g_vec[i];
-            let sig = 1.0 / (1.0 + (-val).exp());
-            act[i] = val * sig * u_vec[i];
-        }
-        let act_tensor = cpu_tensor(act, g.shape().clone());
-        Ok(self.down_proj.forward(&act_tensor)?)
+        // Fused silu(gate) * up on-device; skips the per-expert host roundtrip.
+        let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
+        Ok(self.down_proj.forward(&act)?)
     }
 }
 
@@ -386,39 +375,92 @@ impl Qwen38FlashNextBlock {
         let _q_dim = self.num_heads * self.head_dim;
         let _kv_dim = self.num_kv_heads * self.head_dim;
 
-        let mut q_vec = q.to_vec_f32()?;
-        let mut k_vec = k.to_vec_f32()?;
+        // Device-first path: RoPE and fused GQA attention stay on-device
+        // (same pattern as block.rs / qwen35.rs). The host path below only
+        // runs when the backend lacks the rope/qkv_attention kernels.
+        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+        let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, 10000.0);
+        let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
+            let mut pos_ext = Vec::with_capacity(seq_len * heads);
+            for &pos in positions {
+                for _ in 0..heads {
+                    pos_ext.push(pos);
+                }
+            }
+            let t3 = crate::block::reshaped_view(
+                t,
+                &Shape::new(vec![1, seq_len * heads, self.head_dim]),
+            )?;
+            match dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape()) {
+                Ok((rope_s, _h)) => {
+                    let roped = Tensor::new(
+                        rope_s.into(),
+                        t3.shape().clone(),
+                        grim_tensor::DType::F32,
+                        t.provenance().clone(),
+                        t.device().clone(),
+                    );
+                    crate::block::reshaped_view(
+                        &roped,
+                        &Shape::new(vec![seq_len, heads * self.head_dim]),
+                    )
+                }
+                Err(_) => {
+                    // Backend lacks the rope kernel — host fallback.
+                    let mut vec = t.to_vec_f32()?;
+                    crate::qwen35::apply_rope_neox(
+                        &mut vec,
+                        positions,
+                        heads,
+                        self.head_dim,
+                        10000.0,
+                    );
+                    Ok(cpu_tensor(vec, t.shape().clone()))
+                }
+            }
+        };
 
-        crate::qwen35::apply_rope_neox(
-            &mut q_vec,
-            positions,
-            self.num_heads,
-            self.head_dim,
-            10000.0,
-        );
-        crate::qwen35::apply_rope_neox(
-            &mut k_vec,
-            positions,
+        let q_rope = rope_ext(&q, self.num_heads)?;
+        let k_rope = rope_ext(&k, self.num_kv_heads)?;
+
+        let out_shape = Shape::new(vec![seq_len, self.num_heads * self.head_dim]);
+        let attn_tensor = match dev.qkv_attention(
+            q_rope.storage().as_ref(),
+            k_rope.storage().as_ref(),
+            v.storage().as_ref(),
             self.num_kv_heads,
-            self.head_dim,
-            10000.0,
-        );
-
-        let q_heads = q_vec;
-        let k_heads = k_vec;
-        let v_heads = v.to_vec_f32()?;
-
-        let attn_tensor = crate::shared_attention::fused_or_scalar_attention(
-            &q_heads,
-            &k_heads,
-            &v_heads,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
             seq_len,
+            0,
             None,
-            x.device(),
-        )?;
+            &out_shape,
+            None,
+            None,
+        ) {
+            Ok((s, _h)) => Tensor::new(
+                std::sync::Arc::from(s),
+                out_shape.clone(),
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                x.device().clone(),
+            ),
+            Err(_) => {
+                // Host fallback (legacy path): pull Q/K/V to host vecs.
+                let q_heads = q_rope.to_vec_f32()?;
+                let k_heads = k_rope.to_vec_f32()?;
+                let v_heads = v.to_vec_f32()?;
+                crate::shared_attention::fused_or_scalar_attention(
+                    &q_heads,
+                    &k_heads,
+                    &v_heads,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    seq_len,
+                    None,
+                    x.device(),
+                )?
+            }
+        };
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
         let res1_tensor = grim_nn::modules::add_on_device(x, &attn_proj)?;
