@@ -398,10 +398,68 @@ impl Lfm2Block {
 
         let block_out = if let Some(in_proj) = &self.shortconv_in_proj {
             let proj = in_proj.forward(&norm_x)?;
-            let proj_v = proj.to_vec_f32()?;
             let h_dim = norm_x.shape().dims().last().copied().unwrap_or(0);
-            let steps = proj_v.len() / (3 * h_dim);
+            // Derived from the shape so the device decode path below can skip
+            // the D2H pull of `proj` entirely.
+            let steps = if h_dim > 0 {
+                proj.shape().elem_count() / (3 * h_dim)
+            } else {
+                0
+            };
 
+            let mut y_out = vec![0.0f32; steps * h_dim];
+
+            let conv_kernel_vec = self.shortconv_conv_vec.as_ref().unwrap();
+            let conv_shape = self.shortconv_conv.as_ref().unwrap().shape().dims();
+            let l_cache = *conv_shape.last().unwrap_or(&3);
+
+            if cache.is_none() {
+                *cache = Some(Lfm2LayerCache::ShortConv(vec![
+                    0.0f32;
+                    h_dim * (l_cache - 1)
+                ]));
+            }
+
+            let state = match cache.as_mut().unwrap() {
+                Lfm2LayerCache::ShortConv(st) => st,
+                _ => {
+                    return Err(grim_core::error::Error::Session(
+                        "Mismatched ShortConv layer cache".into(),
+                    ));
+                }
+            };
+
+            // WI-F: decode step (steps == 1) runs b·x, the depthwise causal
+            // conv and the c gate on-device (`mul` + `short_conv1d_causal_step`
+            // + `mul`), so `proj` never crosses D2H. Only the new `bx` row is
+            // fetched (h_dim floats) to slide the host state mirror. Prefill
+            // keeps the host loop. The device result feeds the same residual
+            // + FFN tail as the host path — no early return.
+            let mut device_block_out: Option<Tensor> = None;
+            if steps == 1 {
+                let device = norm_x.device().clone();
+                match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device) {
+                    Ok(Some(y_t)) => {
+                        let block_out_2d = self
+                            .shortconv_out_proj
+                            .as_ref()
+                            .unwrap()
+                            .forward(&y_t)?;
+                        device_block_out = Some(Tensor::new(
+                            block_out_2d.storage().clone(),
+                            Shape::new(vec![1, steps, h_dim]),
+                            block_out_2d.dtype(),
+                            block_out_2d.provenance().clone(),
+                            block_out_2d.device().clone(),
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let host_block_out = if device_block_out.is_none() {
+            let proj_v = proj.to_vec_f32()?;
             // Debug: compare projection output between CPU and CUDA.
             if std::env::var_os("GRIM_DEBUG_SHORTCONV").is_some() {
                 eprintln!(
@@ -437,27 +495,6 @@ impl Lfm2Block {
                 );
             }
 
-            let mut y_out = vec![0.0f32; steps * h_dim];
-
-            let conv_kernel_vec = self.shortconv_conv_vec.as_ref().unwrap();
-            let conv_shape = self.shortconv_conv.as_ref().unwrap().shape().dims();
-            let l_cache = *conv_shape.last().unwrap_or(&3);
-
-            if cache.is_none() {
-                *cache = Some(Lfm2LayerCache::ShortConv(vec![
-                    0.0f32;
-                    h_dim * (l_cache - 1)
-                ]));
-            }
-
-            let state = match cache.as_mut().unwrap() {
-                Lfm2LayerCache::ShortConv(st) => st,
-                _ => {
-                    return Err(grim_core::error::Error::Session(
-                        "Mismatched ShortConv layer cache".into(),
-                    ));
-                }
-            };
 
             for step in 0..steps {
                 let offset = step * 3 * h_dim;
@@ -513,13 +550,20 @@ impl Lfm2Block {
             // Reshape from [steps, h_dim] to [1, steps, h_dim] so the
             // residual add works correctly on backends without broadcasting
             // (e.g. CUDA). The input x is [1, steps, hidden_size].
-            Tensor::new(
+            Some(Tensor::new(
                 block_out_2d.storage().clone(),
                 Shape::new(vec![1, steps, h_dim]),
                 block_out_2d.dtype(),
                 block_out_2d.provenance().clone(),
                 block_out_2d.device().clone(),
-            )
+            ))
+            } else {
+                None
+            };
+            match device_block_out {
+                Some(d) => d,
+                None => host_block_out.expect("host block_out must exist when device path skipped"),
+            }
         } else if self.is_moe {
             self.forward_moe_ffn(&norm_x)?
         } else {
@@ -938,6 +982,90 @@ impl Lfm2Block {
     /// projection. All of it on the device; the host only sees the tiny
     /// gate-logit vector. Falls back to the host loop only when a backend
     /// lacks one of the required ops (allocsilce/transpose/matmul/silu_mul).
+    /// WI-F: one decode step of the shortconv block on device.
+    ///
+    /// Slices the `b`/`c`/`x` thirds off the single-row `proj` output D2D,
+    /// computes `bx = b·x` (`mul`), runs the depthwise causal conv
+    /// (`short_conv1d_causal_step`), and gates `y = c·conv` (`mul`). `proj`
+    /// never crosses D2H; only `bx` (h_dim floats) is fetched so the host
+    /// state mirror can slide. `state` is time-major `[t][d]`; the kernel
+    /// wants channel-major `[d][t]` — rearranged per call (host data).
+    /// Returns `Ok(None)` when the backend lacks the kernels.
+    fn shortconv_step_device(
+        &self,
+        proj: &Tensor,
+        h_dim: usize,
+        l_cache: usize,
+        state: &mut Vec<f32>,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let dev = grim_nn::modules::pick_device_for_storage_device(device);
+        let mut inner = || -> Result<Tensor> {
+            let kc = l_cache - 1;
+            let proj_st = proj.storage().as_ref();
+            let slice = |off: usize| -> Result<Box<dyn grim_tensor::BackendStorage>> {
+                let st = dev.alloc_storage(&Shape::new(vec![h_dim]), DType::F32)?;
+                dev.copy_slice_range(st.as_ref(), 0, proj_st, off, h_dim)?;
+                Ok(st)
+            };
+            let b_st = slice(0)?;
+            let c_st = slice(h_dim)?;
+            let x_st = slice(2 * h_dim)?;
+            let (bx_st, _) = dev.mul(
+                b_st.as_ref(),
+                x_st.as_ref(),
+                &Shape::new(vec![h_dim]),
+            )?;
+
+            let mut st_cm = vec![0.0f32; kc * h_dim];
+            for t in 0..kc {
+                for d in 0..h_dim {
+                    st_cm[d * kc + t] = state[t * h_dim + d];
+                }
+            }
+            let state_st =
+                dev.from_cpu(&st_cm, &Shape::new(vec![kc * h_dim]), DType::F32)?;
+
+            let conv_w = self.shortconv_conv.as_ref().unwrap();
+            let (sum_st, _) = dev.short_conv1d_causal_step(
+                bx_st.as_ref(),
+                conv_w.storage().as_ref(),
+                None,
+                state_st.as_ref(),
+                &Shape::new(vec![h_dim]),
+            )?;
+            // Out storage must carry the consumer-facing 2-D shape —
+            // Linear::forward reads the storage shape for matmul.
+            let (y_st, _) = dev.mul(
+                sum_st.as_ref(),
+                c_st.as_ref(),
+                &Shape::new(vec![1, h_dim]),
+            )?;
+
+            // Slide the host state mirror with the new bx row.
+            let mut bx_h = bx_st.to_cpu_vec_f32()?;
+            bx_h.truncate(h_dim);
+            state.copy_within(h_dim.., 0);
+            state[(kc - 1) * h_dim..].copy_from_slice(&bx_h);
+
+            Ok(Tensor::new(
+                Arc::from(y_st),
+                Shape::new(vec![1, h_dim]),
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                device.clone(),
+            ))
+        };
+        match inner() {
+            Ok(t) => Ok(Some(t)),
+            Err(
+                grim_core::Error::Unimplemented(_)
+                | grim_core::Error::Tensor(grim_tensor::Error::Unimplemented(_)),
+            ) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn forward_moe_ffn_device(
         &self,
         x: &Tensor,
@@ -1785,6 +1913,109 @@ mod shortconv_numeric_reference_tests {
                 );
             }
             _ => panic!("shortconv forward must populate a ShortConv cache"),
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod shortconv_device_decode_tests {
+    use super::*;
+    use grim_nn::Linear;
+
+    /// WI-F gate: single-token forward (device `short_conv1d_causal_step`
+    /// path) must match multi-token forward (host loop) — causal equivalence
+    /// through the conv + gate + out_proj stack, including state evolution.
+    #[test]
+    fn shortconv_decode_matches_prefill() {
+        let hidden = 4usize;
+        let l_cache = 3usize;
+        let steps = 3usize;
+
+        let weights = |seed: u64, n: usize| -> Vec<f32> {
+            let mut st = seed;
+            (0..n)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((st >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.4
+                })
+                .collect()
+        };
+        let lin = |w: Vec<f32>, out_dim: usize, in_dim: usize| -> Linear {
+            Linear::from_tensor(
+                grim_backend_cpu::cpu_tensor(w, Shape::new(vec![out_dim, in_dim])),
+                None,
+            )
+        };
+        let unit = || -> RmsNorm {
+            RmsNorm {
+                weight: grim_backend_cpu::cpu_tensor(vec![1.0; hidden], Shape::new(vec![hidden])),
+                eps: 1e-5,
+            }
+        };
+
+        let block = Lfm2Block {
+            attn_norm: unit(),
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            shortconv_in_proj: Some(lin(weights(1, 3 * hidden * hidden), 3 * hidden, hidden)),
+            shortconv_conv: Some(grim_backend_cpu::cpu_tensor(
+                weights(2, hidden * l_cache),
+                Shape::new(vec![hidden, 1, l_cache]),
+            )),
+            shortconv_conv_vec: Some(weights(2, hidden * l_cache)),
+            shortconv_out_proj: Some(lin(weights(3, hidden * hidden), hidden, hidden)),
+            ffn_norm: unit(),
+            ffn_gate: lin(weights(4, hidden * hidden), hidden, hidden),
+            ffn_up: lin(weights(5, hidden * hidden), hidden, hidden),
+            ffn_down: lin(weights(6, hidden * hidden), hidden, hidden),
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: hidden,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+        };
+
+        let x_data: Vec<f32> = vec![
+            0.3, -0.5, 0.7, 0.1, -0.2, 0.4, 0.6, -0.1, 0.25, 0.05, -0.35, 0.45,
+        ];
+
+        // Path A: one prefill call (host conv loop).
+        let x_all = grim_backend_cpu::cpu_tensor(x_data.clone(), Shape::new(vec![steps, hidden]));
+        let mut cache_a = None;
+        let out_a = block.forward(&x_all, &mut cache_a).unwrap().to_vec_f32().unwrap();
+
+        // Path B: three single-token calls (device kernel path at steps == 1).
+        let mut out_b = Vec::new();
+        let mut cache_b = None;
+        for t in 0..steps {
+            let x1 = grim_backend_cpu::cpu_tensor(
+                x_data[t * hidden..(t + 1) * hidden].to_vec(),
+                Shape::new(vec![1, hidden]),
+            );
+            out_b.extend(block.forward(&x1, &mut cache_b).unwrap().to_vec_f32().unwrap());
+        }
+
+        assert_eq!(out_a.len(), out_b.len());
+        for (i, (a, b)) in out_a.iter().zip(&out_b).enumerate() {
+            assert!((a - b).abs() < 1e-5, "token {i}: prefill {a} vs decode {b}");
         }
     }
 }

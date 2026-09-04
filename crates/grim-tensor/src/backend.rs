@@ -1573,6 +1573,42 @@ pub trait RecurrentOps {
         ))
     }
 
+    /// Falcon-H1 / Mamba-2-style selective scan (WI-D,
+    /// `ssm-conv-device-integration-plan.md`) — one decode step.
+    ///
+    /// Unlike [`BackendDevice::selective_scan`] (per-channel scalar B/C,
+    /// precomputed `a = exp(a_log+1)`), this variant matches the
+    /// llama.cpp `build_mamba2_layer` recurrence used by Falcon-H1:
+    ///
+    /// - `h[n,s] = exp(dt[h(n)]·a[h(n)])·h_prev[n,s] + b[s]·x[n]·dt[h(n)]`
+    /// - `y[n] = Σ_s c[s]·h[n,s] + d[h(n)]·x[n]·dt[h(n)]`
+    ///
+    /// where `h(n) = n / head_dim_ssm`. `dt` arrives post-softplus.
+    /// Layouts: `x [d_inner]`, `dt [n_heads]`, `a [n_heads]`, `d [n_heads]`,
+    /// `b [d_state]` and `c [d_state]` (this token's slices),
+    /// `state [d_inner·d_state]` read + written in place.
+    /// Default returns `Err(Unimplemented)`; backends wire a real kernel
+    /// incrementally, with the host loop as the always-present fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn selective_scan_headed(
+        &self,
+        _x: &dyn BackendStorage,
+        _dt: &dyn BackendStorage,
+        _a: &dyn BackendStorage,
+        _b: &dyn BackendStorage,
+        _c: &dyn BackendStorage,
+        _d: &dyn BackendStorage,
+        _state: &dyn BackendStorage,
+        _n_heads: usize,
+        _d_state: usize,
+        _head_dim_ssm: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "selective_scan_headed not implemented for this backend".into(),
+        ))
+    }
+
 
     /// RWKV time-mix kernel (Phase 2 — mambo5.md Item 14).
     ///
