@@ -1833,6 +1833,29 @@ pub trait GraphCaptureOps {
 /// operation's completion.
 ///
 /// # Safety Taxonomy
+/// Resolves one block-table lookup for [`BackendDevice::qkv_attention_paged`].
+///
+/// The table arrives as `BlockTableEntry { block_id: u32, page_size: u32 }` —
+/// two words per entry — uploaded as raw u32 bit patterns inside an f32
+/// tensor (see `paged_self_attention` in grim-models-transformer). Decode the
+/// entry word with [`f32::to_bits`], never float value casts: `f32::from_bits(1)`
+/// as f32 is a denormal that truncates to 0 under `as usize`, silently mapping
+/// every non-zero block onto physical block 0.
+///
+/// Sequence blocks past `max_blocks` fall back to the identity mapping the
+/// kernels use for overflow tokens.
+pub fn block_table_block_id(
+    block_table: &[f32],
+    block_idx_in_seq: usize,
+    max_blocks: usize,
+) -> usize {
+    if block_idx_in_seq < max_blocks {
+        f32::to_bits(block_table[block_idx_in_seq * 2]) as usize
+    } else {
+        block_idx_in_seq
+    }
+}
+
 /// Operations implemented by backends conform to the following three-tier model:
 /// - **Tier 1 — Safe-by-construction**: Safe Rust code utilizing type-safety rules.
 /// - **Tier 2 — Explicit `unsafe` with contract**: Backend operations that execute
@@ -3040,6 +3063,25 @@ pub trait BackendStorage: Send + Sync {
 mod tests {
     use super::*;
     use crate::dtype::QuantProvenance;
+
+    /// The packed `BlockTableEntry` ABI: bit patterns survive the f32 carrier
+    /// only under `to_bits`; value casts decode denormals to 0 (the bug this
+    /// guards — see the CPU paged-attention fix, commit 7634602).
+    #[test]
+    fn test_block_table_block_id_decodes_packed_entries() {
+        let page_size: u32 = 16;
+        let table: Vec<f32> = [7u32, 0u32, 1u32, 4096u32]
+            .into_iter()
+            .chain(std::iter::once(page_size))
+            .map(f32::from_bits)
+            .collect();
+
+        assert_eq!(block_table_block_id(&table, 0, 2), 7);
+        assert_eq!(block_table_block_id(&table, 1, 2), 1);
+        // Sequence blocks past the table keep the identity fallback.
+        assert_eq!(block_table_block_id(&table, 2, 2), 2);
+        assert_eq!(block_table_block_id(&table, 5, 2), 5);
+    }
 
     #[test]
     fn test_quantized_matmul_backward_residuals_from_tensor_default() {

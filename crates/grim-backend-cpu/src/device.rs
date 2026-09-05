@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use grim_tensor::backend::{ComputeHandle, ReadyHandle};
+use grim_tensor::backend::{block_table_block_id, ComputeHandle, ReadyHandle};
 use grim_tensor::dtype::{DType, Device, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, Shape, Tensor,
@@ -2005,22 +2005,6 @@ fn a_storage(s: &dyn BackendStorage) -> Result<&CpuStorage> {
 
 fn b_storage(s: &dyn BackendStorage) -> Result<&CpuStorage> {
     a_storage(s)
-}
-
-/// Resolves one block-table lookup for the paged attention kernels.
-///
-/// Entries arrive as `BlockTableEntry { block_id: u32, page_size: u32 }` —
-/// two words per entry, uploaded as raw u32 bit patterns inside an f32
-/// tensor (see `paged_self_attention` in grim-models-transformer). Decode
-/// with `to_bits`, never float value casts: `from_bits(1)` as f32 is a
-/// denormal that truncates to 0 under `as usize`, silently mapping every
-/// non-zero block onto physical block 0.
-fn block_table_block_id(block_table: &[f32], block_idx_in_seq: usize, max_blocks: usize) -> usize {
-    if block_idx_in_seq < max_blocks {
-        f32::to_bits(block_table[block_idx_in_seq * 2]) as usize
-    } else {
-        block_idx_in_seq
-    }
 }
 
 fn ensure_cpu_native(dtype: &DType) -> Result<()> {
