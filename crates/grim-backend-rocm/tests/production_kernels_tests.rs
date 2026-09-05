@@ -3,7 +3,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{Shape, dtype::DType,
-    backend::BackendStorage, CoreTensorOps, MemoryOps,
+    backend::{BackendStorage, RecurrentOps}, CoreTensorOps, MemoryOps,
 };
 use std::panic;
 
@@ -138,6 +138,89 @@ fn test_flash_decode_split_kv_parity() -> TestResult {
 /// match the per-head reference — this is what lets deepseek2 drop its
 /// num_heads serial launches. Weight blocks are laid out like kv_b_proj
 /// (head h's rows start after `nope` skipped rows), exercising the offset.
+/// P2 gate: the headed selective-scan kernel must reproduce the llama.cpp
+/// style Mamba-2 recurrence falcon_h1 runs on the host:
+///   h[n,s] = exp(dt[h]*a[h])*h_prev[n,s] + b[s]*x[n]*dt[h]
+///   y[n]   = sum_s c[s]*h[n,s] + d[h]*x[n]*dt[h]
+/// State updates in place; outputs compared elementwise.
+#[test]
+fn test_selective_scan_headed_parity() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
+    use grim_tensor::CoreTensorOps;
+
+    let n_heads = 4usize;
+    let head_dim_ssm = 6usize;
+    let d_state = 16usize;
+    let d_inner = n_heads * head_dim_ssm;
+
+    let x: Vec<f32> = (0..d_inner).map(|i| (i as f32 * 0.13).sin()).collect();
+    let dt: Vec<f32> = (0..n_heads).map(|h| 0.1 + h as f32 * 0.05).collect();
+    let a: Vec<f32> = (0..n_heads).map(|h| -(0.5 + h as f32 * 0.1)).collect();
+    let b: Vec<f32> = (0..d_state).map(|s| (s as f32 * 0.3).sin() * 0.5).collect();
+    let c: Vec<f32> = (0..d_state).map(|s| (s as f32 * 0.2).cos() * 0.5).collect();
+    let d: Vec<f32> = (0..n_heads).map(|h| 0.25 - h as f32 * 0.05).collect();
+    let state: Vec<f32> = (0..d_inner * d_state).map(|i| (i as f32 * 0.07).cos()).collect();
+
+    // Host recurrence reference.
+    let mut host_state = state.clone();
+    let mut expected = vec![0.0f32; d_inner];
+    for n in 0..d_inner {
+        let h = n / head_dim_ssm;
+        let decay = (dt[h] * a[h]).exp();
+        let mut y = 0.0f32;
+        for s in 0..d_state {
+            let idx = n * d_state + s;
+            host_state[idx] = decay * host_state[idx] + b[s] * x[n] * dt[h];
+            y += c[s] * host_state[idx];
+        }
+        expected[n] = y + d[h] * x[n] * dt[h];
+    }
+
+    let up = |v: &[f32], shape: &[usize]| -> Result<Box<dyn BackendStorage>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(dev
+            .from_cpu(v, &Shape::new(shape.to_vec()), DType::F32)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?)
+    };
+    let x_s = up(&x, &[d_inner])?;
+    let dt_s = up(&dt, &[n_heads])?;
+    let a_s = up(&a, &[n_heads])?;
+    let b_s = up(&b, &[d_state])?;
+    let c_s = up(&c, &[d_state])?;
+    let d_s = up(&d, &[n_heads])?;
+    let state_s = up(&state, &[d_inner, d_state])?;
+    let (out_st, _handle) = dev.selective_scan_headed(
+        x_s.as_ref(),
+        dt_s.as_ref(),
+        a_s.as_ref(),
+        b_s.as_ref(),
+        c_s.as_ref(),
+        d_s.as_ref(),
+        state_s.as_ref(),
+        n_heads,
+        d_state,
+        head_dim_ssm,
+        &Shape::new(vec![d_inner]),
+    )?;
+    dev.synchronize();
+
+    let y_dev = out_st.to_cpu_vec_f32()?;
+    for n in 0..d_inner {
+        let err = (y_dev[n] - expected[n]).abs();
+        assert!(err < 1e-4, "headed scan mismatch at [{n}]: {} vs {}", y_dev[n], expected[n]);
+    }
+    // State must have been updated in place on device.
+    let state_dev = state_s.to_cpu_vec_f32()?;
+    for (i, (&act, &exp)) in state_dev.iter().zip(host_state.iter()).enumerate() {
+        assert!(
+            (act - exp).abs() < 1e-4,
+            "headed scan state mismatch at [{i}]: {act} vs {exp}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_mla_head_stride_multi_head_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
