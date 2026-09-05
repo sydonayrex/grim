@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use grim_tensor::backend::ComputeHandle;
+use grim_tensor::backend::{block_table_block_id, ComputeHandle};
 use grim_tensor::dtype::{
     ArithType, DType, FloatPackScheme, KQuantScheme, Storage as DTypeStorage,
 };
@@ -2249,18 +2249,20 @@ impl AttentionOps for CudaDevice {
         let pool_blocks = k_dims[0] / page_size;
 
         // Resolve a sequence-block position to a physical pool block id. The
-        // table entry (an f32 cast to usize) is validated against the real pool
+        // table carries packed `BlockTableEntry { block_id, page_size }` words
+        // (see `paged_self_attention` in grim-models-transformer); the entry
+        // word is decoded with `to_bits` and validated against the real pool
         // capacity before any buffer index is computed; an out-of-range id is a
         // hard error instead of an out-of-bounds index.
         let resolve_block = |block_idx_in_seq: usize| -> Result<usize> {
             let id = if block_idx_in_seq < max_blocks {
-                if block_idx_in_seq >= btd.len() {
+                if block_idx_in_seq * 2 >= btd.len() {
                     return Err(Error::Backend(format!(
-                        "qkv_attention_paged: block table entry index {block_idx_in_seq} is out of range (table holds {} entries)",
+                        "qkv_attention_paged: block table entry {block_idx_in_seq} is out of range (table holds {} words, 2 per entry)",
                         btd.len()
                     )));
                 }
-                btd[block_idx_in_seq] as usize
+                block_table_block_id(&btd, block_idx_in_seq, max_blocks)
             } else {
                 block_idx_in_seq
             };
