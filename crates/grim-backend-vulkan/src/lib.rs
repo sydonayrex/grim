@@ -4077,6 +4077,8 @@ impl AttentionOps for VulkanDevice {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        _w_uv_offset_words: usize,
+        _w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let qa = q_absorbed.to_cpu_vec_f32()?;
         let qr = q_rope.to_cpu_vec_f32()?;

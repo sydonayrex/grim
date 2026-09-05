@@ -26,7 +26,9 @@ __global__ void grim_mla_absorbed_decode(
     int v_head_dim,                       // e.g. 128
     int seq_len,
     float inv_sqrt_d,
-    int has_w_uv
+    int has_w_uv,
+    int w_uv_offset_words,
+    int w_uv_head_stride_words
 ) {
     const int h = blockIdx.x; // query head index
     const int tid = threadIdx.x;
@@ -114,7 +116,12 @@ __global__ void grim_mla_absorbed_decode(
         for (int v = tid; v < v_head_dim; v += block_size) {
             float v_acc = 0.0f;
             for (int c = 0; c < kv_lora_rank && c < 512; ++c) {
-                v_acc += w_uv[v * kv_lora_rank + c] * s_latent[c];
+                // Per-head w_uv block: base offset (kv_b rows layout puts
+                // each head's block after `nope` skipped rows) plus the
+                // per-head stride; 0 stride = one shared matrix for all
+                // heads (legacy single-head launches).
+                long w_base = (long)w_uv_offset_words + (long)h * w_uv_head_stride_words;
+                v_acc += w_uv[w_base + v * kv_lora_rank + c] * s_latent[c];
             }
             out[h * v_head_dim + v] = v_acc;
         }

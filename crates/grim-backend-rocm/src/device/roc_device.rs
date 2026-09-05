@@ -3051,6 +3051,8 @@ impl AttentionOps for RocmDevice {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let q_abs = q_absorbed
             .as_any()
@@ -3092,6 +3094,8 @@ impl AttentionOps for RocmDevice {
             qk_rope_dim,
             v_head_dim,
             seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
         )?;
         Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
             self.active_stream(),
@@ -11584,6 +11588,8 @@ impl RocmDevice {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
     ) -> Result<*mut c_void> {
         let q_abs_ptr = q_absorbed.device_ptr.ok_or_else(|| {
             Error::Backend("mla_absorbed_decode: q_absorbed has no device ptr".into())
@@ -11615,6 +11621,8 @@ impl RocmDevice {
         let mut slen = seq_len as i32;
         let mut inv_sqrt = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
         let mut has_w = has_w_uv;
+        let mut w_off = w_uv_offset_words as i32;
+        let mut w_stride = w_uv_head_stride_words as i32;
 
         let lds_bytes = 256 * std::mem::size_of::<f32>();
         self.launch_compute_kernel_with_solution(
@@ -11634,6 +11642,8 @@ impl RocmDevice {
                 arg(&mut slen),
                 arg(&mut inv_sqrt),
                 arg(&mut has_w),
+                arg(&mut w_off),
+                arg(&mut w_stride),
             ],
             None,
             lds_bytes,

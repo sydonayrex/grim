@@ -3,7 +3,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{Shape, dtype::DType,
-    CoreTensorOps, MemoryOps,
+    backend::BackendStorage, CoreTensorOps, MemoryOps,
 };
 use std::panic;
 
@@ -134,6 +134,111 @@ fn test_flash_decode_split_kv_parity() -> TestResult {
     Ok(())
 }
 
+/// P1 gate: one multi-head launch with per-head w_uv offset+stride must
+/// match the per-head reference — this is what lets deepseek2 drop its
+/// num_heads serial launches. Weight blocks are laid out like kv_b_proj
+/// (head h's rows start after `nope` skipped rows), exercising the offset.
+#[test]
+fn test_mla_head_stride_multi_head_parity() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
+
+    let num_heads = 4usize;
+    let nope = 8usize;
+    let kv_lora_rank = 32usize;
+    let qk_rope_dim = 16usize;
+    let v_dim = 24usize;
+    let seq_len = 48usize;
+    let inv_sqrt_d = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
+
+    let q_nope: Vec<f32> = (0..num_heads * kv_lora_rank).map(|i| (i as f32 * 0.07).sin()).collect();
+    let q_pe: Vec<f32> = (0..num_heads * qk_rope_dim).map(|i| (i as f32 * 0.04).cos()).collect();
+    let kv_comp: Vec<f32> = (0..seq_len * kv_lora_rank).map(|i| (i as f32 * 0.02).sin()).collect();
+    let k_pe: Vec<f32> = (0..seq_len * qk_rope_dim).map(|i| (i as f32 * 0.01).cos()).collect();
+
+    // kv_b-style weight: [num_heads*(nope+v_dim), kv_lora_rank]; head h's
+    // v-block sits at word offset h*(nope+v_dim)*rank + nope*rank.
+    let w_rows = num_heads * (nope + v_dim);
+    let w_full: Vec<f32> = (0..w_rows * kv_lora_rank).map(|i| (i as f32 * 0.11).sin()).collect();
+    let w_offset_words = nope * kv_lora_rank;
+    let w_stride_words = (nope + v_dim) * kv_lora_rank;
+
+    // Host reference: per-head absorbed decode against that head's block.
+    let mut expected = vec![0.0f32; num_heads * v_dim];
+    for h in 0..num_heads {
+        let w_base = w_offset_words + h * w_stride_words;
+        let mut running_max = -1e20f32;
+        let mut running_sum = 0.0f32;
+        let mut acc = vec![0.0f32; kv_lora_rank];
+        for j in 0..seq_len {
+            let mut dot = 0.0f32;
+            for d in 0..kv_lora_rank {
+                dot += q_nope[h * kv_lora_rank + d] * kv_comp[j * kv_lora_rank + d];
+            }
+            for d in 0..qk_rope_dim {
+                dot += q_pe[h * qk_rope_dim + d] * k_pe[j * qk_rope_dim + d];
+            }
+            let score = dot * inv_sqrt_d;
+            let new_max = running_max.max(score);
+            let alpha = (running_max - new_max).exp();
+            let beta = (score - new_max).exp();
+            running_sum = running_sum * alpha + beta;
+            running_max = new_max;
+            for c in 0..kv_lora_rank {
+                acc[c] = acc[c] * alpha + beta * kv_comp[j * kv_lora_rank + c];
+            }
+        }
+        for v in 0..v_dim {
+            let mut sum = 0.0f32;
+            for c in 0..kv_lora_rank {
+                sum += w_full[w_base + v * kv_lora_rank + c] * (acc[c] / running_sum);
+            }
+            expected[h * v_dim + v] = sum;
+        }
+    }
+
+    let to_storage = |v: &[f32], shape: &[usize]| -> Result<Box<dyn BackendStorage>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(dev
+            .from_cpu(v, &Shape::new(shape.to_vec()), DType::F32)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?)
+    };
+    let q_nope_s = to_storage(&q_nope, &[num_heads, kv_lora_rank])?;
+    let q_pe_s = to_storage(&q_pe, &[num_heads, qk_rope_dim])?;
+    let mut packed = Vec::with_capacity(seq_len * (kv_lora_rank + qk_rope_dim));
+    for j in 0..seq_len {
+        packed.extend_from_slice(&kv_comp[j * kv_lora_rank..(j + 1) * kv_lora_rank]);
+        packed.extend_from_slice(&k_pe[j * qk_rope_dim..(j + 1) * qk_rope_dim]);
+    }
+    let packed_kv_s = to_storage(&packed, &[seq_len, kv_lora_rank + qk_rope_dim])?;
+    let w_s = to_storage(&w_full, &[w_rows, kv_lora_rank])?;
+    let out_s = to_storage(&vec![0.0f32; num_heads * v_dim], &[num_heads, v_dim])?;
+
+    dev.launch_mla_absorbed_decode(
+        grim_backend_rocm::device::util::as_rocm(q_nope_s.as_ref())?,
+        grim_backend_rocm::device::util::as_rocm(q_pe_s.as_ref())?,
+        grim_backend_rocm::device::util::as_rocm(packed_kv_s.as_ref())?,
+        Some(grim_backend_rocm::device::util::as_rocm(w_s.as_ref())?),
+        grim_backend_rocm::device::util::as_rocm(out_s.as_ref())?,
+        num_heads,
+        kv_lora_rank,
+        qk_rope_dim,
+        v_dim,
+        seq_len,
+        w_offset_words,
+        w_stride_words,
+    )?;
+    dev.synchronize();
+
+    let actual = out_s.to_cpu_vec_f32()?;
+    assert_eq!(actual.len(), expected.len());
+    for (i, (&act, &exp)) in actual.iter().zip(expected.iter()).enumerate() {
+        let err = (act - exp).abs();
+        assert!(err < 2e-3, "head-stride parity broken at [{i}]: {act} vs {exp}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_mla_absorbed_decode_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
@@ -230,6 +335,8 @@ fn test_mla_absorbed_decode_parity() -> TestResult {
         qk_rope_dim,
         v_dim,
         seq_len,
+        0,
+        0,
     )?;
     dev.synchronize();
 
