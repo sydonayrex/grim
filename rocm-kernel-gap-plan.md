@@ -67,9 +67,11 @@ existing kernel machinery. Gate: headed vs host-loop parity on GPU.
 ## [NOW] P3 — wire MoE bypassers onto shared MoeFfn/Charon
 
 These build custom expert loops and never reach `grim_moe_fused_dispatch`:
-`qwen35moe.rs` (own top-k loop, `cpu_tensor` out), `glm5_2.rs`, `glm4_moe_lite.rs`,
-`hyv3.rs`, `bailingmoe3.rs`, and the big ones `deepseek2.rs`
-(`DeepSeek2Expert`) + `qwen38_flash_next.rs` (`Qwen38MoeBlock`). Migrate the
+the big ones `deepseek2.rs` (`DeepSeek2Expert`) +
+`qwen38_flash_next.rs` (`Qwen38MoeBlock`), plus the small custom-loop
+bypassers `glm4_moe_lite.rs`, `glm5_2.rs`, `hyv3.rs`. (`qwen35moe.rs`
+was migrated in P3, status table above; `bailingmoe3.rs` uses `MoeFfn`,
+not a bypasser.) Migrate the
 small ones onto `MoeBlock`/`MoeFfn` first; DeepSeek/Qwen38 need shared-expert
 and latent-layout care. Gate: logits parity vs the old path (CPU) + Charon
 exercised on GPU.
