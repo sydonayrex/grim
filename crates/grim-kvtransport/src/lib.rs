@@ -13,6 +13,9 @@ use std::sync::Mutex;
 use grim_core::error::{Error, Result};
 use grim_tensor::AttentionOps;
 
+pub mod activation_channel;
+pub use activation_channel::TcpActivationTransport;
+
 pub mod bitmask_index;
 pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};
 
