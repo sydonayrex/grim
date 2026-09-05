@@ -5,10 +5,11 @@
 //! - **Fine-Grained MoE**: Top-k softmax routing across $N$ routed experts plus dedicated shared expert pathways.
 //! - **GQA Attention**: Grouped Query Attention with RMSNorm pre/post attention normalizations.
 
-use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
+use grim_backend_cpu::cpu_tensor;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
+use grim_nn::moe::{ExpertBank, ExpertTriple, MoeFfn, MoeRouter, RouterKind};
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
@@ -119,12 +120,13 @@ impl Qwen35MoeExpert {
     }
 }
 
+/// Qwen3.5-MoE feed-forward: routes through the shared `MoeFfn` so ROCm
+/// serving gets the fused Charon dispatch (top-k router + routed experts +
+/// shared expert) instead of a per-token host loop. Weight layout is
+/// unchanged (`mlp.gate`, `mlp.experts.{e}.gate_proj|up_proj|down_proj`,
+/// `mlp.shared_expert.*`).
 pub struct Qwen35MoeLayer {
-    pub gate: Linear,
-    pub shared_expert: Option<Qwen35MoeExpert>,
-    pub experts: Vec<Qwen35MoeExpert>,
-    pub num_experts_per_tok: usize,
-    pub routed_scaling_factor: f32,
+    pub ffn: MoeFfn,
 }
 
 impl Qwen35MoeLayer {
@@ -141,7 +143,9 @@ impl Qwen35MoeLayer {
             None
         };
 
-        let mut experts = Vec::with_capacity(cfg.num_experts);
+        let mut gates = Vec::with_capacity(cfg.num_experts);
+        let mut ups = Vec::with_capacity(cfg.num_experts);
+        let mut downs = Vec::with_capacity(cfg.num_experts);
         let exp_ws = ws.scoped("experts");
         for e in 0..cfg.num_experts {
             let exp = Qwen35MoeExpert::load(
@@ -149,67 +153,45 @@ impl Qwen35MoeLayer {
                 cfg.hidden_size,
                 cfg.intermediate_size,
             )?;
-            experts.push(exp);
+            let Qwen35MoeExpert {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } = exp;
+            gates.push(gate_proj);
+            ups.push(up_proj);
+            downs.push(down_proj);
         }
 
-        Ok(Self {
+        let router = MoeRouter::new(
             gate,
-            shared_expert,
-            experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-            routed_scaling_factor: cfg.routed_scaling_factor,
+            RouterKind::SoftmaxTopK,
+            cfg.num_experts_per_tok,
+            cfg.num_experts,
+            None,
+        );
+        let shared = shared_expert.map(|s| ExpertTriple {
+            gate: s.gate_proj,
+            up: s.up_proj,
+            down: s.down_proj,
+            inter: cfg
+                .shared_expert_intermediate_size
+                .unwrap_or(cfg.intermediate_size),
+            hidden: cfg.hidden_size,
+        });
+
+        Ok(Self {
+            ffn: MoeFfn::new(
+                router,
+                ExpertBank::from_linears(gates, ups, downs),
+                shared,
+                cfg.routed_scaling_factor,
+            ),
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let seq_len = x.shape().dims()[0];
-        let hidden_dim = x.shape().dims()[1];
-        let logits = self.gate.forward(x)?;
-        let logits_v = logits.to_vec_f32()?;
-        let num_exp = self.experts.len();
-
-        let xv = x.to_vec_f32()?;
-        let mut out = vec![0.0f32; seq_len * hidden_dim];
-
-        for s in 0..seq_len {
-            let row = &logits_v[s * num_exp..(s + 1) * num_exp];
-            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
-
-            let max_l = topk
-                .iter()
-                .map(|(_, l)| *l)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
-            let sum_e: f32 = exps.iter().sum();
-            let weights: Vec<f32> = exps
-                .iter()
-                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
-                .collect();
-
-            let token_x = cpu_tensor(
-                xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
-                Shape::new(vec![1, hidden_dim]),
-            );
-
-            for (i, (exp_idx, _)) in topk.iter().enumerate() {
-                let w = weights[i];
-                let exp_out = self.experts[*exp_idx].forward(&token_x)?.to_vec_f32()?;
-                for d in 0..hidden_dim {
-                    out[s * hidden_dim + d] += w * exp_out[d];
-                }
-            }
-
-            if let Some(ref shared) = self.shared_expert {
-                let shared_out = shared.forward(&token_x)?.to_vec_f32()?;
-                for d in 0..hidden_dim {
-                    out[s * hidden_dim + d] += shared_out[d];
-                }
-            }
-        }
-
-        Ok(cpu_tensor(out, x.shape().clone()))
+        self.ffn.forward(x).map_err(grim_core::error::Error::from)
     }
 }
 
@@ -468,5 +450,125 @@ mod tests {
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(cfg.num_experts, 64);
         assert_eq!(cfg.num_experts_per_tok, 8);
+    }
+
+    /// Parity gate for the MoeFfn migration: the layer must reproduce the
+    /// original per-token host algorithm (softmax top-k routing, weighted
+    /// expert sum scaled by routed_scaling_factor, shared expert added
+    /// unconditionally) — that algorithm is what the fused Charon kernel
+    /// matches bit-for-bit on ROCm.
+    #[test]
+    fn test_qwen35moe_layer_matches_host_reference() {
+        let hidden = 4usize;
+        let inter = 4usize;
+        let num_experts = 3usize;
+        let top_k = 2usize;
+        let scaling = 1.7f32;
+
+        let lin = |rows: usize, cols: usize, seed: f32| {
+            Linear::from_tensor(
+                cpu_tensor(
+                    (0..rows * cols)
+                        .map(|i| ((i as f32 + seed).sin()) * 0.4)
+                        .collect(),
+                    Shape::new(vec![rows, cols]),
+                ),
+                None,
+            )
+        };
+
+        let router = MoeRouter::new(
+            lin(num_experts, hidden, 11.0),
+            RouterKind::SoftmaxTopK,
+            top_k,
+            num_experts,
+            None,
+        );
+        let gates: Vec<Linear> = (0..num_experts).map(|e| lin(hidden, inter, e as f32)).collect();
+        let ups: Vec<Linear> = (0..num_experts).map(|e| lin(hidden, inter, e as f32 + 0.3)).collect();
+        let downs: Vec<Linear> = (0..num_experts).map(|e| lin(inter, hidden, e as f32 + 0.6)).collect();
+        let shared = ExpertTriple {
+            gate: lin(hidden, inter, 9.1),
+            up: lin(hidden, inter, 9.4),
+            down: lin(inter, hidden, 9.7),
+            inter,
+            hidden,
+        };
+        let layer = Qwen35MoeLayer {
+            ffn: MoeFfn::new(
+                router,
+                ExpertBank::from_linears(gates.clone(), ups.clone(), downs.clone()),
+                Some(shared),
+                scaling,
+            ),
+        };
+
+        let swiglu = |g: &[f32], u: &[f32]| -> Vec<f32> {
+            g.iter()
+                .zip(u.iter())
+                .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+                .collect()
+        };
+        let forward_expert = |g: &Linear, u: &Linear, d: &Linear, x: &[f32]| -> Vec<f32> {
+            let mm = |w: &[f32], r: usize, c: usize, v: &[f32]| -> Vec<f32> {
+                (0..r)
+                    .map(|o| (0..c).map(|k| v[k] * w[o * c + k]).sum::<f32>())
+                    .collect()
+            };
+            // Linear::from_tensor stores [out, in]; forward = x @ w_t.
+            let g_out = mm(&g.weight().to_vec_f32().unwrap(), inter, hidden, x);
+            let u_out = mm(&u.weight().to_vec_f32().unwrap(), inter, hidden, x);
+            let act = swiglu(&g_out, &u_out);
+            mm(&d.weight().to_vec_f32().unwrap(), hidden, inter, &act)
+        };
+
+        let x: Vec<f32> = vec![0.5f32, -0.3, 0.9, -0.7];
+        let rows = 1usize;
+        let x_t = cpu_tensor(x.clone(), Shape::new(vec![rows, hidden]));
+
+        // Reference algorithm (the pre-migration host loop). Router gate was
+        // stored [num_experts, hidden], so logit_e = x . w_row_e.
+        let gw: Vec<f32> = (0..num_experts * hidden)
+            .map(|i| ((i as f32 + 11.0).sin()) * 0.4)
+            .collect();
+        let shared_triple = (
+            lin(hidden, inter, 9.1),
+            lin(hidden, inter, 9.4),
+            lin(inter, hidden, 9.7),
+        );
+        let mut expected = vec![0.0f32; rows * hidden];
+        for s in 0..rows {
+            let token = &x[s * hidden..(s + 1) * hidden];
+            let mut row_logits: Vec<(usize, f32)> = (0..num_experts)
+                .map(|e| {
+                    let dot: f32 = (0..hidden).map(|k| token[k] * gw[e * hidden + k]).sum::<f32>();
+                    (e, dot)
+                })
+                .collect();
+            row_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = &row_logits[..top_k];
+            let max_l = top.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = top.iter().map(|(_, l)| (l - max_l).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (_i, ((e, _), ex)) in top.iter().zip(exps.iter()).enumerate() {
+                let w = ex / sum * scaling;
+                let eo = forward_expert(&gates[*e], &ups[*e], &downs[*e], token);
+                for dd in 0..hidden {
+                    expected[s * hidden + dd] += w * eo[dd];
+                }
+            }
+            let so = forward_expert(&shared_triple.0, &shared_triple.1, &shared_triple.2, token);
+            for dd in 0..hidden {
+                expected[s * hidden + dd] += so[dd];
+            }
+        }
+
+        let out = layer.forward(&x_t).unwrap().to_vec_f32().unwrap();
+        for (i, (&act, &exp)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (act - exp).abs() < 1e-4,
+                "qwen35moe layer diverges from host reference at [{i}]: {act} vs {exp}"
+            );
+        }
     }
 }
