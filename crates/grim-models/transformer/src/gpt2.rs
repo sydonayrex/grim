@@ -193,6 +193,7 @@ impl Gpt2Block {
             hidden_size,
             hidden_size,
             &(0..self.num_heads).collect::<Vec<_>>(),
+            None,
         );
 
         let attn_out_tensor = cpu_tensor(
