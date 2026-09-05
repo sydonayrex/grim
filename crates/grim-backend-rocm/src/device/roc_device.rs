@@ -2915,6 +2915,20 @@ impl SamplingOps for RocmDevice {
 
 impl AttentionOps for RocmDevice {
 
+    /// SageAttention dispatch. The GPU entry existed without trait wiring,
+    /// so callers always hit the Unimplemented default and fell back to the
+    /// F32 qkv path; this makes the kernel reachable.
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.sage_attention_gpu(q, k, v, num_kv_heads, kv_seq_len, out_shape)
+    }
 
     fn kv_dequant_attention(
         &self,
