@@ -17,8 +17,10 @@ pub mod train_packed;
 
 pub use cache_blend::{CacheBlendEngine, CachedSegment, StitchedPromptLayout};
 pub use pipeline_engine::{
-    PipelinePlan, PipelineStageConfig, PipelineStageExecutor, PipelineStageRunner,
-    PipelinedModelCoordinator,
+    vpp_async_schedule, InprocVppTransport, PipelinePlan, PipelineStageConfig,
+    PipelineStageExecutor, PipelineStageRunner, PipelinedModelCoordinator, TcpVppTransport,
+    VirtualPipelineCoordinator, VirtualPipelinePlan, VppActivationTransport, VppChannel, VppStep,
+    VppTransfer,
 };
 pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
 

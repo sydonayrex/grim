@@ -3,8 +3,11 @@
 //! Partitions transformer layers across multiple pipeline stages/GPUs and schedules
 //! activation transfers between adjacent stages using point-to-point communication.
 
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use grim_core::error::{Error, Result};
+use grim_kvtransport::TcpActivationTransport;
 use grim_memory::KvBlockPool;
 use grim_tensor::tensor::Tensor;
 use grim_tensor::shape::Shape;
@@ -469,30 +472,481 @@ impl VirtualPipelineCoordinator {
     }
 
     /// Execute a forward pass across all virtual pipeline stages in V-traversal sequence.
-    pub fn forward_vpp<F>(
-        &self,
-        initial_input: Tensor,
-        layer_forward_fn: F,
-    ) -> Result<Tensor>
+    pub fn forward_vpp<F>(&self, initial_input: Tensor, layer_forward_fn: F) -> Result<Tensor>
     where
         F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
     {
         let mut curr = initial_input;
         for runner in &self.runners {
-            let mut h = curr;
-            {
-                let mut pool = runner.block_pool.lock().map_err(|e| {
-                    Error::KvCache(format!("Failed to lock stage KV block pool: {}", e))
-                })?;
-                for layer_idx in runner.config.start_layer..runner.config.end_layer {
-                    h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
-                }
-            }
-            curr = h;
+            curr = self.run_virtual_stage(runner.config.stage_id, curr, &layer_forward_fn)?;
         }
         Ok(curr)
     }
+
+    /// Runs one virtual stage's layers over `input` using that stage's
+    /// isolated KV pool. Shared by the single-node and multi-rank paths.
+    fn run_virtual_stage<F>(
+        &self,
+        virtual_stage: usize,
+        input: Tensor,
+        layer_forward_fn: &F,
+    ) -> Result<Tensor>
+    where
+        F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
+    {
+        let runner = &self.runners[virtual_stage];
+        let mut h = input;
+        let mut pool = runner
+            .block_pool
+            .lock()
+            .map_err(|e| Error::KvCache(format!("Failed to lock stage KV block pool: {}", e)))?;
+        for layer_idx in runner.config.start_layer..runner.config.end_layer {
+            h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+        }
+        Ok(h)
+    }
+
+    /// Execute `chunk_inputs` across `num_physical_ranks` ranks with async
+    /// bidirectional handoffs at the fold points (VPP-Async), so chunk *k*'s
+    /// heavy middle on rank *r* overlaps chunk *k±1*'s tail/head on the peer
+    /// rank. Returns one output per chunk, in chunk order.
+    ///
+    /// Single-rank plans stay on the inline [`Self::forward_vpp`] path —
+    /// per-rank threads and transport would only add overhead.
+    pub fn forward_vpp_multi_rank<F>(
+        &self,
+        transport: &dyn VppActivationTransport,
+        chunk_inputs: Vec<Tensor>,
+        layer_forward_fn: F,
+    ) -> Result<Vec<Tensor>>
+    where
+        F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor> + Sync,
+    {
+        let num_chunks = chunk_inputs.len();
+        if num_chunks == 0 {
+            return Err(Error::Config(
+                "forward_vpp_multi_rank: no chunks to execute".into(),
+            ));
+        }
+        if self.plan.num_physical_ranks == 1 {
+            return chunk_inputs
+                .into_iter()
+                .map(|chunk| self.forward_vpp(chunk, &layer_forward_fn))
+                .collect();
+        }
+
+        let shape = chunk_inputs[0].shape().dims().to_vec();
+        if chunk_inputs
+            .iter()
+            .any(|c| c.shape().dims() != shape.as_slice())
+        {
+            return Err(Error::Config(
+                "forward_vpp_multi_rank: all chunks must share one activation shape".into(),
+            ));
+        }
+        let elem_count: usize = shape.iter().product();
+        let schedule = vpp_async_schedule(&self.plan, num_chunks);
+        let outputs: Mutex<Vec<Option<Tensor>>> =
+            Mutex::new((0..num_chunks).map(|_| None).collect());
+
+        std::thread::scope(|scope| {
+            let shared_fn = &layer_forward_fn;
+            let shared_inputs = &chunk_inputs;
+            let shared_shape = &shape;
+            let shared_outputs = &outputs;
+            let handles: Vec<_> = schedule
+                .iter()
+                .enumerate()
+                .map(|(rank, steps)| {
+                    scope.spawn(move || {
+                        self.run_vpp_rank(
+                            rank,
+                            steps,
+                            transport,
+                            shared_inputs,
+                            shared_shape,
+                            elem_count,
+                            shared_fn,
+                            shared_outputs,
+                        )
+                    })
+                })
+                .collect();
+            let mut first_err = None;
+            for handle in handles {
+                let rank_result = handle.join().unwrap_or_else(|panic| {
+                    Err(Error::Session(format!(
+                        "vpp rank thread panicked: {panic:?}"
+                    )))
+                });
+                if let Err(e) = rank_result {
+                    first_err.get_or_insert(e);
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        })?;
+
+        let filled = outputs
+            .into_inner()
+            .map_err(|_| Error::Session("vpp output slot poisoned".into()))?;
+        filled
+            .into_iter()
+            .enumerate()
+            .map(|(chunk, slot)| {
+                slot.ok_or_else(|| Error::Session(format!("vpp chunk {chunk} produced no output")))
+            })
+            .collect()
+    }
+
+    /// Executes one rank's scheduled steps. A rank blocks only where the
+    /// schedule says a cross-rank input is pending; same-rank fold handoffs
+    /// pass through a worker-local map. On any error the worker returns and
+    /// its open transfers close, which unblocks peers with an error instead
+    /// of a hang.
+    #[allow(clippy::too_many_arguments)]
+    fn run_vpp_rank<F>(
+        &self,
+        rank: usize,
+        steps: &[VppStep],
+        transport: &dyn VppActivationTransport,
+        chunk_inputs: &[Tensor],
+        shape: &[usize],
+        elem_count: usize,
+        layer_forward_fn: &F,
+        outputs: &Mutex<Vec<Option<Tensor>>>,
+    ) -> Result<()>
+    where
+        F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
+    {
+        let mut local_handoff: HashMap<usize, Tensor> = HashMap::new();
+        for step in steps {
+            let input = match &step.recv {
+                Some(xfer) => tensor_from_f32_vec(
+                    transport.recv(rank, xfer, elem_count)?,
+                    Shape::from_slice(shape),
+                ),
+                None if step.virtual_stage == 0 => chunk_inputs[step.chunk].clone(),
+                None => local_handoff.remove(&step.chunk).ok_or_else(|| {
+                    Error::Session(format!(
+                        "vpp rank {rank}: stage {} chunk {} missing local fold handoff",
+                        step.virtual_stage, step.chunk
+                    ))
+                })?,
+            };
+
+            let out = self.run_virtual_stage(step.virtual_stage, input, layer_forward_fn)?;
+            if step.virtual_stage + 1 == self.plan.virtual_stages.len() {
+                outputs
+                    .lock()
+                    .map_err(|_| Error::Session("vpp output slot poisoned".into()))?[step.chunk] =
+                    Some(out);
+            } else {
+                let successor = &self.plan.virtual_stages[step.virtual_stage + 1];
+                if successor.physical_rank == rank {
+                    local_handoff.insert(step.chunk, out);
+                } else if let Some(xfer) = &step.send {
+                    let data = out.to_vec_f32()?;
+                    transport.send(rank, xfer, &data)?;
+                } else {
+                    return Err(Error::Session(format!(
+                        "vpp rank {rank}: stage {} chunk {} has a remote successor but no send",
+                        step.virtual_stage, step.chunk
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+// ── Multi-rank VPP transport and VPP-Async scheduling (R3) ──────────────────
+
+/// Which arm of the V-traversal a transfer belongs to. Forward-arm frames
+/// flow rank *r* → *r+1*; return-arm frames flow rank *r+1* → *r*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VppChannel {
+    Forward,
+    Return,
+}
+
+impl VppChannel {
+    /// Discriminator on the TCP activation wire.
+    fn wire_id(self) -> u32 {
+        match self {
+            Self::Forward => 0,
+            Self::Return => 1,
+        }
+    }
+}
+
+/// One cross-rank activation transfer: who to talk to and which frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VppTransfer {
+    pub peer_rank: usize,
+    pub channel: VppChannel,
+    pub chunk: usize,
+}
+
+/// One scheduled execution: run `virtual_stage` on `chunk`, pulling the
+/// input from `recv` and pushing the output to `send`. Both are `None` when
+/// the neighbor stage sits on the same rank — the model head consumes the
+/// chunk input directly, fold pairs hand off locally, and the model tail
+/// produces the chunk output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VppStep {
+    pub virtual_stage: usize,
+    pub chunk: usize,
+    pub recv: Option<VppTransfer>,
+    pub send: Option<VppTransfer>,
+}
+
+/// Builds the per-rank VPP-Async execution order for `num_chunks` chunks.
+///
+/// The paper's tail/head swap, made concrete for the fold-back topology:
+/// non-fold ranks run their forward-arm stage for *every* chunk before their
+/// first return-arm stage, so entry-rank sends fire while the interior ranks
+/// are still consuming earlier chunks; the fold rank (which owns two adjacent
+/// stages) interleaves head→tail per chunk so return frames stream back
+/// during the forward drain. With this order a rank is idle only during
+/// warmup, not at every chunk boundary.
+pub fn vpp_async_schedule(plan: &VirtualPipelinePlan, num_chunks: usize) -> Vec<Vec<VppStep>> {
+    let num_ranks = plan.num_physical_ranks;
+    let total_stages = plan.virtual_stages.len();
+    let mut schedule = Vec::with_capacity(num_ranks);
+    for rank in 0..num_ranks {
+        let forward_stage = rank;
+        let return_stage = total_stages - 1 - rank;
+        let is_fold_rank = rank + 1 == num_ranks;
+        let mut steps = Vec::with_capacity(2 * num_chunks);
+        for chunk in 0..num_chunks {
+            steps.push(VppStep {
+                virtual_stage: forward_stage,
+                chunk,
+                recv: (rank > 0).then(|| VppTransfer {
+                    peer_rank: rank - 1,
+                    channel: VppChannel::Forward,
+                    chunk,
+                }),
+                send: (!is_fold_rank).then(|| VppTransfer {
+                    peer_rank: rank + 1,
+                    channel: VppChannel::Forward,
+                    chunk,
+                }),
+            });
+            if is_fold_rank {
+                steps.push(VppStep {
+                    virtual_stage: return_stage,
+                    chunk,
+                    recv: None,
+                    send: (rank > 0).then(|| VppTransfer {
+                        peer_rank: rank - 1,
+                        channel: VppChannel::Return,
+                        chunk,
+                    }),
+                });
+            }
+        }
+        if !is_fold_rank {
+            for chunk in 0..num_chunks {
+                steps.push(VppStep {
+                    virtual_stage: return_stage,
+                    chunk,
+                    recv: Some(VppTransfer {
+                        peer_rank: rank + 1,
+                        channel: VppChannel::Return,
+                        chunk,
+                    }),
+                    send: (rank > 0).then(|| VppTransfer {
+                        peer_rank: rank - 1,
+                        channel: VppChannel::Return,
+                        chunk,
+                    }),
+                });
+            }
+        }
+        schedule.push(steps);
+    }
+    schedule
+}
+
+/// Moves activation payloads between physical ranks. Value-based: the engine
+/// hands over host f32 slices and receives host f32 buffers, so one schedule
+/// runs over in-process channels (single node, multi GPU) or TCP (multi
+/// node) unchanged.
+pub trait VppActivationTransport: Send + Sync {
+    /// Pushes one activation frame from `from_rank` toward `xfer.peer_rank`.
+    fn send(&self, from_rank: usize, xfer: &VppTransfer, data: &[f32]) -> Result<()>;
+
+    /// Blocks until the frame `xfer` describes arrives at `for_rank`, and
+    /// validates it carries exactly `elem_count` elements.
+    fn recv(&self, for_rank: usize, xfer: &VppTransfer, elem_count: usize) -> Result<Vec<f32>>;
+}
+
+/// How long a rank waits for a scheduled frame before declaring the
+/// exchange wedged. Bounds the hang a broken schedule could otherwise cause.
+const VPP_RECV_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Same-process transport: one ordered mailbox per directed
+/// (from, to, channel) link. Single-node multi-GPU ranks share address
+/// space, so rank threads need no sockets.
+pub struct InprocVppTransport {
+    mailboxes: Mutex<HashMap<InprocLinkKey, VecDeque<(usize, Vec<f32>)>>>,
+    signal: Condvar,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct InprocLinkKey {
+    from: usize,
+    to: usize,
+    channel: VppChannel,
+}
+
+impl InprocVppTransport {
+    /// Builds the link mesh for `num_ranks` adjacent-pair ranks.
+    pub fn mesh(num_ranks: usize) -> Arc<Self> {
+        let mut mailboxes = HashMap::new();
+        for rank in 0..num_ranks.saturating_sub(1) {
+            mailboxes.insert(
+                InprocLinkKey {
+                    from: rank,
+                    to: rank + 1,
+                    channel: VppChannel::Forward,
+                },
+                VecDeque::new(),
+            );
+            mailboxes.insert(
+                InprocLinkKey {
+                    from: rank + 1,
+                    to: rank,
+                    channel: VppChannel::Return,
+                },
+                VecDeque::new(),
+            );
+        }
+        Arc::new(Self {
+            mailboxes: Mutex::new(mailboxes),
+            signal: Condvar::new(),
+        })
+    }
+
+    fn lock_mailboxes(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<InprocLinkKey, VecDeque<(usize, Vec<f32>)>>>> {
+        self.mailboxes
+            .lock()
+            .map_err(|_| Error::Session("vpp inproc transport poisoned".into()))
+    }
+}
+
+impl VppActivationTransport for InprocVppTransport {
+    fn send(&self, from_rank: usize, xfer: &VppTransfer, data: &[f32]) -> Result<()> {
+        let key = InprocLinkKey {
+            from: from_rank,
+            to: xfer.peer_rank,
+            channel: xfer.channel,
+        };
+        {
+            let mut mailboxes = self.lock_mailboxes()?;
+            let queue = mailboxes.get_mut(&key).ok_or_else(|| {
+                Error::Session(format!(
+                    "vpp inproc: no link {from_rank}→{} on {:?}",
+                    xfer.peer_rank, xfer.channel
+                ))
+            })?;
+            queue.push_back((xfer.chunk, data.to_vec()));
+        }
+        self.signal.notify_all();
+        Ok(())
+    }
+
+    fn recv(&self, for_rank: usize, xfer: &VppTransfer, elem_count: usize) -> Result<Vec<f32>> {
+        let key = InprocLinkKey {
+            from: xfer.peer_rank,
+            to: for_rank,
+            channel: xfer.channel,
+        };
+        let mut mailboxes = self.lock_mailboxes()?;
+        let deadline = Instant::now() + VPP_RECV_DEADLINE;
+        loop {
+            if let Some(queue) = mailboxes.get_mut(&key) {
+                match queue.front() {
+                    Some((tag, _)) if *tag == xfer.chunk => {
+                        let (_, data) = queue.pop_front().expect("front checked non-empty");
+                        if data.len() != elem_count {
+                            return Err(Error::Session(format!(
+                                "vpp inproc: frame chunk {} carries {} elements, expected {}",
+                                xfer.chunk,
+                                data.len(),
+                                elem_count
+                            )));
+                        }
+                        return Ok(data);
+                    }
+                    Some((tag, _)) => {
+                        return Err(Error::Session(format!(
+                            "vpp inproc: out-of-order frame chunk {tag}, expected {}",
+                            xfer.chunk
+                        )));
+                    }
+                    None => {}
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::Session(format!(
+                    "vpp inproc: chunk {} on {:?} not delivered within {VPP_RECV_DEADLINE:?}",
+                    xfer.chunk, xfer.channel
+                )));
+            }
+            let (relocked, _) = self
+                .signal
+                .wait_timeout(mailboxes, deadline - now)
+                .map_err(|_| Error::Session("vpp inproc transport poisoned".into()))?;
+            mailboxes = relocked;
+        }
+    }
+}
+
+/// Adapter driving [`TcpActivationTransport`] (multi-node / cross-process)
+/// through the engine's transport trait.
+pub struct TcpVppTransport(pub TcpActivationTransport);
+
+impl VppActivationTransport for TcpVppTransport {
+    fn send(&self, from_rank: usize, xfer: &VppTransfer, data: &[f32]) -> Result<()> {
+        self.0.send_activation(
+            xfer.peer_rank,
+            xfer.channel.wire_id(),
+            chunk_tag(xfer.chunk, from_rank)?,
+            data,
+        )
+    }
+
+    fn recv(&self, for_rank: usize, xfer: &VppTransfer, elem_count: usize) -> Result<Vec<f32>> {
+        let data = self.0.recv_activation(
+            for_rank,
+            xfer.channel.wire_id(),
+            chunk_tag(xfer.chunk, for_rank)?,
+        )?;
+        if data.len() != elem_count {
+            return Err(Error::Session(format!(
+                "vpp tcp: frame chunk {} carries {} elements, expected {}",
+                xfer.chunk,
+                data.len(),
+                elem_count
+            )));
+        }
+        Ok(data)
+    }
+}
+
+fn chunk_tag(chunk: usize, rank: usize) -> Result<u32> {
+    u32::try_from(chunk).map_err(|_| {
+        Error::Session(format!(
+            "vpp: chunk {chunk} at rank {rank} exceeds u32 tags"
+        ))
+    })
+}
+
 
 #[cfg(test)]
 mod tests {

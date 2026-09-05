@@ -383,6 +383,22 @@ impl Scheduler {
     }
 
     /// Called once per engine tick. Decides what runs this step.
+    /// Chunked-prefill progress per request whose drain has started but not
+    /// finished: id -> (consumed_tokens, prompt_tokens). Covers mid-drain
+    /// remainders parked in `waiting` as well as `running` entries, so
+    /// consumers like the multi-rank VPP coordinator can interleave two
+    /// requests' chunks for drain-window packing without reaching into
+    /// scheduler collections. Requests that have not been chunk-scheduled
+    /// yet report no offset — there is no boundary to interleave with.
+    pub fn chunk_offsets(&self) -> std::collections::HashMap<u64, (usize, usize)> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .filter(|r| r.consumed_tokens > 0 && r.consumed_tokens < r.prompt_tokens)
+            .map(|r| (r.id, (r.consumed_tokens, r.prompt_tokens)))
+            .collect()
+    }
+
     pub fn schedule(&mut self) -> SchedulerOutput {
         if self.determinism_mode == DeterminismMode::Strict {
             // Sort waiting queue deterministically by request ID
@@ -1082,6 +1098,50 @@ mod tests {
         assert_eq!(running.consumed_tokens, 120);
         let out4 = sched.schedule();
         assert_eq!(out4.decode_ids, vec![7], "fully-prefilled request decodes");
+    }
+
+    /// VPP drain-window packing: the multi-rank VPP coordinator interleaves
+    /// two requests' prefill chunks, so it needs each in-flight request's
+    /// chunk progress without reaching into scheduler collections.
+    /// `chunk_offsets` reports id -> (consumed_tokens, prompt_tokens) for
+    /// every request that still has prefill work outstanding — including
+    /// mid-drain remainders parked in `waiting`, not just `running` entries.
+    #[test]
+    fn test_chunk_offsets_expose_drain_progress() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(100, 8, ctrl);
+        sched.chunked_prefill_size = 50;
+
+        sched.enqueue(Request {
+            id: 7,
+            prompt_tokens: 120,
+            ..Default::default()
+        });
+
+        assert!(
+            sched.chunk_offsets().is_empty(),
+            "no prefill outstanding before the first pass"
+        );
+
+        let _ = sched.schedule();
+        assert_eq!(
+            sched.chunk_offsets().get(&7),
+            Some(&(50, 120)),
+            "pass 1 consumed 50 of 120"
+        );
+
+        let _ = sched.schedule();
+        assert_eq!(
+            sched.chunk_offsets().get(&7),
+            Some(&(100, 120)),
+            "pass 2 accumulates to 100"
+        );
+
+        let _ = sched.schedule();
+        assert!(
+            !sched.chunk_offsets().contains_key(&7),
+            "fully drained request has no outstanding chunk work"
+        );
     }
 
     /// Decode-mid-prefill exclusion: a request whose prompt is only partly
