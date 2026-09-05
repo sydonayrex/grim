@@ -186,6 +186,7 @@ impl GemmaBlock {
             q_row,
             kv_row,
             &kv_head,
+                    None,
         );
 
         let attn_out_t = cpu_tensor(attn_out, grim_tensor::Shape::new(vec![new_tokens, q_row]));

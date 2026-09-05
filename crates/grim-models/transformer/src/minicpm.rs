@@ -586,7 +586,8 @@ impl MiniCpmBlock {
                 row_elems,
                 kv_stride,
                 &kv_head,
-            );
+                        None,
+        );
             out_total.extend_from_slice(&out);
         }
 
