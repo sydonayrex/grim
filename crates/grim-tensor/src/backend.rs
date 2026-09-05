@@ -704,7 +704,10 @@ pub trait AttentionOps {
     /// - `kv_cache`: `[seq_len, num_kv_heads(=1), kv_lora_rank + qk_rope_dim]`
     ///   — compressed latent KV (kv_a_layernorm'ed c_kv + rope key)
     /// - `w_uv`: `[num_heads * v_head_dim, kv_lora_rank]` — absorbed
-    ///   up+value projection (optional; None ⇒ output stays in latent space)
+    ///   up+value projection (optional; None ⇒ output stays in latent space).
+    ///   Head *h*'s block starts at word `w_uv_offset_words + h *
+    ///   w_uv_head_stride_words`; a zero stride shares one matrix across all
+    ///   heads (legacy single-head launches pass offset 0, stride 0)
     /// - `out_shape`: `[1, num_heads, v_head_dim]`
     ///
     /// Scale: `1/sqrt(kv_lora_rank + qk_rope_dim)`.
@@ -723,8 +726,12 @@ pub trait AttentionOps {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let _ = (
+            w_uv_offset_words,
+            w_uv_head_stride_words,
             q_absorbed,
             q_rope,
             kv_cache,
@@ -2361,6 +2368,8 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         (**self).mla_absorbed_decode(
             q_absorbed,
@@ -2373,6 +2382,8 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
             qk_rope_dim,
             v_head_dim,
             seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
         )
     }
 }

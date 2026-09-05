@@ -329,6 +329,8 @@ impl AttentionOps for ProbeDevice {
         _qk_rope_dim: usize,
         _v_head_dim: usize,
         _seq_len: usize,
+        _w_uv_offset_words: usize,
+        _w_uv_head_stride_words: usize,
     ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
         probe_err("mla_absorbed_decode")?;
         unreachable!()

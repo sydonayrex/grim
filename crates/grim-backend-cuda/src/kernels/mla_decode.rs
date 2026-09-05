@@ -31,7 +31,9 @@ __global__ void grim_mla_absorbed_decode(
     int v_head_dim,
     int seq_len,
     float inv_sqrt_d,
-    int has_w_uv
+    int has_w_uv,
+    int w_uv_offset_words,
+    int w_uv_head_stride_words
 ) {
     const int h          = blockIdx.x;
     const int tid        = threadIdx.x;
@@ -95,7 +97,8 @@ __global__ void grim_mla_absorbed_decode(
         for (int v = tid; v < v_head_dim; v += block_size) {
             float va = 0.0f;
             for (int c = 0; c < kv_lora_rank && c < 512; ++c)
-                va += w_uv[v * kv_lora_rank + c] * s_latent[c];
+            long w_base = (long)w_uv_offset_words + (long)h * w_uv_head_stride_words;
+            va += w_uv[w_base + v * kv_lora_rank + c] * s_latent[c];
             out[h * v_head_dim + v] = va;
         }
     } else {
