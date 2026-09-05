@@ -5,6 +5,20 @@ Companion to `gpu-followup-workitems.md`. Derived from a full sweep of
 scope for the current pass are marked [NOW]; the rest are sequenced follow-ups
 with the evidence needed to start them.
 
+## Status (2026-09-04)
+
+| Item | State | Commit |
+|---|---|---|
+| P0 Gemma-2 attention softcap (correctness) | **DONE** — host reference applies `cap·tanh(s/cap)`; kernel fast-path sequenced | `2d87dbb` |
+| P1 MLA per-head `w_uv` stride | **DONE** — one multi-head launch, GPU parity gate | `0074924` |
+| P2 `selective_scan_headed` on ROCm | **DONE** — kernel + source registration, GPU parity | `35d0faa` |
+| P3 Qwen3.5-MoE onto MoeFfn/Charon | **DONE** — layer parity gate | `8f58a43` |
+| P4 sage_attention trait wiring | **DONE** — trait method → `sage_attention_gpu` | `837981e` |
+| Paged block-table stride-2 decode (CPU+CUDA) | **DONE** — `block_table_block_id` shared helper | `7634602`/`655542f` |
+| Multi-rank VPP (R3) | **DONE** — schedule, inproc+TCP transports, benchmark | `665602b` |
+
+Remaining items below stay as sequenced follow-ups.
+
 ## Findings summary
 
 Covered already: standard GQA (WMMA qkv + flash_decode), paged + quantized-KV
