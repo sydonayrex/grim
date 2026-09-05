@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use grim_tensor::backend::{ComputeHandle, ReadyHandle};
+use grim_tensor::backend::{block_table_block_id, ComputeHandle, ReadyHandle};
 use grim_tensor::dtype::{DType, Device, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, Shape, Tensor,
@@ -1174,11 +1174,7 @@ impl AttentionOps for CpuDevice {
                     } else {
                         let block_idx_in_seq = t2 / page_size;
                         let offset_in_block = t2 % page_size;
-                        let block_id = if block_idx_in_seq < max_blocks {
-                            btd[block_idx_in_seq] as usize
-                        } else {
-                            block_idx_in_seq
-                        };
+                        let block_id = block_table_block_id(&btd, block_idx_in_seq, max_blocks);
 
                         let k_offset =
                             (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
@@ -1219,11 +1215,7 @@ impl AttentionOps for CpuDevice {
                     for (t2, &score) in scores.iter().enumerate() {
                         let block_idx_in_seq = t2 / page_size;
                         let offset_in_block = t2 % page_size;
-                        let block_id = if block_idx_in_seq < max_blocks {
-                            btd[block_idx_in_seq] as usize
-                        } else {
-                            block_idx_in_seq
-                        };
+                        let block_id = block_table_block_id(&btd, block_idx_in_seq, max_blocks);
                         let v_offset =
                             (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
                         acc += score * vd[v_offset + d];
@@ -2277,13 +2269,17 @@ mod tests {
         .unwrap();
 
         // Paged: lay K/V out in blocks [num_blocks, page_size, kvh, hd]
-        // using an IDENTITY block table (physical block == logical block).
+        // through a REVERSED block table (logical block b lives on physical
+        // block num_blocks-1-b). An identity mapping decodes correctly even
+        // with a broken table reader, so only a permuted table actually
+        // guards the packed `BlockTableEntry` ABI.
         let num_blocks = kv_seq.div_ceil(page_size);
+        let physical_of = |logical: usize| num_blocks - 1 - logical;
         let page_elems = page_size * num_kv_heads * head_dim;
         let mut k_pages = vec![0.0f32; num_blocks * page_elems];
         let mut v_pages = vec![0.0f32; num_blocks * page_elems];
         for t2 in 0..kv_seq {
-            let b = t2 / page_size;
+            let b = physical_of(t2 / page_size);
             let off = t2 % page_size;
             for h in 0..num_kv_heads {
                 for d in 0..head_dim {
@@ -2302,8 +2298,15 @@ mod tests {
             v_pages,
             Shape::new(vec![num_blocks, page_size, num_kv_heads, head_dim]),
         );
-        let table_data: Vec<f32> = (0..num_blocks).map(|b| b as f32).collect();
-        let table_t = cpu_tensor(table_data, Shape::new(vec![num_blocks]));
+        let table_data: Vec<f32> = (0..num_blocks)
+            .flat_map(|b| {
+                [
+                    f32::from_bits(physical_of(b) as u32),
+                    f32::from_bits(page_size as u32),
+                ]
+            })
+            .collect();
+        let table_t = cpu_tensor(table_data, Shape::new(vec![num_blocks * 2]));
 
         let (paged_st, _) = dev
             .qkv_attention_paged(
