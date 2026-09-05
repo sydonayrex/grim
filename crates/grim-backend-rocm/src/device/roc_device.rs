@@ -5699,6 +5699,50 @@ impl RecurrentOps for RocmDevice {
         ))
     }
 
+    /// Headed single-step scan (Falcon-H1 / Mamba-2 decode). See the trait
+    /// doc for the recurrence; state updates in place.
+    fn selective_scan_headed(
+        &self,
+        x: &dyn BackendStorage,
+        dt: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        state: &dyn BackendStorage,
+        n_heads: usize,
+        d_state: usize,
+        head_dim_ssm: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let dt_s = as_rocm(dt)?;
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        let c_s = as_rocm(c)?;
+        let d_s = as_rocm(d)?;
+        let state_s = as_rocm(state)?;
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.launch_selective_scan_headed(
+            x_s,
+            dt_s,
+            a_s,
+            b_s,
+            c_s,
+            d_s,
+            state_s,
+            &out_storage,
+            n_heads,
+            d_state,
+            head_dim_ssm,
+        )?;
+        Ok((
+            Box::new(out_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
 
     fn rwkv_time_mix(
         &self,
@@ -15741,6 +15785,78 @@ impl RocmDevice {
                 arg(&mut batch_index),
                 arg(&mut d_inner),
                 arg(&mut d_state),
+            ],
+            None,
+            shared_mem_bytes,
+        )
+    }
+
+    pub(crate) fn launch_selective_scan_headed(
+        &self,
+        x_storage: &RocmStorage,
+        dt_storage: &RocmStorage,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        c_storage: &RocmStorage,
+        d_storage: &RocmStorage,
+        state_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_heads: usize,
+        d_state: usize,
+        head_dim_ssm: usize,
+    ) -> Result<*mut c_void> {
+        let mut x_ptr = x_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: x has no device ptr".into()))?;
+        let mut dt_ptr = dt_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: dt has no device ptr".into()))?;
+        let mut a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: a has no device ptr".into()))?;
+        let mut b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: b has no device ptr".into()))?;
+        let mut c_ptr = c_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: c has no device ptr".into()))?;
+        let mut d_ptr = d_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: d has no device ptr".into()))?;
+        let mut h_ptr = state_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: state has no device ptr".into()))?;
+        let mut y_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan_headed: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let d_inner = n_heads * head_dim_ssm;
+        let grid_x: u32 = (d_inner as u64).div_ceil(BLOCK_SIZE as u64) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut nh = n_heads as i32;
+        let mut ds = d_state as i32;
+        let mut hds = head_dim_ssm as i32;
+
+        let shared_mem_bytes = d_state * BLOCK_SIZE * std::mem::size_of::<f32>();
+        self.launch_compute_kernel_with_solution(
+            "grim_selective_scan_headed",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut dt_ptr),
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut c_ptr),
+                arg(&mut d_ptr),
+                arg(&mut h_ptr),
+                arg(&mut y_ptr),
+                arg(&mut nh),
+                arg(&mut ds),
+                arg(&mut hds),
             ],
             None,
             shared_mem_bytes,
