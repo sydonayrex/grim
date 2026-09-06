@@ -193,8 +193,9 @@ impl Gemma2Block {
 
     /// GPU-first forward: RoPE and attention run on the tensor's device;
     /// host paths are only reached through the fused-kernel fallback guards.
-    /// Attention-logit softcapping would need a tanh kernel, so blocks
-    /// without it take the fully device-resident path.
+    /// Capped blocks take the host attention reference (the fused kernels
+    /// cannot apply cap*tanh(s/cap) before softmax); uncapped blocks take
+    /// the fully device-resident path.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -216,31 +217,63 @@ impl Gemma2Block {
             positions,
         )?;
 
-        // GPU-first; on backends that reject the kernel call fall back to the
-        // host-history entry (scalar reference on CPU).
-        let attn_tensor = match crate::shared_attention::fused_attention_tensors(
-            &q,
-            &k,
-            &v,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            seq_len,
-            seq_len,
-            None,
-        ) {
-            Ok(t) => t,
-            Err(_) => crate::shared_attention::fused_or_scalar_attention(
-                &q.to_vec_f32()?,
-                &k.to_vec_f32()?,
-                &v.to_vec_f32()?,
+        // Attention-logit softcapping sits between the QK product and the
+        // softmax — the fused GPU kernels have no stage for it, so capped
+        // blocks MUST take the host reference (an uncapped fused run would
+        // silently produce wrong logits). Uncapped blocks keep the fully
+        // device-resident path.
+        let attn_tensor = if let Some(cap) = self.attn_logit_softcapping {
+            let q_vec = q.to_vec_f32()?;
+            let k_vec = k.to_vec_f32()?;
+            let v_vec = v.to_vec_f32()?;
+            let q_row = self.num_heads * self.head_dim;
+            let kv_row = self.num_kv_heads * self.head_dim;
+            let kv_head: Vec<usize> = (0..self.num_heads)
+                .map(|h| (h * self.num_kv_heads) / self.num_heads)
+                .collect();
+            let out = crate::kv_attention::causal_attention(
+                &q_vec,
+                &k_vec,
+                &v_vec,
+                seq_len,
+                seq_len,
+                0,
+                self.num_heads,
+                self.head_dim,
+                q_row,
+                kv_row,
+                &kv_head,
+                Some(cap),
+            );
+            grim_nn::modules::move_to_device(
+                &cpu_tensor(out, grim_tensor::Shape::new(vec![seq_len, q_row])),
+                x.device(),
+            )?
+        } else {
+            match crate::shared_attention::fused_attention_tensors(
+                &q,
+                &k,
+                &v,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
                 seq_len,
+                seq_len,
                 None,
-                x.device(),
-            )?,
+            ) {
+                Ok(t) => t,
+                Err(_) => crate::shared_attention::fused_or_scalar_attention(
+                    &q.to_vec_f32()?,
+                    &k.to_vec_f32()?,
+                    &v.to_vec_f32()?,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    seq_len,
+                    None,
+                    x.device(),
+                )?,
+            }
         };
         let attn_proj = self.wo.forward(&attn_tensor)?;
         let post_attn = self.post_attention_layernorm.forward(&attn_proj)?;
@@ -420,6 +453,104 @@ mod tests {
         let softcapped = cap * (large_val / cap).tanh();
         assert!(softcapped <= cap);
         assert!((softcapped - cap).abs() < 1e-4);
+    }
+
+    /// The attention-logit softcap (cap*tanh(s/cap) before softmax) must
+    /// change block outputs. Regression guard for the gap where the cap was
+    /// stored in the config but never applied on any path.
+    /// The attention-logit softcap (cap*tanh(s/cap) before softmax) must
+    /// change block outputs. Regression guard for the gap where the cap was
+    /// stored in the config but never applied on any path.
+    // temp debug
+#[test]
+fn dbg_shapes() {
+    use crate::gemma2::*;
+    let hidden=16; let q_dim=16; let head_dim=8;
+    let lin = |rows: usize, cols: usize, scale: f32| {
+        Linear::from_tensor(cpu_tensor((0..rows*cols).map(|i| ((i%13) as f32-6.0)*scale).collect(), Shape::new(vec![rows, cols])), None)
+    };
+    let wq = lin(hidden, q_dim, 0.1);
+    let q_in = crate::kv_attention::f32_tensor(vec![0.1f32; 2*hidden], Shape::new(vec![2, hidden]));
+    let q = wq.forward(&q_in).unwrap();
+    eprintln!("q {:?}", q.shape().dims());
+    let rope = grim_nn::modules::Rope::new(head_dim, 10000.0);
+    let qr = crate::shared_attention::rope_2d_on_device(&rope, &q, 2, &[0u32,1]).unwrap();
+    eprintln!("q roped {:?}", qr.shape().dims());
+}
+
+    #[test]
+    fn test_attention_logit_softcapping_changes_logits() {
+        let mut cfg = Gemma2Config::default();
+        cfg.vocab_size = 32;
+        cfg.hidden_size = 16;
+        cfg.intermediate_size = 32;
+        cfg.num_hidden_layers = 1;
+        cfg.num_attention_heads = 2;
+        cfg.num_key_value_heads = 1;
+        cfg.head_dim = 8;
+        assert_eq!(cfg.attn_logit_softcapping, Some(50.0));
+
+        let (hidden, q_heads, kv_heads, head_dim, mlp_dim) = (16usize, 2usize, 1usize, 8usize, 32usize);
+        let q_dim = q_heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        // Linear::from_tensor takes [out, in] (it pre-transposes for forward).
+        let lin = |out: usize, inp: usize, scale: f32| {
+            Linear::from_tensor(
+                cpu_tensor(
+                    (0..out * inp)
+                        .map(|i| ((i % 13) as f32 - 6.0) * scale)
+                        .collect(),
+                    Shape::new(vec![out, inp]),
+                ),
+                None,
+            )
+        };
+        let norm = |v: f32| RmsNorm {
+            weight: cpu_tensor(vec![v; hidden], Shape::new(vec![hidden])),
+            eps: 1e-6,
+        };
+        let make_block = |cap: Option<f32>| Gemma2Block {
+            wq: lin(q_dim, hidden, 0.1),
+            wk: lin(kv_dim, hidden, 0.1),
+            wv: lin(kv_dim, hidden, 0.1),
+            wo: lin(hidden, q_dim, 0.1),
+            input_layernorm: norm(1.0),
+            post_attention_layernorm: norm(1.0),
+            pre_feedforward_layernorm: norm(1.0),
+            post_feedforward_layernorm: norm(1.0),
+            mlp: Gemma2Mlp {
+                gate_proj: lin(mlp_dim, hidden, 0.1),
+                up_proj: lin(mlp_dim, hidden, 0.1),
+                down_proj: lin(hidden, mlp_dim, 0.1),
+            },
+            rope: grim_nn::modules::Rope::new(head_dim, 10000.0),
+            num_heads: q_heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            attn_logit_softcapping: cap,
+        };
+
+        let x = cpu_tensor(
+            (0..2 * hidden).map(|i| (i as f32 * 0.125 - 1.0).sin()).collect(),
+            Shape::new(vec![2, hidden]),
+        );
+        let positions = vec![0u32, 1];
+
+        let with_cap = make_block(Some(50.0))
+            .forward(&x, &positions)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let without_cap = make_block(None)
+            .forward(&x, &positions)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_ne!(
+            with_cap, without_cap,
+            "attention logit softcapping is configured but had no effect on logits"
+        );
     }
 
     #[test]

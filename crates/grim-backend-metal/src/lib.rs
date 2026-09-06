@@ -3753,6 +3753,8 @@ impl AttentionOps for MetalDevice {
         qk_rope_dim: usize,
         _v_head_dim: usize,
         seq_len: usize,
+        _w_uv_offset_words: usize,
+        _w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         // CPU fallback / host validation for MLA absorbed decode on Metal
         let q_abs_vec = q_absorbed.to_cpu_vec_f32()?;

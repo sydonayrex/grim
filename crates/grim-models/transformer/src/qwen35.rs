@@ -589,47 +589,79 @@ impl Qwen35Block {
             )?;
             out_branch = attn_tensor.to_vec_f32()?;
         } else {
-            // SSM short-conv path with fused attn_qkv
+            // SSM short-conv path with fused attn_qkv.
+            // GPU-first: conv runs on device via short_conv1d wrapper; state
+            // is uploaded/downloaded around the device call.
             if let Some(ref qkv_lin) = self.attn_qkv {
                 let qkv = qkv_lin.forward(&x_normed)?;
                 let qkv_vec = qkv.to_vec_f32()?;
                 let qkv_total_per_tok = qkv_vec.len() / seq_len;
                 let conv_w = self.ssm_conv_vec.as_deref();
+                let dev = pick_device_for_storage_device(&device);
 
                 for t in 0..seq_len {
                     let base = t * qkv_total_per_tok;
                     let num_feats = q_dim.min(qkv_total_per_tok);
 
-                    // If short-conv kernel weights are present and state is allocated,
-                    // apply causal 1D convolution and roll state.
                     if let Some(w) = conv_w {
                         let l_conv = (w.len() / num_feats.max(1)).max(1);
-                        let state = &mut cache.conv_state;
                         let state_len_per_feat = l_conv.saturating_sub(1);
 
-                        for d in 0..num_feats {
-                            let curr_val = qkv_vec[base + d];
-                            let w_base = d * l_conv;
-                            let mut sum = w.get(w_base + l_conv.saturating_sub(1)).copied().unwrap_or(1.0) * curr_val;
+                        // Build per-token input [1, 1, num_feats] for device conv
+                        let tok_data = &qkv_vec[base..base + num_feats];
+                        let x_storage = dev.from_cpu(tok_data, &Shape::new(vec![1, 1, num_feats]), DType::F32)?;
+                        let x_tok = Tensor::new(
+                            Arc::from(x_storage),
+                            Shape::new(vec![1, 1, num_feats]),
+                            DType::F32,
+                            qkv.provenance().clone(),
+                            device.clone(),
+                        );
 
-                            if state_len_per_feat > 0 && state.len() >= num_feats * state_len_per_feat {
-                                for k in 0..state_len_per_feat {
-                                    let st_val = state[k * num_feats + d];
-                                    sum += w.get(w_base + k).copied().unwrap_or(0.0) * st_val;
-                                }
-                            }
-                            out_branch[t * q_dim + d] = silu(sum);
+                        // Build conv weight [num_feats, l_conv] (depthwise)
+                        let w_storage = dev.from_cpu(&w[..num_feats * l_conv], &Shape::new(vec![num_feats, l_conv]), DType::F32)?;
+                        let w_tensor = Tensor::new(
+                            Arc::from(w_storage),
+                            Shape::new(vec![num_feats, l_conv]),
+                            DType::F32,
+                            qkv.provenance().clone(),
+                            device.clone(),
+                        );
+
+                        // Upload conv state to device
+                        let state_data = if state_len_per_feat > 0 && cache.conv_state.len() >= num_feats * state_len_per_feat {
+                            cache.conv_state[..num_feats * state_len_per_feat].to_vec()
+                        } else {
+                            vec![0.0f32; num_feats * state_len_per_feat.max(1)]
+                        };
+                        let state_storage = dev.from_cpu(&state_data, &Shape::new(vec![1, state_len_per_feat.max(1), num_feats]), DType::F32)?;
+                        let mut state_tensor = Tensor::new(
+                            Arc::from(state_storage),
+                            Shape::new(vec![1, state_len_per_feat.max(1), num_feats]),
+                            DType::F32,
+                            qkv.provenance().clone(),
+                            device.clone(),
+                        );
+
+                        // Device short-conv: updates state_tensor in-place
+                        let conv_result = grim_nn::modules::short_conv1d(
+                            &x_tok,
+                            &w_tensor,
+                            None,
+                            Some(&mut state_tensor),
+                        )?;
+
+                        // Download result and updated state
+                        let conv_vec = conv_result.to_vec_f32()?;
+                        let state_new = state_tensor.to_vec_f32()?;
+                        if state_len_per_feat > 0 && cache.conv_state.len() >= num_feats * state_len_per_feat {
+                            cache.conv_state[..num_feats * state_len_per_feat].copy_from_slice(&state_new[..num_feats * state_len_per_feat]);
                         }
 
-                        // Roll state: shift older steps and append current input
-                        if state_len_per_feat > 0 && state.len() >= num_feats * state_len_per_feat {
-                            if state_len_per_feat > 1 {
-                                state.copy_within(num_feats..num_feats * state_len_per_feat, 0);
-                            }
-                            let last_offset = (state_len_per_feat - 1) * num_feats;
-                            for d in 0..num_feats {
-                                state[last_offset + d] = qkv_vec[base + d];
-                            }
+                        // Apply silu (elementwise on CPU — data already downloaded)
+                        for d in 0..num_feats.min(conv_vec.len()) {
+                            let v = conv_vec[d];
+                            out_branch[t * q_dim + d] = v / (1.0 + (-v).exp());
                         }
                     } else {
                         for d in 0..num_feats {

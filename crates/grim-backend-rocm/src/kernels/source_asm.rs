@@ -44,6 +44,9 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::fp8_gemm_rdna4::KERNEL_SOURCE);
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
+    // WI-D: the selective scan sources live in their own TU — without this
+    // append hipModuleGetFunction fails on first falcon_h1/mamba decode step.
+    s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
     s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);
     // MXFP4/MXFP8 standalone dequant kernels (grim_dequant_mxfp4 et al.) —
     // same aggregate-unit requirement as the q4k/iq families above.

@@ -90,6 +90,7 @@ pub fn causal_attention(
     q_row_elems: usize,
     kv_row_elems: usize,
     kv_head: &[usize],
+    softcap: Option<f32>,
 ) -> Vec<f32> {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0.0f32; new_tokens * q_row_elems];
@@ -106,7 +107,12 @@ pub fn causal_attention(
                     dot += q[t * q_row_elems + h * head_dim + d]
                         * k[t2 * kv_row_elems + kh * head_dim + d];
                 }
-                scores[t2] = dot * scale;
+                scores[t2] = match softcap {
+                    // Gemma-style logit softcap: cap * tanh(s / cap), applied
+                    // between the QK product and the softmax.
+                    Some(cap) => cap * (dot * scale / cap).tanh(),
+                    None => dot * scale,
+                };
             }
             let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;

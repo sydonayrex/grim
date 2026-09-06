@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint channels;     // number of channels (C)
+    uint k_size;       // conv kernel size
+    uint batch;        // batch size (B)
+    uint has_bias;     // 1 if bias buffer provided
+    uint pad0;         // padding
+    float eps;         // unused, reserved
+} params;
+
+// x: [B, C] current input
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };
+// weight: [C, k_size] depthwise conv weight (per-channel)
+layout(std430, binding = 1) readonly buffer BufW { float W[]; };
+// bias: [C] optional
+layout(std430, binding = 2) readonly buffer BufB { float Bias[]; };
+// state: [B, k_size, C] rolling conv state (past k_size-1 inputs per channel)
+layout(std430, binding = 3) buffer BufState { float State[]; };
+// out: [B, C] output
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= params.channels) return;
+
+    float b_val = (params.has_bias == 1u && c < params.channels) ? Bias[c] : 0.0;
+
+    for (uint b_idx = 0u; b_idx < params.batch; ++b_idx) {
+        uint state_base = b_idx * params.k_size * params.channels + c;
+        uint x_idx = b_idx * params.channels + c;
+
+        // Causal conv: out[c] = sum_{t=0}^{k_size-1} weight[c,t] * input[c, k_size-1-t]
+        // where input[k_size-1] is current x, input[k_size-2..0] is state
+        float acc = b_val;
+
+        // Current input (newest)
+        acc += W[c * params.k_size + (params.k_size - 1u)] * X[x_idx];
+
+        // Past inputs from state (oldest to newest-1)
+        for (uint k = 0u; k < params.k_size - 1u; ++k) {
+            float s_val = State[state_base + k];
+            acc += W[c * params.k_size + k] * s_val;
+        }
+
+        Out[x_idx] = acc;
+
+        // Shift state: state[0..k_size-2] <- state[1..k_size-1], state[k_size-1] <- x
+        for (uint k = 0u; k < params.k_size - 2u; ++k) {
+            State[state_base + k] = State[state_base + k + 1u];
+        }
+        if (params.k_size >= 2u) {
+            State[state_base + params.k_size - 2u] = X[x_idx];
+        }
+    }
+}
