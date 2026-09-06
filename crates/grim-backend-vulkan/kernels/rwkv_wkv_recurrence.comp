@@ -1,0 +1,73 @@
+#version 450
+
+// RWKV-4 WKV (weighted key-value) recurrence — one token step.
+//
+// Per-channel recurrence (fully parallel across channels):
+//   ww = time_first[i] + k[i]
+//   p  = max(pp[i], k[i])
+//   e1 = exp(pp[i] - p)
+//   e2 = exp(ww - p)
+//   num = e1 * aa[i] + e2 * v[i]
+//   den = e1 * bb[i] + e2
+//   y[i] = sigmoid(r[i]) * num / den
+//   aa[i] = num;  bb[i] = den;  pp[i] = p + time_decay[i]
+//
+// Each thread handles one channel. State (aa, bb, pp) is
+// read-modified-written in place.
+//
+// Dispatch: dim threads (one per channel).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint dim;           // hidden dimension (channel count)
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+    float pad4;
+} params;
+
+// k: [dim] key (post-projection, post-token-shift)
+layout(std430, binding = 0) readonly buffer BufK { float K[]; };
+// v: [dim] value (post-projection, post-token-shift)
+layout(std430, binding = 1) readonly buffer BufV { float V[]; };
+// r: [dim] receptance (post-projection, post-token-shift)
+layout(std430, binding = 2) readonly buffer BufR { float R[]; };
+// time_first: [dim] per-channel time-first parameter
+layout(std430, binding = 3) readonly buffer BufTF { float time_first[]; };
+// time_decay: [dim] per-channel time-decay parameter
+layout(std430, binding = 4) readonly buffer BufTD { float time_decay[]; };
+// state_aa: [dim] running numerator state (read-write)
+layout(std430, binding = 5) buffer BufAA { float aa[]; };
+// state_bb: [dim] running denominator state (read-write)
+layout(std430, binding = 6) buffer BufBB { float bb[]; };
+// state_pp: [dim] running max-key state (read-write)
+layout(std430, binding = 7) buffer BufPP { float pp[]; };
+// out: [dim] WKV output (pre-output-projection)
+layout(std430, binding = 8) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.dim) return;
+
+    float k_ch = K[i];
+    float v_ch = V[i];
+    float r_ch = R[i];
+    float tf_ch = time_first[i];
+    float td_ch = time_decay[i];
+
+    float ww = tf_ch + k_ch;
+    float p = max(pp[i], k_ch);
+    float e1 = exp(pp[i] - p);
+    float e2 = exp(ww - p);
+    float num = e1 * aa[i] + e2 * v_ch;
+    float den = e1 * bb[i] + e2;
+
+    float sig_r = 1.0 / (1.0 + exp(-r_ch));
+    Out[i] = sig_r * (den != 0.0 ? num / den : 0.0);
+
+    aa[i] = num;
+    bb[i] = den;
+    pp[i] = p + td_ch;
+}

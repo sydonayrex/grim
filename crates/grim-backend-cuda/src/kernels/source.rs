@@ -24,6 +24,22 @@ extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int
     out[i] = g * s * up[i];
 }
 
+extern "C" __global__ void grim_gelu_tanh_mul(const float* gate, const float* up, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x = gate[i];
+    // sqrt(2/pi) = 0.7978845608f
+    float tanh_in = 0.7978845608f * (x + 0.044715f * x * x * x);
+    float gelu = 0.5f * x * (1.0f + tanhf(tanh_in));
+    out[i] = gelu * up[i];
+}
+
+extern "C" __global__ void grim_tanh(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = tanhf(x[i]);
+}
+
 extern "C" __global__ void grim_silu_mul_backward(
     const float* gate,
     const float* up,
@@ -131,8 +147,11 @@ extern "C" __global__ void grim_qkv_attention(
     int kv_seq_len,
     int cache_offset,
     float inv_sqrt_d,
-    int window_lo       // sliding-window lower bound: max(0, abs_i - window + 1).
+    int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
                         // Pass 0 for full causal attention (no window).
+    float softcap,      // logit softcapping cap (e.g. 50.0f for Gemma-2). Pass <=0.0f to disable.
+    const float* __restrict__ alibi_slopes, // [num_heads] or NULL
+    int has_alibi
 ) {
     const int i = blockIdx.x;             // query pos (0..seq_len)
     const int h = blockIdx.y;             // head idx
@@ -190,6 +209,12 @@ extern "C" __global__ void grim_qkv_attention(
             }
         }
         score *= inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi && alibi_slopes != 0) {
+            score += alibi_slopes[h] * (float)(kj - abs_i);
+        }
 
         const float old_max = running_max;
         running_max = fmaxf(running_max, score);
@@ -1609,4 +1634,356 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
         conv_state[state_offset + kernel_size - 2] = val;
     }
 }
+
+extern "C" __global__ void grim_kda_gated_delta_rule_step(
+    const float* q, const float* k, const float* v, const float* beta,
+    const float* a_gate, float* S_state, float* out,
+    int d_k, int d_v
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= d_v) return;
+
+    // A_t = sigmoid(a_gate)
+    float a_t = 1.0f / (1.0f + expf(-a_gate[row]));
+    float beta_val = beta[row];
+
+    float k_dot_s = 0.0f;
+    for (int col = 0; col < d_k; ++col) {
+        k_dot_s += k[col] * S_state[row * d_k + col];
+    }
+    float delta_v = v[row] - beta_val * k_dot_s;
+
+    float y_val = 0.0f;
+    for (int col = 0; col < d_k; ++col) {
+        float old_s = S_state[row * d_k + col];
+        float new_s = a_t * old_s + beta_val * delta_v * k[col];
+        S_state[row * d_k + col] = new_s;
+        y_val += q[col] * new_s;
+    }
+    out[row] = y_val;
+}
+
+extern "C" __global__ void grim_mla_q_kv_norm_split(
+    const float* q_raw, const float* kv_raw, const float* q_norm_w, const float* kv_norm_w,
+    float* q_nope, float* q_rope, float* kv_nope, float* kv_rope,
+    int qk_nope_dim, int qk_rope_dim, int v_dim, float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < qk_nope_dim) {
+        float ss = 0.0f;
+        for (int j = 0; j < qk_nope_dim; ++j) {
+            float val = q_raw[j];
+            ss += val * val;
+        }
+        float rms = sqrtf(ss / (float)qk_nope_dim + eps);
+        q_nope[idx] = q_raw[idx] * q_norm_w[idx] / rms;
+    } else if (idx < qk_nope_dim + qk_rope_dim) {
+        int rope_i = idx - qk_nope_dim;
+        q_rope[rope_i] = q_raw[idx];
+    }
+
+    if (idx < qk_nope_dim) {
+        float ss = 0.0f;
+        for (int j = 0; j < qk_nope_dim; ++j) {
+            float val = kv_raw[j];
+            ss += val * val;
+        }
+        float rms = sqrtf(ss / (float)qk_nope_dim + eps);
+        kv_nope[idx] = kv_raw[idx] * kv_norm_w[idx] / rms;
+    } else if (idx < qk_nope_dim + qk_rope_dim) {
+        int rope_i = idx - qk_nope_dim;
+        kv_rope[rope_i] = kv_raw[idx];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paged Attention & Tree Attention for CUDA
+// ---------------------------------------------------------------------------
+
+struct BlockTableEntry {
+    unsigned int block_id;
+    unsigned int page_size;
+};
+
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_paged(
+    const float* __restrict__ q,
+    const BlockTableEntry* __restrict__ block_tables,
+    const float* __restrict__ k_pages,
+    const float* __restrict__ v_pages,
+    float* __restrict__ out,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_blocks,
+    int page_size,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo
+) {
+    const int batch_idx = blockIdx.x;
+    const int h = blockIdx.y;
+    
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    
+    const int q_offset = (batch_idx * num_heads + h) * head_dim;
+    const int abs_i = cache_offset;
+
+    const int tid = threadIdx.x;
+    const int wave_size = 32;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int lo = window_lo;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    const BlockTableEntry* my_table = block_tables + batch_idx * max_blocks;
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        if (j > abs_i || j >= kv_seq_len) break;
+
+        const int b = j / page_size;
+        const int t = j % page_size;
+        const BlockTableEntry entry = my_table[b];
+        const int physical_token_idx = entry.block_id * page_size + t;
+        const int kv_offset = (physical_token_idx * num_kv_heads + kv_head) * head_dim;
+        
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 256; ++dim) {
+            if (dim < head_dim) {
+                score += q[q_offset + dim] * k_pages[kv_offset + dim];
+            }
+        }
+        score *= inv_sqrt_d;
+        
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] += w * v_pages[kv_offset + d];
+            }
+        }
+        running_sum += w;
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w) {
+                if (w >= num_waves) break;
+                const float mw = s_max[w];
+                const float uw = s_sum[w];
+                const float aw = s_acc[w][d];
+                const float m_new = fmaxf(m_final, mw);
+                const float scale_a = expf(m_final - m_new);
+                const float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+}
+
+__device__ bool cuda_is_ancestor(int j, int i, const unsigned int* tree_parents) {
+    if (j == i) return true;
+    int curr = i;
+    while (curr > 0) {
+        curr = (int)tree_parents[curr];
+        if (curr == j) return true;
+    }
+    return false;
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void grim_tree_attention(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    const unsigned int* __restrict__ tree_parents,
+    float* __restrict__ out,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int gamma,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    const int batch_idx = blockIdx.z;
+    
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    
+    const int q_offset = ((batch_idx * (1 + gamma) + i) * num_heads + h) * head_dim;
+    
+    const int tid = threadIdx.x;
+    const int wave_size = 32;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int range_len = kv_seq_len;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    for (int j = j_start; j < j_end; ++j) {
+        if (j >= kv_seq_len) break;
+        if (j >= cache_offset) {
+            int tree_idx = j - cache_offset;
+            if (!cuda_is_ancestor(tree_idx, i, tree_parents)) {
+                continue;
+            }
+        }
+
+        const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 256; ++dim) {
+            if (dim < head_dim) {
+                score += q[q_offset + dim] * k_tensor[kv_offset + dim];
+            }
+        }
+        score *= inv_sqrt_d;
+
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
+            running_sum = running_sum * scale;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
+            w = 1.0f;
+        }
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] += w * v_tensor[kv_offset + d];
+            }
+        }
+        running_sum += w;
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w) {
+                if (w >= num_waves) break;
+                const float mw = s_max[w];
+                const float uw = s_sum[w];
+                const float aw = s_acc[w][d];
+                const float m_new = fmaxf(m_final, mw);
+                const float scale_a = expf(m_final - m_new);
+                const float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
+    }
+}
 "#;
+

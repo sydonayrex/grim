@@ -48,36 +48,5 @@ __global__ void grim_mxfp4_gemm(
     }
     C[row * N + col] = acc;
 }
-
-__global__ void grim_fused_dequant_gemm_q5k(
-    const float* __restrict__ A,
-    const unsigned char* __restrict__ B_q5k,
-    float* __restrict__ C,
-    int M, int N, int K)
-{
-    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long total = (unsigned long long)M * N;
-    if (idx >= total) return;
-
-    int row = (int)(idx / N);
-    int col = (int)(idx % N);
-
-    int blocks_per_row = K / 256;
-    int row_bytes = blocks_per_row * 176;
-    const unsigned char* row_b_ptr = B_q5k + col * row_bytes;
-
-    float acc = 0.0f;
-    // Q5_K row dot product
-    for (int sb = 0; sb < blocks_per_row; ++sb) {
-        const unsigned char* block_ptr = row_b_ptr + sb * 176;
-        // Super-block Q5_K decode
-        for (int k_in = 0; k_in < 256; ++k_in) {
-            int k = sb * 256 + k_in;
-            acc += A[row * K + k] * 0.0f; // placeholder accumulator
-        }
-    }
-    C[row * N + col] = acc;
-}
-
 }
 "#;

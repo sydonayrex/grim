@@ -5,12 +5,14 @@
 //! - **Linear Attention**: Query readout $o_t = q_t S_t$ with linear $O(1)$ memory complexity per step.
 //! - **SwiGLU FFN**: Feed-forward projection with RMSNorm normalization.
 
+use std::sync::Arc;
+
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -95,6 +97,8 @@ impl DeltaNetAttention {
     }
 
     /// Forward pass updating per-head state matrix $S \in \mathbb{R}^{H \times D \times D}$.
+    /// GPU-first: delta-rule recurrence runs on device via `delta_rule_decode`.
+    /// State is uploaded/downloaded around the device call.
     pub fn forward(&self, x: &Tensor, state: &mut Option<Vec<f32>>) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let q = self.q_proj.forward(x)?;
@@ -102,62 +106,73 @@ impl DeltaNetAttention {
         let v = self.v_proj.forward(x)?;
         let beta = self.beta_proj.forward(x)?;
 
-        let q_v = q.to_vec_f32()?;
-        let k_v = k.to_vec_f32()?;
-        let v_v = v.to_vec_f32()?;
-        let b_v = beta.to_vec_f32()?;
-
-        let q_dim = self.num_heads * self.head_dim;
         let d = self.head_dim;
+        let q_dim = self.num_heads * d;
         let state_size = self.num_heads * d * d;
+        let dev = grim_nn::modules::pick_device_for_tensor(x);
 
+        // Initialize or restore state
         let mut s_mat = state.clone().unwrap_or_else(|| vec![0.0f32; state_size]);
         let mut out = vec![0.0f32; seq_len * q_dim];
 
+        // Get beta values (sigmoided) on CPU — one scalar per token per head
+        let b_v = beta.to_vec_f32()?;
+
+        // Upload state to device once; it gets updated in-place per token
+        let state_storage = dev.from_cpu(&s_mat, &Shape::new(vec![self.num_heads, d, d]), DType::F32)?;
+        let state_tensor = Tensor::new(
+            Arc::from(state_storage),
+            Shape::new(vec![self.num_heads, d, d]),
+            DType::F32,
+            q.provenance().clone(),
+            x.device().clone(),
+        );
+
         for t in 0..seq_len {
-            for h in 0..self.num_heads {
-                let q_slice = &q_v[t * q_dim + h * d..t * q_dim + (h + 1) * d];
-                let k_slice = &k_v[t * q_dim + h * d..t * q_dim + (h + 1) * d];
-                let v_slice = &v_v[t * q_dim + h * d..t * q_dim + (h + 1) * d];
-                let b_val = 1.0 / (1.0 + (-b_v[t * self.num_heads + h]).exp()); // sigmoid
+            // Extract per-token q, k, v: [num_heads, d]
+            let tok_offset = t * q_dim;
+            let q_tok = &q.to_vec_f32()?[tok_offset..tok_offset + q_dim];
+            let k_tok = &k.to_vec_f32()?[tok_offset..tok_offset + q_dim];
+            let v_tok = &v.to_vec_f32()?[tok_offset..tok_offset + q_dim];
 
-                let s_head_off = h * d * d;
+            // Compute beta scalar for this token (average across heads)
+            let beta_val: f32 = (0..self.num_heads).map(|h| {
+                1.0 / (1.0 + (-b_v[t * self.num_heads + h]).exp())
+            }).sum::<f32>() / self.num_heads as f32;
 
-                // Compute Sk = S * k
-                let mut sk = vec![0.0f32; d];
-                for i in 0..d {
-                    let mut sum = 0.0f32;
-                    for j in 0..d {
-                        sum += s_mat[s_head_off + i * d + j] * k_slice[j];
-                    }
-                    sk[i] = sum;
-                }
+            // Upload per-token tensors to device
+            let q_storage = dev.from_cpu(q_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
+            let k_storage = dev.from_cpu(k_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
+            let v_storage = dev.from_cpu(v_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
 
-                // Delta error: delta_v = beta * (v - Sk)
-                let mut delta_v = vec![0.0f32; d];
-                for i in 0..d {
-                    delta_v[i] = b_val * (v_slice[i] - sk[i]);
-                }
+            let q_t = Tensor::new(Arc::from(q_storage), Shape::new(vec![self.num_heads, d]), DType::F32, q.provenance().clone(), x.device().clone());
+            let k_t = Tensor::new(Arc::from(k_storage), Shape::new(vec![self.num_heads, d]), DType::F32, k.provenance().clone(), x.device().clone());
+            let v_t = Tensor::new(Arc::from(v_storage), Shape::new(vec![self.num_heads, d]), DType::F32, v.provenance().clone(), x.device().clone());
 
-                // Update S: S += delta_v * k^T
-                for i in 0..d {
-                    for j in 0..d {
-                        s_mat[s_head_off + i * d + j] += delta_v[i] * k_slice[j];
-                    }
-                }
+            // Device delta-rule recurrence (updates state in-place)
+            let out_shape = Shape::new(vec![self.num_heads, d]);
+            let (out_storage, _handle) = dev.delta_rule_decode(
+                q_t.storage().as_ref(),
+                k_t.storage().as_ref(),
+                v_t.storage().as_ref(),
+                beta_val,
+                state_tensor.storage().as_ref(),
+                d,
+                d,
+                self.num_heads,
+                &out_shape,
+            )?;
 
-                // Query output: o = q * S^T
-                for i in 0..d {
-                    let mut acc = 0.0f32;
-                    for j in 0..d {
-                        acc += q_slice[j] * s_mat[s_head_off + i * d + j];
-                    }
-                    out[t * q_dim + h * d + i] = acc;
-                }
-            }
+            // Download output for this token
+            let out_t = Tensor::new(Arc::from(out_storage), out_shape, DType::F32, q.provenance().clone(), x.device().clone());
+            let out_vec = out_t.to_vec_f32()?;
+            out[tok_offset..tok_offset + q_dim].copy_from_slice(&out_vec);
         }
 
+        // Download final state
+        s_mat = state_tensor.to_vec_f32()?;
         *state = Some(s_mat);
+
         let out_t = cpu_tensor(out, Shape::new(vec![seq_len, q_dim]));
         Ok(self.o_proj.forward(&out_t)?)
     }
@@ -218,8 +233,8 @@ impl DeltaNetBlock {
         let normed_attn = self.attn_norm.forward(x)?;
         let attn_out = self.attn.forward(&normed_attn, state)?;
 
-        // Residual adds and SwiGLU on-device; only the delta-rule scan
-        // above stays host-side (no device kernel for the recurrence).
+        // Residual adds and SwiGLU on-device; delta-rule scan runs on
+        // device via delta_rule_decode (GPU-first path).
         let res1_t = grim_nn::modules::add_on_device(x, &attn_out)?;
 
         let normed_ffn = self.ffn_norm.forward(&res1_t)?;
