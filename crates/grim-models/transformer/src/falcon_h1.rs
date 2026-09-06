@@ -288,32 +288,12 @@ impl CausalLm for FalconH1Model {
         positions: &Tensor,
         _adapters: &[grim_core::model::AdapterHandle],
     ) -> Result<Tensor> {
-        let ids: Vec<u32> = match input_ids.dtype() {
-            d if d == DType::F32 => input_ids
-                .to_vec_f32()?
-                .into_iter()
-                .map(|x| x as u32)
-                .collect(),
-            _ => {
-                return Err(grim_tensor::Error::Unimplemented(
-                    "FalconH1 only accepts F32 input ids".into(),
-                )
-                .into());
-            }
-        };
-        let positions_vec: Vec<u32> = match positions.dtype() {
-            d if d == DType::F32 => positions
-                .to_vec_f32()?
-                .into_iter()
-                .map(|x| x as u32)
-                .collect(),
-            _ => {
-                return Err(grim_tensor::Error::Unimplemented(
-                    "FalconH1 only accepts F32 positions".into(),
-                )
-                .into());
-            }
-        };
+        // Native integer readback: U32 passes through, I64 truncates, F32
+        // casts. Avoids forcing integer tensors through an f32 round-trip
+        // (which would be garbage on backends with genuinely-integer
+        // storage layouts, e.g. Vulkan U32 buffers).
+        let ids: Vec<u32> = input_ids.to_vec_u32()?;
+        let positions_vec: Vec<u32> = positions.to_vec_u32()?;
         let caches: &mut Vec<FalconH1LayerCache> = match session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<FalconH1LayerCache>>())

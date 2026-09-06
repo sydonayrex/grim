@@ -1912,6 +1912,17 @@ impl BackendStorage for CpuStorage {
     fn quant_scales(&self) -> Option<&[f32]> {
         self.quant_scales.as_deref()
     }
+    /// CPU canonical layout is `Vec<f32>` (integers stored as f32 values),
+    /// so the u32 view is a straight cast — correct for F32, U32 and I64
+    /// dtypes alike. Mirrors the `to_cpu_vec_f32` dequant fallback for
+    /// quantized storage.
+    fn to_cpu_vec_u32(&self) -> Result<Vec<u32>> {
+        Ok(self
+            .to_cpu_vec_f32()?
+            .into_iter()
+            .map(|v| v as u32)
+            .collect())
+    }
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
         if !self.data.is_empty() || self.dtype.storage == Storage::Native {
             return Ok((*self.data).clone());

@@ -3081,6 +3081,21 @@ pub trait BackendStorage: Send + Sync {
     /// should keep data on-device and avoid this when possible.
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>>;
 
+    /// Copy the buffer contents into a host `Vec<u32>`, converting from the
+    /// storage's declared dtype: `U32` passes through, `I64` truncates,
+    /// `F32` casts. Lets models read token ids / positions natively instead
+    /// of forcing integer tensors through the f32 readback path.
+    ///
+    /// Default returns `Unimplemented` — a blanket f32 round-trip would be
+    /// silently wrong for backends whose storage layout is genuinely integer
+    /// (e.g. Vulkan U32 buffers reinterpret u32 bytes as f32 garbage).
+    /// Backends must opt in with a dtype-aware implementation.
+    fn to_cpu_vec_u32(&self) -> Result<Vec<u32>> {
+        Err(crate::error::Error::Unimplemented(
+            "to_cpu_vec_u32 not implemented for this backend".into(),
+        ))
+    }
+
     /// Backend-private downcast hook. Only backends that own the storage
     /// type call this — see `CpuDevice::a_storage`.
     fn as_any(&self) -> &dyn std::any::Any;

@@ -64,6 +64,14 @@ impl Tensor {
         self.storage.to_cpu_vec_f32()
     }
 
+    /// Transfer to host `Vec<u32>` — dtype-aware native integer readback.
+    /// U32 passes through, I64 truncates, F32 casts. Use for token ids and
+    /// positions instead of `to_vec_f32` + cast so integer tensors on GPU
+    /// don't round-trip through a meaningless f32 reinterpretation.
+    pub fn to_vec_u32(&self) -> Result<Vec<u32>> {
+        self.storage.to_cpu_vec_u32()
+    }
+
     /// Shape-checked view access; returns shape mismatch rather than
     /// trigonometrically-obvious "panic on next op".
     pub fn expect_shape(&self, expected: &Shape) -> Result<()> {

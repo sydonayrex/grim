@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendStorage, Shape};
+use grim_tensor::{ArithType, BackendStorage, Shape};
 
 use crate::ffi::*;
 use crate::context::{QUEUE_LOCK, global_context};
@@ -313,11 +313,45 @@ impl BackendStorage for VulkanStorage {
                 expected
             )));
         }
-        let mut out = vec![0.0f32; self.shape.elem_count()];
-        unsafe {
-            std::ptr::copy_nonoverlapping(raw.as_ptr() as *const f32, out.as_mut_ptr(), out.len());
+        // Safe byte-to-f32 reinterpretation: no raw pointer cast. A Vec<u8>'s
+        // backing allocation is only 1-byte aligned by Rust guarantees, so
+        // casting `raw.as_ptr()` to `*const f32` and copying through it is UB
+        // (and the CodeQL "Access of invalid pointer" root cause). Chunked
+        // `from_ne_bytes` is alignment-agnostic and matches the GPU's native
+        // little-endian layout on every supported target.
+        Ok(raw
+            .chunks_exact(4)
+            .take(self.shape.elem_count())
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// Dtype-aware u32 readback: U32 buffers are chunked straight from
+    /// bytes (native layout — no f32 reinterpretation garbage), I64
+    /// truncates through `i64`, everything else falls back to the f32
+    /// path + cast (F32-backed scratch tensors).
+    fn to_cpu_vec_u32(&self) -> Result<Vec<u32>> {
+        match self.dtype.arith {
+            ArithType::U32 => {
+                let raw = self.read_raw_bytes()?;
+                Ok(raw
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect())
+            }
+            ArithType::I64 => {
+                let raw = self.read_raw_bytes()?;
+                Ok(raw
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as u32)
+                    .collect())
+            }
+            _ => Ok(self
+                .to_cpu_vec_f32()?
+                .into_iter()
+                .map(|v| v as u32)
+                .collect()),
         }
-        Ok(out)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
