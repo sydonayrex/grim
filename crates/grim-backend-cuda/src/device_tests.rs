@@ -34,7 +34,36 @@ mod tests {
             src.contains("window_lo"),
             "grim_qkv_attention must take a window_lo parameter for SWA"
         );
+        assert!(
+            src.contains("softcap"),
+            "grim_qkv_attention must take a softcap parameter for Gemma-2"
+        );
+        assert!(
+            src.contains("alibi_slopes"),
+            "grim_qkv_attention must take an alibi_slopes parameter"
+        );
+        assert!(
+            src.contains("grim_gelu_tanh_mul"),
+            "KERNELS_SOURCE must declare grim_gelu_tanh_mul"
+        );
+        assert!(
+            src.contains("grim_qkv_attention_paged"),
+            "KERNELS_SOURCE must declare grim_qkv_attention_paged"
+        );
+        assert!(
+            src.contains("grim_tree_attention"),
+            "KERNELS_SOURCE must declare grim_tree_attention"
+        );
+        assert!(
+            src.contains("grim_kda_gated_delta_rule_step"),
+            "KERNELS_SOURCE must declare grim_kda_gated_delta_rule_step"
+        );
+        assert!(
+            src.contains("grim_mla_q_kv_norm_split"),
+            "KERNELS_SOURCE must declare grim_mla_q_kv_norm_split"
+        );
     }
+
 
     #[test]
     fn test_cuda_device_probe() {

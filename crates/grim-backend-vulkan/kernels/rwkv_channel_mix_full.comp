@@ -1,0 +1,55 @@
+#version 450
+
+// RWKV-4 Channel-Mix (FFN) token-shift + gating — one token step.
+//
+// Per-channel computation (fully parallel):
+//   k_mix = ffn_tm_mix_k[i] * x[i] + (1 - ffn_tm_mix_k[i]) * ffn_xx_prev[i]
+//   r_mix = ffn_tm_mix_r[i] * x[i] + (1 - ffn_tm_mix_r[i]) * ffn_xx_prev[i]
+//   gated[i] = sigmoid(r_mix) * max(k_mix, 0)
+//   ffn_xx[i] = x[i]  (update stored previous)
+//
+// Each thread handles one channel. ffn_xx state is read-modified-written.
+//
+// Dispatch: dim threads (one per channel).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint dim;           // hidden dimension (channel count)
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+    float pad4;
+} params;
+
+// x: [dim] current input (post-norm2 residual)
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };
+// ffn_tm_mix_k: [dim] per-channel K mix coefficient
+layout(std430, binding = 1) readonly buffer BufMK { float mix_k[]; };
+// ffn_tm_mix_r: [dim] per-channel R mix coefficient
+layout(std430, binding = 2) readonly buffer BufMR { float mix_r[]; };
+// ffn_xx: [dim] stored previous hidden (read-write)
+layout(std430, binding = 3) buffer BufXX { float ffn_xx[]; };
+// out: [dim] gated output (pre-value-projection)
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.dim) return;
+
+    float x_val = X[i];
+    float mk = mix_k[i];
+    float mr = mix_r[i];
+
+    // Token shift
+    float k_mix = mk * x_val + (1.0 - mk) * ffn_xx[i];
+    float r_mix = mr * x_val + (1.0 - mr) * ffn_xx[i];
+
+    // Sigmoid gate + ReLU on mixed key
+    float sig_r = 1.0 / (1.0 + exp(-r_mix));
+    Out[i] = sig_r * max(k_mix, 0.0);
+
+    // Update stored previous
+    ffn_xx[i] = x_val;
+}

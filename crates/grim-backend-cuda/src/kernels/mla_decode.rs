@@ -96,9 +96,10 @@ __global__ void grim_mla_absorbed_decode(
 
         for (int v = tid; v < v_head_dim; v += block_size) {
             float va = 0.0f;
-            for (int c = 0; c < kv_lora_rank && c < 512; ++c)
             long w_base = (long)w_uv_offset_words + (long)h * w_uv_head_stride_words;
-            va += w_uv[w_base + v * kv_lora_rank + c] * s_latent[c];
+            for (int c = 0; c < kv_lora_rank && c < 512; ++c) {
+                va += w_uv[w_base + v * kv_lora_rank + c] * s_latent[c];
+            }
             out[h * v_head_dim + v] = va;
         }
     } else {

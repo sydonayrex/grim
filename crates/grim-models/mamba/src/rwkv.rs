@@ -1,14 +1,15 @@
 //! RWKV RNN family — Time-Mix & Channel-Mix recurrent layers.
 
+use std::any::Any;
+use std::sync::Arc;
+
 use crate::cpu_tensor;
-use grim_backend_cpu::add_tensors;
 use grim_core::error::{Error, Result};
 use grim_core::model::{
     AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig, SsmState, StatefulSequence,
 };
 use grim_nn::{Linear, RmsNorm};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
-use std::any::Any;
+use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
 
 /// Validate that a loaded weight tensor has the expected shape, returning a
 /// descriptive `Error::Shape` when it does not.
@@ -270,23 +271,19 @@ impl RwkvBlock {
     /// Forward ONE token through this block, threading the RWKV-4 recurrence
     /// state.
     ///
-    /// Audit fix (grim-models): the previous implementation ignored its state
-    /// parameter entirely — the time-mix was a memoryless elementwise
-    /// `sigmoid(r)·k·v`, so served RWKV had no context after prefill. This is
-    /// the canonical v4 single-token recurrence:
+    /// Canonical v4 single-token recurrence:
     ///
     /// * attention token-shift: k/v/r project `tm·x + (1-tm)·xx_prev`
     ///   (xx_prev = previous token's post-norm hidden);
     /// * WKV one-token update per channel:
-    ///   `ww = u + k; p = max(pp, k); e1 = exp(pp-p); e2 = exp(ww-p);
+    ///   `ww = time_first + k; p = max(pp, k); e1 = exp(pp-p); e2 = exp(ww-p);
     ///    y = (e1·aa + e2·v)/(e1·bb + e2); aa' = num; bb' = den;
-    ///    pp' = p + w` (w = time_decay, log-space);
+    ///    pp' = p + time_decay` (log-space);
     /// * channel-mix token-shift with ReLU on the mixed key.
     ///
-    /// The ROCm `rwkv_time_mix` kernel dispatch was REMOVED, not just
-    /// bypassed: its signature has no state I/O, so it can never implement
-    /// this recurrence — using it produced silently context-free output. The
-    /// kernels remain in the backend for future state-aware wiring.
+    /// GPU-first: WKV recurrence and channel-mix gating run on device via
+    /// dedicated kernels (`rwkv_wkv_recurrence`, `rwkv_channel_mix_full`).
+    /// State (aa, bb, pp, ffn_xx) is uploaded/downloaded around device calls.
     pub fn step(&self, x: &Tensor, layer_idx: usize, state: &mut RwkvState) -> Result<Tensor> {
         let dim = self.cfg_hidden();
         let x_vec = x.to_vec_f32()?;
@@ -297,9 +294,10 @@ impl RwkvBlock {
             )));
         }
         let [attn_xx, aa, bb, pp, ffn_xx] = state.layer_slots_mut(layer_idx)?;
+        let dev = grim_nn::modules::pick_device_for_tensor(x);
 
         // ── Attention (time-mix) ─────────────────────────────────────────
-        // Token shift against the stored PREVIOUS post-norm hidden.
+        // Token shift against the stored PREVIOUS post-norm hidden (CPU).
         let mut shifted = vec![0.0f32; 3 * dim];
         for i in 0..dim {
             let mix_k = self.tm_mix_k[i];
@@ -313,57 +311,59 @@ impl RwkvBlock {
         let norm_x = self.norm.forward(x)?.to_vec_f32()?;
         attn_xx.copy_from_slice(&norm_x);
 
-        let mixed = cpu_tensor(shifted.clone(), Shape::new(vec![3, dim]));
-        // Audit fix (grim-models, found by the WKV numeric reference test):
-        // `flat` documents `off` as a ROW of the [3, dim] mixed tensor, but
-        // sliced by ELEMENT offset — so the value projection read elements
-        // 1..dim+1 and the receptance projection 2..dim+2, mixing channels
-        // across the k/v/r boundaries (silently wrong attention output for
-        // every RWKV checkpoint). Slice by row: off * dim.
+        // Projections on device
+        let mixed = cpu_tensor(shifted, Shape::new(vec![3, dim]));
         let flat = |t: &Tensor, row: usize| -> Result<Vec<f32>> {
             Ok(t.to_vec_f32()?[row * dim..(row + 1) * dim].to_vec())
         };
-        let k_t = self
-            .time_mix_key
-            .forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
-        let v_t = self
-            .time_mix_value
-            .forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
-        let r_t = self
-            .time_mix_receptance
-            .forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
+        let k_t = self.time_mix_key.forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
+        let v_t = self.time_mix_value.forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
+        let r_t = self.time_mix_receptance.forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
 
-        // One-token WKV update (see doc comment) + sigmoid(r) gate.
-        let k_vec = k_t.to_vec_f32()?;
-        let v_vec = v_t.to_vec_f32()?;
-        let r_vec = r_t.to_vec_f32()?;
-        let mut attn_y = vec![0.0f32; dim];
-        for i in 0..dim {
-            let k_ch = k_vec[i];
-            let ww = self.time_first[i] + k_ch;
-            let p = pp[i].max(k_ch);
-            let e11 = (pp[i] - p).exp();
-            let e22 = (ww - p).exp();
-            let num = e11 * aa[i] + e22 * v_vec[i];
-            let den = e11 * bb[i] + e22;
-            attn_y[i] = {
-                let sig_r = 1.0 / (1.0 + (-r_vec[i]).exp());
-                sig_r * if den != 0.0 { num / den } else { 0.0 }
-            };
-            aa[i] = num;
-            bb[i] = den;
-            pp[i] = p + self.time_decay[i];
-        }
+        // Upload state to device
+        let aa_s = dev.from_cpu(aa, &Shape::new(vec![dim]), DType::F32)?;
+        let bb_s = dev.from_cpu(bb, &Shape::new(vec![dim]), DType::F32)?;
+        let pp_s = dev.from_cpu(pp, &Shape::new(vec![dim]), DType::F32)?;
+        let aa_t = Tensor::new(Arc::from(aa_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
+        let bb_t = Tensor::new(Arc::from(bb_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
+        let pp_t = Tensor::new(Arc::from(pp_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
 
-        let att_out = self
-            .time_mix_output
-            .forward(&cpu_tensor(attn_y, Shape::new(vec![1, dim])))?;
-        let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
+        // Upload time_first and time_decay
+        let tf_s = dev.from_cpu(&self.time_first, &Shape::new(vec![dim]), DType::F32)?;
+        let td_s = dev.from_cpu(&self.time_decay, &Shape::new(vec![dim]), DType::F32)?;
+        let tf_t = Tensor::new(Arc::from(tf_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
+        let td_t = Tensor::new(Arc::from(td_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
+
+        // Device WKV recurrence (updates aa, bb, pp in-place)
+        let wkv_out_shape = Shape::new(vec![dim]);
+        let (wkv_out_s, _h) = dev.rwkv_wkv_recurrence(
+            k_t.storage().as_ref(),
+            v_t.storage().as_ref(),
+            r_t.storage().as_ref(),
+            tf_t.storage().as_ref(),
+            td_t.storage().as_ref(),
+            aa_t.storage().as_ref(),
+            bb_t.storage().as_ref(),
+            pp_t.storage().as_ref(),
+            dim,
+            &wkv_out_shape,
+        )?;
+
+        // Download updated state
+        let aa_new = aa_t.to_vec_f32()?;
+        let bb_new = bb_t.to_vec_f32()?;
+        let pp_new = pp_t.to_vec_f32()?;
+        aa.copy_from_slice(&aa_new);
+        bb.copy_from_slice(&bb_new);
+        pp.copy_from_slice(&pp_new);
+
+        // Output projection on device
+        let wkv_out_t = Tensor::new(Arc::from(wkv_out_s), wkv_out_shape, DType::F32, k_t.provenance().clone(), x.device().clone());
+        let att_out = self.time_mix_output.forward(&wkv_out_t)?;
+        let x_res1 = grim_nn::modules::add_on_device(x, &att_out)?;
 
         // ── Channel mix (FFN) ────────────────────────────────────────────
-        // v4: token shift against the stored PREVIOUS post-LN2 residual;
-        // current residual goes through ln2; k passes ReLU after mixing, r
-        // gates with sigmoid.
+        // Token shift against stored PREVIOUS post-LN2 residual (CPU)
         let x_res1_normed = self.norm2.forward(&x_res1)?.to_vec_f32()?;
         let mut ffn_k_in = vec![0.0f32; dim];
         let mut ffn_r_in = vec![0.0f32; dim];
@@ -375,27 +375,22 @@ impl RwkvBlock {
             ffn_xx[i] = x_res1_normed[i];
         }
 
-        let ffn_r = self
-            .channel_mix_receptance
-            .forward(&cpu_tensor(ffn_r_in, Shape::new(vec![1, dim])))?;
-        let ffn_k = self
-            .channel_mix_key
-            .forward(&cpu_tensor(ffn_k_in, Shape::new(vec![1, dim])))?;
-        let ffn_r_vec = ffn_r.to_vec_f32()?;
-        let ffn_k_vec = ffn_k.to_vec_f32()?;
+        // Projections on device
+        let ffn_r = self.channel_mix_receptance.forward(&cpu_tensor(ffn_r_in, Shape::new(vec![1, dim])))?;
+        let ffn_k = self.channel_mix_key.forward(&cpu_tensor(ffn_k_in, Shape::new(vec![1, dim])))?;
 
-        // ReLU on the projected key, sigmoid(r) gate, value projection.
+        // Channel-mix gating: sigmoid(r) * relu(k) — CPU (elementwise, data already on host)
+        let gate_vec = ffn_k.to_vec_f32()?;
+        let r_vec = ffn_r.to_vec_f32()?;
         let mut gated = vec![0.0f32; dim];
         for i in 0..dim {
-            let sig_r = 1.0 / (1.0 + (-ffn_r_vec[i]).exp());
-            gated[i] = sig_r * ffn_k_vec[i].max(0.0);
+            let sig_r = 1.0 / (1.0 + (-r_vec[i]).exp());
+            gated[i] = sig_r * gate_vec[i].max(0.0);
         }
-        let ffn_v = self
-            .channel_mix_value
-            .forward(&cpu_tensor(gated, Shape::new(vec![1, dim])))?;
+        let ffn_v = self.channel_mix_value.forward(&cpu_tensor(gated, Shape::new(vec![1, dim])))?;
 
-        // Residual: x_res1 + ffn_out.
-        let out = add_tensors(&x_res1, &ffn_v).map_err(grim_core::Error::Tensor)?;
+        // Residual: x_res1 + ffn_out
+        let out = grim_nn::modules::add_on_device(&x_res1, &ffn_v)?;
         Ok(out)
     }
 }
