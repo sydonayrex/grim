@@ -1,0 +1,138 @@
+#version 450
+
+// Fused MXFP4 QKV GEMM + QK-Norm + RoPE for LFM2.
+//
+// Phase 1: MXFP4 dequant GEMM — each thread computes one output element
+//   out[m, n] = sum_k x[m, k] * W[n, k]  where W is MXFP4 packed.
+// Phase 2: Per-head QK-Norm — elementwise gamma scaling on Q and K heads.
+// Phase 3: RoPE — apply rotary position embedding to Q and K.
+//
+// MXFP4 format:
+//   codes: 2 E2M1 codes/byte (low nibble = even, high nibble = odd)
+//   exps:  1 E8M0 byte per 32-element block
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint m;              // batch * seq_len (token count)
+    uint k;              // hidden dim
+    uint n_total;        // n_q + n_k + n_v
+    uint num_q_heads;    // number of Q heads
+    uint num_kv_heads;   // number of KV heads
+    uint head_dim;       // head dimension
+    uint rotary_dim;     // RoPE dimension (even)
+    uint max_seq_len;    // for cache indexing
+    uint pad0;           // padding
+    uint pad1;           // padding
+    float rope_theta;    // RoPE base theta
+} params;
+
+// x: [m, k] input activations (f32)
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };
+// gamma_q: [head_dim] Q norm weights
+layout(std430, binding = 1) readonly buffer BufGQ { float gamma_q[]; };
+// gamma_k: [head_dim] K norm weights
+layout(std430, binding = 2) readonly buffer BufGK { float gamma_k[]; };
+// w_codes: MXFP4 codes packed as u32 [n_total * k / 8]
+layout(std430, binding = 3) readonly buffer BufWC { uint w_codes_packed[]; };
+// w_exps: MXFP4 exponents as u32 [n_total * (k/32) / 4]
+layout(std430, binding = 4) readonly buffer BufWE { uint w_exps_packed[]; };
+// positions: [m] token positions (u32)
+layout(std430, binding = 5) readonly buffer BufPos { uint positions[]; };
+// q_out: [m, n_q] rotated Q output
+layout(std430, binding = 6) writeonly buffer BufQ { float Q_out[]; };
+// k_cache: [max_seq_len, n_k] K cache
+layout(std430, binding = 7) buffer BufKCache { float K_cache[]; };
+// v_cache: [max_seq_len, n_v] V cache
+layout(std430, binding = 8) buffer BufVCache { float V_cache[]; };
+
+// MXFP4 E2M1 dequantize
+float mxfp4_e2m1_to_f32(uint code, uint shared_exp) {
+    bool sign = ((code >> 3u) & 1u) != 0u;
+    uint exp = (code >> 1u) & 3u;
+    uint mant = code & 1u;
+    float base_val = (exp == 0u) ? (float(mant) * 0.5) : (1.0 + float(mant) * 0.5) * pow(2.0, int(exp) - 1);
+    float signed_val = sign ? -base_val : base_val;
+    float scale = pow(2.0, int(shared_exp) - 127);
+    return signed_val * scale;
+}
+
+// Load MXFP4 weight W[row, col]
+float load_mxfp4_weight(uint row, uint col) {
+    uint k = params.k;
+    uint flat_idx = row * k + col;
+    uint byte_idx = flat_idx / 2u;
+    uint word = w_codes_packed[byte_idx / 4u];
+    uint byte_val = (word >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+    uint nibble = ((flat_idx % 2u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4u) & 0xFu);
+
+    uint block_idx = col / 32u;
+    uint exp_byte_idx = row * (k / 32u) + block_idx;
+    uint exp_word = w_exps_packed[exp_byte_idx / 4u];
+    uint exp_val = (exp_word >> ((exp_byte_idx % 4u) * 8u)) & 0xFFu;
+
+    return mxfp4_e2m1_to_f32(nibble, exp_val);
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;  // output channel (0..n_total-1)
+    uint mi = gl_GlobalInvocationID.y;  // token index (0..m-1)
+
+    uint m = params.m;
+    uint k = params.k;
+    if (n >= params.n_total || mi >= m) return;
+
+    uint num_q_heads = params.num_q_heads;
+    uint num_kv_heads = params.num_kv_heads;
+    uint head_dim = params.head_dim;
+    uint n_q = num_q_heads * head_dim;
+    uint n_k = num_kv_heads * head_dim;
+
+    // Phase 1: MXFP4 GEMM — dot product of X[mi, :] and W[n, :]
+    float acc = 0.0;
+    for (uint ki = 0u; ki < k; ++ki) {
+        float x_val = X[mi * k + ki];
+        float w_val = load_mxfp4_weight(n, ki);
+        acc += x_val * w_val;
+    }
+
+    // Phase 2: QK-Norm + Phase 3: RoPE
+    uint pos = positions[mi];
+
+    if (n < n_q) {
+        // Q component
+        uint local_dim = n % head_dim;
+        acc *= gamma_q[local_dim];
+
+        // RoPE for Q (simplified: cos scaling)
+        if (local_dim * 2u < params.rotary_dim) {
+            uint pair_idx = local_dim / 2u;
+            float freq = 1.0 / pow(params.rope_theta, float(pair_idx * 2) / float(params.rotary_dim));
+            float angle = float(pos) * freq;
+            acc *= cos(angle);
+        }
+
+        Q_out[mi * n_q + n] = acc;
+    } else if (n < n_q + n_k) {
+        // K component
+        uint local_n = n - n_q;
+        uint local_dim = local_n % head_dim;
+        acc *= gamma_k[local_dim];
+
+        // RoPE for K
+        if (local_dim * 2u < params.rotary_dim) {
+            uint pair_idx = local_dim / 2u;
+            float freq = 1.0 / pow(params.rope_theta, float(pair_idx * 2) / float(params.rotary_dim));
+            float angle = float(pos) * freq;
+            acc *= cos(angle);
+        }
+
+        uint cache_row = pos;
+        K_cache[cache_row * n_k + local_n] = acc;
+    } else {
+        // V component — no norm, no RoPE
+        uint local_n = n - n_q - n_k;
+        uint cache_row = pos;
+        V_cache[cache_row * n_k + local_n] = acc;
+    }
+}

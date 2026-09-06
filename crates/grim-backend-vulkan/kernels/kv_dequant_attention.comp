@@ -3,53 +3,88 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
-    uint size;
-    uint dim;
-    uint k;
-    uint n;
-    uint m;
-    float eps;
+    uint seq_len;
+    uint head_dim;
+    uint quant_bits;  // 8 for Q8_0, 4 for Q4_K
+    uint num_heads;
+    uint block_stride; // bytes per KV block (34 for Q8_0, 16 for Q4_K)
+    float inv_sqrt_d;
 } params;
 
 layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
-layout(std430, binding = 1) readonly buffer BufK { uint K_bytes[]; };
-layout(std430, binding = 2) readonly buffer BufV { uint V_bytes[]; };
+layout(std430, binding = 1) readonly buffer BufK { uint K_packed[]; };
+layout(std430, binding = 2) readonly buffer BufV { uint V_packed[]; };
 layout(std430, binding = 3) readonly buffer BufKScales { float K_scales[]; };
 layout(std430, binding = 4) readonly buffer BufVScales { float V_scales[]; };
 layout(std430, binding = 5) writeonly buffer BufOut { float Out[]; };
 
-uint get_byte_k(uint byte_idx) {
-    uint word = K_bytes[byte_idx / 4u];
+// Q8_0 dequant: 1 byte per value, scale per block
+float dequant_q8(uint byte_idx, float scale) {
+    uint word = K_packed[byte_idx / 4u];
     uint shift = (byte_idx % 4u) * 8u;
-    return (word >> shift) & 0xFFu;
+    uint raw = (word >> shift) & 0xFFu;
+    int sb = (raw >= 128u) ? int(raw) - 256 : int(raw);
+    return scale * float(sb);
 }
 
-uint get_byte_v(uint byte_idx) {
-    uint word = V_bytes[byte_idx / 4u];
+// Q4_K dequant: 2 values per byte (low nibble first), scale per block
+float dequant_q4(uint byte_idx, uint elem_offset, float scale) {
+    uint word = K_packed[byte_idx / 4u];
     uint shift = (byte_idx % 4u) * 8u;
-    return (word >> shift) & 0xFFu;
+    uint byte_val = (word >> shift) & 0xFFu;
+    uint nibble = (elem_offset % 2u == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4u) & 0xFu);
+    int sb = (nibble >= 8u) ? int(nibble) - 16 : int(nibble);
+    return scale * float(sb);
+}
+
+float dequant_k(uint t, uint d, uint head_dim) {
+    if (params.quant_bits == 8u) {
+        uint block_start = t * params.block_stride;
+        float d_k = K_scales[t];
+        return dequant_q8(block_start + d, d_k);
+    } else {
+        // Q4_K: block_stride=16 bytes per block (8 bytes scales + 8 bytes packed)
+        uint block_start = t * params.block_stride;
+        float d_k = K_scales[t];
+        uint byte_idx = block_start + (d / 2u);
+        return dequant_q4(byte_idx, d, d_k);
+    }
+}
+
+float dequant_v(uint t, uint d, uint head_dim) {
+    if (params.quant_bits == 8u) {
+        uint block_start = t * params.block_stride;
+        float d_v = V_scales[t];
+        return dequant_q8(block_start + d, d_v);
+    } else {
+        uint block_start = t * (params.block_stride);
+        float d_v = V_scales[t];
+        uint byte_idx = block_start + (d / 2u);
+        uint word = V_packed[byte_idx / 4u];
+        uint shift = (byte_idx % 4u) * 8u;
+        uint byte_val = (word >> shift) & 0xFFu;
+        uint nibble = (d % 2u == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4u) & 0xFu);
+        int sb = (nibble >= 8u) ? int(nibble) - 16 : int(nibble);
+        return d_v * float(sb);
+    }
 }
 
 void main() {
-    uint seq_len = params.m;
-    uint head_dim = params.n;
+    uint seq_len = params.seq_len;
+    uint head_dim = params.head_dim;
     uint tid = gl_GlobalInvocationID.x;
 
     if (tid >= head_dim) return;
 
-    float scale = 1.0 / sqrt(float(head_dim));
-    float q_val = Q[tid] * scale;
+    float q_val = Q[tid] * params.inv_sqrt_d;
 
     float acc_out = 0.0;
     float sum_exp = 0.0;
     float max_score = -1e30;
 
     for (uint t = 0u; t < seq_len; ++t) {
-        uint block_start = t * 34u;
-        float d_k = K_scales[t];
-        uint raw_k = get_byte_k(t * 32u + (tid % 32u));
-        int sb_k = (raw_k >= 128u) ? int(raw_k) - 256 : int(raw_k);
-        float k_val = d_k * float(sb_k);
+        float k_val = dequant_k(t, tid % head_dim, head_dim);
+        float v_val = dequant_v(t, tid % head_dim, head_dim);
 
         float score = q_val * k_val;
         if (score > max_score) {
@@ -58,11 +93,6 @@ void main() {
         } else {
             sum_exp += exp(score - max_score);
         }
-
-        float d_v = V_scales[t];
-        uint raw_v = get_byte_v(t * 32u + (tid % 32u));
-        int sb_v = (raw_v >= 128u) ? int(raw_v) - 256 : int(raw_v);
-        float v_val = d_v * float(sb_v);
 
         float p = exp(score - max_score);
         acc_out += p * v_val;

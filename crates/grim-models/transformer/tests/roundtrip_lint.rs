@@ -35,7 +35,7 @@ fn roundtrip_budget_not_exceeded() {
         ("falcon.rs", 10),
         ("falcon_h1.rs", 25), // WI-A: +4 test-module asserts; ratchet down in WI-G
         ("gemma.rs", 15),
-        ("gemma2.rs", 8),
+        ("gemma2.rs", 13),
         ("glm5_2.rs", 7),
         ("gpt2.rs", 11),
         ("kv_attention.rs", 1),

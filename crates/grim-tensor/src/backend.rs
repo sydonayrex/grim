@@ -704,7 +704,10 @@ pub trait AttentionOps {
     /// - `kv_cache`: `[seq_len, num_kv_heads(=1), kv_lora_rank + qk_rope_dim]`
     ///   — compressed latent KV (kv_a_layernorm'ed c_kv + rope key)
     /// - `w_uv`: `[num_heads * v_head_dim, kv_lora_rank]` — absorbed
-    ///   up+value projection (optional; None ⇒ output stays in latent space)
+    ///   up+value projection (optional; None ⇒ output stays in latent space).
+    ///   Head *h*'s block starts at word `w_uv_offset_words + h *
+    ///   w_uv_head_stride_words`; a zero stride shares one matrix across all
+    ///   heads (legacy single-head launches pass offset 0, stride 0)
     /// - `out_shape`: `[1, num_heads, v_head_dim]`
     ///
     /// Scale: `1/sqrt(kv_lora_rank + qk_rope_dim)`.
@@ -723,8 +726,12 @@ pub trait AttentionOps {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let _ = (
+            w_uv_offset_words,
+            w_uv_head_stride_words,
             q_absorbed,
             q_rope,
             kv_cache,
@@ -1650,6 +1657,68 @@ pub trait RecurrentOps {
             "rwkv_channel_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
         ))
     }
+
+    /// Standard delta rule recurrence (DeltaNet / SolarOpen2).
+    ///
+    /// Per-token, per-head recurrence: Sk = S*k, delta_v = beta*(v - Sk),
+    /// S += delta_v * k^T, o = q * S^T. Default returns `Unimplemented`.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_rule_decode(
+        &self,
+        _q: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _beta: f32,
+        _state: &dyn BackendStorage,
+        _d_k: usize,
+        _d_v: usize,
+        _num_heads: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "delta_rule_decode requires a GPU backend with a wired kernel".into(),
+        ))
+    }
+
+    /// RWKV-4 WKV weighted key-value recurrence (one token step).
+    ///
+    /// Per-channel recurrence with state (aa, bb, pp). Default returns `Unimplemented`.
+    #[allow(clippy::too_many_arguments)]
+    fn rwkv_wkv_recurrence(
+        &self,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _r: &dyn BackendStorage,
+        _time_first: &dyn BackendStorage,
+        _time_decay: &dyn BackendStorage,
+        _state_aa: &dyn BackendStorage,
+        _state_bb: &dyn BackendStorage,
+        _state_pp: &dyn BackendStorage,
+        _dim: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "rwkv_wkv_recurrence requires a GPU backend with a wired kernel".into(),
+        ))
+    }
+
+    /// RWKV-4 channel-mix token-shift + gating (one token step).
+    ///
+    /// Per-channel: token-shift, sigmoid(r) gate, ReLU(k). Default returns `Unimplemented`.
+    #[allow(clippy::too_many_arguments)]
+    fn rwkv_channel_mix_full(
+        &self,
+        _x: &dyn BackendStorage,
+        _mix_k: &dyn BackendStorage,
+        _mix_r: &dyn BackendStorage,
+        _ffn_xx: &dyn BackendStorage,
+        _dim: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "rwkv_channel_mix_full requires a GPU backend with a wired kernel".into(),
+        ))
+    }
 }
 
 /// Tensor-parallel collectives and GEMM latency prediction.
@@ -2361,6 +2430,8 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         (**self).mla_absorbed_decode(
             q_absorbed,
@@ -2373,6 +2444,8 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
             qk_rope_dim,
             v_head_dim,
             seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
         )
     }
 }

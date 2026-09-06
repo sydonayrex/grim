@@ -571,6 +571,8 @@ impl DeepSeek4Mla {
                 rope_d,
                 vd,
                 total_kv_len,
+                0,
+                0,
             ))?
             .is_none()
             {

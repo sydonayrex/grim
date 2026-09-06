@@ -160,6 +160,15 @@ fn kernels() -> Vec<(&'static str, String)> {
         ),
         ("charon_backward", load_kernel("charon_backward")),
         ("moe_mega_kernel", load_kernel("moe_mega_kernel")),
+        ("short_conv1d_causal_step", load_kernel("short_conv1d_causal_step")),
+        ("gated_delta_net_decode", load_kernel("gated_delta_net_decode")),
+        ("mla_qkv_norm_split", load_kernel("mla_qkv_norm_split")),
+        ("selective_scan_headed", load_kernel("selective_scan_headed")),
+        ("fused_mxfp4_qkv", load_kernel("fused_mxfp4_qkv")),
+        ("block_diffusion_attention", load_kernel("block_diffusion_attention")),
+        ("delta_rule_decode", load_kernel("delta_rule_decode")),
+        ("rwkv_wkv_recurrence", load_kernel("rwkv_wkv_recurrence")),
+        ("rwkv_channel_mix_full", load_kernel("rwkv_channel_mix_full")),
     ]
 }
 
@@ -270,6 +279,15 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/charon_backward.comp");
     println!("cargo:rerun-if-changed=kernels/moe_mega_kernel.comp");
     println!("cargo:rerun-if-changed=kernels/rerope.comp");
+    println!("cargo:rerun-if-changed=kernels/short_conv1d_causal_step.comp");
+    println!("cargo:rerun-if-changed=kernels/gated_delta_net_decode.comp");
+    println!("cargo:rerun-if-changed=kernels/mla_qkv_norm_split.comp");
+    println!("cargo:rerun-if-changed=kernels/selective_scan_headed.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_mxfp4_qkv.comp");
+    println!("cargo:rerun-if-changed=kernels/block_diffusion_attention.comp");
+    println!("cargo:rerun-if-changed=kernels/delta_rule_decode.comp");
+    println!("cargo:rerun-if-changed=kernels/rwkv_wkv_recurrence.comp");
+    println!("cargo:rerun-if-changed=kernels/rwkv_channel_mix_full.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 

@@ -1,0 +1,95 @@
+#version 450
+
+// Block Diffusion Attention for DiffusionGemma.
+//
+// Custom attention mask: bidirectional self-attention within fixed-size canvas
+// blocks, paired with causal prompt context. Tokens within the same block
+// attend to each other bidirectionally; tokens before the block attend causally.
+//
+// Block size configurable via push constant (typically 256).
+// Uses online softmax to avoid large local memory allocation.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint seq_len;       // total sequence length (S)
+    uint num_heads;     // number of attention heads (H)
+    uint num_kv_heads;  // number of KV heads
+    uint head_dim;      // dimension per head (D)
+    uint block_size;    // canvas block size (256)
+    uint prompt_len;    // length of prompt context (causal)
+} params;
+
+// q: [S, H, D]
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+// k: [S, num_kv_heads, D]
+layout(std430, binding = 1) readonly buffer BufK { float K[]; };
+// v: [S, num_kv_heads, D]
+layout(std430, binding = 2) readonly buffer BufV { float V[]; };
+// out: [S, H, D]
+layout(std430, binding = 3) writeonly buffer BufOut { float Out[]; };
+
+// Determine if token i should attend to token j based on block-diffusion mask
+bool should_attend(uint i, uint j) {
+    if (j <= i) return true;  // causal: always attend to past
+    // j > i (future): only attend if in same canvas block AND after prompt
+    uint prompt_len = params.prompt_len;
+    if (j < prompt_len) return true;  // prompt context always attended
+    uint bs = params.block_size;
+    return (i / bs) == (j / bs);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;  // query position
+    uint h = gl_WorkGroupID.y;         // head index
+
+    uint seq_len = params.seq_len;
+    uint num_heads = params.num_heads;
+    if (i >= seq_len || h >= num_heads) return;
+
+    uint num_kv_heads = params.num_kv_heads;
+    uint head_dim = params.head_dim;
+    uint kv_head = h % num_kv_heads;
+
+    uint q_base = (i * num_heads + h) * head_dim;
+    uint k_stride = num_kv_heads * head_dim;
+
+    // Online softmax: accumulate output vector while tracking running max/sum
+    float acc[256];
+    for (uint d = 0u; d < head_dim && d < 256u; ++d) acc[d] = 0.0;
+
+    float running_max = -1e30;
+    float running_sum = 0.0;
+
+    for (uint j = 0u; j < seq_len; ++j) {
+        if (!should_attend(i, j)) continue;
+
+        // Compute dot product Q[i,h] . K[j,kv_head]
+        float dot = 0.0;
+        uint k_base = j * k_stride + kv_head * head_dim;
+        for (uint d = 0u; d < head_dim; ++d) {
+            dot += Q[q_base + d] * K[k_base + d];
+        }
+        float score = dot * (1.0 / sqrt(float(params.head_dim)));
+
+        // Online softmax update
+        float new_max = max(running_max, score);
+        float scale_old = exp(running_max - new_max);
+        float scale_new = exp(score - new_max);
+        running_sum = running_sum * scale_old + scale_new;
+
+        // Rescale accumulator and add new contribution
+        uint v_base = j * k_stride + kv_head * head_dim;
+        for (uint d = 0u; d < head_dim && d < 256u; ++d) {
+            acc[d] = acc[d] * scale_old + scale_new * V[v_base + d];
+        }
+        running_max = new_max;
+    }
+
+    // Write output
+    uint out_base = q_base;
+    float inv_sum = (running_sum > 0.0) ? (1.0 / running_sum) : 0.0;
+    for (uint d = 0u; d < head_dim && d < 256u; ++d) {
+        Out[out_base + d] = acc[d] * inv_sum;
+    }
+}

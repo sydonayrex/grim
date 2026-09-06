@@ -1,0 +1,60 @@
+#version 450
+
+// Falcon-H1 / Mamba-2-style selective scan with head-indexed parameters.
+// One decode step per call. Recurrence:
+//   h[n,s] = exp(dt[h(n)]*a[h(n)]) * h_prev[n,s] + b[s]*x[n]*dt[h(n)]
+//   y[n]   = sum_s c[s]*h[n,s] + d[h(n)]*x[n]*dt[h(n)]
+// where h(n) = n / head_dim_ssm.
+//
+// Layouts: x[d_inner], dt[n_heads], a[n_heads], d[n_heads],
+//          b[d_state], c[d_state], state[d_inner*d_state] (read+write).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint d_inner;      // inner dimension
+    uint d_state;      // SSM state dimension
+    uint n_heads;      // number of heads
+    uint head_dim_ssm; // head dimension for SSM (d_inner / n_heads)
+    uint pad0;
+    float pad1;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };       // [d_inner]
+layout(std430, binding = 1) readonly buffer BufDt { float Dt[]; };     // [n_heads]
+layout(std430, binding = 2) readonly buffer BufA { float A[]; };       // [n_heads]
+layout(std430, binding = 3) readonly buffer BufB { float B[]; };       // [d_state]
+layout(std430, binding = 4) readonly buffer BufC { float C[]; };       // [d_state]
+layout(std430, binding = 5) readonly buffer BufD { float D[]; };       // [n_heads]
+layout(std430, binding = 6) buffer BufState { float State[]; };        // [d_inner * d_state]
+layout(std430, binding = 7) writeonly buffer BufOut { float Out[]; };  // [d_inner]
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    uint d_inner = params.d_inner;
+    if (n >= d_inner) return;
+
+    uint d_state = params.d_state;
+    uint head_dim_ssm = params.head_dim_ssm;
+    uint hn = n / head_dim_ssm;  // head index
+
+    float dt_val = Dt[hn];
+    float a_val = A[hn];
+    float d_val = D[hn];
+    float x_val = X[n];
+
+    float exp_dt_a = exp(dt_val * a_val);
+    float dt_x = dt_val * x_val;
+
+    uint state_base = n * d_state;
+    float y = 0.0;
+
+    for (uint s = 0u; s < d_state; ++s) {
+        float h_prev = State[state_base + s];
+        float h_new = exp_dt_a * h_prev + B[s] * dt_x;
+        State[state_base + s] = h_new;
+        y += C[s] * h_new;
+    }
+
+    Out[n] = y + d_val * dt_x;
+}

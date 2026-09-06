@@ -345,13 +345,11 @@ impl DeepSeek2Mla {
     /// projection happens inside the kernel, and the decoded output stays a
     /// device tensor — no `synchronize`, no result D2H, no host matmul.
     ///
-    /// The kernel indexes `w_uv` WITHOUT a per-head offset
-    /// (`w_uv[v * kv_lora_rank + c]` for every head), so a single multi-head
-    /// launch would repeat head 0's rows for all heads. The kernel is instead
-    /// launched once per head with `num_heads = 1`, passing exactly that
-    /// head's `[v_head_dim, kv_lora_rank]` block extracted D2D from the
-    /// device-resident `kv_b_proj.weight` (contiguous rows
-    /// `[h*(nope+v) + nope, +v)` — identical values to `self.w_vc[h]`).
+    /// The kernel reads head *h*'s `w_vc` block directly from the
+    /// device-resident `kv_b_proj.weight` via the per-head word offset
+    /// (`nope * rank`) and stride (`(nope + v) * rank`), so one multi-head
+    /// launch covers all heads — head *h*'s weight rows are
+    /// `[h*(nope+v) + nope, +v)`, identical values to `self.w_vc[h]`.
     ///
     /// Returns `Ok(None)` when the backend lacks a needed kernel
     /// (`is_kernel_unimplemented`); the caller then runs the scalar latent
@@ -414,90 +412,27 @@ impl DeepSeek2Mla {
         let kv_st = latent_all.storage().as_ref();
         let w_src = self.kv_b_proj.weight.storage().as_ref();
 
-        for h in 0..nh {
-            let Some(qa_h) =
-                or_host_fallback(dev.alloc_storage(&Shape::new(vec![rank]), DType::F32))?
-            else {
-                return Ok(None);
-            };
-            if or_host_fallback(dev.copy_slice_range(
-                qa_h.as_ref(),
-                0,
-                qa_all.as_ref(),
-                h * rank,
-                rank,
-            ))?
-            .is_none()
-            {
-                return Ok(None);
-            }
-
-            let Some(qr_h) =
-                or_host_fallback(dev.alloc_storage(&Shape::new(vec![rope_d]), DType::F32))?
-            else {
-                return Ok(None);
-            };
-            if or_host_fallback(dev.copy_slice_range(
-                qr_h.as_ref(),
-                0,
-                qr_all.as_ref(),
-                h * rope_d,
-                rope_d,
-            ))?
-            .is_none()
-            {
-                return Ok(None);
-            }
-
-            // w_vc[h] = contiguous rows [h*(nope+v)+nope, +v) of kv_b_proj.weight.
-            let Some(w_h) =
-                or_host_fallback(dev.alloc_storage(&Shape::new(vec![vd, rank]), DType::F32))?
-            else {
-                return Ok(None);
-            };
-            if or_host_fallback(dev.copy_slice_range(
-                w_h.as_ref(),
-                0,
-                w_src,
-                (h * (nope + vd) + nope) * rank,
-                vd * rank,
-            ))?
-            .is_none()
-            {
-                return Ok(None);
-            }
-
-            let Some(out_h) =
-                or_host_fallback(dev.alloc_storage(&Shape::new(vec![vd]), DType::F32))?
-            else {
-                return Ok(None);
-            };
-            if or_host_fallback(dev.mla_absorbed_decode(
-                qa_h.as_ref(),
-                qr_h.as_ref(),
-                kv_st,
-                Some(w_h.as_ref()),
-                out_h.as_ref(),
-                1,
-                rank,
-                rope_d,
-                vd,
-                total_kv_len,
-            ))?
-            .is_none()
-            {
-                return Ok(None);
-            }
-            if or_host_fallback(dev.copy_slice_into(
-                out_all.as_ref(),
-                out_h.as_ref(),
-                h * vd,
-                vd,
-            ))?
-            .is_none()
-            {
-                return Ok(None);
-            }
+        // Single multi-head launch: the kernel takes a per-head word offset
+        // and stride, so it reads each head's w_vc block straight out of the
+        // device-resident kv_b_proj weight — no per-head D2D slicing, no
+        // serial per-head launches.
+        if or_host_fallback(dev.mla_absorbed_decode(
+            qa_all.as_ref(),
+            qr_all.as_ref(),
+            kv_st,
+            Some(w_src),
+            out_all.as_ref(),
+            nh,
+            rank,
+            rope_d,
+            vd,
+            total_kv_len,
+            nope * rank,
+            (nope + vd) * rank,
+        ))?
+        .is_none()
+        {
+            return Ok(None);
         }
 
         Ok(Some(Tensor::new(

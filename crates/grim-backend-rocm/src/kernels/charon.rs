@@ -297,7 +297,7 @@ __device__ __forceinline__ float mxfp8_e4m3_to_f32(unsigned char b, unsigned cha
 // grim-quant::quantize_f32_to_fp8_block16):
 //   gate/up: w_scale[exp*inter*(hidden/16) + j*(hidden/16) + i/16]
 //   down:    w_scale[exp*hidden*(inter/16) + h*(inter/16) + j/16]
-__global__ void grim_moe_fused_grouped_fp8(
+extern "C" __global__ void grim_moe_fused_grouped_fp8(
     const float* __restrict__ activations,    // [batch, hidden]
     const unsigned char* __restrict__ egate_w,// [num_experts, inter*hidden] FP8
     const unsigned char* __restrict__ eup_w,  // [num_experts, inter*hidden] FP8
@@ -395,7 +395,7 @@ __device__ __forceinline__ unsigned char mxfp4_code_at(const unsigned char* code
     return (idx & 1) ? (b >> 4) & 0x0F : b & 0x0F;
 }
 
-__global__ void grim_moe_fused_grouped_mxfp4(
+extern "C" __global__ void grim_moe_fused_grouped_mxfp4(
     const float* __restrict__ activations,    // [batch, hidden]
     const unsigned char* __restrict__ egate_w,// [num_experts, inter*hidden/2] packed E2M1
     const unsigned char* __restrict__ eup_w,  // [num_experts, inter*hidden/2] packed E2M1

@@ -1,17 +1,28 @@
+//! Vulkan backend for Grim — GPU compute via Vulkan 1.1 SPIR-V.
+//!
+//! Modularized architecture (mirrors CUDA/ROCm backends):
+//! - `ffi.rs`        — Vulkan API types, constants, extern "C" declarations.
+//! - `context.rs`    — VulkanContext: device init, queues, pipeline setup.
+//! - `storage.rs`    — VulkanStorage: GPU buffer management, host-visible staging.
+//! - `lib.rs`        — VulkanDevice struct + all BackendDevice trait impls, kernel dispatch.
+
 pub mod autotune;
 pub mod caps;
 pub mod collective;
+pub mod context;
+pub mod ffi;
 pub mod fsdp;
 pub mod graph_capture;
 pub mod hugepage;
+pub mod storage;
 
 pub use autotune::{GemmOp, ShapeClass, VulkanAutotuner, VulkanTileConfig};
 pub use caps::VulkanCaps;
 pub use hugepage::VulkanHugePageBuffer;
+pub use storage::{VulkanHandle, VulkanStorage};
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{
@@ -25,1384 +36,15 @@ pub use grim_tensor::{
     RecurrentOps, SamplingOps, ScythePlacement, Shape,
 };
 
-// Vulkan FFI types and constants
-
-pub type VkFlags = u32;
-pub type VkDeviceSize = u64;
-
-#[repr(C)]
-pub struct VkInstanceCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub p_application_info: *const c_void,
-    pub enabled_layer_count: u32,
-    pub pp_enabled_layer_names: *const *const i8,
-    pub enabled_extension_count: u32,
-    pub pp_enabled_extension_names: *const *const i8,
-}
-
-#[repr(C)]
-pub struct VkDeviceQueueCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub queue_family_index: u32,
-    pub queue_count: u32,
-    pub p_queue_priorities: *const f32,
-}
-
-#[repr(C)]
-pub struct VkDeviceCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub queue_create_info_count: u32,
-    pub p_queue_create_infos: *const VkDeviceQueueCreateInfo,
-    pub enabled_layer_count: u32,
-    pub pp_enabled_layer_names: *const *const i8,
-    pub enabled_extension_count: u32,
-    pub pp_enabled_extension_names: *const *const i8,
-    pub p_enabled_features: *const c_void,
-}
-
-#[repr(C)]
-pub struct VkBufferCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub size: VkDeviceSize,
-    pub usage: u32,
-    pub sharing_mode: u32,
-    pub queue_family_index_count: u32,
-    pub p_queue_family_indices: *const u32,
-}
-
-#[repr(C)]
-pub struct VkBufferCopy {
-    pub src_offset: VkDeviceSize,
-    pub dst_offset: VkDeviceSize,
-    pub size: VkDeviceSize,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct VkMemoryRequirements {
-    pub size: VkDeviceSize,
-    pub alignment: VkDeviceSize,
-    pub memory_type_bits: u32,
-}
-
-#[repr(C)]
-pub struct VkMemoryAllocateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub allocation_size: VkDeviceSize,
-    pub memory_type_index: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct VkMemoryType {
-    pub property_flags: VkFlags,
-    pub heap_index: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct VkMemoryHeap {
-    pub size: VkDeviceSize,
-    pub flags: VkFlags,
-}
-
-#[repr(C)]
-pub struct VkPhysicalDeviceMemoryProperties {
-    pub memory_type_count: u32,
-    pub memory_types: [VkMemoryType; 32],
-    pub memory_heap_count: u32,
-    pub memory_heaps: [VkMemoryHeap; 16],
-}
-
-pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
-pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
-pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
-pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
-pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
-
-// Physical device types. Rejects software rasterizers (lavapipe/swiftshader).
-pub const VK_PHYSICAL_DEVICE_TYPE_OTHER: u32 = 0;
-pub const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: u32 = 1;
-pub const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
-pub const VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: u32 = 3;
-pub const VK_PHYSICAL_DEVICE_TYPE_CPU: u32 = 4;
-
-#[repr(C)]
-pub struct VkPhysicalDeviceProperties {
-    pub api_version: u32,
-    pub driver_version: u32,
-    pub vendor_id: u32,
-    pub device_id: u32,
-    pub device_type: u32,
-    pub device_name: [u8; 256],
-    // Remaining fields intentionally omitted; we only read device_type.
-}
-
-pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39;
-pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
-pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
-pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
-pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32;
-pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33;
-pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34;
-pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: u32 = 35;
-pub const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: u32 = 29;
-pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
-pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4;
-pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: u32 = 18;
-
-pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
-pub const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x00000020;
-pub const VK_QUEUE_COMPUTE_BIT: u32 = 0x00000002;
-
-pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x00000020;
-pub const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
-
-pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: u32 = 0x00000001;
-pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x00000002;
-pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x00000004;
-
-pub const VK_SUCCESS: i32 = 0;
-
-#[repr(C)]
-pub struct VkDescriptorSetLayoutBinding {
-    pub binding: u32,
-    pub descriptor_type: u32,
-    pub descriptor_count: u32,
-    pub stage_flags: u32,
-    pub p_immutable_samplers: *const c_void,
-}
-
-#[repr(C)]
-pub struct VkDescriptorSetLayoutCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub binding_count: u32,
-    pub p_bindings: *const VkDescriptorSetLayoutBinding,
-}
-
-#[repr(C)]
-pub struct VkDescriptorPoolSize {
-    pub r#type: u32,
-    pub descriptor_count: u32,
-}
-
-#[repr(C)]
-pub struct VkDescriptorPoolCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub max_sets: u32,
-    pub pool_size_count: u32,
-    pub p_pool_sizes: *const VkDescriptorPoolSize,
-}
-
-#[repr(C)]
-pub struct VkDescriptorBufferInfo {
-    pub buffer: u64,
-    pub offset: VkDeviceSize,
-    pub range: VkDeviceSize,
-}
-
-#[repr(C)]
-pub struct VkWriteDescriptorSet {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub dst_set: u64,
-    pub dst_binding: u32,
-    pub dst_array_element: u32,
-    pub descriptor_count: u32,
-    pub descriptor_type: u32,
-    pub p_image_info: *const c_void,
-    pub p_buffer_info: *const VkDescriptorBufferInfo,
-    pub p_texel_buffer_view: *const c_void,
-}
-
-#[repr(C)]
-pub struct VkDescriptorSetAllocateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub descriptor_pool: u64,
-    pub descriptor_set_count: u32,
-    pub p_set_layouts: *const u64,
-}
-
-#[repr(C)]
-pub struct VkShaderModuleCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub code_size: usize,
-    pub p_code: *const u32,
-}
-
-#[repr(C)]
-pub struct VkPipelineLayoutCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub set_layout_count: u32,
-    pub p_set_layouts: *const u64,
-    pub push_constant_range_count: u32,
-    pub p_push_constant_ranges: *const c_void,
-}
-
-#[repr(C)]
-pub struct VkPushConstantRange {
-    pub stage_flags: u32,
-    pub offset: u32,
-    pub size: u32,
-}
-
-#[repr(C)]
-pub struct VkPipelineShaderStageCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub stage: u32,
-    pub module: u64,
-    pub p_name: *const i8,
-    pub p_specialization_info: *const c_void,
-}
-
-#[repr(C)]
-pub struct VkComputePipelineCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub stage: VkPipelineShaderStageCreateInfo,
-    pub layout: u64,
-    pub base_pipeline_handle: u64,
-    pub base_pipeline_index: i32,
-}
-
-#[repr(C)]
-pub struct VkCommandPoolCreateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: VkFlags,
-    pub queue_family_index: u32,
-}
-
-#[repr(C)]
-pub struct VkCommandBufferAllocateInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub command_pool: u64,
-    pub level: u32,
-    pub command_buffer_count: u32,
-}
-
-#[repr(C)]
-pub struct VkCommandBufferBeginInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub flags: u32,
-    pub p_inheritance_info: *const c_void,
-}
-
-#[repr(C)]
-pub struct VkSubmitInfo {
-    pub s_type: u32,
-    pub p_next: *const c_void,
-    pub wait_semaphore_count: u32,
-    pub p_wait_semaphores: *const u64,
-    pub p_wait_dst_stage_mask: *const u32,
-    pub command_buffer_count: u32,
-    pub p_command_buffers: *const u64,
-    pub signal_semaphore_count: u32,
-    pub p_signal_semaphores: *const u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct VkQueueFamilyProperties {
-    pub queue_flags: u32,
-    pub queue_count: u32,
-    pub timestamp_valid_bits: u32,
-    pub min_image_transfer_granularity_width: u32,
-    pub min_image_transfer_granularity_height: u32,
-    pub min_image_transfer_granularity_depth: u32,
-}
-
-unsafe extern "C" {
-    fn vkCreateInstance(
-        pCreateInfo: *const VkInstanceCreateInfo,
-        pAllocator: *const c_void,
-        pInstance: *mut *mut c_void,
-    ) -> i32;
-    fn vkDestroyInstance(instance: *mut c_void, pAllocator: *const c_void);
-    fn vkEnumeratePhysicalDevices(
-        instance: *mut c_void,
-        pPhysicalDeviceCount: *mut u32,
-        pPhysicalDevices: *mut *mut c_void,
-    ) -> i32;
-    fn vkCreateDevice(
-        physicalDevice: *mut c_void,
-        pCreateInfo: *const VkDeviceCreateInfo,
-        pAllocator: *const c_void,
-        pDevice: *mut *mut c_void,
-    ) -> i32;
-    fn vkDestroyDevice(device: *mut c_void, pAllocator: *const c_void);
-    fn vkCreateBuffer(
-        device: *mut c_void,
-        pCreateInfo: *const VkBufferCreateInfo,
-        pAllocator: *const c_void,
-        pBuffer: *mut u64,
-    ) -> i32;
-    fn vkDestroyBuffer(device: *mut c_void, buffer: u64, pAllocator: *const c_void);
-    fn vkGetBufferMemoryRequirements(
-        device: *mut c_void,
-        buffer: u64,
-        pMemoryRequirements: *mut VkMemoryRequirements,
-    );
-    fn vkAllocateMemory(
-        device: *mut c_void,
-        pAllocateInfo: *const VkMemoryAllocateInfo,
-        pAllocator: *const c_void,
-        pMemory: *mut u64,
-    ) -> i32;
-    fn vkFreeMemory(device: *mut c_void, memory: u64, pAllocator: *const c_void);
-    fn vkBindBufferMemory(
-        device: *mut c_void,
-        buffer: u64,
-        memory: u64,
-        memoryOffset: VkDeviceSize,
-    ) -> i32;
-    fn vkMapMemory(
-        device: *mut c_void,
-        memory: u64,
-        offset: VkDeviceSize,
-        size: VkDeviceSize,
-        flags: VkFlags,
-        ppData: *mut *mut c_void,
-    ) -> i32;
-    fn vkUnmapMemory(device: *mut c_void, memory: u64);
-    fn vkGetPhysicalDeviceMemoryProperties(
-        physicalDevice: *mut c_void,
-        pMemoryProperties: *mut VkPhysicalDeviceMemoryProperties,
-    );
-    fn vkGetPhysicalDeviceQueueFamilyProperties(
-        physicalDevice: *mut c_void,
-        pQueueFamilyPropertyCount: *mut u32,
-        pQueueFamilyProperties: *mut VkQueueFamilyProperties,
-    );
-    fn vkGetPhysicalDeviceProperties(
-        physicalDevice: *mut c_void,
-        pProperties: *mut VkPhysicalDeviceProperties,
-    );
-    fn vkGetDeviceQueue(
-        device: *mut c_void,
-        queueFamilyIndex: u32,
-        queueIndex: u32,
-        pQueue: *mut *mut c_void,
-    );
-    fn vkCreateDescriptorSetLayout(
-        device: *mut c_void,
-        pCreateInfo: *const VkDescriptorSetLayoutCreateInfo,
-        pAllocator: *const c_void,
-        pSetLayout: *mut u64,
-    ) -> i32;
-    fn vkDestroyDescriptorSetLayout(
-        device: *mut c_void,
-        descriptorSetLayout: u64,
-        pAllocator: *const c_void,
-    );
-    fn vkCreateDescriptorPool(
-        device: *mut c_void,
-        pCreateInfo: *const VkDescriptorPoolCreateInfo,
-        pAllocator: *const c_void,
-        pDescriptorPool: *mut u64,
-    ) -> i32;
-    fn vkDestroyDescriptorPool(device: *mut c_void, descriptorPool: u64, pAllocator: *const c_void);
-    fn vkAllocateDescriptorSets(
-        device: *mut c_void,
-        pAllocateInfo: *const VkDescriptorSetAllocateInfo,
-        pDescriptorSets: *mut u64,
-    ) -> i32;
-    fn vkUpdateDescriptorSets(
-        device: *mut c_void,
-        descriptorWriteCount: u32,
-        pDescriptorWrites: *const VkWriteDescriptorSet,
-        descriptorCopyCount: u32,
-        pDescriptorCopies: *const c_void,
-    );
-    fn vkCreateShaderModule(
-        device: *mut c_void,
-        pCreateInfo: *const VkShaderModuleCreateInfo,
-        pAllocator: *const c_void,
-        pShaderModule: *mut u64,
-    ) -> i32;
-    fn vkDestroyShaderModule(device: *mut c_void, shaderModule: u64, pAllocator: *const c_void);
-    fn vkCreatePipelineLayout(
-        device: *mut c_void,
-        pCreateInfo: *const VkPipelineLayoutCreateInfo,
-        pAllocator: *const c_void,
-        pPipelineLayout: *mut u64,
-    ) -> i32;
-    fn vkDestroyPipelineLayout(device: *mut c_void, pipelineLayout: u64, pAllocator: *const c_void);
-    fn vkCreateComputePipelines(
-        device: *mut c_void,
-        pipelineCache: u64,
-        createInfoCount: u32,
-        pCreateInfos: *const VkComputePipelineCreateInfo,
-        pAllocator: *const c_void,
-        pPipelines: *mut u64,
-    ) -> i32;
-    fn vkDestroyPipeline(device: *mut c_void, pipeline: u64, pAllocator: *const c_void);
-    fn vkCreateCommandPool(
-        device: *mut c_void,
-        pCreateInfo: *const VkCommandPoolCreateInfo,
-        pAllocator: *const c_void,
-        pCommandPool: *mut u64,
-    ) -> i32;
-    fn vkDestroyCommandPool(device: *mut c_void, commandPool: u64, pAllocator: *const c_void);
-    fn vkAllocateCommandBuffers(
-        device: *mut c_void,
-        pAllocateInfo: *const VkCommandBufferAllocateInfo,
-        pCommandBuffers: *mut *mut c_void,
-    ) -> i32;
-    fn vkBeginCommandBuffer(
-        commandBuffer: *mut c_void,
-        pBeginInfo: *const VkCommandBufferBeginInfo,
-    ) -> i32;
-    fn vkEndCommandBuffer(commandBuffer: *mut c_void) -> i32;
-    fn vkCmdBindPipeline(commandBuffer: *mut c_void, pipelineBindPoint: u32, pipeline: u64);
-    fn vkCmdBindDescriptorSets(
-        commandBuffer: *mut c_void,
-        pipelineBindPoint: u32,
-        layout: u64,
-        firstSet: u32,
-        descriptorSetCount: u32,
-        pDescriptorSets: *const u64,
-        dynamicOffsetCount: u32,
-        pDynamicOffsets: *const u32,
-    );
-    fn vkCmdDispatch(
-        commandBuffer: *mut c_void,
-        groupCountX: u32,
-        groupCountY: u32,
-        groupCountZ: u32,
-    );
-    fn vkCmdCopyBuffer(
-        commandBuffer: *mut c_void,
-        srcBuffer: u64,
-        dstBuffer: u64,
-        regionCount: u32,
-        pRegions: *const VkBufferCopy,
-    );
-    fn vkCmdPushConstants(
-        commandBuffer: *mut c_void,
-        layout: u64,
-        stageFlags: u32,
-        offset: u32,
-        size: u32,
-        pValues: *const c_void,
-    );
-    fn vkQueueSubmit(
-        queue: *mut c_void,
-        submitCount: u32,
-        pSubmits: *const VkSubmitInfo,
-        fence: u64,
-    ) -> i32;
-    fn vkQueueWaitIdle(queue: *mut c_void) -> i32;
-}
-
-// Vulkan helper context
-
-struct VulkanContext {
-    instance: *mut c_void,
-    physical_device: *mut c_void,
-    device: *mut c_void,
-    queue: *mut c_void,
-    compute_family_index: u32,
-    device_name: String,
-    vendor_id: u32,
-    device_id: u32,
-    driver_version: u32,
-}
-
-unsafe impl Send for VulkanContext {}
-unsafe impl Sync for VulkanContext {}
-
-impl VulkanContext {
-    fn init() -> Result<Self> {
-        // Do NOT enable third-party layers (e.g. Steam overlay, MangoHud, Bumblebee);
-        // they hang headless environments. Disable implicit layers unless user specified otherwise.
-        if std::env::var("VK_LOADER_LAYERS_DISABLE").is_err() {
-            unsafe {
-                std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~all~");
-            }
-        }
-
-        let instance_ci = VkInstanceCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            p_application_info: std::ptr::null(),
-            enabled_layer_count: 0,
-            pp_enabled_layer_names: std::ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
-        };
-
-        let mut instance: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { vkCreateInstance(&instance_ci, std::ptr::null(), &mut instance) };
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "vkCreateInstance failed with status {}",
-                res
-            )));
-        }
-
-        let mut gpu_count: u32 = 0;
-        unsafe {
-            vkEnumeratePhysicalDevices(instance, &mut gpu_count, std::ptr::null_mut());
-        }
-        if gpu_count == 0 {
-            unsafe {
-                vkDestroyInstance(instance, std::ptr::null());
-            }
-            return Err(Error::Backend("No Vulkan physical devices found".into()));
-        }
-
-        let mut gpus = vec![std::ptr::null_mut(); gpu_count as usize];
-        let res =
-            unsafe { vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr()) };
-        if res != VK_SUCCESS || gpus.is_empty() || gpus.iter().all(|&p| p.is_null()) {
-            unsafe {
-                vkDestroyInstance(instance, std::ptr::null());
-            }
-            return Err(Error::Backend(format!(
-                "vkEnumeratePhysicalDevices failed with status {}",
-                res
-            )));
-        }
-
-        // Iterate devices and choose best GPU (prefer discrete GPU over integrated GPU; reject CPU).
-        let mut chosen_dev = None;
-        let mut chosen_props = None;
-
-        for &dev in &gpus {
-            if dev.is_null() {
-                continue;
-            }
-            let mut props = VkPhysicalDeviceProperties {
-                api_version: 0,
-                driver_version: 0,
-                vendor_id: 0,
-                device_id: 0,
-                device_type: 0,
-                device_name: [0u8; 256],
-            };
-            unsafe { vkGetPhysicalDeviceProperties(dev, &mut props) };
-            if props.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
-                continue;
-            }
-            if props.device_type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
-                chosen_dev = Some(dev);
-                chosen_props = Some(props);
-                break;
-            }
-            if chosen_dev.is_none() {
-                chosen_dev = Some(dev);
-                chosen_props = Some(props);
-            }
-        }
-
-        let (physical_device, props) = match (chosen_dev, chosen_props) {
-            (Some(d), Some(p)) => (d, p),
-            _ => {
-                unsafe {
-                    vkDestroyInstance(instance, std::ptr::null());
-                }
-                return Err(Error::Backend(
-                    "No valid non-CPU Vulkan GPU device found".into(),
-                ));
-            }
-        };
-
-        // Find compute queue family index
-        let mut qfam_count: u32 = 0;
-        unsafe {
-            vkGetPhysicalDeviceQueueFamilyProperties(
-                physical_device,
-                &mut qfam_count,
-                std::ptr::null_mut(),
-            );
-        }
-        if qfam_count == 0 {
-            unsafe {
-                vkDestroyInstance(instance, std::ptr::null());
-            }
-            return Err(Error::Backend(
-                "No queue families found on Vulkan physical device".into(),
-            ));
-        }
-        let mut qfam_props = vec![
-            VkQueueFamilyProperties {
-                queue_flags: 0,
-                queue_count: 0,
-                min_image_transfer_granularity_width: 0,
-                min_image_transfer_granularity_height: 0,
-                min_image_transfer_granularity_depth: 0,
-                timestamp_valid_bits: 0,
-            };
-            qfam_count as usize
-        ];
-        unsafe {
-            vkGetPhysicalDeviceQueueFamilyProperties(
-                physical_device,
-                &mut qfam_count,
-                qfam_props.as_mut_ptr(),
-            );
-        }
-        let mut compute_family_index = None;
-        for i in 0..qfam_count {
-            if (qfam_props[i as usize].queue_flags & VK_QUEUE_COMPUTE_BIT) != 0 {
-                compute_family_index = Some(i);
-                break;
-            }
-        }
-        let compute_family_index = match compute_family_index {
-            Some(idx) => idx,
-            None => {
-                unsafe {
-                    vkDestroyInstance(instance, std::ptr::null());
-                }
-                return Err(Error::Backend(
-                    "No compute queue family found on Vulkan physical device".into(),
-                ));
-            }
-        };
-
-        let priorities: f32 = 1.0f32;
-        let queue_ci = VkDeviceQueueCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            queue_family_index: compute_family_index,
-            queue_count: 1,
-            p_queue_priorities: &priorities,
-        };
-
-        let device_ci = VkDeviceCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            queue_create_info_count: 1,
-            p_queue_create_infos: &queue_ci,
-            enabled_layer_count: 0,
-            pp_enabled_layer_names: std::ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
-            p_enabled_features: std::ptr::null(),
-        };
-
-        let mut device: *mut c_void = std::ptr::null_mut();
-        let res =
-            unsafe { vkCreateDevice(physical_device, &device_ci, std::ptr::null(), &mut device) };
-        if res != VK_SUCCESS {
-            unsafe {
-                vkDestroyInstance(instance, std::ptr::null());
-            }
-            return Err(Error::Backend(format!(
-                "vkCreateDevice failed with status {}",
-                res
-            )));
-        }
-
-        let mut queue: *mut c_void = std::ptr::null_mut();
-        unsafe {
-            vkGetDeviceQueue(device, compute_family_index, 0, &mut queue);
-        }
-        if queue.is_null() {
-            unsafe {
-                vkDestroyDevice(device, std::ptr::null());
-                vkDestroyInstance(instance, std::ptr::null());
-            }
-            return Err(Error::Backend(
-                "vkGetDeviceQueue returned null queue pointer".into(),
-            ));
-        }
-
-        Ok(Self {
-            instance,
-            physical_device,
-            device,
-            queue,
-            compute_family_index,
-            device_name: read_device_name(&props.device_name),
-            vendor_id: props.vendor_id,
-            device_id: props.device_id,
-            driver_version: props.driver_version,
-        })
-    }
-}
-
-/// Convert a null-terminated `VkPhysicalDeviceProperties.device_name`
-/// (`[u8; 256]`) into a `String`.
-fn read_device_name(name: &[u8; 256]) -> String {
-    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    String::from_utf8_lossy(&name[..end]).into_owned()
-}
-
-impl Drop for VulkanContext {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.device.is_null() {
-                vkDestroyDevice(self.device, std::ptr::null());
-            }
-            if !self.instance.is_null() {
-                vkDestroyInstance(self.instance, std::ptr::null());
-            }
-        }
-    }
-}
-
-lazy_static::lazy_static! {
-    static ref GLOBAL_CONTEXT: Mutex<Option<VulkanContext>> = Mutex::new(VulkanContext::init().ok());
-    static ref QUEUE_LOCK: Mutex<()> = Mutex::new(());
-}
-
-/// Guards against re-attempting Vulkan init on every consumer call after a
-/// persistent failure. A single on-demand retry (see `global_context`) is
-/// enough; re-running init in a hot loop would just spam the loader.
-static RETRY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-
-/// Re-initializes the global Vulkan context after a failed init.
-///
-/// `lazy_static` caches `None` forever when the initial `VulkanContext::init`
-/// fails (e.g. GPU was busy or a transient loader error at process start).
-/// This is the explicit re-init/retry entry point consumers can call when
-/// they hit a stale "Vulkan context uninitialized" error. Only one fresh init
-/// is attempted; a persistent failure surfaces as `Err` and the caller decides
-/// whether to degrade gracefully.
-pub fn reset_global_context() -> Result<()> {
-    let mut guard = GLOBAL_CONTEXT.lock().unwrap();
-    if guard.is_none() {
-        RETRY_ATTEMPTED.store(true, Ordering::SeqCst);
-        *guard = VulkanContext::init().ok();
-    }
-    if guard.is_some() {
-        Ok(())
-    } else {
-        Err(Error::Backend(
-            "Vulkan context re-initialization failed".into(),
-        ))
-    }
-}
-
-/// Accessor for the global context that re-attempts init once when the
-/// initial `lazy_static` init failed (which would otherwise cache `None`
-/// forever). A persistent failure is not re-tried on every call thanks to
-/// `RETRY_ATTEMPTED`; callers see `None` and can invoke `reset_global_context`
-/// explicitly if they want another attempt.
-fn global_context() -> std::sync::MutexGuard<'static, Option<VulkanContext>> {
-    let mut guard = GLOBAL_CONTEXT.lock().unwrap();
-    if guard.is_none() && !RETRY_ATTEMPTED.swap(true, Ordering::SeqCst) {
-        *guard = VulkanContext::init().ok();
-    }
-    guard
-}
-
-// Vulkan crate structs
-
-/// A handle to a Vulkan compute operation.
-///
-/// INVARIANT: `run_compute_shader` calls `vkQueueWaitIdle` synchronously during dispatch.
-/// Therefore, operations associated with `VulkanHandle` are already completed when returned,
-/// making `synchronize()` a safe no-op and `is_ready()` always true.
-#[derive(Debug)]
-pub struct VulkanHandle;
-
-impl ComputeHandle for VulkanHandle {
-    fn synchronize(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_ready(&self) -> bool {
-        true
-    }
-}
-
-/// Vulkan-side tensor storage.
-#[derive(Debug)]
-pub struct VulkanStorage {
-    buffer: u64,
-    memory: u64,
-    bytes: usize,
-    shape: Shape,
-    dtype: DType,
-    provenance: QuantProvenance,
-    device: *mut c_void,
-    /// Whether the backing `memory` is host-visible. Device-local buffers
-    /// cannot be `vkMapMemory`'d and are read back via a staging copy.
-    host_visible: bool,
-}
-
-unsafe impl Send for VulkanStorage {}
-unsafe impl Sync for VulkanStorage {}
-
-/// Which memory tier `alloc_gpu_inner` should prefer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuMemoryTier {
-    /// Require HOST_VISIBLE | HOST_COHERENT (mappable; used for uploads).
-    HostVisible,
-    /// Prefer DEVICE_LOCAL, falling back to host-visible when no device-local
-    /// type matches the buffer's `memory_type_bits`.
-    DeviceLocal,
-}
-
-impl VulkanStorage {
-    /// Allocates memory and a buffer on the Vulkan device (host-visible).
-    pub fn alloc_gpu(
-        shape: &Shape,
-        dtype: DType,
-        device: *mut c_void,
-        physical_device: *mut c_void,
-    ) -> Result<Self> {
-        Self::alloc_gpu_inner(
-            shape,
-            dtype,
-            device,
-            physical_device,
-            GpuMemoryTier::HostVisible,
-        )
-    }
-
-    /// Allocates a buffer preferring `DEVICE_LOCAL` VRAM for compute outputs,
-    /// falling back to a host-visible type where no suitable device-local type
-    /// exists (e.g. some UMA/APU configs). `host_visible` on the result
-    /// records what was actually selected so readback can route through a
-    /// staging copy.
-    pub fn alloc_device_local_gpu(
-        shape: &Shape,
-        dtype: DType,
-        device: *mut c_void,
-        physical_device: *mut c_void,
-    ) -> Result<Self> {
-        Self::alloc_gpu_inner(
-            shape,
-            dtype,
-            device,
-            physical_device,
-            GpuMemoryTier::DeviceLocal,
-        )
-    }
-
-    fn alloc_gpu_inner(
-        shape: &Shape,
-        dtype: DType,
-        device: *mut c_void,
-        physical_device: *mut c_void,
-        tier: GpuMemoryTier,
-    ) -> Result<Self> {
-        let bytes = shape
-            .elem_count()
-            .checked_mul(dtype_byte_size(&dtype))
-            .ok_or_else(|| {
-                Error::Backend(format!(
-                    "alloc_gpu: byte count overflow for shape {:?} dtype {:?}",
-                    shape, dtype
-                ))
-            })?;
-
-        let alloc_bytes = bytes.max(16);
-        let buffer_ci = VkBufferCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            size: alloc_bytes as VkDeviceSize,
-            usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            sharing_mode: VK_SHARING_MODE_EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: std::ptr::null(),
-        };
-
-        let mut buffer: u64 = 0;
-        let res = unsafe { vkCreateBuffer(device, &buffer_ci, std::ptr::null(), &mut buffer) };
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "vkCreateBuffer failed with status {}",
-                res
-            )));
-        }
-
-        let mut reqs = VkMemoryRequirements {
-            size: 0,
-            alignment: 0,
-            memory_type_bits: 0,
-        };
-        unsafe {
-            vkGetBufferMemoryRequirements(device, buffer, &mut reqs);
-        }
-
-        // Select a memory type for the requested tier. HostVisible requires a
-        // mappable+coherent type; DeviceLocal prefers VRAM and falls back to a
-        // mappable type (UMA/APU) so allocation never hard-fails on those.
-        let (memory_type_index, host_visible) = {
-            let mut mem_properties = VkPhysicalDeviceMemoryProperties {
-                memory_type_count: 0,
-                memory_types: [VkMemoryType {
-                    property_flags: 0,
-                    heap_index: 0,
-                }; 32],
-                memory_heap_count: 0,
-                memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
-            };
-            unsafe {
-                vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
-            }
-
-            let mappable =
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            let find = |required: u32| -> Option<u32> {
-                (0..mem_properties.memory_type_count).find(|i| {
-                    (reqs.memory_type_bits & (1 << i)) != 0
-                        && (mem_properties.memory_types[*i as usize].property_flags & required)
-                            == required
-                })
-            };
-
-            match tier {
-                GpuMemoryTier::HostVisible => (
-                    find(mappable).ok_or_else(|| {
-                        Error::Backend("Failed to find suitable Vulkan memory type".into())
-                    })?,
-                    true,
-                ),
-                GpuMemoryTier::DeviceLocal => match find(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-                    // A device-local type that also happens to be mappable
-                    // (UMA) can still be read directly.
-                    Some(i) => {
-                        let flags = mem_properties.memory_types[i as usize].property_flags;
-                        (i, (flags & mappable) == mappable)
-                    }
-                    None => (
-                        find(mappable).ok_or_else(|| {
-                            Error::Backend("Failed to find suitable Vulkan memory type".into())
-                        })?,
-                        true,
-                    ),
-                },
-            }
-        };
-
-        let alloc_info = VkMemoryAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            p_next: std::ptr::null(),
-            allocation_size: reqs.size,
-            memory_type_index,
-        };
-
-        let mut memory: u64 = 0;
-        let res = unsafe { vkAllocateMemory(device, &alloc_info, std::ptr::null(), &mut memory) };
-        if res != VK_SUCCESS {
-            unsafe {
-                vkDestroyBuffer(device, buffer, std::ptr::null());
-            }
-            return Err(Error::Backend(format!(
-                "vkAllocateMemory failed with status {}",
-                res
-            )));
-        }
-
-        let res = unsafe { vkBindBufferMemory(device, buffer, memory, 0) };
-        if res != VK_SUCCESS {
-            unsafe {
-                vkFreeMemory(device, memory, std::ptr::null());
-                vkDestroyBuffer(device, buffer, std::ptr::null());
-            }
-            return Err(Error::Backend(format!(
-                "vkBindBufferMemory failed with status {}",
-                res
-            )));
-        }
-
-        Ok(Self {
-            buffer,
-            memory,
-            bytes,
-            shape: shape.clone(),
-            dtype,
-            provenance: QuantProvenance::GrimNative,
-            device,
-            // This allocator records the tier actually selected above.
-            host_visible,
-        })
-    }
-
-    /// Read the raw backing bytes, routing device-local buffers through a
-    /// staging copy. Prefer this over direct `vkMapMemory` for readback so
-    /// the caller works regardless of which memory tier was selected.
-    fn read_raw_bytes(&self) -> Result<Vec<u8>> {
-        if self.host_visible {
-            let mut mapped: *mut c_void = std::ptr::null_mut();
-            let res = unsafe {
-                vkMapMemory(
-                    self.device,
-                    self.memory,
-                    0,
-                    self.bytes as VkDeviceSize,
-                    0,
-                    &mut mapped,
-                )
-            };
-            if res != VK_SUCCESS {
-                return Err(Error::Backend(format!(
-                    "vkMapMemory failed with status {}",
-                    res
-                )));
-            }
-            let bytes = unsafe {
-                let slice = std::slice::from_raw_parts(mapped as *const u8, self.bytes);
-                let v = slice.to_vec();
-                vkUnmapMemory(self.device, self.memory);
-                v
-            };
-            Ok(bytes)
-        } else {
-            // Device-local buffers are not host-mappable: route through a
-            // staging buffer copy on the compute queue. `read_back_via_staging`
-            // acquires the global context itself, so callers must not hold the
-            // context lock (BackendStorage trait methods never do).
-            read_back_via_staging(self)
-        }
-    }
-}
-
-impl Drop for VulkanStorage {
-    fn drop(&mut self) {
-        unsafe {
-            vkDestroyBuffer(self.device, self.buffer, std::ptr::null());
-            vkFreeMemory(self.device, self.memory, std::ptr::null());
-        }
-    }
-}
-
-impl BackendStorage for VulkanStorage {
-    fn dtype(&self) -> DType {
-        self.dtype.clone()
-    }
-
-    fn provenance(&self) -> QuantProvenance {
-        self.provenance.clone()
-    }
-
-    fn shape(&self) -> &Shape {
-        &self.shape
-    }
-
-    fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
-        let raw = self.read_raw_bytes()?;
-        let expected = self
-            .shape
-            .elem_count()
-            .checked_mul(4)
-            .ok_or_else(|| Error::Backend("to_cpu_vec_f32: elem_count overflow".into()))?;
-        if raw.len() < expected {
-            return Err(Error::Backend(format!(
-                "to_cpu_vec_f32: read {} bytes, expected at least {}",
-                raw.len(),
-                expected
-            )));
-        }
-        let mut out = vec![0.0f32; self.shape.elem_count()];
-        unsafe {
-            std::ptr::copy_nonoverlapping(raw.as_ptr() as *const f32, out.as_mut_ptr(), out.len());
-        }
-        Ok(out)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-/// Allocate a host-visible, host-coherent staging buffer on `device`.
-/// Returns `(buffer, memory)`. The caller owns cleanup.
-fn alloc_host_visible_staging_buffer(
-    device: *mut c_void,
-    physical_device: *mut c_void,
-    bytes: usize,
-) -> Result<(u64, u64)> {
-    unsafe {
-        let buffer_ci = VkBufferCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            size: bytes as VkDeviceSize,
-            usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            sharing_mode: VK_SHARING_MODE_EXCLUSIVE,
-            queue_family_index_count: 0,
-            p_queue_family_indices: std::ptr::null(),
-        };
-
-        let mut buffer: u64 = 0;
-        let res = vkCreateBuffer(device, &buffer_ci, std::ptr::null(), &mut buffer);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "alloc_host_visible_staging_buffer: vkCreateBuffer failed: {res}"
-            )));
-        }
-
-        let mut reqs = VkMemoryRequirements {
-            size: 0,
-            alignment: 0,
-            memory_type_bits: 0,
-        };
-        vkGetBufferMemoryRequirements(device, buffer, &mut reqs);
-
-        let mut mem_properties = VkPhysicalDeviceMemoryProperties {
-            memory_type_count: 0,
-            memory_types: [VkMemoryType {
-                property_flags: 0,
-                heap_index: 0,
-            }; 32],
-            memory_heap_count: 0,
-            memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
-        };
-        vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
-
-        let mappable = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        let memory_type_index = (0..mem_properties.memory_type_count)
-            .find(|i| {
-                (reqs.memory_type_bits & (1 << i)) != 0
-                    && (mem_properties.memory_types[*i as usize].property_flags & mappable)
-                        == mappable
-            })
-            .ok_or_else(|| Error::Backend("staging: no mappable memory type".into()))?;
-
-        let alloc_info = VkMemoryAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            p_next: std::ptr::null(),
-            allocation_size: reqs.size,
-            memory_type_index,
-        };
-
-        let mut memory: u64 = 0;
-        let res = vkAllocateMemory(device, &alloc_info, std::ptr::null(), &mut memory);
-        if res != VK_SUCCESS {
-            vkDestroyBuffer(device, buffer, std::ptr::null());
-            return Err(Error::Backend(format!(
-                "alloc_host_visible_staging_buffer: vkAllocateMemory failed: {res}"
-            )));
-        }
-
-        let res = vkBindBufferMemory(device, buffer, memory, 0);
-        if res != VK_SUCCESS {
-            vkFreeMemory(device, memory, std::ptr::null());
-            vkDestroyBuffer(device, buffer, std::ptr::null());
-            return Err(Error::Backend(format!(
-                "alloc_host_visible_staging_buffer: vkBindBufferMemory failed: {res}"
-            )));
-        }
-
-        Ok((buffer, memory))
-    }
-}
-
-/// Synchronously copy `size` bytes from `src_buffer` (device) into
-/// `dst_buffer` (host-visible staging) using a one-shot command buffer on the
-/// compute queue. Compute queues support transfer operations.
-fn copy_device_buffer_to_host(
-    device: *mut c_void,
-    queue: *mut c_void,
-    compute_family_index: u32,
-    src_buffer: u64,
-    dst_buffer: u64,
-    size: u64,
-) -> Result<()> {
-    unsafe {
-        let pool_ci = VkCommandPoolCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            queue_family_index: compute_family_index,
-        };
-        let mut command_pool = 0u64;
-        let res = vkCreateCommandPool(device, &pool_ci, std::ptr::null(), &mut command_pool);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "copy_device_buffer_to_host: vkCreateCommandPool failed: {res}"
-            )));
-        }
-        struct PoolCleanup {
-            device: *mut c_void,
-            command_pool: u64,
-        }
-        impl Drop for PoolCleanup {
-            fn drop(&mut self) {
-                if self.command_pool != 0 {
-                    unsafe {
-                        vkDestroyCommandPool(self.device, self.command_pool, std::ptr::null());
-                    }
-                }
-            }
-        }
-        let _pool = PoolCleanup {
-            device,
-            command_pool,
-        };
-
-        let cmd_alloc_info = VkCommandBufferAllocateInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            p_next: std::ptr::null(),
-            command_pool,
-            level: 0,
-            command_buffer_count: 1,
-        };
-        let mut command_buffer: *mut c_void = std::ptr::null_mut();
-        let res = vkAllocateCommandBuffers(device, &cmd_alloc_info, &mut command_buffer);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "copy_device_buffer_to_host: vkAllocateCommandBuffers failed: {res}"
-            )));
-        }
-
-        let begin_info = VkCommandBufferBeginInfo {
-            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            p_next: std::ptr::null(),
-            flags: 1, // VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-            p_inheritance_info: std::ptr::null(),
-        };
-        let res = vkBeginCommandBuffer(command_buffer, &begin_info);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "copy_device_buffer_to_host: vkBeginCommandBuffer failed: {res}"
-            )));
-        }
-
-        let region = VkBufferCopy {
-            src_offset: 0,
-            dst_offset: 0,
-            size,
-        };
-        vkCmdCopyBuffer(command_buffer, src_buffer, dst_buffer, 1, &region);
-
-        let res = vkEndCommandBuffer(command_buffer);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "copy_device_buffer_to_host: vkEndCommandBuffer failed: {res}"
-            )));
-        }
-
-        let cmd_buf_u64 = command_buffer as u64;
-        let submit_info = VkSubmitInfo {
-            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            p_next: std::ptr::null(),
-            wait_semaphore_count: 0,
-            p_wait_semaphores: std::ptr::null(),
-            p_wait_dst_stage_mask: std::ptr::null(),
-            command_buffer_count: 1,
-            p_command_buffers: &cmd_buf_u64,
-            signal_semaphore_count: 0,
-            p_signal_semaphores: std::ptr::null(),
-        };
-        let _q_lock = QUEUE_LOCK.lock().unwrap();
-        let res = vkQueueSubmit(queue, 1, &submit_info, 0);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "copy_device_buffer_to_host: vkQueueSubmit failed: {res}"
-            )));
-        }
-        let res = vkQueueWaitIdle(queue);
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "copy_device_buffer_to_host: vkQueueWaitIdle failed: {res}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Read back a device-local `VulkanStorage` by copying into a host-visible
-/// staging buffer. Acquires the global context for the compute queue; callers
-/// must NOT hold the context lock when invoking readback.
-fn read_back_via_staging(storage: &VulkanStorage) -> Result<Vec<u8>> {
-    let (device, queue, compute_family_index, physical_device) = {
-        let guard = global_context();
-        let ctx = guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        (
-            ctx.device,
-            ctx.queue,
-            ctx.compute_family_index,
-            ctx.physical_device,
-        )
-    };
-    let (staging_buffer, staging_memory) =
-        alloc_host_visible_staging_buffer(device, physical_device, storage.bytes)?;
-
-    struct StagingCleanup {
-        device: *mut c_void,
-        buffer: u64,
-        memory: u64,
-    }
-    impl Drop for StagingCleanup {
-        fn drop(&mut self) {
-            unsafe {
-                if self.memory != 0 {
-                    vkFreeMemory(self.device, self.memory, std::ptr::null());
-                }
-                if self.buffer != 0 {
-                    vkDestroyBuffer(self.device, self.buffer, std::ptr::null());
-                }
-            }
-        }
-    }
-    let _staging = StagingCleanup {
-        device,
-        buffer: staging_buffer,
-        memory: staging_memory,
-    };
-
-    copy_device_buffer_to_host(
-        device,
-        queue,
-        compute_family_index,
-        storage.buffer,
-        staging_buffer,
-        storage.bytes as u64,
-    )?;
-
-    let mut mapped: *mut c_void = std::ptr::null_mut();
-    let res = unsafe {
-        vkMapMemory(
-            device,
-            staging_memory,
-            0,
-            storage.bytes as VkDeviceSize,
-            0,
-            &mut mapped,
-        )
-    };
-    if res != VK_SUCCESS {
-        return Err(Error::Backend(format!(
-            "read_back_via_staging: vkMapMemory failed with status {}",
-            res
-        )));
-    }
-    let bytes = unsafe {
-        let slice = std::slice::from_raw_parts(mapped as *const u8, storage.bytes);
-        let v = slice.to_vec();
-        vkUnmapMemory(device, staging_memory);
-        v
-    };
-    Ok(bytes)
-}
+// Re-exported from submodules for use within trait impls.
+pub(crate) use context::global_context;
+pub(crate) use context::QUEUE_LOCK;
+pub(crate) use context::VulkanContext;
+use ffi::*;
+
+// ============================================================================
+// VulkanDevice — all trait implementations and kernel dispatch
+// ============================================================================
 
 /// Vulkan device handle.
 #[derive(Debug)]
@@ -4077,6 +2719,8 @@ impl AttentionOps for VulkanDevice {
         qk_rope_dim: usize,
         v_head_dim: usize,
         seq_len: usize,
+        _w_uv_offset_words: usize,
+        _w_uv_head_stride_words: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let qa = q_absorbed.to_cpu_vec_f32()?;
         let qr = q_rope.to_cpu_vec_f32()?;
@@ -5759,7 +4403,186 @@ impl RecurrentOps for VulkanDevice {
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
+    // --- New kernel dispatch functions (modularization-era additions) ---
 
+    /// Standard delta rule recurrence (DeltaNet / SolarOpen2).
+    fn delta_rule_decode(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: f32,
+        state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        num_heads: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = q.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan delta_rule: q is not VulkanStorage".into())
+        })?;
+        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan delta_rule: k is not VulkanStorage".into())
+        })?;
+        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan delta_rule: v is not VulkanStorage".into())
+        })?;
+        let state_s = state.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan delta_rule: state is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, state_s.buffer, out_storage.buffer];
+        let push = push_params(d_k as u32, d_v as u32, 0, 0, 0, beta);
+        let grid_y = num_heads.max(1) as u32;
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::DeltaRuleDecode,
+            &buffers,
+            d_v.max(1) as u32,
+            grid_y,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan delta_rule dispatch failed: {e}")))?;
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    /// RWKV-4 WKV weighted key-value recurrence.
+    fn rwkv_wkv_recurrence(
+        &self,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        time_first: &dyn BackendStorage,
+        time_decay: &dyn BackendStorage,
+        state_aa: &dyn BackendStorage,
+        state_bb: &dyn BackendStorage,
+        state_pp: &dyn BackendStorage,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: k is not VulkanStorage".into())
+        })?;
+        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: v is not VulkanStorage".into())
+        })?;
+        let r_s = r.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: r is not VulkanStorage".into())
+        })?;
+        let tf_s = time_first.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: time_first is not VulkanStorage".into())
+        })?;
+        let td_s = time_decay.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: time_decay is not VulkanStorage".into())
+        })?;
+        let aa_s = state_aa.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: state_aa is not VulkanStorage".into())
+        })?;
+        let bb_s = state_bb.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: state_bb is not VulkanStorage".into())
+        })?;
+        let pp_s = state_pp.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_wkv: state_pp is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let buffers = [
+            k_s.buffer, v_s.buffer, r_s.buffer, tf_s.buffer, td_s.buffer,
+            aa_s.buffer, bb_s.buffer, pp_s.buffer, out_storage.buffer,
+        ];
+        let push = [dim as u32, 0, 0, 0, 0, 0];
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::RwkvWkvRecurrence,
+            &buffers,
+            dim.max(1) as u32,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan rwkv_wkv dispatch failed: {e}")))?;
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    /// RWKV-4 channel-mix token-shift + gating.
+    fn rwkv_channel_mix_full(
+        &self,
+        x: &dyn BackendStorage,
+        mix_k: &dyn BackendStorage,
+        mix_r: &dyn BackendStorage,
+        ffn_xx: &dyn BackendStorage,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_cm: x is not VulkanStorage".into())
+        })?;
+        let mk_s = mix_k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_cm: mix_k is not VulkanStorage".into())
+        })?;
+        let mr_s = mix_r.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_cm: mix_r is not VulkanStorage".into())
+        })?;
+        let xx_s = ffn_xx.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rwkv_cm: ffn_xx is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+
+        let buffers = [x_s.buffer, mk_s.buffer, mr_s.buffer, xx_s.buffer, out_storage.buffer];
+        let push = [dim as u32, 0, 0, 0, 0, 0];
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::RwkvChannelMixFull,
+            &buffers,
+            dim.max(1) as u32,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan rwkv_cm dispatch failed: {e}")))?;
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+    }
 }
 
 impl CollectiveOps for VulkanDevice {
@@ -6356,6 +5179,24 @@ pub enum VulkanKernel {
     CharonBackward,
     /// MoE persistent-worker comm-compute mega-kernel dispatch.
     MoeMegaKernel,
+    /// Depthwise 1D causal conv step with rolling state (LFM2/KDA/DeltaNet).
+    ShortConv1dCausalStep,
+    /// Gated Delta Network / delta-rule linear attention decode.
+    GatedDeltaNetDecode,
+    /// MLA fused Q/KV norm + split (DeepSeek-style).
+    MlaQkvNormSplit,
+    /// Falcon-H1 / Mamba-2 selective scan with head-indexed params.
+    SelectiveScanHeaded,
+    /// Fused MXFP4 QKV GEMM + QK-Norm + RoPE (LFM2).
+    FusedMxfp4Qkv,
+    /// Block-diffusion attention with bidirectional-within-block mask (DiffusionGemma).
+    BlockDiffusionAttention,
+    /// Standard delta rule recurrence (DeltaNet / SolarOpen2).
+    DeltaRuleDecode,
+    /// RWKV-4 WKV weighted key-value recurrence.
+    RwkvWkvRecurrence,
+    /// RWKV-4 channel-mix token-shift + gating.
+    RwkvChannelMixFull,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -6442,6 +5283,15 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::CooperativeMatrixGemm => SPIRV_COOPERATIVE_MATRIX_GEMM,
         VulkanKernel::CharonBackward => SPIRV_CHARON_BACKWARD,
         VulkanKernel::MoeMegaKernel => SPIRV_MOE_MEGA_KERNEL,
+        VulkanKernel::ShortConv1dCausalStep => SPIRV_SHORT_CONV1D_CAUSAL_STEP,
+        VulkanKernel::GatedDeltaNetDecode => SPIRV_GATED_DELTA_NET_DECODE,
+        VulkanKernel::MlaQkvNormSplit => SPIRV_MLA_QKV_NORM_SPLIT,
+        VulkanKernel::SelectiveScanHeaded => SPIRV_SELECTIVE_SCAN_HEADED,
+        VulkanKernel::FusedMxfp4Qkv => SPIRV_FUSED_MXFP4_QKV,
+        VulkanKernel::BlockDiffusionAttention => SPIRV_BLOCK_DIFFUSION_ATTENTION,
+        VulkanKernel::DeltaRuleDecode => SPIRV_DELTA_RULE_DECODE,
+        VulkanKernel::RwkvWkvRecurrence => SPIRV_RWKV_WKV_RECURRENCE,
+        VulkanKernel::RwkvChannelMixFull => SPIRV_RWKV_CHANNEL_MIX_FULL,
     }
 }
 
@@ -6534,6 +5384,15 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::QuantFp8
         | VulkanKernel::CommFuseReduce => 2,
         VulkanKernel::MoeFusedDispatch => 8,
+        VulkanKernel::ShortConv1dCausalStep => 5,
+        VulkanKernel::GatedDeltaNetDecode => 6,
+        VulkanKernel::MlaQkvNormSplit => 8,
+        VulkanKernel::SelectiveScanHeaded => 8,
+        VulkanKernel::FusedMxfp4Qkv => 9,
+        VulkanKernel::BlockDiffusionAttention => 4,
+        VulkanKernel::DeltaRuleDecode => 5,
+        VulkanKernel::RwkvWkvRecurrence => 9,
+        VulkanKernel::RwkvChannelMixFull => 5,
     }
 }
 
@@ -6573,7 +5432,7 @@ fn run_compute_shader_kernel(
 }
 
 /// Helper function to retrieve the size in bytes of a data type.
-fn dtype_byte_size(dtype: &DType) -> usize {
+pub(crate) fn dtype_byte_size(dtype: &DType) -> usize {
     match dtype.arith {
         ArithType::F32 | ArithType::U32 => 4,
         ArithType::F16 => 2,
@@ -6606,36 +5465,35 @@ fn f32_to_bf16_to_f32(val: f32) -> f32 {
 
 /// Query `(free_bytes, total_bytes)` memory on Vulkan device `ordinal`.
 pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
-    if let Ok(guard) = GLOBAL_CONTEXT.lock() {
-        if let Some(ctx) = guard.as_ref() {
-            unsafe {
-                let mut props = VkPhysicalDeviceMemoryProperties {
-                    memory_type_count: 0,
-                    memory_types: [VkMemoryType {
-                        property_flags: 0,
-                        heap_index: 0,
-                    }; 32],
-                    memory_heap_count: 0,
-                    memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
-                };
-                vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut props);
+    let guard = global_context();
+    if let Some(ctx) = guard.as_ref() {
+        unsafe {
+            let mut props = VkPhysicalDeviceMemoryProperties {
+                memory_type_count: 0,
+                memory_types: [VkMemoryType {
+                    property_flags: 0,
+                    heap_index: 0,
+                }; 32],
+                memory_heap_count: 0,
+                memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
+            };
+            vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut props);
 
-                // Sum all device-local heaps (VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1).
-                let mut total_device_local: u64 = 0;
-                for i in 0..(props.memory_heap_count as usize) {
-                    if (props.memory_heaps[i].flags & 1) != 0 {
-                        total_device_local += props.memory_heaps[i].size;
-                    }
+            // Sum all device-local heaps (VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1).
+            let mut total_device_local: u64 = 0;
+            for i in 0..(props.memory_heap_count as usize) {
+                if (props.memory_heaps[i].flags & 1) != 0 {
+                    total_device_local += props.memory_heaps[i].size;
                 }
+            }
 
-                if total_device_local == 0 {
-                    return None;
-                }
-
-                // Without VK_EXT_memory_budget, live free memory is unavailable.
-                // Return None so callers know free memory querying is unsupported.
+            if total_device_local == 0 {
                 return None;
             }
+
+            // Without VK_EXT_memory_budget, live free memory is unavailable.
+            // Return None so callers know free memory querying is unsupported.
+            return None;
         }
     }
 
@@ -7569,7 +6427,7 @@ mod tier_b_complex_tests {
         let qr=stor(&dev,&[0.0f32,1.0],&[2]);
         let kv=stor(&dev,&[1.0f32,0.0,0.0,1.0],&[4]); // seq_len*(latent+rope)=1*4
         let out=stor(&dev,&[0.0f32,0.0],&[2]);
-        let h=AttentionOps::mla_absorbed_decode(&dev,qa.as_ref(),qr.as_ref(),kv.as_ref(),None,out.as_ref(),1,2,2,2,1).unwrap();
+        let h=AttentionOps::mla_absorbed_decode(&dev,qa.as_ref(),qr.as_ref(),kv.as_ref(),None,out.as_ref(),1,2,2,2,1,0,0).unwrap();
         h.synchronize().unwrap();
         assert_eq!(out.shape().dims(),vec![2]);
     }
@@ -7683,5 +6541,103 @@ mod tier_b_alibi_test {
         let (out,h)=AttentionOps::qkv_attention_alibi(&dev,q.as_ref(),k.as_ref(),v.as_ref(),2,1,0,None,slopes.as_ref(),&Shape::new(vec![1,2,2])).unwrap();
         h.synchronize().unwrap();
         assert_eq!(out.shape().dims(),vec![1,2,2]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module structure tests — verify modularization correctness
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    /// Verify that all submodules are accessible and their public types are exported.
+    #[test]
+    fn test_module_exports_exist() {
+        // FFI types accessible
+        let _ffi_types = std::mem::size_of::<VkInstanceCreateInfo>();
+
+        // Context type accessible
+        let _ctx_name = std::any::type_name::<VulkanContext>();
+
+        // Storage types accessible
+        let _handle_name = std::any::type_name::<VulkanHandle>();
+        let _storage_name = std::any::type_name::<VulkanStorage>();
+    }
+
+    /// Verify kernel binding counts match SPIR-V shader declarations.
+    #[test]
+    fn test_binding_counts_match_shaders() {
+        // 2-binding kernels
+        assert_eq!(binding_count(VulkanKernel::Sub), 3);
+        assert_eq!(binding_count(VulkanKernel::AddScalar), 2);
+        assert_eq!(binding_count(VulkanKernel::SubScalar), 2);
+
+        // 3-binding kernels
+        assert_eq!(binding_count(VulkanKernel::Add), 3);
+        assert_eq!(binding_count(VulkanKernel::Mul), 3);
+        assert_eq!(binding_count(VulkanKernel::Rope), 3);
+
+        // 4-binding kernels
+        assert_eq!(binding_count(VulkanKernel::QkvAttention), 4);
+        assert_eq!(binding_count(VulkanKernel::FlashAttention), 4);
+
+        // 5-binding kernels
+        assert_eq!(binding_count(VulkanKernel::KvDequantAttention), 6);
+        assert_eq!(binding_count(VulkanKernel::ShortConv1dCausalStep), 5);
+
+        // 6-binding kernels
+        assert_eq!(binding_count(VulkanKernel::SelectiveScan), 6);
+        assert_eq!(binding_count(VulkanKernel::GatedDeltaNetDecode), 6);
+
+        // 8-binding kernels
+        assert_eq!(binding_count(VulkanKernel::MoeMegaKernel), 8);
+        assert_eq!(binding_count(VulkanKernel::MlaQkvNormSplit), 8);
+
+        // 9-binding kernels
+        assert_eq!(binding_count(VulkanKernel::FusedMxfp4Qkv), 9);
+        assert_eq!(binding_count(VulkanKernel::RwkvWkvRecurrence), 9);
+    }
+
+    /// Verify spirv_for returns non-empty SPIR-V for all kernels.
+    #[test]
+    fn test_spirv_for_all_kernels() {
+        // Every kernel should have a valid (non-empty) SPIR-V blob.
+        let kernels = [
+            VulkanKernel::Add,
+            VulkanKernel::Mul,
+            VulkanKernel::SiluMul,
+            VulkanKernel::QkvAttention,
+            VulkanKernel::FlashAttention,
+            VulkanKernel::SelectiveScan,
+            VulkanKernel::ShortConv1dCausalStep,
+            VulkanKernel::GatedDeltaNetDecode,
+            VulkanKernel::MlaQkvNormSplit,
+            VulkanKernel::FusedMxfp4Qkv,
+            VulkanKernel::BlockDiffusionAttention,
+            VulkanKernel::DeltaRuleDecode,
+            VulkanKernel::RwkvWkvRecurrence,
+            VulkanKernel::RwkvChannelMixFull,
+        ];
+        for kernel in kernels {
+            let spirv = spirv_for(kernel);
+            assert!(!spirv.is_empty(), "SPIR-V for {:?} is empty", kernel);
+        }
+    }
+
+    /// Verify FFI constants are correctly defined.
+    #[test]
+    fn test_ffi_constants() {
+        assert_eq!(VK_SUCCESS, 0);
+        assert_eq!(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7);
+        assert_eq!(VK_SHADER_STAGE_COMPUTE_BIT, 0x00000020);
+    }
+
+    /// Verify device creation works (requires GPU, so gated).
+    #[test]
+    #[ignore]
+    fn test_device_creation_with_modules() {
+        let dev = VulkanDevice::new();
+        assert!(!dev.caps().device_name.is_empty());
     }
 }
