@@ -165,6 +165,7 @@ impl QuantOps for VulkanDevice {
                     FloatPackScheme::Fp8 => grim_quant::dequant_fp8(&b_bytes_cpu, k * n)?,
                     FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(&b_bytes_cpu, k * n)?,
                     FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(&b_bytes_cpu, k * n)?,
+                    FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(&b_bytes_cpu, k * n)?,
                 })
             }
             Storage::Block(dtype) => {

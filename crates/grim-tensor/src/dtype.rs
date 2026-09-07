@@ -206,6 +206,21 @@ pub enum FloatPackScheme {
     /// [u64 LE: exps_len]  [exps...]
     /// ```
     MxFp8,
+    /// NVFP4: NVIDIA 4-bit floating point (E2M1 codebook) for Blackwell GPUs.
+    ///
+    /// Uses the same OCP E2M1 encoding as MXFP4 but with NVIDIA's block-scaling
+    /// convention: per-16-element sub-blocks with one E8M0 shared exponent byte
+    /// per sub-block, packed in NVIDIA's native ordering. 256 weights per
+    /// super-block (16 sub-blocks × 16 weights).
+    ///
+    /// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
+    /// NVIDIA packs scales and codes interleaved per sub-block:
+    /// ```text
+    /// [scale_0 (1 byte)] [codes_0 (8 bytes)] [scale_1] [codes_1] ... [scale_15] [codes_15]
+    /// ```
+    /// Total: 16 + 128 = 144 bytes per 256-weight super-block.
+    /// Codes are packed 2 per byte (low nibble = element 2i, high nibble = element 2i+1).
+    NvFp4,
 }
 
 /// Target quantization format for the device-side `quantize` path.
@@ -419,6 +434,8 @@ impl DType {
                 FloatPackScheme::Fp8 => elem_count,
                 FloatPackScheme::MxFp4 => (elem_count + 1) / 2 + (elem_count.div_ceil(32)),
                 FloatPackScheme::MxFp8 => elem_count + (elem_count.div_ceil(32)),
+                // NVFP4: 1 byte E8M0 scale per 16-elem sub-block + 0.5 byte per weight.
+                FloatPackScheme::NvFp4 => (elem_count + 1) / 2 + elem_count.div_ceil(16),
             },
             Storage::Block(b) => match b {
                 BlockDtype::Fp4 | BlockDtype::Nf4 => (elem_count + 1) / 2,

@@ -5,6 +5,7 @@ use crate::gguf::{
     GGUF_MAGIC, GGUF_VERSION, GgufValue, GrimFusionOp, GrimRocmlProfile, read_gguf,
     read_tensor_bytes,
 };
+use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::TensorProvider;
 
@@ -395,6 +396,9 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             }
             grim_tensor::dtype::FloatPackScheme::MxFp8 => {
                 grim_quant::dequant_mxfp8(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::FloatPackScheme::NvFp4 => {
+                grim_quant::dequant_nvfp4(&raw.bytes, elem_count)
             }
         },
         grim_tensor::dtype::Storage::GroupInt(cfg) => {
@@ -1237,5 +1241,585 @@ mod tests {
         );
         expected_ffn_payload.resize(expected_ffn_payload_size as usize, 0u8);
         assert_eq!(payload_ffn_sq, &expected_ffn_payload);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External quantization toolkit format detection and layout adapters.
+//
+// TorchAO, Quark, ModelOpt, and FBGEMM-FP8 each pack FP8/INT4/INT8 weights
+// with their own scale conventions. Rather than add a new `Storage` variant
+// per toolkit, we detect the producer from safetensors metadata (or GGUF
+// quantize_config.json) and adapt their layout onto the existing
+// `Storage` variants in grim-tensor. This keeps the dequant kernel surface
+// bounded while supporting models from all four toolkits.
+// ---------------------------------------------------------------------------
+
+/// Identifies which external quantization toolkit produced a model checkpoint.
+///
+/// Detection reads safetensors `__metadata__` and the companion
+/// `quantize_config.json` (if present). The producer tag drives the layout
+/// adapter that maps the checkpoint's scale/codebook convention onto grim's
+/// `Storage` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolkitProducer {
+    /// TorchAO (PyTorch): int4_weight_only, float8_weight_only,
+    /// float8_dynamic_activation_float8_weight, MXFP4, MXFP8.
+    TorchAO,
+    /// AMD Quark: GPTQ, AWQ, FP8, INT4/INT8 with AMD-specific packing.
+    Quark,
+    /// NVIDIA ModelOpt (TensorRT Model Optimizer): FP8, INT4, NVFP4.
+    ModelOpt,
+    /// Meta FBGEMM-FP8: FP8 with per-channel block-scaling.
+    FbgemmFp8,
+}
+
+/// Detect the toolkit producer from safetensors metadata.
+///
+/// Checks `__metadata__` keys in priority order:
+///   - `"quant_method"` / `"quantization"` / `"producer"`
+///   - `"torchao"` → TorchAO
+///   - `"quark"` → Quark
+///   - `"modelopt"` / `"tensorrt_model_optimizer"` / `"nvfp4"` → ModelOpt
+///   - `"fbgemm"` / `"fbgemm_fp8"` → FBGEMM-FP8
+///
+/// Returns `None` when no toolkit signature is recognized — the caller
+/// falls back to the default `Storage` interpretation.
+pub fn detect_toolkit_producer(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Option<ToolkitProducer> {
+    let lookup = |keys: &[&str]| -> Option<&str> {
+        for k in keys {
+            if let Some(v) = metadata.get(*k) {
+                return Some(v.as_str());
+            }
+        }
+        None
+    };
+
+    // TorchAO stamps `"quant_method": "torchao"` or a `"torchao"` key with
+    // a `"quant_type"` sub-field in quantize_config.json.
+    if let Some(v) = lookup(&["quant_method", "quantization", "producer"]) {
+        let lower = v.to_ascii_lowercase();
+        if lower.contains("torchao") {
+            return Some(ToolkitProducer::TorchAO);
+        }
+        if lower.contains("quark") {
+            return Some(ToolkitProducer::Quark);
+        }
+        if lower.contains("modelopt") || lower.contains("tensorrt") || lower.contains("nvfp4") {
+            return Some(ToolkitProducer::ModelOpt);
+        }
+        if lower.contains("fbgemm") {
+            return Some(ToolkitProducer::FbgemmFp8);
+        }
+    }
+
+    // Direct toolkit keys (safetensors `__metadata__` may carry them verbatim).
+    for (key, val) in metadata {
+        let lower = key.to_ascii_lowercase();
+        let val_lower = val.to_ascii_lowercase();
+        if lower.contains("torchao") || val_lower.contains("torchao") {
+            return Some(ToolkitProducer::TorchAO);
+        }
+        if lower.contains("quark") || val_lower.contains("quark") {
+            return Some(ToolkitProducer::Quark);
+        }
+        if lower.contains("modelopt") || lower.contains("nvfp4") || lower.contains("tensorrt") {
+            return Some(ToolkitProducer::ModelOpt);
+        }
+        if lower.contains("fbgemm") {
+            return Some(ToolkitProducer::FbgemmFp8);
+        }
+    }
+    None
+}
+
+/// Detect the toolkit producer from GGUF metadata.
+///
+/// GGUF checkpoints produced by these toolkits carry a `quantize_config.json`
+/// alongside the file, or stamp the producer in metadata keys like
+/// `general.quantization_config`. This function scans string-valued GGUF
+/// metadata for toolkit signatures. It is the GGUF-container counterpart to
+/// [`detect_toolkit_producer`] (which reads safetensors `__metadata__`).
+pub fn detect_toolkit_producer_from_gguf(
+    metadata: &std::collections::HashMap<String, crate::gguf::GgufValue>,
+) -> Option<ToolkitProducer> {
+    // GGUF metadata is String → GgufValue; we only match String values.
+    for (key, val) in metadata {
+        let key_lower = key.to_ascii_lowercase();
+        if let Some(s) = val.as_str() {
+            let val_lower = s.to_ascii_lowercase();
+            // Only inspect keys that signal quantization provenance.
+            if key_lower.contains("quant")
+                || key_lower.contains("producer")
+                || key_lower.contains("format")
+            {
+                if val_lower.contains("torchao") {
+                    return Some(ToolkitProducer::TorchAO);
+                }
+                if val_lower.contains("quark") {
+                    return Some(ToolkitProducer::Quark);
+                }
+                if val_lower.contains("modelopt")
+                    || val_lower.contains("nvfp4")
+                    || val_lower.contains("tensorrt")
+                {
+                    return Some(ToolkitProducer::ModelOpt);
+                }
+                if val_lower.contains("fbgemm") {
+                    return Some(ToolkitProducer::FbgemmFp8);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Toolkit-specific tensor packing descriptor.
+///
+/// Returned by [`classify_toolkit_tensor`] and consumed by the layout
+/// adapters to select the correct reframe function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolkitQuantFormat {
+    /// TorchAO INT4 weight-only: `[qweight (int4 packed)][scales (f32)]`.
+    TorchAOInt4,
+    /// TorchAO FP8 weight-only: `[weights (fp8_e4m3)][scales (f32)]`.
+    TorchAOFP8,
+    /// TorchAO FP8 W8A8: weights + activations both FP8.
+    TorchAOFP8W8A8,
+    /// Quark GPTQ variant: same GroupInt layout as standard GPTQ.
+    QuarkGPTQ { bits: u8 },
+    /// Quark FP8: per-channel scaled FP8.
+    QuarkFP8,
+    /// ModelOpt FP8: per-tensor or per-channel scaled FP8.
+    ModelOptFP8,
+    /// ModelOpt NVFP4: 4-bit E2M1 with NVIDIA packing.
+    ModelOptNVFP4,
+    /// FBGEMM-FP8: per-channel block-scaled FP8.
+    FbgemmFP8,
+}
+
+/// Classify a quantized tensor's toolkit-specific format from its name and
+/// the detected producer.
+///
+/// Uses naming conventions (e.g. `.qweight` suffix for GPTQ, `.scale` for
+/// FP8) to disambiguate formats within a single toolkit.
+pub fn classify_toolkit_tensor(
+    producer: ToolkitProducer,
+    tensor_name: &str,
+) -> Option<ToolkitQuantFormat> {
+    let name_lower = tensor_name.to_ascii_lowercase();
+    match producer {
+        ToolkitProducer::TorchAO => {
+            if name_lower.contains("int4") || name_lower.contains("weight_only") {
+                Some(ToolkitQuantFormat::TorchAOInt4)
+            } else if name_lower.contains("w8a8") || name_lower.contains("dynamic") {
+                Some(ToolkitQuantFormat::TorchAOFP8W8A8)
+            } else if name_lower.contains("fp8") || name_lower.contains("float8") {
+                Some(ToolkitQuantFormat::TorchAOFP8)
+            } else {
+                // Default TorchAO format is INT4 weight-only.
+                Some(ToolkitQuantFormat::TorchAOInt4)
+            }
+        }
+        ToolkitProducer::Quark => {
+            if name_lower.contains("qweight") || name_lower.contains("gptq") {
+                Some(ToolkitQuantFormat::QuarkGPTQ { bits: 4 })
+            } else if name_lower.contains("fp8") || name_lower.contains("float8") {
+                Some(ToolkitQuantFormat::QuarkFP8)
+            } else {
+                None
+            }
+        }
+        ToolkitProducer::ModelOpt => {
+            if name_lower.contains("nvfp4") || name_lower.contains("fp4") {
+                Some(ToolkitQuantFormat::ModelOptNVFP4)
+            } else if name_lower.contains("fp8") || name_lower.contains("float8") {
+                Some(ToolkitQuantFormat::ModelOptFP8)
+            } else {
+                None
+            }
+        }
+        ToolkitProducer::FbgemmFp8 => Some(ToolkitQuantFormat::FbgemmFP8),
+    }
+}
+
+/// Map a toolkit's packed weight bytes onto the appropriate `Storage` variant.
+///
+/// This is the central dispatch: given a producer + tensor format, it selects
+/// the existing `Storage` variant that can carry the tensor without precision
+/// loss. The raw bytes are passed through unchanged where the toolkit layout
+/// already matches a `Storage` variant, or reframed where conventions differ.
+///
+/// # Returns
+/// `Some(storage)` when the toolkit format maps cleanly onto an existing
+/// `Storage` variant; `None` when a dedicated adapter is needed (caller
+/// should use `reframe_toolkit_bytes`).
+pub fn toolkit_to_storage(
+    _producer: ToolkitProducer,
+    qfmt: ToolkitQuantFormat,
+) -> Option<Storage> {
+    use grim_tensor::dtype::{FloatPackScheme, GroupQuantScheme, GpuIntConfig};
+    match qfmt {
+        ToolkitQuantFormat::TorchAOInt4 => {
+            // TorchAO INT4 packs int4 codes + f32 scales, structurally W4A16.
+            Some(Storage::W4A16(grim_tensor::dtype::W4A16Config { group_size: 128 }))
+        }
+        ToolkitQuantFormat::TorchAOFP8 | ToolkitQuantFormat::FbgemmFP8 => {
+            // FP8 weights with per-channel scales → CompressedTensorsW8A8Fp8.
+            Some(Storage::CompressedTensorsW8A8Fp8)
+        }
+        ToolkitQuantFormat::TorchAOFP8W8A8 => Some(Storage::W8A8Mxfp8),
+        ToolkitQuantFormat::QuarkGPTQ { bits } => Some(Storage::GroupInt(GpuIntConfig {
+            bits,
+            group_size: 128,
+            scheme: GroupQuantScheme::Asymmetric,
+            desc_act: true,
+        })),
+        ToolkitQuantFormat::QuarkFP8 => Some(Storage::CompressedTensorsW8A8Fp8),
+        ToolkitQuantFormat::ModelOptFP8 => Some(Storage::CompressedTensorsW8A8Fp8),
+        ToolkitQuantFormat::ModelOptNVFP4 => {
+            // NVFP4 uses NVIDIA's native packing → NvFp4 FloatPack.
+            Some(Storage::FloatPack(FloatPackScheme::NvFp4))
+        }
+    }
+}
+
+/// Layout adapter: reframe toolkit-specific packed bytes into the canonical
+/// layout expected by the target `Storage` variant.
+///
+/// Some toolkit formats pack scales/codes in an order that differs from
+/// grim's `Storage` byte convention. This function reorders them so the
+/// existing dequant kernels can consume them without modification.
+///
+/// # Returns
+/// Reframed bytes ready for the target `Storage` variant, or `Err` when
+/// the layout is unsupported.
+pub fn reframe_toolkit_bytes(
+    qfmt: ToolkitQuantFormat,
+    bytes: &[u8],
+    elem_count: usize,
+) -> Result<Vec<u8>> {
+    match qfmt {
+        ToolkitQuantFormat::TorchAOInt4 => {
+            // TorchAO INT4 packs as: [qweight int4 codes][scales f32].
+            // Grim's W4A16 expects: [codes (N*K/8 u32)][scales (N*K/group_size f32)].
+            // Both are codes-then-scales with identical packing, so pass through.
+            Ok(bytes.to_vec())
+        }
+        ToolkitQuantFormat::TorchAOFP8 | ToolkitQuantFormat::QuarkFP8 => {
+            // FP8 with per-channel f32 scales: [fp8 codes][f32 scales].
+            // CompressedTensorsW8A8Fp8 expects: [u64 scale_len][codes][scale bytes].
+            // Prefix the scale length to match the convention.
+            let num_channels = elem_count; // per-channel: one scale per column
+            let codes_len = elem_count;
+            let scale_bytes = num_channels * 4;
+            if bytes.len() < codes_len + scale_bytes {
+                return Err(Error::Backend(format!(
+                    "FP8 toolkit bytes too short: expected {}, got {}",
+                    codes_len + scale_bytes,
+                    bytes.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(8 + codes_len + scale_bytes);
+            out.extend_from_slice(&(scale_bytes as u64).to_le_bytes());
+            out.extend_from_slice(&bytes[codes_len..codes_len + scale_bytes]);
+            out.extend_from_slice(&bytes[..codes_len]);
+            Ok(out)
+        }
+        ToolkitQuantFormat::ModelOptFP8 => {
+            // ModelOpt FP8 is per-tensor scaled: [fp8 codes][1 f32 scale].
+            // CompressedTensorsW8A8Fp8 expects: [u64 scale_len][scale bytes][codes].
+            if bytes.len() < elem_count + 4 {
+                return Err(Error::Backend(format!(
+                    "ModelOpt FP8 bytes too short: expected {}, got {}",
+                    elem_count + 4,
+                    bytes.len()
+                )));
+            }
+            let scale = &bytes[elem_count..elem_count + 4];
+            let mut out = Vec::with_capacity(8 + 4 + elem_count);
+            out.extend_from_slice(&4u64.to_le_bytes());
+            out.extend_from_slice(scale);
+            out.extend_from_slice(&bytes[..elem_count]);
+            Ok(out)
+        }
+        ToolkitQuantFormat::ModelOptNVFP4 => {
+            // NVFP4 native packing already matches FloatPackScheme::NvFp4.
+            // Pass through — dequant_nvfp4 understands the interleaved layout.
+            Ok(bytes.to_vec())
+        }
+        ToolkitQuantFormat::FbgemmFP8 => {
+            // FBGEMM-FP8: per-channel block-scaled FP8 with f32 scales.
+            // Same structure as TorchAOFP8 adapter: move scales in front.
+            let num_channels = elem_count;
+            let codes_len = elem_count;
+            let scale_bytes = num_channels * 4;
+            if bytes.len() < codes_len + scale_bytes {
+                return Err(Error::Backend(format!(
+                    "FBGEMM-FP8 bytes too short: expected {}, got {}",
+                    codes_len + scale_bytes,
+                    bytes.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(8 + codes_len + scale_bytes);
+            out.extend_from_slice(&(scale_bytes as u64).to_le_bytes());
+            out.extend_from_slice(&bytes[codes_len..codes_len + scale_bytes]);
+            out.extend_from_slice(&bytes[..codes_len]);
+            Ok(out)
+        }
+        ToolkitQuantFormat::QuarkGPTQ { .. } => {
+            // Quark GPTQ uses standard GroupInt framing — pass through.
+            Ok(bytes.to_vec())
+        }
+        ToolkitQuantFormat::TorchAOFP8W8A8 => {
+            // W8A8 MXFP8: codes + exponents, already in length-prefixed form.
+            Ok(bytes.to_vec())
+        }
+    }
+}
+
+/// Build a `QuantProvenance` tag for a toolkit-produced tensor.
+///
+/// External toolkit tensors must never be re-quantized by grim-quant (that
+/// would compound quantization error). This tag marks them as foreign so
+/// the conversion pipeline preserves them verbatim or routes them to the
+/// correct dequant path.
+pub fn toolkit_to_provenance(
+    _producer: ToolkitProducer,
+    qfmt: ToolkitQuantFormat,
+) -> grim_tensor::dtype::QuantProvenance {
+    use grim_tensor::dtype::{GroupQuantScheme, QuantProvenance};
+    match qfmt {
+        ToolkitQuantFormat::QuarkGPTQ { bits } => QuantProvenance::ExternalQat {
+            bits,
+            group_size: 128,
+            scheme: GroupQuantScheme::Asymmetric,
+            desc_act: true,
+        },
+        // All other toolkit formats are weight-only PTQ (not QAT) — mark as
+        // external so the pipeline skips re-quantization but uses the correct
+        // storage-specific dequant path.
+        _ => QuantProvenance::ExternalQat {
+            bits: match qfmt {
+                ToolkitQuantFormat::TorchAOInt4
+                | ToolkitQuantFormat::ModelOptNVFP4 => 4,
+                ToolkitQuantFormat::TorchAOFP8
+                | ToolkitQuantFormat::TorchAOFP8W8A8
+                | ToolkitQuantFormat::QuarkFP8
+                | ToolkitQuantFormat::ModelOptFP8
+                | ToolkitQuantFormat::FbgemmFP8 => 8,
+                ToolkitQuantFormat::QuarkGPTQ { .. } => 4,
+            },
+            group_size: 128,
+            scheme: GroupQuantScheme::Symmetric,
+            desc_act: false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod toolkit_tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_toolkit_producer_torchao() {
+        use std::collections::HashMap;
+        let mut meta = HashMap::new();
+        meta.insert("quant_method".into(), "torchao".into());
+        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::TorchAO));
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_quark() {
+        use std::collections::HashMap;
+        let mut meta = HashMap::new();
+        meta.insert("quant_method".into(), "quark".into());
+        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::Quark));
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_modelopt() {
+        use std::collections::HashMap;
+        let mut meta = HashMap::new();
+        meta.insert("quant_method".into(), "modelopt".into());
+        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::ModelOpt));
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_fbgemm() {
+        use std::collections::HashMap;
+        let mut meta = HashMap::new();
+        meta.insert("producer".into(), "fbgemm_fp8".into());
+        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::FbgemmFp8));
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_none() {
+        use std::collections::HashMap;
+        let meta = HashMap::new();
+        assert_eq!(detect_toolkit_producer(&meta), None);
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_from_gguf_torchao() {
+        use crate::gguf::GgufValue;
+        use std::collections::HashMap;
+        let mut meta: HashMap<String, GgufValue> = HashMap::new();
+        meta.insert(
+            "general.quantization_config".into(),
+            GgufValue::String("torchao".into()),
+        );
+        assert_eq!(
+            detect_toolkit_producer_from_gguf(&meta),
+            Some(ToolkitProducer::TorchAO),
+        );
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_from_gguf_nvfp4() {
+        use crate::gguf::GgufValue;
+        use std::collections::HashMap;
+        let mut meta: HashMap<String, GgufValue> = HashMap::new();
+        meta.insert(
+            "quant_format".into(),
+            GgufValue::String("nvfp4".into()),
+        );
+        assert_eq!(
+            detect_toolkit_producer_from_gguf(&meta),
+            Some(ToolkitProducer::ModelOpt),
+        );
+    }
+
+    #[test]
+    fn test_detect_toolkit_producer_from_gguf_none() {
+        use crate::gguf::GgufValue;
+        use std::collections::HashMap;
+        let mut meta: HashMap<String, GgufValue> = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        assert_eq!(detect_toolkit_producer_from_gguf(&meta), None);
+    }
+
+    #[test]
+    fn test_classify_toolkit_tensor() {
+        assert_eq!(
+            classify_toolkit_tensor(ToolkitProducer::TorchAO, "model.layers.0.qweight_scale"),
+            Some(ToolkitQuantFormat::TorchAOInt4)
+        );
+        assert_eq!(
+            classify_toolkit_tensor(ToolkitProducer::ModelOpt, "layers.0.nvfp4.weight"),
+            Some(ToolkitQuantFormat::ModelOptNVFP4)
+        );
+        assert_eq!(
+            classify_toolkit_tensor(ToolkitProducer::FbgemmFp8, "any_name"),
+            Some(ToolkitQuantFormat::FbgemmFP8)
+        );
+    }
+
+    #[test]
+    fn test_toolkit_to_storage_nvfp4() {
+        use grim_tensor::dtype::{FloatPackScheme, Storage};
+        let storage = toolkit_to_storage(
+            ToolkitProducer::ModelOpt,
+            ToolkitQuantFormat::ModelOptNVFP4,
+        )
+        .unwrap();
+        assert_eq!(storage, Storage::FloatPack(FloatPackScheme::NvFp4));
+    }
+
+    #[test]
+    fn test_reframe_toolkit_bytes_fp8() {
+        // 4 FP8 codes + 4 f32 scales (per-channel).
+        let mut bytes = vec![0x80u8, 0x81, 0x82, 0x83]; // fp8 codes
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&(i as f32).to_le_bytes()); // f32 scales
+        }
+        let reframe = reframe_toolkit_bytes(
+            ToolkitQuantFormat::TorchAOFP8,
+            &bytes,
+            4,
+        )
+        .unwrap();
+        // Output: [u64 scale_len (=16)][f32 scales (16 bytes)][fp8 codes (4 bytes)]
+        assert_eq!(reframe.len(), 8 + 16 + 4);
+        assert_eq!(
+            u64::from_le_bytes(reframe[0..8].try_into().unwrap()),
+            16
+        );
+    }
+
+    /// Independent OCP E2M1 codebook oracle — transcribed from spec, NOT
+    /// calling grim's own `mxfp4_e2m1_to_f32`. Used to verify that the
+    /// toolkit-to-storage pipeline produces bytes that `dequant_nvfp4`
+    /// decodes to the correct values.
+    fn oracle_e2m1(code: u8) -> f32 {
+        let sign = (code >> 3) & 1 != 0;
+        let exp = (code >> 1) & 3;
+        let mant = (code & 1) as f32;
+        let base = if exp == 0 {
+            mant * 0.5
+        } else {
+            (1.0 + mant * 0.5) * 2f32.powi(exp as i32 - 1)
+        };
+        if sign { -base } else { base }
+    }
+
+    #[test]
+    fn test_nvfp4_toolkit_storage_produces_correct_dequant() {
+        // Build a 32-weight NVFP4 buffer by hand: 2 sub-blocks of 16.
+        // Sub-block 0: exp=127 (scale 1.0), code=2 (codebook 1.0) → 1.0
+        // Sub-block 1: exp=128 (scale 2.0), code=4 (codebook 2.0) → 4.0
+        let mut nvfp4 = Vec::with_capacity(18);
+        // Sub-block 0: scale byte + 8 packed code bytes
+        nvfp4.push(127); // E8M0 scale
+        for _ in 0..8 {
+            nvfp4.push(0x22); // two code-2 nibbles per byte
+        }
+        // Sub-block 1
+        nvfp4.push(128); // E8M0 scale = 128 → 2^1 = 2.0
+        for _ in 0..8 {
+            nvfp4.push(0x44); // two code-4 nibbles per byte
+        }
+
+        // Route through the toolkit adapter (as SafetensorsProvider would).
+        let storage = toolkit_to_storage(
+            ToolkitProducer::ModelOpt,
+            ToolkitQuantFormat::ModelOptNVFP4,
+        )
+        .unwrap();
+        let reframe_bytes = reframe_toolkit_bytes(
+            ToolkitQuantFormat::ModelOptNVFP4,
+            &nvfp4,
+            32,
+        )
+        .unwrap();
+
+        // Verify the storage variant is NvFp4.
+        assert_eq!(storage, grim_tensor::dtype::Storage::FloatPack(
+            grim_tensor::dtype::FloatPackScheme::NvFp4
+        ));
+
+        // Dequantize and verify against the independent oracle.
+        let f32_out = grim_quant::dequant_nvfp4(&reframe_bytes, 32).unwrap();
+        assert_eq!(f32_out.len(), 32);
+
+        for (i, &v) in f32_out.iter().take(16).enumerate() {
+            let expected = oracle_e2m1(2) * 2f32.powi(0); // code 2 * scale 1.0 = 1.0
+            assert!(
+                (v - expected).abs() < 1e-6,
+                "sub-block 0 elem {i}: expected {expected}, got {v}"
+            );
+        }
+        for (i, &v) in f32_out.iter().skip(16).enumerate() {
+            let expected = oracle_e2m1(4) * 2f32.powi(1); // code 4 * scale 2.0 = 4.0
+            assert!(
+                (v - expected).abs() < 1e-6,
+                "sub-block 1 elem {i}: expected {expected}, got {v}"
+            );
+        }
     }
 }

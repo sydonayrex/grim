@@ -27,7 +27,10 @@ pub use ftw::{FtwDirectLoader, FtwHeader, FtwHostBank, FtwQuantFormat};
 pub use torch::{PthProvider, TorchTensorEntry};
 
 pub use convert::{
-    GpuDequant, convert_gguf_to_grim, convert_to_grim, convert_to_grim_with_dequant,
+    GpuDequant, classify_toolkit_tensor, convert_gguf_to_grim, convert_to_grim,
+    convert_to_grim_with_dequant, detect_toolkit_producer, detect_toolkit_producer_from_gguf,
+    reframe_toolkit_bytes, toolkit_to_provenance, toolkit_to_storage,
+    ToolkitProducer, ToolkitQuantFormat,
 };
 pub use format::normals_packed_size;
 pub use format::{

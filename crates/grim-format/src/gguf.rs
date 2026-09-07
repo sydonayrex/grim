@@ -166,6 +166,12 @@ pub enum GgufDType {
     IQ4_XS = 36,
     #[allow(non_camel_case_types)]
     MXFP4 = 39,
+    /// NVFP4: NVIDIA 4-bit floating point (E2M1 codebook) for Blackwell.
+    /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling
+    /// convention (per-16-element block with E8M0 shared exponent, NVIDIA
+    /// packing). GGUF tag is provisional (0x4E = 78, "NVFP4" fourCC).
+    #[allow(non_camel_case_types)]
+    NVFP4 = 78,
 }
 
 impl GgufDType {
@@ -203,6 +209,7 @@ impl GgufDType {
             35 => Some(GgufDType::IQ4_NL),
             36 => Some(GgufDType::IQ4_XS),
             39 => Some(GgufDType::MXFP4),
+            78 => Some(GgufDType::NVFP4),
             _ => None,
         }
     }
@@ -242,6 +249,7 @@ impl GgufDType {
             GgufDType::IQ4_NL => 35,
             GgufDType::IQ4_XS => 36,
             GgufDType::MXFP4 => 39,
+            GgufDType::NVFP4 => 78,
         }
     }
 
@@ -291,7 +299,8 @@ impl GgufDType {
             | GgufDType::IQ2_S
             | GgufDType::IQ1_S
             | GgufDType::IQ1_M
-            | GgufDType::MXFP4 => 256,
+            | GgufDType::MXFP4
+            | GgufDType::NVFP4 => 256,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
         }
@@ -332,6 +341,9 @@ impl GgufDType {
             GgufDType::IQ1_S => 50,
             GgufDType::IQ1_M => 56,
             GgufDType::MXFP4 => 136,
+            // NVFP4: 256 weights per super-block. 1 byte E8M0 scale per 16-elem
+            // sub-block (16 scales) + 128 bytes packed E2M1 codes (2 per byte).
+            GgufDType::NVFP4 => 16 + 128,
             _ => 0,
         }
     }
@@ -1889,6 +1901,10 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
+        GgufDType::NVFP4 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::FloatPack(FloatPackScheme::NvFp4),
+        },
     }
 }
 
@@ -1927,7 +1943,8 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::Q4K
         | GgufDType::IQ4_NL
         | GgufDType::IQ4_XS
-        | GgufDType::MXFP4 => Some(4),
+        | GgufDType::MXFP4
+        | GgufDType::NVFP4 => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
         GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S => Some(2),
@@ -1967,6 +1984,7 @@ impl GgufDType {
                 | GgufDType::IQ1_S
                 | GgufDType::IQ1_M
                 | GgufDType::MXFP4
+                | GgufDType::NVFP4
         )
     }
 
@@ -2005,6 +2023,7 @@ impl GgufDType {
             GgufDType::IQ1_S => "IQ1_S",
             GgufDType::IQ1_M => "IQ1_M",
             GgufDType::MXFP4 => "MXFP4",
+            GgufDType::NVFP4 => "NVFP4",
         }
     }
 }

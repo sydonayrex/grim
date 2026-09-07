@@ -1417,6 +1417,180 @@ pub fn dequant_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Dequantize NVFP4 (NVIDIA Blackwell 4-bit float, E2M1 codebook) bytes to f32.
+///
+/// Uses the same OCP E2M1 codebook as MXFP4 (`mxfp4_e2m1_to_f32`) but
+/// NVIDIA's native packing convention: per-16-element sub-blocks with one
+/// E8M0 shared exponent byte per sub-block, interleaved.
+///
+/// # Layout (per 256-weight super-block = 144 bytes)
+/// 16 sub-blocks of 16 weights each. Per sub-block:
+///   - 1 byte E8M0 shared exponent
+///   - 8 bytes packed E2M1 codes (2 per byte, low nibble = even, high = odd)
+///
+/// Total: 16 × (1 + 8) = 144 bytes per 256 weights.
+///
+/// This is structurally distinct from MXFP4's length-prefixed framing and
+/// its 32-element groups, hence a dedicated path rather than a flag.
+pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    const SUB_BLOCK: usize = 16; // weights per sub-block
+    const CODES_PER_SUB: usize = 8; // 16 weights / 2 per byte
+    const SUB_BLOCK_BYTES: usize = 1 + CODES_PER_SUB; // 1 scale + 8 code bytes = 9
+
+    // NVFP4 data is a sequence of sub-blocks. The number of sub-blocks is
+    // determined by the weight count, not by full 256-weight super-blocks —
+    // real tensors may have any number of weights.
+    let num_sub_blocks = num_values.div_ceil(SUB_BLOCK);
+    let expected_bytes = num_sub_blocks * SUB_BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "NVFP4: expected {expected_bytes} bytes for {num_values} weights \
+             ({num_sub_blocks} sub-blocks), got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_values);
+    let mut pos = 0usize;
+    for _ in 0..num_sub_blocks {
+        let shared_exp = data[pos];
+        pos += 1;
+        let codes = &data[pos..pos + CODES_PER_SUB];
+        pos += CODES_PER_SUB;
+
+        // Last sub-block may be partial if num_values isn't a multiple of 16.
+        let out_start = out.len();
+        let out_end = (out_start + SUB_BLOCK).min(num_values);
+        for i in out_start..out_end {
+            let local = i - out_start;
+            let code_byte = codes[local / 2];
+            let code = if local % 2 == 0 {
+                code_byte & 0x0F
+            } else {
+                (code_byte >> 4) & 0x0F
+            };
+            out.push(mxfp4_e2m1_to_f32(code, shared_exp));
+        }
+    }
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    Ok(out)
+}
+
+/// Reframe NVFP4 native packing into the length-prefixed `[codes][exps]`
+/// framing consumed by `dequant_mxfp4` (ROCm/CUDA kernel input).
+///
+/// NVFP4 packs per-16-element sub-blocks interleaved (scale + 8 code bytes).
+/// MXFP4's kernel framing expects all codes first, then all exponents, with
+/// 32-element groups.
+///
+/// # Lossless-only contract
+///
+/// Two adjacent NVFP4 sub-blocks map onto one 32-element MXFP4 group. This
+/// reframing is **only lossless when both sub-blocks share the same E8M0
+/// exponent**. When they differ, the function returns `Err` rather than
+/// silently dropping one exponent (which would produce a 2x scaling error
+/// for half the group). Callers can then fall back to `dequant_nvfp4` directly,
+/// which preserves per-16-element exponents exactly.
+///
+/// This makes the MXFP4 kernel path opt-in for NVFP4 tensors where adjacent
+/// sub-blocks happen to share exponents (e.g. uniformly-scaled weights), and
+/// forces the precise `dequant_nvfp4` path otherwise.
+pub fn reframe_nvfp4_to_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<u8>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    const SUB_BLOCK: usize = 16;
+    const CODES_PER_SUB: usize = 8;
+    const SUB_BLOCK_BYTES: usize = 1 + CODES_PER_SUB; // 9
+
+    let num_sub_blocks = num_values.div_ceil(SUB_BLOCK);
+    let codes_len = num_values.div_ceil(2);
+    let num_groups = num_values.div_ceil(32);
+    let exps_len = num_groups;
+
+    // Validate input has enough bytes for all sub-blocks.
+    let expected_bytes = num_sub_blocks * SUB_BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "reframe_nvfp4_to_mxfp4: expected {expected_bytes} bytes for \
+             {num_values} weights ({num_sub_blocks} sub-blocks), got {}",
+            data.len()
+        )));
+    }
+
+    // First pass: collect per-sub-block exponents and verify losslessness.
+    // Each pair of adjacent sub-blocks maps to one MXFP4 group. If their
+    // exponents differ, the reframing would silently mis-scale half the group.
+    let mut sub_exps = Vec::with_capacity(num_sub_blocks);
+    let mut pos = 0usize;
+    for _ in 0..num_sub_blocks {
+        sub_exps.push(data[pos]);
+        pos += SUB_BLOCK_BYTES;
+    }
+    for pair in sub_exps.chunks(2) {
+        let first = pair[0];
+        let second = pair.get(1).copied().unwrap_or(first);
+        if first != second {
+            return Err(Error::Backend(format!(
+                "reframe_nvfp4_to_mxfp4: adjacent NVFP4 sub-blocks have \
+                 different E8M0 exponents ({first} vs {second}); cannot \
+                 losslessly reframe to MXFP4's 32-element groups. Fall back \
+                 to dequant_nvfp4 for exact per-16-element dequantization."
+            )));
+        }
+    }
+
+    // Second pass: pack codes and exponents (now known to be lossless).
+    let mut codes = vec![0u8; codes_len];
+    let mut exps = vec![0u8; exps_len];
+
+    pos = 0;
+    for sb in 0..num_sub_blocks {
+        let shared_exp = data[pos];
+        pos += 1;
+        let sb_codes = &data[pos..pos + CODES_PER_SUB];
+        pos += CODES_PER_SUB;
+
+        let sb_start = sb * SUB_BLOCK;
+        let sb_end = (sb_start + SUB_BLOCK).min(num_values);
+
+        for i in sb_start..sb_end {
+            let local = i - sb_start;
+            let src_byte = sb_codes[local / 2];
+            let nibble = if local % 2 == 0 {
+                src_byte & 0x0F
+            } else {
+                (src_byte >> 4) & 0x0F
+            };
+            let dst_byte_idx = i / 2;
+            if i % 2 == 0 {
+                codes[dst_byte_idx] = (codes[dst_byte_idx] & 0xF0) | nibble;
+            } else {
+                codes[dst_byte_idx] = (codes[dst_byte_idx] & 0x0F) | (nibble << 4);
+            }
+        }
+
+        // Both sub-blocks in each pair share the same exponent (verified above),
+        // so assigning from either is correct.
+        let mx_group = sb / 2;
+        if mx_group < exps_len && sb % 2 == 0 {
+            exps[mx_group] = shared_exp;
+        }
+    }
+
+    let mut out = Vec::with_capacity(16 + codes.len() + exps.len());
+    out.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+    out.extend_from_slice(&codes);
+    out.extend_from_slice(&(exps.len() as u64).to_le_bytes());
+    out.extend_from_slice(&exps);
+    Ok(out)
+}
+
 /// Dequantize MXFP8 (OCP Microscaling, Magpie tier) single-buffer bytes to f32.
 ///
 /// # Layout
