@@ -34,6 +34,11 @@ pub struct GgufProvider {
     tensors: HashMap<String, GgufTensorInfo>,
     grim: GrimMetadata,
     overrides: HashMap<String, GrimQuantOverride>,
+    /// Detected external-toolkit producer (TorchAO/Quark/ModelOpt/FBGEMM).
+    /// When `Some`, tensors whose GGUF dtype maps to a toolkit format are
+    /// routed through the layout adapter so the correct `Storage` variant
+    /// and `QuantProvenance` are selected.
+    toolkit_producer: Option<crate::convert::ToolkitProducer>,
 }
 
 impl GgufProvider {
@@ -54,6 +59,19 @@ impl GgufProvider {
             .iter()
             .map(|o| (o.tensor_name.clone(), o.clone()))
             .collect();
+
+        // Detect external-toolkit producer from GGUF metadata. This is the
+        // GGUF-container counterpart to the safetensors `__metadata__` path in
+        // SafetensorsProvider. Toolkit-produced GGUF files (e.g. NVFP4 models
+        // distributed via HuggingFace in GGUF wrapping) stamp the producer in
+        // string metadata keys like `general.quantization_config`.
+        let toolkit_producer = crate::convert::detect_toolkit_producer_from_gguf(&gguf.metadata);
+        if let Some(producer) = toolkit_producer {
+            println!(
+                "[GgufProvider] Detected external toolkit producer: {:?}",
+                producer
+            );
+        }
 
         // §5.3 companion draft bundle config loading
         let companion_path = format!("{}.json", path);
@@ -83,6 +101,7 @@ impl GgufProvider {
             tensors,
             grim,
             overrides,
+            toolkit_producer,
         })
     }
 
@@ -189,6 +208,33 @@ impl TensorProvider for GgufProvider {
         let bytes = self.slice_tensor(info)?;
         let dtype = effective_dtype(info, &self.overrides);
         let n = info.shape().iter().product::<usize>();
+
+        // External-toolkit tensor routing: when a toolkit producer was
+        // detected from GGUF metadata and this tensor's dtype maps to a
+        // toolkit-specific format (e.g. NVFP4), route through the layout
+        // adapter so the correct `Storage` variant and `QuantProvenance`
+        // are selected. This mirrors the safetensors path in
+        // SafetensorsProvider::get.
+        if let Some(producer) = self.toolkit_producer {
+            if let Some(qfmt) = crate::convert::classify_toolkit_tensor(producer, name) {
+                let storage = crate::convert::toolkit_to_storage(producer, qfmt)
+                    .ok_or_else(|| Error::Backend(format!(
+                        "no Storage mapping for toolkit format {qfmt:?}"
+                    )))?;
+                let reframe_bytes = crate::convert::reframe_toolkit_bytes(qfmt, &bytes, n)?;
+                let provenance = crate::convert::toolkit_to_provenance(producer, qfmt);
+                return Ok(RawTensor {
+                    bytes: reframe_bytes,
+                    shape: info.shape(),
+                    dtype: DType {
+                        arith: grim_tensor::dtype::ArithType::F32,
+                        storage,
+                    },
+                    provenance,
+                });
+            }
+        }
+
         let bytes = self.reframe_bytes(bytes, n, &dtype)?;
         Ok(RawTensor {
             bytes,
@@ -391,6 +437,10 @@ pub struct SafetensorsProvider {
     /// AWQ checkpoints also use `.qweight` naming but a different layout;
     /// `quantize_config.json` decides which provider decodes the file.
     awq: Option<crate::awq::AwqProvider>,
+    /// Detected external-toolkit producer (TorchAO/Quark/ModelOpt/FBGEMM).
+    /// When `Some`, non-GPTQ/AWQ tensors are routed through the toolkit
+    /// layout adapter so the correct `Storage` variant is selected.
+    toolkit_producer: Option<crate::convert::ToolkitProducer>,
 }
 
 impl SafetensorsProvider {
@@ -398,7 +448,19 @@ impl SafetensorsProvider {
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot open safetensors file '{path}': {e}")))?;
         let reader = BufReader::new(file);
-        let (info, _metadata, data_region_start) = read_safetensors_header(reader)?;
+        let (info, metadata, data_region_start) = read_safetensors_header(reader)?;
+
+        // Detect external-toolkit producer from safetensors `__metadata__`.
+        let toolkit_producer = metadata
+            .as_ref()
+            .and_then(|m| crate::convert::detect_toolkit_producer(m));
+
+        if let Some(producer) = toolkit_producer {
+            println!(
+                "[SafetensorsProvider] Detected external toolkit producer: {:?}",
+                producer
+            );
+        }
 
         // §5.3 companion draft bundle config loading
         let companion_path = format!("{}.json", path);
@@ -491,6 +553,7 @@ impl SafetensorsProvider {
             data_region_start,
             gptq,
             awq,
+            toolkit_producer,
         })
     }
 
@@ -527,6 +590,49 @@ impl TensorProvider for SafetensorsProvider {
                 return gptq.get(name);
             }
         }
+
+        // External-toolkit tensor routing: when a toolkit producer was
+        // detected, classify the tensor and map it onto the correct
+        // `Storage` variant via the layout adapter.
+        if let Some(producer) = self.toolkit_producer {
+            if let Some(qfmt) = crate::convert::classify_toolkit_tensor(producer, name) {
+                let info = self.info.get(name).ok_or_else(|| {
+                    Error::Backend(format!(
+                        "tensor '{name}' not found in safetensors file"
+                    ))
+                })?;
+                let start = self
+                    .data_region_start
+                    .checked_add(info.data_start)
+                    .ok_or_else(|| {
+                        Error::Backend("safetensors tensor offset overflow".into())
+                    })?;
+                let len = (info.data_end - info.data_start) as usize;
+                let raw_bytes = self.read_region(start, len)?;
+                let elem_count: usize = info.shape().iter().product();
+
+                let storage =
+                    crate::convert::toolkit_to_storage(producer, qfmt).ok_or_else(|| {
+                        Error::Backend(format!(
+                            "no Storage mapping for toolkit format {qfmt:?}"
+                        ))
+                    })?;
+                let reframe_bytes =
+                    crate::convert::reframe_toolkit_bytes(qfmt, &raw_bytes, elem_count)?;
+                let provenance = crate::convert::toolkit_to_provenance(producer, qfmt);
+
+                return Ok(RawTensor {
+                    bytes: reframe_bytes,
+                    shape: info.shape(),
+                    dtype: DType {
+                        arith: grim_tensor::dtype::ArithType::F32,
+                        storage,
+                    },
+                    provenance,
+                });
+            }
+        }
+
         let info = self.info.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in safetensors file"))
         })?;

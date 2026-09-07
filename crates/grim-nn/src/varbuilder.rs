@@ -20,8 +20,8 @@ use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_iq2s,
     dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
-    dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k,
-    dequant_q6k, dequant_q80,
+    dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nvfp4, dequant_q2k, dequant_q3k,
+    dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -838,6 +838,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             FloatPackScheme::Fp8 => dequant_fp8(&raw.bytes, n),
             FloatPackScheme::MxFp4 => dequant_mxfp4(&raw.bytes, n),
             FloatPackScheme::MxFp8 => dequant_mxfp8(&raw.bytes, n),
+            FloatPackScheme::NvFp4 => dequant_nvfp4(&raw.bytes, n),
         },
         Storage::Block(block_type) => match block_type {
             BlockDtype::Fp4 => dequant_fp4(&raw.bytes, n),

@@ -429,6 +429,7 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             FloatPackScheme::Fp8 => 8,
             FloatPackScheme::MxFp4 => 4,
             FloatPackScheme::MxFp8 => 8,
+            FloatPackScheme::NvFp4 => 4,
         },
         Storage::GroupInt(cfg) => cfg.bits,
         Storage::ResidualPacked(cfg) => cfg.bpw,

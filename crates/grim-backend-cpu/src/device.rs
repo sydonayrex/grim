@@ -1957,6 +1957,7 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::FloatPackScheme::Fp8 => grim_quant::dequant_fp8(raw, n),
                 grim_tensor::dtype::FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(raw, n),
+                grim_tensor::dtype::FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(raw, n),
             },
             Storage::Block(block_type) => match block_type {
                 grim_tensor::dtype::BlockDtype::Fp4 => grim_quant::dequant_fp4(raw, n),

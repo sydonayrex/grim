@@ -1249,6 +1249,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 FloatPackScheme::MxFp8 => 8,
                 FloatPackScheme::Fp4 => 4,
                 FloatPackScheme::Fp8 => 8,
+                FloatPackScheme::NvFp4 => 4,
                 _ => 32, // fallback: treat as fp32
             };
             // Round up: ceil(elem_count * bits / 8)
