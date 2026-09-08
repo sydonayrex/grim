@@ -412,9 +412,9 @@ impl VulkanDevice {
                 0,
                 &mut mapped,
             );
-            if res != VK_SUCCESS {
+            if res != VK_SUCCESS || mapped.is_null() {
                 return Err(Error::Backend(format!(
-                    "vkMapMemory failed with status {res}"
+                    "vkMapMemory failed with status {res} (mapped: {mapped:?})"
                 )));
             }
             std::ptr::write_bytes(mapped, 0, out_storage.bytes);
@@ -1430,7 +1430,7 @@ impl AutogradOps for VulkanDevice {
                 0,
                 &mut mapped,
             );
-            if res == VK_SUCCESS {
+            if res == VK_SUCCESS && !mapped.is_null() {
                 std::ptr::write_bytes(mapped, 0, dw.bytes);
                 vkUnmapMemory(ctx.device, dw.memory);
             }
@@ -1579,7 +1579,7 @@ impl AutogradOps for VulkanDevice {
                 0,
                 &mut mapped,
             );
-            if res == VK_SUCCESS {
+            if res == VK_SUCCESS && !mapped.is_null() {
                 std::ptr::write_bytes(mapped, 0, dw.bytes);
                 vkUnmapMemory(ctx.device, dw.memory);
             }
@@ -1743,7 +1743,7 @@ impl VulkanDevice {
                 0,
                 &mut mapped,
             );
-            if res == VK_SUCCESS {
+            if res == VK_SUCCESS && !mapped.is_null() {
                 std::ptr::write_bytes(mapped, 0, dg.bytes);
                 vkUnmapMemory(ctx.device, dg.memory);
             }
@@ -2067,7 +2067,7 @@ impl CollectiveOps for VulkanDevice {
                                     &mut mapped,
                                 )
                             };
-                            if res == VK_SUCCESS {
+                            if res == VK_SUCCESS && !mapped.is_null() {
                                 unsafe {
                                     std::ptr::write_bytes(mapped, 0, out_storage.bytes);
                                     vkUnmapMemory(ctx.device, out_storage.memory);
@@ -2177,7 +2177,7 @@ impl CollectiveOps for VulkanDevice {
                                     &mut mapped,
                                 )
                             };
-                            if res == VK_SUCCESS {
+                            if res == VK_SUCCESS && !mapped.is_null() {
                                 unsafe {
                                     std::ptr::write_bytes(mapped, 0, out_storage.bytes);
                                     vkUnmapMemory(ctx.device, out_storage.memory);

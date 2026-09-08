@@ -732,7 +732,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const evalResult = evaluateHardwareFeasibility(model, trainingMode, loraRank, optimizerName, primaryVramBytes, gpuCount);
-    const modelName = model.split('/').pop();
+    const rawModelName = model.split('/').pop() || '';
+    const modelName = rawModelName
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
 
     if (evalResult.isFeasible) {
       // Best case scenario passes!

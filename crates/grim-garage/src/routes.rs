@@ -582,20 +582,45 @@ fn prevent_path_traversal(id: &str) -> Result<(), (StatusCode, Json<serde_json::
     }
 }
 
+/// Safely resolve a model identifier into a PathBuf.
+/// Guarantees that the path exists and does not escape allowed directories.
+fn resolve_safe_model_path(
+    id: &str,
+) -> Result<std::path::PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    prevent_path_traversal(id)?;
+    let p = Path::new(id);
+    let resolved = if p.exists() {
+        p.to_path_buf()
+    } else {
+        let dir_candidate = default_models_dir().join(id);
+        if dir_candidate.exists() {
+            dir_candidate
+        } else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("model not found: {id}") })),
+            ));
+        }
+    };
+
+    // Verify canonical path does not contain traversal
+    if let Ok(canon) = resolved.canonicalize() {
+        Ok(canon)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model not found: {id}") })),
+        ))
+    }
+}
+
 async fn get_bolt_ons(
     AxumPath(model_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    prevent_path_traversal(&model_id)?;
-    let model_path = Path::new(&model_id);
-    if !model_path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("model not found: {}", model_id) })),
-        ));
-    }
+    let model_path = resolve_safe_model_path(&model_id)?;
 
     // Open the .grim file and check backup2 status for each tensor.
-    let file = match std::fs::File::open(model_path) {
+    let file = match std::fs::File::open(&model_path) {
         Ok(f) => f,
         Err(e) => {
             return Err((
@@ -643,18 +668,11 @@ async fn attach_bolt_on_route(
     AxumPath(model_id): AxumPath<String>,
     Json(req): Json<AttachBoltOnRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    prevent_path_traversal(&model_id)?;
+    let model_path = resolve_safe_model_path(&model_id)?;
     // M1-class gate: `adapter_path` becomes `{adapter_path}.train` and is read for the LoRA sidecar.
     // Without this check a POST could point at an arbitrary file via `..`/absolute segments -.
     if let Err(e) = validate_job_path("adapter_path", &req.adapter_path) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
-    }
-    let model_path = Path::new(&model_id);
-    if !model_path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("model not found: {}", model_id) })),
-        ));
     }
 
     // Load the adapter sidecar.
@@ -734,7 +752,7 @@ async fn attach_bolt_on_route(
                 );
 
                 match grim_format::bolt_on::attach_bolt_on(
-                    model_path,
+                    &model_path,
                     tensor_name,
                     &a_tensor,
                     &b_tensor,
@@ -773,16 +791,9 @@ async fn merge_bolt_on_route(
     AxumPath(model_id): AxumPath<String>,
     Json(req): Json<AttachBoltOnRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    prevent_path_traversal(&model_id)?;
+    let model_path = resolve_safe_model_path(&model_id)?;
     if let Err(e) = validate_job_path("adapter_path", &req.adapter_path) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
-    }
-    let model_path = Path::new(&model_id);
-    if !model_path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("model not found: {}", model_id) })),
-        ));
     }
 
     let sidecar_path = format!("{}.train", req.adapter_path);
@@ -857,7 +868,7 @@ async fn merge_bolt_on_route(
                 );
 
                 match grim_format::bolt_on::merge_bolt_on(
-                    model_path,
+                    &model_path,
                     tensor_name,
                     &a_tensor,
                     &b_tensor,
@@ -895,17 +906,10 @@ async fn merge_bolt_on_route(
 async fn detach_bolt_on_route(
     AxumPath((model_id, slot)): AxumPath<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    prevent_path_traversal(&model_id)?;
-    let model_path = Path::new(&model_id);
-    if !model_path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("model not found: {}", model_id) })),
-        ));
-    }
+    let model_path = resolve_safe_model_path(&model_id)?;
 
     // Use the tensor name from the URL path (slot = tensor_name).
-    match grim_format::bolt_on::detach_bolt_on(model_path, &slot) {
+    match grim_format::bolt_on::detach_bolt_on(&model_path, &slot) {
         Ok(()) => Ok(Json(json!({
             "status": "detached",
             "model_id": model_id,
@@ -1212,38 +1216,24 @@ async fn load_model_handler(
     State(state): State<AppState>,
     Json(req): Json<LoadModelRequest>,
 ) -> Result<Json<LoadModelResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let model_name = std::path::Path::new(&req.model_path)
+    let resolved_path = resolve_safe_model_path(&req.model_path)?;
+    let model_str = resolved_path.to_string_lossy().to_string();
+    let model_name = resolved_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| req.model_path.clone());
 
-    if req.model_path.contains("..") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "error": "Invalid model path: path traversal components ('..') are prohibited" }),
-            ),
-        ));
-    }
-
-    if !std::path::Path::new(&req.model_path).exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Model file not found: {}", req.model_path) })),
-        ));
-    }
-
     // Load tokenizer from GGUF metadata
-    let tokenizer = load_tokenizer_from_path(&req.model_path);
+    let tokenizer = load_tokenizer_from_path(&model_str);
     if tokenizer.is_none() {
         eprintln!(
             "[load_model] warning: failed to load tokenizer from {}",
-            req.model_path
+            model_str
         );
     }
 
     // Load the model
-    let model = match model_loader::load_from_path(&req.model_path) {
+    let model = match model_loader::load_from_path(&model_str) {
         Ok(m) => m,
         Err(e) => {
             return Err((
@@ -1278,11 +1268,18 @@ async fn chat_handler(
         ));
     }
 
-    // GAR-1 fix: `model_id` is later used directly as a filesystem path by `load_tokenizer_from_path` / `model_loader::load_from_path`.
-    // Reject any traversal / separator characters up front so a caller cannot escape the model.
-    prevent_path_traversal(&req.model_id)?;
-
-    let model_name = std::path::Path::new(&req.model_id)
+    let resolved_path = resolve_safe_model_path(&req.model_id).map_err(|(status, body)| {
+        if status == StatusCode::NOT_FOUND {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to load model: model not found: {}", req.model_id) })),
+            )
+        } else {
+            (status, body)
+        }
+    })?;
+    let model_str = resolved_path.to_string_lossy().to_string();
+    let model_name = resolved_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| req.model_id.clone());
@@ -1295,12 +1292,12 @@ async fn chat_handler(
         if !engine.loaded_models().contains(&model_name) {
             // Lazily set the tokenizer from GGUF metadata too
             if state.tokenizer.lock().unwrap().is_none() {
-                if let Some(tok) = load_tokenizer_from_path(&req.model_id) {
+                if let Some(tok) = load_tokenizer_from_path(&model_str) {
                     *state.tokenizer.lock().unwrap() = Some(tok);
                 }
             }
 
-            let model = model_loader::load_from_path(&req.model_id).map_err(|e| {
+            let model = model_loader::load_from_path(&model_str).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("Failed to load model: {e}") })),

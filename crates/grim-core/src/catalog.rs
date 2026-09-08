@@ -397,8 +397,13 @@ fn resolve_with_ext(candidate: &Path, force_ext: Option<&str>) -> Option<PathBuf
 /// `.grim` path; otherwise `None`.
 fn grim_sibling_if_gguf(path: &Path) -> Option<PathBuf> {
     if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        // Validate canonical path starts with the models directory or parent directory to prevent arbitrary path traversal.
+        let models_dir = grim_models_dir();
+        if !is_safe_model_path(path, &models_dir) {
+            return None;
+        }
         let grim = path.with_extension("grim");
-        if grim.exists() {
+        if grim.exists() && is_safe_model_path(&grim, &models_dir) {
             return Some(grim);
         }
     }

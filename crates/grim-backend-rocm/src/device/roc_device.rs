@@ -902,11 +902,13 @@ impl RocmDevice {
         };
         // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer stream, fence this (compute) stream on its completion event so the prefetch can overlap the prior decode-step GEMM instead of racing it.
         // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the host.
-        if let Ok(guard) = self.upload_event.lock() {
-            if let Some(ev) = *guard {
-                if !ev.is_null() {
-                    unsafe {
-                        let _ = crate::hipStreamWaitEvent(stream, ev, 0);
+        if !stream.is_null() {
+            if let Ok(guard) = self.upload_event.lock() {
+                if let Some(ev) = *guard {
+                    if !ev.is_null() {
+                        unsafe {
+                            let _ = crate::hipStreamWaitEvent(stream, ev, 0);
+                        }
                     }
                 }
             }
