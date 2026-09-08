@@ -18,7 +18,7 @@ pub mod topology;
 pub use cache::CpuCacheKey;
 pub use dequant_gemm::dequant_row;
 pub use deterministic_rng::DeterministicRng;
-pub use device::{CpuDevice, add_tensors, cpu_tensor};
+pub use device::{CpuDevice, add_tensors, attn_logit_softcap, cpu_tensor, set_attn_logit_softcap};
 pub use gemv::cpu_gemv;
 pub use graph_capture::{CpuCapturedGraph, CpuGraphRegistry};
 pub use hardware_spec::CpuHardwareSpec;

@@ -348,6 +348,7 @@ impl AttentionOps for RocmDevice {
         let mut co = cache_offset_i;
         let mut isd = inv_sqrt_d;
         let mut wlo = window_lo_i;
+        let mut softcap: f32 = self.attn_logit_softcap();
         let mut oproj_ptr: u64 = 0;
         let mut odim: i32 = 0;
         let mut fuseo: i32 = 0;
@@ -363,6 +364,7 @@ impl AttentionOps for RocmDevice {
             && window.is_none()
             && out_max.is_none()
             && out_sum.is_none()
+            && softcap <= 0.0
         {
             let num_splits = self.flash_decode_split_count(
                 q_s,
@@ -431,6 +433,7 @@ impl AttentionOps for RocmDevice {
                     let mut co = cache_offset_i;
                     let mut isd = inv_sqrt_d;
                     let mut wlo = window_lo_i;
+                    let mut softcap = softcap;
                     let mut oproj_ptr: u64 = 0;
                     let mut odim: i32 = 0;
                     let mut fuseo: i32 = 0;
@@ -455,6 +458,7 @@ impl AttentionOps for RocmDevice {
                             arg(&mut co),
                             arg(&mut isd),
                             arg(&mut wlo),
+                            arg(&mut softcap),
                             arg(&mut oproj_ptr),
                             arg(&mut odim),
                             arg(&mut fuseo),
@@ -489,6 +493,7 @@ impl AttentionOps for RocmDevice {
                 arg(&mut co),
                 arg(&mut isd),
                 arg(&mut wlo),
+                arg(&mut softcap),
                 arg(&mut oproj_ptr),
                 arg(&mut odim),
                 arg(&mut fuseo),
@@ -498,8 +503,8 @@ impl AttentionOps for RocmDevice {
         )?;
 
         let _ = (
-            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, oproj_ptr,
-            odim, fuseo, alibi_ptr, has_alibi,
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo, softcap,
+            oproj_ptr, odim, fuseo, alibi_ptr, has_alibi,
         );
 
         // No post-launch sync: the output storage is returned to the caller and any readback (or same-stream reuse of pooled scratch) is ordered by the single active stream.
@@ -578,6 +583,7 @@ impl AttentionOps for RocmDevice {
         let mut co = cache_offset as i32;
         let mut isd: f32 = 1.0 / (head_dim as f32).sqrt();
         let mut wlo = window_lo_i;
+        let mut softcap: f32 = self.attn_logit_softcap();
         let mut oproj_ptr: u64 = 0;
         let mut odim: i32 = 0;
         let mut fuseo: i32 = 0;
@@ -603,6 +609,7 @@ impl AttentionOps for RocmDevice {
                 arg(&mut co),
                 arg(&mut isd),
                 arg(&mut wlo),
+                arg(&mut softcap),
                 arg(&mut oproj_ptr),
                 arg(&mut odim),
                 arg(&mut fuseo),
@@ -611,7 +618,7 @@ impl AttentionOps for RocmDevice {
             ],
         )?;
         let _ = (
-            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo,
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo, softcap,
             oproj_ptr, odim, fuseo, alibi_ptr, has_alibi,
         );
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))

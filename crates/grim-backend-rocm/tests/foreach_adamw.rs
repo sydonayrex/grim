@@ -44,14 +44,26 @@ fn upload(fx: &Fixture, data: &[f32]) -> RocmStorage {
 /// overhead dominates.
 const SIZES: &[usize] = &[7, 100, 333, 1024, 4096, 17];
 
-fn make_state(fx: &Fixture, seed: f32) -> (Vec<RocmStorage>, Vec<RocmStorage>, Vec<RocmStorage>, Vec<RocmStorage>) {
+fn make_state(
+    fx: &Fixture,
+    seed: f32,
+) -> (
+    Vec<RocmStorage>,
+    Vec<RocmStorage>,
+    Vec<RocmStorage>,
+    Vec<RocmStorage>,
+) {
     let mut ps = Vec::new();
     let mut gs = Vec::new();
     let mut ms = Vec::new();
     let mut vs = Vec::new();
     for (i, &len) in SIZES.iter().enumerate() {
-        let p: Vec<f32> = (0..len).map(|j| seed + (i * 31 + j % 13) as f32 * 0.01).collect();
-        let g: Vec<f32> = (0..len).map(|j| ((i * 7 + j % 11) as f32) * 0.05 - 0.25).collect();
+        let p: Vec<f32> = (0..len)
+            .map(|j| seed + (i * 31 + j % 13) as f32 * 0.01)
+            .collect();
+        let g: Vec<f32> = (0..len)
+            .map(|j| ((i * 7 + j % 11) as f32) * 0.05 - 0.25)
+            .collect();
         let m: Vec<f32> = vec![0.0; len];
         let v: Vec<f32> = vec![0.0; len];
         ps.push(upload(fx, &p));
@@ -76,8 +88,7 @@ fn foreach_adamw_parity() {
         let handle = fx
             .dev
             .fused_adamw_step(
-                &ps_a[i], &gs_a[i], &ms_a[i], &vs_a[i], lr, b1, b2, eps, wd, bc1, bc2,
-                SIZES[i],
+                &ps_a[i], &gs_a[i], &ms_a[i], &vs_a[i], lr, b1, b2, eps, wd, bc1, bc2, SIZES[i],
             )
             .unwrap();
         handle.synchronize().unwrap();
@@ -91,7 +102,9 @@ fn foreach_adamw_parity() {
     let v_refs: Vec<&dyn BackendStorage> = vs_b.iter().map(|s| s as &dyn BackendStorage).collect();
     let handle = fx
         .dev
-        .fused_adamw_step_foreach(&p_refs, &g_refs, &m_refs, &v_refs, lr, b1, b2, eps, wd, bc1, bc2)
+        .fused_adamw_step_foreach(
+            &p_refs, &g_refs, &m_refs, &v_refs, lr, b1, b2, eps, wd, bc1, bc2,
+        )
         .unwrap();
     handle.synchronize().unwrap();
 
@@ -100,17 +113,26 @@ fn foreach_adamw_parity() {
         let a = ps_a[i].to_cpu_vec_f32().unwrap();
         let b = ps_b[i].to_cpu_vec_f32().unwrap();
         for (x, y) in a.iter().zip(b.iter()) {
-            assert!((x - y).abs() <= 1e-9, "param tensor {i} diverged: {x} vs {y}");
+            assert!(
+                (x - y).abs() <= 1e-9,
+                "param tensor {i} diverged: {x} vs {y}"
+            );
         }
         let ma = ms_a[i].to_cpu_vec_f32().unwrap();
         let mb = ms_b[i].to_cpu_vec_f32().unwrap();
         for (x, y) in ma.iter().zip(mb.iter()) {
-            assert!((x - y).abs() <= 1e-9, "momentum tensor {i} diverged: {x} vs {y}");
+            assert!(
+                (x - y).abs() <= 1e-9,
+                "momentum tensor {i} diverged: {x} vs {y}"
+            );
         }
         let va = vs_a[i].to_cpu_vec_f32().unwrap();
         let vb = vs_b[i].to_cpu_vec_f32().unwrap();
         for (x, y) in va.iter().zip(vb.iter()) {
-            assert!((x - y).abs() <= 1e-9, "variance tensor {i} diverged: {x} vs {y}");
+            assert!(
+                (x - y).abs() <= 1e-9,
+                "variance tensor {i} diverged: {x} vs {y}"
+            );
         }
     }
 }
@@ -133,10 +155,12 @@ fn foreach_adamw_throughput() {
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
         for i in 0..SIZES.len() {
-            let handle = fx.dev.fused_adamw_step(
-                &ps[i], &gs[i], &ms[i], &vs[i], lr, b1, b2, eps, wd, bc1, bc2, SIZES[i],
-            )
-            .unwrap();
+            let handle = fx
+                .dev
+                .fused_adamw_step(
+                    &ps[i], &gs[i], &ms[i], &vs[i], lr, b1, b2, eps, wd, bc1, bc2, SIZES[i],
+                )
+                .unwrap();
             let _ = handle;
         }
         fx.dev.synchronize();
@@ -145,10 +169,12 @@ fn foreach_adamw_throughput() {
 
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let handle = fx.dev.fused_adamw_step_foreach(
-            &p_refs, &g_refs, &m_refs, &v_refs, lr, b1, b2, eps, wd, bc1, bc2,
-        )
-        .unwrap();
+        let handle = fx
+            .dev
+            .fused_adamw_step_foreach(
+                &p_refs, &g_refs, &m_refs, &v_refs, lr, b1, b2, eps, wd, bc1, bc2,
+            )
+            .unwrap();
         let _ = handle;
         fx.dev.synchronize();
     }
@@ -159,7 +185,10 @@ fn foreach_adamw_throughput() {
         SIZES.len(),
         per_tensor_us / foreach_us
     );
-    assert!(foreach_us <= per_tensor_us, "foreach slower than per-tensor");
+    assert!(
+        foreach_us <= per_tensor_us,
+        "foreach slower than per-tensor"
+    );
 }
 
 fn main() {}

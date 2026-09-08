@@ -199,59 +199,43 @@ impl Gemma2Block {
             positions,
         )?;
 
-        // Attention-logit softcapping sits between the QK product and the softmax - the fused GPU kernels have no stage for it, so capped blocks MUST take the host reference (an uncapped fused run would silently produce wrong logits).
-        // Uncapped blocks keep the fully device-resident path.
-        let attn_tensor = if let Some(cap) = self.attn_logit_softcapping {
-            let q_vec = q.to_vec_f32()?;
-            let k_vec = k.to_vec_f32()?;
-            let v_vec = v.to_vec_f32()?;
-            let q_row = self.num_heads * self.head_dim;
-            let kv_row = self.num_kv_heads * self.head_dim;
-            let kv_head: Vec<usize> = (0..self.num_heads)
-                .map(|h| (h * self.num_kv_heads) / self.num_heads)
-                .collect();
-            let out = crate::kv_attention::causal_attention(
-                &q_vec,
-                &k_vec,
-                &v_vec,
-                seq_len,
-                seq_len,
-                0,
-                self.num_heads,
-                self.head_dim,
-                q_row,
-                kv_row,
-                &kv_head,
-                Some(cap),
-            );
-            grim_nn::modules::move_to_device(
-                &cpu_tensor(out, grim_tensor::Shape::new(vec![seq_len, q_row])),
-                x.device(),
-            )?
-        } else {
-            match crate::shared_attention::fused_attention_tensors(
-                &q,
-                &k,
-                &v,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                seq_len,
-                seq_len,
-                None,
-            ) {
-                Ok(t) => t,
-                Err(_) => crate::shared_attention::fused_or_scalar_attention(
+        let attn_tensor = match crate::shared_attention::fused_attention_tensors_softcapped(
+            &q,
+            &k,
+            &v,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            seq_len,
+            seq_len,
+            None,
+            self.attn_logit_softcapping,
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                let q_row = self.num_heads * self.head_dim;
+                let kv_row = self.num_kv_heads * self.head_dim;
+                let kv_head: Vec<usize> = (0..self.num_heads)
+                    .map(|h| (h * self.num_kv_heads) / self.num_heads)
+                    .collect();
+                let out = crate::kv_attention::causal_attention(
                     &q.to_vec_f32()?,
                     &k.to_vec_f32()?,
                     &v.to_vec_f32()?,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
                     seq_len,
-                    None,
+                    seq_len,
+                    0,
+                    self.num_heads,
+                    self.head_dim,
+                    q_row,
+                    kv_row,
+                    &kv_head,
+                    self.attn_logit_softcapping,
+                );
+                grim_nn::modules::move_to_device(
+                    &cpu_tensor(out, grim_tensor::Shape::new(vec![seq_len, q_row])),
                     x.device(),
-                )?,
+                )?
             }
         };
         let attn_proj = self.wo.forward(&attn_tensor)?;

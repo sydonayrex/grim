@@ -13,6 +13,21 @@ use grim_tensor::{
 
 use crate::storage::CpuStorage;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static ATTN_LOGIT_SOFTCAP: AtomicU32 = AtomicU32::new(0);
+
+/// Set the attention logit softcap for CPU execution. Pass None or <= 0.0 to disable.
+pub fn set_attn_logit_softcap(cap: Option<f32>) {
+    let bits = cap.filter(|&c| c > 0.0).unwrap_or(0.0).to_bits();
+    ATTN_LOGIT_SOFTCAP.store(bits, Ordering::Relaxed);
+}
+
+/// Retrieve the active attention logit softcap for CPU execution.
+pub fn attn_logit_softcap() -> f32 {
+    f32::from_bits(ATTN_LOGIT_SOFTCAP.load(Ordering::Relaxed))
+}
+
 /// CPU device. All operations are synchronous; returns `ReadyHandle`.
 #[derive(Clone, Default)]
 pub struct CpuDevice {
@@ -192,7 +207,12 @@ impl CpuDevice {
                             Some(slopes) => slopes[h] * (t2 as f32 - q_abs as f32),
                             None => 0.0,
                         };
-                        *score = dot * scale + bias;
+                        let mut s = dot * scale + bias;
+                        let cap = attn_logit_softcap();
+                        if cap > 0.0 {
+                            s = cap * (s / cap).tanh();
+                        }
+                        *score = s;
                     }
                 }
                 // Stable softmax

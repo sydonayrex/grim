@@ -151,21 +151,29 @@ impl MtpLayer {
             )));
         }
 
-        let mut concat = Vec::with_capacity(self.hidden_size * 2);
-        concat.extend_from_slice(h);
-        concat.extend_from_slice(e);
-
-        let concat_cpu = cpu_tensor(concat, Shape::new(vec![1, self.hidden_size * 2]));
         let target_dev = self.proj.weight.device();
-        let concat_t = grim_nn::modules::move_to_device(&concat_cpu, target_dev)?;
+        let h_t = grim_nn::modules::move_to_device(
+            &cpu_tensor(h.to_vec(), Shape::new(vec![1, self.hidden_size])),
+            target_dev,
+        )?;
+        let e_t = grim_nn::modules::move_to_device(
+            &cpu_tensor(e.to_vec(), Shape::new(vec![1, self.hidden_size])),
+            target_dev,
+        )?;
+        let (h_next_t, next_token) = self.forward_step_tensor(&h_t, &e_t)?;
+        Ok((h_next_t.to_vec_f32()?, next_token))
+    }
 
+    /// Fully device-resident MTP step: takes `h` [1, D] and `e` [1, D] on device,
+    /// fuses them via on-device concatenation, computes projection, norm, and lm_head,
+    /// and performs on-device argmax. Only the predicted token ID is returned to the host.
+    pub fn forward_step_tensor(&self, h: &Tensor, e: &Tensor) -> Result<(Tensor, u32)> {
+        let concat_t = grim_nn::modules::concat_2d_horizontal_on_device(h, e)?;
         let projected = self.proj.forward(&concat_t)?;
         let normed = self.norm.forward(&projected)?;
         let logits = self.lm_head.forward(&normed)?;
-
         let next_token = argmax_last_row_device(&logits, self.vocab_size)?;
-        let h_next = normed.to_vec_f32()?;
-        Ok((h_next, next_token))
+        Ok((normed, next_token))
     }
 }
 
@@ -248,11 +256,9 @@ impl MtpDepthProvider for LlamaMtp {
         // Retrieve last hidden state from session or approximate from a
         // single-row embedding gather (never the whole table).
         let mut curr_h = if let Some(last_h) = session.get_last_hidden_state() {
-            let vec = last_h.to_vec_f32()?;
-            let offset = vec.len().saturating_sub(hidden_size);
-            vec[offset..].to_vec()
+            grim_nn::modules::slice_last_row_2d_on_device(&last_h)?
         } else {
-            embedding_row_device(
+            embedding_row_tensor(
                 &self.base.tok_embeddings.weight,
                 curr_token,
                 hidden_size,
@@ -262,13 +268,13 @@ impl MtpDepthProvider for LlamaMtp {
 
         let mut tokens = Vec::with_capacity(self.mtp_layers.len());
         for layer in &self.mtp_layers {
-            let curr_e = embedding_row_device(
+            let curr_e = embedding_row_tensor(
                 &self.base.tok_embeddings.weight,
                 curr_token,
                 hidden_size,
                 vocab_size,
             )?;
-            let (next_h, next_token) = layer.forward_step(&curr_h, &curr_e)?;
+            let (next_h, next_token) = layer.forward_step_tensor(&curr_h, &curr_e)?;
             tokens.push(next_token);
             curr_h = next_h;
             curr_token = next_token;
@@ -353,11 +359,9 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
         let mut curr_token = argmax_last_row_device(&base_logits, vocab_size)?;
 
         let mut curr_h = if let Some(last_h) = session.get_last_hidden_state() {
-            let vec = last_h.to_vec_f32()?;
-            let offset = vec.len().saturating_sub(hidden_size);
-            vec[offset..].to_vec()
+            grim_nn::modules::slice_last_row_2d_on_device(&last_h)?
         } else {
-            embedding_row_device(
+            embedding_row_tensor(
                 &self.base.tok_embeddings.weight,
                 curr_token,
                 hidden_size,
@@ -367,13 +371,13 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
 
         let mut tokens = Vec::with_capacity(self.mtp_layers.len());
         for layer in &self.mtp_layers {
-            let curr_e = embedding_row_device(
+            let curr_e = embedding_row_tensor(
                 &self.base.tok_embeddings.weight,
                 curr_token,
                 hidden_size,
                 vocab_size,
             )?;
-            let (next_h, next_token) = layer.forward_step(&curr_h, &curr_e)?;
+            let (next_h, next_token) = layer.forward_step_tensor(&curr_h, &curr_e)?;
             tokens.push(next_token);
             curr_h = next_h;
             curr_token = next_token;
@@ -437,14 +441,29 @@ fn argmax_last_row_device(logits: &Tensor, vocab_size: usize) -> Result<u32> {
 
 /// Single-row embedding gather: pulls exactly one hidden-size row from the table (via the device gather kernel), never the whole vocab×hidden table.
 /// OOV tokens clamp to row 0 (matches the legacy host helper).
+fn embedding_row_tensor(
+    weight: &Tensor,
+    tok: u32,
+    hidden_size: usize,
+    vocab_size: usize,
+) -> Result<Tensor> {
+    let tok = if (tok as usize) < vocab_size { tok } else { 0 };
+    Ok(grim_nn::embedding_gather_on_device(
+        weight,
+        &[tok],
+        1,
+        hidden_size,
+    )?)
+}
+
+#[allow(dead_code)]
 fn embedding_row_device(
     weight: &Tensor,
     tok: u32,
     hidden_size: usize,
     vocab_size: usize,
 ) -> Result<Vec<f32>> {
-    let tok = if (tok as usize) < vocab_size { tok } else { 0 };
-    let row = grim_nn::embedding_gather_on_device(weight, &[tok], 1, hidden_size)?;
+    let row = embedding_row_tensor(weight, tok, hidden_size, vocab_size)?;
     Ok(row.to_vec_f32()?)
 }
 
