@@ -10,8 +10,8 @@ use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 use crate::device::roc_device::{CharonBackwardResult, RocmDevice};
 use crate::memory::storage::RocmStorage;
 use crate::{
-    HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFree, hipMemset,
-    hipStreamSynchronize, hipSuccess, upload_device_buffer,
+    HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFreeAsync,
+    hipMemsetAsync, upload_device_buffer,
 };
 
 impl RocmDevice {
@@ -55,7 +55,7 @@ impl RocmDevice {
         // Zero the output buffer before launch: the kernel accumulates per- expert contributions via `atomicAdd`, so any stale bytes in the output storage would be added into the result.
         // This mirrors the `BackendDevice::zeros` path (hipMemset, roc_device.rs:1363).
         check_hip("charon hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         // Plan the launch (wave-aligned block, grid over pairs). Pass the
@@ -115,21 +115,16 @@ impl RocmDevice {
         )?;
 
         // Free the transient routing buffers after the kernel completes.
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -246,7 +241,7 @@ impl RocmDevice {
         )?;
 
         check_hip("moe_mega hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         let mut dest_slots_ptr = upload_device_buffer(self.ordinal, destination_slots)?;
@@ -324,24 +319,18 @@ impl RocmDevice {
 
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                hipFree(dest_slots_ptr);
-                hipFree(offsets_ptr);
-                hipFree(counts_ptr);
-                hipFree(tokens_ptr);
-                hipFree(experts_ptr);
-                hipFree(weights_ptr);
-                hipFree(arrivals_ptr);
-                hipFree(ready_ptr);
-                hipFree(cursor_ptr);
-                hipFree(packed_act_ptr);
-                hipFree(packed_out_ptr);
-                if sync != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "moe_mega hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(dest_slots_ptr, free_stream);
+                let _ = hipFreeAsync(offsets_ptr, free_stream);
+                let _ = hipFreeAsync(counts_ptr, free_stream);
+                let _ = hipFreeAsync(tokens_ptr, free_stream);
+                let _ = hipFreeAsync(experts_ptr, free_stream);
+                let _ = hipFreeAsync(weights_ptr, free_stream);
+                let _ = hipFreeAsync(arrivals_ptr, free_stream);
+                let _ = hipFreeAsync(ready_ptr, free_stream);
+                let _ = hipFreeAsync(cursor_ptr, free_stream);
+                let _ = hipFreeAsync(packed_act_ptr, free_stream);
+                let _ = hipFreeAsync(packed_out_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -589,7 +578,7 @@ impl RocmDevice {
 
         // Output is accumulated via atomicAdd in-kernel; zero first.
         check_hip("charon_grouped hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -636,21 +625,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -699,7 +683,7 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_fp8 hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -754,21 +738,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_fp8 hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -814,7 +793,7 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_mxfp4 hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -869,21 +848,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_mxfp4 hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -929,7 +903,7 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_mxfp8 hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -984,21 +958,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_mxfp8 hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -1041,7 +1010,7 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_q80 hipMemset(output, 0)", unsafe {
-            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1090,21 +1059,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_q80 hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -1135,13 +1099,14 @@ impl RocmDevice {
         let _ = num_experts; // validated by caller; kernel reads per-expert super-blocks
 
         check_hip("charon_grouped_iqk hipMemset(output, 0)", unsafe {
-            hipMemset(
+            hipMemsetAsync(
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_iqk: out has no device ptr".into())
                 })? as *mut c_void,
-                0,
+                 0,
                 out_storage.bytes(),
-            )
+                 self.active_stream(),
+    )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1197,21 +1162,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_iqk hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -1238,13 +1198,14 @@ impl RocmDevice {
         let _ = num_experts;
 
         check_hip("charon_grouped_w8a8_int8 hipMemset(output, 0)", unsafe {
-            hipMemset(
+            hipMemsetAsync(
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_w8a8_int8: out has no device ptr".into())
                 })? as *mut c_void,
-                0,
+                 0,
                 out_storage.bytes(),
-            )
+                 self.active_stream(),
+    )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1297,21 +1258,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_w8a8_int8 hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -1338,13 +1294,14 @@ impl RocmDevice {
         let _ = num_experts;
 
         check_hip("charon_grouped_w8a8_fp8 hipMemset(output, 0)", unsafe {
-            hipMemset(
+            hipMemsetAsync(
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_w8a8_fp8: out has no device ptr".into())
                 })? as *mut c_void,
-                0,
+                 0,
                 out_storage.bytes(),
-            )
+                 self.active_stream(),
+    )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1397,21 +1354,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_w8a8_fp8 hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -1448,13 +1400,14 @@ impl RocmDevice {
         let _ = num_experts;
 
         check_hip("charon_grouped_awq hipMemset(output, 0)", unsafe {
-            hipMemset(
+            hipMemsetAsync(
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_awq: out has no device ptr".into())
                 })? as *mut c_void,
-                0,
+                 0,
                 out_storage.bytes(),
-            )
+                 self.active_stream(),
+    )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1531,21 +1484,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_awq hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)
@@ -1795,16 +1743,16 @@ impl RocmDevice {
 
         // All four output buffers are accumulated via atomicAdd; zero first.
         check_hip("charon_backward hipMemset(d_gate_w, 0)", unsafe {
-            hipMemset(dgw_ptr as *mut c_void, 0, d_gate_w.bytes())
+            hipMemsetAsync(dgw_ptr as *mut c_void, 0, d_gate_w.bytes(), self.active_stream())
         })?;
         check_hip("charon_backward hipMemset(d_up_w, 0)", unsafe {
-            hipMemset(duw_ptr as *mut c_void, 0, d_up_w.bytes())
+            hipMemsetAsync(duw_ptr as *mut c_void, 0, d_up_w.bytes(), self.active_stream())
         })?;
         check_hip("charon_backward hipMemset(d_down_w, 0)", unsafe {
-            hipMemset(ddw_ptr as *mut c_void, 0, d_down_w.bytes())
+            hipMemsetAsync(ddw_ptr as *mut c_void, 0, d_down_w.bytes(), self.active_stream())
         })?;
         check_hip("charon_backward hipMemset(d_x, 0)", unsafe {
-            hipMemset(dx_ptr as *mut c_void, 0, d_x.bytes())
+            hipMemsetAsync(dx_ptr as *mut c_void, 0, d_x.bytes(), self.active_stream())
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1861,21 +1809,16 @@ impl RocmDevice {
             ],
         )?;
 
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
+        // The old per-launch hipStreamSynchronize blocked the host once per MoE
+        // layer per step and serialized the next layer's enqueue; launch errors
+        // are surfaced by launch_compute_kernel's own return code.
         if self.active_capture_stream().is_none() {
             unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(tok_ptr);
-                    hipFree(exp_ptr);
-                    hipFree(w_ptr);
-                    return Err(Error::Backend(format!(
-                        "charon_grouped_backward hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(tok_ptr);
-                hipFree(exp_ptr);
-                hipFree(w_ptr);
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
             }
         }
         Ok(stream)

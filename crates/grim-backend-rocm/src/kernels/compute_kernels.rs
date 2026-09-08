@@ -314,7 +314,7 @@ extern "C" __global__ void grim_silu_mul_backward(
 }
 
 // On-device all_reduce accumulator: out[i] = sum_k inputs[k][i].
-// `inputs` is a device array of `n_inputs` device pointers (each points to `n_elements` floats on.
+// `inputs` is a device array of `n_inputs` device pointers (each points to `n_elements` floats on the device).
 extern "C" __global__ void grim_all_reduce_accum(
     float* out,
     const float* const* inputs,
@@ -328,6 +328,38 @@ extern "C" __global__ void grim_all_reduce_accum(
         acc += inputs[k][i];
     }
     out[i] = acc;
+}
+
+// On-device all_reduce accumulator for F16: out[i] = sum_k inputs[k][i], accumulated in float.
+extern "C" __global__ void grim_all_reduce_accum_f16(
+    __half* out,
+    const __half* const* inputs,
+    int n_inputs,
+    int n_elements
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) return;
+    float acc = 0.0f;
+    for (int k = 0; k < n_inputs; ++k) {
+        acc += __half2float(inputs[k][i]);
+    }
+    out[i] = __float2half(acc);
+}
+
+// On-device all_reduce accumulator for BF16: out[i] = sum_k inputs[k][i], accumulated in float.
+extern "C" __global__ void grim_all_reduce_accum_bf16(
+    hip_bfloat16* out,
+    const hip_bfloat16* const* inputs,
+    int n_inputs,
+    int n_elements
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) return;
+    float acc = 0.0f;
+    for (int k = 0; k < n_inputs; ++k) {
+        acc += float(inputs[k][i]);
+    }
+    out[i] = hip_bfloat16(acc);
 }
 
 // Warp-per-row RMS norm: one warp owns a row; the sum of squares reduces with 5 __shfl_xor butterflies (no barriers).
@@ -785,6 +817,18 @@ mod tests {
         assert!(
             OTHER_KERNEL_SOURCE.contains("b_scale"),
             "b_scale param missing from grim_scale_bias_epilogue"
+        );
+    }
+
+    #[test]
+    fn test_all_reduce_accum_f16_bf16_presence() {
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_all_reduce_accum_f16"),
+            "grim_all_reduce_accum_f16 kernel missing from OTHER_KERNEL_SOURCE"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_all_reduce_accum_bf16"),
+            "grim_all_reduce_accum_bf16 kernel missing from OTHER_KERNEL_SOURCE"
         );
     }
 }

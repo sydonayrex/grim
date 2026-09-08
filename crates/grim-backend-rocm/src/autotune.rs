@@ -367,6 +367,11 @@ pub struct AutotuneConfig {
     /// stochastic. Tuned as a quality/throughput trade-off.
     #[serde(default)]
     pub spec_alpha: f32,
+    /// SPEED-ROC-3: split-K factor recorded from the tuned GEMM winner so
+    /// `matmul_op`'s rocBLAS dispatch can consume the persisted table.
+    /// 0/absent (older JSON tables) = "no recorded preference".
+    #[serde(default)]
+    pub split_k: u32,
 }
 
 impl AutotuneConfig {
@@ -400,6 +405,7 @@ impl Default for AutotuneConfig {
             spec_gamma: Self::default_spec_gamma(),
             spec_acceptance_threshold: Self::default_spec_acceptance_threshold(),
             spec_alpha: Self::default_spec_alpha(),
+            split_k: 0,
         }
     }
 }
@@ -1053,6 +1059,7 @@ mod tests {
             spec_gamma: 8,
             spec_acceptance_threshold: 0.45,
             spec_alpha: 0.25,
+            split_k: 0,
         };
         let json = serde_json::to_string(&cfg).expect("serialize AutotuneConfig with spec fields");
         let restored: AutotuneConfig = serde_json::from_str(&json).expect("deserialize");

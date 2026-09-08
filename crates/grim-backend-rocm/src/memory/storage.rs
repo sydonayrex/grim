@@ -156,21 +156,8 @@ impl RocmStorage {
                 shape.dims()
             );
         }
-        eprintln!(
-            "[grim-backend-rocm] copy_from_host: ENTER ordinal={} bytes={} shape={:?}",
-            ordinal,
-            host_data.len() * 4,
-            shape.dims()
-        );
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
         let arith = dtype.arith;
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
-        eprintln!(
-            "[grim-backend-rocm] copy_from_host: ALLOC OK storage.ordinal={} device_ptr={:?}",
-            storage.ordinal, storage.device_ptr
-        );
-        let _ = std::io::stderr().flush();
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
 
         // WI-M1 context discipline: a synchronous `hipMemcpy` executes in the calling thread's current device context.
@@ -215,11 +202,6 @@ impl RocmStorage {
             },
         };
 
-        eprintln!(
-            "[grim-backend-rocm] copy_from_host: MEMCPY DONE ordinal={} result={}",
-            ordinal, upload_result
-        );
-        let _ = std::io::stderr().flush();
         if upload_result != hipSuccess {
             storage.allocator.free(dev_ptr_void, storage.bytes);
             storage.device_ptr = None;
@@ -459,12 +441,6 @@ impl BackendStorage for RocmStorage {
                 "RocmStorage has no valid device pointer".into(),
             ));
         }
-        eprintln!(
-            "[grim-backend-rocm] RocmStorage::to_cpu_vec_f32: ENTER self.ordinal={} bytes={} dtype={:?} ptr={:?}",
-            self.ordinal, self.bytes, self.dtype, self.device_ptr
-        );
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
         let elem_count = self.shape.elem_count();
 
@@ -590,12 +566,6 @@ impl BackendStorage for RocmStorage {
                 Ok(host_data)
             }
         };
-        eprintln!(
-            "[grim-backend-rocm] RocmStorage::to_cpu_vec_f32: EXIT ok self.ordinal={} out_len={}",
-            self.ordinal,
-            result_f32.as_ref().map(|v| v.len()).unwrap_or(0)
-        );
-        let _ = std::io::stderr().flush();
         result_f32
     }
 

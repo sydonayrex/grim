@@ -1529,6 +1529,7 @@ impl RocmDevice {
                 spec_gamma: 4,
                 spec_acceptance_threshold: 0.6,
                 spec_alpha: 0.0,
+                split_k: 0,
             };
             let _ = tuner.record(key, cfg);
             let _ = self.save_autotune_cache(std::path::Path::new(&format!(
@@ -1630,6 +1631,7 @@ impl RocmDevice {
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: 0,
         };
         if let Ok(mut tuner) = self.autotuner.lock() {
             let _ = tuner.record(key, cfg);

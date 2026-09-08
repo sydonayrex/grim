@@ -56,6 +56,10 @@ default = ["jit-hw-adaptive", "cubecl", "q2k", "q3k", "q4k", "q5k", "q6k"]
 rocm = []
 jit-hw-adaptive = ["rocm"]
 multi-gpu-kernel = ["rocm"]
+# SPEED-ROC-5: one switch for multi-GPU training/inference builds. Pulls in
+# RCCL so cross-GPU collectives run on-device instead of falling back to the
+# host-staging ring (D2H -> CPU sum -> H2D) in ParallelCommunicator.
+multi-gpu = ["multi-gpu-kernel", "rccl"]
 rocm-profile = ["rocm"]
 ncu = []
 
