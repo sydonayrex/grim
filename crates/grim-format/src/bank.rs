@@ -1,15 +1,10 @@
 //! Host memory bank management with lazy mmap and pin-after-fill direct I/O.
-//!
-//! Allocates lazy virtual memory allocations (`MAP_ANONYMOUS | MAP_PRIVATE`)
-//! without immediate page commit, streams weights directly from disk into the
-//! uncommitted buffer (optionally using `O_DIRECT` DMA), and registers the memory
-//! region with the GPU runtime (`pin()`) *after* filling. This avoids redundant
-//! kernel zero-fill overhead during model bootstrap.
+//! Allocates lazy virtual memory allocations (`MAP_ANONYMOUS | MAP_PRIVATE`) without immediate page commit, streams weights directly.
 
+use grim_tensor::error::{Error, Result};
 use std::fs::File;
 use std::io::Read;
 use std::os::raw::c_void;
-use grim_tensor::error::{Error, Result};
 
 /// Fill flags controlling disk-to-host transfer behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,17 +28,17 @@ unsafe impl Sync for HostBank {}
 
 impl HostBank {
     /// Allocate an uncommitted lazy virtual memory bank of size `len`.
-    ///
-    /// # Contracts
-    /// * `len > 0`
+    /// # Contracts * `len > 0`
     pub fn mmap_lazy(len: usize) -> Result<Self> {
         if len == 0 {
-            return Err(Error::Backend("HostBank: cannot allocate 0-sized bank".into()));
+            return Err(Error::Backend(
+                "HostBank: cannot allocate 0-sized bank".into(),
+            ));
         }
 
         // Align len to 4096-byte page boundary
         let page_size = 4096usize;
-        let aligned_len = ((len + page_size - 1) / page_size) * page_size;
+        let aligned_len = len.div_ceil(page_size) * page_size;
 
         let ptr = unsafe {
             libc::mmap(
@@ -116,7 +111,7 @@ impl HostBank {
     /// Check if pages are physically resident in memory using `mincore`.
     pub fn is_resident(&self) -> bool {
         let page_size = 4096usize;
-        let num_pages = (self.len + page_size - 1) / page_size;
+        let num_pages = self.len.div_ceil(page_size);
         let mut vec = vec![0u8; num_pages];
         let ret = unsafe {
             libc::mincore(
@@ -176,7 +171,7 @@ impl Drop for HostBank {
             }
         }
         let page_size = 4096usize;
-        let aligned_len = ((self.len + page_size - 1) / page_size) * page_size;
+        let aligned_len = self.len.div_ceil(page_size) * page_size;
         unsafe {
             libc::munmap(self.ptr as *mut c_void, aligned_len);
         }

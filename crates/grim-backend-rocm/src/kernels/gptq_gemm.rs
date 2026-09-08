@@ -1,32 +1,5 @@
 //! GPTQ / EfficientQAT GroupInt fused dequant-GEMM HIP kernels.
-//!
-//! Consumes the length-prefixed four-segment packed layout documented on
-//! [`grim_tensor::dtype::GpuIntConfig`]:
-//!
-//! ```text
-//! [u64 LE: qweight_len][qweight][u64 LE: qzeros_len][qzeros]
-//! [u64 LE: scales_len][scales][u64 LE: g_idx_len][g_idx]
-//! ```
-//!
-//! The four segments live contiguously in ONE device buffer (the weight blob
-//! is immutable), so the kernels address them IN PLACE through interior
-//! pointers computed on the host from the segment lengths. No per-GEMM split,
-//! no per-call H2D re-upload of scales — mirrors the MXFP4 framed-blob
-//! treatment in `roc_device.rs`. Segment boundaries are all 4-byte multiples
-//! (qweight/qzeros/scales are u32 arrays; g_idx is u32/u64), and device
-//! allocations are >=256B aligned, so every interior pointer stays 4-byte
-//! aligned for the u32/float loads below.
-//!
-//! Dequant semantics match `grim_quant::dequant_gptq_group_int` exactly:
-//! asymmetric `(code - (zero + 1)) * scale`, GPTQ/BitBLAS cross-word packing
-//! for 3-bit codes (32 values across 3 consecutive u32 words), and optional
-//! act-order `g_idx` permutation (stored as u32 or u64 LE).
-//!
-//! A [in_features, out_features] weight is stored column-packed: `qweight`
-//! word index = (in_idx / values_per_word) * out_features + out_idx, so the
-//! logical B consumed here is [K=in, N=out] and the kernel indexes `col`
-//! over N — the same [out, in] relabel contract the ROCm KQuant fused path
-//! uses (`transpose_last_two` relabels without moving bytes).
+//! Consumes the length-prefixed four-segment packed layout documented on [`grim_tensor::dtype::GpuIntConfig`]: ```text [u64 LE: qweight_len][qweight][u64 LE: qzeros_len][qzeros].
 
 pub const GPTQ_GEMM_KERNEL_SOURCE: &str = r#"
 // ---- GPTQ GroupInt dequant helpers (device-only, unique symbol prefix) ----
@@ -36,9 +9,8 @@ static inline __device__ unsigned int grim_gptq_read_u32(
     return *(const unsigned int*)(base + word_idx * 4);
 }
 
-// Read a 3-bit code packed GPTQ/BitBLAS style: values 0-31 of a super-block
-// span three consecutive u32 words (0-10 in word0, 11-21 in word1, 22-31 in
-// word2).
+// Read a 3-bit code packed GPTQ/BitBLAS style: values 0-31 of a super-block span
+// three consecutive u32 words (0-10 in word0, 11-21 in word1, 22-31 in word2).
 static inline __device__ unsigned int grim_gptq_read_code3(
     const unsigned char* qweight, long long base_word, int lane)
 {
@@ -168,8 +140,7 @@ mod tests {
     use super::*;
 
     /// CPU mirror of the kernel's dequant arithmetic for parity tests.
-    /// Mirrors `grim_quant::dequant_gptq_group_int` semantics restricted to
-    /// what the kernel implements (non-desc_act handled via g_idx segment).
+    /// Mirrors `grim_quant::dequant_gptq_group_int` semantics restricted to what the kernel implements (non-desc_act handled via g_idx segment).
     pub fn cpu_reference_w_row(
         qweight: &[u8],
         qzeros: &[u8],
@@ -260,9 +231,8 @@ mod tests {
                 ]);
                 let updated = cur | (code << off);
                 qweight[w * 4..w * 4 + 4].copy_from_slice(&updated.to_le_bytes());
-                // Oracle values match the per-group data written below:
-                // group `g` carries zero/scale as a function of its group-index
-                // `g*gs` and the output column `ni`, exactly what the decoder reads.
+                // Oracle values match the per-group data written below: group `g` carries zero/scale as a
+                // function of its group-index `g*gs` and the output column `ni`, exactly what the decoder reads.
                 let zero = ((g * gs + ni) % 8) as f32 + 1.0;
                 let scale = 0.25 + 0.5 * ((g * gs + ni) % 3) as f32;
                 expect[ki * n + ni] = (code as f32 - zero) * scale;
@@ -342,9 +312,8 @@ mod tests {
         // Element (k=0,n=0): code 0, group from g_idx[0]=1 → scale row 1 → 1.0, zero 1 → w=-1.
         let got = cpu_reference_w_row(&qweight, &qzeros, &scales, Some(&g_idx), 0, 0, n, bits, gs);
         assert!((got - (-1.0)).abs() < 1e-6, "got {got}");
-        // Without g_idx it would have been group 0 → also 1.0 scale here, but
-        // check an index where the two groups differ in effect via code choice:
-        // k=1,n=0: code 1, permuted group=1 → w = (1-1)*1 = 0.
+        // Without g_idx it would have been group 0 → also 1.0 scale here, but check an index where the
+        // two groups differ in effect via code choice: k=1,n=0: code 1, permuted group=1 → w = (1-1)*1 = 0.
         let got2 = cpu_reference_w_row(&qweight, &qzeros, &scales, Some(&g_idx), 1, 0, n, bits, gs);
         assert!(got2.abs() < 1e-6, "got {got2}");
     }

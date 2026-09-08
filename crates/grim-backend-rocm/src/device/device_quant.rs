@@ -10,18 +10,16 @@ use grim_tensor::{BackendStorage, CoreTensorOps, QuantOps, Shape};
 
 use crate::device::gemm_tuning::lookup_solution_index;
 use crate::device::roc_device::{
-    RocmDevice, FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS,
+    FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
 };
 use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemcpyAsync, hipStreamSynchronize,
-    linear_launch, HipDim3, HipMemcpyKind, RocmHandle,
+    HipDim3, HipMemcpyKind, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32,
+    hipMemcpyAsync, hipStreamSynchronize, linear_launch,
 };
 
 impl QuantOps for RocmDevice {
-
-
     fn quantize(
         &self,
         x: &dyn BackendStorage,
@@ -30,7 +28,6 @@ impl QuantOps for RocmDevice {
         let (out, _handle) = self.quantize_on_device(x, format)?;
         Ok(out)
     }
-
 
     fn quantized_matmul(
         &self,
@@ -146,21 +143,8 @@ impl QuantOps for RocmDevice {
                 }
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
-                // The MXFP4 kernel reads one E8M0 exponent per 32-element block
-                // (block_idx = (col*K+k)/32) and expects B_codes / B_exps as
-                // separate device buffers. Weight tensors carry the
-                // length-prefixed framing [u64 codes_len][codes][u64
-                // exps_len][exps]; both segment lengths are derivable from the
-                // shape. The framed segments are addressed IN PLACE via
-                // interior pointers — the weight blob is immutable, so the
-                // former per-call split (two allocations + two synchronous
-                // DtoD copies of the whole weight per GEMM per layer per token)
-                // was pure overhead. Alignment: device allocations are
-                // >=256B-aligned and codes_len = N*K/2 is a multiple of 16 for
-                // any K multiple of 32, so both interior pointers stay
-                // 16B-aligned for vectorized kernel loads. Legacy codes-only
-                // buffers (no framing) keep the _b_scales / dummy exponent
-                // path and pass B through unchanged.
+                // The MXFP4 kernel reads one E8M0 exponent per 32-element block (block_idx = (col*K+k)/32) and expects B_codes / B_exps as separate device buffers.
+                // Weight tensors carry the length-prefixed framing [u64 codes_len][codes][u64 exps_len][exps]; both segment lengths are derivable from.
                 let elems = k * n;
                 let codes_len = elems / 2;
                 let exps_len = elems.div_ceil(32);
@@ -169,9 +153,8 @@ impl QuantOps for RocmDevice {
                     .device_ptr_u64()
                     .ok_or_else(|| Error::Backend("mxfp4 gemm: b has no device ptr".into()))?;
 
-                // Keep any transient exponent storage alive until after the
-                // kernel launch below (single-stream ordering makes pooled
-                // reuse safe once this binding drops).
+                // Keep any transient exponent storage alive until after the kernel launch
+                // below (single-stream ordering makes pooled reuse safe once this binding drops).
                 let exps_storage: Option<RocmStorage>;
                 let (codes_ptr, exps_ptr): (u64, u64) = if b_storage.bytes == framed_len {
                     exps_storage = None;
@@ -239,9 +222,8 @@ impl QuantOps for RocmDevice {
                         k,
                     )?;
                 }
-                // Keep any transient exponent storage alive until the kernel
-                // launch(es) above are enqueued on the active stream. Pooled
-                // reuse is only safe once the transitive storage drops.
+                // Keep any transient exponent storage alive until the kernel launch(es) above are enqueued on the active stream.
+                // Pooled reuse is only safe once the transitive storage drops.
                 drop(exps_storage);
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
@@ -263,6 +245,13 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                 )?;
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::NvFp4) => {
+                if m <= 4 {
+                    self.launch_nvfp4_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_nvfp4_gemm_tiled(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::ResidualPacked(cfg) => {
                 // Generic variable-bitwidth packed + residual layout (WI-C / WI-T8): [see: `grim_fused_dequant_gemm_f16`, `enabled`]
@@ -392,10 +381,8 @@ impl QuantOps for RocmDevice {
                 return Ok((Box::new(out_f32), handle));
             }
             DTypeStorage::GroupInt(cfg) => {
-                // GPTQ/EfficientQAT fused dequant-GEMM: the packed four-segment
-                // blob stays resident on-device and the kernel dequantizes
-                // in-kernel (previously this arm fell through to `_ =>`,
-                // forcing a host-side F32 inflation of every GPTQ weight).
+                // GPTQ/EfficientQAT fused dequant-GEMM: the packed four-segment blob stays resident on-device and the kernel dequantizes in-kernel (previously
+                // this arm fell through to `_ =>`, forcing a host-side F32 inflation of every GPTQ weight).
                 if !matches!(cfg.bits, 2 | 4 | 8) {
                     return Err(Error::Backend(format!(
                         "gptq quantized_matmul: unsupported bit width {}",
@@ -523,7 +510,6 @@ impl QuantOps for RocmDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-
     /// WI-F5-close: fused dequant backward dispatch (the lattice point [see: `grim-autograd::matmul_backward`]
     fn quantized_matmul_backward_dx(
         &self,
@@ -606,17 +592,7 @@ impl QuantOps for RocmDevice {
         };
 
         // Pack scales into a temporary ROCm buffer so the kernel can reach them.
-        // `grim_fused_dequant_backward_gemm_f16` (and the matching forward
-        // `grim_fused_dequant_gemm_f16`) read scales as `const unsigned char*`
-        // and divide by 255.0f to recover a [0, 1] per-column scale. The
-        // caller (`grim-autograd::matmul_backward`) hands us float scales —
-        // for formats like `ResidualPacked`/`GroupInt` these are arbitrary
-        // positive reals (`with_quant_scales(vec![2.5f32, 2.5f32])`). Uploading
-        // them as raw F32 and casting to `unsigned char*` would have the kernel
-        // read the IEEE-754 exponent byte as the scale, producing garbage. We
-        // quantize F32→U8 here so the kernel contract holds: `scale_byte / 255.0f`
-        // is a normalized factor. Values > 1.0 saturate at 255; this is the
-        // intended contract for the WI-C residual-packed fallback path.
+        // `grim_fused_dequant_backward_gemm_f16` (and the matching forward `grim_fused_dequant_gemm_f16`) read scales as `const unsigned char*` and divide by.
         let scales_storage = if b_scales.is_empty() {
             None
         } else {
@@ -844,12 +820,8 @@ impl QuantOps for RocmDevice {
                 )?;
             }
             DTypeStorage::ResidualPacked(cfg) => {
-                // Mirror the forward `enabled` gate: when the fused backward path
-                // is disabled, fall back to a standard matmul of dY against the
-                // transposed dequantized B (same behavior as the forward fallback
-                // at line ~2252). This fixes the asymmetry where the forward
-                // dispatch honors `FusedDequantGemmConfig::enabled` but the
-                // backward dispatch unconditionally calls the fused kernel.
+                // Mirror the forward `enabled` gate: when the fused backward path is disabled, fall back to a standard matmul of dY against the transposed dequantized B (same behavior as the forward fallback at line ~2252).
+                // This fixes the asymmetry where the forward dispatch honors `FusedDequantGemmConfig::enabled` but the backward dispatch unconditionally.
                 if !self.fused_dequant_gemm_enabled.load(Ordering::Relaxed) {
                     FUSED_BACKWARD_DISPATCH_STATS
                         .fallback_calls
@@ -877,16 +849,12 @@ impl QuantOps for RocmDevice {
                 )?;
             }
             DTypeStorage::Native => {
-                // Unquantized weights: no dequant needed. Use straight matmul
-                // (dY @ B^T). This was previously falling through to the fused
-                // backward kernel, which is incorrect for native FP16/BF16 weights.
+                // Unquantized weights: no dequant needed. Use straight matmul (dY @ B^T).
                 return self.matmul(dy, b_packed, out_shape);
             }
             DTypeStorage::GroupInt(cfg) => {
-                // GPTQ/EfficientQAT fused dequant backward: mirror the forward
-                // GroupInt arm instead of falling into the ResidualPacked-style
-                // `_` catch-all, whose kernel ABI (u8 scales / backup regions)
-                // does not match the GPTQ packed layout.
+                // GPTQ/EfficientQAT fused dequant backward: mirror the forward GroupInt arm instead of falling into the ResidualPacked-style `_`
+                // catch-all, whose kernel ABI (u8 scales / backup regions) does not match the GPTQ packed layout.
                 if !matches!(cfg.bits, 2 | 4 | 8) {
                     return Err(Error::Backend(format!(
                         "gptq quantized_matmul_backward_dx: unsupported bit width {}",
@@ -1016,11 +984,7 @@ impl QuantOps for RocmDevice {
     }
 }
 
-
-
-
 impl RocmDevice {
-
     /// Launch the JIT compiled fused dequantization GEMM kernel for [see: `b_storage`, `Storage::ResidualPacked`]
     pub(crate) fn launch_fused_dequant_gemm_f16(
         &self,
@@ -1123,20 +1087,8 @@ impl RocmDevice {
         )
     }
 
-    /// Launch the Charon fused MoE dispatch kernel (`rocm_kernel_plan.md`
-    /// WI-A). Single sortless launch: each block reads its (token, expert)
-    /// pair from the uploaded routing arrays and performs the fused
-    /// gate+up→SiLU→down→weighted-accumulate.
-    ///
-    /// Device-gated: only callable with real `RocmStorage` device buffers.
-    /// The host-logic half (routing flatten + grid/block plan + arg
-    /// marshalling) is unit-tested without a device in
-    /// `kernels::charon::tests` (G-A2).
-    ///
-    /// VERIFIED(gpu-verify): Parity vs the CPU oracle (`MoeFfn::forward`) is G-A4.
-    /// Verified end-to-end numeric parity vs `MoeFfn::forward` on physical
-    /// hardware (`gfx1036`) in `tests/moe_ffn_device_chaining_parity.rs` and
-
+    /// Launch the Charon fused MoE dispatch kernel (`rocm_kernel_plan.md` WI-A).
+    /// Single sortless launch: each block reads its (token, expert) pair from the uploaded routing arrays.
     pub(crate) fn launch_fused_dequant_backward_gemm_f16(
         &self,
         dy_storage: &RocmStorage,
@@ -1209,8 +1161,7 @@ impl RocmDevice {
         let mut b2_scale_off = backup2_scale_offset as i32;
 
         // STE: grad_scale = 1.0 for pure identity (straight-through estimator).
-        // The quantize→dequantize step receives zero gradient — the upstream
-        // gradient flows straight through to the dequantized weight values.
+        // The quantize→dequantize step receives zero gradient - the upstream gradient flows straight through to the.
         let mut grad_scale: f32 = 1.0;
 
         self.launch_compute_kernel(
@@ -1242,17 +1193,8 @@ impl RocmDevice {
         )
     }
 
-    /// FUSED-QUANT-BWD §4: Launch the M+Adam fused optimizer-step kernel.
-    ///
-    /// Runs AFTER the backward GEMM kernel so all tile-level gradients in `dX`
-    /// are fully accumulated before scale-bump propagation begins (fixes the
-    /// stale-scale one-step concern from new_methods.md §Caveats).
-    ///
-    /// Updates `weight` and `scale` in-place using M+Adam's additive-multiplicative
-    /// split: momentum in FP8-simulated precision, scale-bump propagation in BF16.
-    #[allow(dead_code)] // kernel launcher, not yet wired into this build's call graph
-
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
+    #[allow(dead_code)] // kernel launcher, not yet wired into this build's call graph
     pub(crate) fn launch_fused_dequant_gemm_q4k(
         &self,
         a_storage: &RocmStorage,
@@ -1307,9 +1249,7 @@ impl RocmDevice {
     }
 
     /// Launch the JIT compiled Q4_K fused dequantization backward matmul kernel (Crow Tier).
-    /// `b_scales_ptr` is accepted for interface parity with the f16 fallback;
-    /// KQuant blocks carry their own per-block scales inline and the kernel
-    /// does not consume it (passing null here is the KQuant contract).
+    /// `b_scales_ptr` is accepted for interface parity with the f16 fallback; KQuant blocks carry their own.
     pub(crate) fn launch_fused_dequant_backward_gemm_q4k(
         &self,
         dy_storage: &RocmStorage,
@@ -1608,6 +1548,36 @@ impl RocmDevice {
         )
     }
 
+    /// Standalone NVFP4 dequant: decompress NVFP4 codes + interleaved scales to F32.
+    pub(crate) fn launch_dequant_nvfp4(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_weights: usize,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant_nvfp4: packed has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant_nvfp4: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_weights as u64).div_ceil(BLOCK_SIZE as u64))
+            .try_into()
+            .map_err(|_| Error::Backend("dequant_nvfp4: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_w = n_weights as i32;
+        self.launch_compute_kernel(
+            "grim_dequant_nvfp4",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_w)],
+        )
+    }
+
     // ─── Standalone IQ dequant launchers ──────────────────────────
 
     pub(crate) fn launch_dequant_iq2xxs(
@@ -1708,10 +1678,8 @@ impl RocmDevice {
         )
     }
 
-    /// Public dequant service (quant workstream): WNA16 packed blob → F32
-    /// weights, decoded on-device. Layout contract mirrors
-    /// `Storage::WNA16`: [u32 n_bit][u32 num_blocks][codes][f16 block
-    /// scales][f32 tensor scale], 256-weight blocks, MSB-first codes.
+    /// Public dequant service (quant workstream): WNA16 packed blob → F32 weights, decoded on-device.
+    /// Layout contract mirrors `Storage::WNA16`: [u32 n_bit][u32 num_blocks][codes][f16 block scales][f32 tensor scale], 256-weight blocks, MSB-first codes.
     pub fn dequant_wna16_blob_to_f32(
         &self,
         blob: &dyn BackendStorage,
@@ -1795,10 +1763,8 @@ impl RocmDevice {
         )
     }
 
-    /// Public dequant service (quant workstream): EmbeddingWNA16Int packed
-    /// blob → F32 embedding table, decoded on-device. Layout contract
-    /// mirrors `Storage::EmbeddingWNA16Int`: [u32 n_bit][u32
-    /// embedding_dim][u32 num_rows][codes MSB-first].
+    /// Public dequant service (quant workstream): EmbeddingWNA16Int packed blob → F32 embedding table, decoded on-device.
+    /// Layout contract mirrors `Storage::EmbeddingWNA16Int`: [u32 n_bit][u32 embedding_dim][u32 num_rows][codes MSB-first].
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_embedding_wna16_int_to_f32(
         &self,
@@ -2300,9 +2266,8 @@ impl RocmDevice {
         Ok(values)
     }
 
-    /// Dequantize Q4_K packed bytes to F32 on the GPU. [see: `block_q4_K`]
-    /// `packed` must hold `n_blocks` × 144-byte super-blocks; `out` must hold
-    /// `n_blocks` × 256 F32 values.
+    /// Dequantize Q4_K packed bytes to F32 on the GPU.
+    /// [see: `block_q4_K`] `packed` must hold `n_blocks` × 144-byte super-blocks; `out` must hold `n_blocks` × 256.
     pub fn dequantize_q4k(&self, packed: &RocmStorage) -> Result<RocmStorage> {
         const QK4_K: usize = 256;
         const BLOCK_BYTES: usize = 144;
@@ -2539,6 +2504,33 @@ impl RocmDevice {
     /// Dequantize an MXFP8 single-buffer roster (length-prefixed codes/exps segments) to f32.
     pub fn dequantize_mxfp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
         self.split_dequant_mxfp(bytes, elem_count, "mxfp8")
+    }
+
+    /// Dequantize NVFP4 interleaved packed bytes (1 E8M0 scale byte + 8 codes per 16 weights) to f32.
+    pub fn dequantize_nvfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = RocmStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dequant_nvfp4(&packed, &out_storage, elem_count)?;
+        let mut values = self.read_to_host_async(&out_storage)?;
+        values.truncate(elem_count);
+        Ok(values)
     }
 
     /// Dequantize Q8_0 packed bytes to F32. `n_blocks` is the number of [see: `packed`, `packed.bytes / 34`]
@@ -2798,10 +2790,7 @@ impl RocmDevice {
     }
 
     /// Launch the JIT compiled tiled MXFP4 GEMM kernel.
-    ///
-    /// `b_codes_ptr` / `b_exps_ptr` are raw device pointers: either standalone
-    /// storages or interior pointers into a framed weight blob (see the
-    /// `MxFp4` arm of `quantized_matmul`).
+    /// `b_codes_ptr` / `b_exps_ptr` are raw device pointers: either standalone storages or interior pointers into a.
     pub fn launch_mxfp4_gemm_tiled(
         &self,
         a_storage: &RocmStorage,
@@ -2819,9 +2808,8 @@ impl RocmDevice {
                 "mxfp4_gemm_tiled: K must be a multiple of 32, got {k}"
             )));
         }
-        // Skinny-M decode: a plain (n/16, m/16) grid leaves most CUs idle
-        // (e.g. m=1, n=4096 -> 16 CTAs on a 28+ CU part). Route to the
-        // split-K pair so the K dimension spreads work across the device.
+        // Skinny-M decode: a plain (n/16, m/16) grid leaves most CUs idle (e.g.
+        // m=1, n=4096 -> 16 CTAs on a 28+ CU part).
         if m <= 8 && k >= 2048 {
             return self.launch_mxfp4_gemm_splitk(
                 a_storage,
@@ -2869,9 +2857,8 @@ impl RocmDevice {
         )
     }
 
-    /// Split-K MXFP4 GEMM for skinny-M decode (M <= 8): slice K across CUs,
-    /// reduce the partials deterministically. Kept as two launches so the
-    /// result is bit-stable across runs (no float atomics).
+    /// Split-K MXFP4 GEMM for skinny-M decode (M <= 8): slice K across CUs, reduce the partials deterministically.
+    /// Kept as two launches so the result is bit-stable across runs (no float atomics).
     pub(crate) fn launch_mxfp4_gemm_splitk(
         &self,
         a_storage: &RocmStorage,
@@ -2957,6 +2944,96 @@ impl RocmDevice {
         // `partials` drops to the pool here; same-stream reuse is ordered
         // after both kernels above.
         Ok(stream)
+    }
+
+    /// Fused NVFP4 GEMV with cooperative Wave reduction in LDS (for decode batch M <= 4).
+    pub fn launch_nvfp4_gemv(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("nvfp4_gemv: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("nvfp4_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("nvfp4_gemv: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new(n as u32, m as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_nvfp4_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Tiled NVFP4 GEMM for prefill batch (M > 4).
+    pub fn launch_nvfp4_gemm_tiled(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("nvfp4_gemm_tiled: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("nvfp4_gemm_tiled: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("nvfp4_gemm_tiled: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_dim = HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_nvfp4_gemm_tiled",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// Launch the JIT compiled backward MXFP4 GEMM kernel (dA = dY @ B^T).
@@ -3175,12 +3252,7 @@ impl RocmDevice {
     }
 
     /// Launch the GPTQ/EfficientQAT GroupInt fused dequant-GEMM (forward).
-    ///
-    /// `b_storage` holds the documented length-prefixed four-segment packed
-    /// layout (`GpuIntConfig`); `qw/qz/sc/gi` are byte offsets of each segment
-    /// within that blob, addressed in place by the kernel. B packs a [K, N]
-    /// weight ([in, out], GPTQ column-packed), matching the relabel contract
-    /// of the ROCm quantized fast path.
+    /// `b_storage` holds the documented length-prefixed four-segment packed layout (`GpuIntConfig`); `qw/qz/sc/gi` are byte offsets of each.
     pub(crate) fn launch_gptq_dequant_gemm(
         &self,
         a_storage: &RocmStorage,
@@ -3267,8 +3339,7 @@ impl RocmDevice {
     }
 
     /// Launch the GPTQ/EfficientQAT GroupInt fused dequant-GEMM (backward).
-    /// Computes `dX[M, K] = dY[M, N] @ dequant(B)` from the same packed blob
-    /// as [`Self::launch_gptq_dequant_gemm`].
+    /// Computes `dX[M, K] = dY[M, N] @ dequant(B)` from the same packed blob as [`Self::launch_gptq_dequant_gemm`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_gptq_dequant_backward_gemm(
         &self,
@@ -3355,20 +3426,8 @@ impl RocmDevice {
         )
     }
 
-    /// Compute the length-prefixed GroupInt segment offsets for a packed
-    /// weight blob of `blob_bytes` bytes. Returns
-    /// `(qw_off, qz_off, sc_off, gi_off, has_g_idx)`.
-    ///
-    /// The four segments follow the documented `GpuIntConfig` convention:
-    /// `[u64 len][qweight][u64 len][qzeros][u64 len][scales][u64 len][g_idx]`,
-    /// so every offset is derivable from `(bits, group_size, k, n)` alone —
-    /// no host-side copy of the blob is needed. The declared total is
-    /// validated against `blob_bytes` (with and without a trailing g_idx
-    /// segment, since providers emit an empty-length g_idx segment when the
-    /// checkpoint has no act-order permutation) so a truncated or corrupt
-    /// blob errors loudly here instead of faulting inside the kernel.
-    /// A g_idx stored as u64 (rather than u32) is rejected explicitly — the
-    /// kernel reads u32 indices only.
+    /// Compute the length-prefixed GroupInt segment offsets for a packed weight blob of `blob_bytes` bytes.
+    /// Returns `(qw_off, qz_off, sc_off, gi_off, has_g_idx)`.
     pub(crate) fn gptq_segment_offsets(
         bits: u8,
         group_size: usize,
@@ -3392,10 +3451,8 @@ impl RocmDevice {
         let qz_len = groups * n.div_ceil(vpw) * 4;
         let sc_len = groups * n * 4;
 
-        // Each segment is preceded by ITS OWN u64 length prefix:
-        //   [u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx]
-        // so data starts are 8 / (8+qw+8) / (8+qw+8+qz+8) / (+8+sc), and the
-        // blob ends with the (possibly empty-length) g_idx prefix.
+        // Each segment is preceded by ITS OWN u64 length prefix: [u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx] so data starts
+        // are 8 / (8+qw+8) / (8+qw+8+qz+8) / (+8+sc), and the blob ends with the (possibly empty-length) g_idx prefix.
         let qz_data = 8 + qw_len + 8;
         let sc_data = qz_data + qz_len + 8;
         let gi_data = sc_data + sc_len + 8;
@@ -3424,9 +3481,7 @@ impl RocmDevice {
     }
 
     /// Launch the AWQ fused dequant-GEMM (forward).
-    /// Computes `C[M, N] = A[M, K] @ dequant(B)^T` where B is packed in the
-    /// native AWQ 3-segment length-prefixed layout:
-    /// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales (f16)]`.
+    /// Computes `C[M, N] = A[M, K] @ dequant(B)^T` where B is packed in the native.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_awq_dequant_gemm(
         &self,
@@ -3628,11 +3683,8 @@ impl RocmDevice {
         Ok((8, qz_data as i64, sc_data as i64))
     }
 
-    /// Audit-wiring (quant workstream): W4A16 blobs are a SINGLE packed
-    /// segment pair — `[codes (N*K/8 u32)][scales (N*groups f32)]` per the
-    /// `Storage::W4A16` layout contract — so the dense dispatch path needs a
-    /// launcher that derives the scales pointer from the same device buffer
-    /// instead of requiring two separate storages.
+    /// Audit-wiring (quant workstream): W4A16 blobs are a SINGLE packed segment pair - `[codes (N*K/8 u32)][scales (N*groups f32)]` per the `Storage::W4A16` layout contract -
+    /// so the dense dispatch path needs a launcher that derives the scales pointer from the same device buffer instead of requiring two separate storages.
     pub fn launch_marlin_gemm_w4a16_blob(
         &self,
         a_storage: &RocmStorage,
@@ -3829,12 +3881,8 @@ impl RocmDevice {
         Ok((n_bit, num_blocks))
     }
 
-    /// Public materialization service (quant workstream): dequantize a
-    /// Marlin W4A16 packed expert blob to row-major F32 [k_dim? no —]
-    ///
-    /// Returns Dᵀ flattened ([k_dim, n_rows] where C = A @ Dᵀ was computed
-    /// with an identity activation), i.e. the caller transposes if it needs
-    /// row-major [n_rows, k_dim].
+    /// Public materialization service (quant workstream): dequantize a Marlin W4A16 packed expert blob to row-major F32 [k_dim?
+    /// no -] Returns Dᵀ flattened ([k_dim, n_rows] where C = A @ Dᵀ was computed.
     pub fn dequant_w4a16_blob_to_f32(
         &self,
         blob: &RocmStorage,
@@ -3866,9 +3914,8 @@ impl RocmDevice {
         Ok(Box::new(out))
     }
 
-    /// Public materialization service (quant workstream): run the GPTQ
-    /// forward-dequant GEMM with an identity activation so C = D, the full
-    /// row-major [n_out, k_in] dequantized weight.
+    /// Public materialization service (quant workstream): run the GPTQ forward-dequant GEMM with an
+    /// identity activation so C = D, the full row-major [n_out, k_in] dequantized weight.
     #[allow(clippy::too_many_arguments)]
     pub fn gptq_dequant_identity_to_f32(
         &self,
@@ -4346,7 +4393,6 @@ impl RocmDevice {
     }
 }
 
-
 /// P1-WI-1: pure routing decision for the WMMA GEMM path. Extracted from [see: `RocmDevice::should_use_wmma_path`]
 pub(crate) fn wmma_route_decision(
     ext: Option<&grim_format::spec::GrimTensorExt>,
@@ -4412,6 +4458,9 @@ impl grim_format::convert::GpuDequant for RocmDevice {
             }
             Storage::FloatPack(FloatPackScheme::MxFp8) => {
                 Ok(Some(self.dequantize_mxfp8_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::NvFp4) => {
+                Ok(Some(self.dequantize_nvfp4_host(bytes, elem_count)?))
             }
             Storage::Block(BlockDtype::Fp8 | BlockDtype::Fp8Block16) => {
                 Ok(Some(self.dequantize_fp8_host(bytes, elem_count)?))

@@ -1,20 +1,5 @@
-//! Qwen3.8-Flash-Next architecture with Hybrid Gated DeltaNet + QSA Attention,
-//! Gated Residual streams, N-gram embeddings, and 512 Fine-Grained Routed Experts.
-//!
-//! # Architecture Details
-//! - **Hybrid Attention**: Interleaved 3:1 Gated DeltaNet (GDN) linear attention and Qwen Sparse Attention (QSA).
-//! - **Gated Residual Streams**: 4-branch residual stream with dynamic read/write gating.
-//! - **Fine-Grained MoE**: 512 routed experts (top-10 routed per token) plus dedicated shared expert pathways.
-//! - **N-Gram Embeddings**: Auxiliary high-order token/n-gram projection table.
-//! - **YaRN RoPE**: Interleaved multimodal M-RoPE with dynamic frequency scaling.
-//! - **Physical Checkpoint Parity**: Weight-loading pathways and numerical transforms
-//!   are verified against real disk SafeTensors shard `models/qwen3.8-model-00001-of-00131.safetensors`
-//!   via `grim_format::tprov::SafetensorsProvider`.
-//!
-//! # Contract & Verification
-//! Real BF16 tensor weights parsed from the checkpoint container are verified for
-//! layer-group mappings (`hyper_connection_mixer`, `attn_hyper_connection`, `linear_attn`)
-//! with exact mathematical signal propagation and non-divergence guarantees.
+//! Qwen3.8-Flash-Next architecture with Hybrid Gated DeltaNet + QSA Attention, Gated Residual streams, N-gram embeddings, and 512 Fine-Grained Routed Experts.
+//! # Architecture Details - **Hybrid Attention**: Interleaved 3:1 Gated DeltaNet (GDN) linear attention and Qwen.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -23,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Qwen3.8-Flash-Next architecture (matching HuggingFace `qwen4_exp_text`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -121,9 +104,7 @@ impl ModelConfig for Qwen38FlashNextConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Hyper-Connection Mixer (Residual Stream Routing)
-// ---------------------------------------------------------------------------
 
 /// Hyper-Connection Mixer performing low-rank multi-branch residual projection.
 #[derive(Clone)]
@@ -135,11 +116,24 @@ pub struct Qwen38HyperConnection {
 }
 
 impl Qwen38HyperConnection {
-    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, hc_lowrank: usize, eps: f32) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden_size: usize,
+        hc_lowrank: usize,
+        eps: f32,
+    ) -> Result<Self> {
         let hc_norm = RmsNorm::load(&ws.scoped("hc_norm"), hidden_size, eps)?;
-        let input_mix_down = Linear::load_shape(&ws.scoped("input_mix_weight_down"), [hidden_size, hc_lowrank])?;
-        let input_mix_up = Linear::load_shape(&ws.scoped("input_mix_weight_up"), [hc_lowrank, hidden_size])?;
-        let block_inject = Linear::load_shape(&ws.scoped("block_inject_weight"), [hidden_size, hidden_size]).ok();
+        let input_mix_down = Linear::load_shape(
+            &ws.scoped("input_mix_weight_down"),
+            [hidden_size, hc_lowrank],
+        )?;
+        let input_mix_up =
+            Linear::load_shape(&ws.scoped("input_mix_weight_up"), [hc_lowrank, hidden_size])?;
+        let block_inject = Linear::load_shape(
+            &ws.scoped("block_inject_weight"),
+            [hidden_size, hidden_size],
+        )
+        .ok();
 
         Ok(Self {
             hc_norm,
@@ -180,9 +174,7 @@ impl Qwen38HyperConnection {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block Layers & Feed Forward
-// ---------------------------------------------------------------------------
 
 struct Qwen38MoeExpert {
     gate_proj: Linear,
@@ -271,7 +263,10 @@ impl Qwen38MoeBlock {
             let k = self.num_experts_per_tok.min(num_exp);
             let topk = &indexed[..k];
 
-            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum_e: f32 = exps.iter().sum();
             let weights: Vec<f32> = exps
@@ -375,9 +370,8 @@ impl Qwen38FlashNextBlock {
         let _q_dim = self.num_heads * self.head_dim;
         let _kv_dim = self.num_kv_heads * self.head_dim;
 
-        // Device-first path: RoPE and fused GQA attention stay on-device
-        // (same pattern as block.rs / qwen35.rs). The host path below only
-        // runs when the backend lacks the rope/qkv_attention kernels.
+        // Device-first path: RoPE and fused GQA attention stay on-device (same pattern as block.rs / qwen35.rs).
+        // The host path below only runs when the backend lacks the rope/qkv_attention kernels.
         let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
         let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, 10000.0);
         let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
@@ -488,9 +482,8 @@ pub struct Qwen38NgramAddressing {
 }
 
 impl Qwen38NgramAddressing {
-    /// Construct addressing tables with coprime moduli and precomputed power weights:
-    /// $\text{mod}_{i, j} = m + 2 \cdot (i \cdot k + j) + 1$,
-    /// $w_{i, j, \delta} = V^\delta \pmod{\text{mod}_{i, j}}$.
+    /// Construct addressing tables with coprime moduli and precomputed power weights: $\text{mod}_{i, j} = m +
+    /// 2 \cdot (i \cdot k + j) + 1$, $w_{i, j, \delta} = V^\delta \pmod{\text{mod}_{i, j}}$.
     pub fn new(vocab_size: usize, m_base: usize, split_parts: usize, neighbor_num: usize) -> Self {
         let n_minus_1 = neighbor_num.saturating_sub(1).max(1);
         let k = split_parts.max(1);
@@ -560,13 +553,7 @@ impl Qwen38NgramAddressing {
 }
 
 /// N-gram embedding layer implementing Position-aware / Prompt-Lookup N-gram Embedding (PLE).
-///
-/// Maps high-order token n-grams ($N \in [2, 3]$) to compact auxiliary representations
-/// that augment standard 1-gram token embeddings. The auxiliary N-gram embedding table
-/// is placed in host RAM (mirroring llama.cpp `-ot "ple_ngram_embd=CPU"` offloading)
-/// and gathered per token before being projected into the transformer's hidden space.
-///
-/// Addressing uses the exact coprime modular polynomial index generator from SGLang/vLLM.
+/// Maps high-order token n-grams ($N \in [2, 3]$) to compact auxiliary representations that augment standard.
 #[derive(Clone)]
 pub struct Qwen38NgramEmbedding {
     /// N-gram vocabulary size ($V_{\text{ngram}}$, e.g. 20M entries).
@@ -585,14 +572,14 @@ pub struct Qwen38NgramEmbedding {
 
 impl Qwen38NgramEmbedding {
     /// Performs N-gram lookup and projection for a sequence of tokens.
-    ///
-    /// # Contract
-    /// * `tokens.len() == seq_len`.
-    /// * Returns projected tensor of shape `[seq_len, hidden_size]`.
+    /// # Contract * `tokens.len() == seq_len`.
     pub fn lookup_and_project(&self, tokens: &[u32]) -> Result<Tensor> {
         let seq_len = tokens.len();
         if seq_len == 0 {
-            return Ok(cpu_tensor(vec![], grim_tensor::Shape::new(vec![0, self.hidden_size])));
+            return Ok(cpu_tensor(
+                vec![],
+                grim_tensor::Shape::new(vec![0, self.hidden_size]),
+            ));
         }
 
         let table_vec = self.table.to_vec_f32()?;
@@ -601,7 +588,8 @@ impl Qwen38NgramEmbedding {
         for i in 0..seq_len {
             // N-gram lookup for positions with context history
             if i >= 1 {
-                let ngram_idx = self.addressing.compute_ngram_id(tokens, i, 0) % self.ngram_vocab_size;
+                let ngram_idx =
+                    self.addressing.compute_ngram_id(tokens, i, 0) % self.ngram_vocab_size;
                 let table_offset = ngram_idx * self.ngram_dim;
                 let dst_offset = i * self.ngram_dim;
                 if table_offset + self.ngram_dim <= table_vec.len() {
@@ -619,9 +607,7 @@ impl Qwen38NgramEmbedding {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 /// Qwen3.8-Flash-Next Causal Language Model.
 pub struct Qwen38FlashNext {
@@ -649,7 +635,12 @@ impl Qwen38FlashNext {
         cfg: Qwen38FlashNextConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
-        let root = if ws.scoped("model").scoped("language_model").get([cfg.vocab_size, cfg.hidden_size], "embed_tokens").is_ok() {
+        let root = if ws
+            .scoped("model")
+            .scoped("language_model")
+            .get([cfg.vocab_size, cfg.hidden_size], "embed_tokens")
+            .is_ok()
+        {
             ws.scoped("model").scoped("language_model")
         } else {
             ws.scoped("model")
@@ -686,20 +677,18 @@ impl Qwen38FlashNext {
                 })?;
 
             let proj = Linear::load_shape(
-                &root.scoped("layers").scoped("1").scoped("ple").scoped("key_proj"),
+                &root
+                    .scoped("layers")
+                    .scoped("1")
+                    .scoped("ple")
+                    .scoped("key_proj"),
                 [ngram_dim, cfg.hidden_size],
             )
             .or_else(|_| {
-                Linear::load_shape(
-                    &root.scoped("ngram_proj"),
-                    [ngram_dim, cfg.hidden_size],
-                )
+                Linear::load_shape(&root.scoped("ngram_proj"), [ngram_dim, cfg.hidden_size])
             })
             .or_else(|_| {
-                Linear::load_shape(
-                    &root.scoped("ple_ngram_proj"),
-                    [ngram_dim, cfg.hidden_size],
-                )
+                Linear::load_shape(&root.scoped("ple_ngram_proj"), [ngram_dim, cfg.hidden_size])
             })
             .map_err(|e| {
                 grim_core::Error::Config(format!(
@@ -735,8 +724,15 @@ impl Qwen38FlashNext {
             layers.push(block);
         }
 
-        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps)
-            .or_else(|_| RmsNorm::load(&root.scoped("hyper_connection_mixer").scoped("hc_norm"), cfg.hidden_size, cfg.rms_norm_eps))?;
+        let norm = RmsNorm::load(&root.scoped("norm"), cfg.hidden_size, cfg.rms_norm_eps).or_else(
+            |_| {
+                RmsNorm::load(
+                    &root.scoped("hyper_connection_mixer").scoped("hc_norm"),
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                )
+            },
+        )?;
         let output = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
             .unwrap_or_else(|_| Linear::from_tensor(tok_embeddings.w_t.clone(), None));
 
@@ -759,37 +755,36 @@ impl Qwen38FlashNext {
             ),
             None,
         );
-        let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
-            (cfg.ngram_vocab_size, cfg.ngram_dim)
-        {
-            let table = cpu_tensor(
-                vec![0.01f32; ngram_vocab * ngram_dim],
-                grim_tensor::Shape::new(vec![ngram_vocab, ngram_dim]),
-            );
-            let proj = Linear::from_tensor(
-                cpu_tensor(
-                    vec![0.01f32; cfg.hidden_size * ngram_dim],
-                    grim_tensor::Shape::new(vec![cfg.hidden_size, ngram_dim]),
-                ),
-                None,
-            );
-            let addressing = Qwen38NgramAddressing::new(
-                cfg.vocab_size,
-                ngram_vocab,
-                cfg.split_ngram_parts,
-                cfg.ngram_size,
-            );
-            Some(Qwen38NgramEmbedding {
-                ngram_vocab_size: ngram_vocab,
-                ngram_dim,
-                hidden_size: cfg.hidden_size,
-                table,
-                proj,
-                addressing,
-            })
-        } else {
-            None
-        };
+        let ngram_embeddings =
+            if let (Some(ngram_vocab), Some(ngram_dim)) = (cfg.ngram_vocab_size, cfg.ngram_dim) {
+                let table = cpu_tensor(
+                    vec![0.01f32; ngram_vocab * ngram_dim],
+                    grim_tensor::Shape::new(vec![ngram_vocab, ngram_dim]),
+                );
+                let proj = Linear::from_tensor(
+                    cpu_tensor(
+                        vec![0.01f32; cfg.hidden_size * ngram_dim],
+                        grim_tensor::Shape::new(vec![cfg.hidden_size, ngram_dim]),
+                    ),
+                    None,
+                );
+                let addressing = Qwen38NgramAddressing::new(
+                    cfg.vocab_size,
+                    ngram_vocab,
+                    cfg.split_ngram_parts,
+                    cfg.ngram_size,
+                );
+                Some(Qwen38NgramEmbedding {
+                    ngram_vocab_size: ngram_vocab,
+                    ngram_dim,
+                    hidden_size: cfg.hidden_size,
+                    table,
+                    proj,
+                    addressing,
+                })
+            } else {
+                None
+            };
 
         let norm = RmsNorm {
             weight: cpu_tensor(
@@ -874,7 +869,10 @@ impl CausalLm for Qwen38FlashNext {
             }
         }
 
-        let mut h = cpu_tensor(h_vec, grim_tensor::Shape::new(vec![seq_len, self.cfg.hidden_size]));
+        let mut h = cpu_tensor(
+            h_vec,
+            grim_tensor::Shape::new(vec![seq_len, self.cfg.hidden_size]),
+        );
 
         for layer in &self.layers {
             h = layer.forward(&h, &pos_u32)?;
@@ -921,12 +919,19 @@ mod tests {
         let id2 = addressing.compute_ngram_id(&tokens2, 1, 0);
         let id3 = addressing.compute_ngram_id(&tokens3, 1, 0);
 
-        assert_eq!(id1, id2, "identical token sequences must produce identical polynomial IDs");
-        assert_ne!(id1, id3, "distinct token sequences should produce distinct polynomial IDs");
+        assert_eq!(
+            id1, id2,
+            "identical token sequences must produce identical polynomial IDs"
+        );
+        assert_ne!(
+            id1, id3,
+            "distinct token sequences should produce distinct polynomial IDs"
+        );
         assert!(id1 < m_base + 256);
         assert!(id3 < m_base + 256);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_qwen38_ngram_lookup_and_forward_fusion() {
         let mut cfg = Qwen38FlashNextConfig::default();
@@ -942,10 +947,13 @@ mod tests {
         let input_ids = cpu_tensor(vec![5.0, 12.0, 18.0], grim_tensor::Shape::new(vec![3]));
         let positions = cpu_tensor(vec![0.0, 1.0, 2.0], grim_tensor::Shape::new(vec![3]));
 
-        let out = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let out = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(out.shape().dims(), &[3, 32]);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_qwen38_single_token_prefix_isolation() {
         let mut cfg = Qwen38FlashNextConfig::default();
@@ -972,7 +980,11 @@ mod tests {
         // For a single token [7], position 0 has no preceding n-gram (must return all 0s)
         let res = ngram_emb.lookup_and_project(&[7]).unwrap();
         let res_vec = res.to_vec_f32().unwrap();
-        assert_eq!(res_vec, vec![0.0f32; 8], "Single token at pos 0 must have zero n-gram contribution");
+        assert_eq!(
+            res_vec,
+            vec![0.0f32; 8],
+            "Single token at pos 0 must have zero n-gram contribution"
+        );
     }
 
     #[test]
@@ -987,18 +999,19 @@ mod tests {
             table_data.push((r * 2 + 1) as f32);
             table_data.push((r * 2 + 2) as f32);
         }
-        let table = cpu_tensor(table_data.clone(), grim_tensor::Shape::new(vec![ngram_vocab_size, ngram_dim]));
+        let table = cpu_tensor(
+            table_data.clone(),
+            grim_tensor::Shape::new(vec![ngram_vocab_size, ngram_dim]),
+        );
 
         // Proj weight: shape [hidden_size, ngram_dim] = [4, 2]
         // W = [[1, 0], [0, 1], [1, 1], [2, 1]]
-        let proj_w = vec![
-            1.0f32, 0.0,
-            0.0, 1.0,
-            1.0, 1.0,
-            2.0, 1.0,
-        ];
+        let proj_w = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0];
         let proj = Linear::from_tensor(
-            cpu_tensor(proj_w, grim_tensor::Shape::new(vec![hidden_size, ngram_dim])),
+            cpu_tensor(
+                proj_w,
+                grim_tensor::Shape::new(vec![hidden_size, ngram_dim]),
+            ),
             None,
         );
 
@@ -1033,7 +1046,12 @@ mod tests {
 
         for k in 0..4 {
             let diff = (res_vec[4 + k] - expected_t1[k]).abs();
-            assert!(diff < 1e-6, "Numeric discrepancy at dim {k}: got {}, expected {}", res_vec[4 + k], expected_t1[k]);
+            assert!(
+                diff < 1e-6,
+                "Numeric discrepancy at dim {k}: got {}, expected {}",
+                res_vec[4 + k],
+                expected_t1[k]
+            );
         }
     }
 
@@ -1054,6 +1072,7 @@ mod tests {
         assert_eq!(scale, 0.5f32);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_qwen38_missing_ple_weights_fails_loudly() {
         let mut cfg = Qwen38FlashNextConfig::default();
@@ -1066,10 +1085,14 @@ mod tests {
         struct EmptyProvider;
         impl grim_tensor::TensorProvider for EmptyProvider {
             fn get(&self, name: &str) -> grim_tensor::error::Result<grim_tensor::RawTensor> {
-                Err(grim_tensor::error::Error::Backend(format!("tensor '{name}' not found")))
+                Err(grim_tensor::error::Error::Backend(format!(
+                    "tensor '{name}' not found"
+                )))
             }
             fn meta(&self, _name: &str) -> grim_tensor::error::Result<grim_tensor::TensorMeta> {
-                Err(grim_tensor::error::Error::Backend("tensor not found".into()))
+                Err(grim_tensor::error::Error::Backend(
+                    "tensor not found".into(),
+                ))
             }
         }
 
@@ -1077,13 +1100,17 @@ mod tests {
         let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
 
         let err = Qwen38FlashNext::load(Device::Cpu, &ws, cfg);
-        assert!(err.is_err(), "load_tp must fail loudly when PLE weights are missing");
+        assert!(
+            err.is_err(),
+            "load_tp must fail loudly when PLE weights are missing"
+        );
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_qwen38_real_safetensors_layout_weight_loading_and_forward() {
-        use std::collections::HashMap;
         use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
+        use std::collections::HashMap;
 
         let mut cfg = Qwen38FlashNextConfig::default();
         cfg.vocab_size = 16;
@@ -1106,64 +1133,155 @@ mod tests {
         let ngram_vocab = 20;
         let ngram_dim = 4;
 
-        fn raw_f32_tensor(val: f32, shape: Vec<usize>) -> (Vec<u8>, Vec<usize>, grim_tensor::DType, grim_tensor::QuantProvenance) {
+        fn raw_f32_tensor(
+            val: f32,
+            shape: Vec<usize>,
+        ) -> (
+            Vec<u8>,
+            Vec<usize>,
+            grim_tensor::DType,
+            grim_tensor::QuantProvenance,
+        ) {
             let count: usize = shape.iter().product();
             let mut bytes = Vec::with_capacity(count * 4);
             for _ in 0..count {
                 bytes.extend_from_slice(&val.to_le_bytes());
             }
-            (bytes, shape, grim_tensor::DType::F32, grim_tensor::QuantProvenance::GrimNative)
+            (
+                bytes,
+                shape,
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::GrimNative,
+            )
         }
 
         let mut tensors = HashMap::new();
         // Model embeddings & output (Linear::load_shape expects [out_features, in_features] or transposed)
-        tensors.insert("model.embed_tokens.weight".into(), raw_f32_tensor(0.05, vec![cfg.hidden_size, cfg.vocab_size]));
-        tensors.insert("lm_head.weight".into(), raw_f32_tensor(0.02, vec![cfg.vocab_size, cfg.hidden_size]));
-        tensors.insert("model.norm.weight".into(), raw_f32_tensor(1.0, vec![cfg.hidden_size]));
+        tensors.insert(
+            "model.embed_tokens.weight".into(),
+            raw_f32_tensor(0.05, vec![cfg.hidden_size, cfg.vocab_size]),
+        );
+        tensors.insert(
+            "lm_head.weight".into(),
+            raw_f32_tensor(0.02, vec![cfg.vocab_size, cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.norm.weight".into(),
+            raw_f32_tensor(1.0, vec![cfg.hidden_size]),
+        );
 
         // PLE N-gram embedding table (matching HuggingFace / vLLM naming)
-        tensors.insert("model.layers.1.ple.ple_embedding.ngram_embedding.shard_0".into(), raw_f32_tensor(0.1, vec![ngram_vocab, ngram_dim]));
-        tensors.insert("model.layers.1.ple.key_proj.weight".into(), raw_f32_tensor(0.05, vec![cfg.hidden_size, ngram_dim]));
+        tensors.insert(
+            "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0".into(),
+            raw_f32_tensor(0.1, vec![ngram_vocab, ngram_dim]),
+        );
+        tensors.insert(
+            "model.layers.1.ple.key_proj.weight".into(),
+            raw_f32_tensor(0.05, vec![cfg.hidden_size, ngram_dim]),
+        );
 
         // Layer 0 Attention & MoE weights
-        tensors.insert("model.layers.0.self_attn.q_proj.weight".into(), raw_f32_tensor(0.01, vec![q_dim, cfg.hidden_size]));
-        tensors.insert("model.layers.0.self_attn.k_proj.weight".into(), raw_f32_tensor(0.01, vec![kv_dim, cfg.hidden_size]));
-        tensors.insert("model.layers.0.self_attn.v_proj.weight".into(), raw_f32_tensor(0.01, vec![kv_dim, cfg.hidden_size]));
-        tensors.insert("model.layers.0.self_attn.o_proj.weight".into(), raw_f32_tensor(0.01, vec![cfg.hidden_size, q_dim]));
-        tensors.insert("model.layers.0.input_layernorm.weight".into(), raw_f32_tensor(1.0, vec![cfg.hidden_size]));
-        tensors.insert("model.layers.0.post_attention_layernorm.weight".into(), raw_f32_tensor(1.0, vec![cfg.hidden_size]));
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![q_dim, cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.layers.0.self_attn.k_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![kv_dim, cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.layers.0.self_attn.v_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![kv_dim, cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.layers.0.self_attn.o_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![cfg.hidden_size, q_dim]),
+        );
+        tensors.insert(
+            "model.layers.0.input_layernorm.weight".into(),
+            raw_f32_tensor(1.0, vec![cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            raw_f32_tensor(1.0, vec![cfg.hidden_size]),
+        );
 
         // MoE Router Gate
-        tensors.insert("model.layers.0.mlp.gate.weight".into(), raw_f32_tensor(0.01, vec![cfg.num_experts, cfg.hidden_size]));
+        tensors.insert(
+            "model.layers.0.mlp.gate.weight".into(),
+            raw_f32_tensor(0.01, vec![cfg.num_experts, cfg.hidden_size]),
+        );
 
         // MoE Experts
         for e in 0..cfg.num_experts {
-            tensors.insert(format!("model.layers.0.mlp.experts.{e}.gate_proj.weight"), raw_f32_tensor(0.01, vec![cfg.intermediate_size, cfg.hidden_size]));
-            tensors.insert(format!("model.layers.0.mlp.experts.{e}.up_proj.weight"), raw_f32_tensor(0.01, vec![cfg.intermediate_size, cfg.hidden_size]));
-            tensors.insert(format!("model.layers.0.mlp.experts.{e}.down_proj.weight"), raw_f32_tensor(0.01, vec![cfg.hidden_size, cfg.intermediate_size]));
+            tensors.insert(
+                format!("model.layers.0.mlp.experts.{e}.gate_proj.weight"),
+                raw_f32_tensor(0.01, vec![cfg.intermediate_size, cfg.hidden_size]),
+            );
+            tensors.insert(
+                format!("model.layers.0.mlp.experts.{e}.up_proj.weight"),
+                raw_f32_tensor(0.01, vec![cfg.intermediate_size, cfg.hidden_size]),
+            );
+            tensors.insert(
+                format!("model.layers.0.mlp.experts.{e}.down_proj.weight"),
+                raw_f32_tensor(0.01, vec![cfg.hidden_size, cfg.intermediate_size]),
+            );
         }
 
         // Shared Expert
-        tensors.insert("model.layers.0.mlp.shared_expert.gate_proj.weight".into(), raw_f32_tensor(0.01, vec![16, cfg.hidden_size]));
-        tensors.insert("model.layers.0.mlp.shared_expert.up_proj.weight".into(), raw_f32_tensor(0.01, vec![16, cfg.hidden_size]));
-        tensors.insert("model.layers.0.mlp.shared_expert.down_proj.weight".into(), raw_f32_tensor(0.01, vec![cfg.hidden_size, 16]));
+        tensors.insert(
+            "model.layers.0.mlp.shared_expert.gate_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![16, cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.layers.0.mlp.shared_expert.up_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![16, cfg.hidden_size]),
+        );
+        tensors.insert(
+            "model.layers.0.mlp.shared_expert.down_proj.weight".into(),
+            raw_f32_tensor(0.01, vec![cfg.hidden_size, 16]),
+        );
 
         struct SafeTensorsMockProvider {
-            tensors: HashMap<String, (Vec<u8>, Vec<usize>, grim_tensor::DType, grim_tensor::QuantProvenance)>,
+            tensors: HashMap<
+                String,
+                (
+                    Vec<u8>,
+                    Vec<usize>,
+                    grim_tensor::DType,
+                    grim_tensor::QuantProvenance,
+                ),
+            >,
         }
 
         impl TensorProvider for SafeTensorsMockProvider {
             fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
-                let (bytes, shape, dtype, provenance) = self.tensors.get(name).cloned().ok_or_else(|| {
-                    grim_tensor::error::Error::Backend(format!("Tensor {name} not found in SafeTensors mock provider"))
-                })?;
-                Ok(RawTensor { bytes, shape, dtype, provenance })
+                let (bytes, shape, dtype, provenance) =
+                    self.tensors.get(name).cloned().ok_or_else(|| {
+                        grim_tensor::error::Error::Backend(format!(
+                            "Tensor {name} not found in SafeTensors mock provider"
+                        ))
+                    })?;
+                Ok(RawTensor {
+                    bytes,
+                    shape,
+                    dtype,
+                    provenance,
+                })
             }
             fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
-                let (_, shape, dtype, provenance) = self.tensors.get(name).cloned().ok_or_else(|| {
-                    grim_tensor::error::Error::Backend(format!("Tensor meta {name} not found in SafeTensors mock provider"))
-                })?;
-                Ok(TensorMeta { dtype, provenance, shape, fusion_mask: 0 })
+                let (_, shape, dtype, provenance) =
+                    self.tensors.get(name).cloned().ok_or_else(|| {
+                        grim_tensor::error::Error::Backend(format!(
+                            "Tensor meta {name} not found in SafeTensors mock provider"
+                        ))
+                    })?;
+                Ok(TensorMeta {
+                    dtype,
+                    provenance,
+                    shape,
+                    fusion_mask: 0,
+                })
             }
         }
 
@@ -1171,15 +1289,25 @@ mod tests {
         let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
 
         // Load model completely through real SafeTensors WeightSource path
-        let model = Qwen38FlashNext::load(Device::Cpu, &ws, cfg).expect("Qwen38FlashNext must load completely from SafeTensors WeightSource");
-        assert!(model.ngram_embeddings.is_some(), "PLE N-gram embeddings must be loaded from weights");
+        let model = Qwen38FlashNext::load(Device::Cpu, &ws, cfg)
+            .expect("Qwen38FlashNext must load completely from SafeTensors WeightSource");
+        assert!(
+            model.ngram_embeddings.is_some(),
+            "PLE N-gram embeddings must be loaded from weights"
+        );
 
         let mut session = model.new_session();
         let input_ids = cpu_tensor(vec![3.0, 7.0, 11.0], grim_tensor::Shape::new(vec![3]));
         let positions = cpu_tensor(vec![0.0, 1.0, 2.0], grim_tensor::Shape::new(vec![3]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).expect("Forward pass on loaded model must succeed");
-        assert_eq!(logits.shape().dims(), &[3, 16], "Logits shape must match [seq_len, vocab_size]");
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .expect("Forward pass on loaded model must succeed");
+        assert_eq!(
+            logits.shape().dims(),
+            &[3, 16],
+            "Logits shape must match [seq_len, vocab_size]"
+        );
 
         // Assert valid numeric output
         let logits_vec = logits.to_vec_f32().unwrap();
@@ -1190,27 +1318,26 @@ mod tests {
         }
     }
 
-    /// Verifies numerical weight loading and forward signal propagation directly
-    /// against the real physical 992MB SafeTensors model shard on disk
-    /// (`models/qwen3.8-model-00001-of-00131.safetensors`).
-    ///
-    /// # Contract & Checks
-    /// 1. Reads binary header, metadata, and IEEE 754 BF16 data offsets via `SafetensorsProvider::open`.
-    /// 2. Loads `Qwen38HyperConnection` weights (`hc_norm.weight`, `input_mix_weight_down.weight`, `input_mix_weight_up.weight`).
-    /// 3. Converts BF16 tensor storage into computational tensors and executes `mix(&x)` forward transformation.
-    /// 4. Asserts output finiteness, absence of NaNs/Infs, and non-trivial numerical signal transformation.
+    /// Verifies numerical weight loading and forward signal propagation directly against the real physical 992MB SafeTensors model shard on disk (`models/qwen3.8-model-00001-of-00131.safetensors`).
+    /// # Contract & Checks 1.
     #[test]
     fn test_qwen38_real_disk_safetensor_shard_numerics() {
-        use std::path::Path;
         use grim_format::tprov::SafetensorsProvider;
+        use std::path::Path;
 
         let shard_path = Path::new("../../../models/qwen3.8-model-00001-of-00131.safetensors");
         if !shard_path.exists() {
-            println!("[SKIP] test_qwen38_real_disk_safetensor_shard_numerics: '{}' not present in environment", shard_path.display());
+            println!(
+                "[SKIP] test_qwen38_real_disk_safetensor_shard_numerics: '{}' not present in environment",
+                shard_path.display()
+            );
             return;
         }
 
-        println!("[EXEC] test_qwen38_real_disk_safetensor_shard_numerics: reading real 992MB shard '{}'", shard_path.display());
+        println!(
+            "[EXEC] test_qwen38_real_disk_safetensor_shard_numerics: reading real 992MB shard '{}'",
+            shard_path.display()
+        );
 
         let provider = SafetensorsProvider::open(shard_path.to_str().unwrap())
             .expect("Must open real 992MB Qwen 3.8 safetensors shard");
@@ -1220,18 +1347,26 @@ mod tests {
         let hc_lowrank = 320;
         let hidden_size = 10240; // 4 branches * 2560
         let hc_mixer_res = Qwen38HyperConnection::load(
-            &ws.scoped("model").scoped("language_model").scoped("hyper_connection_mixer"),
+            &ws.scoped("model")
+                .scoped("language_model")
+                .scoped("hyper_connection_mixer"),
             hidden_size,
             hc_lowrank,
             1e-6,
         );
 
-        assert!(hc_mixer_res.is_ok(), "Hyper-connection mixer must load from real safetensor shard: {:?}", hc_mixer_res.err());
+        assert!(
+            hc_mixer_res.is_ok(),
+            "Hyper-connection mixer must load from real safetensor shard: {:?}",
+            hc_mixer_res.err()
+        );
         let hc_mixer = hc_mixer_res.unwrap();
 
         // Verify numeric forward mixing with real BF16 weights converted to tensor
         let x = cpu_tensor(vec![1.0f32; hidden_size], Shape::new(vec![hidden_size]));
-        let mixed = hc_mixer.mix(&x).expect("HC mixer must run forward without error");
+        let mixed = hc_mixer
+            .mix(&x)
+            .expect("HC mixer must run forward without error");
         let mixed_vec = mixed.to_vec_f32().unwrap();
 
         assert_eq!(mixed_vec.len(), hidden_size);
@@ -1242,6 +1377,9 @@ mod tests {
 
         // Verify that mixing actually transformed the signal (not a trivial no-op zero)
         let mean = mixed_vec.iter().sum::<f32>() / (mixed_vec.len() as f32);
-        assert!(mean.abs() > 1e-4, "Real weights must produce non-trivial mean response (got {mean})");
+        assert!(
+            mean.abs() > 1e-4,
+            "Real weights must produce non-trivial mean response (got {mean})"
+        );
     }
 }

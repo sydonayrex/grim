@@ -2,8 +2,8 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test moe_mega_kernel_parity`.
 
-use grim_tensor::{CoreTensorOps, DType, Shape};
 use grim_backend_vulkan::VulkanDevice;
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 #[test]
 fn moe_mega_kernel_produces_finite_output() {
@@ -35,13 +35,30 @@ fn moe_mega_kernel_produces_finite_output() {
     let gw_s = dev.from_cpu(&gate_w, &gw_shape, DType::F32).unwrap();
     let uw_s = dev.from_cpu(&up_w, &gw_shape, DType::F32).unwrap();
     let dw_s = dev.from_cpu(&down_w, &dw_shape, DType::F32).unwrap();
-    let ds_s = dev.upload_u32(&destination_slots, &Shape::new(vec![total_routed])).unwrap();
-    let go_s = dev.upload_u32(&global_offsets, &Shape::new(vec![num_experts as usize + 1])).unwrap();
-    let ec_s = dev.upload_u32(&expert_counts, &Shape::new(vec![num_experts as usize])).unwrap();
+    let ds_s = dev
+        .upload_u32(&destination_slots, &Shape::new(vec![total_routed]))
+        .unwrap();
+    let go_s = dev
+        .upload_u32(&global_offsets, &Shape::new(vec![num_experts as usize + 1]))
+        .unwrap();
+    let ec_s = dev
+        .upload_u32(&expert_counts, &Shape::new(vec![num_experts as usize]))
+        .unwrap();
 
     let result = dev.moe_mega_kernel(
-        &*act_s, &*gw_s, &*uw_s, &*dw_s, &*ds_s, &*go_s, &*ec_s,
-        batch as u32, hidden, inter, num_experts, top_k, total_routed as u32,
+        &*act_s,
+        &*gw_s,
+        &*uw_s,
+        &*dw_s,
+        &*ds_s,
+        &*go_s,
+        &*ec_s,
+        batch as u32,
+        hidden,
+        inter,
+        num_experts,
+        top_k,
+        total_routed as u32,
     );
     assert!(result.is_ok(), "moe_mega_kernel: {:?}", result.err());
 }

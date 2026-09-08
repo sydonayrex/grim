@@ -401,7 +401,11 @@ unsafe extern "C" {
         pAllocator: *const c_void,
         pDescriptorPool: *mut u64,
     ) -> i32;
-    pub fn vkDestroyDescriptorPool(device: *mut c_void, descriptorPool: u64, pAllocator: *const c_void);
+    pub fn vkDestroyDescriptorPool(
+        device: *mut c_void,
+        descriptorPool: u64,
+        pAllocator: *const c_void,
+    );
     pub fn vkAllocateDescriptorSets(
         device: *mut c_void,
         pAllocateInfo: *const VkDescriptorSetAllocateInfo,
@@ -427,7 +431,11 @@ unsafe extern "C" {
         pAllocator: *const c_void,
         pPipelineLayout: *mut u64,
     ) -> i32;
-    pub fn vkDestroyPipelineLayout(device: *mut c_void, pipelineLayout: u64, pAllocator: *const c_void);
+    pub fn vkDestroyPipelineLayout(
+        device: *mut c_void,
+        pipelineLayout: u64,
+        pAllocator: *const c_void,
+    );
     pub fn vkCreateComputePipelines(
         device: *mut c_void,
         pipelineCache: u64,
@@ -494,4 +502,3 @@ unsafe extern "C" {
     ) -> i32;
     pub fn vkQueueWaitIdle(queue: *mut c_void) -> i32;
 }
-

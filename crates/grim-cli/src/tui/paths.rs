@@ -24,13 +24,14 @@ pub fn config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Serializes tests that mutate process-global env vars. Env is shared across
-/// the parallel test threads of this binary; every test that sets an XDG var
-/// must hold this lock.
+/// Serializes tests that mutate process-global env vars.
+/// Env is shared across the parallel test threads of this binary; every test that sets.
 #[cfg(test)]
 pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -49,7 +50,10 @@ mod tests {
     fn xdg_config_home_wins() {
         let _g = env_lock();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/grim-test-config") };
-        assert_eq!(config_dir(), Some(PathBuf::from("/tmp/grim-test-config/grim")));
+        assert_eq!(
+            config_dir(),
+            Some(PathBuf::from("/tmp/grim-test-config/grim"))
+        );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }

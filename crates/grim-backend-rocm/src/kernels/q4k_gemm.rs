@@ -71,9 +71,8 @@ extern "C" {
 mod tests {
     use super::*;
 
-    /// TEMP-DIAG (GGUF fault hunt): hipRTC-compile ONLY this file's
-    /// KERNEL_SOURCE and report whether the fused-q4k symbols exist in the
-    /// resulting module. Opt-in via GRIM_Q4K_REPRO=1.
+    /// TEMP-DIAG (GGUF fault hunt): hipRTC-compile ONLY this file's KERNEL_SOURCE and report whether the fused-q4k symbols exist in the resulting module.
+    /// Opt-in via GRIM_Q4K_REPRO=1.
     #[test]
     fn diag_q4k_solo_compile_symbols() {
         if std::env::var("GRIM_Q4K_REPRO").is_err() {
@@ -101,9 +100,8 @@ mod tests {
             }
             Err(e) => eprintln!("DIAG solo compile ERR: {e}"),
         }
-        // Variant (c): bisect the full aggregate. Walk the exact
-        // compute_kernel_source() push order cumulatively and find where
-        // grim_fused_dequant_gemm_q4k stops appearing in the compiled object.
+        // Variant (c): bisect the full aggregate. Walk the exact compute_kernel_source() push
+        // order cumulatively and find where grim_fused_dequant_gemm_q4k stops appearing in the compiled object.
         use crate::kernels::shared_device_fns;
         let parts: Vec<&str> = vec![
             shared_device_fns::KERNEL_SOURCE,

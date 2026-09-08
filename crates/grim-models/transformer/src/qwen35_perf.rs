@@ -1,10 +1,5 @@
 //! Phase 0: baseline harness for Qwen3.5 GPU inference speed audit.
-//!
-//! Red-green discipline: these tests are written to FAIL under the current
-//! host-roundtrip implementation, then made to PASS by the device-resident
-//! refactor in `qwen35.rs`. Frozen once green unless objectively wrong.
-//!
-//! <!-- TIER_DOC: EVAL_ISOLATED_TESTS -->
+//! Red-green discipline: these tests are written to FAIL under the current host-roundtrip implementation, then made.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::model::{CausalLm, Model, ModelConfig};
@@ -15,11 +10,8 @@ use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 use crate::qwen35::{Qwen35Block, Qwen35Config, Qwen35LayerCache};
 
-// ---------------------------------------------------------------------------
 // Deterministic synthetic-tensor builder for the TinyQwen harness.
-// Builds model weights directly as CPU tensors instead of going through
-// WeightSource/TensorProvider, so the harness stays self-contained.
-// ---------------------------------------------------------------------------
+// Builds model weights directly as CPU tensors instead of going through WeightSource/TensorProvider, so the harness.
 
 struct TinyBuilder {
     seed: u64,
@@ -57,10 +49,8 @@ impl TinyBuilder {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tiny Qwen3.5: 2 layers, hidden=64, 2 q-heads, 1 kv-head, head_dim=32,
 // full_attention_interval=2 (layer 0 = SSM, layer 1 = full attention).
-// ---------------------------------------------------------------------------
 
 const TINY_CFG: Qwen35Config = Qwen35Config {
     vocab_size: 8,
@@ -123,11 +113,8 @@ impl TinyQwen {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Build a Qwen35Block from synthetic tensors. Mirrors Qwen35Block::load_tp
-// but constructs every weight from the TinyBuilder directly, bypassing
-// WeightSource — exactly what the existing tiny-model tests do.
-// ---------------------------------------------------------------------------
+// Build a Qwen35Block from synthetic tensors.
+// Mirrors Qwen35Block::load_tp but constructs every weight from the TinyBuilder directly, bypassing WeightSource - exactly what.
 
 impl Qwen35Block {
     fn from_tensors(
@@ -137,8 +124,7 @@ impl Qwen35Block {
         _tp: TensorParallelConfig,
     ) -> Result<Self, grim_tensor::Error> {
         let device = Device::Cpu;
-        let is_full_attention =
-            (layer_idx + 1) % cfg.full_attention_interval.max(1) == 0;
+        let is_full_attention = (layer_idx + 1) % cfg.full_attention_interval.max(1) == 0;
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
         let qkv_dim = q_dim + 2 * kv_dim;
@@ -185,31 +171,18 @@ impl Qwen35Block {
         let ssm_conv1d = None;
         let ssm_conv_vec = None;
         let ssm_a = None;
-        let ssm_alpha = Linear::from_tensor(
-            b.tensor_2d(cfg.ssm_dt_rank, cfg.hidden_size),
-            None,
-        );
-        let ssm_beta = Linear::from_tensor(
-            b.tensor_2d(cfg.ssm_dt_rank, cfg.hidden_size),
-            None,
-        );
+        let ssm_alpha = Linear::from_tensor(b.tensor_2d(cfg.ssm_dt_rank, cfg.hidden_size), None);
+        let ssm_beta = Linear::from_tensor(b.tensor_2d(cfg.ssm_dt_rank, cfg.hidden_size), None);
         let ssm_dt_bias = None;
         let ssm_norm = None;
 
         let post_attention_norm = b.rms_norm(cfg.hidden_size, cfg.rms_norm_eps);
 
-        let ffn_gate = Linear::from_tensor(
-            b.tensor_2d(cfg.intermediate_size, cfg.hidden_size),
-            None,
-        );
-        let ffn_up = Linear::from_tensor(
-            b.tensor_2d(cfg.intermediate_size, cfg.hidden_size),
-            None,
-        );
-        let ffn_down = Linear::from_tensor(
-            b.tensor_2d(cfg.hidden_size, cfg.intermediate_size),
-            None,
-        );
+        let ffn_gate =
+            Linear::from_tensor(b.tensor_2d(cfg.intermediate_size, cfg.hidden_size), None);
+        let ffn_up = Linear::from_tensor(b.tensor_2d(cfg.intermediate_size, cfg.hidden_size), None);
+        let ffn_down =
+            Linear::from_tensor(b.tensor_2d(cfg.hidden_size, cfg.intermediate_size), None);
 
         Ok(Self {
             device,
@@ -246,9 +219,7 @@ impl Qwen35Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model + CausalLm impl so the harness exercises the real forward path.
-// ---------------------------------------------------------------------------
 
 impl Model for TinyQwen {
     fn config(&self) -> &dyn ModelConfig {
@@ -282,11 +253,11 @@ impl CausalLm for TinyQwen {
         positions: &Tensor,
         _adapters: &[grim_core::model::AdapterHandle],
     ) -> Result<Tensor, grim_core::Error> {
-        let seq_len = input_ids.shape().dim(0)
-            .map_err(|e| grim_core::Error::Tensor(e))?;
+        let seq_len = input_ids.shape().dim(0).map_err(grim_core::Error::Tensor)?;
         // Extract u32 indices from the F32 input tensor the same way
         // Qwen35::forward does (to_vec_f32 + map).
-        let ids_u32: Vec<u32> = input_ids.to_vec_f32()
+        let ids_u32: Vec<u32> = input_ids
+            .to_vec_f32()
             .unwrap_or_else(|_| vec![0.0])
             .into_iter()
             .map(|x| x as u32)
@@ -294,7 +265,7 @@ impl CausalLm for TinyQwen {
         let mut h = self
             .tok_embeddings
             .forward(&ids_u32, seq_len, self.cfg.hidden_size)
-            .map_err(|e| grim_core::Error::Tensor(e))?;
+            .map_err(grim_core::Error::Tensor)?;
 
         if session.model_state().is_none() {
             let fresh: Vec<Qwen35LayerCache> = (0..self.blocks.len())
@@ -318,26 +289,23 @@ impl CausalLm for TinyQwen {
         };
 
         for (i, block) in self.blocks.iter().enumerate() {
-            h = block
-                .forward(&h, &positions, &mut caches[i])?;
+            h = block.forward(&h, &positions, &mut caches[i])?;
             caches[i].current_pos += positions.len();
         }
         let normed = self
             .output_norm
             .forward(&h)
-            .map_err(|e| grim_core::Error::Tensor(e))?;
+            .map_err(grim_core::Error::Tensor)?;
         let logits = self
             .output
             .forward(&normed)
-            .map_err(|e| grim_core::Error::Tensor(e))?;
+            .map_err(grim_core::Error::Tensor)?;
         session.advance_pos(positions.len());
         Ok(logits)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helper: forward TinyQwen, return output logits as Vec<f32>.
-// ---------------------------------------------------------------------------
 
 fn forward_tiny(
     model: &TinyQwen,
@@ -357,12 +325,10 @@ fn forward_tiny(
     let logits = model
         .forward(&mut *sess, &ids, &pos, &[])
         .map_err(|e| grim_tensor::Error::Backend(e.to_string()))?;
-    Ok(logits.to_vec_f32()?)
+    logits.to_vec_f32()
 }
 
-// ---------------------------------------------------------------------------
 // Phase 0 tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn phase0_cpu_parity_baseline() {

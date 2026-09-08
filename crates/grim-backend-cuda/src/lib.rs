@@ -21,8 +21,12 @@ pub mod kernels;
 pub mod memory;
 pub mod nccl;
 
-pub use fsdp::{ConsumerDpConfig, ConsumerDpGroup, ConsumerFsdpConfig, ConsumerFsdpGroup, ConsumerZeroPlanner};
-pub use device::parallel_comm::{CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology};
+pub use device::parallel_comm::{
+    CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,
+};
+pub use fsdp::{
+    ConsumerDpConfig, ConsumerDpGroup, ConsumerFsdpConfig, ConsumerFsdpGroup, ConsumerZeroPlanner,
+};
 pub use nccl::{CudaComm, UniqueId};
 
 #[cfg(test)]
@@ -31,13 +35,13 @@ mod device_tests;
 pub use autotune::{CudaAutotuner, CudaTileConfig, GemmOp, ShapeClass};
 pub use caps::CudaCaps;
 pub use device::{
-    compute_utilization, cudaDeviceGetAttribute, cudaDeviceSynchronize, cudaFree,
+    CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_STATUS_SUCCESS, CUstream, CublasHandle, CudaDevice,
+    CudaHandle, compute_utilization, cudaDeviceGetAttribute, cudaDeviceSynchronize, cudaFree,
     cudaGetDeviceCount, cudaGraphCreate, cudaGraphDestroy, cudaGraphExecDestroy,
     cudaGraphInstantiate, cudaGraphLaunch, cudaMalloc, cudaMemGetInfo, cudaMemcpy,
     cudaMemcpyDeviceToDevice, cudaMemcpyDeviceToHost, cudaMemcpyHostToDevice, cudaMemcpyPeer,
     cudaMemset, cudaSetDevice, cudaStreamBeginCapture, cudaStreamCreate, cudaStreamDestroy,
-    cudaStreamEndCapture, cudaStreamSynchronize, cudaSuccess, vram_info, CublasHandle, CudaDevice,
-    CudaHandle, CUstream, CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_STATUS_SUCCESS,
+    cudaStreamEndCapture, cudaStreamSynchronize, cudaSuccess, vram_info,
 };
 pub use graph_capture::{
     CudaGraphExecutor, DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey,
@@ -52,7 +56,7 @@ pub use grim_tensor::dtype::{
 };
 pub use grim_tensor::error::{Error, Result};
 pub use grim_tensor::{
-    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
-    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps,
-    RecurrentOps, SamplingOps, Shape,
+    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps, CoreTensorOps,
+    ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps,
+    SamplingOps, Shape,
 };

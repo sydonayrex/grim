@@ -1,5 +1,4 @@
 //! Additional model configuration structs for unsupported and specialized transformer architectures.
-//!
 //! Implements `ModelConfig` for Falcon, BLOOM, Phi, Qwen, and MoE variants.
 
 use grim_core::model::{ModalityHint, ModelConfig};
@@ -30,7 +29,6 @@ impl ModelConfig for FalconConfig {
         self
     }
 }
-
 
 /// Configuration for Phi (Phi-2/Phi-3/Phi-Moe) model architecture family.
 #[derive(Debug, Clone)]

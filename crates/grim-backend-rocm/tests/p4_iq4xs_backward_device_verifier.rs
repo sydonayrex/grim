@@ -26,8 +26,8 @@
 //! Run with:
 //!   GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm --test p4_iq4xs_backward_device_verifier -- --ignored --nocapture
 
-use grim_quant::quant_iq4xs;
 use grim_backend_rocm::{CoreTensorOps, MemoryOps, QuantOps};
+use grim_quant::quant_iq4xs;
 use grim_tensor::{
     KQuantScheme, QuantizedMatmulBackwardResiduals, Shape,
     dtype::{ArithType, DType, Storage},

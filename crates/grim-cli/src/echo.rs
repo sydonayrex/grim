@@ -105,9 +105,7 @@ impl EchoTrainer {
     }
 
     /// Estimate the gradient direction via finite differences in the subspace.
-    ///
     /// Returns `(current_loss - previous_loss) / (perturbation_scale * ||perturbation||)`.
-    /// The returned vector is a direction-only estimate in the subspace.
     pub fn estimate_gradient(
         &mut self,
         current_loss: f32,
@@ -127,7 +125,6 @@ impl EchoTrainer {
     }
 
     /// Quantize an update to FP4 and apply it in-place to `weights`.
-    ///
     /// FP4 quantization: clamp to [-3, 3], round to nearest 0.25 step.
     pub fn apply_fp4_update(weights: &mut [f32], update: &[f32]) {
         assert_eq!(weights.len(), update.len(), "weight/update length mismatch");
@@ -139,16 +136,8 @@ impl EchoTrainer {
         }
     }
 
-    /// One echo training step.
-    ///
-    /// (a) Forward through model with frozen base + adapter (represented here
-    ///     by projecting the current adapter weights into the echo subspace).
-    /// (b) Compute loss as the L2 norm of the echo state (lower = better).
-    /// (c) Estimate gradient via finite differences in subspace.
-    /// (d) Apply FIM preconditioning (diagonal).
-    /// (e) Apply FP4 update to adapter weights only.
-    ///
-    /// Returns the scalar loss for this step.
+    /// One echo training step. (a) Forward through model with frozen base +
+    /// adapter (represented here by projecting the current adapter weights into the echo subspace).
     pub fn step(&mut self, weights: &mut [f32]) -> f32 {
         let previous_loss = if self.step_count == 0 {
             2.3
@@ -219,9 +208,8 @@ mod tests {
         let input = vec![1.0f32; 16];
         let h = trainer.echo_forward(&input);
         assert_eq!(h.len(), 8, "echo state must match subspace_rank");
-        // Second call with same input should produce same output because
-        // generate_projection consumes RNG state; verify determinism with
-        // fresh trainer.
+        // Second call with same input should produce same output
+        // because generate_projection consumes RNG state; verify determinism with fresh trainer.
         let mut trainer2 = EchoTrainer::new(EchoConfig::default());
         let h2 = trainer2.echo_forward(&input);
         assert_eq!(h2.len(), 8);

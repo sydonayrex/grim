@@ -1,14 +1,17 @@
 //! Device storage abstraction for GPU VRAM buffers on CUDA devices.
 
-use std::ffi::c_void;
-use grim_tensor::dtype::{ArithType, BlockDtype, DType, FloatPackScheme, KQuantScheme, QuantProvenance, Storage as DTypeStorage};
+use grim_tensor::dtype::{
+    ArithType, BlockDtype, DType, FloatPackScheme, KQuantScheme, QuantProvenance,
+    Storage as DTypeStorage,
+};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, Shape};
+use std::ffi::c_void;
 
 use crate::device::cuda_device::CudaDevice;
 use crate::device::handles::{
-    cudaFree, cudaMalloc, cudaMemcpy, cudaMemcpyDeviceToHost, cudaMemcpyHostToDevice,
-    cudaMemset, cudaSetDevice, cudaSuccess,
+    cudaFree, cudaMalloc, cudaMemcpy, cudaMemcpyDeviceToHost, cudaMemcpyHostToDevice, cudaMemset,
+    cudaSetDevice, cudaSuccess,
 };
 
 /// Returns the byte size of a DType.

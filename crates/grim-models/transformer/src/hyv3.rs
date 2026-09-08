@@ -1,10 +1,5 @@
-//! Tencent Hunyuan-V3 (HY-V3) architecture with QK Normalization,
-//! fine-grained routed Mixture of Experts (MoE), dedicated shared expert, and RoPE.
-//!
-//! # Architecture Details
-//! - **Attention**: Grouped Query Attention (GQA) with per-head QK Normalization (`q_norm`, `k_norm`) before RoPE.
-//! - **Feed Forward**: Fine-grained MoE with routed top-k experts and dedicated shared expert.
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm.
+//! Tencent Hunyuan-V3 (HY-V3) architecture with QK Normalization, fine-grained routed Mixture of Experts (MoE), dedicated shared expert, and RoPE.
+//! # Architecture Details - **Attention**: Grouped Query Attention (GQA) with per-head QK Normalization (`q_norm`, `k_norm`).
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for HY-V3 architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,9 +62,7 @@ impl ModelConfig for HyV3Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Block
-// ---------------------------------------------------------------------------
 
 struct HyV3Expert {
     gate_proj: Linear,
@@ -94,8 +85,8 @@ impl HyV3Expert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let act = grim_nn::modules::silu_mul_on_device(&g, &u)
-            .map_err(grim_core::error::Error::from)?;
+        let act =
+            grim_nn::modules::silu_mul_on_device(&g, &u).map_err(grim_core::error::Error::from)?;
         Ok(self.down_proj.forward(&act)?)
     }
 }
@@ -164,9 +155,7 @@ impl HyV3MoeBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct HyV3Block {
     pub wq: Linear,
@@ -185,7 +174,11 @@ pub struct HyV3Block {
 }
 
 impl HyV3Block {
-    pub fn load(ws: &WeightSource<'_>, cfg: &HyV3Config, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &HyV3Config,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -196,9 +189,21 @@ impl HyV3Block {
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
         let q_norm = RmsNorm::load(&attn_ws.scoped("q_norm"), cfg.head_dim, cfg.rms_norm_eps)
-            .or_else(|_| RmsNorm::load(&attn_ws.scoped("q_layernorm"), cfg.head_dim, cfg.rms_norm_eps))?;
+            .or_else(|_| {
+                RmsNorm::load(
+                    &attn_ws.scoped("q_layernorm"),
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                )
+            })?;
         let k_norm = RmsNorm::load(&attn_ws.scoped("k_norm"), cfg.head_dim, cfg.rms_norm_eps)
-            .or_else(|_| RmsNorm::load(&attn_ws.scoped("k_layernorm"), cfg.head_dim, cfg.rms_norm_eps))?;
+            .or_else(|_| {
+                RmsNorm::load(
+                    &attn_ws.scoped("k_layernorm"),
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                )
+            })?;
 
         let input_layernorm = RmsNorm::load(
             &ws.scoped("input_layernorm"),
@@ -231,9 +236,8 @@ impl HyV3Block {
         })
     }
 
-    /// GPU-first forward: Q/K RoPE, attention and the residual adds run on
-    /// the tensor's device. Host paths are only reached through the
-    /// fused-kernel fallback guards and the (host-side) MoE routing pull.
+    /// GPU-first forward: Q/K RoPE, attention and the residual adds run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards and the (host-side) MoE routing.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -242,12 +246,8 @@ impl HyV3Block {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -281,9 +281,7 @@ impl HyV3Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct HyV3 {
     pub cfg: HyV3Config,
@@ -337,7 +335,10 @@ impl HyV3 {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -411,9 +412,7 @@ impl CausalLm for HyV3 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -429,6 +428,7 @@ mod tests {
         assert_eq!(cfg.num_experts_per_tok, 8);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_hy_v3_forward_and_session_state() {
         let mut cfg = HyV3Config::default();
@@ -443,7 +443,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

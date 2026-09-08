@@ -1,10 +1,5 @@
-//! ViT (Dosovitskiy-style Vision Transformer) — `Encoder` trait impl.
-//!
-//! pipeline:
-//!   patch_embed → prepend [CLS] → N × encoder block → ln → cls-token output
-//!
-//! All in F32 CPU for the structural layer; kernel backends land with
-//! grim-backend-rocm in phase 4.
+//! ViT (Dosovitskiy-style Vision Transformer) - `Encoder` trait impl.
+//! pipeline: patch_embed → prepend [CLS] → N × encoder block → ln → cls-token output.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -114,11 +109,8 @@ impl ModelConfig for VitConfig {
     }
 }
 
-/// True LayerNorm (mean-subtracted, learnable bias) — distinct from `RmsNorm`.
-///
-/// Real ViT checkpoints are trained with LayerNorm, so loading their `weight`/
-/// `bias` into an RmsNorm (no mean subtraction, no bias) is numerically wrong.
-/// [P1-34 fix: ViT norms are LayerNorm, not RmsNorm.]
+/// True LayerNorm (mean-subtracted, learnable bias) - distinct from `RmsNorm`.
+/// Real ViT checkpoints are trained with LayerNorm, so loading their `weight`/ `bias` into an RmsNorm.
 pub struct LayerNorm {
     pub weight: Vec<f32>,
     pub bias: Vec<f32>,
@@ -343,8 +335,7 @@ impl VitBlock {
         for i in 0..attn_res.len() {
             attn_res[i] += attn_out[i];
         }
-        // Pre-MLP norm: mlp operates on norm2(attn_res), and the second
-        // residual adds onto attn_res (not the block input x).
+        // Pre-MLP norm: mlp operates on norm2(attn_res), and the second residual adds onto attn_res (not the block input x).
         // [P1-34 fix: missing pre-MLP norm + wrong second residual base.]
         let normed2 = self.norm2.forward(&attn_res);
         let fc1_out = self
@@ -437,11 +428,8 @@ impl Vit {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for ViT. ViT is a vision encoder (`Model`/
-    /// `Encoder`, not `CausalLm`); `VitBlock::forward` calls plain
-    /// `Linear::forward` with no all-reduce hook, and TP for vision encoders is
-    /// low-leverage since they don't run on the serving engine's text-out
-    /// path. Refused until a `forward` rework + an encoder consumer arrive.
+    /// Tensor-parallel load entry for ViT. ViT is a vision encoder (`Model`/ `Encoder`, not `CausalLm`); `VitBlock::forward` calls plain `Linear::forward` with
+    /// no all-reduce hook, and TP for vision encoders is low-leverage since they don't run on the serving engine's text-out path.
     pub fn load_tp(
         device: Device,
         ws: &WeightSource<'_>,
@@ -644,12 +632,8 @@ mod tests {
 
     #[test]
     fn vit_pos_embed_applied_once_and_to_cls() {
-        // With zeroed projection weights and a zeroed cls_token, the CLS row
-        // entering the block stack is exactly pos_embed[0..hidden] — so the
-        // final LayerNorm output must equal LayerNorm(pos_embed[0..hidden]).
-        // Double application (2x) or a missing CLS pos_embed (zeros) both
-        // produce a different result, since LayerNorm is not scale-invariant
-        // once the row is non-constant vs. all-zero.
+        // With zeroed projection weights and a zeroed cls_token, the CLS row entering the block stack is exactly pos_embed[0..hidden] - so the final LayerNorm output must equal LayerNorm(pos_embed[0..hidden]).
+        // Double application (2x) or a missing CLS pos_embed (zeros) both produce a different result, since.
         let cfg = VitConfig {
             image_size: 4,
             patch_size: 2,

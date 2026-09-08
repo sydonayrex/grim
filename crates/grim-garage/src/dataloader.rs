@@ -4,13 +4,8 @@ use grim_tensor::{Shape, Tensor};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
-/// Reads a `.jsonl` file where each line is `{"text": "..."}`,
-/// tokenizes each line, packs tokens into fixed-length sequences,
-/// and yields `(input_ids, labels)` tensor pairs.
-///
+/// Reads a `.jsonl` file where each line is `{"text": "..."}`, tokenizes each line, packs tokens into fixed-length sequences, and yields `(input_ids, labels)` tensor pairs.
 /// Labels are input_ids shifted left by 1 position (next-token prediction).
-/// The last token in each sequence is set to the pad token ID.
-/// Shorter sequences are padded with the pad token ID.
 pub struct JsonlBatchIterator {
     token_buffer: Vec<u32>,
     seq_len: usize,
@@ -93,8 +88,7 @@ impl JsonlBatchIterator {
     }
 
     /// Load the next preference optimization batch (chosen/rejected pairs).
-    /// Returns `Ok(Some((chosen, rejected)))` when a batch is ready,
-    /// `Ok(None)` when the file is exhausted, or `Err` on I/O errors.
+    /// Returns `Ok(Some((chosen, rejected)))` when a batch is ready, `Ok(None)` when the file is exhausted, or.
     pub fn next_preference_batch(&mut self) -> Result<Option<(Tensor, Tensor)>> {
         let needed = self.batch_size * self.seq_len;
         while self.token_buffer.len() < needed * 2 && !self.exhausted {
@@ -127,9 +121,8 @@ impl JsonlBatchIterator {
             Shape::from_slice(&[self.batch_size, self.seq_len]),
         );
 
-        // P2-14c: the `is_preferred` vector was computed but never consumed —
-        // every caller destructured the return with `_` and discarded it, so
-        // drop it from the API entirely.
+        // P2-14c: the `is_preferred` vector was computed but never consumed - every caller destructured
+        // the return with `_` and discarded it, so drop it from the API entirely.
         Ok(Some((chosen_ids, rejected_ids)))
     }
 

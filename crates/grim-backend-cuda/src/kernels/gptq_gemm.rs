@@ -1,21 +1,10 @@
 //! GPTQ / EfficientQAT GroupInt fused dequant-GEMM CUDA kernels.
-//!
 //! Ported from grim-backend-rocm `kernels/gptq_gemm.rs`.
-//!
-//! Consumes the length-prefixed four-segment packed layout:
-//!   [u64 LE: qweight_len][qweight][u64 LE: qzeros_len][qzeros]
-//!   [u64 LE: scales_len][scales][u64 LE: g_idx_len][g_idx]
-//!
-//! Dequant: asymmetric (code - (zero+1)) * scale, matching grim_quant::dequant_gptq_group_int.
-//! Supports 2-bit, 3-bit, 4-bit, 8-bit codes and optional act-order g_idx permutation.
-//! Inference-only: forward GEMM only (no backward weight-gradient kernel).
 
 pub const GPTQ_GEMM_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// Helpers — GPTQ packed-weight read utilities
-// ---------------------------------------------------------------------------
+// Helpers - GPTQ packed-weight read utilities
 
 __device__ __forceinline__ unsigned int grim_gptq_read_u32(
     const unsigned char* __restrict__ base, long long word_idx)
@@ -62,16 +51,8 @@ __device__ __forceinline__ float grim_gptq_read_zero(
     return (float)((word >> ((col % values_per_word) * bits)) & ((1u << bits) - 1u)) + 1.0f;
 }
 
-// ---------------------------------------------------------------------------
-// grim_gptq_dequant_gemm — forward inference GEMM for GPTQ/EfficientQAT.
-//
-// C[M,N] = A[M,K] @ dequant(B)^T  where B packs a [K,N] weight.
-// Grid: ceil(M*N / 256) blocks, 256 threads. One thread per output cell.
-//
-// Contract:
-//   B_packed layout: [qweight | qzeros | scales | g_idx] (offsets passed as args)
-//   scale format: fp32 per (group, out_col) stored contiguously.
-// ---------------------------------------------------------------------------
+// grim_gptq_dequant_gemm - forward inference GEMM for GPTQ/EfficientQAT.
+// C[M,N] = A[M,K] @ dequant(B)^T where B packs a [K,N] weight.
 __global__ void grim_gptq_dequant_gemm(
     const float* __restrict__ A,
     const unsigned char* __restrict__ B_packed,

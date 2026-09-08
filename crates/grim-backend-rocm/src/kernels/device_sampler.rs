@@ -1,42 +1,10 @@
 //! WI-X3: GPU-native stochastic sampling kernel for ROCm.
-//!
-//! [`DEVICE_SAMPLER_KERNEL_SOURCE`] defines `grim_sample_logits_stochastic`: a
-//! single-block HIP kernel that applies temperature scaling, top-k and top-p
-//! filtering entirely on device, then picks a token with the Gumbel-max trick —
-//! `argmax(logit - log(-log(u)))` with `u` drawn from a counter-based
-//! (splitmix/xorshift-style) RNG keyed by `(seed, position, thread, chunk)`.
-//! The Gumbel perturbation of log-softmax scores yields exact multinomial
-//! sampling without any prefix-sum scan. The host reads back ONLY the 4-byte
-//! token id (vs. the full logits row for CPU sampling).
-//!
-//! Compile/launch follows the crate-wide JIT pattern: the source is appended to
-//! the aggregate compute translation unit in
-//! [`crate::kernels::source_asm::compute_kernel_source`] and dispatched via
-//! `RocmDevice::launch_compute_kernel` — the same path as the greedy
-//! `grim_sample_logits_argmax` kernel in `kernels/speculative_sampler.rs`.
+//! [`DEVICE_SAMPLER_KERNEL_SOURCE`] defines `grim_sample_logits_stochastic`: a single-block HIP kernel that applies temperature scaling, top-k and top-p filtering.
 
 /// HIP C++ source for `grim_sample_logits_stochastic`. [see: `compute_kernel_source`, `launch_compute_kernel`]
 pub const DEVICE_SAMPLER_KERNEL_SOURCE: &str = r#"
-// ---------------------------------------------------------------------------
-// WI-X3: GPU Stochastic Logits Sampler (temperature + top-k + top-p + Gumbel)
-// ---------------------------------------------------------------------------
-// Grid:  (1, 1)      — one block samples one token from one logits row.
-// Block: (256, 1)    — threads stride across the vocab; all reductions are
-//                      block-wide tree reductions over shared memory.
-//
-// Filtering operates in temperature-scaled logit space s = logit / T, which is
-// order-equivalent to filtering on softmax probabilities.
-//
-// Approximations (documented by design):
-//  * top-k uses count-based bisection on the scaled-logit value to find the
-//    k-th largest value in O(24 * vocab). Ties AT the threshold survive, so a
-//    run of equal logits may keep slightly more than k tokens (never fewer).
-//  * top-p uses mass-based bisection to locate the probability threshold whose
-//    surviving mass first reaches top_p. The boundary token may push total
-//    kept mass slightly ABOVE top_p (identical to CPU top-p semantics); ties
-//    at the threshold are kept together. At least the argmax token always
-//    survives both filters.
-// ---------------------------------------------------------------------------
+// WI-X3: GPU Stochastic Logits Sampler (temperature + top-k + top-p + Gumbel) Grid: (1, 1)   - one block samples one token from one logits row.
+// Block: (256, 1) - threads stride across the vocab; all reductions are block-wide tree reductions.
 #define GRIM_SAMPLER_BLOCK 256
 
 __device__ unsigned int grim_sampler_hash(unsigned int x) {
@@ -77,9 +45,8 @@ extern "C" __global__ void grim_sample_logits_stochastic(
     __shared__ int   s_idx[GRIM_SAMPLER_BLOCK];
 
     if (temperature <= 0.0f) {
-        // Greedy shortcut: T->0 collapses softmax to a point mass, which the
-        // Gumbel-max trick reproduces only in the infinite-noise limit — so
-        // take the exact argmax instead of dividing by zero.
+        // Greedy shortcut: T->0 collapses softmax to a point mass, which the Gumbel-max trick reproduces only
+        // in the infinite-noise limit - so take the exact argmax instead of dividing by zero.
         float local_max = -1e30f;
         int local_idx = -1;
         for (int v = tid; v < vocab_size; v += block) {
@@ -167,9 +134,7 @@ extern "C" __global__ void grim_sample_logits_stochastic(
     }
 
     // ---- pass 3: top-p threshold (mass-bisection over surviving set).
-    // mass(x) = sum_{unmasked, s >= x} p(s), non-increasing in x. We look for
-    // the LOWEST kept value t_p such that mass(t_p) >= top_p (the smallest
-    // descending-prefix with cumulative mass reaching top_p).
+    // mass(x) = sum_{unmasked, s >= x} p(s), non-increasing in x.
     float t_p = -1e30f; // sentinel == "disabled"
     if (top_p < 1.0f) {
         float local_z = 0.0f;
@@ -227,11 +192,8 @@ extern "C" __global__ void grim_sample_logits_stochastic(
         }
     }
 
-    // ---- pass 4: Gumbel-max multinomial draw over the filtered support ----
-    // key_i = s_i + g_i with g ~ Gumbel(0,1) = -log(-log(u)). argmax key is a
-    // sample from softmax(s) restricted to the unmasked tokens — no cumsum.
-    // Each thread tracks its local best; a final block reduction picks the
-    // global winner.
+    // ---- pass 4: Gumbel-max multinomial draw over the filtered support ---- key_i = s_i + g_i with g ~ Gumbel(0,1) = -log(-log(u)).
+    // argmax key is a sample from softmax(s) restricted to the unmasked tokens - no cumsum.
     float best_key = -1e30f;
     int best_v = -1;
     int n = 0;
@@ -278,9 +240,8 @@ use crate::device::util::DeviceGuard;
 /// `GRIM_SAMPLER_BLOCK` in [`DEVICE_SAMPLER_KERNEL_SOURCE`]).
 const SAMPLER_BLOCK: u32 = 256;
 
-/// Largest vocabulary accepted by the device sampler. Beyond this the LDS /
-/// register budget of the single-block design degrades and callers should use
-/// the CPU sampler instead (`Ok(None)` contract).
+/// Largest vocabulary accepted by the device sampler.
+/// Beyond this the LDS / register budget of the single-block design degrades and callers should.
 pub const MAX_DEVICE_SAMPLER_VOCAB: usize = 1 << 18; // 262144
 
 /// Shared implementation behind [`sample_logits_on_device`] /
@@ -368,9 +329,8 @@ fn validate_input(logits: &RocmStorage, vocab: usize, temperature: f32, top_p: f
     if !temperature.is_finite() || !top_p.is_finite() || temperature < 0.0 {
         return None;
     }
-    // Offset to the LAST `vocab` entries: the engine's logits table may be
-    // wider than the model vocab (65536-wide), and host-side CPU sampling
-    // slices the tail — mirror that exactly on device.
+    // Offset to the LAST `vocab` entries: the engine's logits table may be wider than the
+    // model vocab (65536-wide), and host-side CPU sampling slices the tail - mirror that exactly on device.
     let tail_offset = logits.bytes() - vocab * std::mem::size_of::<f32>();
     logits
         .device_ptr_u64()
@@ -379,17 +339,7 @@ fn validate_input(logits: &RocmStorage, vocab: usize, temperature: f32, top_p: f
 }
 
 /// WI-X3: sample one token from a logits row entirely on the GPU.
-///
-/// Applies `temperature`, `top_k` (0 = disabled) and `top_p` (>= 1.0 =
-/// disabled) filtering plus multinomial sampling via the Gumbel-max trick, then
-/// copies back ONLY the 4-byte token id. `seed` packs `(seed, position)`:
-/// low 32 bits seed the per-thread RNG streams, high 32 bits act as the decode
-/// step/position — pass `((position as u64) << 32) | base_seed` for
-/// reproducible per-step sampling.
-///
-/// Returns `Ok(None)` when the input is unsupported (vocab out of range,
-/// missing/short device buffer, non-finite params) so callers fall back to the
-/// CPU sampler; any HIP failure surfaces as `Err`.
+/// Applies `temperature`, `top_k` (0 = disabled) and `top_p` (>= 1.0 = disabled) filtering plus multinomial.
 pub fn sample_logits_on_device(
     device: &RocmDevice,
     logits: &RocmStorage,

@@ -5,13 +5,7 @@ pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
     /// RWKV time-mix: single token step with recurrence over time.
-    ///
-    /// One thread block handles one token position t. Within the block,
-    /// threads cooperatively compute the weighted accumulation across
-    /// all prior positions (or a sliding window).
-    ///
-    /// Input x_t ∈ R[d_model], prior states h_{t-1} ∈ R[d_model].
-    /// Output h_t ∈ R[d_model] (written in-place or to separate buffer).
+    /// One thread block handles one token position t.
     __global__ void grim_rwkv_time_mix(
         const float* __restrict__ x,            // [batch, seq_len, d_model]  current input
         const float* __restrict__ w_key,         // [d_model, d_model]  W_k  key projection
@@ -44,8 +38,7 @@ extern "C" {
         float decay = 1.0f / (1.0f + expf(-w_d));  // sigmoid of decay weight
 
         // Weighted accumulation over prior positions.
-        // h_t[d] = decay * h_{t-1}[d] + sum_{i=0..t} (w_i * k_i[d]) * v_t[d]
-        // For v1, use the full history with a simple weighted sum.
+        // h_t[d] = decay * h_{t-1}[d] + sum_{i=0..t} (w_i * k_i[d]) * v_t[d] For v1, use.
         float accum = 0.0f;
         for (int i = 0; i <= t; ++i) {
             float k_i_d = k_cache[batch_index * seq_len * d_model + i * d_model + d];
@@ -63,8 +56,7 @@ extern "C" {
         y[batch_index * d_model + d] = y_d;
     }
 
-    /// RWKV channel-mix (FFN-like) pass: replaces the standard MLP with
-    /// a multiplicative gating mechanism (RWKV-5/RWKV-6 style).
+    /// RWKV channel-mix (FFN-like) pass: replaces the standard MLP with a multiplicative gating mechanism (RWKV-5/RWKV-6 style).
     /// y = (W_k @ x) * σ(W_v @ x) + W_r @ x
     __global__ void grim_rwkv_channel_mix(
         const float* __restrict__ x,            // [batch, d_model]  input

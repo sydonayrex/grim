@@ -1,8 +1,5 @@
-//! Prefill hit compaction kernel.
-//!
-//! Compacts MoE expert request vectors on-device by partitioning cache-resident
-//! expert slots (which can be gathered via high-bandwidth D2D copy) from cache
-//! misses (which must be streamed asynchronously over PCIe).
+//! Prefill hit compaction kernel. Compacts MoE expert request vectors on-device by partitioning cache-resident expert slots (which
+//! can be gathered via high-bandwidth D2D copy) from cache misses (which must be streamed asynchronously over PCIe).
 
 use grim_tensor::error::{Error, Result};
 
@@ -77,14 +74,7 @@ mod tests {
     #[test]
     fn test_compact_expert_requests() {
         // 8 total experts: E0 (slot 3), E1 (None), E2 (slot 0), E3 (None), E4 (slot 1), E5 (None)
-        let slot_table = vec![
-            Some(3),
-            None,
-            Some(0),
-            None,
-            Some(1),
-            None,
-        ];
+        let slot_table = vec![Some(3), None, Some(0), None, Some(1), None];
 
         let requested = vec![0, 1, 2, 3, 4];
         let compacted = compact_expert_requests(&requested, &slot_table).unwrap();

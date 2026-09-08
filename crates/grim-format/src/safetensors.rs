@@ -30,12 +30,8 @@ impl SafetensorInfo {
             .unwrap_or(usize::MAX)
     }
     pub fn byte_size(&self) -> usize {
-        // FMT-10 fix: unknown dtype tags previously fell through to a 4-byte
-        // default, silently mis-sizing buffers for tensors we don't actually
-        // support. `grim_dtype()` already rejects unknown tags, so an unknown
-        // tag here means the tensor is unsupported — report 0 bytes rather than
-        // guessing, which makes any downstream allocation fail loudly instead
-        // of reading the wrong number of bytes.
+        // FMT-10 fix: unknown dtype tags previously fell through to a 4-byte default, silently mis-sizing buffers for tensors we don't actually support.
+        // `grim_dtype()` already rejects unknown tags, so an unknown tag here means the tensor is unsupported.
         let elem = match self.dtype_tag.as_str() {
             "F32" | "I32" | "U32" => 4,
             "F16" | "BF16" => 2,
@@ -181,10 +177,8 @@ pub fn read_safetensor_bytes<R: Read + Seek>(
     info: &SafetensorInfo,
     data_region_start: u64,
 ) -> Result<Vec<u8>> {
-    // Safetensors data_offsets in the JSON header are relative to the
-    // data section, which starts at `data_region_start` (the header length
-    // prefix + JSON header).  Add this base offset to reach the actual
-    // file position.
+    // Safetensors data_offsets in the JSON header are relative to the data section, which starts at `data_region_start` (the header length prefix + JSON header).
+    // Add this base offset to reach the actual file position.
     let start = data_region_start + info.data_start;
     let size = (info.data_end - info.data_start) as usize;
     reader.seek(SeekFrom::Start(start))?;

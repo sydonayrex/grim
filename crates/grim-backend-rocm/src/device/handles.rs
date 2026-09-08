@@ -31,17 +31,8 @@ impl RocmHandle {
     }
 }
 
-// SAFETY: `RocmHandle` wraps an optional HIP stream pointer. HIP stream handles
-// are opaque platform resources that are valid process-wide on the owning device.
-// Moving the handle to another thread (Send) is safe because the stream remains
-// valid in the new thread's context. The type is intentionally NOT `Sync` —
-// concurrent access to the same stream from multiple threads without external
-// synchronization can cause race conditions on stream-ordered operations.
-//
-// Current enforcement: all live call paths into this type pass through
-// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
-// possible through the server's actual API today. Do NOT add a `Sync` impl or
-// introduce concurrent stream access without adding an internal Mutex first.
+// SAFETY: `RocmHandle` wraps an optional HIP stream pointer.
+// HIP stream handles are opaque platform resources that are valid process-wide on the owning device.
 unsafe impl Send for RocmHandle {}
 
 impl ComputeHandle for RocmHandle {
@@ -114,10 +105,8 @@ unsafe extern "C" {
     pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
     pub fn hipMallocManaged(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipFree(device: *mut c_void) -> HipErrorT;
-    /// Enqueue an async free on `stream`; the buffer is released once all prior
-    /// work on that stream has completed. Available from ROCm 5.4+.
-    /// Pass `null_mut()` to use the default (null) stream, which serialises with
-    /// device-wide execution but avoids a full hipDeviceSynchronize stall.
+    /// Enqueue an async free on `stream`; the buffer is released once all prior work on that stream has completed.
+    /// Available from ROCm 5.4+.
     pub fn hipFreeAsync(device: *mut c_void, stream: *mut c_void) -> HipErrorT;
     pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
@@ -150,9 +139,8 @@ unsafe extern "C" {
 
     // Graph and Stream FFI
     pub fn hipStreamCreate(stream: *mut *mut c_void) -> HipErrorT;
-    /// Create a stream with flags. `HIP_STREAM_NON_BLOCKING` (0x1) makes the
-    /// stream NOT synchronize with the legacy default stream — required for
-    /// long-lived persistent kernels that must never block control traffic.
+    /// Create a stream with flags. `HIP_STREAM_NON_BLOCKING` (0x1) makes the stream NOT synchronize with the
+    /// legacy default stream - required for long-lived persistent kernels that must never block control traffic.
     pub fn hipStreamCreateWithFlags(
         stream: *mut *mut c_void,
         flags: u32,
@@ -198,9 +186,8 @@ unsafe extern "C" {
     pub fn hipEventDestroy(event: *mut c_void) -> HipErrorT;
     pub fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> HipErrorT;
     pub fn hipEventSynchronize(event: *mut c_void) -> HipErrorT;
-    // Cross-stream dependency: block `stream` until `event` (recorded on another
-    // stream) completes. Enables upload-on-transfer-stream to overlap with
-    // compute-on-active-stream (SPEED-ROC-1 decode-step overlap).
+    // Cross-stream dependency: block `stream` until `event` (recorded on another stream) completes.
+    // Enables upload-on-transfer-stream to overlap with compute-on-active-stream (SPEED-ROC-1 decode-step overlap).
     pub fn hipStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> HipErrorT;
     pub fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT;
 
@@ -264,18 +251,11 @@ unsafe extern "C" {
     pub fn hiprtcGetProgramLog(prog: HiprtcProgram, log: *mut i8) -> HipErrorT;
 }
 
-// ======== Attribute / advice constants ========
-//
-// Numbers verified against ROCm 7.x `hip_runtime_api.h`
-// (`hipDeviceAttribute_t`) and probed live on gfx1201/gfx1200: the previous
-// values here were CUDA numbering, so every query landed on a different
-// attribute (WARP_SIZE=24 read ManagedMemory; MULTIPROCESSOR_COUNT=16 read
-// Integrated; MAX_THREADS_PER_BLOCK=1 read AccessPolicyMaxWindowSize;
-// PAGEABLE_MEMORY_ACCESS=231 did not exist and always errored).
+// ======== Attribute / advice constants ======== Numbers verified against ROCm 7.x `hip_runtime_api.h` (`hipDeviceAttribute_t`) and probed live on gfx1201/gfx1200: the previous values here were CUDA
+// numbering, so every query landed on a different attribute (WARP_SIZE=24 read ManagedMemory; MULTIPROCESSOR_COUNT=16 read Integrated; MAX_THREADS_PER_BLOCK=1 read AccessPolicyMaxWindowSize; PAGEABLE_MEMORY_ACCESS=231 did not exist and always errored).
 
 /// XNACK and device memory attribute flags for unified memory detection.
-/// NOTE: `hipDeviceAttributeCoherentDeviceAlloc` has no backing attribute in
-/// current ROCm headers; the number is kept for API stability only.
+/// NOTE: `hipDeviceAttributeCoherentDeviceAlloc` has no backing attribute in current ROCm headers; the number is kept for.
 pub const HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC: i32 = 230;
 pub const HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: i32 = 65;
 

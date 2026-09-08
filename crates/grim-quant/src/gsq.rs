@@ -1,8 +1,5 @@
 //! GSQ (Gumbel-Softmax Quantization) for sub-Q4 scalar quantization.
-//!
-//! Learns discrete scalar grid assignments and per-group scales via continuous
-//! Gumbel-Softmax relaxation. Closes the gap between scalar and vector quantization
-//! at 2 to 3 bits while remaining deployable into standard scalar formats (Q2_K, Q3_K, IQ2/3).
+//! Learns discrete scalar grid assignments and per-group scales via continuous Gumbel-Softmax relaxation.
 
 use grim_tensor::error::{Error, Result};
 
@@ -44,15 +41,8 @@ pub struct GsqBlockFit {
 }
 
 /// Fit a sub-Q4 weight block using Gumbel-Softmax relaxation.
-///
-/// Optimizes continuous coordinates `c_0, ..., c_{K-1}` and scalar `scale` such that
-/// soft relaxation $\sum_k P(w_i \in k) c_k \cdot \text{scale}$ minimizes MSE to $w_i$,
-/// then extracts hard assignments $\arg\max_k P(w_i \in k)$.
-pub fn gsq_fit_block(
-    data: &[f32],
-    bits: u8,
-    config: &GsqConfig,
-) -> Result<GsqBlockFit> {
+/// Optimizes continuous coordinates `c_0, ..., c_{K-1}` and scalar `scale` such that soft relaxation $\sum_k P(w_i.
+pub fn gsq_fit_block(data: &[f32], bits: u8, config: &GsqConfig) -> Result<GsqBlockFit> {
     if data.is_empty() {
         return Err(Error::Backend("gsq_fit_block: empty data block".into()));
     }
@@ -70,14 +60,13 @@ pub fn gsq_fit_block(
 
     // Initial grid: uniform spacing centered around zero
     let half_levels = (n_levels - 1) as f32 * 0.5;
-    let mut grid: Vec<f32> = (0..n_levels)
-        .map(|k| k as f32 - half_levels)
-        .collect();
+    let mut grid: Vec<f32> = (0..n_levels).map(|k| k as f32 - half_levels).collect();
 
     // Optimization loop via Gumbel-Softmax gradient steps
     for step in 0..config.steps {
         let progress = step as f32 / config.steps.max(1) as f32;
-        let tau = config.temperature_init * (config.temperature_min / config.temperature_init).powf(progress);
+        let tau = config.temperature_init
+            * (config.temperature_min / config.temperature_init).powf(progress);
 
         // Compute assignment logits: -||w_i - scale * c_k||^2
         let mut d_grid = vec![0.0f32; n_levels];
@@ -104,8 +93,8 @@ pub fn gsq_fit_block(
                 sum_exp += p;
             }
             if sum_exp > 0.0 {
-                for k in 0..n_levels {
-                    probs[k] /= sum_exp;
+                for p in probs.iter_mut() {
+                    *p /= sum_exp;
                 }
             }
 

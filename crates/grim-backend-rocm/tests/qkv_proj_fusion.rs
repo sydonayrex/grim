@@ -7,9 +7,7 @@
 //! exists.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{DType, Shape,
-    CoreTensorOps,
-};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {

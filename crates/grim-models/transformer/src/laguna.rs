@@ -1,14 +1,5 @@
-//! Laguna 2 MoE transformer — routes every layer through a shared `MoeBlock`.
-//!
-//! Laguna uses a sigmoid router with a noisy-router / dedup correction bias
-//! (`exp_probs_b`) and an always-on shared expert. Attention towers are plain
-//! Llama-style full-context causal GQA; the MoE routing replaces the dense FFN
-//! per layer.
-//!
-//! Note: sliding-window / interleaved local-global attention is *not* supported
-//! here. The attention kernels in `block.rs` have no windowing path, and
-//! Laguna's design uses plain causal attention. (Hybrid windowed attention
-//! exists elsewhere — see `muse_glimmer` — but is unrelated to this model.)
+//! Laguna 2 MoE transformer - routes every layer through a shared `MoeBlock`.
+//! Laguna uses a sigmoid router with a noisy-router / dedup correction bias (`exp_probs_b`) and an.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -20,9 +11,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::model::{Llama, LlamaConfig};
 use crate::moe_block::MoESpec;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct LagunaConfig {
@@ -111,9 +100,7 @@ impl ModelConfig for LagunaConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Laguna {
     pub cfg: LagunaConfig,
@@ -148,10 +135,8 @@ impl Laguna {
             yarn: None,
         };
 
-        // The MoE router is a token-level sigmoid gate (one score per expert
-        // per token). Laguna's `gating: "per-head"` config selects the
-        // attention output gate (applied in `LlamaBlock::forward_with_kv_paged`),
-        // not a per-head MoE router.
+        // The MoE router is a token-level sigmoid gate (one score per expert per token).
+        // Laguna's `gating: "per-head"` config selects the attention output gate (applied in `LlamaBlock::forward_with_kv_paged`), not a per-head.
         let router_kind = RouterKind::SigmoidTopKWithBias;
 
         let spec = MoESpec {

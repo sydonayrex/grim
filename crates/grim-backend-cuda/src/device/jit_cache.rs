@@ -7,18 +7,14 @@ use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
+use crate::device::handles::{CUmodule, cuInit, cuModuleLoadData};
 use grim_tensor::error::{Error, Result};
-use crate::device::handles::{cuInit, cuModuleLoadData, CUmodule};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SendCmodule(pub CUmodule);
 
-// SAFETY: `CUmodule` is owned and managed by the CUDA driver. Concurrent
-// `cuModuleLoadData` / `cuLaunchKernel` calls on the same module are
-// serialized by the driver; the JIT cache (`JIT_CACHE`) is additionally
-// protected by a `Mutex`. `Send` is safe because the driver tracks the
-// module independently of the creating thread. `Sync` is safe because
-// the driver itself serializes concurrent launches on the same module.
+// SAFETY: `CUmodule` is owned and managed by the CUDA driver.
+// Concurrent `cuModuleLoadData` / `cuLaunchKernel` calls on the same module are serialized by the driver; the.
 unsafe impl Send for SendCmodule {}
 unsafe impl Sync for SendCmodule {}
 
@@ -127,9 +123,8 @@ pub fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmod
         .map_err(|e| Error::Backend(format!("Failed to convert PTX to CString: {e}")))?;
 
     let mut module: CUmodule = std::ptr::null_mut();
-    // SAFETY: `cuModuleLoadData` parses PTX text from memory and compiles it
-    // into a device-specific module. `ptx_c_str` is a valid null-terminated
-    // string; `module` is initialized to null and checked against 0.
+    // SAFETY: `cuModuleLoadData` parses PTX text from memory and compiles it into a device-specific module.
+    // `ptx_c_str` is a valid null-terminated string; `module` is initialized to null and checked against 0.
     unsafe {
         let res = cuModuleLoadData(&mut module, ptx_c_str.as_ptr() as *const c_void);
         if res != 0 {

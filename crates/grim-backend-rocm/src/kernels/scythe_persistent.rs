@@ -1,71 +1,13 @@
-//! ScytheRing persistent dispatch kernel — device-side opcode loop
-//! (WI-Charon-3 item 2).
-//!
-//! `charon_kernel_plan_v3.md` §3 WI-Charon-3 item 2:
-//! > Persistent-kernel dispatch-loop extension: `if (desc.opcode == 6) {
-//! >   ... cast desc.weight_ptr to MoETaskDescriptor*, call the Charon
-//! >   kernel inline ... }` — no separate `hipLaunchKernel`, matching how
-//! > opcodes 0-5 already work.
-//!
-//! The host-side `ScytheRing` (`grim_engine::scythe2::ScytheRing`) enqueues
-//! `ScytheTaskDescriptor` slots; this file is the **device-side persistent
-//! kernel** that polls those slots and dispatches per opcode. Opcodes 0–5
-//! (nop/column-GEMM/row-GEMM/attention/norm/CommFuse-reduce) are the
-//! documented existing arms; opcode 6 (MoE dispatch, WI-Charon-3) is the new
-//! arm that casts `weight_ptr` to `MoETaskDescriptor*` and calls the Charon
-//! forward kernel inline.
-//!
-//! ## Status
-//!
-//! The full persistent kernel (all 7 opcodes with their device-side bodies)
-//! is a large body of work; the existing arms live in different kernel files
-//! (`wmma_gemm.rs` for column/row GEMM, `cross_attention.rs` for attention,
-//! `comm_fuse.rs` for opcode 5's fan-in, etc.). This file's job is the
-//! **dispatch loop skeleton + opcode-6 arm**, written so:
-//!
-//! 1. The Charon-integration shape is concrete and reviewable: a host
-//!    enqueues a `ScytheTaskDescriptor { opcode: 6, weight_ptr: &MoETask,
-//!    input_ptr/output_ptr/peer_ptr: ... }`, and the device reads
-//!    `MoETaskDescriptor` fields by name.
-//! 2. A host-side test can assert the dispatch loop reads every named field
-//!    of `MoETaskDescriptor` (the "kernel reads back correct fields" half of
-//!    WI-Charon-3 gate 2) — the structural check that catches a regression
-//!    where the device reads the wrong field, drops one, or mis-casts the
-//!    `weight_ptr`.
-//! 3. The on-device dispatch (opcode 6 firing a real Charon launch) remains
-//!    device-gated per gate (3); this file provides the source the
-//!    device-side JIT would compile.
-//!
-//! ## FFI alignment
-//!
-//! The device-side `scythe_task_descriptor_t` and `moe_task_descriptor_t`
-//! mirror the Rust `ScytheTaskDescriptor` / `MoETaskDescriptor` (`#[repr(C,
-//! align(32))]` in `grim_engine::scythe2`). The `extern "C"` linkage + the
-//! `align(32)` guarantee the device reads the same bytes the host wrote — no
-//! padding mismatch, no field-reordering.
+//! ScytheRing persistent dispatch kernel - device-side opcode loop (WI-Charon-3 item 2).
+//! `charon_kernel_plan_v3.md` §3 WI-Charon-3 item 2: > Persistent-kernel dispatch-loop extension: `if (desc.opcode == 6) { >.
 
-// ---------------------------------------------------------------------------
-// HIP source — persistent dispatch loop (opcode switch, with opcode-6 MoE arm)
-// ---------------------------------------------------------------------------
+// HIP source - persistent dispatch loop (opcode switch, with opcode-6 MoE arm)
 
 /// HIP source for the ScytheRing persistent dispatch kernel.
-///
-/// The kernel is launched ONCE per persistent wave (one wave per CU typically)
-/// and runs forever, polling the ring for new descriptors. Each iteration:
-///   1. Read `slots[tail].status` (Acquire).
-///   2. If `status == pending`, claim it (CAS to running), dispatch on
-///      `opcode`, mark complete.
-///   3. Advance `tail`.
-///
-/// The opcode-6 arm casts `desc.weight_ptr` to `MoETaskDescriptor*` and
-/// branches on `quant_mode` to call the matching Charon forward variant.
-/// This file embeds only the FP32 arm (`grim_moe_fused_grouped`); the
-/// quantized variants would branch to `grim_moe_fused_grouped_fp8` etc. —
-/// same dispatch shape, different target kernel.
+/// The kernel is launched ONCE per persistent wave (one wave per CU typically) and runs.
 pub const KERNEL_SOURCE: &str = r#"
-// Device-side mirrors of the Rust ScytheTaskDescriptor / MoETaskDescriptor
-// (grim_engine::scythe2). #[repr(C, align(32))] on the Rust side; the device
-// matches that layout exactly so the host-written bytes are read correctly.
+// Device-side mirrors of the Rust ScytheTaskDescriptor / MoETaskDescriptor (grim_engine::scythe2).
+// #[repr(C, align(32))] on the Rust side; the device matches that layout exactly so the host-written.
 struct __align__(32) scythe_task_descriptor_t {
     unsigned int opcode;     // 0=nop,1=col-GEMM,2=row-GEMM,3=attn,4=norm,5=CommFuse,6=MoE,7=add
     unsigned int m, n, k;
@@ -120,8 +62,7 @@ struct __align__(32) moe_task_descriptor_t {
 #define ST_ERROR    3u
 
 // The forward-declared Charon kernel (defined in charon.rs's KERNEL_SOURCE).
-// One persistent kernel dispatch wave calls this inline for opcode=6 — no
-// separate hipLaunchKernel, per WI-Charon-3 item 2.
+// One persistent kernel dispatch wave calls this inline for opcode=6 - no separate hipLaunchKernel, per.
 extern "C" __device__ void grim_moe_fused_grouped_device(
     const float* activations,
     const float* expert_gate_w,
@@ -134,23 +75,8 @@ extern "C" __device__ void grim_moe_fused_grouped_device(
     int hidden, int inter, int num_tokens, int block_size,
     float routed_scaling_factor);
 
-// ────────────────────────────────────────────────────────────────────────
-// grim_scythe_persistent_dispatch — the persistent dispatch-loop kernel.
-//
-// One wave of this kernel is launched per CU (or per persistent wave, per the
-// Concordia 2606.23521 scheme). It polls `slots[tail].status` and dispatches.
-//
-// For opcode=6 (MoE), the wave casts `desc.weight_ptr` to
-// `moe_task_descriptor_t*`, reads the geometry fields by name, and calls
-// `grim_moe_fused_grouped` inline (the FP32 path; quantized variants branch
-// on `quant_mode` to the matching grim_moe_fused_grouped_* kernel).
-//
-// `slots` is the device-resident ring buffer (ScytheRing::slots_device_ptr).
-// `capacity` is the ring capacity (power of 2). `tail_ptr` is the device-side
-// tail counter (mirrored from the host's atomic). With `resident != 0` the
-// wave survives empty-queue gaps and exits only via `stop_ptr`/max_tasks —
-// the WI-SB6 resident-wave mode.
-// ────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────── grim_scythe_persistent_dispatch - the persistent dispatch-loop kernel.
+// One wave of this kernel is launched per CU (or per persistent wave, per the.
 extern "C" __global__ void grim_scythe_persistent_dispatch(
     scythe_task_descriptor_t* slots,
     unsigned int capacity,
@@ -160,16 +86,13 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     unsigned int max_tasks,
     unsigned int resident)
 {
-    // Lane zero owns queue control; the whole block cooperates on the claimed
-    // descriptor so Charon receives the launch width it expects. Shared state
-    // also gives every lane the same termination condition.
+    // Lane zero owns queue control; the whole block cooperates on the claimed descriptor so Charon receives the launch width it expects.
+    // Shared state also gives every lane the same termination condition.
     __shared__ unsigned int claimed_slot;
     __shared__ unsigned int active;
     __shared__ unsigned int terminate;
-    // WI-SB6 idle backoff: unthrottled global atomics from a tight spin
-    // wedged the wave on RDNA4 under ROCm 7.2 (idle-gap-then-wedge,
-    // scythe2 plan log 2026-08-24). Exponential s_sleep backoff, capped,
-    // resets the moment a task claims.
+    // WI-SB6 idle backoff: unthrottled global atomics from a tight spin wedged the wave on RDNA4 under ROCm 7.2 (idle-gap-then-wedge, scythe2 plan log 2026-08-24).
+    // Exponential s_sleep backoff, capped, resets the moment a task claims.
     __shared__ unsigned int backoff_shift;
     if (threadIdx.x == 0) {
         terminate = 0;
@@ -196,9 +119,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (threadIdx.x == 0)
                 terminate = atomicAdd((unsigned int*)head_ptr, 0) == atomicAdd(tail_ptr, 0);
             __syncthreads();
-            // WI-SB6 resident wave: an empty queue is not a stop condition —
-            // the worker parks here until the host publishes new work via
-            // head, and exits only through stop_ptr (or max_tasks).
+            // WI-SB6 resident wave: an empty queue is not a stop condition - the worker parks
+            // here until the host publishes new work via head, and exits only through stop_ptr (or max_tasks).
             if (terminate && !resident) break;
             // Bounded exponential backoff: throttle the global atomic poll
             if (threadIdx.x == 0) {
@@ -215,10 +137,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
 
         // Dispatch on opcode.
         if (desc->opcode == OP_MOE) {
-            // WI-Charon-3 item 2: cast weight_ptr to MoETaskDescriptor* and
-            // call the Charon kernel inline. Read every named field — the
-            // structural test below pins each one so a regression that
-            // drops or mis-reads a field fails the host-side check.
+            // WI-Charon-3 item 2: cast weight_ptr to MoETaskDescriptor* and call the Charon kernel inline.
+            // Read every named field - the structural test below pins each one so a regression.
             moe_task_descriptor_t* moe =
                 (moe_task_descriptor_t*)desc->weight_ptr;
 
@@ -229,9 +149,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             const float* up_w   = (const float*)moe->up_w_ptr;
             const float* down_w = (const float*)moe->down_w_ptr;
 
-            // F3 (audit): the schedule arrives as three independent device
-            // buffers — the same three-pointer convention the host-side
-            // Charon call sites use. No contiguous packing contract.
+            // F3 (audit): the schedule arrives as three independent device buffers - the same three-pointer convention the host-side Charon call sites use.
+            // No contiguous packing contract.
             const unsigned int* sorted_token_ids =
                 (const unsigned int*)moe->token_ids_ptr;
             const unsigned int* sorted_expert_ids =
@@ -260,8 +179,7 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             unsigned int N = desc->n;
             unsigned int K = desc->k;
             // WI-SB6: stride the full M*N output space across the block.
-            // The previous m-major loop left threads >= M idle (a decode
-            // GEMM with m=1 ran on ONE thread of the 128-wide wave).
+            // The previous m-major loop left threads >= M idle (a decode GEMM with m=1 ran.
             for (unsigned int idx = threadIdx.x; idx < M * N; idx += blockDim.x) {
                 unsigned int m_idx = idx / N;
                 unsigned int n_idx = idx % N;
@@ -293,10 +211,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 }
             }
         } else if (desc->opcode == OP_ATTN) {
-            // F2 (audit): the flash-attention accumulator below is a fixed
-            // 256-lane register array; head_dim beyond that SILENTLY
-            // truncated outputs. Reject at claim time so the failure is
-            // loud, and let the tail still advance (see completion block).
+            // F2 (audit): the flash-attention accumulator below is a fixed 256-lane register array; head_dim beyond that SILENTLY truncated outputs.
+            // Reject at claim time so the failure is loud, and let the tail still advance.
             if (desc->k > 256u) {
                 if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
                 __syncthreads();
@@ -355,9 +271,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 if (local_out) local_out[idx] = val;
             }
         } else if (desc->opcode == OP_ADD) {
-            // WI-SB5 descriptor-linked fan-in: elementwise C = A + B over
-            // m*n elements. Used to sum row-parallel partials without any
-            // host round-trip.
+            // WI-SB5 descriptor-linked fan-in: elementwise C = A + B over m*n elements.
+            // Used to sum row-parallel partials without any host round-trip.
             const float* a = (const float*)desc->input_ptr;
             const float* b = (const float*)desc->weight_ptr;
             float* out = (float*)desc->output_ptr;
@@ -369,10 +284,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
 
-        // Mark complete and advance tail. The tail advances for ERRORED
-        // tasks too: an arm that sets ST_ERROR and skips the tail bump
-        // leaves tail < head forever, so the wave can never terminate (the
-        // unknown-opcode arm had exactly this wedge).
+        // Mark complete and advance tail. The tail advances for ERRORED tasks too: an arm that sets ST_ERROR and skips the
+        // tail bump leaves tail < head forever, so the wave can never terminate (the unknown-opcode arm had exactly this wedge).
         __syncthreads();
         if (threadIdx.x == 0) {
             if (desc->status == ST_RUNNING) {
@@ -391,14 +304,8 @@ mod tests {
     use super::*;
     use grim_tensor::{CoreTensorOps, MemoryOps};
 
-    /// WI-Charon-3 gate (2), host-testable half: the persistent dispatch
-    /// kernel reads every named field of `MoETaskDescriptor` when servicing
-    /// an opcode-6 slot. A regression that drops a field, mis-casts
-    /// `weight_ptr`, or reads the wrong schedule offset is caught here
-    /// before any device run.
-    ///
-    /// The device-side "kernel actually fires and produces correct output"
-    /// half is gate (3), device-gated per the plan.
+    /// WI-Charon-3 gate (2), host-testable half: the persistent dispatch kernel reads every named field of `MoETaskDescriptor` when servicing an opcode-6 slot.
+    /// A regression that drops a field, mis-casts `weight_ptr`, or reads the wrong schedule offset is.
     #[test]
     fn persistent_dispatch_reads_all_moe_descriptor_fields_by_name() {
         let src = KERNEL_SOURCE;
@@ -432,9 +339,8 @@ mod tests {
     #[test]
     fn persistent_dispatch_opcodes_match_scythe_descriptor_doc() {
         let src = KERNEL_SOURCE;
-        // Opcodes 0–6 are defined as #defines AND used in the dispatch arm.
-        // Pin both so a renumbering on either side surfaces here. Normalize
-        // whitespace (the HIP source aligns #defines with extra spaces).
+        // Opcodes 0-6 are defined as #defines AND used in the dispatch arm.
+        // Pin both so a renumbering on either side surfaces here.
         let normalized: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
         for (name, val) in [
             ("OP_NOP", "0u"),
@@ -499,13 +405,8 @@ mod tests {
 
     #[test]
     fn persistent_dispatch_schedule_reads_three_named_pointers() {
-        // F3 (audit) Option A: the schedule is three INDEPENDENT buffers —
-        // sorted_token_ids (u32[]), sorted_expert_ids (u32[]),
-        // sorted_weights (f32[]) — read via the descriptor's own
-        // token_ids_ptr / expert_ids_ptr / weights_ptr fields. Pin the
-        // named-field reads so a mutant that reintroduces the (never
-        // produced by any host path) contiguous-offset arithmetic fails
-        // here.
+        // F3 (audit) Option A: the schedule is three INDEPENDENT buffers - sorted_token_ids (u32[]), sorted_expert_ids (u32[]), sorted_weights (f32[]) - read via the descriptor's own token_ids_ptr / expert_ids_ptr / weights_ptr fields.
+        // Pin the named-field reads so a mutant that reintroduces the (never produced by any host.
         let src = KERNEL_SOURCE;
         for (field, cast) in [
             ("token_ids_ptr", "const unsigned int*"),
@@ -527,9 +428,8 @@ mod tests {
 
     #[test]
     fn persistent_dispatch_attention_rejects_head_dim_over_256() {
-        // F2 (audit): head_dim > 256 must set ST_ERROR at claim time — the
-        // accumulator is a fixed 256-lane register array and used to
-        // silently truncate.
+        // F2 (audit): head_dim > 256 must set ST_ERROR at claim time -
+        // the accumulator is a fixed 256-lane register array and used to silently truncate.
         let src = KERNEL_SOURCE;
         assert!(
             src.contains("if (desc->k > 256u)"),
@@ -547,9 +447,8 @@ mod tests {
 
     #[test]
     fn persistent_dispatch_ffi_structs_are_align_32() {
-        // rust-ffi-grim §1.1: the device structs must be __align__(32) to
-        // match the Rust #[repr(C, align(32))] source. A mis-alignment would
-        // cause the device to read padding bytes the host never wrote.
+        // rust-ffi-grim §1.1: the device structs must be __align__(32) to match the Rust #[repr(C, align(32))] source.
+        // A mis-alignment would cause the device to read padding bytes the host never wrote.
         let src = KERNEL_SOURCE;
         assert!(
             src.contains("struct __align__(32) scythe_task_descriptor_t"),
@@ -562,15 +461,13 @@ mod tests {
     }
 
     /// WI-Charon-3 gate (3): Device-gated test for persistent dispatch kernel opcode 6.
-    ///
-    /// Verifies that when ROCm hardware is present, launching `grim_scythe_persistent_dispatch`
-    /// against a VRAM task slot carrying opcode=6 processes the slot and marks it complete (ST_COMPLETE=2).
+    /// Verifies that when ROCm hardware is present, launching `grim_scythe_persistent_dispatch` against a VRAM task slot carrying.
     #[test]
     // Verified via gfx1036 iGPU — 2026-08-13.
     fn rocm_persistent_dispatch_opcode_6_device_gated() {
         use crate::RocmDevice;
+        use grim_tensor::Shape;
         use grim_tensor::dtype::{ArithType, DType, Storage};
-        use grim_tensor::{Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
@@ -694,16 +591,13 @@ mod tests {
         );
     }
 
-    /// F2 (audit): OP_ATTN must (a) produce correct causal attention at a
-    /// typical head_dim (128) and (b) reject head_dim > 256 at claim time
-    /// with ST_ERROR *while still advancing the tail* — the fixed
-    /// 256-lane accumulator used to silently truncate, and an errored task
-    /// that skips its tail bump wedges the wave forever.
+    /// F2 (audit): OP_ATTN must (a) produce correct causal attention at a typical head_dim (128) and (b) reject head_dim > 256 at claim time with ST_ERROR *while
+    /// still advancing the tail* - the fixed 256-lane accumulator used to silently truncate, and an errored task that skips its tail bump wedges the wave forever.
     #[test]
     fn rocm_persistent_attention_head_dim_guard_device_gated() {
         use crate::RocmDevice;
+        use grim_tensor::Shape;
         use grim_tensor::dtype::{ArithType, DType, Storage};
-        use grim_tensor::{Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
@@ -826,9 +720,8 @@ mod tests {
             "head_dim=128 attention must match host reference (max diff {max_diff})"
         );
 
-        // ── Case B: head_dim = 512 errors AND releases its slot ──
-        // Pointers reference the small Case-A buffers — the guard fires
-        // before any dereference, so nothing is read or written.
+        // ── Case B: head_dim = 512 errors AND releases its slot ── Pointers reference the
+        // small Case-A buffers - the guard fires before any dereference, so nothing is read or written.
         let mut bad_slot = vec![0u8; 64];
         bad_slot[0..4].copy_from_slice(&3u32.to_ne_bytes());
         bad_slot[4..8].copy_from_slice(&(seq as u32).to_ne_bytes());
@@ -875,8 +768,8 @@ mod tests {
     #[test]
     fn rocm_persistent_dispatch_opcodes_1_through_5_device_gated() {
         use crate::RocmDevice;
+        use grim_tensor::Shape;
         use grim_tensor::dtype::{ArithType, DType, Storage};
-        use grim_tensor::{Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,

@@ -1,5 +1,4 @@
 //! Configuration structs for encoder architecture variants.
-//!
 //! Includes `ModernBertConfig`, `NomicBertConfig`, `T5EncoderConfig`.
 
 use grim_core::model::{ModalityHint, ModelConfig};

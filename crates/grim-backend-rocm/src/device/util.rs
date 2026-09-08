@@ -11,13 +11,8 @@ use grim_tensor::{ArithType, BackendStorage, Error, Result};
 
 use crate::{RocmStorage, hipGetDeviceProperties};
 
-/// Default launch block size for 1-D elementwise launches (rotary, scale-bias,
-/// copy): 256 threads. These are latency-bound elementwise ops where more
-/// threads improve occupancy without register-pressure concerns.
-/// On RDNA2 (gfx1036, Wave32): 256 = 8 Wave32 wavefronts.
-/// On CDNA (gfx9xx, Wave64): 256 = 4 Wave64 wavefronts.
-/// Fused attention kernels launch 128 threads on Wave32 (fusion.rs:78,
-/// roc_device.rs:8145) and derive num_waves from blockDim.x at runtime.
+/// Default launch block size for 1-D elementwise launches (rotary, scale-bias, copy): 256 threads.
+/// These are latency-bound elementwise ops where more threads improve occupancy without register-pressure concerns.
 pub const ROCM_COMPUTE_BLOCK: u32 = 256;
 
 /// Grid/block dims for a 1-D launch over `total` elements.
@@ -29,9 +24,8 @@ pub fn linear_launch(total: usize) -> (crate::HipDim3, crate::HipDim3) {
     )
 }
 
-/// Grid/block dims for warp-per-row kernels (`grim_rms_norm`,
-/// `grim_add_rms_norm`, `grim_softmax`): 256-thread blocks = 8 warps, each
-/// warp owning one row with `__shfl_xor` reductions.
+/// Grid/block dims for warp-per-row kernels (`grim_rms_norm`, `grim_add_rms_norm`, `grim_softmax`): 256-thread blocks
+/// = 8 warps, each warp owning one row with `__shfl_xor` reductions.
 pub fn warp_rows_launch(rows: usize) -> (crate::HipDim3, crate::HipDim3) {
     const WARPS_PER_BLOCK: usize = (ROCM_COMPUTE_BLOCK as usize) / 32;
     let grid = (rows.max(1).div_ceil(WARPS_PER_BLOCK)) as u32;
@@ -75,11 +69,8 @@ pub fn gpu_test_enabled() -> bool {
     check("GRIM_GPU_TEST") || check("GRIM_RUN_GPU_TESTS") || check("GRIM_RUN_GPU_TEST")
 }
 
-/// RAII guard that switches the calling thread to `ordinal` and restores the
-/// previous current device on drop. Probes that call `hipSetDevice` on
-/// multi-GPU boxes must use this: leaving the thread on a foreign device makes
-/// subsequent `hipModuleLoad` calls bind the module to the wrong context,
-/// which surfaces as `hipErrorNoBinaryForGPU` (209) at kernel-launch time.
+/// RAII guard that switches the calling thread to `ordinal` and restores the previous current device on drop.
+/// Probes that call `hipSetDevice` on multi-GPU boxes must use this: leaving the thread on a.
 pub struct DeviceGuard {
     prev: i32,
 }
@@ -107,10 +98,7 @@ impl Drop for DeviceGuard {
 // ── Context-drift watch (gguf_multigpu_context_plan.md WI-M1/M2) ────────────
 
 /// Process-wide latch set by the engine for the duration of a prefill pass.
-/// While it is up, ANY context switch to a non-zero ordinal is traced with a
-/// forced backtrace under `GRIM_ALLOC_TRACE`, so the setter that flips the
-/// main thread's HIP context mid-forward (the ctx_dev=2 page-fault producer)
-/// is named in the log even when it does not go through `DeviceGuard`.
+/// While it is up, ANY context switch to a non-zero ordinal is traced with a.
 static PREFILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Mark the beginning (`true`) or end (`false`) of a prefill pass. Called by
@@ -128,17 +116,8 @@ fn alloc_trace_enabled() -> bool {
     std::env::var("GRIM_ALLOC_TRACE").is_ok()
 }
 
-/// Emit one `[ctx-trace]` line plus a forced backtrace when `target` is a
-/// context switch worth naming: the legacy TEMP-DIAG case (anything parking
-/// on ordinal 2) and — new in WI-M2 — any switch to a non-zero device while
-/// the prefill latch is up. The thread id is recorded next to `prev` so
-/// cross-thread flips are obvious in the log.
-///
-/// Hot-path cost: the overwhelmingly common case (latch down, target != 2)
-/// costs ONE atomic load and returns before any environment lookup. The
-/// env::var check deliberately runs only when a trace would actually be
-/// emitted; guard calls sit on per-op paths where an unconditional getenv
-/// measurably perturbs timing-sensitive fused pipelines.
+/// Emit one `[ctx-trace]` line plus a forced backtrace when `target` is a context switch worth naming: the legacy TEMP-DIAG case (anything parking on ordinal 2) and - new in WI-M2 - any switch to a non-zero device while the prefill latch is up.
+/// The thread id is recorded next to `prev` so cross-thread flips are obvious in the.
 fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
     let latch_up = prefill_in_flight();
     if target != 2 && !(latch_up && target != 0) {
@@ -154,11 +133,7 @@ fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
     eprintln!("{}", std::backtrace::Backtrace::force_capture());
 }
 
-/// The sanctioned raw-context setter. Every `hipSetDevice` call outside
-/// `DeviceGuard` (i.e. the two legitimate unguarded callers: the
-/// `RocmDevice::try_new` construction path and `peer_access.rs`'s
-/// save-restore pair) must route through here so the [ctx-trace] drift watch
-/// sees it. Returns the raw HIP status like the FFI it wraps.
+/// The sanctioned raw-context setter. Every `hipSetDevice` call outside `DeviceGuard` (i.e.
 pub fn raw_set_device(ordinal: i32) -> crate::HipErrorT {
     let mut prev: i32 = 0;
     unsafe {
@@ -169,9 +144,8 @@ pub fn raw_set_device(ordinal: i32) -> crate::HipErrorT {
     status
 }
 
-/// Test-only launch-seam stamps used by the WI-M3 context-drift gates:
-/// every kernel launch records `(self_dev, ctx_dev)` so a test can assert
-/// the launching thread was not parked on a foreign device.
+/// Test-only launch-seam stamps used by the WI-M3 context-drift gates: every kernel launch records `(self_dev, ctx_dev)`
+/// so a test can assert the launching thread was not parked on a foreign device.
 #[cfg(test)]
 static LAUNCH_SELF_STAMP: AtomicI32 = AtomicI32::new(-1);
 #[cfg(test)]
@@ -227,44 +201,29 @@ pub fn gpu_target_flag(arch: &str) -> CString {
     CString::new(format!("--offload-arch={arch}")).expect("GRIM_GPU_TARGET contains interior NUL")
 }
 
-/// True for CDNA-class targets (gfx9xx, MI-series), where Matrix-FMA (MFMA)
-/// is Wave64-native. RDNA (gfx10/11/12) uses Wave32 and Wave32-only WMMA,
-/// so forcing Wave64 there faults at runtime.
+/// True for CDNA-class targets (gfx9xx, MI-series), where Matrix-FMA (MFMA) is Wave64-native.
+/// RDNA (gfx10/11/12) uses Wave32 and Wave32-only WMMA, so forcing Wave64 there faults at runtime.
 fn is_cdna(arch: &str) -> bool {
     arch.starts_with("gfx9")
 }
 
-/// Build compiler options list for AMD hipRTC based on detected hardware target `arch`. [see: `gfx103x`, `gfx11xx`, `gfx12xx`, `gfx9xx`]
-///
-/// Injects the ROCm include directory (`-I`) so that JIT-compiled HIP
-/// kernels can `#include` third-party headers like `<rocwmma/rocwmma.hpp>`.
-/// Without this, hipRTC has no header search path for ROCm's own includes
-/// and compilation fails with "file not found" on `rocwmma`, `rccl`, etc.
+/// Build compiler options list for AMD hipRTC based on detected hardware target `arch`.
+/// [see: `gfx103x`, `gfx11xx`, `gfx12xx`, `gfx9xx`] Injects the ROCm include directory (`-I`) so that JIT-compiled HIP.
 pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
     let mut opts = vec![
-        // rocWMMA 2.x targets C++17 (`inline constexpr`, nested namespace
-        // definitions, `namespace X::Y`), and its headers are pulled in by
-        // kernels on gfx11/gfx12 targets. Other HIP kernels in this crate
-        // are a strict subset of C++17, so --std=c++17 is safe for all.
+        // rocWMMA 2.x targets C++17 (`inline constexpr`, nested namespace definitions, `namespace X::Y`), and its headers are pulled in by kernels on gfx11/gfx12 targets.
+        // Other HIP kernels in this crate are a strict subset of C++17, so --std=c++17 is.
         CString::new("--std=c++17").unwrap(),
     ];
     if is_cdna(arch) {
         // CDNA / MFMA is Wave64-native: do NOT force a wave size, let hipRTC
         // pick the 64-wide wavefront the Matrix-FMA path expects.
     } else {
-        // RDNA2/3/4 (incl. gfx1036): these are Wave32-native and WMMA is
-        // Wave32-only. We do NOT push `-mwavefrontsize32` here: hipRTC
-        // (unlike offline clang) rejects that flag with "unknown argument",
-        // which blocks JIT compilation on gfx1036 (confirmed via
-        // hiprtcCompileProgram status 6). hipRTC derives the wave size from
-        // `--offload-arch=<gfx>` automatically, so the flag is unnecessary
-        // and harmful.
+        // RDNA2/3/4 (incl. gfx1036): these are Wave32-native and WMMA is Wave32-only.
     }
     opts.push(gpu_target_flag(arch));
-    // HIPRTC does not search the ROCm include tree by default. Add the
-    // discovered include directory so `<rocwmma/rocwmma.hpp>` and friends
-    // resolve at JIT-compile time. If discovery fails we proceed without
-    // the flag (kernels that don't need ROCm headers still compile).
+    // HIPRTC does not search the ROCm include tree by default.
+    // Add the discovered include directory so `<rocwmma/rocwmma.hpp>` and friends resolve at JIT-compile time.
     if let Some(include_dir) = crate::rocm_detect::rocm_include_dir() {
         let inc_flag = format!("-I{}", include_dir.display());
         if let Ok(c) = CString::new(inc_flag) {
@@ -357,10 +316,8 @@ mod util_self_tests {
             .into_iter()
             .map(|c| c.into_string().unwrap())
             .collect();
-        // hipRTC rejects `-mwavefrontsize32` with "unknown argument"
-        // (confirmed: hiprtcCompileProgram status 6 on ROCm 7.2 / gfx1036).
-        // The flag is unnecessary: hipRTC derives wave size from the
-        // `--offload-arch=gfx1036` target automatically.
+        // hipRTC rejects `-mwavefrontsize32` with "unknown argument" (confirmed: hiprtcCompileProgram status 6 on ROCm 7.2 / gfx1036).
+        // The flag is unnecessary: hipRTC derives wave size from the `--offload-arch=gfx1036` target automatically.
         assert!(
             !opts.iter().any(|o| o == "-mwavefrontsize32"),
             "RDNA must not pass -mwavefrontsize32 to hipRTC (rejected): {opts:?}"

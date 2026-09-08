@@ -1,7 +1,5 @@
 //! GPU-Native Speculative Decoding Generation Loop.
-//!
-//! Orchestrates draft token generation, target model verification, and device-side
-//! rejection sampling with minimal host-GPU synchronization.
+//! Orchestrates draft token generation, target model verification, and device-side rejection sampling with minimal host-GPU synchronization.
 
 /// Configuration for the Speculative Decoding Engine.
 #[derive(Debug, Clone)]
@@ -68,10 +66,7 @@ impl SpeculativeLoop {
     }
 
     /// Device-native rejection sampling verification across draft token sequence.
-    ///
-    /// Given draft token probabilities `p_draft` and target model probabilities `p_target`,
-    /// evaluates exact rejection sampling criteria:
-    /// accept if $r < \min(1, p_{\text{target}}(x) / p_{\text{draft}}(x))$.
+    /// Given draft token probabilities `p_draft` and target model probabilities `p_target`, evaluates exact rejection sampling criteria:.
     pub fn verify_tokens_with_rejection_sampling(
         &mut self,
         draft_tokens: &[u32],
@@ -106,9 +101,7 @@ impl SpeculativeLoop {
     }
 
     /// Multi-head Medusa / Eagle tree speculative verification.
-    ///
-    /// Evaluates speculative tree candidates in parallel and selects the longest
-    /// valid accepted prefix path.
+    /// Evaluates speculative tree candidates in parallel and selects the longest valid accepted prefix path.
     pub fn verify_medusa_tree_candidates(
         &mut self,
         tree_paths: &[Vec<u32>],
@@ -141,19 +134,8 @@ impl SpeculativeLoop {
         longest_accepted
     }
 
-    /// Host-side bookkeeping for one draft round: records the previous
-    /// round's verification stats and returns how many next-round draft
-    /// candidates are staged.
-    ///
-    /// **This is sequential accounting, not pipelining.** No second stream
-    /// is created and nothing overlaps: `verify_draft_step` runs to
-    /// completion before the candidate count is read. The commit that
-    /// introduced this function called it "dual-stream overlapping
-    /// execution"; that mechanism does not exist yet — real draft/verify
-    /// overlap would require device-side scheduling of the drafter and
-    /// verifier on independent streams (a rocm-backend work item, not a
-    /// host loop). Named for what it does so telemetry built on it makes
-    /// no overlap claims.
+    /// Host-side bookkeeping for one draft round: records the previous round's verification stats and returns how many next-round draft candidates are staged.
+    /// **This is sequential accounting, not pipelining.** No second stream is created and nothing overlaps: `verify_draft_step`.
     pub fn settle_draft_round(
         &mut self,
         prev_draft_tokens: &[u32],

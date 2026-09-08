@@ -5,8 +5,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, Encoder, ModalityHint};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor,
-};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -248,11 +247,8 @@ impl Bert {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for BERT. BERT is an encoder (`Model`, not
-    /// `CausalLm`) and `BertBlock::forward` calls plain `Linear::forward` with
-    /// no all-reduce hook. The serving engine's text-out path does not reach
-    /// encoders, so TP here is low-leverage; refused until a `forward` rework
-    /// and an actual encoder-consumer arrive.
+    /// Tensor-parallel load entry for BERT. BERT is an encoder (`Model`,
+    /// not `CausalLm`) and `BertBlock::forward` calls plain `Linear::forward` with no all-reduce hook.
     pub fn load_tp(
         device: Device,
         ws: &grim_nn::WeightSource<'_>,

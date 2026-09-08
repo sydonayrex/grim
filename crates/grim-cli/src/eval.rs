@@ -1,10 +1,5 @@
-//! `grim eval` — perplexity and task evaluation (§WI-E1, FIND-1).
-//!
-//! Two tasks:
-//! - `ppl`   — windowed perplexity over the committed wikitext2 sample corpus.
-//!   Runs the model directly (no server). Deterministic.
-//! - `gsm8k` — exact-match grade of 100 committed questions against a running
-//!   server's `/v1/chat/completions` (temperature 0).
+//! `grim eval` - perplexity and task evaluation (§WI-E1, FIND-1).
+//! Two tasks: - `ppl`  - windowed perplexity over the committed wikitext2 sample corpus.
 
 use grim_core::error::{Error, Result};
 use grim_core::model::CausalLm;
@@ -13,9 +8,8 @@ use grim_tensor::Device;
 /// PPL sliding-window size in tokens.
 const PPL_WINDOW: usize = 2048;
 
-/// Resolve the eval device from `GRIM_BACKEND` / `GRIM_FORCE_DEVICE`
-/// (`rocm[:ord]`, `cuda[:ord]`); anything else stays CPU. Kept local to the
-/// lib crate — `run.rs`'s probe lives in the binary target.
+/// Resolve the eval device from `GRIM_BACKEND` / `GRIM_FORCE_DEVICE` (`rocm[:ord]`, `cuda[:ord]`); anything else stays CPU.
+/// Kept local to the lib crate - `run.rs`'s probe lives in the binary target.
 fn resolve_device() -> Device {
     let requested = std::env::var("GRIM_BACKEND")
         .or_else(|_| std::env::var("GRIM_FORCE_DEVICE"))
@@ -73,11 +67,7 @@ fn load_model(model: &str) -> Result<(Box<dyn CausalLm>, String)> {
 }
 
 /// Compute windowed perplexity of `tokens` under `model`.
-///
-/// Slides a window of `PPL_WINDOW` tokens with full overlap; each window
-/// predicts its last token from the preceding `PPL_WINDOW - 1`. NLL is
-/// accumulated over windows; ppl = exp(mean NLL). Uses log2-free f32 math via
-/// ln then exp — deterministic given the same model + tokens.
+/// Slides a window of `PPL_WINDOW` tokens with full overlap; each window predicts its last token.
 pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)> {
     if tokens.len() < PPL_WINDOW + 1 {
         return Err(Error::Config(format!(
@@ -89,9 +79,8 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
     let mut sum_nll = 0.0f64;
     let mut n_windows = 0usize;
     let mut start = 0usize;
-    // GRIM_EVAL_MAX_WINDOWS: deterministic prefix cap. Baselines produced
-    // with a cap record it in their metrics JSON — same corpus + cap + model
-    // always yields the same ppl.
+    // GRIM_EVAL_MAX_WINDOWS: deterministic prefix cap.
+    // Baselines produced with a cap record it in their metrics JSON - same corpus +.
     let max_windows: Option<usize> = std::env::var("GRIM_EVAL_MAX_WINDOWS")
         .ok()
         .and_then(|v| v.parse().ok());
@@ -489,8 +478,7 @@ mod tests {
     #[test]
     fn test_ppl_math_synthetic_logits_known_answer() {
         // Test cross-entropy and perplexity calculation with uniform logits.
-        // For uniform distribution over V classes:
-        // P(target) = 1/V, -ln(1/V) = ln(V), exp(ln(V)) = V.
+        // For uniform distribution over V classes: P(target) = 1/V, -ln(1/V) = ln(V), exp(ln(V)) = V.
         let vocab_size = 100usize;
         let uniform_logits = vec![1.0f32; vocab_size];
 

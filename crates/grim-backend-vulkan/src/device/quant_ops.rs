@@ -1,25 +1,22 @@
 //! `QuantOps` implementation for VulkanDevice.
-//!
-//! Extracted from lib.rs (modularization): trait impls live in `device/`,
-//! dispatch plumbing in `kernel.rs`, buffers in `storage.rs`, device init
-//! in `context.rs`.
+//! Extracted from lib.rs (modularization): trait impls live in `device/`, dispatch plumbing in `kernel.rs`, buffers in.
 
 use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{DType, KQuantScheme, QuantFormat, QuantProvenance, Storage as DTypeStorage};
+use grim_tensor::dtype::{
+    DType, KQuantScheme, QuantFormat, QuantProvenance, Storage as DTypeStorage,
+};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ArithType, BackendStorage, Shape, CoreTensorOps, QuantOps};
+use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, QuantOps, Shape};
 
-use grim_tensor::MemoryOps;
 use crate::context::global_context;
 use crate::kernel::{
-    push_params, push_params_backward, run_compute_shader,
-    run_compute_shader_kernel, spirv_for, VulkanKernel,
+    VulkanKernel, push_params, push_params_backward, run_compute_shader, run_compute_shader_kernel,
+    spirv_for,
 };
-use crate::{extract_raw_bytes, VulkanDevice, VulkanHandle, VulkanStorage};
+use crate::{VulkanDevice, VulkanHandle, VulkanStorage, extract_raw_bytes};
+use grim_tensor::MemoryOps;
 
 impl QuantOps for VulkanDevice {
-
-
     fn quantized_matmul(
         &self,
         a: &dyn BackendStorage,
@@ -35,19 +32,14 @@ impl QuantOps for VulkanDevice {
         let n = out_dims[1];
 
         // Try GPU fused dequant dispatch if both inputs are VulkanStorage.
-        // Kernel selection is based on the weight tensor's actual dtype — NOT on
-        // k % 256, which is only a coincidental sizing constraint and does not
-        // identify the quantization format. Routing by size instead of dtype
-        // causes GroupInt / ResidualPacked / Q4K weights with k divisible by 256
-        // to silently hit the wrong shader.
+        // Kernel selection is based on the weight tensor's actual dtype - NOT on k %.
         if let (Some(a_s), Some(b_s)) = (
             a.as_any().downcast_ref::<VulkanStorage>(),
             b_packed.as_any().downcast_ref::<VulkanStorage>(),
         ) {
             use grim_tensor::dtype::{FloatPackScheme, KQuantScheme, Storage};
             // Map the weight dtype to the kernel that knows its block layout.
-            // Formats not handled by any Vulkan fused kernel skip GPU dispatch
-            // and fall through to the CPU path below.
+            // Formats not handled by any Vulkan fused kernel skip GPU dispatch and fall through to.
             let b_weight_dtype = b_packed.dtype();
             let maybe_kernel = match &b_weight_dtype.storage {
                 Storage::KQuant(KQuantScheme::Q4K) => Some(VulkanKernel::FusedDequantGemmQ4K),
@@ -127,12 +119,8 @@ impl QuantOps for VulkanDevice {
         let mut b_dequant = vec![0.0f32; k * n];
         let blocks_per_col = k / 32;
 
-        // Safety contract for the CPU fallback dequant loop below:
-        // the loop decodes bytes as Q8_0 (signed int8, block size 32, scale from b_scales).
-        // Calling to_cpu_vec_f32() on a packed quantized buffer reinterprets the raw
-        // packed bytes as f32 — dtype-blind — then truncates back to u8, producing
-        // numerically garbage nibbles for any format that isn't Q8_0.
-        // Guard here and extract the raw bytes directly via vkMapMemory instead.
+        // Safety contract for the CPU fallback dequant loop below: the loop decodes bytes as Q8_0 (signed int8, block size 32, scale from b_scales).
+        // Calling to_cpu_vec_f32() on a packed quantized buffer reinterprets the raw packed bytes as f32 -.
         use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
         let b_weight_dtype = b_packed.dtype();
 
@@ -237,7 +225,6 @@ impl QuantOps for VulkanDevice {
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
-
     fn quantize(
         &self,
         x: &dyn BackendStorage,
@@ -246,7 +233,6 @@ impl QuantOps for VulkanDevice {
         let (out, _handle) = self.quantize_on_device(x, format)?;
         Ok(out)
     }
-
 
     fn fused_quant_gemm(
         &self,
@@ -303,7 +289,6 @@ impl QuantOps for VulkanDevice {
         Ok((Box::new(out_storage), Box::new(VulkanHandle)))
     }
 
-
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
@@ -327,9 +312,8 @@ impl QuantOps for VulkanDevice {
                 Error::Backend("Vulkan backward dx b_packed is not VulkanStorage".into())
             })?;
 
-        // Extract context device/physical_device pointers without holding the
-        // lock — from_cpu_bytes also locks GLOBAL_CONTEXT, so we must release
-        // here to avoid deadlock.
+        // Extract context device/physical_device pointers without holding the lock - from_cpu_bytes
+        // also locks GLOBAL_CONTEXT, so we must release here to avoid deadlock.
         let (ctx_device, ctx_physical_device) = {
             let ctx_guard = global_context();
             let ctx = ctx_guard
@@ -350,10 +334,8 @@ impl QuantOps for VulkanDevice {
         let backup2_codes_offset = residuals.map(|r| r.backup2_codes_offset).unwrap_or(0);
         let backup2_scale_offset = residuals.map(|r| r.backup2_scale_offset).unwrap_or(0);
 
-        // --- Extract outlier index/value data from the tensor's provenance ---
-        // `QuantizedMatmulBackwardResiduals::from_tensor` leaves the raw device
-        // pointers null; the actual host-decoded outlier vectors live in
-        // `QuantProvenance::WithResiduals`.
+        // --- Extract outlier index/value data from the tensor's provenance --- `QuantizedMatmulBackwardResiduals::from_tensor` leaves
+        // the raw device pointers null; the actual host-decoded outlier vectors live in `QuantProvenance::WithResiduals`.
         let prov = b_s.provenance();
         let (outlier_indices_host, outlier_values_host) = match &prov {
             QuantProvenance::WithResiduals {
@@ -374,9 +356,8 @@ impl QuantOps for VulkanDevice {
             _ => (Vec::new(), Vec::new()),
         };
 
-        // --- Upload outlier buffers (binding 3 = indices u32, binding 4 = values f32) ---
-        // When outlier_count == 0 the shader checks the count before accessing
-        // these buffers, so minimal dummies suffice.
+        // --- Upload outlier buffers (binding 3 = indices u32, binding 4 = values f32) --- When
+        // outlier_count == 0 the shader checks the count before accessing these buffers, so minimal dummies suffice.
         let (outlier_idx_box, outlier_val_box) = if outlier_count > 0
             && !outlier_indices_host.is_empty()
             && !outlier_values_host.is_empty()
@@ -486,9 +467,8 @@ impl QuantOps for VulkanDevice {
             1.0, // grad_scale = 1.0 for STE identity (straight-through estimator)
         );
 
-        // --- Build GPU buffer binding list ---
-        // bindings: [0]=dY, [1]=B_codes, [2]=dX, [3]=outlier_indices,
-        //           [4]=outlier_values, [5]=scales_u8 (generic only)
+        // --- Build GPU buffer binding list --- bindings:
+        // [0]=dY, [1]=B_codes, [2]=dX, [3]=outlier_indices, [4]=outlier_values, [5]=scales_u8 (generic only)
         let mut buffers: Vec<u64> = vec![
             dy_s.buffer,
             b_s.buffer,
@@ -520,4 +500,3 @@ impl QuantOps for VulkanDevice {
         Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 }
-

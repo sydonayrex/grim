@@ -1,5 +1,4 @@
 //! Cross-entropy loss and backward gradient computation (WI-T5 item 2).
-//!
 //! Provides `cross_entropy_loss` returning `(loss_val, loss_grad_tensor)`.
 
 use grim_tensor::{
@@ -9,14 +8,10 @@ use grim_tensor::{
 use std::sync::Arc;
 
 // Compute cross-entropy loss and its backward gradient w.r.t logits.
-//
 // `logits` has shape `[batch_size, vocab_size]`; `targets` has shape `[batch_size]`.
-// Returns `(loss_float, loss_grad_tensor)`. CONTRACT: target token IDs must be `< vocab_size`.
 
 /// Compute Fused Linear Cross Entropy without allocating full [B, V] logits tensor.
-///
-/// Multiplies hidden states `hidden` [batch_size, hidden_dim] by LM head `lm_head` [vocab_size, hidden_dim]
-/// in chunks of `chunk_size` tokens, computing online cross entropy loss and gradient w.r.t `hidden`.
+/// Multiplies hidden states `hidden` [batch_size, hidden_dim] by LM head `lm_head` [vocab_size, hidden_dim] in chunks of.
 pub use fused_linear_cross_entropy_loss as fused_linear_ce;
 
 pub fn fused_linear_cross_entropy_loss(

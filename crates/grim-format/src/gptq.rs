@@ -1,10 +1,5 @@
 //! GPTQ v2 tensor layout reader for EfficientQAT/GPTQ checkpoints.
-//!
-//! §7.2: Reads grouped INT weights with asymmetric quantization:
-//! - `qweight`: packed low-bit weights
-//! - `qzeros`: per-group zero-points
-//! - `scales`: per-group scales
-//! - `g_idx`: group assignment or permutation indices
+//! §7.2: Reads grouped INT weights with asymmetric quantization: - `qweight`: packed low-bit weights - `qzeros`:.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -145,10 +140,8 @@ fn read_quant_params(
 impl GptqProvider {
     /// Open a safetensors file containing GPTQ tensors.
     pub fn open(path: &str) -> Result<Self> {
-        // FMT-16 fix: canonicalize the path so symlinks and relative components
-        // resolve to a stable absolute path before any I/O. If canonicalization
-        // is unavailable (e.g. sandbox without realpath), fall back to the raw
-        // path so a load that would otherwise succeed is not broken.
+        // FMT-16 fix: canonicalize the path so symlinks and relative components resolve to a stable absolute path before any I/O.
+        // If canonicalization is unavailable (e.g.
         let resolved =
             std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
         let resolved_str = resolved.to_string_lossy().into_owned();
@@ -188,10 +181,7 @@ impl GptqProvider {
             let qw = tensor_info.shape();
             let shape: Vec<usize> = if qw.len() >= 2 {
                 // Shape reconstruction: the packed weight has qw[1] u32 words.
-                // For 3-bit, 32 elements span 3 u32 words (96 bits), so
-                // out_features = qw[1] * 32 / 3 (multiply first to avoid truncation).
-                // For other bit widths: out_features = qw[1] * 32 / bits.
-                // Use saturating arithmetic to avoid overflow.
+                // For 3-bit, 32 elements span 3 u32 words (96 bits), so out_features = qw[1] *.
                 let out_features = if valid_bits == 3 {
                     (qw[1].saturating_mul(32) / 3).max(1)
                 } else {
@@ -271,9 +261,8 @@ impl GptqProvider {
                     GptqTensorInfo {
                         name: base_name.to_string(),
                         shape,
-                        // FMT-17 fix: store the clamped `valid_bits` (not the raw
-                        // `bits`) so `dequant_gptq_tensor` dequantizes with the
-                        // same bit width the shape was reconstructed for.
+                        // FMT-17 fix: store the clamped `valid_bits` (not the raw `bits`) so
+                        // `dequant_gptq_tensor` dequantizes with the same bit width the shape was reconstructed for.
                         bits: valid_bits,
                         group_size,
                         desc_act,
@@ -393,11 +382,8 @@ impl TensorProvider for GptqProvider {
             None
         };
 
-        // Concatenate following the documented length-prefixed convention:
-        // [u64 LE: qweight_len] [qweight_bytes...]
-        // [u64 LE: qzeros_len]  [qzeros_bytes...]
-        // [u64 LE: scales_len]  [scales_bytes...]
-        // [u64 LE: g_idx_len]   [g_idx_bytes...]
+        // Concatenate following the documented length-prefixed convention: [u64 LE: qweight_len] [qweight_bytes...] [u64
+        // LE: qzeros_len] [qzeros_bytes...] [u64 LE: scales_len] [scales_bytes...] [u64 LE: g_idx_len] [g_idx_bytes...]
         let qweight_len = qweight.len() as u64;
         let qzeros_len = qzeros.len() as u64;
         let scales_len = scales.len() as u64;

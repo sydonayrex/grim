@@ -1,11 +1,8 @@
 //! 2MB Linux HugePage Host Memory for Vulkan Zero-Copy DMA Transfers.
-//!
-//! Allocates 2MB-aligned host memory via `mmap(MAP_HUGETLB | MAP_HUGE_2MB)` on Linux
-//! (with automatic fallback to aligned anonymous memory) for low-latency host-to-device
-//! and device-to-host memory transport.
+//! Allocates 2MB-aligned host memory via `mmap(MAP_HUGETLB | MAP_HUGE_2MB)` on Linux (with automatic fallback to aligned.
 
-use std::ptr::NonNull;
 use grim_tensor::error::{Error, Result};
+use std::ptr::NonNull;
 
 const HUGEPAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
 

@@ -35,9 +35,7 @@
 use std::time::Instant;
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{DType, Shape,
-    CoreTensorOps,
-};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;

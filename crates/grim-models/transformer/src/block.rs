@@ -17,9 +17,8 @@ pub enum AttentionType {
     Sliding,
 }
 
-/// Standard ALiBi slopes for `n` heads (Press et al., 2021):
-/// `slope_i = 2^(-(i+1) * 2^-(log2(n)-3))` for power-of-two `n`; non-powers
-/// of two interleave the slopes of the two nearest powers of two.
+/// Standard ALiBi slopes for `n` heads (Press et al., 2021): `slope_i = 2^(-(i+1) * 2^-(log2(n)-3))`
+/// for power-of-two `n`; non-powers of two interleave the slopes of the two nearest powers of two.
 pub fn alibi_slopes_for(num_heads: usize) -> Vec<f32> {
     fn pow2_slopes(n: usize) -> Vec<f32> {
         let log2n = (n as f32).log2();
@@ -71,10 +70,8 @@ impl LayerAttentionSpec {
         }
     }
 
-    /// Full-attention layer with an explicit rotary dim and optional YaRN
-    /// scaling. Used by Qwen3.5-MoE and other models that combine partial
-    /// rotary with YaRN RoPE on every layer. `rotary_dim` is clamped to
-    /// `head_dim` by the `RopeConfig`.
+    /// Full-attention layer with an explicit rotary dim and optional YaRN scaling.
+    /// Used by Qwen3.5-MoE and other models that combine partial rotary with YaRN RoPE on every.
     pub fn full_with_rope(
         num_heads: usize,
         num_kv_heads: usize,
@@ -117,13 +114,7 @@ pub struct LlamaConfigRefs {
 }
 
 /// Compute the per-rank TP sharding plan for attention heads.
-///
-/// Returns `(local_num_heads, local_num_kv_heads, kv_head_replica_factor)`:
-/// - If `num_kv_heads % world_size == 0`: KV heads are sharded, each rank gets
-///   `num_kv_heads / world_size` of them (replica factor 1).
-/// - If `world_size % num_kv_heads == 0`: KV heads are replicated, each rank
-///   gets all `num_kv_heads`, with `world_size / num_kv_heads` replicas.
-/// - Otherwise: unsupported GQA topology (e.g. 8 KV heads / 6 GPUs).
+/// Returns `(local_num_heads, local_num_kv_heads, kv_head_replica_factor)`: - If `num_kv_heads % world_size == 0`: KV heads are sharded,.
 pub fn plan_kv_head_sharding(
     num_heads: usize,
     num_kv_heads: usize,
@@ -150,21 +141,7 @@ pub fn plan_kv_head_sharding(
 }
 
 /// Per-layer KV cache for Llama-style attention.
-///
 /// Stores post-RoPE Key and raw Value tensors from previous decode steps.
-/// On each forward, the current K/V are appended after the cached ones so
-/// `prefilled_self_attention` can attend to the full prefix without
-/// re-running attention on past tokens.
-///
-/// Two storage tiers:
-/// - `k_device`/`v_device`: device-resident arena (grows by re-alloc +
-///   D2D copy). Appends are pure device-side (`copy_slice_into`), so decode
-///   steps on ROCm never roundtrip the cache through host memory.
-/// - `k_cache`/`v_cache`: flat f32 host mirrors, used by backends without
-///   `alloc_storage`/`copy_slice_into` (CPU, CUDA, Vulkan, Metal).
-///
-/// Layout: `(past_len, local_num_kv_heads, head_dim)` for both K and V,
-/// matching the per-rank sharded KV-head count.
 #[derive(Default)]
 pub struct LlamaLayerCache {
     /// Post-RoPE keys, flat layout `(past_len, local_num_kv_heads, head_dim)`.
@@ -195,11 +172,8 @@ fn is_unimplemented(e: &Error) -> bool {
     )
 }
 
-/// Zero-copy relabel (B, S*H, D) → (B, S, H*D): the flat row-major
-/// layout must match exactly. When the *storage* shape doesn't already
-/// match the target, materialize a physically reshaped storage instead
-/// (D2D copy on backends with `alloc_storage`/`copy_slice_into`, host
-/// roundtrip elsewhere) — backend matmuls derive shapes from the storage.
+/// Zero-copy relabel (B, S*H, D) → (B, S, H*D): the flat row-major layout must match exactly.
+/// When the *storage* shape doesn't already match the target, materialize a physically reshaped storage instead.
 pub(crate) fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
     if x.shape().elem_count() != shape.elem_count() {
         return Err(Error::Shape(format!(
@@ -252,9 +226,8 @@ pub(crate) fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
     ))
 }
 
-/// Physically reshape any contiguous producer layout (2-D `(rows, H*D)` or
-/// batch-1 3-D `(1, rows, H*D)` / `(1, rows*H, D)`) into `(s, h, d)`,
-/// zero-copy when the storage already matches, D2D copy otherwise.
+/// Physically reshape any contiguous producer layout (2-D `(rows, H*D)` or batch-1 3-D `(1, rows, H*D)` /
+/// `(1, rows*H, D)`) into `(s, h, d)`, zero-copy when the storage already matches, D2D copy otherwise.
 fn relabel_3d(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
     let flat = x.shape().elem_count();
     if flat != s * h * d {
@@ -268,11 +241,8 @@ fn relabel_3d(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
     reshaped_view(x, &Shape::new(vec![s, h, d]))
 }
 
-/// Append `s_len` newly produced K/V rows (3-D `(S, H, D)` contiguous) into
-/// the device-resident cache arena, doubling the row capacity when needed.
-/// Pure device-side work (`alloc_storage` + `copy_slice_into`); returns
-/// `Err(Unimplemented)` on backends that lack these primitives so callers
-/// can degrade to the host-mirror cache.
+/// Append `s_len` newly produced K/V rows (3-D `(S, H, D)` contiguous) into the device-resident cache arena, doubling the row capacity when needed.
+/// Pure device-side work (`alloc_storage` + `copy_slice_into`); returns `Err(Unimplemented)` on backends that lack these primitives so.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cache_append_kv<'a>(
     dev: &dyn grim_tensor::BackendDevice,
@@ -338,16 +308,13 @@ pub struct LlamaBlock {
     /// Per-head ALiBi slopes (Press et al.). `None` = no position bias.
     /// Score bias for query abs position `i` / key `j`: `slopes[h] * (j - i)`.
     pub alibi_slopes: Option<Vec<f32>>,
-    /// When true this layer's dense FFN is NOT applied inside
-    /// `forward_with_kv_paged`; the caller (e.g. `Llama::decode_paged`)
-    /// routes the post-attention residual through a `MoeBlock` instead.
-    /// Set for MoE layers so the dense SwiGLU triple is never double-applied.
+    /// When true this layer's dense FFN is NOT applied inside `forward_with_kv_paged`; the caller (e.g.
+    /// `Llama::decode_paged`) routes the post-attention residual through a `MoeBlock` instead.
     pub(crate) ffn_disabled: bool,
 }
 
 impl LlamaBlock {
     /// Load a `LlamaBlock` with TP config taken from the `WeightSource`.
-    ///
     /// See [`crate::model::Llama::load`] for why this no longer re-reads env.
     pub fn load(ws: &WeightSource<'_>, cfg: &LlamaConfig) -> Result<Self> {
         Self::load_tp(ws, cfg, ws.tp_config())
@@ -507,9 +474,8 @@ impl LlamaBlock {
         })
     }
 
-    /// Enable ALiBi position bias on this block (baichuan/mpt/jais/gptneox
-    /// class). Computes per-head slopes via [`alibi_slopes_for`] for the
-    /// block's head count. Builder-style: `block.with_alibi()`.
+    /// Enable ALiBi position bias on this block (baichuan/mpt/jais/gptneox class).
+    /// Computes per-head slopes via [`alibi_slopes_for`] for the block's head count.
     pub fn with_alibi(mut self) -> Self {
         self.alibi_slopes = Some(alibi_slopes_for(self._cfg.num_heads));
         self
@@ -520,9 +486,8 @@ impl LlamaBlock {
         Ok(out)
     }
 
-    /// Like `forward` but also returns the K and V tensors (post-RoPE) so
-    /// the caller can populate the KV cache (MAJ-1: Llama CPU path was
-    /// not storing K/V, making the cache infrastructure dead code).
+    /// Like `forward` but also returns the K and V tensors (post-RoPE) so the caller can populate
+    /// the KV cache (MAJ-1: Llama CPU path was not storing K/V, making the cache infrastructure dead code).
     pub fn forward_with_kv(
         &self,
         x: &Tensor,
@@ -557,39 +522,23 @@ impl LlamaBlock {
 
         let paged_attn_out = if let Some(sess) = session {
             if sess.has_paged_kv() {
-                // The GPU `grim_qkv_attention_paged` kernel computes attention
-                // for a SINGLE query position (abs_i = cache_offset) and
-                // indexes the block table as `block_tables + batch_idx *
-                // max_blocks` with batch_idx = grid.x. Passing a multi-token
-                // prefill as "batch" walks the table far past the upload —
-                // observed as GPU page faults on MiniCPM5 (622-token prompt)
-                // while short-sequence models never crossed the page boundary.
-                // The paged kernel is therefore decode-only: multi-token
-                // queries fall back to the dense path below (K/V are still
-                // appended to the pages first so subsequent decode is correct).
+                // The GPU `grim_qkv_attention_paged` kernel computes attention for a SINGLE query position (abs_i = cache_offset) and indexes the block table as `block_tables + batch_idx * max_blocks` with batch_idx = grid.x.
+                // Passing a multi-token prefill as "batch" walks the table far past the upload - observed.
                 let seq_tokens = x_2d.shape().dims().first().copied().unwrap_or(0);
                 if seq_tokens == 1 {
-                    // Append this layer's K/V into the paged store BEFORE attending
-                    // so the current token is visible to the attention kernel
-                    // (which reads up to `cache_offset + total_tokens`). The K
-                    // stored must be POST-RoPE — the classic `LlamaLayerCache`
-                    // path caches `k_rot` and the dense attention reads it
-                    // directly, so the paged pages must match exactly.
+                    // Append this layer's K/V into the paged store BEFORE attending so the current token is visible to the attention kernel (which reads up to `cache_offset + total_tokens`).
+                    // The K stored must be POST-RoPE - the classic `LlamaLayerCache` path caches `k_rot` and the.
                     let k_rot =
                         self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
-                    // A FAILED append must skip the paged read — attending over
-                    // pages missing this call's K/V silently corrupts output
-                    // (the `.ok()` here used to swallow the error and read the
-                    // stale pages anyway). The classic-cache fallback is always
-                    // correct.
+                    // A FAILED append must skip the paged read - attending over pages missing this call's K/V silently corrupts output (the `.ok()` here used to swallow the error and read the stale pages anyway).
+                    // The classic-cache fallback is always correct.
                     let appended = sess.append_kv_layer(layer, &k_rot, &v).is_ok();
                     if appended {
                         if let (Some(bt), Some((k_pages, v_pages, page_size))) =
                             (sess.block_table(), sess.paged_kv_handles(layer))
                         {
-                            // WI-kv: reuse the session-cached device block table
-                            // (rebuilt only when the table grows) instead of a
-                            // per-layer-per-token H2D upload.
+                            // WI-kv: reuse the session-cached device block table (rebuilt only
+                            // when the table grows) instead of a per-layer-per-token H2D upload.
                             let bt_gpu = sess.block_table_gpu_handle();
                             self.paged_self_attention(
                                 &q, bt, &k_pages, &v_pages, page_size, positions, bt_gpu,
@@ -620,9 +569,8 @@ impl LlamaBlock {
             Some(out) => out,
             None => self.prefilled_self_attention(&q, &k, &v, positions, cache)?,
         };
-        // Laguna-S-2.1 attention output gate: g_proj runs on the pre-attention
-        // hidden state (vLLM `laguna.py`), softplus in f32, then per-head
-        // broadcast over head_dim before o_proj.
+        // Laguna-S-2.1 attention output gate: g_proj runs on the pre-attention hidden state
+        // (vLLM `laguna.py`), softplus in f32, then per-head broadcast over head_dim before o_proj.
         let attn_out = if let Some(g) = &self.g_proj {
             let gate = g.forward(&x_norm)?;
             grim_nn::modules::softplus_mul_on_device(
@@ -638,9 +586,8 @@ impl LlamaBlock {
 
         let added = grim_nn::modules::add_on_device(x_2d, &attn_out)?;
 
-        // MoE layers: the dense SwiGLU triple is disabled; the caller routes
-        // `added` (post-attention residual) through a `MoeBlock`. Return it
-        // directly so `Llama::decode_paged` can apply the router + experts.
+        // MoE layers: the dense SwiGLU triple is disabled; the caller routes `added` (post-attention residual) through a `MoeBlock`.
+        // Return it directly so `Llama::decode_paged` can apply the router + experts.
         if self.ffn_disabled {
             return Ok((added, k, v));
         }
@@ -669,12 +616,8 @@ impl LlamaBlock {
         Ok((out, k, v))
     }
 
-    /// Apply a per-head RMS-norm over `head_dim` to a multi-head tensor
-    /// `(B, S, num_heads * head_dim)` (or 2-D `(S, num_heads * head_dim)`).
-    /// The row-major layout makes `(B, S, num_heads, head_dim)` identical to
-    /// `(B * S * num_heads, head_dim)`, so the norm runs as a zero-copy
-    /// relabel + `RmsNorm::forward` + relabel back. Returns `x` unchanged
-    /// when the norm is absent.
+    /// Apply a per-head RMS-norm over `head_dim` to a multi-head tensor `(B, S, num_heads * head_dim)` (or 2-D `(S, num_heads * head_dim)`).
+    /// The row-major layout makes `(B, S, num_heads, head_dim)` identical to `(B * S * num_heads,.
     pub(crate) fn apply_qk_norm(
         &self,
         norm: &Option<RmsNorm>,
@@ -713,10 +656,8 @@ impl LlamaBlock {
         reshaped_view(&normed, &Shape::new(vec![b, s, num_heads * head_dim]))
     }
 
-    /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim)
-    /// or (S, num_heads * head_dim). Stays fully on-device by relabeling the
-    /// tensor to (B, S * num_heads, head_dim), calling the backend's `rope`
-    /// kernel, then relabeling back — no CPU roundtrip.
+    /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim) or (S, num_heads * head_dim).
+    /// Stays fully on-device by relabeling the tensor to (B, S * num_heads, head_dim), calling the.
     pub(crate) fn apply_rope_multi_head(
         &self,
         x: &Tensor,
@@ -742,9 +683,7 @@ impl LlamaBlock {
         }
 
         // Relabel (B, S, num_heads*head_dim) → (B, S*num_heads, head_dim).
-        // The data layout is already (B, S, num_heads, head_dim) row-major,
-        // which is identical to (B, S*num_heads, head_dim) — so this is a
-        // zero-copy shape relabel.
+        // The data layout is already (B, S, num_heads, head_dim) row-major, which is identical to (B,.
         let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
         let relabeled = Tensor::new(
             x.storage().clone(),
@@ -833,11 +772,8 @@ impl LlamaBlock {
         let old_past_len = cache.as_ref().map(|c| c.past_len).unwrap_or(0);
         let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
 
-        // --- KV cache: append the current K/V rows -------------------------
-        // Preferred path: device-resident arenas + D2D append. Only the newly
-        // produced rows are copied; the host never sees the cache contents.
-        // Fallback (backend without alloc_storage/copy_slice_into): keep the
-        // flat host mirrors and re-upload the concatenated cache.
+        // --- KV cache: append the current K/V rows ------------------------- Preferred path: device-resident arenas + D2D append.
+        // Only the newly produced rows are copied; the host never sees the cache contents.
         let (mut k_borrowed, mut v_borrowed): (
             Option<&dyn BackendStorage>,
             Option<&dyn BackendStorage>,
@@ -878,10 +814,8 @@ impl LlamaBlock {
                 Err(e) => return Err(e),
             }
         } else {
-            // One-shot prefill without a cache: K/V are already device-resident
-            // (RoPE ran on-device above), so borrow their storages directly
-            // instead of round-tripping through the host. The attention kernels
-            // read flat rows + kv_len, not the storage shape.
+            // One-shot prefill without a cache: K/V are already device-resident (RoPE ran on-device above), so borrow their storages directly instead of round-tripping through the host.
+            // The attention kernels read flat rows + kv_len, not the storage shape.
             k_borrowed = Some(k_3d.storage().as_ref());
             v_borrowed = Some(v_3d.storage().as_ref());
             kv_len = q_len;
@@ -897,9 +831,8 @@ impl LlamaBlock {
             };
         let _t2a = std::time::Instant::now();
 
-        // Fused GQA + causal attention. ROCm and CPU implement the kernel;
-        // other backends degrade to the host fallback below. ALiBi models
-        // route through the bias-aware kernel variant.
+        // Fused GQA + causal attention. ROCm and CPU implement
+        // the kernel; other backends degrade to the host fallback below.
         let attn_out = if let Some(slopes) = &self.alibi_slopes {
             let slope_shape = Shape::new(vec![cfg.local_num_heads]);
             let slopes_st = dev.from_cpu(slopes, &slope_shape, grim_tensor::DType::F32)?;
@@ -1062,6 +995,7 @@ impl LlamaBlock {
     }
 
     /// Dispatch self-attention via paged attention kernel when block table & physical KV pools are available.
+    #[allow(clippy::too_many_arguments)]
     pub fn paged_self_attention(
         &self,
         q: &Tensor,
@@ -1087,33 +1021,24 @@ impl LlamaBlock {
         };
 
         let q_3d_shape = Shape::new(vec![total_tokens, cfg.local_num_heads, cfg.head_dim]);
-        // Relabel through `relabel_3d` so the BACKEND STORAGE carries the 3-D
-        // shape — kernels read the storage's dims, and a hand-rolled
-        // `Tensor::new(storage.clone(), shape)` leaves the storage at the old
-        // [B, S, H*D] shape (the CPU paged kernel then reads seq_len/heads/
-        // head_dim from the wrong axes and scrambles the causal mask).
+        // Relabel through `relabel_3d` so the BACKEND STORAGE carries the 3-D shape - kernels read the storage's dims, and a hand-rolled `Tensor::new(storage.clone(), shape)` leaves the
+        // storage at the old [B, S, H*D] shape (the CPU paged kernel then reads seq_len/heads/ head_dim from the wrong axes and scrambles the causal mask).
         let q_3d = relabel_3d(&q_rot, total_tokens, cfg.local_num_heads, cfg.head_dim)?;
         let _ = q_3d_shape;
 
-        // Kernel ABI: `grim_qkv_attention_paged` reads the block table as
-        // `BlockTableEntry { block_id: u32, page_size: u32 }` — two words per
-        // entry. Upload raw u32 bit patterns (f32::from_bits keeps the bytes
-        // intact through the f32-typed host->device copy); a plain
-        // `b as f32` array made the kernel decode garbage ids and walk past
-        // the buffer (MiniCPM5 page fault). WI-kv: prefer the session-cached
-        // device table — upload only on cache miss (table changed).
-        let bt_storage: std::sync::Arc<dyn grim_tensor::BackendStorage> =
-            match bt_gpu {
-                Some(a) => a,
-                None => {
-                    let bt_f32: Vec<f32> = block_table
-                        .iter()
-                        .flat_map(|&b| [f32::from_bits(b), f32::from_bits(page_size as u32)])
-                        .collect();
-                    let bt_shape = Shape::new(vec![block_table.len() * 2]);
-                    Arc::from(dev.from_cpu(&bt_f32, &bt_shape, grim_tensor::DType::F32)?)
-                }
-            };
+        // Kernel ABI: `grim_qkv_attention_paged` reads the block table as `BlockTableEntry { block_id: u32, page_size: u32 }` - two words per entry.
+        // Upload raw u32 bit patterns (f32::from_bits keeps the bytes intact through the f32-typed host->device copy);.
+        let bt_storage: std::sync::Arc<dyn grim_tensor::BackendStorage> = match bt_gpu {
+            Some(a) => a,
+            None => {
+                let bt_f32: Vec<f32> = block_table
+                    .iter()
+                    .flat_map(|&b| [f32::from_bits(b), f32::from_bits(page_size as u32)])
+                    .collect();
+                let bt_shape = Shape::new(vec![block_table.len() * 2]);
+                Arc::from(dev.from_cpu(&bt_f32, &bt_shape, grim_tensor::DType::F32)?)
+            }
+        };
 
         let out_shape_3d = Shape::new(vec![total_tokens, cfg.local_num_heads, cfg.head_dim]);
         let cache_offset = positions.first().copied().unwrap_or(0);
@@ -1142,11 +1067,8 @@ impl LlamaBlock {
             q.provenance().clone(),
             q.device().clone(),
         );
-        // The kernel returns a 3-D storage `[total_tokens, num_heads,
-        // head_dim]`; relabel it to the 2-D `[total_tokens, num_head_dims]`
-        // view the downstream `wo` matmul expects. Use `reshaped_view` so the
-        // storage shape matches the declared shape on every backend (the CPU
-        // matmul validates storage rank).
+        // The kernel returns a 3-D storage `[total_tokens, num_heads, head_dim]`; relabel it to the 2-D `[total_tokens, num_head_dims]` view the downstream `wo` matmul expects.
+        // Use `reshaped_view` so the storage shape matches the declared shape on every backend (the CPU.
         reshaped_view(&attn_out, &out_shape_2d)
     }
 }
@@ -1208,9 +1130,8 @@ mod tests {
     }
 
     fn make_linear(in_dim: usize, out_dim: usize) -> Linear {
-        // Small weights to keep attention scores in a reasonable range for
-        // softmax (large weights saturate softmax and make RoPE effects
-        // invisible).
+        // Small weights to keep attention scores in a reasonable range
+        // for softmax (large weights saturate softmax and make RoPE effects invisible).
         let w = cpu_tensor(
             (0..out_dim * in_dim)
                 .map(|i| (i as f32 * 0.001) - 0.05)
@@ -1286,13 +1207,8 @@ mod tests {
         cpu_tensor(data, Shape::new(shape.to_vec()))
     }
 
-    /// Phase-1 correctness proof at the block level: a `LlamaBlock` driven
-    /// through the paged-KV path (session-backed page tensors + block table)
-    /// must produce byte-identical attention output to the same block driven
-    /// through the classic per-layer `LlamaLayerCache` path, for both prefill
-    /// (multi-token) and decode (single-token) shapes. This is the invariant
-    /// that lets the engine re-enable prefix-cache/tiering wiring on top of
-    /// the paged path without changing serving numerics.
+    /// Phase-1 correctness proof at the block level: a `LlamaBlock` driven through the paged-KV path (session-backed page tensors + block table) must produce byte-identical attention output to the same block driven through the classic per-layer `LlamaLayerCache` path, for both prefill (multi-token) and decode (single-token) shapes.
+    /// This is the invariant that lets the engine re-enable prefix-cache/tiering wiring on top of the.
     #[test]
     fn paged_attention_matches_classic_attention() {
         use grim_core::session::Inner;
@@ -1311,8 +1227,7 @@ mod tests {
         let positions = [0u32, 1, 2, 3];
 
         // Compute q/k/v once, then compare the two ATTENTION paths on
-        // identical inputs (before wo/FFN), which is where the paged-vs-class
-        // difference lives.
+        // identical inputs (before wo/FFN), which is where the paged-vs-class difference lives.
         let x_norm = block.attn_norm.forward(&x).unwrap();
         let q = block.wq.forward(&x_norm).unwrap();
         let k = block.wk.forward(&x_norm).unwrap();
@@ -1359,9 +1274,8 @@ mod tests {
         }
         let bt: Vec<u32> = sess.block_table().unwrap().to_vec();
         let (kp, vp, ps) = sess.paged_kv_handles(0).unwrap();
-        // Pass the RAW (post-QK-norm, pre-RoPE) q: `paged_self_attention`
-        // applies RoPE internally (mirroring the runtime call in
-        // `forward_with_kv_paged`), so feeding it `q_rot` would rotate twice.
+        // Pass the RAW (post-QK-norm, pre-RoPE) q: `paged_self_attention` applies RoPE internally (mirroring
+        // the runtime call in `forward_with_kv_paged`), so feeding it `q_rot` would rotate twice.
         let paged_attn = block
             .paged_self_attention(&q, &bt, &kp, &vp, ps, &positions, None)
             .unwrap();
@@ -1371,9 +1285,8 @@ mod tests {
             "prefill attention output must match between paged and classic paths"
         );
 
-        // Decode: single token at position 4. First prefill the classic cache with
-        // the same 4 tokens the paged session already holds, so both paths have
-        // identical KV context before the decode step.
+        // Decode: single token at position 4. First prefill the classic cache with the same 4 tokens
+        // the paged session already holds, so both paths have identical KV context before the decode step.
         let _ = block
             .forward_with_kv_paged(&x, &positions, None, Some(&mut classic_cache), 0)
             .unwrap();
@@ -1392,9 +1305,8 @@ mod tests {
         );
     }
 
-    /// CRIT-1: Causal mask — token at position i must not attend to positions > i.
-    /// With a 3-token input, changing the 3rd token must not affect the output
-    /// at position 0 or 1.
+    /// CRIT-1: Causal mask - token at position i must not attend to positions > i.
+    /// With a 3-token input, changing the 3rd token must not affect the output at position.
     #[test]
     fn test_causal_mask_no_future_leakage() {
         let block = small_block();
@@ -1431,10 +1343,8 @@ mod tests {
         }
     }
 
-    /// CRIT-2: RoPE is applied — non-uniform position shifts produce
-    /// different outputs for the same input embedding. Uses 3 tokens so
-    /// attention depends on Q/K via relative positions (a uniform shift is
-    /// invariant under RoPE, so it must not be uniform).
+    /// CRIT-2: RoPE is applied - non-uniform position shifts produce different outputs for the same input embedding.
+    /// Uses 3 tokens so attention depends on Q/K via relative positions (a uniform shift is.
     #[test]
     fn test_rope_applied_in_forward() {
         let block = small_block();
@@ -1496,10 +1406,8 @@ mod tests {
         assert!(diff > 1e-3, "apply_rope_multi_head diff={}", diff);
     }
 
-    /// Debug: verify RoPE relative-encoding property. A uniform position shift
-    /// must leave the attention output invariant (Q·K depends only on pos_q -
-    /// pos_k), while a non-uniform shift must change it. This proves RoPE is
-    /// actually applied in the block forward path.
+    /// Debug: verify RoPE relative-encoding property.
+    /// A uniform position shift must leave the attention output invariant (Q·K depends only on pos_q.
     #[test]
     fn test_rope_relative_encoding_property() {
         let block = small_block();
@@ -1644,8 +1552,7 @@ mod tests {
     }
 
     /// MAJ-3: Different positions produce different outputs (position tracking).
-    /// Uses non-uniform spacing so RoPE relative encoding produces different
-    /// attention scores (uniform shifts are invariant under RoPE).
+    /// Uses non-uniform spacing so RoPE relative encoding produces different attention scores (uniform shifts are invariant.
     #[test]
     fn test_positions_affect_output() {
         let block = small_block();
@@ -1694,9 +1601,8 @@ mod tests {
         assert!(result.is_err(), "8 KV heads / 6 GPUs should error");
     }
 
-    /// LlamaBlock::load_tp with world_size=1 (single device) using a fake
-    /// provider that serves zero-initialised tensors. Verifies wrapper types
-    /// are constructed and shard_size == full size.
+    /// LlamaBlock::load_tp with world_size=1 (single device) using a fake provider that serves zero-initialised tensors.
+    /// Verifies wrapper types are constructed and shard_size == full size.
     #[test]
     fn test_llama_block_load_tp_shards_weights() {
         use grim_tensor::{DType, QuantProvenance, RawTensor, TensorMeta, TensorProvider};
@@ -1809,15 +1715,8 @@ mod tests {
         assert_eq!(shard_out_wq, 64);
     }
 
-    /// Part 7: TP parity — concatenating the shards from rank 0 and rank 1
-    /// (world_size=2) must reproduce the full weight matrix exactly. This
-    /// proves the sharding is a clean partition with no overlap, gap, or
-    /// off-by-one in the rank offset — the class of bug the sanity check
-    /// flagged (issue #6).
-    ///
-    /// Weight values are distinct per element (`row*1000+col` scaled), so a
-    /// wrong shard boundary or swapped rank would be caught by element-wise
-    /// inequality rather than a vacuous all-zeros match.
+    /// Part 7: TP parity - concatenating the shards from rank 0 and rank 1 (world_size=2) must reproduce the full weight matrix exactly.
+    /// This proves the sharding is a clean partition with no overlap, gap, or off-by-one in.
     #[test]
     fn test_llama_block_tp_parity_concat_shards_equals_full() {
         use grim_tensor::{DType, QuantProvenance, RawTensor, TensorMeta, TensorProvider};
@@ -2043,17 +1942,13 @@ mod tests {
 mod alibi_reference_tests {
     use super::alibi_slopes_for;
 
-    /// Reference for the documented scheme:
-    /// - powers of two: slope_i = 2^(-(i+1)·8/n)  (Press et al. §2.1)
-    /// - non-powers: pair the closest-lower power's slopes with every other
-    ///   slope of the closest-HIGHER power — [lower0, higher0, lower1,
-    ///   higher2, …] — and truncate to n heads. (Note: the official ALiBi
-    ///   repo APPENDS the higher set's even-indexed slopes instead of
-    ///   interleaving; either is a valid non-power approximation, and this
-    ///   test pins the convention THIS crate documents.)
+    /// Reference for the documented scheme: - powers of two: slope_i = 2^(-(i+1)·8/n) (Press et al.
+    /// §2.1) - non-powers: pair the closest-lower power's slopes with every other slope of the closest-HIGHER.
     fn reference_slopes(n: usize) -> Vec<f32> {
         fn pow2(n: usize) -> Vec<f32> {
-            (1..=n).map(|i| 2.0f32.powf(-8.0 * i as f32 / n as f32)).collect()
+            (1..=n)
+                .map(|i| 2.0f32.powf(-8.0 * i as f32 / n as f32))
+                .collect()
         }
         if n.count_ones() == 1 {
             return pow2(n);
@@ -2081,10 +1976,7 @@ mod alibi_reference_tests {
             let want = reference_slopes(n);
             assert_eq!(got.len(), n);
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() < 1e-6,
-                    "n={n} slope[{i}]: got {g}, want {w}"
-                );
+                assert!((g - w).abs() < 1e-6, "n={n} slope[{i}]: got {g}, want {w}");
             }
         }
         // n=8 sanity against the paper's worked example: 1/2, 1/4, …, 1/256.
@@ -2098,7 +1990,10 @@ mod alibi_reference_tests {
             let got = alibi_slopes_for(n);
             assert_eq!(got.len(), n);
             for w in &got {
-                assert!(*w > 0.0, "n={n}: slopes are positive (bias = slope·(j−i) < 0)");
+                assert!(
+                    *w > 0.0,
+                    "n={n}: slopes are positive (bias = slope·(j−i) < 0)"
+                );
             }
             let got_ref = reference_slopes(n);
             for (g, w) in got.iter().zip(&got_ref) {

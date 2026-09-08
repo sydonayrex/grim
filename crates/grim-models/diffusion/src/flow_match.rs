@@ -1,7 +1,5 @@
 //! FlowMatch Euler Discrete Noise Scheduler for Rectified Flow Diffusion Models.
-//!
-//! Implements resolution-dependent empirical time-shifting and deterministic Euler ODE steps:
-//! $$x_{t - \Delta t} = x_t + (\sigma_{t - \Delta t} - \sigma_t) \cdot v_\theta(x_t, \sigma_t, c)$$
+//! Implements resolution-dependent empirical time-shifting and deterministic Euler ODE steps: $$x_{t - \Delta t} = x_t.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};

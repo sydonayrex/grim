@@ -60,16 +60,8 @@ extern "C" {
         const unsigned char* scales = block_ptr + 4;
         const unsigned char* qs = block_ptr + 16;
 
-        // ggml `dequantize_row_q4_K`: four 64-weight groups. Within group g,
-        // the first 32 outputs take low nibbles (q[l] & 0xF) and the next 32
-        // take high nibbles (q[l] >> 4) of the *same* 32-byte `qs` window
-        // (q advances by 32 bytes per 64-output group). The low group uses
-        // scale sub-block `is = 2*g`, the high group uses `2*g + 1`.
-        //
-        // The previous per-element formula here read `qs[is*16 + il]`, which
-        // for the high nibble (is odd) shifted up by 16 bytes into the next
-        // group's window and so crossed group boundaries — wrong bytes,
-        // wrong results.
+        // ggml `dequantize_row_q4_K`: four 64-weight groups.
+        // Within group g, the first 32 outputs take low nibbles (q[l] & 0xF) and the.
         int group = in_sb / 64;           // 0..3
         int half  = (in_sb % 64) / 32;     // 0 = low nibble, 1 = high nibble
         int l     = in_sb % 32;           // 0..31 within the 32-byte window
@@ -80,13 +72,8 @@ extern "C" {
             sc = scales[is] & 63;
             m  = scales[is + 4] & 63;
         } else {
-            // High sub-blocks (4..7), per upstream ggml get_scale_min_k4
-            // (ggml-quants.c): sc takes its top 2 bits from scales[is-4],
-            // but m takes its top 2 bits from scales[is] itself
-            // ("q[j-0]" upstream). scales[is-4] here is a DIFFERENT byte;
-            // using it corrupts min values for sub-blocks 4..7 (weights
-            // 128..255 per super-block). Keep in lockstep with
-            // grim_quant::get_scale_min_k4 and q5k/iq_gemm.
+            // High sub-blocks (4..7), per upstream ggml get_scale_min_k4 (ggml-quants.c): sc takes its top 2 bits from scales[is-4], but m takes its top 2 bits from scales[is] itself ("q[j-0]" upstream).
+            // scales[is-4] here is a DIFFERENT byte; using it corrupts min values for sub-blocks 4..7 (weights.
             sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
             m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
         }
@@ -118,11 +105,8 @@ mod tests {
         }
     }
 
-    /// Host mirror of the DEVICE fn `dequant_q4k_element` above. The
-    /// standalone-dequant kernel has its own mirror in `q4k_dequant.rs`; the
-    /// GEMM-fused path used by every Q4_K matmul had NO oracle coverage
-    /// before these tests — exactly how the `scales[is-4]` min-byte bug
-    /// survived there.
+    /// Host mirror of the DEVICE fn `dequant_q4k_element` above.
+    /// The standalone-dequant kernel has its own mirror in `q4k_dequant.rs`; the GEMM-fused path used by every.
     fn dequant_q4k_element_host(blk: &[u8], in_sb: usize) -> f32 {
         let d = fp16_to_f32_host(blk[0], blk[1]);
         let dmin = fp16_to_f32_host(blk[2], blk[3]);
@@ -157,12 +141,8 @@ mod tests {
 
     #[test]
     fn q4k_element_mirror_matches_cpu_oracle_high_bit_scales_golden() {
-        // Golden block built so the DIVERGENT bits are non-zero AND differ:
-        // for sub-block s=4 the correct m takes its top 2 bits from
-        // scales[4] (top2 = 0b10), while the historical bug read them from
-        // scales[0] (top2 = 0b01). Every weight 128..255 therefore
-        // discriminates the two formulas — the older fixtures masked all
-        // scale bytes to 6 bits and could not.
+        // Golden block built so the DIVERGENT bits are non-zero AND differ: for sub-block s=4 the correct m takes its top 2 bits from scales[4] (top2 = 0b10), while the historical bug read them from scales[0] (top2 = 0b01).
+        // Every weight 128..255 therefore discriminates the two formulas - the older fixtures masked all scale.
         let mut buf = vec![0u8; 144];
         buf[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d   = 1.0
         buf[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // min = 0.25
@@ -177,10 +157,7 @@ mod tests {
 
         let oracle = grim_quant::dequant_q4k(&buf, 256).expect("cpu dequant");
 
-        // Hand-derived expectation via ggml get_scale_min_k4(j=4):
-        //   sc4 = (scales[8]&0xF)=5 | ((scales[0]>>6)<<4)=1<<4 -> sc4 = 21
-        //   m4  = (scales[8]>>4)=3 | ((scales[4]>>6)<<4)=2<<4 -> m4  = 35
-        // out[128] = d*sc4*q - min*m4 = 21*10 - 0.25*35 = 201.25.
+        // Hand-derived expectation via ggml get_scale_min_k4(j=4): sc4 = (scales[8]&0xF)=5 | ((scales[0]>>6)<<4)=1<<4 -> sc4 = 21 m4 = (scales[8]>>4)=3 | ((scales[4]>>6)<<4)=2<<4 -> m4 = 35 out[128] = d*sc4*q - min*m4 = 21*10 - 0.25*35 = 201.25.
         // Under the scales[is-4] bug, m4 would be 3|(1<<4)=19 → 205.25.
         assert_close(
             oracle[128],
@@ -194,9 +171,8 @@ mod tests {
             21.0 * 6.0 - 0.25 * 35.0,
             "oracle second s=4 weight",
         );
-        // The hi nibble of byte 80 belongs to sub-block s=5 (all-zero
-        // scales here) — documents that hi weights of a 64-group use the
-        // ODD scale index, i.e. out[160..192) are s=5 weights.
+        // The hi nibble of byte 80 belongs to sub-block s=5 (all-zero scales here) - documents that hi weights of a 64-group use the ODD scale index, i.e.
+        // out[160..192) are s=5 weights.
         assert_close(oracle[160], 0.0, "s=5 weights are zeroed by fixture");
 
         let mirror: Vec<f32> = (0..256)
@@ -249,9 +225,8 @@ mod tests {
 
     #[test]
     fn q4k_element_device_source_pins_the_min_byte() {
-        // Structural pin: the fused-GEMM device source must take m's top
-        // bits from scales[is] (ggml "q[j-0]") — the exact line the
-        // scales[is-4] mutation changes. Positive and negative assertions.
+        // Structural pin: the fused-GEMM device source must take m's top bits from scales[is] (ggml "q[j-0]") - the exact line the scales[is-4] mutation changes.
+        // Positive and negative assertions.
         assert!(
             KERNEL_SOURCE.contains("m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);"),
             "dequant_q4k_element m-line drifted from grim_quant::get_scale_min_k4"

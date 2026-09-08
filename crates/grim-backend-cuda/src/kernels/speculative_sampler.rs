@@ -1,23 +1,11 @@
 //! GPU speculative decoding rejection sampler + argmax/stochastic samplers.
-//!
 //! Ported from grim-backend-rocm `kernels/speculative_sampler.rs`.
-//! Four kernels:
-//!   1. `grim_speculative_rejection_sample` — modified rejection sampling + residual
-//!   2. `grim_sample_logits_argmax`         — zero-CPU greedy argmax
-//!   3. `grim_sample_stochastic`            — temperature + top-k + Gumbel-max
-//!   4. `grim_speculative_tree_verify`      — Medusa/Eagle tree path verifier
 
 pub const SPECULATIVE_SAMPLER_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// Speculative Rejection Sampling
-//
-// Grid: (batch_size, 1)  Block: (256, 1)
-// Verifies draft tokens against target probabilities using the standard
-// modified rejection sampling algorithm. On rejection, samples from the
-// residual distribution max(0, P - Q) device-side. No host round-trip.
-// ---------------------------------------------------------------------------
+// Speculative Rejection Sampling Grid: (batch_size, 1) Block: (256, 1) Verifies draft tokens against target probabilities using the standard modified rejection sampling algorithm.
+// On rejection, samples from the residual distribution max(0, P - Q) device-side.
 __global__ void grim_speculative_rejection_sample(
     const float* __restrict__ target_probs,  // [batch, num_draft+1, vocab]
     const float* __restrict__ draft_probs,   // [batch, num_draft, vocab]
@@ -92,12 +80,8 @@ __global__ void grim_speculative_rejection_sample(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Greedy Argmax Sampler
-//
-// Grid: (batch_size, 1)  Block: (256, 1)
-// Finds argmax per row via parallel reduction. D2H only the token id.
-// ---------------------------------------------------------------------------
+// Greedy Argmax Sampler Grid: (batch_size, 1) Block: (256, 1) Finds argmax per row via parallel reduction.
+// D2H only the token id.
 __global__ void grim_sample_logits_argmax(
     const float* __restrict__ logits, // [batch, vocab]
     int*   __restrict__ out_tokens,   // [batch]
@@ -130,13 +114,8 @@ __global__ void grim_sample_logits_argmax(
     if (tid == 0) out_tokens[b] = s_idx[0];
 }
 
-// ---------------------------------------------------------------------------
-// Stochastic Sampler — temperature + top-k + Gumbel-max (WI-X3)
-//
-// Grid: (batch_size, 1)  Block: (256, 1)
-// Same RNG and bisection algorithm as ROCm version. Reproducible:
-// (logits, seed) -> same token on any run.
-// ---------------------------------------------------------------------------
+// Stochastic Sampler - temperature + top-k + Gumbel-max (WI-X3) Grid: (batch_size, 1) Block: (256, 1) Same RNG and bisection algorithm as ROCm version.
+// Reproducible: (logits, seed) -> same token on any run.
 __global__ void grim_sample_stochastic(
     const float* __restrict__ logits, // [batch, vocab]
     int*   __restrict__ out_tokens,   // [batch]
@@ -203,13 +182,8 @@ __global__ void grim_sample_stochastic(
     if (tid == 0) out_tokens[b] = s_idx[0];
 }
 
-// ---------------------------------------------------------------------------
-// Tree Speculative Verifier (Medusa / Eagle)
-//
-// Grid: (num_paths/32, 1)  Block: (num_paths % 32 or 32, 1)
-// Evaluates all candidate tree paths in parallel, picks the longest accepted
-// prefix via atomicMax. No sequential host round-trips between tree steps.
-// ---------------------------------------------------------------------------
+// Tree Speculative Verifier (Medusa / Eagle) Grid: (num_paths/32, 1) Block: (num_paths % 32 or 32, 1) Evaluates all candidate tree paths in parallel, picks the longest accepted prefix via atomicMax.
+// No sequential host round-trips between tree steps.
 __global__ void grim_speculative_tree_verify(
     const int*   __restrict__ candidate_paths,  // [num_paths, max_path_len]
     const float* __restrict__ target_logits,    // [max_path_len, vocab]

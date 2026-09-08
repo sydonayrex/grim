@@ -5,12 +5,13 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::device::device_quant::wmma_route_decision;
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendStorage, Shape};
-use crate::device::device_quant::wmma_route_decision;
 pub use grim_tensor::{
-    CoreTensorOps, ElementwiseOps, SamplingOps, AttentionOps, FusionOps, AutogradOps, OptimizerOps, QuantOps, RecurrentOps, CollectiveOps, MemoryOps, GraphCaptureOps,
+    AttentionOps, AutogradOps, CollectiveOps, CoreTensorOps, ElementwiseOps, FusionOps,
+    GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
 };
 
 /// Statistics for `BackendDevice::quantized_matmul_backward_dx` dispatch (WI-F5-close). [see: `attempts`, `grim-autograd::matmul_backward`]
@@ -109,10 +110,7 @@ use crate::{
 };
 
 /// Return type for [`RocmDevice::charon_grouped_backward_roundtrip`].
-///
-/// Holds the four named gradient buffers from the Charon MoE backward kernel,
-/// each as a flat `Vec<f32>` in the device layout (expert-outermost for weight
-/// grads, batch-outermost for `d_x`).
+/// Holds the four named gradient buffers from the Charon MoE backward kernel, each as a.
 #[derive(Debug, Clone)]
 pub struct CharonBackwardResult {
     pub d_gate_w: Vec<f32>,
@@ -139,51 +137,37 @@ pub struct RocmDevice {
     /// AtomicBool shadow of `fused_dequant_gemm_config.enabled` — read lock-free on every
     /// quantized_matmul dispatch. Written by `set_fused_dequant_gemm_enabled`.
     pub(crate) fused_dequant_gemm_enabled: AtomicBool,
-    /// Opt-in gate for the Jay-Tier MXFP4 fused dequant-GEMM kernel
-    /// (`launch_fused_dequant_gemm_mxfp4`). Defaults to `false` so the proven
-    /// tiled MXFP4 path stays the default until parity with the F32 oracle is
-    /// confirmed on a target GPU. Written by `set_mxfp4_fused_dequant_gemm_enabled`.
+    /// Opt-in gate for the Jay-Tier MXFP4 fused dequant-GEMM kernel (`launch_fused_dequant_gemm_mxfp4`).
+    /// Defaults to `false` so the proven tiled MXFP4 path stays the default until parity with.
     pub(crate) mxfp4_fused_dequant_gemm_enabled: AtomicBool,
     /// AtomicBool shadow of `wmma_gemm_config.enabled` — read lock-free by
     /// `should_use_wmma_path`. Written by `set_wmma_gemm_enabled`.
     pub(crate) wmma_gemm_enabled: AtomicBool,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
-    /// Pinned host buffers backing in-flight stream-ordered H2D copies. A
-    /// `hipMemcpyAsync` reads these pages on the copy engine *after* the CPU
-    /// returns, so the page-locked source must outlive the enqueue. Each
-    /// stream-ordered upload retains its pin here; `synchronize()` drains the
-    /// list only after the device has completed all queued copies. This is the
-    /// lifetime-safety half of the async H2D pipeline.
+    /// Pinned host buffers backing in-flight stream-ordered H2D copies.
+    /// A `hipMemcpyAsync` reads these pages on the copy engine *after* the CPU returns, so the.
     pub(crate) retained_pins: Mutex<Vec<RocmPinnedBuffer<f32>>>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed [see: `hipMalloc`, `get_scratch`]
     pub(crate) scratch_pool: Arc<crate::memory::pool::DeviceScratchPool>,
     /// Loaded HIP modules + resolved entry functions, cached per unique kernel entry. [see: `hipModuleLoad`, `hipModuleGetFunction`]
     pub(crate) autotuner: Mutex<crate::autotune::Autotuner>,
     /// Tuning-mode + occupancy + tuning-solution store for this device.
-    /// [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
-    /// tuning solution storage]
+    /// [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning, tuning solution storage]
     #[allow(dead_code)]
     pub(crate) tuning: Mutex<crate::autotune::AutotunerConfig>,
 
     pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
-    /// Resolved-function fast path for `launch_compute_kernel_with_solution`:
-    /// (entry, grid_x, grid_y) -> hipFunction. Skips the per-launch kernel
-    /// source regeneration + seahash + CString work for repeat launches (the
-    /// overwhelming case on the decode hot path). Grid dims are part of the
-    /// key because `jit-hw-adaptive` bakes tile geometry derived from them
-    /// into the source.
+    /// Resolved-function fast path for `launch_compute_kernel_with_solution`: (entry, grid_x, grid_y) -> hipFunction.
+    /// Skips the per-launch kernel source regeneration + seahash + CString work for repeat launches (the.
     pub(crate) resolved_kernel_cache: Mutex<HashMap<(String, u32, u32, Option<i32>), *mut c_void>>,
-    /// Interner for `&'static str` autotune keys (entry / arch). Each unique
-    /// string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` /
-    /// `store_tune_cache` calls reuse it instead of leaking per call.
+    /// Interner for `&'static str` autotune keys (entry / arch).
+    /// Each unique string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` / `store_tune_cache` calls reuse it instead.
     pub(crate) str_interner: Mutex<std::collections::HashSet<&'static str>>,
     /// Real `hipModuleLoad` call count (cache hits excluded). Item 2 acceptance.
     pub(crate) module_load_count: AtomicUsize,
     /// Total kernel + GEMM launches since the last `reset_launch_count`.
-    /// Instrumentation for fusion-boundary launch-count gates (WI-F1 etc.);
-    /// counts every `hipModuleLaunchKernel` and every rocBLAS GEMM enqueued
-    /// through `matmul_op`.
+    /// Instrumentation for fusion-boundary launch-count gates (WI-F1 etc.); counts every `hipModuleLaunchKernel` and every rocBLAS GEMM enqueued.
     pub(crate) launch_counter: AtomicUsize,
     /// GPU target this device was created for, captured at construction. Used to [see: `temp_env::with_var("GRIM_GPU_TARGET", ..)`]
     pub(crate) gpu_target: String,
@@ -205,18 +189,8 @@ pub struct RocmDevice {
     pub(crate) upload_event: Mutex<Option<*mut c_void>>,
 }
 
-// SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle
-// caches) that is process-local and accessed only through the owning thread's
-// HIP context. Moving the device to another thread (Send) is safe because HIP
-// contexts are thread-local but the device ordinal remains valid. The type is
-// Sync because all mutable state is behind interior mutability (Mutex,
-// AtomicBool) that serializes access.
-//
-// Current enforcement: all live call paths into this type pass through
-// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
-// possible through the server's actual API today. Do NOT remove that lock or add
-// a second concurrent access path (e.g. worker pool, background prefetch thread)
-// without auditing the interior mutability here first.
+// SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
+// Moving the device to another thread (Send) is safe because HIP contexts are thread-local but.
 unsafe impl Send for RocmDevice {}
 unsafe impl Sync for RocmDevice {}
 
@@ -230,10 +204,8 @@ impl RocmDevice {
             &self.allocator,
             self.ordinal,
         )?;
-        // WI-SB6: ring slots MUST start zeroed — `status` byte-layout begins
-        // with PENDING(0). Uninitialized VRAM let a resident worker claim
-        // phantom descriptors with garbage opcodes and wedge the device
-        // before the host's first descriptor upload landed.
+        // WI-SB6: ring slots MUST start zeroed - `status` byte-layout begins with PENDING(0).
+        // Uninitialized VRAM let a resident worker claim phantom descriptors with garbage opcodes and wedge the.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if let Some(ptr) = storage.device_ptr_u64() {
             let rc = unsafe { crate::device::handles::hipMemset(ptr as *mut c_void, 0, bytes) };
@@ -247,9 +219,8 @@ impl RocmDevice {
         Ok(storage)
     }
 
-    /// WI-SB5: cross-device F32 copy via pinned staging with per-leg context
-    /// pins. Independent of RCCL/peer-access features — safe default for
-    /// small fan-in/gather transfers (decode-sized rows).
+    /// WI-SB5: cross-device F32 copy via pinned staging with per-leg context pins.
+    /// Independent of RCCL/peer-access features - safe default for small fan-in/gather transfers (decode-sized rows).
     pub fn copy_cross_device_bounce(
         &self,
         dst_ordinal: usize,
@@ -316,11 +287,8 @@ impl RocmDevice {
         })
     }
 
-    /// WI-SB6: create a NON-BLOCKING stream. Unlike pool streams (created
-    /// blocking-with-legacy), a non-blocking stream never serializes with
-    /// other streams — required for the resident persistent wave so host
-    /// control traffic (head publishes, tail polls, stop) is never queued
-    /// behind an eternally-running kernel.
+    /// WI-SB6: create a NON-BLOCKING stream. Unlike pool streams (created blocking-with-legacy), a non-blocking stream never serializes with other streams - required
+    /// for the resident persistent wave so host control traffic (head publishes, tail polls, stop) is never queued behind an eternally-running kernel.
     pub fn create_non_blocking_stream(&self) -> Result<*mut c_void> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut stream: *mut c_void = std::ptr::null_mut();
@@ -345,14 +313,8 @@ impl RocmDevice {
         }
     }
 
-    /// [`Self::copy_scythe_descriptor_async`] on an explicit stream — the
-    /// resident-wave control path must never enqueue behind the worker.
-    ///
-    /// WI-SB6 (2026-08-24): async enqueue + CONTROL-STREAM-ONLY sync. A
-    /// fully blocking hipMemcpy here deadlocked at the first submit with a
-    /// resident wave running (device-scope staging sync never completes
-    /// against an eternal kernel); stream-scoped sync preserves the
-    /// payload-before-head ordering without any device-wide barrier.
+    /// [`Self::copy_scythe_descriptor_async`] on an explicit stream - the resident-wave control path must never enqueue behind the worker.
+    /// WI-SB6 (2026-08-24): async enqueue + CONTROL-STREAM-ONLY sync.
     pub fn copy_scythe_descriptor_async_on(
         &self,
         dst: u64,
@@ -400,14 +362,8 @@ impl RocmDevice {
         let detected = detect_gpu_arch(ordinal as i32);
         crate::rocm_detect::auto_configure_hsa_override(&detected);
 
-        // WI-M1/M2 context discipline: construction must run on the target
-        // device's context (streams and the rocBLAS handle bind to whatever
-        // device is current), but construction must be context-NEUTRAL for
-        // the caller. This path used to park the constructing thread on
-        // `ordinal` permanently — first use of a foreign ordinal from a
-        // worker thread mid-forward flipped that thread's context, which is
-        // exactly the ctx_dev=2 fault mechanism under hunt. raw_set_device
-        // keeps every such flip visible to [ctx-trace].
+        // WI-M1/M2 context discipline: construction must run on the target device's context (streams and the rocBLAS handle bind to whatever device is current), but construction must be context-NEUTRAL for the caller.
+        // This path used to park the constructing thread on `ordinal` permanently - first use of.
         let mut prev_dev: i32 = 0;
         unsafe {
             let _ = crate::device::handles::hipGetDevice(&mut prev_dev);
@@ -460,9 +416,8 @@ impl RocmDevice {
             }
         }
         let dev = Self::build(ordinal, warp_size, xnack_val, handle_cache, streams);
-        // Auto-init RCCL when multi-process TP is active — this rank process
-        // builds its own RcclAllReduce over the full ordinal list so
-        // `RowParallelLinear::forward`'s all_reduce has a live comm handle.
+        // Auto-init RCCL when multi-process TP is active - this rank process builds its own
+        // RcclAllReduce over the full ordinal list so `RowParallelLinear::forward`'s all_reduce has a live comm handle.
         dev.auto_init_rccl();
         // Construction is context-neutral: hand the calling thread its
         // previous device back instead of parking it on `ordinal`.
@@ -473,11 +428,8 @@ impl RocmDevice {
         Self::build(ordinal, 32, 0, None, Vec::new())
     }
 
-    /// Attach (or detach) an RCCL multi-GPU collective handle. Called by the
-    /// training orchestrator after constructing `RcclAllReduce` so that
-    /// [`BackendDevice::all_reduce`] and [`BackendDevice::comm_fuse_reduce`]
-    /// can dispatch device-side collectives instead of falling back to the
-    /// CPU fan-in path. [see: `RcclAllReduce::try_new`]
+    /// Attach (or detach) an RCCL multi-GPU collective handle.
+    /// Called by the training orchestrator after constructing `RcclAllReduce` so that [`BackendDevice::all_reduce`] and [`BackendDevice::comm_fuse_reduce`] can dispatch.
     pub fn set_rccl_handle(&self, handle: Option<Arc<crate::rccl::RcclAllReduce>>) {
         *self.rccl.lock().unwrap_or_else(|e| e.into_inner()) = handle;
     }
@@ -487,16 +439,8 @@ impl RocmDevice {
         self.rccl.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Auto-init the RCCL handle from `GRIM_TP_*` env vars when multi-process
-    /// TP is active. Each rank process calls this after construction; the
-    /// handle covers the full ordinal list so every rank's `ncclAllReduce`
-    /// rendezvous with its peers. No-op when `GRIM_TP_SIZE <= 1` or when
-    /// RCCL is unavailable.
-    ///
-    /// Reads the env inline (mirrors `TensorParallelConfig::from_env`) because
-    /// `grim-backend-rocm` cannot depend on `grim-nn` (grim-nn → grim-backend-
-    /// rocm would form a cycle). Must agree with the ordinal-resolution logic
-    /// in `grim-engine`'s `model_loader` and `Engine::new`.
+    /// Auto-init the RCCL handle from `GRIM_TP_*` env vars when multi-process TP is active.
+    /// Each rank process calls this after construction; the handle covers the full ordinal list so.
     pub fn auto_init_rccl(&self) {
         // Inline TensorParallelConfig::from_env — returns None when GRIM_TP_SIZE
         // is unset or 1 (single-device).
@@ -556,15 +500,8 @@ impl RocmDevice {
         }
     }
 
-    /// P2P memcpy that routes via direct peer DMA or host-bounce staging,
-    /// bridging the typed routing decision (`P2PStatus` → `RouteLink`) to the
-    /// actual memcpy primitives.
-    ///
-    /// This is the bridge that `p2p_route.rs` defers: it calls
-    /// `peer_access::peer_status` to classify the link, `to_route_link` to
-    /// pick the route strategy, then `copy_route` to execute either
-    /// `hipMemcpyPeerAsync` (PeerDirect) or a D2H→H2D host-pin `hipMemcpyAsync`
-    /// pair (HostBounce). The stream is pulled from this device's stream pool.
+    /// P2P memcpy that routes via direct peer DMA or host-bounce staging, bridging the typed routing decision (`P2PStatus` → `RouteLink`) to the actual memcpy primitives.
+    /// This is the bridge that `p2p_route.rs` defers: it calls `peer_access::peer_status` to classify the link, `to_route_link`.
     pub fn copy_via_route(
         &self,
         src_device: i32,
@@ -582,23 +519,15 @@ impl RocmDevice {
     }
 
     /// Process-wide cache of constructed devices, keyed by ordinal.
-    ///
-    /// Constructing a `RocmDevice` is *not* cheap: it creates a rocBLAS handle
-    /// (which itself hipMallocs a 32–128 MiB internal workspace), four HIP
-    /// streams and a fresh caching allocator. Hot paths (weight materialisation,
-    /// per-token tensor uploads) used to call `RocmDevice::new` per tensor,
-    /// which on small-VRAM parts (e.g. gfx1036 with a 2 GiB carve-out) exhausts
-    /// device memory and makes `rocblas_create_handle` fail with status 5
-    /// (`rocblas_status_memory_error`). Use `shared` on those paths.
+    /// Constructing a `RocmDevice` is *not* cheap: it creates a rocBLAS handle (which itself hipMallocs a.
     fn device_cache() -> &'static Mutex<HashMap<usize, Arc<RocmDevice>>> {
         static CACHE: std::sync::OnceLock<Mutex<HashMap<usize, Arc<RocmDevice>>>> =
             std::sync::OnceLock::new();
         CACHE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Return the process-wide shared device for `ordinal`, constructing it on
-    /// first use. Prefer this over `RocmDevice::new` anywhere a device is
-    /// obtained repeatedly (per tensor, per token, per layer). [see: `RocmDevice::new`]
+    /// Return the process-wide shared device for `ordinal`, constructing it on first use.
+    /// Prefer this over `RocmDevice::new` anywhere a device is obtained repeatedly (per tensor, per token, per.
     pub fn shared(ordinal: usize) -> Arc<RocmDevice> {
         let cache = Self::device_cache();
         let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -674,10 +603,8 @@ impl RocmDevice {
                 let derived = total_vram / 6; // ≈ 16.7 % of VRAM
                 derived
             })
-            // Pool floor raised to 512 MB (a 512 MB cap on a 16 GB card
-            // forced real hipMalloc/hipFree churn for every transient once
-            // the cap was hit — i.e. always); ceiling 4 GB keeps runaway
-            // env overrides bounded.
+            // Pool floor raised to 512 MB (a 512 MB cap on a 16 GB card forced real hipMalloc/hipFree churn for every transient once the cap was hit - i.e.
+            // always); ceiling 4 GB keeps runaway env overrides bounded.
             .clamp(512 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
 
         let arch_leak: &'static str = Box::leak(gpu_target.clone().into_boxed_str());
@@ -708,8 +635,7 @@ impl RocmDevice {
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
             // Tuning-mode + occupancy + tuning-solution store for this device.
-            // [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
-            // tuning solution storage]
+            // [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning, tuning solution storage]
             tuning: Mutex::new(crate::autotune::AutotunerConfig::default()),
 
             module_cache: Mutex::new(HashMap::new()),
@@ -746,9 +672,8 @@ impl RocmDevice {
             mxfp4_fused_dequant_gemm_enabled: AtomicBool::new(
                 match std::env::var("GRIM_MXFP4_FUSED_GEMM") {
                     Ok(v) => {
-                        // Explicit operator override: "1"/"true" forces the fused
-                        // path on, "0"/"false" forces it off. Any other value
-                        // falls back to the arch-confirmed default.
+                        // Explicit operator override: "1"/"true" forces the fused path on, "0"/"false" forces it off.
+                        // Any other value falls back to the arch-confirmed default.
                         !matches!(v.as_str(), "0" | "false" | "off" | "no")
                     }
                     Err(_) => {
@@ -820,8 +745,7 @@ impl RocmDevice {
     }
 
     /// Set whether the Jay-Tier MXFP4 fused dequant-GEMM kernel is enabled.
-    /// Defaults to `false` (tiled fallback) until parity with the F32 oracle is
-    /// confirmed on a target GPU.
+    /// Defaults to `false` (tiled fallback) until parity with the F32 oracle is confirmed on a.
     pub fn set_mxfp4_fused_dequant_gemm_enabled(&self, enabled: bool) {
         self.mxfp4_fused_dequant_gemm_enabled
             .store(enabled, Ordering::Relaxed);
@@ -866,10 +790,8 @@ impl RocmDevice {
         self.launch_counter.load(Ordering::SeqCst)
     }
 
-    /// `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` for a kernel entry that
-    /// has already been launched (and thus resolved) on this device. Returns
-    /// `None` if the entry is not in the resolved-kernel cache yet. Occupancy
-    /// regression harness for fusion gates (WI-F2/F4).
+    /// `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` for a kernel entry that has already been launched (and thus resolved) on this device.
+    /// Returns `None` if the entry is not in the resolved-kernel cache yet.
     pub fn kernel_max_blocks_per_cu(&self, entry: &str, block_size: u32) -> Option<i32> {
         let func = self
             .resolved_kernel_cache
@@ -935,9 +857,8 @@ impl RocmDevice {
         let bytes = data.len() * elem_size;
         let align = elem_size.max(16); // safe default; matches element boundaries.
         let buf = self.scratch_pool.get(bytes, align)?;
-        // WI-M1 context discipline: the pooled buffer lives on THIS device;
-        // pin the context or a drifted thread's synchronous H2D copy lands
-        // the data on another device's memory.
+        // WI-M1 context discipline: the pooled buffer lives on THIS device; pin the context
+        // or a drifted thread's synchronous H2D copy lands the data on another device's memory.
         let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // Copy host → device. We do a synchronous `hipMemcpy` here; the
         let res: HipErrorT = unsafe {
@@ -979,11 +900,8 @@ impl RocmDevice {
         } else {
             self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut())
         };
-        // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer
-        // stream, fence this (compute) stream on its completion event so the
-        // prefetch can overlap the prior decode-step GEMM instead of racing it.
-        // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the
-        // host. The event is recorded by `upload_from_host_stream_ordered`.
+        // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer stream, fence this (compute) stream on its completion event so the prefetch can overlap the prior decode-step GEMM instead of racing it.
+        // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the host.
         if let Ok(guard) = self.upload_event.lock() {
             if let Some(ev) = *guard {
                 if !ev.is_null() {
@@ -998,15 +916,12 @@ impl RocmDevice {
 
     /// Block until all previously issued work on all streams of this device
     pub fn synchronize(&self) {
-        // Pin the correct device before synchronizing — hipDeviceSynchronize()
-        // synchronizes the calling thread's current device, not necessarily
-        // self.ordinal. [P1-7 fix: DeviceGuard before sync.]
+        // Pin the correct device before synchronizing - hipDeviceSynchronize() synchronizes the calling thread's current device, not necessarily self.ordinal.
+        // [P1-7 fix: DeviceGuard before sync.]
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let _ = unsafe { hipDeviceSynchronize() };
-        // All stream-ordered H2D copies are complete, so the pinned host
-        // sources they read are now safe to release. Draining here (rather than
-        // at each upload) is what allows consecutive uploads to queue on the
-        // stream pool and overlap with one another.
+        // All stream-ordered H2D copies are complete, so the pinned host sources they read are now safe to release.
+        // Draining here (rather than at each upload) is what allows consecutive uploads to queue on.
         if let Ok(mut pins) = self.retained_pins.lock() {
             pins.clear();
         }
@@ -1121,13 +1036,8 @@ impl RocmDevice {
                 let _ = hipGraphDestroy(old.graph);
             }
         }
-        // Do NOT reset the rocBLAS handle to the null stream here. Every eager
-        // GEMM dispatch re-binds the handle to `active_stream()` before use
-        // (P0-17 fix), so leaving it bound to the capture stream is harmless
-        // and avoids the footgun where a later GEMM that forgets to set the
-        // stream silently lands on the default stream instead of the active
-        // one. The next dispatch's `rocblas_set_stream(handle, active_stream())`
-        // overwrites this binding regardless.
+        // Do NOT reset the rocBLAS handle to the null stream here.
+        // Every eager GEMM dispatch re-binds the handle to `active_stream()` before use (P0-17 fix), so leaving.
         self.capture_active.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -1164,13 +1074,8 @@ impl RocmDevice {
                 if res != hipSuccess {
                     return Err(Error::Backend(format!("hipGraphLaunch failed: {}", res)));
                 }
-                // No post-replay sync: replay is async on `stream`; callers
-                // that need the result sync (or read back) at their boundary.
-                // The rocblas handle binding is an enqueue-time setting, so we
-                // leave it bound to `stream` rather than resetting to null:
-                // the next eager GEMM re-binds to `active_stream()` anyway, and
-                // resetting to the default stream would be a footgun (P0-17
-                // class) if any future dispatch forgets to set the stream.
+                // No post-replay sync: replay is async on `stream`; callers that need the result sync (or read back) at their boundary.
+                // The rocblas handle binding is an enqueue-time setting, so we leave it bound to `stream`.
                 Ok(true)
             }
             None => Ok(false),
@@ -1185,9 +1090,7 @@ impl RocmDevice {
             .contains_key(key)
     }
 
-    // =============================================================================
     // WRECK-9: decode-step graph capture via GraphCaptureManager.
-    // =============================================================================
 
     /// Lazily-initialized GraphCaptureManager for decode-step graph capture.
     fn ensure_graph_capture_mgr(&self) {
@@ -1200,12 +1103,8 @@ impl RocmDevice {
         }
     }
 
-    /// Capture the decode-step GEMM (`launch_decode_gemm_f16`) under a shape key via the
-    /// GraphCaptureManager, then replay it. Collapses per-step launch+dispatch overhead for
-    /// repeated decode steps at the same shape.
-    ///
-    /// Returns Ok(true) if captured and replayed; Ok(false) if manager not initialized
-    /// (callers fall back to eager `launch_decode_gemm_f16`).
+    /// Capture the decode-step GEMM (`launch_decode_gemm_f16`) under a shape key via the GraphCaptureManager, then replay it.
+    /// Collapses per-step launch+dispatch overhead for repeated decode steps at the same shape.
     pub fn decode_graph_capture_and_replay(
         &self,
         key: crate::graph_capture::DecodeGraphKey,
@@ -1259,9 +1158,8 @@ impl RocmDevice {
             return Ok(Vec::new());
         }
 
-        // P1-3: rocBLAS batched GEMM runs on the calling thread's current
-        // device — pin to the owning ordinal or a drifted thread launches
-        // against foreign pointers (same class as the matmul_op fix).
+        // P1-3: rocBLAS batched GEMM runs on the calling thread's current device - pin to the
+        // owning ordinal or a drifted thread launches against foreign pointers (same class as the matmul_op fix).
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // One-time warm-up of the rocBLAS `gemm_strided_batched_ex` kernel.
@@ -1423,10 +1321,7 @@ impl RocmDevice {
                 ROCBLAS_GEMM_FLAGS_NONE,
             );
             // NOTE: do NOT reset the handle to the null (default) stream here.
-            // Every eager GEMM dispatch re-binds the handle to `active_stream()`
-            // before its call (P0-17 fix), so leaving the binding as-is is
-            // correct and avoids the footgun where a later GEMM that omits the
-            // set_stream would silently dispatch on the default stream.
+            // Every eager GEMM dispatch re-binds the handle to `active_stream()` before its call (P0-17 fix), so.
             if status != rocblas_status_success {
                 return Err(Error::Backend(format!(
                     "rocblas_gemm_strided_batched_ex failed with status {status}"
@@ -1457,10 +1352,8 @@ impl RocmDevice {
             })?;
             out.push(Box::new(batch_storage) as Box<dyn BackendStorage>);
         }
-        // No trailing sync: the unpacked D2D copies share the GEMM's stream,
-        // so callers that read the outputs observe completed data through
-        // stream order (or their own sync). The previous per-call drain
-        // serialized every batched QKV projection.
+        // No trailing sync: the unpacked D2D copies share the GEMM's stream, so callers that read the outputs observe completed data through stream order (or their own sync).
+        // The previous per-call drain serialized every batched QKV projection.
         Ok(out)
     }
 
@@ -1471,9 +1364,8 @@ impl RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        // WI-M1 context discipline: an async H2D enqueues on a stream bound
-        // to the calling thread's current context; pin the owning ordinal so
-        // a drifted caller cannot schedule the copy against foreign memory.
+        // WI-M1 context discipline: an async H2D enqueues on a stream bound to the calling thread's current
+        // context; pin the owning ordinal so a drifted caller cannot schedule the copy against foreign memory.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
         let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
@@ -1501,8 +1393,7 @@ impl RocmDevice {
                 res
             )));
         }
-        // Retain the pin until the next device-wide synchronize — never free a
-        // page-locked source while a stream-ordered copy may still read it.
+        // Retain the pin until the next device-wide synchronize - never free a page-locked source while a stream-ordered copy may still read it.
         // This matches the correct pattern in `upload_from_host_stream_ordered`.
         if let Ok(mut pins) = self.retained_pins.lock() {
             pins.push(pinned);
@@ -1511,31 +1402,15 @@ impl RocmDevice {
     }
 
     /// Stream-ordered f32 H2D upload that does NOT synchronize before returning.
-    ///
-    /// Pins the host data, allocates device storage, and issues `hipMemcpyAsync`
-    /// on a dedicated **transfer stream** (distinct from the compute stream the
-    /// GEMMs use). After the copy it records a reusable completion event into
-    /// [`RocmDevice::upload_event`]; [`active_stream`] fences the compute stream
-    /// on that event, so a weight prefetch enqueued here can overlap the prior
-    /// decode-step GEMM on the compute stream instead of serializing behind it
-    /// (SPEED-ROC-1). The pinned source is retained in [`RocmDevice::retained_pins`]
-    /// so it outlives the enqueue; [`synchronize`] releases every retained pin
-    /// after the device completes the copies.
-    ///
-    /// [`synchronize`]: RocmDevice::synchronize
-    /// [`active_stream`]: RocmDevice::active_stream
+    /// Pins the host data, allocates device storage, and issues `hipMemcpyAsync` on a dedicated **transfer stream**.
     pub fn upload_from_host_stream_ordered(
         &self,
         data: &[f32],
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        // WI-M1 context discipline: the async copy, the event CREATE and the
-        // event RECORD all bind to the calling thread's current context. The
-        // cached `upload_event` is reused across uploads — if the first use
-        // happened under a drifted context, every later record fails with
-        // hipErrorInvalidHandle (400). Pin the owning ordinal across the
-        // whole body so stream, event and copy all bind consistently.
+        // WI-M1 context discipline: the async copy, the event CREATE and the event RECORD all bind to the calling thread's current context.
+        // The cached `upload_event` is reused across uploads - if the first use happened under a.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
         let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
@@ -1566,9 +1441,8 @@ impl RocmDevice {
                 "hipMemcpyAsync(H2D, stream-ordered) failed with error code {status}"
             )));
         }
-        // Record a completion event on the transfer stream so the next
-        // compute-dispatch on the active stream (via `active_stream()`) can
-        // wait on it. Reuse a single event across uploads.
+        // Record a completion event on the transfer stream so the next compute-dispatch on the active stream (via `active_stream()`) can wait on it.
+        // Reuse a single event across uploads.
         let event = {
             let mut guard = self
                 .upload_event
@@ -1636,13 +1510,8 @@ impl RocmDevice {
         Ok(Box::new(storage))
     }
 
-    /// In-memory D2D transpose of a contiguous `[a, b]` f32 tensor into a fresh
-    /// `[b, a]` device buffer via `grim_transpose_2d_f32`.
-    ///
-    /// This replaces the DtoH + transpose + H2D round trip that the host
-    /// fallback performs for F32 weights on GPU: the input storage is read and
-    /// written entirely in device memory, so transposing a weight that is
-    /// already resident on the device costs no host transfer.
+    /// In-memory D2D transpose of a contiguous `[a, b]` f32 tensor into a fresh `[b, a]` device buffer via `grim_transpose_2d_f32`.
+    /// This replaces the DtoH + transpose + H2D round trip that the host fallback performs.
     pub fn transpose_f32_2d(
         &self,
         src: &dyn BackendStorage,
@@ -1683,9 +1552,8 @@ impl RocmDevice {
         Ok(Box::new(storage))
     }
 
-    /// Upload f32 data into HIP managed memory. Managed allocations remain
-    /// valid to ordinary ROCm kernels while HIP may migrate cold pages to
-    /// system RAM, providing a transparent overflow tier for large weights.
+    /// Upload f32 data into HIP managed memory.
+    /// Managed allocations remain valid to ordinary ROCm kernels while HIP may migrate cold pages to.
     pub fn from_cpu_managed(
         &self,
         data: &[f32],
@@ -1784,10 +1652,8 @@ impl RocmDevice {
 
 impl Drop for RocmDevice {
     fn drop(&mut self) {
-        // Drain any in-flight kernels on the pooled streams before recycling or
-        // freeing. Pin the device first (P1-7 discipline): hipDeviceSynchronize
-        // targets the calling thread's current device, which may not be
-        // `self.ordinal` if another device's Drop ran on this thread.
+        // Drain any in-flight kernels on the pooled streams before recycling or freeing.
+        // Pin the device first (P1-7 discipline): hipDeviceSynchronize targets the calling thread's current device, which may.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             let _ = hipDeviceSynchronize();
@@ -1913,9 +1779,7 @@ impl RocmDevice {
             return Ok(h);
         }
 
-        // Pin the calling thread's device before creating the rocBLAS handle —
-        // rocBLAS inherits whatever device is current, and a handle created on
-        // the wrong device produces silent wrong-answer GEMMs.
+        // Pin the calling thread's device before creating the rocBLAS handle - rocBLAS inherits whatever device is current, and a handle created on the wrong device produces silent wrong-answer GEMMs.
         // [P1-3 fix: DeviceGuard::set before rocblas_create_handle.]
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
@@ -1923,9 +1787,7 @@ impl RocmDevice {
             let mut h: RocblasHandle = RocblasHandle(std::ptr::null_mut());
             let mut status = rocblas_create_handle(&mut h);
             if status != rocblas_status_success {
-                // rocBLAS hipMallocs a 32-128 MiB internal workspace when the
-                // handle is created; on small-VRAM parts or under high allocator pressure,
-                // that fails with status 5 (rocblas_status_memory_error).
+                // rocBLAS hipMallocs a 32-128 MiB internal workspace when the handle is created; on small-VRAM parts or under high allocator pressure, that fails with status 5 (rocblas_status_memory_error).
                 // Drain allocator memory pool and synchronize device before retrying.
                 let _ = crate::hipDeviceSynchronize();
                 self.allocator.empty_cache();
@@ -1937,15 +1799,8 @@ impl RocmDevice {
                 return Ok(h);
             }
 
-            // Fallback: If rocBLAS workspace creation fails due to VRAM memory pressure,
-            // return a zeroed handle — our custom HIP fused GEMM kernels handle matmuls
-            // without requiring rocBLAS internal workspace allocations.
-            //
-            // IMPORTANT: callers MUST null-check the handle before use. Passing a
-            // null RocblasHandle to rocblas_gemm_ex will SIGSEGV. The existing
-            // matmul_op/matmul_with_solution call sites already guard with
-            // `!h.0.is_null()` before falling back to the WMMA/custom path.
-            // [P1-6: documented null-handle risk; existing callers already guard.]
+            // Fallback: If rocBLAS workspace creation fails due to VRAM memory pressure, return a zeroed handle - our custom HIP fused GEMM kernels handle matmuls without requiring rocBLAS internal workspace allocations.
+            // IMPORTANT: callers MUST null-check the handle before use.
             if status == 5 {
                 eprintln!(
                     "[grim-backend-rocm] rocblas_create_handle failed with memory error (status 5); \
@@ -1978,10 +1833,8 @@ impl RocmDevice {
         }
     }
 
-    /// Device-side element-wise sum of multiple F32 storages via the
-    /// `grim_all_reduce_accum` kernel. Each input must have the same shape.
-    /// The result is written into the pre-allocated `out_ptr` (a `RocmStorage`
-    /// device pointer u64). No host round-trip occurs. [see: `grim_all_reduce_accum`]
+    /// Device-side element-wise sum of multiple F32 storages via the `grim_all_reduce_accum` kernel.
+    /// Each input must have the same shape.
     pub(crate) fn device_accumulate_f32(
         &self,
         inputs: &[&dyn BackendStorage],
@@ -2027,10 +1880,7 @@ impl RocmDevice {
     }
 }
 
-
 impl grim_tensor::BackendDevice for RocmDevice {}
-
-
 
 // to `device::gemm_tuning` — see that module.
 pub use crate::device::gemm_tuning::{
@@ -2038,4 +1888,3 @@ pub use crate::device::gemm_tuning::{
 };
 
 // Re-exports that pulled up `pub use crate::graph_capture::*` etc. in [see: `pub use`]
-

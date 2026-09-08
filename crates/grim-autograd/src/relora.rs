@@ -2,11 +2,7 @@
 //! zero the adapters, and restart optimizer momentum for those parameters.
 
 /// Merge `scale * (b @ a)` into `base`, then zero `a` and `b`.
-///
-/// Shape contracts:
-/// - `a`: `[rank, in_features]` row-major.
-/// - `b`: `[out_features, rank]` row-major.
-/// - `base`: `[out_features, in_features]` row-major.
+/// Shape contracts: - `a`: `[rank, in_features]` row-major.
 pub fn merge_and_zero(
     rank: usize,
     in_features: usize,

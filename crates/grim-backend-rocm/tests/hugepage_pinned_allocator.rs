@@ -1,13 +1,13 @@
 //! Integration test for HugePagePinnedBuffer (2MB Linux HugePage Host-Pinned Allocator).
 
-use std::ffi::c_void;
-use std::panic;
 use grim_backend_rocm::{
-    check_hip, hipMemcpy, HipMemcpyKind, HugePagePinnedBuffer, RocmDevice, RocmStorage
+    HipMemcpyKind, HugePagePinnedBuffer, RocmDevice, RocmStorage, check_hip, hipMemcpy,
 };
+use grim_tensor::MemoryOps;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
-use grim_tensor::{MemoryOps};
+use std::ffi::c_void;
+use std::panic;
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -20,10 +20,18 @@ fn gpu_device() -> Option<RocmDevice> {
 #[test]
 fn test_hugepage_pinned_buffer_allocation_and_readwrite() {
     let size_bytes = 4 * 1024 * 1024; // 4MB (2 hugepages)
-    let mut buf = HugePagePinnedBuffer::new(size_bytes).expect("HugePagePinnedBuffer allocation failed");
+    let mut buf =
+        HugePagePinnedBuffer::new(size_bytes).expect("HugePagePinnedBuffer allocation failed");
 
-    assert!(buf.size() >= size_bytes, "Allocated size must be >= requested");
-    assert_eq!(buf.size() % (2 * 1024 * 1024), 0, "Buffer size must be 2MB aligned");
+    assert!(
+        buf.size() >= size_bytes,
+        "Allocated size must be >= requested"
+    );
+    assert_eq!(
+        buf.size() % (2 * 1024 * 1024),
+        0,
+        "Buffer size must be 2MB aligned"
+    );
 
     let slice = buf.as_mut_slice();
     for (i, byte) in slice.iter_mut().take(1024).enumerate() {
@@ -45,24 +53,28 @@ fn test_hugepage_pinned_buffer_gpu_dma_roundtrip() {
 
     let count = 512 * 1024; // 512k floats = 2MB
     let size_bytes = count * std::mem::size_of::<f32>();
-    let mut host_buf = HugePagePinnedBuffer::new(size_bytes).expect("allocate hugepage pinned buffer");
+    let mut host_buf =
+        HugePagePinnedBuffer::new(size_bytes).expect("allocate hugepage pinned buffer");
 
     // Write source data into hugepage host buffer
-    let host_f32: &mut [f32] = unsafe {
-        std::slice::from_raw_parts_mut(host_buf.as_mut_ptr() as *mut f32, count)
-    };
+    let host_f32: &mut [f32] =
+        unsafe { std::slice::from_raw_parts_mut(host_buf.as_mut_ptr() as *mut f32, count) };
     for (i, val) in host_f32.iter_mut().enumerate() {
         *val = (i as f32 * 0.05).sin();
     }
 
     let shape = Shape::new(vec![count]);
-    let d_storage_box = dev.alloc_storage(&shape, DType::F32).expect("alloc GPU storage");
+    let d_storage_box = dev
+        .alloc_storage(&shape, DType::F32)
+        .expect("alloc GPU storage");
     let d_storage = d_storage_box
         .as_any()
         .downcast_ref::<RocmStorage>()
         .expect("downcast to RocmStorage");
 
-    let dev_ptr = d_storage.device_ptr_checked().expect("valid device pointer") as *mut c_void;
+    let dev_ptr = d_storage
+        .device_ptr_checked()
+        .expect("valid device pointer") as *mut c_void;
 
     // 1. DMA H2D from hugepage buffer into GPU storage
     check_hip("hipMemcpy H2D", unsafe {
@@ -72,7 +84,8 @@ fn test_hugepage_pinned_buffer_gpu_dma_roundtrip() {
             size_bytes,
             HipMemcpyKind::HostToDevice,
         )
-    }).expect("H2D transfer failed");
+    })
+    .expect("H2D transfer failed");
 
     // 2. Clear host buffer to verify D2H overwrite
     for val in host_f32.iter_mut() {
@@ -87,7 +100,8 @@ fn test_hugepage_pinned_buffer_gpu_dma_roundtrip() {
             size_bytes,
             HipMemcpyKind::DeviceToHost,
         )
-    }).expect("D2H transfer failed");
+    })
+    .expect("D2H transfer failed");
 
     // 4. Verify byte-exact equality
     for (i, &val) in host_f32.iter().enumerate() {

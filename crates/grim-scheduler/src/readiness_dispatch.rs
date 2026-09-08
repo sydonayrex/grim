@@ -1,13 +1,9 @@
 //! Readiness-Driven Runtime for Pipeline-Parallel Dispatch (RRFP).
-//!
-//! Implements out-of-order readiness-driven stage scheduling based on
-//! Liu et al. (arXiv:2605.18750). Treats pipeline schedules as non-binding
-//! priority hints, dispatching ready microbatches from a `ReadySet` to absorb
-//! PCIe/interconnect communication jitter without stalling physical stages.
+//! Implements out-of-order readiness-driven stage scheduling based on Liu et al.
 
+use grim_core::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use grim_core::error::{Error, Result};
 
 /// Classification of computation and communication tasks in a pipeline stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,10 +61,11 @@ impl ReadySet {
     pub fn insert(&mut self, task: MicrobatchTask) {
         let key = (task.microbatch_id, task.kind);
         if task.is_ready() {
-            self.ready_by_kind
-                .entry(task.kind)
-                .or_default()
-                .push_back((task.microbatch_id, task.priority, task.arrival_epoch));
+            self.ready_by_kind.entry(task.kind).or_default().push_back((
+                task.microbatch_id,
+                task.priority,
+                task.arrival_epoch,
+            ));
         }
         self.all_tasks.insert(key, task);
     }
@@ -79,10 +76,11 @@ impl ReadySet {
             if task.pending_dependencies > 0 {
                 task.pending_dependencies -= 1;
                 if task.pending_dependencies == 0 {
-                    self.ready_by_kind
-                        .entry(kind)
-                        .or_default()
-                        .push_back((task.microbatch_id, task.priority, task.arrival_epoch));
+                    self.ready_by_kind.entry(kind).or_default().push_back((
+                        task.microbatch_id,
+                        task.priority,
+                        task.arrival_epoch,
+                    ));
                     return true;
                 }
             }
@@ -174,9 +172,7 @@ impl ReadinessDispatcher {
     }
 
     /// Arbitrate and select the next executable task according to the priority hint.
-    ///
-    /// If the highest-priority kind has no ready tasks, skips to the next kind
-    /// in the hint list, completely eliminating idle wait bubbles.
+    /// If the highest-priority kind has no ready tasks, skips to the next kind in the.
     pub fn arbitrate(&self) -> Option<MicrobatchTask> {
         let mut rs = self.ready_set.lock().unwrap();
 
@@ -214,18 +210,16 @@ impl ReadinessDispatcher {
     ) -> Result<Option<MicrobatchTask>> {
         // All non-None choices must agree on microbatch_id and kind
         let mut elected: Option<MicrobatchTask> = local_choice.cloned();
-        for peer in peer_choices {
-            if let Some(p) = peer {
-                if let Some(ref e) = elected {
-                    if e.microbatch_id != p.microbatch_id || e.kind != p.kind {
-                        return Err(Error::Config(format!(
-                            "TP Coordination divergence: local ({:?}, mb {}) vs peer ({:?}, mb {})",
-                            e.kind, e.microbatch_id, p.kind, p.microbatch_id
-                        )));
-                    }
-                } else {
-                    elected = Some(p.clone());
+        for p in peer_choices.iter().flatten() {
+            if let Some(ref e) = elected {
+                if e.microbatch_id != p.microbatch_id || e.kind != p.kind {
+                    return Err(Error::Config(format!(
+                        "TP Coordination divergence: local ({:?}, mb {}) vs peer ({:?}, mb {})",
+                        e.kind, e.microbatch_id, p.kind, p.microbatch_id
+                    )));
                 }
+            } else {
+                elected = Some(p.clone());
             }
         }
         Ok(elected)

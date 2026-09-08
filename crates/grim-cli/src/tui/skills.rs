@@ -1,18 +1,9 @@
 //! Skill discovery and loading for the grim TUI.
-//!
 //! Skills are directories under `~/.agents/skills/<name>/SKILL.md` (default).
-//! Each SKILL.md has YAML frontmatter (`---`) with at minimum `name` and
-//! `description` fields, followed by the skill body as markdown.
-//!
-//! When a skill is activated via `/skill <name>`, the full SKILL.md content
-//! (body only, frontmatter stripped) is injected as the system prompt so the
-//! model adopts the skill's behavioral context for the session.
 
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
 // Public types
-// ---------------------------------------------------------------------------
 
 /// A discovered skill loaded from a SKILL.md file.
 #[derive(Debug, Clone)]
@@ -27,34 +18,24 @@ pub struct Skill {
     pub path: PathBuf,
 }
 
-// ---------------------------------------------------------------------------
 // Default search root
-// ---------------------------------------------------------------------------
 
 /// Return the default skills directory: `~/.agents/skills/`.
-///
-/// Falls back to `$HOME/.agents/skills` on Unix. Returns `None` if the
-/// home directory cannot be determined.
+/// Falls back to `$HOME/.agents/skills` on Unix.
 pub fn default_skills_dir() -> Option<PathBuf> {
     // Try $HOME env var first; fall back to /home/<USER> on Linux.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("USER")
-                .ok()
-                .map(|u| PathBuf::from(format!("/home/{u}")))
-        })?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
+        std::env::var("USER")
+            .ok()
+            .map(|u| PathBuf::from(format!("/home/{u}")))
+    })?;
     Some(home.join(".agents").join("skills"))
 }
 
-// ---------------------------------------------------------------------------
 // Discovery
-// ---------------------------------------------------------------------------
 
 /// Scan `dir` for `<name>/SKILL.md` entries and parse their frontmatter.
-///
-/// Silently skips entries that are not directories, lack a SKILL.md, or have
-/// malformed frontmatter. Result is sorted alphabetically by `id`.
+/// Silently skips entries that are not directories, lack a SKILL.md, or have malformed frontmatter.
 pub fn discover_skills(dir: &Path) -> Vec<Skill> {
     let mut skills = Vec::new();
 
@@ -99,7 +80,6 @@ pub fn discover_skills(dir: &Path) -> Vec<Skill> {
 }
 
 /// Search for a skill by name (case-insensitive prefix match on `id` and `name`).
-///
 /// Returns the first match, or `None` if nothing is found.
 pub fn find_skill<'a>(skills: &'a [Skill], query: &str) -> Option<&'a Skill> {
     let q = query.trim().to_lowercase();
@@ -118,22 +98,16 @@ pub fn find_skill<'a>(skills: &'a [Skill], query: &str) -> Option<&'a Skill> {
 }
 
 /// Read a skill's SKILL.md and return the body (frontmatter stripped).
-///
 /// The body is everything after the closing `---` of the frontmatter block.
-/// If there is no frontmatter, the entire file is returned as-is.
 pub fn load_skill_body(skill: &Skill) -> std::io::Result<String> {
     let content = std::fs::read_to_string(&skill.path)?;
     Ok(strip_frontmatter(&content).to_string())
 }
 
-// ---------------------------------------------------------------------------
 // Frontmatter helpers
-// ---------------------------------------------------------------------------
 
 /// Parse YAML frontmatter for `name` and `description` fields.
-///
-/// Returns `(name, description)` with the directory id as fallback for name
-/// and an empty string as fallback for description.
+/// Returns `(name, description)` with the directory id as fallback for name and an empty string.
 fn parse_frontmatter(content: &str) -> (String, String) {
     // Frontmatter must start with `---` on the very first line.
     if !content.starts_with("---") {
@@ -150,8 +124,8 @@ fn parse_frontmatter(content: &str) -> (String, String) {
     let mut desc_lines: Vec<String> = Vec::new();
 
     for line in fm.lines() {
-        if line.starts_with("name:") {
-            name = line["name:".len()..].trim().to_string();
+        if let Some(stripped) = line.strip_prefix("name:") {
+            name = stripped.trim().to_string();
             // Strip surrounding quotes if present.
             if (name.starts_with('"') && name.ends_with('"'))
                 || (name.starts_with('\'') && name.ends_with('\''))
@@ -159,8 +133,8 @@ fn parse_frontmatter(content: &str) -> (String, String) {
                 name = name[1..name.len() - 1].to_string();
             }
             in_description_block = false;
-        } else if line.starts_with("description:") {
-            let inline = line["description:".len()..].trim();
+        } else if let Some(stripped) = line.strip_prefix("description:") {
+            let inline = stripped.trim();
             if inline == ">" || inline == "|" {
                 // Multi-line block scalar — collect subsequent indented lines.
                 in_description_block = true;
@@ -190,7 +164,6 @@ fn parse_frontmatter(content: &str) -> (String, String) {
 }
 
 /// Return the content of `raw` with YAML frontmatter removed.
-///
 /// Strips the opening and closing `---` fences and everything between them.
 fn strip_frontmatter(raw: &str) -> &str {
     if !raw.starts_with("---") {
@@ -215,9 +188,7 @@ fn strip_frontmatter(raw: &str) -> &str {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -267,9 +238,18 @@ mod tests {
                 path: PathBuf::from("/fake/rust-review/SKILL.md"),
             },
         ];
-        assert_eq!(find_skill(&skills, "caveman").map(|s| &s.id[..]), Some("caveman"));
-        assert_eq!(find_skill(&skills, "cav").map(|s| &s.id[..]), Some("caveman"));
-        assert_eq!(find_skill(&skills, "rust").map(|s| &s.id[..]), Some("rust-review"));
+        assert_eq!(
+            find_skill(&skills, "caveman").map(|s| &s.id[..]),
+            Some("caveman")
+        );
+        assert_eq!(
+            find_skill(&skills, "cav").map(|s| &s.id[..]),
+            Some("caveman")
+        );
+        assert_eq!(
+            find_skill(&skills, "rust").map(|s| &s.id[..]),
+            Some("rust-review")
+        );
         assert!(find_skill(&skills, "xyz").is_none());
     }
 }

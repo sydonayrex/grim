@@ -1,7 +1,5 @@
 //! Distributed lookup client with Bloom filter pre-filtering.
-//!
-//! Queries local bloom filter summaries of remote peer KV cache tables before
-//! issuing network requests, avoiding expensive TCP round-trips for prefix misses.
+//! Queries local bloom filter summaries of remote peer KV cache tables before issuing network requests,.
 
 use crate::bloom::BloomFilter;
 use grim_kvtransport::NetworkKvClient;

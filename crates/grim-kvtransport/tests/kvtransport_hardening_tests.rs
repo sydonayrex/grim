@@ -10,8 +10,8 @@
 //! 9. Clock monotonic safety in PinLeaseMonitor.
 
 use grim_kvtransport::{
-    bitmask_index::BitmaskChunkIndex, compute_checksum, pin_lease::PinLeaseMonitor, CacheTier,
-    EmbeddingSpillManager, KvBlockHeader, LocalSpillManager, NvmeWeightStreamer,
+    CacheTier, EmbeddingSpillManager, KvBlockHeader, LocalSpillManager, NvmeWeightStreamer,
+    bitmask_index::BitmaskChunkIndex, compute_checksum, pin_lease::PinLeaseMonitor,
 };
 use std::time::Duration;
 use tempfile::tempdir;
@@ -28,7 +28,10 @@ fn test_nvme_file_cleaned_up_on_retrieve() {
     // Demote to NVMe
     manager.demote_to_nvme(1).unwrap();
     let expected_file = tmp.path().join("kv_block_1.bin");
-    assert!(expected_file.exists(), "NVMe spill file should exist on disk");
+    assert!(
+        expected_file.exists(),
+        "NVMe spill file should exist on disk"
+    );
     assert_eq!(manager.get_tier(1), Some(CacheTier::NvMe));
 
     // Retrieve promotes back to Host RAM and deletes file
@@ -38,7 +41,10 @@ fn test_nvme_file_cleaned_up_on_retrieve() {
     assert_eq!(ret_k, k);
     assert_eq!(ret_v, v);
     assert_eq!(manager.get_tier(1), Some(CacheTier::HostRam));
-    assert!(!expected_file.exists(), "NVMe file should be deleted after promotion");
+    assert!(
+        !expected_file.exists(),
+        "NVMe file should be deleted after promotion"
+    );
 }
 
 #[test]
@@ -50,7 +56,10 @@ fn test_nan_payload_checksum_exactness() {
 
     let c1 = compute_checksum(&k, &v);
     let c2 = compute_checksum(&k, &v);
-    assert_eq!(c1, c2, "Checksums must be deterministic for identical NaN bit representations");
+    assert_eq!(
+        c1, c2,
+        "Checksums must be deterministic for identical NaN bit representations"
+    );
 
     // Serialize and deserialize roundtrip
     let header = KvBlockHeader {
@@ -73,7 +82,10 @@ fn test_all_zeros_kv_block_checksum() {
     let k = vec![0.0f32; 128];
     let v = vec![0.0f32; 128];
     let c = compute_checksum(&k, &v);
-    assert_ne!(c, 0, "Checksum of all-zeros block should produce non-zero FNV hash");
+    assert_ne!(
+        c, 0,
+        "Checksum of all-zeros block should produce non-zero FNV hash"
+    );
 }
 
 #[test]
@@ -115,14 +127,20 @@ fn test_bitmask_chunk_index_distinct_nvme_tiers() {
     assert!(!e1.tier_mask.has_tier(CacheTier::NvMeWeightStream));
 
     let e2 = index.lookup(hash2).unwrap();
-    assert_eq!(e2.tier_mask.highest_tier(), Some(CacheTier::NvMeWeightStream));
+    assert_eq!(
+        e2.tier_mask.highest_tier(),
+        Some(CacheTier::NvMeWeightStream)
+    );
     assert!(e2.tier_mask.has_tier(CacheTier::NvMeWeightStream));
     assert!(!e2.tier_mask.has_tier(CacheTier::NvMe));
 
     // Update chunk tier
     index.update_chunk_tier(hash1, CacheTier::NvMe, CacheTier::HostRam);
     let e1_updated = index.lookup(hash1).unwrap();
-    assert_eq!(e1_updated.tier_mask.highest_tier(), Some(CacheTier::HostRam));
+    assert_eq!(
+        e1_updated.tier_mask.highest_tier(),
+        Some(CacheTier::HostRam)
+    );
     assert!(!e1_updated.tier_mask.has_tier(CacheTier::NvMe));
 }
 

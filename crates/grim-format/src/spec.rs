@@ -1,28 +1,11 @@
 //! Per-tensor capability descriptors for the `.grim` spec.
-//!
-//! The on-disk wire format stays at version 1 (`GRIM\x01`, fixed header +
-//! JSON metadata + tensor registry). All advanced capabilities from the
-//! spec (per-row scales, mixed-bitwidth rows, two-level residual backups,
-//! GPTQ ordering, outlier compression, fusion mask, optional payload
-//! compression) ride the JSON metadata layer as declarations on a
-//! per-tensor extension struct. Backends read these declarations to pick
-//! dequant kernels; the bytes on disk never change.
-//!
-//! Field naming and enum values track `docs/grim-file.md` decisions
-//! D2–D15. Each field defaults to its legacy meaning when zeroed so a
-//! reader that ignores the extension struct behaves exactly like a plain
-//! V1 reader.
+//! The on-disk wire format stays at version 1 (`GRIM\x01`, fixed header + JSON metadata +.
 
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// Enums — kept small and explicit so the on-JSON representation is stable.
-// ---------------------------------------------------------------------------
+// Enums - kept small and explicit so the on-JSON representation is stable.
 
 /// Per-row scale dtype. Spec D2 + D15.
-///
-/// `U8` is the default symmetric mode; `F16` is reserved for a future
-/// asymmetric-quant fallback. `Fp8` is the FP8 block scale mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowScaleDtype {
     /// Symmetric u8 scale (default).
@@ -48,10 +31,7 @@ impl RowScaleDtype {
 }
 
 /// Activation quantization dtype (P3-WI-2 / WI-R5 enabler).
-///
-/// Records which numeric format the *activations* (not weights) are
-/// quantized to when this tensor participates in a fused GEMM.  A value
-/// of `None` means no activation quantization — the legacy inference path.
+/// Records which numeric format the *activations* (not weights) are quantized to when this tensor participates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActQuantDtype {
     /// No activation quantization (default, legacy).
@@ -77,10 +57,7 @@ impl ActQuantDtype {
 }
 
 /// Scale layout for activation quantization (P3-WI-2 / WI-R5 enabler).
-///
-/// Tells the kernel where to find the activation scale factors:
-/// per-tensor (one global f32) or per-token (one f32 per sequence position).
-/// `None` means no activation scale is stored alongside this tensor.
+/// Tells the kernel where to find the activation scale factors: per-tensor (one global f32) or.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActScaleLayout {
     /// No activation scale (default, legacy).
@@ -106,10 +83,6 @@ impl ActScaleLayout {
 }
 
 /// Per-row bitwidth assignment mode. Spec D3 + Phase 3.
-///
-/// `Uniform` is the legacy whole-tensor mode: every row uses
-/// `default_bpw` bits. `PerRowTable` reads per-row bitwidths from a
-/// `[u8; row_count]` table stored at `bpw_table_offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerRowBpwMode {
     /// Whole-tensor uniform bitwidth at `default_bpw`.
@@ -132,11 +105,6 @@ impl PerRowBpwMode {
 }
 
 /// Outlier index encoding. Spec D6 + Phase 5.
-///
-/// `FlatU32` is the legacy 6-byte record (`u32 index | f16 value`) that
-/// matches `crate::format::GrimOutlier`. `DeltaVarint` is the compressed
-/// path from Phase 5: delta-varint sorted indices plus delta-u8 residual
-/// values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutlierIndexEncoding {
     /// Legacy flat u32 index + f16 value (6 bytes/outlier).
@@ -181,20 +149,13 @@ impl PayloadCompression {
 }
 
 /// Kernel-side layout hint. Spec field `layout_hint`.
-///
-/// Numeric tags are assigned via [`LayoutHintTag::as_u8`] /
-/// [`LayoutHintTag::from_u8`] (not `#[repr(u8)]`, because the `PackedQuantWmma`
-/// variant carries data). Tag values: `Default=0`, `WavefrontTiled=1`,
-/// `BlockSparse=2`, `PackedQuantWmma=3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutHintTag {
     Default,
     WavefrontTiled,
     BlockSparse,
-    /// WI-R7: packed low-bit, matrix-fragment-aligned layout for the WMMA
-    /// GEMM path (WI-G). Tells the kernel "this tensor is N-bit packed for
-    /// WMMA" so it can dispatch without re-deriving strides. RDNA3/RDNA4
-    /// only (gfx110x/gfx1200); does not touch CDNA/MFMA.
+    /// WI-R7: packed low-bit, matrix-fragment-aligned layout for the WMMA GEMM path (WI-G).
+    /// Tells the kernel "this tensor is N-bit packed for WMMA" so it can dispatch without.
     PackedQuantWmma {
         bits: u8,
         frag_m: u8,
@@ -227,10 +188,6 @@ impl LayoutHintTag {
 }
 
 /// One backup (residual) layer descriptor. Spec D4 + D5 + Phase 4.
-///
-/// Up to two of these attach per tensor. Each describes an additive
-/// correction stream packed at `bpw` bits with its own per-row u8 scale
-/// region.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BackupLayer {
     /// Offset of the packed backup codes inside the payload region,
@@ -278,35 +235,13 @@ impl BackupLayer {
 }
 
 /// Four-word opaque kernel dispatch hint. Spec field `layout_descriptor`.
-///
-/// The reader does not interpret these; they are passed through to the
-/// backend kernel verbatim. Defaults to all zeros (= "let the kernel
-/// decide").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LayoutDescriptor(pub [u32; 4]);
 
-// ---------------------------------------------------------------------------
-// GrimTensorExt — per-tensor capability declaration
-// ---------------------------------------------------------------------------
+// GrimTensorExt - per-tensor capability declaration
 
-/// Per-tensor capability extension.
-///
-/// One of these attaches to each tensor in the file via the JSON metadata
-/// key `grim.ext.entries` (an array indexed by tensor name in
-/// `tensor_name`). Every field defaults to its legacy meaning when zeroed,
-/// so a reader that never reads extensions sees a plain version-1 file.
-///
-/// Field set covers spec Phases 2–7:
-/// - Phase 2 per-row scales: `row_count`, `row_stride`, `block_size`,
-///   `scale_offset`, `scale_size`, `row_scale_dtype`
-/// - Phase 3 per-row mixed bitwidth: `per_row_bpw_mode`, `default_bpw`,
-///   `bpw_table_offset`, `bpw_table_count`, `own_bpw_table`
-/// - Phase 4 backups + GPTQ ordering: `backup1`, `backup2`, `gptq_ordered`
-/// - Phase 5 outlier compression: `outlier_index_encoding`,
-///   `outlier_residual_bpw`
-/// - Phase 6 payload compression: `compression`
-/// - Phase 7 fusion dispatch: `fusion_mask`, `layout_hint`,
-///   `layout_descriptor`
+/// Per-tensor capability extension. One of these attaches to each tensor in the file
+/// via the JSON metadata key `grim.ext.entries` (an array indexed by tensor name in `tensor_name`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrimTensorExt {
     /// Tensor name this extension applies to. Matches the V1 registry
@@ -336,9 +271,8 @@ pub struct GrimTensorExt {
     /// Size of the per-row scale bytes.
     pub scale_size: u64,
 
-    /// 1 if the codes were quantized through GPTQ with inverse-Hessian
-    /// ordering. Kernels apply `gptq_inv_r` to backups only when this is
-    /// set; spec D8 + Q3.
+    /// 1 if the codes were quantized through GPTQ with inverse-Hessian ordering.
+    /// Kernels apply `gptq_inv_r` to backups only when this is set; spec D8 + Q3.
     pub gptq_ordered: u8,
 
     /// Outlier index/value encoding.
@@ -361,14 +295,11 @@ pub struct GrimTensorExt {
     pub backup1: BackupLayer,
     pub backup2: BackupLayer,
 
-    // --- SpQR sparse residuals (P5 Task 5.1) ---
-    /// Sparse indices for the SpQR sidecar, stored as a flat u32
-    /// array. Length = nnz (number of non-zero elements). The indices
-    /// encode positions into the tensor's flat payload.
+    // --- SpQR sparse residuals (P5 Task 5.1) --- Sparse indices for the SpQR sidecar, stored as a flat u32 array.
+    // Length = nnz (number of non-zero elements).
     pub spqr_indices: Vec<u32>,
     /// Sparse values corresponding to each index in `spqr_indices`.
-    /// Uses f32 for full precision; quantized to f16 only if
-    /// the storage backend requires it.
+    /// Uses f32 for full precision; quantized to f16 only if the storage backend requires it.
     pub spqr_values: Vec<f32>,
 
     // --- P3-WI-2: activation-quant metadata (WI-R5 enabler) ---
@@ -383,13 +314,8 @@ pub struct GrimTensorExt {
 pub const FUSION_MASK_RMSNORM_MATMUL: u8 = 0b01;
 pub const FUSION_MASK_QKV_ATTENTION: u8 = 0b10;
 
-/// Translate a list of `GrimFusionOp`s into the spec's `fusion_mask`
-/// bitfield (Phase 7.1).
-///
-/// - `RmsNormMatMul` → bit0
-/// - `QkvAttention` → bit1
-///
-/// Unknown ops are ignored. Duplicate ops OR into the same bit (idempotent).
+/// Translate a list of `GrimFusionOp`s into the spec's `fusion_mask` bitfield (Phase 7.1).
+/// - `RmsNormMatMul` → bit0 - `QkvAttention` → bit1 Unknown ops are ignored.
 pub fn fusion_mask_from_ops(ops: &[crate::gguf::GrimFusionOp]) -> u8 {
     let mut mask = 0u8;
     for op in ops {
@@ -432,9 +358,8 @@ impl Default for GrimTensorExt {
 }
 
 impl GrimTensorExt {
-    /// Convenience: does this tensor declare anything beyond the legacy
-    /// version-1 surface? A reader can use this to short-circuit the
-    /// extension lookup table for plain tensors.
+    /// Convenience: does this tensor declare anything beyond the legacy version-1 surface?
+    /// A reader can use this to short-circuit the extension lookup table for plain tensors.
     pub fn is_legacy(&self) -> bool {
         self.block_size == 0
             && self.per_row_bpw_mode == PerRowBpwMode::Uniform
@@ -601,24 +526,10 @@ impl GrimTensorExt {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Delta-varint outlier codec (spec D6 + Phase 5.2/5.3)
-// ---------------------------------------------------------------------------
 
-/// Encode a sorted slice of `(index, value)` outliers using the spec's
-/// delta-varint + delta-u8 residual encoding.
-///
-/// Layout:
-/// ```text
-/// [ value_dtype : u8 ]                    // 0 = u8 residual, 1 = f16 raw
-/// [ count_varint ]                        // number of records
-/// [ delta_varint(idx_0) | delta_varint(idx_i - idx_{i-1}) | ... ]
-/// [ delta_value_0 | delta_value_1 | ... ] // u8 if dtype=0, else f16
-/// ```
-///
-/// Indices MUST be sorted ascending. The leading `count_varint` lets the
-/// decoder know where the index region ends and the value region begins
-/// without an out-of-band length.
+/// Encode a sorted slice of `(index, value)` outliers using the spec's delta-varint + delta-u8 residual encoding.
+/// Layout: ```text [ value_dtype : u8 ] // 0 = u8 residual, 1 = f16.
 pub fn encode_outliers_delta_varint(outliers: &[(u32, f32)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(outliers.len() * 2 + 8);
 
@@ -635,16 +546,8 @@ pub fn encode_outliers_delta_varint(outliers: &[(u32, f32)]) -> Vec<u8> {
         prev_idx = cur;
     }
 
-    // Delta-u8 values: each value is the residual between consecutive
-    // dequant-base reconstructions. We don't have the base here, so we
-    // emit the raw value quantized to u8 in [-128, 127] when it fits,
-    // falling back to clamping. The reader reconstructs by adding the
-    // delta to the running reconstruction.
-    //
-    // The encoder must track the *quantized* reconstruction (`prev_val +=
-    // clamped`), not the true previous value. That keeps encoder and decoder
-    // accumulating the same quantity, so quantization error stays bounded
-    // (≤0.5 per value) instead of compounding across the stream.
+    // Delta-u8 values: each value is the residual between consecutive dequant-base reconstructions.
+    // We don't have the base here, so we emit the raw value quantized to u8.
     let mut prev_val: f32 = 0.0;
     for (_, value) in outliers.iter() {
         let delta = value - prev_val;
@@ -657,7 +560,6 @@ pub fn encode_outliers_delta_varint(outliers: &[(u32, f32)]) -> Vec<u8> {
 }
 
 /// Decode a buffer produced by [`encode_outliers_delta_varint`].
-///
 /// Returns the reconstructed `(index, value)` pairs and the number of bytes consumed.
 pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<(Vec<(u32, f32)>, usize), String> {
     if buf.is_empty() {
@@ -735,19 +637,10 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), String> {
     Err("truncated varint".into())
 }
 
-// ---------------------------------------------------------------------------
-// KvCacheLayout — on-disk KV-cache metadata schema (P3-WI-1)
-// ---------------------------------------------------------------------------
+// KvCacheLayout - on-disk KV-cache metadata schema (P3-WI-1)
 
 /// On-disk KV-cache layout descriptor (WI-R4 / P3-WI-1).
-///
-/// Stored as optional `grim.kv_cache` JSON in the `.grim` file's metadata
-/// region. When absent, the reader behaves exactly as a plain weight-only
-/// file (backward compatible). When present, a resumed session can
-/// reconstruct the compressed KV cache without re-compressing.
-///
-/// Field naming tracks the plan: `kv_rotated`, `kv_bits_k/v`,
-/// `kv_eviction_map_offset`, `kv_sink_fp16`.
+/// Stored as optional `grim.kv_cache` JSON in the `.grim` file's metadata region.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCacheLayout {
     /// `true` if the KV keys were random-orthogonal-rotated before
@@ -798,9 +691,7 @@ impl KvCacheLayout {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -886,12 +777,8 @@ mod tests {
         assert!(!restored.is_legacy());
     }
 
-    /// Phase 5: outlier delta-varint codec round-trips a multi-record
-    /// sequence including a contiguous run (where delta compression wins).
-    ///
-    /// Since the encoder feeds quantized deltas back into `prev_val`, the
-    /// reconstruction is the *encoder's* reconstruction, so integer test
-    /// values round-trip exactly (no drift).
+    /// Phase 5: outlier delta-varint codec round-trips a multi-record sequence including a contiguous run (where delta compression wins).
+    /// Since the encoder feeds quantized deltas back into `prev_val`, the reconstruction is the *encoder's* reconstruction,.
     #[test]
     fn outlier_delta_varint_round_trips() {
         let outliers = vec![(5u32, 1.0f32), (10, 2.0), (11, 3.0), (12, 4.0)];
@@ -904,11 +791,8 @@ mod tests {
         }
     }
 
-    /// Phase 5: fractional values stay within the per-value quantization
-    /// bound (±0.5) instead of compounding. The old encoder (which tracked
-    /// the *true* previous value) drifted unboundedly on a monotone 1.5-step
-    /// sequence — by the 6th record the error reached 3.0. The fixed encoder
-    /// keeps every error ≤ 0.5.
+    /// Phase 5: fractional values stay within the per-value quantization bound (±0.5) instead of compounding.
+    /// The old encoder (which tracked the *true* previous value) drifted unboundedly on a monotone 1.5-step.
     #[test]
     fn outlier_delta_varint_fractional_drift_is_bounded() {
         let outliers: Vec<(u32, f32)> = (0..12)

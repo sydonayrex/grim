@@ -1,24 +1,5 @@
 //! Fused KV-dequantized attention HIP kernel (WI-R5).
-//!
-//! WRECK-5: added KvQuantFormat-based dequant paths for Q8_0 block-quantized
-//! and Q4K super-block-quantized KV caches. Legacy quant_bits paths (4=nibble,
-//! 8=int8) are preserved for backward compatibility; the new paths are gated by
-//! the `quant_format` kernel argument (0=Fp16, 1=Q8_0, 2=Q4K).
-//!
-//! Layout (WRECK-5):
-//! - Fp16: row-major fp16, row bytes = head_dim * 2.
-//! - Q8_0: row-major, each row is ceil(head_dim/32) Q8_0 blocks (34 bytes each:
-//!   2-byte fp16 delta + 32× int8 codes). Per-block scale is the fp16 delta,
-//!   not a separate k_scales entry; k_scales[] is unused for Q8_0 (backward-compat
-//!   stub, kept for signature stability).
-//! - Q4K: row-major, each row is ceil(head_dim/256) Q4K super-blocks (144 bytes
-//!   each: 2-byte fp16 d + 2-byte fp16 min + 12-byte packed scales + 128 bytes
-//!   nibbles). Per-super-block scale is the d/min/scales embedded in the block;
-//!   k_scales[] is unused for Q4K (backward-compat stub).
-//!
-//! Device helpers: `fp16_to_float_device` (software fp16→f32, no HIP fp16 header
-//! dependency) and `dequant_q4k_element` (Q4K super-block element dequant, mirrors
-//! `kernels::q4k_dequant::dequant_q4k_grim_element`).
+//! WRECK-5: added KvQuantFormat-based dequant paths for Q8_0 block-quantized and Q4K super-block-quantized KV caches.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" __global__ __launch_bounds__(256)
@@ -83,16 +64,11 @@ void grim_kv_dequant_attention(
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
-    // ---- WRECK-5 device helpers: fp16→f32 + Q4K element dequant ----
-    // fp16_to_float_device: software conversion, no HIP fp16 header dependency.
+    // ---- WRECK-5 device helpers: fp16→f32 + Q4K element dequant ---- fp16_to_float_device: software conversion, no HIP fp16 header dependency.
     // Handles normal, subnormal, zero, inf, nan.
-    // dequant_q4k_element: Q4K super-block (144 bytes, 256 elements) element dequant.
-    // Formula: d * sc * q - min * m (mirrors kernels::q4k_dequant::dequant_q4k_grim_element).
 
-    // ---- WRECK-5 pre-compute row byte strides for each quant_format ----
-    // Fp16: row_bytes = head_dim * 2.
-    // Q8_0: row_bytes = ceil(head_dim/32) * 34  (34 = 2 fp16 delta + 32 int8 codes).
-    // Q4K: row_bytes = ceil(head_dim/256) * 144 (144 = 2 d + 2 min + 12 scales + 128 nibbles).
+    // ---- WRECK-5 pre-compute row byte strides for each quant_format ---- Fp16: row_bytes = head_dim * 2.
+    // Q8_0: row_bytes = ceil(head_dim/32) * 34 (34 = 2 fp16 delta + 32 int8 codes).
     const int row_bytes_fp16 = head_dim * 2;
     const int row_bytes_q8_0 = ((head_dim + 31) / 32) * 34;
     const int row_bytes_q4k = ((head_dim + 255) / 256) * 144;
@@ -513,9 +489,8 @@ mod tests {
 
     #[test]
     fn kv_dequant_attention_source_pins_the_q4k_min_byte() {
-        // ggml get_scale_min_k4 ("q[j-0]"): m's top 2 bits come from
-        // scales[s] itself. The K and V dequant blocks each embed the
-        // formula; both must use scales[s], never scales[s-4].
+        // ggml get_scale_min_k4 ("q[j-0]"): m's top 2 bits come from scales[s] itself.
+        // The K and V dequant blocks each embed the formula; both must use scales[s], never.
         let good = KERNEL_SOURCE
             .matches("m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);")
             .count();

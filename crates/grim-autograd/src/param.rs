@@ -1,24 +1,13 @@
 //! Trainable parameter types and identifiers (WI-T1 item 4).
-//!
 //! Gradient accumulation buffers for `A`/`B` per adapter, per layer.
 
 use crate::injection::LoRAInjectionPoint;
-use grim_tensor::{DType, Tensor, error::Result,
-    CoreTensorOps,
-};
+use grim_tensor::{CoreTensorOps, DType, Tensor, error::Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Unique identifier for a trainable parameter (adapter A or B matrix).
-///
-/// `(layer_idx, adapter_id, point, is_a)` — four coordinate fields so a single
-/// hash lookup resolves any adapter's gradient buffer anywhere in the model.
-/// `point` is required because a single (layer, adapter) pair owns a *distinct*
-/// A/B matrix per injection point (Q/K/V/O/Gate/Up/Down): without it, all
-/// seven points in a layer collide on the same `ParamId` and the
-/// `TrainableParams` map collapses 14 distinct adapters into 2 overwriting
-/// entries (last writer wins), which is both a silent shape bug and a silent
-/// gradient-mixing bug.
+/// `(layer_idx, adapter_id, point, is_a)` - four coordinate fields so a single hash lookup resolves any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ParamId {
     pub layer_idx: usize,
@@ -66,13 +55,7 @@ impl ParamId {
 }
 
 /// A trainable parameter tensor paired with its gradient accumulator.
-///
-/// `data` is the live parameter value mutated by the optimizer (WI-T4);
-/// `grad` is the accumulated gradient written by `backward` (WI-T1) and
-/// zeroed at the start of each step. When `frozen == true`, the parameter is
-/// tracked (so it stays on the tape for downstream gradients) but `accumulate_grad`
-/// is a no-op and optimizers skip it — the frozen-base QLoRA mechanism where
-/// base weights are registered in `TrainableParams` but never updated.
+/// `data` is the live parameter value mutated by the optimizer (WI-T4); `grad` is the accumulated.
 #[derive(Debug, Clone)]
 pub struct TrainableParam {
     pub id: ParamId,
@@ -202,11 +185,7 @@ impl TrainableParams {
     }
 
     /// Clip gradient norm in-place across all non-frozen parameters.
-    ///
-    /// Computes the global L2 norm of all gradients, and if it exceeds
-    /// `max_norm`, scales every gradient by `max_norm / total_norm`.
-    /// This is the standard gradient clipping operation used in LLM training
-    /// to prevent gradient explosions.
+    /// Computes the global L2 norm of all gradients, and if it exceeds `max_norm`, scales every.
     pub fn clip_grad_norm(&mut self, max_norm: f32) {
         let mut total_norm_sq = 0.0f32;
         for param in self.params.values() {
@@ -246,9 +225,8 @@ impl TrainableParams {
         }
     }
 
-    /// Deterministic checksum of live adapter values for cross-rank
-    /// consistency checks. Parameter IDs are sorted so HashMap iteration order
-    /// cannot affect the result.
+    /// Deterministic checksum of live adapter values for cross-rank consistency checks.
+    /// Parameter IDs are sorted so HashMap iteration order cannot affect the result.
     pub fn weight_checksum(&self) -> Result<u64> {
         let mut ids: Vec<ParamId> = self.params.keys().copied().collect();
         ids.sort_by_key(|id| (id.layer_idx, id.adapter_id, id.point as u8, id.is_a));
@@ -274,12 +252,7 @@ impl TrainableParams {
     }
 
     /// Reduce this rank's gradients with an explicit contribution weight.
-    ///
-    /// For equal batches, callers should use [`Self::all_reduce_grads`]. For
-    /// asymmetric data-parallel batches, each rank passes
-    /// `local_examples / global_examples`; the RCCL sum then directly yields
-    /// the global-batch-weighted gradient. Dividing by rank count is wrong in
-    /// that case because it weights a small rank the same as a large rank.
+    /// For equal batches, callers should use [`Self::all_reduce_grads`].
     pub fn all_reduce_grads_weighted(
         &mut self,
         dev: &dyn grim_tensor::backend::BackendDevice,
@@ -300,9 +273,8 @@ impl TrainableParams {
             ));
         }
 
-        // ── Fast path: RCCL device-pointer all-reduce ─────────────────────
-        // When an RcclAllReduce handle is provided and we have >1 GPU, reduce
-        // gradients on-device via ncclAllReduce to avoid the D2H round-trip.
+        // ── Fast path: RCCL device-pointer all-reduce ───────────────────── When an RcclAllReduce handle is provided and
+        // we have >1 GPU, reduce gradients on-device via ncclAllReduce to avoid the D2H round-trip.
         if let Some(rccl_handle) = rccl {
             if num_gpus > 1 {
                 for param in self.params.values_mut() {
@@ -310,9 +282,8 @@ impl TrainableParams {
                     let count = param.grad.shape().elem_count();
 
                     if let Some(ptr) = dev_ptr {
-                        // Weight the local contribution before the collective;
-                        // the all-reduce sum is then already a global weighted
-                        // average and must not be divided by rank count again.
+                        // Weight the local contribution before the collective; the all-reduce sum is then already
+                        // a global weighted average and must not be divided by rank count again.
                         if (contribution_weight - 1.0).abs() > f32::EPSILON {
                             let (weighted_storage, handle) = dev.mul_scalar(
                                 param.grad.storage().as_ref(),
@@ -328,22 +299,15 @@ impl TrainableParams {
                                 param.grad.device().clone(),
                             );
                         }
-                        // In-place device-pointer all-reduce: send and recv
-                        // alias the same buffer so ncclAllReduce reduces into
-                        // the gradient tensor directly.
+                        // In-place device-pointer all-reduce: send and recv alias the same
+                        // buffer so ncclAllReduce reduces into the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
-                        // ordinal: the gradient tensor's owning device. The old
-                        // code hardcoded rank 0 — on a non-zero rank the
-                        // collective would run on the WRONG GPU, silently
-                        // reducing/writing grads on a device that isn't this
-                        // rank's (the same class the scythe context-pinning
-                        // discipline exists to prevent).
+                        // ordinal: the gradient tensor's owning device.
+                        // The old code hardcoded rank 0 - on a non-zero rank the collective would run.
                         let ordinal = param.grad.device().ordinal().unwrap_or(0);
                         rccl_handle.sum_gradients_device(ptr, ptr, count, stream, ordinal)?;
-                        // Synchronize after the all-reduce on the default stream —
-                        // without this, param.grad may be read before the NCCL
-                        // collective has finished writing it. [P1-15 fix.]
-                        // Downcast through storage rather than Device (Device has no as_any).
+                        // Synchronize after the all-reduce on the default stream - without this, param.grad may be read before the NCCL collective has finished writing it.
+                        // [P1-15 fix.] Downcast through storage rather than Device (Device has no as_any).
                         if let Some(_rocm) = param
                             .grad
                             .storage()
@@ -370,9 +334,8 @@ impl TrainableParams {
             }
         }
 
-        // ── Single-rank accumulation only ─────────────────────────────────
-        // A host accumulation is not a multi-rank reduction. Multi-rank calls
-        // were rejected above so this path cannot silently diverge replicas.
+        // ── Single-rank accumulation only ───────────────────────────────── A host accumulation is not a multi-rank reduction.
+        // Multi-rank calls were rejected above so this path cannot silently diverge replicas.
         if (contribution_weight - 1.0).abs() < 1e-6 {
             // Single-GPU identity: gradient is already exact; do not double-accumulate.
             return Ok(());
@@ -680,7 +643,8 @@ mod tests {
         let mut tp = TrainableParam::new(pid, tensor(vec![1.0, 2.0], vec![2])).unwrap();
         // Simulate accumulating 4 micro-batches of gradient [1.0, 2.0]
         for _ in 0..4 {
-            tp.accumulate_grad(&tensor(vec![1.0, 2.0], vec![2])).unwrap();
+            tp.accumulate_grad(&tensor(vec![1.0, 2.0], vec![2]))
+                .unwrap();
         }
         params.insert(tp);
         assert_eq!(

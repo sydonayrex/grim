@@ -26,10 +26,7 @@ use grim_quant::{dequant_mxfp4, dequant_nvfp4, reframe_nvfp4_to_mxfp4};
 /// legitimate rounding should ever require a loose bound).
 fn assert_close(got: f32, want: f32, ctx: &str) {
     let diff = (got - want).abs();
-    assert!(
-        diff < 1e-4,
-        "{ctx}: got {got}, want {want} (diff {diff})"
-    );
+    assert!(diff < 1e-4, "{ctx}: got {got}, want {want} (diff {diff})");
 }
 
 /// Independent oracle for the OCP E2M1 codebook, transcribed directly from

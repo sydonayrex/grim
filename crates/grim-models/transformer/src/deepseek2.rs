@@ -1,8 +1,5 @@
 //! DeepSeek V2 architecture with Multi-Head Latent Attention (MLA) and Mixture of Experts (MoE).
-//!
-//! # Architecture Details
-//! - **Multi-Head Latent Attention (MLA)**: Compresses KV cache into low-rank latent representations with `kv_a_proj_with_mqa` and `kv_a_layernorm`, then expands to decoupled non-rotary and rotary components (`qk_nope_head_dim: 128`, `qk_rope_head_dim: 64`).
-//! - **DeepSeek MoE**: Top-k routed experts combined with dedicated shared experts (`first_k_dense_replace: 1` dense base layers).
+//! # Architecture Details - **Multi-Head Latent Attention (MLA)**: Compresses KV cache into low-rank latent representations.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -12,9 +9,7 @@ use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, DType, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for DeepSeek V2 model architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,9 +77,7 @@ impl ModelConfig for DeepSeek2Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // GPU fallback guard
-// ---------------------------------------------------------------------------
 
 /// `Ok(None)` marks "backend lacks the kernel — use the host fallback";
 /// other errors are real failures and propagate.
@@ -96,9 +89,7 @@ fn or_host_fallback<T>(r: std::result::Result<T, grim_tensor::Error>) -> Result<
     }
 }
 
-// ---------------------------------------------------------------------------
 // MLA Attention Block
-// ---------------------------------------------------------------------------
 
 /// Multi-Head Latent Attention layer for DeepSeek V2.
 pub struct DeepSeek2Mla {
@@ -149,9 +140,8 @@ impl DeepSeek2Mla {
 
         let rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
 
-        // Extract the per-head key/value up-projections from kv_b_proj's
-        // weight ([num_heads * (nope + v), rank], GGUF row-major) so queries
-        // can absorb w_kc and attention can run in latent space.
+        // Extract the per-head key/value up-projections from kv_b_proj's weight ([num_heads * (nope + v), rank],
+        // GGUF row-major) so queries can absorb w_kc and attention can run in latent space.
         let kv_b_w = kv_b_proj.weight.to_vec_f32()?;
         let (w_kc, w_vc) = crate::mla_common::extract_kv_b_up_projs(
             &kv_b_w,
@@ -208,8 +198,12 @@ impl DeepSeek2Mla {
         let kv_latent_v = kv_latent.to_vec_f32()?;
         let kv_rank = self.kv_a_layernorm.weight.shape().dims()[0];
 
-        let (kv_a_v, mut k_rope_v) =
-            crate::mla_common::split_kv_latent(&kv_latent_v, seq_len, kv_rank, self.qk_rope_head_dim);
+        let (kv_a_v, mut k_rope_v) = crate::mla_common::split_kv_latent(
+            &kv_latent_v,
+            seq_len,
+            kv_rank,
+            self.qk_rope_head_dim,
+        );
 
         let kv_a_t = cpu_tensor(kv_a_v, Shape::new(vec![seq_len, kv_rank]));
         let kv_a_normed = self.kv_a_layernorm.forward(&kv_a_t)?;
@@ -232,11 +226,7 @@ impl DeepSeek2Mla {
         let latent_new =
             crate::mla_common::pack_latent_rows(&kv_a_normed_v, &k_rope_v, seq_len, rank, rope_d);
 
-        // 5. Append to the device-resident latent KV cache. Format: `.0` holds
-        //    the compressed latent `[total_kv, rank + rope_d]`; `.1` is unused
-        //    (kept only for the `(Tensor, Tensor)` cache shape the surrounding
-        //    plumbing uses). The history stays on its device — only the new
-        //    rows cross H2D, and the append is a D2D concat.
+        // 5. Append to the device-resident latent KV cache.
         let row = rank + rope_d;
         let cache_dev = grim_nn::modules::pick_device_for_storage_device(x.device());
         let new_latent_st =
@@ -264,18 +254,21 @@ impl DeepSeek2Mla {
 
         // 6a. GPU decode fast path (decode-only kernel: one launch per head).
         if seq_len == 1 && x.device() != &Device::Cpu {
-            if let Some(attn_t) =
-                self.gpu_absorbed_decode(&q_absorbed, &q_rope_v, &latent_all, rank, total_kv_len, scale, x.device())?
-            {
+            if let Some(attn_t) = self.gpu_absorbed_decode(
+                &q_absorbed,
+                &q_rope_v,
+                &latent_all,
+                rank,
+                total_kv_len,
+                scale,
+                x.device(),
+            )? {
                 return Ok(self.o_proj.forward(&attn_t)?);
             }
         }
 
-        // 6b. Scalar latent-space reference path with causal masking — the
-        // documented FALLBACK, reached only when the backend lacks the MLA
-        // decode kernel (`is_kernel_unimplemented`) or on the CPU device.
-        // Query at absolute position cache_offset + s attends only to
-        // t <= cache_offset + s.
+        // 6b. Scalar latent-space reference path with causal masking - the documented FALLBACK, reached only
+        // when the backend lacks the MLA decode kernel (`is_kernel_unimplemented`) or on the CPU device.
         let latent_all_v = latent_all.to_vec_f32()?;
         let cache_offset = total_kv_len - seq_len;
         let row = rank + rope_d;
@@ -339,21 +332,8 @@ impl DeepSeek2Mla {
         Ok(self.o_proj.forward(&attn_tensor)?)
     }
 
-    /// GPU decode path via `BackendDevice::mla_absorbed_decode` (decode-only,
-    /// `seq_len == 1`). Runs entirely on-device: the latent cache is the
-    /// device-resident tensor (no H2D re-upload), the per-head `w_vc`
-    /// projection happens inside the kernel, and the decoded output stays a
-    /// device tensor — no `synchronize`, no result D2H, no host matmul.
-    ///
-    /// The kernel reads head *h*'s `w_vc` block directly from the
-    /// device-resident `kv_b_proj.weight` via the per-head word offset
-    /// (`nope * rank`) and stride (`(nope + v) * rank`), so one multi-head
-    /// launch covers all heads — head *h*'s weight rows are
-    /// `[h*(nope+v) + nope, +v)`, identical values to `self.w_vc[h]`.
-    ///
-    /// Returns `Ok(None)` when the backend lacks a needed kernel
-    /// (`is_kernel_unimplemented`); the caller then runs the scalar latent
-    /// loop. Real kernel failures propagate.
+    /// GPU decode path via `BackendDevice::mla_absorbed_decode` (decode-only, `seq_len == 1`).
+    /// Runs entirely on-device: the latent cache is the device-resident tensor (no H2D re-upload), the per-head.
     #[allow(clippy::too_many_arguments)]
     fn gpu_absorbed_decode(
         &self,
@@ -392,15 +372,16 @@ impl DeepSeek2Mla {
 
         // H2D only the small per-step query planes; the latent cache and the
         // w_vc source stay on their device.
-        let Some(qa_all) = or_host_fallback(
-            dev.from_cpu(&q_abs_scaled, &Shape::new(vec![nh, rank]), DType::F32),
-        )?
+        let Some(qa_all) =
+            or_host_fallback(dev.from_cpu(&q_abs_scaled, &Shape::new(vec![nh, rank]), DType::F32))?
         else {
             return Ok(None);
         };
-        let Some(qr_all) = or_host_fallback(
-            dev.from_cpu(&q_rope_scaled, &Shape::new(vec![nh, rope_d]), DType::F32),
-        )?
+        let Some(qr_all) = or_host_fallback(dev.from_cpu(
+            &q_rope_scaled,
+            &Shape::new(vec![nh, rope_d]),
+            DType::F32,
+        ))?
         else {
             return Ok(None);
         };
@@ -412,10 +393,8 @@ impl DeepSeek2Mla {
         let kv_st = latent_all.storage().as_ref();
         let w_src = self.kv_b_proj.weight.storage().as_ref();
 
-        // Single multi-head launch: the kernel takes a per-head word offset
-        // and stride, so it reads each head's w_vc block straight out of the
-        // device-resident kv_b_proj weight — no per-head D2D slicing, no
-        // serial per-head launches.
+        // Single multi-head launch: the kernel takes a per-head word offset and stride, so it reads each head's
+        // w_vc block straight out of the device-resident kv_b_proj weight - no per-head D2D slicing, no serial per-head launches.
         if or_host_fallback(dev.mla_absorbed_decode(
             qa_all.as_ref(),
             qr_all.as_ref(),
@@ -445,9 +424,7 @@ impl DeepSeek2Mla {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Feed-Forward Layer
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek2Expert {
     pub w1: Linear,
@@ -519,11 +496,8 @@ impl DeepSeek2Moe {
         })
     }
 
-    /// GPU-first MoE forward: routing stays on host (small gate-logits pull),
-    /// but on non-CPU devices the experts run on-device and the routing
-    /// weighted sum accumulates with scalar-mul/add kernels so per-expert
-    /// outputs never cross to host. Falls back to [`Self::forward_moe_host`]
-    /// on CPU devices or when the backend lacks a needed primitive.
+    /// GPU-first MoE forward: routing stays on host (small gate-logits pull), but on non-CPU devices the experts run on-device and the routing weighted sum accumulates with scalar-mul/add kernels so per-expert outputs never cross to host.
+    /// Falls back to [`Self::forward_moe_host`] on CPU devices or when the backend lacks a needed primitive.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.gate.forward(x)?;
         let logits_v = logits.to_vec_f32()?;
@@ -536,10 +510,8 @@ impl DeepSeek2Moe {
         self.forward_moe_host(x, &logits_v)
     }
 
-    /// Device-resident MoE: token rows are extracted D2D, experts run
-    /// on-device (Linear + `silu_mul_on_device`), and the weighted sum
-    /// accumulates on-device. `Ok(None)` = backend lacks a needed kernel
-    /// (`is_kernel_unimplemented`); caller uses the host path.
+    /// Device-resident MoE: token rows are extracted D2D, experts run on-device (Linear + `silu_mul_on_device`), and the weighted sum accumulates on-device.
+    /// `Ok(None)` = backend lacks a needed kernel (`is_kernel_unimplemented`); caller uses the host path.
     fn forward_moe_device(&self, x: &Tensor, logits_v: &[f32]) -> Result<Option<Tensor>> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -646,10 +618,8 @@ impl DeepSeek2Moe {
         Ok(Some(out_t))
     }
 
-    /// Host routing reference path — the documented FALLBACK (CPU device, or
-    /// GPU backends missing the copy/mul primitives). Identical math to the
-    /// device path: per-token top-k routing on the gate logits, expert
-    /// forward, routed-scaling weighted sum.
+    /// Host routing reference path - the documented FALLBACK (CPU device, or GPU backends missing the copy/mul primitives).
+    /// Identical math to the device path: per-token top-k routing on the gate logits, expert forward,.
     fn forward_moe_host(&self, x: &Tensor, logits_v: &[f32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -700,9 +670,7 @@ impl DeepSeek2Moe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek2Block {
     pub attn_norm: RmsNorm,
@@ -767,9 +735,7 @@ impl DeepSeek2Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek2 {
     pub cfg: DeepSeek2Config,
@@ -889,9 +855,8 @@ mod tests {
         assert_eq!(cfg.n_shared_experts, 2);
     }
 
-    /// Latent-space (absorbed) MLA must match the OLD uncompressed per-head
-    /// math: `q_nope · (w_kc c) == (q_nope w_kc) · c`. Covers seq_len=3 over
-    /// kv_len=7 with causal masking (cache_offset = 4).
+    /// Latent-space (absorbed) MLA must match the OLD uncompressed per-head math: `q_nope · (w_kc c) == (q_nope w_kc) · c`.
+    /// Covers seq_len=3 over kv_len=7 with causal masking (cache_offset = 4).
     #[test]
     fn test_mla_latent_attention_matches_uncompressed() {
         let seq = 3usize;

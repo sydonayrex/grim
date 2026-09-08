@@ -1,10 +1,5 @@
-//! `MarkovHead` trait — the lightweight sequential correction.
-//!
-//! §5.3.2. A low-rank (rank-256 in DSpark-style configs) prefix-conditioned
-//! bias applied to the base logits BEFORE each in-block token is sampled.
-//! This is the "semi" in semi-autoregressive: still one backbone pass, but
-//! each position now depends on the tokens already chosen earlier in the
-//! same block — suppressing suffix decay.
+//! `MarkovHead` trait - the lightweight sequential correction.
+//! §5.3.2.
 
 use grim_core::error::Result;
 use grim_tensor::Tensor;

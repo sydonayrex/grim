@@ -10,13 +10,13 @@
 //! * GPU 1: AMD Radeon RX 9060 XT (gfx1200 / RDNA4, PCI 0000:0A:00.0)
 //! * Driver / ROCm: 7.2.0-1-cachyos
 
+use grim_backend_rocm::RocmDevice;
 use grim_tensor::backend::BackendDevice;
 use grim_tensor::dtype::ArithType;
 use grim_tensor::{
-    AttentionOps, AutogradOps, CollectiveOps, CoreTensorOps, ElementwiseOps,
-    FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
+    AttentionOps, AutogradOps, CollectiveOps, CoreTensorOps, ElementwiseOps, FusionOps,
+    GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
 };
-use grim_backend_rocm::RocmDevice;
 
 #[test]
 fn test_rocm_device_implements_all_backend_traits() {
@@ -72,9 +72,9 @@ fn test_rocm_device_host_dequant_numeric_pathway() {
     assert!(dequant_res.is_ok(), "Host dequant for Q8_0 must succeed");
     let values = dequant_res.unwrap();
     assert_eq!(values.len(), 32);
-    for i in 0..32 {
-        let diff = (values[i] - (i as f32)).abs();
-        assert!(diff < 1e-4, "Mismatch at {}: {}", i, values[i]);
+    for (i, val) in values.iter().enumerate() {
+        let diff = (*val - (i as f32)).abs();
+        assert!(diff < 1e-4, "Mismatch at {}: {}", i, val);
     }
 }
 

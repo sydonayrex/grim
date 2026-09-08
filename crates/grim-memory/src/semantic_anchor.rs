@@ -1,15 +1,5 @@
 //! Semantic-aware state caching for recurrent and hybrid-attention models.
-//!
-//! Frontier models with hybrid-attention (e.g. DeltaNet in Qwen3.6-MoE, Kimi Delta Attention,
-//! Mamba/SWA) compress historical context into a compact recurring state vector per layer.
-//! Because storing state at every token position is memory-prohibitive, this module anchors
-//! full recurrent-state checkpoints exclusively at semantic token boundaries
-//! (e.g. `<think>`, `</think>`, `<tool_call>`, `</tool_output>`, turn delimiters).
-//!
-//! When agent harnesses edit previous context (such as eliding thinking blocks or truncating
-//! tool outputs), prefixes remain bitwise identical up to the semantic boundary, allowing
-//! full-attention layers to reuse their KV cache and recurrent layers to resume directly from
-//! the attached semantic checkpoint without re-prefilling from scratch.
+//! Frontier models with hybrid-attention (e.g.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,9 +43,7 @@ pub struct SemanticAnchorRegistry {
 
 impl SemanticAnchorRegistry {
     /// Create a new registry with default or provided anchor token IDs.
-    ///
-    /// # Contract
-    /// Any token ID passed here will be treated as an anchor candidate during prompt ingestion.
+    /// # Contract Any token ID passed here will be treated as an anchor candidate during.
     pub fn new(anchor_token_ids: impl IntoIterator<Item = u32>) -> Self {
         Self {
             anchor_tokens: anchor_token_ids.into_iter().collect(),
@@ -102,9 +90,7 @@ pub struct RecurrentCheckpointPool {
 
 impl RecurrentCheckpointPool {
     /// Create a new checkpoint pool with bounded capacity.
-    ///
-    /// # Contract
-    /// `max_checkpoints` must be greater than zero.
+    /// # Contract `max_checkpoints` must be greater than zero.
     pub fn new(max_checkpoints: usize) -> Self {
         assert!(max_checkpoints > 0, "max_checkpoints must be > 0");
         Self {
@@ -116,10 +102,7 @@ impl RecurrentCheckpointPool {
     }
 
     /// Store a recurrent checkpoint anchored to `radix_node_id`.
-    ///
-    /// # Contract
-    /// If pool is at capacity, the least recently used checkpoint is evicted.
-    /// Returns the allocated `Arc<RecurrentStateCheckpoint>`.
+    /// # Contract If pool is at capacity, the least recently used checkpoint is evicted.
     pub fn store_checkpoint(
         &mut self,
         radix_node_id: usize,

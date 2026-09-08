@@ -1,37 +1,7 @@
-//! SIMD fast paths for the packed quantized GEMMs (`gemm_q8_0_packed`,
-//! `gemm_q4k_packed`) defined in the crate root.
-//!
-//! Block layouts (authoritative source: the scalar reference implementations in
-//! `lib.rs`, which these kernels mirror instruction-for-instruction where it
-//! matters):
-//!
-//! * Q8_0 — 34-byte block: 2-byte little-endian f16 scale, then 32 i8 quants.
-//!   Requires `k % 32 == 0`.
-//! * Q4_K — 144-byte super-block per 256 weights: f16 `d`, f16 `min`,
-//!   `scales[12]`, then `qs[128]`. There are eight 32-weight sub-blocks; byte
-//!   `t` of `qs` carries weight `t` in its low nibble (sub-block `t / 32`) and
-//!   weight `t + 128` in its high nibble (sub-block `t / 32 + 1`); the per
-//!   sub-block scale/min pair comes from [`crate::get_scale_min_k4`]. Requires
-//!   `k % 256 == 0`.
-//!
-//! Math contract: every kernel computes, per sub-block, the same sums the
-//! scalar loop accumulates — `sum(a[l] * q[l])` with the quantized value used
-//! exactly (sign-extension preserved) — then applies the block scale/min in
-//! f32 and folds into the running dot product. Results therefore match the
-//! scalar path (and dequantize-then-GEMM) up to ordinary floating-point
-//! reassociation of the summation order, which is inherent to any vectorized
-//! reduction.
-//!
-//! Note on instruction choice: the left operand `A` is arbitrary f32 in these
-//! GEMMs, so pure integer byte-dots (`_mm256_maddubs_epi16`, `vdotq_s32`) have
-//! no exact application on the A side. The kernels instead widen the quantized
-//! bytes exactly to f32 lanes and multiply-accumulate there — simpler and
-//! bit-exact on the quantized values, at some cost versus peak integer throughput
-//! (correctness over peak perf).
+//! SIMD fast paths for the packed quantized GEMMs (`gemm_q8_0_packed`, `gemm_q4k_packed`) defined in the crate root.
+//! Block layouts (authoritative source: the scalar reference implementations in `lib.rs`, which these kernels mirror instruction-for-instruction.
 
-// ---------------------------------------------------------------------------
 // x86-64 / AVX2
-// ---------------------------------------------------------------------------
 
 /// Runtime AVX2 availability (gates the x86-64 fast paths).
 #[cfg(target_arch = "x86_64")]
@@ -59,11 +29,8 @@ pub(crate) mod x86 {
         }};
     }
 
-    /// `dsc * sum(a[i] * q[i]) - mm * sum(a[i])` over the 32 consecutive
-    /// weights starting at `a[a_off]`, where `bytes` is a 256-bit vector whose
-    /// 32 bytes hold the quantized values (i8 codes or unpacked nibbles, one
-    /// per weight, order preserved). `dsc`/`mm` are the sub-block's f32 scale
-    /// and offset.
+    /// `dsc * sum(a[i] * q[i]) - mm * sum(a[i])` over the 32 consecutive weights starting at `a[a_off]`, where `bytes` is a 256-bit vector whose 32 bytes hold the quantized values (i8 codes or unpacked nibbles, one per weight, order preserved).
+    /// `dsc`/`mm` are the sub-block's f32 scale and offset.
     macro_rules! sub_block_contrib {
         ($a:expr, $a_off:expr, $bytes:expr, $dsc:expr, $mm:expr) => {{
             let raw = $bytes;
@@ -88,11 +55,7 @@ pub(crate) mod x86 {
     }
 
     /// AVX2 kernel for [`crate::gemm_q8_0_packed`].
-    ///
-    /// # Safety
-    /// The caller must have verified AVX2 support at runtime, and the inputs
-    /// must satisfy the validation contract of the public function
-    /// (`k % 32 == 0`, buffer lengths sufficient for `[m, k]` x `[n, k]`).
+    /// # Safety The caller must have verified AVX2 support at runtime, and the inputs must.
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn gemm_q8_0_packed_avx2(
         a: &[f32],
@@ -116,9 +79,8 @@ pub(crate) mod x86 {
                     for _blk in 0..blocks_per_row {
                         let scale = crate::f16_to_f32(b_row[b_pos], b_row[b_pos + 1]);
 
-                        // Widen the 32 i8 quants to four f32 vectors (exact
-                        // sign extension: i8 -> i16 -> i32 -> f32) and
-                        // multiply-accumulate against the matching A lanes.
+                        // Widen the 32 i8 quants to four f32 vectors (exact sign extension: i8
+                        // -> i16 -> i32 -> f32) and multiply-accumulate against the matching A lanes.
                         let q = _mm256_loadu_si256(b_row.as_ptr().add(b_pos + 2) as *const __m256i);
                         let halves = [_mm256_castsi256_si128(q), _mm256_extracti128_si256::<1>(q)];
                         let mut acc = _mm256_setzero_ps();
@@ -151,14 +113,7 @@ pub(crate) mod x86 {
     }
 
     /// AVX2 kernel for [`crate::gemm_q4k_packed`].
-    ///
-    /// Nibble unpacking and scale/min lookup stay close to the scalar
-    /// reference; the per-sub-block dot products are vectorized.
-    ///
-    /// # Safety
-    /// The caller must have verified AVX2 support at runtime, and the inputs
-    /// must satisfy the validation contract of the public function
-    /// (`k % 256 == 0`, buffer lengths sufficient for `[m, k]` x `[n, k]`).
+    /// Nibble unpacking and scale/min lookup stay close to the scalar reference; the per-sub-block dot products.
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn gemm_q4k_packed_avx2(
         a: &[f32],
@@ -186,9 +141,8 @@ pub(crate) mod x86 {
                         let scales = &b_row[pos + 4..pos + 16];
                         let qs = &b_row[pos + 16..pos + 144];
 
-                        // Same iteration shape as the scalar loop: 4 groups of
-                        // 64 weights; low nibbles feed even sub-blocks, high
-                        // nibbles feed odd ones.
+                        // Same iteration shape as the scalar loop: 4 groups of 64
+                        // weights; low nibbles feed even sub-blocks, high nibbles feed odd ones.
                         let mut is = 0usize;
                         for group in 0..4 {
                             let raw =
@@ -216,20 +170,15 @@ pub(crate) mod x86 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// aarch64 / NEON (NEON is baseline on aarch64 — no runtime detection needed)
-// ---------------------------------------------------------------------------
+// aarch64 / NEON (NEON is baseline
+// on aarch64 - no runtime detection needed)
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod neon {
     use std::arch::aarch64::*;
 
-    /// NEON kernel for [`crate::gemm_q8_0_packed`] (exact i8 -> f32 widening,
-    /// widening accumulate in f32; mirrors the AVX2 kernel above).
-    ///
-    /// # Safety
-    /// Inputs must satisfy the validation contract of the public function
-    /// (`k % 32 == 0`, buffer lengths sufficient for `[m, k]` x `[n, k]`).
+    /// NEON kernel for [`crate::gemm_q8_0_packed`] (exact i8 -> f32 widening, widening accumulate in f32; mirrors the AVX2 kernel above).
+    /// # Safety Inputs must satisfy the validation contract of the public function (`k % 32.
     pub(crate) unsafe fn gemm_q8_0_packed_neon(
         a: &[f32],
         b_q80_bytes: &[u8],

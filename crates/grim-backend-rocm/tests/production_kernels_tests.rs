@@ -2,8 +2,10 @@
 //! FlashDecoding (Split-KV Attention), DeepSeek MLA Decode, Marlin W4A16, and BitNet b1.58.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{Shape, dtype::DType,
-    backend::{BackendStorage, RecurrentOps}, CoreTensorOps, MemoryOps,
+use grim_tensor::{
+    CoreTensorOps, MemoryOps, Shape,
+    backend::{BackendStorage, RecurrentOps},
+    dtype::DType,
 };
 use std::panic;
 
@@ -161,7 +163,9 @@ fn test_selective_scan_headed_parity() -> TestResult {
     let b: Vec<f32> = (0..d_state).map(|s| (s as f32 * 0.3).sin() * 0.5).collect();
     let c: Vec<f32> = (0..d_state).map(|s| (s as f32 * 0.2).cos() * 0.5).collect();
     let d: Vec<f32> = (0..n_heads).map(|h| 0.25 - h as f32 * 0.05).collect();
-    let state: Vec<f32> = (0..d_inner * d_state).map(|i| (i as f32 * 0.07).cos()).collect();
+    let state: Vec<f32> = (0..d_inner * d_state)
+        .map(|i| (i as f32 * 0.07).cos())
+        .collect();
 
     // Host recurrence reference.
     let mut host_state = state.clone();
@@ -178,10 +182,11 @@ fn test_selective_scan_headed_parity() -> TestResult {
         expected[n] = y + d[h] * x[n] * dt[h];
     }
 
-    let up = |v: &[f32], shape: &[usize]| -> Result<Box<dyn BackendStorage>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(dev
-            .from_cpu(v, &Shape::new(shape.to_vec()), DType::F32)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?)
+    let up = |v: &[f32],
+              shape: &[usize]|
+     -> Result<Box<dyn BackendStorage>, Box<dyn std::error::Error + Send + Sync>> {
+        dev.from_cpu(v, &Shape::new(shape.to_vec()), DType::F32)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     };
     let x_s = up(&x, &[d_inner])?;
     let dt_s = up(&dt, &[n_heads])?;
@@ -208,7 +213,12 @@ fn test_selective_scan_headed_parity() -> TestResult {
     let y_dev = out_st.to_cpu_vec_f32()?;
     for n in 0..d_inner {
         let err = (y_dev[n] - expected[n]).abs();
-        assert!(err < 1e-4, "headed scan mismatch at [{n}]: {} vs {}", y_dev[n], expected[n]);
+        assert!(
+            err < 1e-4,
+            "headed scan mismatch at [{n}]: {} vs {}",
+            y_dev[n],
+            expected[n]
+        );
     }
     // State must have been updated in place on device.
     let state_dev = state_s.to_cpu_vec_f32()?;
@@ -235,15 +245,25 @@ fn test_mla_head_stride_multi_head_parity() -> TestResult {
     let seq_len = 48usize;
     let inv_sqrt_d = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
 
-    let q_nope: Vec<f32> = (0..num_heads * kv_lora_rank).map(|i| (i as f32 * 0.07).sin()).collect();
-    let q_pe: Vec<f32> = (0..num_heads * qk_rope_dim).map(|i| (i as f32 * 0.04).cos()).collect();
-    let kv_comp: Vec<f32> = (0..seq_len * kv_lora_rank).map(|i| (i as f32 * 0.02).sin()).collect();
-    let k_pe: Vec<f32> = (0..seq_len * qk_rope_dim).map(|i| (i as f32 * 0.01).cos()).collect();
+    let q_nope: Vec<f32> = (0..num_heads * kv_lora_rank)
+        .map(|i| (i as f32 * 0.07).sin())
+        .collect();
+    let q_pe: Vec<f32> = (0..num_heads * qk_rope_dim)
+        .map(|i| (i as f32 * 0.04).cos())
+        .collect();
+    let kv_comp: Vec<f32> = (0..seq_len * kv_lora_rank)
+        .map(|i| (i as f32 * 0.02).sin())
+        .collect();
+    let k_pe: Vec<f32> = (0..seq_len * qk_rope_dim)
+        .map(|i| (i as f32 * 0.01).cos())
+        .collect();
 
     // kv_b-style weight: [num_heads*(nope+v_dim), kv_lora_rank]; head h's
     // v-block sits at word offset h*(nope+v_dim)*rank + nope*rank.
     let w_rows = num_heads * (nope + v_dim);
-    let w_full: Vec<f32> = (0..w_rows * kv_lora_rank).map(|i| (i as f32 * 0.11).sin()).collect();
+    let w_full: Vec<f32> = (0..w_rows * kv_lora_rank)
+        .map(|i| (i as f32 * 0.11).sin())
+        .collect();
     let w_offset_words = nope * kv_lora_rank;
     let w_stride_words = (nope + v_dim) * kv_lora_rank;
 
@@ -281,11 +301,13 @@ fn test_mla_head_stride_multi_head_parity() -> TestResult {
         }
     }
 
-    let to_storage = |v: &[f32], shape: &[usize]| -> Result<Box<dyn BackendStorage>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(dev
-            .from_cpu(v, &Shape::new(shape.to_vec()), DType::F32)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?)
-    };
+    let to_storage =
+        |v: &[f32],
+         shape: &[usize]|
+         -> Result<Box<dyn BackendStorage>, Box<dyn std::error::Error + Send + Sync>> {
+            dev.from_cpu(v, &Shape::new(shape.to_vec()), DType::F32)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        };
     let q_nope_s = to_storage(&q_nope, &[num_heads, kv_lora_rank])?;
     let q_pe_s = to_storage(&q_pe, &[num_heads, qk_rope_dim])?;
     let mut packed = Vec::with_capacity(seq_len * (kv_lora_rank + qk_rope_dim));
@@ -317,7 +339,10 @@ fn test_mla_head_stride_multi_head_parity() -> TestResult {
     assert_eq!(actual.len(), expected.len());
     for (i, (&act, &exp)) in actual.iter().zip(expected.iter()).enumerate() {
         let err = (act - exp).abs();
-        assert!(err < 2e-3, "head-stride parity broken at [{i}]: {act} vs {exp}");
+        assert!(
+            err < 2e-3,
+            "head-stride parity broken at [{i}]: {act} vs {exp}"
+        );
     }
     Ok(())
 }

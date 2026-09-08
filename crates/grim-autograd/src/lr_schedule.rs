@@ -1,9 +1,7 @@
 //! Cosine-with-warmup learning rate schedule.
 
 /// Cosine learning rate scheduler with linear warmup.
-///
-/// Ramp LR linearly from 0 to `base_lr` over `warmup_steps`,
-/// then decay via cosine curve to `min_lr` across remaining steps up to `total_steps`.
+/// Ramp LR linearly from 0 to `base_lr` over `warmup_steps`, then decay via cosine curve to.
 #[derive(Debug, Clone, Copy)]
 pub struct CosineWarmupSchedule {
     pub total_steps: usize,

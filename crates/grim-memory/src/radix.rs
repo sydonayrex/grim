@@ -1,15 +1,5 @@
 //! Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
-//!
-//! One [`RadixNode`] corresponds to exactly one physical KV [`BlockId`]
-//! (matching [`crate::BLOCK_SIZE`]), so the existing block allocator is
-//! untouched: sharing is always whole-block, which is the only unit the KV
-//! cache can reuse.
-//!
-//! `children` is keyed by a content hash of a block's tokens (the leading
-//! token is insufficient — two distinct blocks could otherwise collide on a
-//! shared first token while differing later in the block). Because each node
-//! is one atomic block, branching happens at block boundaries; there is no
-//! partial-block split (a half-block of KV can never be shared).
+//! One [`RadixNode`] corresponds to exactly one physical KV [`BlockId`] (matching [`crate::BLOCK_SIZE`]), so the existing block.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -77,9 +67,8 @@ impl RadixTree {
         h
     }
 
-    /// Walk from the root, returning the physical blocks whose content
-    /// matches the leading tokens of `tokens`, plus the number of matched
-    /// tokens. Shared prefixes stop at the first non-matching block.
+    /// Walk from the root, returning the physical blocks whose content matches the leading tokens of `tokens`, plus the number of matched tokens.
+    /// Shared prefixes stop at the first non-matching block.
     pub fn match_prefix(&self, tokens: &[u32]) -> (Vec<usize>, usize) {
         let (matched, offset, _) = self.match_prefix_with_anchor(tokens);
         (matched, offset)
@@ -173,12 +162,8 @@ impl RadixTree {
         }
     }
 
-    /// Drop one sequence's reference to `blocks`. Refcounts are decremented
-    /// but nodes are NOT pruned here — an unreferenced prefix stays cached
-    /// (refcount 0) for future reuse until [`RadixTree::evict_coldest_leaf`]
-    /// reclaims it under pressure. This matches RadixAttention semantics:
-    /// prefixes are cached until evicted, not deleted the moment a sequence
-    /// ends.
+    /// Drop one sequence's reference to `blocks`.
+    /// Refcounts are decremented but nodes are NOT pruned here - an unreferenced prefix stays cached.
     pub fn remove(&mut self, blocks: &[usize]) {
         for &bid in blocks {
             if let Some(&idx) = self.block_to_node.get(&bid) {
@@ -188,11 +173,8 @@ impl RadixTree {
         }
     }
 
-    /// Evict the coldest childless leaf with `ref_count == 0`, returning its
-    /// block id. After detaching the leaf, walks up pruning any parent that
-    /// has become childless and unreferenced, so eviction never reclaims a
-    /// block another request's partial prefix still depends on. Returns
-    /// `None` if nothing is evictable.
+    /// Evict the coldest childless leaf with `ref_count == 0`, returning its block id.
+    /// After detaching the leaf, walks up pruning any parent that has become childless and unreferenced,.
     pub fn evict_coldest_leaf(&mut self) -> Option<usize> {
         let mut coldest: Option<(usize, Instant)> = None;
         for (idx, node) in self.nodes.iter().enumerate() {
@@ -246,11 +228,8 @@ impl RadixTree {
         self.nodes.len().saturating_sub(1)
     }
 
-    /// Return the block id of the coldest childless leaf with `ref_count ==
-    /// 0` **without removing it** from the tree. Used by pressure demotion
-    /// (Phase 2.1), which keeps the cached prefix entry so a future request
-    /// can still match and promote it back. Returns `None` if there is no
-    /// cold leaf to demote.
+    /// Return the block id of the coldest childless leaf with `ref_count == 0` **without removing it** from the tree.
+    /// Used by pressure demotion (Phase 2.1), which keeps the cached prefix entry so a future.
     pub fn coldest_leaf(&self) -> Option<usize> {
         let mut coldest: Option<(usize, Instant)> = None;
         for (idx, node) in self.nodes.iter().enumerate() {

@@ -6,9 +6,7 @@ use crate::quantization::{GcnArch, QuantMode, arch_capability, gcn_arch};
 use crate::device::util::detect_gpu_arch;
 use crate::hipGetDeviceCount;
 
-// ---------------------------------------------------------------------------
-// F6 — MFMA availability
-// ---------------------------------------------------------------------------
+// F6 - MFMA availability
 
 /// Whether the arch has native **MFMA** matrix cores for a given arithmetic [see: `cubecl`, `hip/arch.rs`, `is_mfma_capable()`, `gfx1200+`]
 pub fn mfma_supported(arch: GcnArch, mode: QuantMode) -> bool {
@@ -48,9 +46,7 @@ pub fn mfma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
     }
 }
 
-// ---------------------------------------------------------------------------
 // WMMA availability (WI-G)
-// ---------------------------------------------------------------------------
 
 /// Whether the arch has native **WMMA** matrix cores for a given arithmetic mode.
 pub fn wmma_supported(arch: GcnArch, mode: QuantMode) -> bool {
@@ -83,9 +79,7 @@ pub fn wmma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
     }
 }
 
-// ---------------------------------------------------------------------------
-// F8 — Composable Kernel (CK) dispatch
-// ---------------------------------------------------------------------------
+// F8 - Composable Kernel (CK) dispatch
 
 /// CK (Composable Kernel) is AMD's generic GEMM/attention library. The [see: `ck_tile`, `-DCK_TILE_USE_WMMA`]
 pub fn ck_supported(arch: GcnArch) -> bool {
@@ -111,9 +105,7 @@ pub fn ck_dispatch(arch: &str) -> Result<(), &'static str> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// F9 — MIOpen convolution/depthwise kernels
-// ---------------------------------------------------------------------------
+// F9 - MIOpen convolution/depthwise kernels
 
 /// MIOpen provides conv/depthwise kernels. It is available (library present +
 pub fn miopen_supported(arch: GcnArch) -> bool {
@@ -141,9 +133,7 @@ pub fn miopen_conv_dispatch(arch: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// F11 — RCCL multi-GPU collectives
-// ---------------------------------------------------------------------------
+// F11 - RCCL multi-GPU collectives
 
 /// RCCL (ROCm Collective Communications Library) implements NCCL-style [see: `ncclAllReduce`, `ncclBroadcast`]
 pub fn rccl_device_count() -> Result<usize, i32> {

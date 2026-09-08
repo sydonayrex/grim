@@ -1,31 +1,5 @@
-//! Phase-3 §3.7 — Profiling CI gate.
-//!
-//! Regression harness that compares a measured `cycles_per_call` against a
-//! baseline JSON keyed by kernel name and arch, and decides:
-//!
-//! - `Within { delta_pct, threshold_pct }` — measurement is within budget
-//!   (≤ threshold-pct above baseline). Sub-baseline measurements are
-//!   also "Within" (an unexpected speedup is good news, not a failure).
-//! - `Regressed { baseline, current, delta_pct, threshold_pct }` — the
-//!   measurement is `--threshold_pct` above baseline; CI fails.
-//! - `NoBaseline { reason }` — there is no entry for the kernel in the
-//!   baseline file; CI logs this but does not fail (the test runner has
-//!   not yet established a baseline).
-//!
-//! Boundary semantics: a delta exactly equal to the threshold is
-//! `Within`. We use `delta_pct <= threshold_pct` to **avoid flakes** on
-//! deterministic CI machines that occasionally round to exactly the
-//! threshold on repeated measurement — strict `<` would create flakes
-//! without surfacing real regressions.
-//!
-//! Skill attribution:
-//! - `rocm-profiling-perf` — regression gates, methodology discipline.
-//!   The gate as a *primitive* is metric-agnostic; rocprof counters can
-//!   be plumbed in by replacing `cycles_per_call` with a richer struct.
-//! - `rust-gpu-discipline` — `NoBaseline` is surfaced explicitly so a
-//!   missing baseline never fabricates a "passed" gate (no fake pass).
-//! - `rust-ai-ml-inference-guide` Action 8 — recorded baseline numbers
-//!   predate the metrics the gate guards.
+//! Phase-3 §3.7 - Profiling CI gate. Regression harness that compares a measured `cycles_per_call` against a baseline JSON keyed by kernel
+//! name and arch, and decides: - `Within { delta_pct, threshold_pct }` - measurement is within budget (≤ threshold-pct above baseline).
 
 use std::collections::HashMap;
 
@@ -40,11 +14,8 @@ pub struct Measurement {
 }
 
 impl Measurement {
-    /// `(current - baseline) / baseline * 100`. Returned as `f64::NAN`
-    /// if either side is zero — there is no parlance for that case in
-    /// the gate's accounting and we surface the NaN deliberately so the
-    /// downstream caller can flag it rather than get a misleading 0%
-    /// or +inf%.
+    /// `(current - baseline) / baseline * 100`.
+    /// Returned as `f64::NAN` if either side is zero - there is no parlance for that.
     pub fn delta_pct_vs(&self, baseline: f64) -> f64 {
         if baseline == 0.0 || self.cycles_per_call == 0.0 {
             return f64::NAN;
@@ -91,10 +62,8 @@ impl BaselineTable {
         &self.arch
     }
 
-    /// Decide whether the entry is acceptable: `baseline > 0` and
-    /// `threshold_pct > 0`. We reject zero/negative baselines *eagerly*
-    /// so a regression test that runs against a corrupt baseline file
-    /// fails clearly, not silently at the comparison step.
+    /// Decide whether the entry is acceptable: `baseline > 0` and `threshold_pct > 0`.
+    /// We reject zero/negative baselines *eagerly* so a regression test that runs against a corrupt baseline.
     pub fn set_entry(
         &mut self,
         kernel: &str,
@@ -228,10 +197,8 @@ impl Verdict {
 
     /// Construct a `Regressed` verdict.
     pub fn regressed(current: f64, threshold_pct: f64) -> Self {
-        // baseline implied at +threshold_pct boundary; here we compute
-        // a hypothetical baseline such that delta=(current/baseline-1)*100.
-        // The caller should never rely on the round-trip identity for
-        // this concession; tests cover it via the explicit fields.
+        // baseline implied at +threshold_pct boundary; here we compute a hypothetical baseline such that delta=(current/baseline-1)*100.
+        // The caller should never rely on the round-trip identity for this concession; tests cover it.
         let baseline = if threshold_pct > 0.0 {
             current / (1.0 + threshold_pct / 100.0)
         } else {
@@ -273,12 +240,7 @@ impl PerfGate {
     }
 
     /// Compare one measurement; return the verdict.
-    ///
     /// Boundary semantics: `delta_pct <= threshold_pct` is `Within`.
-    /// Strict `<` would create flakes on machines where repeated
-    /// measurements round to the threshold. The CI gate's purpose is
-    /// to catch real regressions, not to pass-through tight numerical
-    /// matches.
     pub fn compare(&self, kernel: &str, measurement: Measurement) -> Verdict {
         let entry = match self.table.entry(kernel) {
             Some(e) => e,
@@ -313,9 +275,8 @@ impl PerfGate {
     }
 }
 
-// We expose a tiny mutator for the self-test only. It bypasses the public
-// `set_entry` validator (which is exercised in the public tests).
-// Not part of the public API.
+// We expose a tiny mutator for the self-test only.
+// It bypasses the public `set_entry` validator (which is exercised in the public tests).
 impl BaselineTable {
     #[doc(hidden)]
     pub fn inner_mut_for_tests(&mut self) -> &mut HashMap<String, BaselineEntry> {
@@ -325,10 +286,8 @@ impl BaselineTable {
 
 #[cfg(test)]
 mod gate_self_tests {
-    //! Tiny self-tests that prove the gate uses the threshold the spec
-    //! calls for (default +5%) on a bare-bones entry. The bulk of the
-    //! tests live in `tests/perf_gate.rs`; here we only keep one
-    //! boundary check the gate must pass without external fixtures.
+    //! Tiny self-tests that prove the gate uses the threshold the spec calls for (default +5%) on a bare-bones entry.
+    //! The bulk of the tests live in `tests/perf_gate.rs`; here we only keep one boundary check.
 
     use super::{BaselineEntry, Measurement, PerfGate, Verdict};
 

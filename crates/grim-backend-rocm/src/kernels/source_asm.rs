@@ -5,9 +5,8 @@ pub fn compute_kernel_source() -> String {
         String::with_capacity(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 16384);
     s.push_str(crate::kernels::shared_device_fns::KERNEL_SOURCE);
     s.push_str(crate::kernels::charon::KERNEL_SOURCE);
-    // TEMP-DIAG (GGUF fault hunt): rocwmma-containing kernels can be
-    // excluded from the aggregate TU via GRIM_DISABLE_ROCWMA_KERNELS=1 to
-    // test module-poisoning on gfx1201.
+    // TEMP-DIAG (GGUF fault hunt): rocwmma-containing kernels can be excluded from
+    // the aggregate TU via GRIM_DISABLE_ROCWMA_KERNELS=1 to test module-poisoning on gfx1201.
     let skip_rocwma = std::env::var("GRIM_DISABLE_ROCWMA_KERNELS").is_ok();
     if !skip_rocwma {
         s.push_str(crate::kernels::charon_wmma::KERNEL_SOURCE);
@@ -18,9 +17,8 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
-    // F-1: the IQ-family fused dequant+GEMM kernels (incl. grim_fused_dequant_gemm_q8_0)
-    // live in their own translation unit and were never appended to the JIT source, so
-    // hipRTC failed with "use of undeclared identifier" at first `run` forward on RDNA2.
+    // F-1: the IQ-family fused dequant+GEMM kernels (incl.
+    // grim_fused_dequant_gemm_q8_0) live in their own translation unit and were never appended to the JIT source,.
     s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     if !skip_rocwma {

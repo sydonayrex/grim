@@ -12,12 +12,7 @@ extern "C" __global__ void grim_decode_gemm_f16(
     int stride_a, int stride_b, int stride_c)
 {
     // Decode-shape F16 GEMM: C[M,N] = A[M,K] @ B[K,N], f32 accumulate, F16 out.
-    //
-    // Simple, correct, single-buffer implementation. Each thread computes one
-    // output element by iterating over the full K axis. Validated on gfx1036
-    // (Radeon 610M, wave32). The double-buffered LDS variant (DCU-GCN §3.1)
-    // is a future optimization gated on a measured speedup (per plan §2.4.4
-    // item 4 / SMALL-BATCH-MC caution).
+    // Simple, correct, single-buffer implementation.
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
     if (idx >= total) return;

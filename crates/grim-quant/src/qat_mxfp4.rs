@@ -1,10 +1,5 @@
 //! WI-E5 (FIND-5b): MXFP4 Quantization-Aware Training support.
-//!
-//! `fake_quant_mxfp4` round-trips weights through the SAME quantize/dequantize
-//! code path the final real-quantize uses (`quant_mxfp4_matrix` +
-//! `mxfp4_e2m1_to_f32`), guaranteeing that the trained-in quantization noise
-//! matches deployment exactly. The STE (straight-through estimator) wrapper in
-//! grim-autograd passes gradients through unchanged.
+//! `fake_quant_mxfp4` round-trips weights through the SAME quantize/dequantize code path the final real-quantize uses (`quant_mxfp4_matrix` +.
 
 use crate::{mxfp4_e2m1_to_f32, quant_mxfp4_matrix};
 use grim_tensor::error::{Error, Result};
@@ -15,13 +10,7 @@ fn cfg_err(msg: String) -> Error {
 }
 
 /// Fake-quantize a row-major `[rows, k]` f32 matrix through MXFP4.
-///
-/// Each 32-element block shares one E8M0 exponent chosen identically to
-/// `quant_mxfp4_matrix`, so `fake_quant_mxfp4(w)` equals dequantizing
-/// `quant_mxfp4_matrix(w)` bit-for-bit — training sees exactly the values the
-/// deployed kernel will compute with.
-///
-/// `k` must be a multiple of 32 (same constraint as the real packer).
+/// Each 32-element block shares one E8M0 exponent chosen identically to `quant_mxfp4_matrix`, so `fake_quant_mxfp4(w)` equals dequantizing.
 pub fn fake_quant_mxfp4(data: &[f32], rows: usize, k: usize) -> Result<Vec<f32>> {
     if k == 0 || k % 32 != 0 || rows == 0 {
         return Err(cfg_err(format!(
@@ -96,10 +85,8 @@ mod tests {
         }
     }
 
-    /// STE semantics: gradient passes through unchanged. Exercised via the
-    /// autograd identity-backward contract — here we assert fake-quant is a
-    /// pure elementwise map of the packed domain so d(fake)/d(w) ≈ I holds
-    /// away from code boundaries.
+    /// STE semantics: gradient passes through unchanged.
+    /// Exercised via the autograd identity-backward contract - here we assert fake-quant is a pure elementwise.
     #[test]
     fn fake_quant_is_deterministic_and_idempotent_domain() {
         let w = deterministic(256, 0xBEEF);

@@ -1,28 +1,5 @@
 //! Backend selection chain for training jobs.
-//!
-//! Per the architecture, the worker must run real steps on the device the
-//! *user* selected, falling back through a priority order when that device
-//! is unavailable:
-//!
-//! ```text
-//! ROCm → CUDA → Vulkan → Metal → CPU
-//! ```
-//!
-//! ROCm and CPU are always in the build (ROCm is grim's primary GPU target,
-//! CPU is the ultimate reference fallback). CUDA / Vulkan / Metal are gated
-//! behind the `gpu-selection` cargo feature so the SDK toolchains aren't
-//! forced into builds that don't want them.
-//!
-//! Each backend is selected only after a genuine liveness probe
-//! (`probe()` / `probe_one()`) succeeds *and* a device construct works.
-//! We never silently degrade a GPU request to CPU — if ROCm is requested and
-//! the ordinal is dead, we surface that and move to the next tier. CPU is the
-//! single documented terminal fallback (it is always present and always works).
-//!
-//! Tensors are created with [`SelectedBackend::make_tensor`], which builds
-//! them on the chosen `Device`. The autograd tape already dispatches through
-//! `pick_device_for_tensor` (grim-autograd / grim-nn), so a device-tagged
-//! tensor runs its matmul / LoRA-accumulate on that device — no CPU detour.
+//! Per the architecture, the worker must run real steps on the device the *user* selected,.
 
 use std::sync::Arc;
 
@@ -33,10 +10,7 @@ use grim_tensor::{Device, Shape, Tensor};
 use serde::{Deserialize, Serialize};
 
 /// Which backend the user asked the scheduler to prefer.
-///
-/// `Auto` means "use the top of the priority chain that is actually present
-/// on this machine" (ROCm first, ... , CPU last). This is what the UI sends
-/// when the user picks "use my GPU" without naming a vendor.
+/// `Auto` means "use the top of the priority chain that is actually present on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferredBackend {
     Auto,
@@ -83,9 +57,8 @@ pub struct TrainingRank {
     pub weight_share: f32,
 }
 
-/// Rank-local execution context. Model providers, tapes, registries, and
-/// optimizers must be owned by the rank that uses them; this type deliberately
-/// carries no shared mutable training state.
+/// Rank-local execution context. Model providers, tapes, registries, and optimizers must be owned by
+/// the rank that uses them; this type deliberately carries no shared mutable training state.
 #[derive(Debug, Clone)]
 pub struct RankContext {
     pub rank: TrainingRank,
@@ -114,10 +87,8 @@ impl RankContext {
         })
     }
 
-    /// Create the rank's deterministic JSONL shard with its capability-sized
-    /// micro-batch. `local_batch` must come from `allocate_batch_sizes`; it is
-    /// passed explicitly so independently constructed rank contexts cannot
-    /// accidentally round to a batch larger than the requested global batch.
+    /// Create the rank's deterministic JSONL shard with its capability-sized micro-batch.
+    /// `local_batch` must come from `allocate_batch_sizes`; it is passed explicitly so independently constructed rank contexts cannot.
     pub fn make_dataloader(
         &self,
         path: &str,
@@ -136,9 +107,8 @@ impl RankContext {
     }
 }
 
-/// Allocate an exact global batch across ranks using largest-remainder
-/// rounding. This avoids dropping or duplicating samples when asymmetric
-/// shares produce fractional micro-batches.
+/// Allocate an exact global batch across ranks using largest-remainder rounding.
+/// This avoids dropping or duplicating samples when asymmetric shares produce fractional micro-batches.
 pub fn allocate_batch_sizes(ranks: &[TrainingRank], global_batch: usize) -> Vec<usize> {
     if ranks.is_empty() || global_batch == 0 {
         return vec![0; ranks.len()];
@@ -181,9 +151,8 @@ pub fn allocate_batch_sizes(ranks: &[TrainingRank], global_batch: usize) -> Vec<
     sizes
 }
 
-/// Return the exact integer batch assigned to each rank context. Keeping this
-/// helper next to dataloader construction makes the invariant explicit:
-/// `sum(result) == global_batch` whenever the global batch can be represented.
+/// Return the exact integer batch assigned to each rank context.
+/// Keeping this helper next to dataloader construction makes the invariant explicit: `sum(result) == global_batch` whenever.
 pub fn allocate_context_batch_sizes(contexts: &[RankContext], global_batch: usize) -> Vec<usize> {
     let ranks: Vec<TrainingRank> = contexts
         .iter()
@@ -192,10 +161,8 @@ pub fn allocate_context_batch_sizes(contexts: &[RankContext], global_batch: usiz
     allocate_batch_sizes(&ranks, global_batch)
 }
 
-/// Execute one rank closure per OS thread and retain rank order in the
-/// results. HIP/RCCL collectives require every rank to enter the collective;
-/// sequentially iterating these closures would deadlock or silently reduce
-/// only one participant.
+/// Execute one rank closure per OS thread and retain rank order in the results.
+/// HIP/RCCL collectives require every rank to enter the collective; sequentially iterating these closures would deadlock.
 pub fn run_concurrent_ranks<T, F>(jobs: Vec<F>) -> Vec<Result<T, String>>
 where
     T: Send,
@@ -240,9 +207,8 @@ pub fn build_training_ranks(gpus: &[TrainingGpu]) -> Vec<TrainingRank> {
         .collect()
 }
 
-/// Enumerate the live ROCm devices and capture the capabilities used for
-/// data-parallel scheduling.  VRAM is read after selecting each ordinal so
-/// mixed cards get proportional work shares instead of assuming symmetry.
+/// Enumerate the live ROCm devices and capture the capabilities used for data-parallel scheduling.
+/// VRAM is read after selecting each ordinal so mixed cards get proportional work shares instead.
 pub fn enumerate_training_gpus() -> Result<Vec<TrainingGpu>, SelectionError> {
     let devices = grim_backend_rocm::RocmDevice::probe()
         .map_err(|e| SelectionError::Tensor(format!("ROCm probe failed: {e}")))?;
@@ -311,10 +277,7 @@ impl std::fmt::Debug for SelectedBackend {
 
 impl SelectedBackend {
     /// Construct a tensor from host `f32` data on the *selected* device.
-    ///
     /// This is the single replacement for `cpu_tensor(...)` in the worker.
-    /// The returned `Tensor` carries `self.device`, so every downstream
-    /// autograd op dispatches to the real backend.
     pub fn make_tensor(&self, data: Vec<f32>, shape: Shape) -> Result<Tensor, SelectionError> {
         let storage = self
             .device_impl
@@ -382,9 +345,8 @@ fn tier_order() -> Vec<(PreferredBackend, Device)> {
     ]
 }
 
-/// Probe every backend in the chain and report what is actually live on this
-/// host. Drives the "select GPU" panel in the UI and lets the start handler
-/// validate `preferred_backend` before dispatching a worker.
+/// Probe every backend in the chain and report what is actually live on this host.
+/// Drives the "select GPU" panel in the UI and lets the start handler validate `preferred_backend`.
 pub fn probe_all() -> Vec<BackendProbe> {
     let mut out = Vec::new();
     // ROCm (always compiled in).
@@ -526,9 +488,8 @@ fn probe_metal() -> BackendProbe {
 fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
     match pref {
         PreferredBackend::Rocm => {
-            // `RocmDevice::new` is infallible but may return a no-stream
-            // fallback device on a GPU-less box; gate on a real probe so we
-            // only select ROCm when a device is actually present.
+            // `RocmDevice::new` is infallible but may return a no-stream fallback device on a GPU-less box; gate
+            // on a real probe so we only select ROCm when a device is actually present.
             let probe = probe_rocm();
             if !probe.available {
                 return None;
@@ -617,14 +578,8 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
     }
 }
 
-/// Select the backend to run a job on.
-///
-/// If `preferred` is `Some(PreferredBackend::X)` and tier X is available, it
-/// is chosen. Otherwise we walk the priority chain `ROCm → CUDA → Vulkan →
-/// Metal → CPU` and pick the first live tier. `Auto` resolves to the top of
-/// that chain.
-///
-/// CPU is always returned as the terminal fallback (it is always present).
+/// Select the backend to run a job on. If `preferred`
+/// is `Some(PreferredBackend::X)` and tier X is available, it is chosen.
 pub fn select_backend(preferred: Option<PreferredBackend>) -> SelectedBackend {
     let pref = preferred.unwrap_or(PreferredBackend::Auto);
 
@@ -635,8 +590,7 @@ pub fn select_backend(preferred: Option<PreferredBackend>) -> SelectedBackend {
             return b;
         }
         // Preferred but unavailable: do NOT silently pretend it worked.
-        // Drop through to the priority chain so the job still runs on the
-        // next-best live device.
+        // Drop through to the priority chain so the job still runs on the next-best live.
     }
 
     for (tier_pref, _dev) in tier_order() {
@@ -650,8 +604,7 @@ pub fn select_backend(preferred: Option<PreferredBackend>) -> SelectedBackend {
 }
 
 /// Construct a concrete ROCm backend for a validated rank ordinal.
-/// `select_backend` intentionally remains the single-device UI fallback; the
-/// multi-rank worker uses this explicit constructor after admission checks.
+/// `select_backend` intentionally remains the single-device UI fallback; the multi-rank worker uses this explicit constructor after.
 pub fn select_rocm_rank(ordinal: usize) -> Result<SelectedBackend, SelectionError> {
     let devices = grim_backend_rocm::RocmDevice::probe()
         .map_err(|e| SelectionError::Tensor(e.to_string()))?;

@@ -1,13 +1,5 @@
 //! MoE resident-set HBM budget (`rocm_kernel_plan.md` WI-C).
-//!
-//! DynaExq-style budget-feasible accounting for the per-expert resident
-//! set: hot experts stay fp16-resident, cold experts demote to int8 (via
-//! the existing `q*k_gemm` dequant path) to fit the HBM envelope. This
-//! module is the *budget envelope* half of `PlanBuilder` (which lives in
-//! `grim-nn::moe`); it tracks current residency and answers "can we
-//! promote expert E to fp16 without breaching the envelope?"
-//!
-//! Pure host logic, unit-testable without a GPU (G-C1's budget-kept check).
+//! DynaExq-style budget-feasible accounting for the per-expert resident set: hot experts stay fp16-resident, cold experts demote.
 
 use std::collections::HashSet;
 
@@ -24,9 +16,8 @@ pub enum ResidentTier {
     Off,
 }
 
-/// HBM envelope tracker for the MoE expert resident set. Knows the
-/// per-tier byte cost of one expert and the total envelope; answers
-/// promotion/demotion queries without touching the device.
+/// HBM envelope tracker for the MoE expert resident set.
+/// Knows the per-tier byte cost of one expert and the total envelope; answers promotion/demotion queries.
 pub struct MoeResidentBudget {
     num_experts: usize,
     bytes_fp16: usize,
@@ -92,9 +83,8 @@ impl MoeResidentBudget {
         freed + new_cost <= self.hbm_envelope_bytes
     }
 
-    /// Promote expert `e` to `tier`. Returns `Err` if the promotion would
-    /// breach the envelope — the caller must demote another expert first
-    /// (the DynaExq top-n eviction policy lives in `PlanBuilder`).
+    /// Promote expert `e` to `tier`. Returns `Err` if the promotion would breach the envelope -
+    /// the caller must demote another expert first (the DynaExq top-n eviction policy lives in `PlanBuilder`).
     pub fn promote(&mut self, e: usize, tier: ResidentTier) -> Result<()> {
         if e >= self.num_experts {
             return Err(Error::Config(format!(
@@ -156,10 +146,7 @@ impl MoeResidentBudget {
 }
 
 /// Dynamic GPU memory allocator managing runtime repartitioning between KV cache and MoE expert slots.
-///
 /// On edge/consumer devices, total VRAM fluctuates and KV cache grows over multi-turn agent sessions.
-/// This structure dynamically adjusts the envelope at scheduler step boundaries (safe points)
-/// without restarting the engine.
 #[derive(Debug, Clone)]
 pub struct ElasticMoEAllocation {
     /// Total VRAM envelope in bytes dedicated to serving.
@@ -176,10 +163,7 @@ pub struct ElasticMoEAllocation {
 
 impl ElasticMoEAllocation {
     /// Create a new elastic allocation given total VRAM and initial KV/expert split.
-    ///
-    /// # Contract
-    /// `slot_size_bytes` must be > 0. Total of `kv_budget_bytes + expert_budget_bytes`
-    /// must not exceed `total_vram_bytes`.
+    /// # Contract `slot_size_bytes` must be > 0.
     pub fn new(
         total_vram_bytes: usize,
         kv_budget_bytes: usize,
@@ -203,9 +187,7 @@ impl ElasticMoEAllocation {
     }
 
     /// Rebalance the split between KV cache and expert cache at a scheduler safe point.
-    ///
-    /// # Contract
-    /// Dynamically shifts capacity. Returns the new number of available expert slots.
+    /// # Contract Dynamically shifts capacity.
     pub fn rebalance(
         &mut self,
         new_kv_budget_bytes: usize,
@@ -225,7 +207,6 @@ impl ElasticMoEAllocation {
 }
 
 /// GPU-resident LRU expert slot residency tracker.
-///
 /// Tracks the mapping of logical `(layer_idx, expert_idx)` to physical GPU cache slot indices.
 #[derive(Debug, Clone)]
 pub struct LruResidencyTracker {
@@ -262,10 +243,7 @@ impl LruResidencyTracker {
     }
 
     /// Allocate or evict an LRU slot to admit `(layer_idx, expert_idx)`.
-    ///
-    /// # Contract
-    /// If free slot exists, uses it. Otherwise evicts the least recently used slot.
-    /// Returns `(allocated_slot_idx, evicted_expert_if_any)`.
+    /// # Contract If free slot exists, uses it.
     pub fn admit(&mut self, layer: usize, expert: usize) -> (usize, Option<(usize, usize)>) {
         if let Some(slot) = self.lookup(layer, expert) {
             return (slot, None);
@@ -392,8 +370,10 @@ impl OffloadMoeCache {
         let gemm_duration = (experts.len() as f64) * 2.0; // Simulated GEMM compute duration
 
         if self.prefill_overlap {
-            let last_load = (self.last_load_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
-            let last_gemm = (self.last_gemm_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
+            let last_load =
+                (self.last_load_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
+            let last_gemm =
+                (self.last_gemm_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
 
             // Load can start as soon as the previous load finishes
             let load_start = last_load;
@@ -403,26 +383,51 @@ impl OffloadMoeCache {
             let gemm_start = load_end.max(last_gemm);
             let gemm_end = gemm_start + gemm_duration;
 
-            self.last_load_end.store((load_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
-            self.last_gemm_end.store((gemm_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
+            self.last_load_end.store(
+                (load_end * 1000.0) as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.last_gemm_end.store(
+                (gemm_end * 1000.0) as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
 
             (
-                TimeRange { start: load_start, end: load_end },
-                TimeRange { start: gemm_start, end: gemm_end },
+                TimeRange {
+                    start: load_start,
+                    end: load_end,
+                },
+                TimeRange {
+                    start: gemm_start,
+                    end: gemm_end,
+                },
             )
         } else {
-            let last_end = (self.last_gemm_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
+            let last_end =
+                (self.last_gemm_end.load(std::sync::atomic::Ordering::SeqCst) as f64) * 0.001;
             let load_start = last_end;
             let load_end = load_start + load_duration;
             let gemm_start = load_end;
             let gemm_end = gemm_start + gemm_duration;
 
-            self.last_load_end.store((load_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
-            self.last_gemm_end.store((gemm_end * 1000.0) as u64, std::sync::atomic::Ordering::SeqCst);
+            self.last_load_end.store(
+                (load_end * 1000.0) as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.last_gemm_end.store(
+                (gemm_end * 1000.0) as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
 
             (
-                TimeRange { start: load_start, end: load_end },
-                TimeRange { start: gemm_start, end: gemm_end },
+                TimeRange {
+                    start: load_start,
+                    end: load_end,
+                },
+                TimeRange {
+                    start: gemm_start,
+                    end: gemm_end,
+                },
             )
         }
     }

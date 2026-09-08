@@ -1,12 +1,5 @@
 //! FreeToken Weight (FTW) bank layout and fast bootstrap loading.
-//!
-//! Conventional checkpoints store expert weights as individual fragmented tensors per layer,
-//! which requires extensive tensor discovery, dictionary lookups, and scatter allocations at startup.
-//! FTW normalizes MoE weights into contiguous expert banks whose leading dimension is the
-//! flattened `(layer_idx * num_experts + expert_idx)` index.
-//!
-//! This layout allows zero-repack direct I/O loading straight into host DRAM banks and unified
-//! single-descriptor DMA transfers over PCIe.
+//! Conventional checkpoints store expert weights as individual fragmented tensors per layer, which requires extensive tensor.
 
 use std::collections::HashMap;
 
@@ -68,9 +61,7 @@ pub struct FtwHeader {
 
 impl FtwHeader {
     /// Create a new FTW header and calculate canonical bank byte dimensions.
-    ///
-    /// # Contract
-    /// Dimensions must be non-zero.
+    /// # Contract Dimensions must be non-zero.
     pub fn new(
         num_layers: usize,
         num_experts: usize,
@@ -141,9 +132,7 @@ impl FtwHeader {
     }
 
     /// Calculate the byte offset for an expert `(layer_idx, expert_idx)` within a named bank.
-    ///
-    /// # Contract
-    /// `layer_idx < num_layers` and `expert_idx < num_experts`.
+    /// # Contract `layer_idx < num_layers` and `expert_idx < num_experts`.
     pub fn expert_byte_offset(
         &self,
         bank_name: &str,
@@ -186,10 +175,7 @@ impl FtwHostBank {
     }
 
     /// Pin the populated memory pages using `libc::mlock` to accelerate PCIe DMA transfers.
-    ///
-    /// # Safety & FFI Contract
-    /// Complies with `rust-ffi-grim`: non-null buffer pointer and bounded size check.
-    /// Gracefully ignores failure if OS user resource limits (RLIMIT_MEMLOCK) deny locking.
+    /// # Safety & FFI Contract Complies with `rust-ffi-grim`: non-null buffer pointer and bounded size check.
     pub fn pin_memory(&mut self) -> bool {
         if self.data.is_empty() || self.is_pinned {
             return self.is_pinned;
@@ -247,10 +233,8 @@ impl FtwDirectLoader {
         Ok(bank.data.len())
     }
 
-    /// Post-load pin all populated host banks.
-    ///
-    /// # Contract
-    /// Called after all weights are written to disk layout to avoid initial zero-fault stalls.
+    /// Post-load pin all populated host banks. # Contract Called after all
+    /// weights are written to disk layout to avoid initial zero-fault stalls.
     pub fn pin_all_banks(&mut self) -> usize {
         let mut pinned_count = 0;
         for bank in self.banks.values_mut() {

@@ -18,9 +18,7 @@
 //!   on this system.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{DType, Shape,
-    CoreTensorOps,
-};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;

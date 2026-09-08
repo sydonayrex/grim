@@ -1,21 +1,11 @@
 //! Extend-path Attention & Log-Sum-Exp (LSE) Chunk Merging for ROCm.
-//!
-//! Enables chunked context processing over long prefix-cached contexts (100k+ tokens)
-//! and multi-turn conversations with exact mathematical state merging.
+//! Enables chunked context processing over long prefix-cached contexts (100k+ tokens) and multi-turn conversations with exact.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// Extend Attention Chunk Kernel
-// ---------------------------------------------------------------------------
-//
-// Computes attention for a batch of query tokens against a specific slice
-// [chunk_start, chunk_end) of the context KV cache.
-//
-// Grid: (num_tokens, num_heads)
-// Block: (head_dim, 1) or (128, 1)
-// ---------------------------------------------------------------------------
+// Extend Attention Chunk Kernel Computes attention for a batch of query tokens against a specific slice [chunk_start, chunk_end) of the context KV cache.
+// Grid: (num_tokens, num_heads) Block: (head_dim, 1) or (128, 1)
 __global__ void grim_extend_attention_chunk(
     const float* __restrict__ q,          // [num_tokens, num_heads, head_dim]
     const float* __restrict__ k_cache,    // [total_context_len, num_kv_heads, head_dim]
@@ -95,16 +85,8 @@ __global__ void grim_extend_attention_chunk(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Merge Attention States Kernel (Log-Sum-Exp Combination)
-// ---------------------------------------------------------------------------
-//
-// Merges state A (O_a, LSE_a) with state B (O_b, LSE_b) into state Out (O_out, LSE_out)
-// using numerically exact log-sum-exp combination.
-//
-// Grid: (num_tokens, num_heads)
-// Block: (head_dim, 1) or (128, 1)
-// ---------------------------------------------------------------------------
+// Merge Attention States Kernel (Log-Sum-Exp Combination) Merges state A (O_a, LSE_a) with state B (O_b, LSE_b) into state Out (O_out, LSE_out) using numerically exact log-sum-exp combination.
+// Grid: (num_tokens, num_heads) Block: (head_dim, 1) or (128, 1)
 __global__ void grim_merge_attn_states(
     const float* __restrict__ out_a,      // [num_tokens, num_heads, head_dim]
     const float* __restrict__ lse_a,      // [num_tokens, num_heads]

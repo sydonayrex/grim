@@ -1,12 +1,5 @@
-//! WI-TOOLS-4 — Post-hoc parsing of model output into structured tool calls.
-//!
-//! Input: the model's raw completion string plus a family hint. Output:
-//! [`ParseOutcome`] — `Some(tool_calls)` when parsing clearly succeeds, `None`
-//! when no tool call is detected (treat as ordinary content).
-//!
-//! **Contract:** never guess. If we cannot clearly extract a well-formed call,
-//! return `None` so the caller falls back to plain content. A failed parse is
-//! not a request failure.
+//! WI-TOOLS-4 - Post-hoc parsing of model output into structured tool calls.
+//! Input: the model's raw completion string plus a family hint.
 
 use grim_format::ToolCallMsg;
 
@@ -34,11 +27,7 @@ pub struct ParseOutcome {
 }
 
 /// Resolve the parse convention from a model's embedded chat template text.
-///
-/// Heuristic, best-effort: a template that mentions `tool_call` (Hermes-2-Pro
-/// and its descendants) gets tag-delimited parsing; otherwise we fall back to
-/// the Auto scanner. This is deliberately cheap — it only biases which
-/// strategy is tried first, and Auto runs all of them anyway.
+/// Heuristic, best-effort: a template that mentions `tool_call` (Hermes-2-Pro and its descendants) gets tag-delimited parsing; otherwise.
 pub fn resolve_tool_family(template: &str) -> ToolFamily {
     let lower = template.to_ascii_lowercase();
     if lower.contains("tool_call") || lower.contains("<tool_call") {
@@ -48,16 +37,11 @@ pub fn resolve_tool_family(template: &str) -> ToolFamily {
     }
 }
 
-/// F-9/WI-E8: per-architecture detector registry. Maps a model family to the
-/// tool-call convention its checkpoints emit natively, so parsing doesn't
-/// depend on template-text heuristics for known families. Unknown archs fall
-/// back to [`resolve_tool_family`], then the Auto scanner inside
-/// [`parse_tool_calls`].
+/// F-9/WI-E8: per-architecture detector registry.
+/// Maps a model family to the tool-call convention its checkpoints emit natively, so parsing doesn't.
 pub fn family_for_arch(arch: &str) -> ToolFamily {
-    // Input is the GGUF `general.architecture` value (e.g. "llama", "lfm2"),
-    // optionally provider-prefixed ("hf:llama") — resolve to the part after
-    // the prefix when present. Normalize case so checkpoint casing quirks
-    // don't defeat the registry.
+    // Input is the GGUF `general.architecture` value (e.g.
+    // "llama", "lfm2"), optionally provider-prefixed ("hf:llama") - resolve to the part after the prefix when present.
     let stripped = match arch.trim().split_once(':') {
         Some((_prefix, rest)) if !rest.is_empty() => rest,
         _ => arch.trim(),
@@ -77,10 +61,8 @@ pub fn family_for_arch(arch: &str) -> ToolFamily {
     }
 }
 
-/// Combined family resolution (§WI-E8 integration): a template-derived
-/// convention wins when the template text identifies one specifically;
-/// otherwise fall back to the loaded model's GGUF architecture via
-/// [`family_for_arch`]; otherwise the Auto scanner.
+/// Combined family resolution (§WI-E8 integration): a template-derived convention wins when the template text identifies one
+/// specifically; otherwise fall back to the loaded model's GGUF architecture via [`family_for_arch`]; otherwise the Auto scanner.
 pub fn resolve_effective_tool_family(template: &str, model_arch: Option<&str>) -> ToolFamily {
     match resolve_tool_family(template) {
         ToolFamily::Auto => model_arch.map(family_for_arch).unwrap_or(ToolFamily::Auto),
@@ -89,14 +71,7 @@ pub fn resolve_effective_tool_family(template: &str, model_arch: Option<&str>) -
 }
 
 /// Parse a completion string for tool calls under a given family convention.
-///
-/// Returns `ParseOutcome { calls: Some(..), .. }` on a clean parse, or
-/// `{ calls: None, .. }` when no call was detected or the candidate text did
-/// not parse as well-formed JSON. Never fails the request — see module docs.
-///
-/// The `family` hint selects the *primary* convention to try first; on a miss
-/// we fall back to the other convention so a mislabeled template still works
-/// in the obvious way (rather than giving up). `Auto` tries both in order.
+/// Returns `ParseOutcome { calls: Some(..), ..
 pub fn parse_tool_calls(completion: &str, family: ToolFamily) -> ParseOutcome {
     if family == ToolFamily::BracketFirst {
         let bracket = parse_bracket_call(completion);
@@ -170,9 +145,8 @@ impl RunawayReason {
     }
 }
 
-/// WI-TOOLS-4c-ii helper: count every `tool_calls` entry across all assistant
-/// messages in `messages`, regardless of name/arguments — the total tool-call
-/// budget consumed so far by this conversation.
+/// WI-TOOLS-4c-ii helper: count every `tool_calls` entry across all assistant messages in `messages`, regardless
+/// of name/arguments - the total tool-call budget consumed so far by this conversation.
 pub fn count_total_prior_tool_calls(messages: &[grim_format::ChatMessage]) -> usize {
     let mut total = 0;
     for m in messages {
@@ -185,15 +159,8 @@ pub fn count_total_prior_tool_calls(messages: &[grim_format::ChatMessage]) -> us
     total
 }
 
-/// WI-TOOLS-4b — Repeated tool call guard.
-///
-/// Count how many times `(name, canonicalized_arguments)` already appears among
-/// prior assistant `tool_calls` entries in `messages`. Canonicalizes
-/// `arguments` by parsing the JSON string and re-serializing with sorted keys
-/// so `{"city":"NYC","units":"F"}` and `{"units":"F","city":"NYC"}` compare
-/// equal. Falls back to raw-string comparison if a prior call's `arguments`
-/// isn't valid JSON (defensive — a client-replayed history could in principle
-/// contain anything; a non-JSON arguments string must never panic the counter).
+/// WI-TOOLS-4b - Repeated tool call guard. Count how many times
+/// `(name, canonicalized_arguments)` already appears among prior assistant `tool_calls` entries in `messages`.
 pub fn count_prior_identical_calls(
     messages: &[grim_format::ChatMessage],
     name: &str,
@@ -215,9 +182,8 @@ pub fn count_prior_identical_calls(
     count
 }
 
-/// Parse + re-serialize a JSON arguments string with sorted keys, so reordered
-/// keys compare equal. On a parse failure the raw string is returned unchanged
-/// (raw-string fallback per the spec).
+/// Parse + re-serialize a JSON arguments string with sorted keys, so reordered keys compare equal.
+/// On a parse failure the raw string is returned unchanged (raw-string fallback per the spec).
 fn canonicalize_args(arguments: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(v) => {
@@ -228,8 +194,7 @@ fn canonicalize_args(arguments: &str) -> String {
 }
 
 /// Recursively rebuild a `serde_json::Value` with object keys sorted ascending,
-/// so two structurally-equal-but-differently-ordered arguments canonicalize to
-/// the same string.
+/// so two structurally-equal-but-differently-ordered arguments canonicalize to the same string.
 fn sort_json_keys(v: serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::Object(map) => {
@@ -316,11 +281,8 @@ fn extract_call(value: &str) -> Option<ToolCallMsg> {
     extract_call_value(&v)
 }
 
-/// F-4: LFM2.5 bracket-call convention —
-/// `<|tool_call_start|>[name(arg=val, ...)]<|tool_call_end|>`.
-/// Parses Python-literal-style arguments (unquoted strings, True/False/None)
-/// into a JSON arguments string. Returns `calls: None` when no marker pair is
-/// present so the caller falls back cleanly to plain content.
+/// F-4: LFM2.5 bracket-call convention - `<|tool_call_start|>[name(arg=val, ...)]<|tool_call_end|>`.
+/// Parses Python-literal-style arguments (unquoted strings, True/False/None) into a JSON arguments string.
 fn parse_bracket_call(completion: &str) -> ParseOutcome {
     const START: &str = "<|tool_call_start|>";
     const END: &str = "<|tool_call_end|>";
@@ -356,9 +318,8 @@ fn parse_bracket_call(completion: &str) -> ParseOutcome {
     }
 }
 
-/// Parse `name(arg=val, ...)` into a `ToolCallMsg`. Arguments use the
-/// Python-literal forms LFM2.5 emits: bare identifiers for strings,
-/// `True`/`False`/`None`, numbers, and nested lists/objects.
+/// Parse `name(arg=val, ...)` into a `ToolCallMsg`.
+/// Arguments use the Python-literal forms LFM2.5 emits: bare identifiers for strings, `True`/`False`/`None`, numbers, and nested.
 fn parse_fn_literal(s: &str) -> Option<ToolCallMsg> {
     let open = s.find('(')?;
     if !s.ends_with(')') {
@@ -596,9 +557,8 @@ mod tests {
         );
     }
 
-    /// WI-TOOLS-4b: identical call arguments (with reordered keys) must count
-    /// as a repeat. Canonicalization normalizes `{"a":1,"b":2}` and
-    /// `{"b":2,"a":1}` to the same string.
+    /// WI-TOOLS-4b: identical call arguments (with reordered keys) must count as a repeat.
+    /// Canonicalization normalizes `{"a":1,"b":2}` and `{"b":2,"a":1}` to the same string.
     #[test]
     fn counts_prior_identical_call_with_reorder() {
         let prior = vec![ChatMessage {

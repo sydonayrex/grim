@@ -1,12 +1,5 @@
-//! ViewModel — deterministic projection of `DisplayState` into the
-//! strings/structs/IDs that the UI surface consumes.
-//!
-//! The UI components (and any future React/Vite/Tauri renderer) render
-//! from this layer rather than from the raw `UiAppState`. This keeps
-//! every piece of UI text testable and stable across renderer swaps.
-//!
-//! `ViewModel::from(&state)` is the single entry point. Render-impls
-//! consume the resulting struct read-only via the [`panel`] submodules.
+//! ViewModel - deterministic projection of `DisplayState` into the strings/structs/IDs that the UI surface consumes.
+//! The UI components (and any future React/Vite/Tauri renderer) render from this layer rather than from.
 
 pub mod hyperparam;
 pub mod job_card;

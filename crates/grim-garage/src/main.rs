@@ -1,13 +1,5 @@
-//! grim-garage — local-first training dashboard web application (WI-T9 & WI-T10).
-//!
-//! Serves the browser web UI and JSON API on `GRIM_GARAGE_BIND_ADDR`
-//! (default `127.0.0.1:8741`).
-//!
-//! WI-4: the default bind is loopback, matching `grim serve`. `grim-garage`
-//! exposes unauthenticated write endpoints (`/api/train/start`), so a
-//! LAN-reachable default would put a training control plane on the network
-//! without the operator asking for it. Binding publicly stays available via
-//! `--bind 0.0.0.0:8741` or `GRIM_GARAGE_BIND_ADDR`, and warns when used.
+//! grim-garage - local-first training dashboard web application (WI-T9 & WI-T10).
+//! Serves the browser web UI and JSON API on `GRIM_GARAGE_BIND_ADDR` (default `127.0.0.1:8741`).
 
 use clap::Parser;
 use grim_garage::{
@@ -75,8 +67,7 @@ mod tests {
     use clap::CommandFactory;
 
     /// WI-4 regression guard: the default bind must stay on loopback.
-    /// `grim-garage` serves unauthenticated training-control write endpoints,
-    /// so a `0.0.0.0` default would silently publish them to the LAN.
+    /// `grim-garage` serves unauthenticated training-control write endpoints, so a `0.0.0.0` default would silently publish them to.
     #[test]
     fn test_default_bind_is_loopback() {
         let args = Args::parse_from(["grim-garage"]);

@@ -2,9 +2,9 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test fsdp_parity`.
 
-use grim_tensor::Shape;
 use grim_backend_vulkan::collective::VkCommunicator;
 use grim_backend_vulkan::fsdp::{VkFsdpConfig, VkFsdpGroup};
+use grim_tensor::Shape;
 
 #[test]
 fn fsdp_shard_shape_splits_first_dim() {

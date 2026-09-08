@@ -1,9 +1,5 @@
 //! Compatibility loader and native implementation for `internlm/Intern-S2-Mobius`.
-//!
-//! # Architecture Details
-//! - **Fused Wqkv Projection**: Single weight matrix `attention.wqkv` projecting query, key, and value vectors.
-//! - **GQA Attention**: Grouped Query Attention with RoPE rotary embeddings.
-//! - **SwiGLU FFN**: $w_1$ (gate), $w_3$ (up), and $w_2$ (down) feed-forward projections with RMSNorm normalization.
+//! # Architecture Details - **Fused Wqkv Projection**: Single weight matrix `attention.wqkv` projecting query, key, and.
 
 use std::sync::Arc;
 
@@ -11,15 +7,12 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Device helpers
-// ---------------------------------------------------------------------------
 
-/// Upload host f32 rows onto `device` (GPU-first). Used to hand results of
-/// documented kernel-gap host loops back to the device residency of their
-/// inputs instead of leaving the residual stream on CPU.
+/// Upload host f32 rows onto `device` (GPU-first).
+/// Used to hand results of documented kernel-gap host loops back to the device residency of.
 fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -> Result<Tensor> {
     let shape = Shape::new(vec![rows, cols]);
     let dev = grim_nn::modules::pick_device_for_storage_device(device);
@@ -33,9 +26,7 @@ fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Intern-S2-Mobius architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,9 +91,7 @@ impl InternS2MobiusConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct InternS2MobiusBlock {
     pub wqkv: Linear,
@@ -169,12 +158,8 @@ impl InternS2MobiusBlock {
         })
     }
 
-    /// GPU-first forward. NOTE: the fused `wqkv` projection interleaves
-    /// Q/K/V column-wise per row and there is no device-side column-split
-    /// kernel yet, so the split stays host-side (documented kernel gap —
-    /// one D2H of the qkv activation). The split Q/K/V are uploaded once;
-    /// RoPE, the KV-cache concat, causal attention and the SwiGLU MLP all
-    /// run device-first.
+    /// GPU-first forward. NOTE: the fused `wqkv` projection interleaves Q/K/V column-wise per row and there is no device-side
+    /// column-split kernel yet, so the split stays host-side (documented kernel gap - one D2H of the qkv activation).
     pub fn forward(
         &self,
         x: &Tensor,
@@ -210,12 +195,8 @@ impl InternS2MobiusBlock {
         let k = f32_rows_on_device(x.device(), &k_v, seq_len, kv_dim)?;
         let v = f32_rows_on_device(x.device(), &v_v, seq_len, kv_dim)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -262,9 +243,7 @@ impl InternS2MobiusBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct InternS2Mobius {
     pub cfg: InternS2MobiusConfig,

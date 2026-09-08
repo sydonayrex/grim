@@ -80,11 +80,16 @@ fn test_scythe_host_materialization_numeric_correctness() {
             g_out[i] = 2.0 * diff;
         }
 
-        if step == 0 { initial_loss = loss; }
-        if step == 9 { final_loss = loss; }
+        if step == 0 {
+            initial_loss = loss;
+        }
+        if step == 9 {
+            final_loss = loss;
+        }
 
         let g_tensor = cpu_tensor(g_out, Shape::new(vec![1, d_out]));
-        opt.fused_step("layer", &mut adapter, &g_tensor, &x).unwrap();
+        opt.fused_step("layer", &mut adapter, &g_tensor, &x)
+            .unwrap();
 
         let u_vals = adapter.u.to_vec_f32().unwrap();
         let v_vals = adapter.v.to_vec_f32().unwrap();

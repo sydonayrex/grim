@@ -1,8 +1,5 @@
 //! ScytheRing persistent dispatch kernel for CUDA.
-//!
 //! Ported from grim-backend-rocm `kernels/scythe_persistent.rs`.
-//! Device-side opcode loop for persistent-kernel serving on CUDA (Volta+).
-//! Matches `scythe_task_descriptor_t` and `moe_task_descriptor_t` FFI layouts.
 
 pub const SCYTHE_PERSISTENT_SOURCE: &str = r#"
 #include <cuda_fp16.h>

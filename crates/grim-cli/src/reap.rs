@@ -1,8 +1,5 @@
-//! grim reap — launch an external app with a grim-tracked model baked in.
-//!
-//! Mirrors ollama's `ollama launch` flow: resolve a tracked model, verify the
-//! binary exists, inject env vars so the child routes through the local grim
-//! serve, and exec with passthrough args after `--`.
+//! grim reap - launch an external app with a grim-tracked model baked in.
+//! Mirrors ollama's `ollama launch` flow: resolve a tracked model, verify the binary exists, inject env.
 
 use crate::ClientIntegration;
 use crate::catalog::resolve_model_preferring_grim;

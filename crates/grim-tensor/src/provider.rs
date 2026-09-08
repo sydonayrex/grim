@@ -1,21 +1,17 @@
-//! `TensorProvider` — abstraction over a checkpoint source. Both GGUF and
-//! safetensors-backed readers implement this; `WeightSource` (in
-//! `grim-nn`) walks it depth-first by prefix.
+//! `TensorProvider` — abstraction over checkpoint sources like GGUF and Safetensors.
+//! Traversed depth-first by `grim_nn::WeightSource`.
 
 use crate::dtype::{DType, QuantProvenance, Storage};
 use crate::error::{Error, Result};
 
-/// Resolved-at-load dtype + provenance for a tensor inside a checkpoint.
-/// Read from the checkpoint's per-tensor metadata (GGUF kv, safetensors
-/// metadata), with call sites providing defaults.
+/// Resolved-at-load dtype and provenance metadata for a checkpoint tensor.
+/// Populated from container keys or defaults.
 #[derive(Debug, Clone)]
 pub struct TensorMeta {
     pub dtype: DType,
     pub provenance: QuantProvenance,
     pub shape: Vec<usize>,
-    /// Kernel fusion dispatch hints (bit0 = RmsNormMatMul,
-    /// bit1 = QkvAttention). Zero = no fusion requested. Source: the
-    /// `.grim` tensor capability extension's `fusion_mask` field.
+    /// Kernel fusion dispatch hints (bit0 = RmsNormMatMul, bit1 = QkvAttention).
     pub fusion_mask: u8,
 }
 
@@ -30,9 +26,7 @@ impl TensorMeta {
     }
 }
 
-/// Raw byte source for a single tensor. Backends convert to their native
-/// layout (F32 vec on CPU, raw bytes + scale/zero on ROCm, ...) when
-/// materializing a tensor from `TensorProvider`.
+/// Raw byte source for a single tensor, converted to native backend layout upon materialization.
 pub trait TensorProvider: Send + Sync {
     /// Look up a tensor by slash-separated path (e.g. `"model.layers.0.wq"`).
     fn get(&self, name: &str) -> Result<RawTensor>;
@@ -45,27 +39,14 @@ pub trait TensorProvider: Send + Sync {
     /// materializing the full tensor (shape, dtype, provenance).
     fn meta(&self, name: &str) -> Result<TensorMeta>;
 
-    /// Enumerate every tensor name this provider can `get`/`get_packed`.
-    ///
-    /// Used by [`grim_nn::WeightSource::prefetch_all`] to parallelize disk
-    /// reads + per-tensor CPU passes (e.g. MXFP4 reframing) ahead of the
-    /// layer-construction loop, eliminating the serial per-tensor read that
-    /// otherwise dominates model load time. The default returns an empty list,
-    /// which makes prefetch a no-op (callers fall back to on-demand reads) —
-    /// providers that don't implement this are unaffected.
+    /// Enumerate all tensor names for ahead-of-time parallel prefetching.
+    /// Returns an empty vector by default.
     fn tensor_names(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Fetch the rank-th shard of a tensor, splitting along `dim`.
-    ///
-    /// `dim == 0` shards rows (column-parallel): each rank owns a contiguous
-    /// block of output rows. `dim == 1` shards columns (row-parallel): each
-    /// rank owns every rank-th stride of each row.
-    ///
-    /// The default implementation calls [`shard_raw_tensor`], which only works
-    /// for native (F32/F16) storage — quantized layouts require a provider
-    /// override (see `GgufProvider::get_packed_sharded`).
+    /// Fetch the rank-th shard of a tensor, splitting along `dim` (0=rows, 1=cols).
+    /// Default implementation uses [`shard_raw_tensor`] for unquantized weights.
     fn get_packed_sharded(
         &self,
         name: &str,
@@ -78,9 +59,7 @@ pub trait TensorProvider: Send + Sync {
     }
 }
 
-/// Validate that `out_dim` is evenly divisible by `world_size` for the given
-/// block size (used by GGUF block-quant sharding). Returns `Err` if the shard
-/// boundary would split a quantization block.
+/// Validates that `out_dim` divides evenly by `world_size` without splitting quantization blocks.
 pub fn shard_boundary_valid(out_dim: usize, world_size: usize, block_size: usize) -> bool {
     if world_size == 0 {
         return false;
@@ -92,9 +71,7 @@ pub fn shard_boundary_valid(out_dim: usize, world_size: usize, block_size: usize
     shard_size % block_size == 0
 }
 
-/// CPU-side sharding fallback for `get_packed_sharded`. Handles dim==0 (contiguous
-/// row slice) and dim==1 (per-row strided copy); errors on non-native storage or
-/// quantized provenance that requires a provider-specific byte-range override.
+/// CPU-side fallback for `get_packed_sharded` supporting contiguous rows or strided columns.
 pub fn shard_raw_tensor(
     raw: RawTensor,
     dim: usize,
@@ -141,9 +118,7 @@ pub fn shard_raw_tensor(
 
     let (rows, cols) = (shape[0], shape[1]);
 
-    // Non-divisible dims would silently truncate (rows / world_size) and
-    // drop the tail from every rank — that is silent weight corruption,
-    // so refuse instead.
+    // Reject non-divisible dimensions to prevent silent weight truncation.
     if rows % world_size != 0 || cols % world_size != 0 {
         return Err(Error::Shape(format!(
             "shard_raw_tensor: dims {rows}x{cols} not divisible by world_size {world_size} \

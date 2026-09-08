@@ -108,8 +108,8 @@ impl T5Block {
         let _k = self.wk.forward(&norm_x)?;
         let _v = self.wv.forward(&norm_x)?;
         let attn_out = self.wo.forward(&q)?;
-        let x_res1 = grim_nn::modules::add_on_device(x, &attn_out)
-            .map_err(grim_core::Error::Tensor)?;
+        let x_res1 =
+            grim_nn::modules::add_on_device(x, &attn_out).map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let up = self.ffn_up.forward(&norm_x2)?;
@@ -135,12 +135,8 @@ impl T5 {
         Self::load_tp(ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for T5. T5 is an encoder–decoder model
-    /// with both self- and cross-attention in the decoder; sharding the
-    /// cross-attention correctly adds symmetrical constraints beyond the
-    /// plain column/row split, and `T5Block::forward` calls plain
-    /// `Linear::forward` (no all-reduce hook). Refuses `world_size > 1`
-    /// until the cross-attention sharding + `forward` rework land.
+    /// Tensor-parallel load entry for T5. T5 is an encoder-decoder model with both self- and cross-attention in the decoder; sharding
+    /// the cross-attention correctly adds symmetrical constraints beyond the plain column/row split, and `T5Block::forward` calls plain `Linear::forward` (no all-reduce hook).
     pub fn load_tp(
         ws: &grim_nn::WeightSource<'_>,
         cfg: T5Config,

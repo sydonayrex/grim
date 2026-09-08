@@ -9,9 +9,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::configs::PhiConfig;
 use crate::model::{Llama, LlamaConfig};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct PhiMoeConfig {
@@ -39,9 +37,7 @@ impl ModelConfig for PhiMoeConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama
 
 pub struct PhiMoe {
     pub cfg: PhiConfig,

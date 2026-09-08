@@ -13,8 +13,6 @@ use crate::device::handles::CudaHandle;
 use crate::memory::storage::CudaStorage;
 
 impl RecurrentOps for CudaDevice {
-
-
     fn selective_scan(
         &self,
         x: &dyn BackendStorage,
@@ -91,7 +89,6 @@ impl RecurrentOps for CudaDevice {
         ))
     }
 
-
     fn rwkv_time_mix(
         &self,
         x: &dyn BackendStorage,
@@ -151,7 +148,6 @@ impl RecurrentOps for CudaDevice {
         ))
     }
 
-
     fn rwkv_channel_mix(
         &self,
         x: &dyn BackendStorage,
@@ -194,7 +190,6 @@ impl RecurrentOps for CudaDevice {
     }
 
     /// Depthwise 1D causal convolution step on CUDA GPU.
-    ///
     /// Executes the causal convolution step kernel against resident GPU state buffers.
     fn short_conv1d_causal_step(
         &self,
@@ -225,10 +220,9 @@ impl RecurrentOps for CudaDevice {
         let mut w_ptr = Self::dev_ptr_or_err("short_conv1d weight", w_s)?;
         let mut b_ptr = match bias {
             Some(b) => {
-                let b_s = b
-                    .as_any()
-                    .downcast_ref::<CudaStorage>()
-                    .ok_or_else(|| Error::Backend("short_conv1d: bias is not CudaStorage".into()))?;
+                let b_s = b.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+                    Error::Backend("short_conv1d: bias is not CudaStorage".into())
+                })?;
                 Self::ensure_f32_input("short_conv1d bias", b_s)?;
                 Self::dev_ptr_or_err("short_conv1d bias", b_s)?
             }
@@ -272,30 +266,32 @@ impl RecurrentOps for CudaDevice {
         d_v: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = q
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kda_gated_delta_rule_step: q is not CudaStorage".into()))?;
-        let k_s = k
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kda_gated_delta_rule_step: k is not CudaStorage".into()))?;
-        let v_s = v
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kda_gated_delta_rule_step: v is not CudaStorage".into()))?;
-        let beta_s = beta
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kda_gated_delta_rule_step: beta is not CudaStorage".into()))?;
+        let q_s = q.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("kda_gated_delta_rule_step: q is not CudaStorage".into())
+        })?;
+        let k_s = k.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("kda_gated_delta_rule_step: k is not CudaStorage".into())
+        })?;
+        let v_s = v.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("kda_gated_delta_rule_step: v is not CudaStorage".into())
+        })?;
+        let beta_s = beta.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("kda_gated_delta_rule_step: beta is not CudaStorage".into())
+        })?;
         let a_gate_s = a_gate
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kda_gated_delta_rule_step: a_gate is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("kda_gated_delta_rule_step: a_gate is not CudaStorage".into())
+            })?;
         let state_s = recurrent_state
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kda_gated_delta_rule_step: recurrent_state is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend(
+                    "kda_gated_delta_rule_step: recurrent_state is not CudaStorage".into(),
+                )
+            })?;
 
         Self::ensure_f32_input("kda q", q_s)?;
         Self::ensure_f32_input("kda k", k_s)?;
@@ -331,4 +327,3 @@ impl RecurrentOps for CudaDevice {
         Ok((Box::new(out), handle))
     }
 }
-

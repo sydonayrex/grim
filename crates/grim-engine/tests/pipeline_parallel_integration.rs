@@ -8,7 +8,7 @@
 //!
 //! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-30
 
-use std::sync::Arc;
+use grim_backend_cpu::storage::CpuStorage;
 use grim_core::error::Result;
 use grim_engine::pipeline_engine::{
     PipelinePlan, PipelineStageExecutor, PipelineStageRunner, PipelinedModelCoordinator,
@@ -17,12 +17,18 @@ use grim_memory::KvBlockPool;
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
-use grim_backend_cpu::storage::CpuStorage;
+use std::sync::Arc;
 
 fn make_cpu_tensor(data: Vec<f32>, shape: Vec<usize>) -> Tensor {
     let s = Shape::new(shape);
     let storage = Arc::new(CpuStorage::new(data, s.clone(), DType::F32));
-    Tensor::new(storage, s, DType::F32, QuantProvenance::GrimNative, Device::Cpu)
+    Tensor::new(
+        storage,
+        s,
+        DType::F32,
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    )
 }
 
 #[test]
@@ -114,7 +120,10 @@ fn test_pipelined_model_coordinator_multi_stage_execution_parity() {
     let pipe_vec = pipelined_output.to_vec_f32().unwrap();
     assert_eq!(pipe_vec.len(), seq_out.len());
     for (p, s) in pipe_vec.iter().zip(seq_out.iter()) {
-        assert!((p - s).abs() < 1e-5, "Mismatch between pipelined and sequential output");
+        assert!(
+            (p - s).abs() < 1e-5,
+            "Mismatch between pipelined and sequential output"
+        );
     }
 }
 

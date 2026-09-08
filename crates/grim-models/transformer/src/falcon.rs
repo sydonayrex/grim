@@ -1,10 +1,5 @@
 //! Falcon causal language model architecture with parallel attention and fused QKV.
-//!
-//! # Architecture Details
-//! - **Fused QKV**: A single linear layer projects the normalized input into concatenated Q, K, and V matrices.
-//! - **Parallel Attention & MLP**: Attention and MLP branches operate concurrently on normalized inputs:
-//!   `x_out = x + Attn(LN_attn(x)) + MLP(LN_mlp(x))`.
-//! - **Rotary Embedding (RoPE)**: Applied to queries and keys per attention head.
+//! # Architecture Details - **Fused QKV**: A single linear layer projects the normalized input into.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,16 +8,10 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // LayerNorm
-// ---------------------------------------------------------------------------
 
 /// Standard LayerNorm with learnable scale and bias.
-///
-/// Host-side kernel gap: no backend currently exposes a LayerNorm device
-/// kernel (grim-nn's own `LayerNorm` is host-bound too), so `forward` pulls
-/// the input and weight/bias once per call and returns a host tensor.
-/// Callers re-upload the result onto the activation's device.
+/// Host-side kernel gap: no backend currently exposes a LayerNorm device kernel (grim-nn's own `LayerNorm` is.
 #[derive(Clone)]
 pub struct LayerNorm {
     pub weight: Tensor,
@@ -64,9 +53,7 @@ impl LayerNorm {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Falcon model architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -118,9 +105,7 @@ impl ModelConfig for FalconConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 /// A single Falcon transformer layer featuring fused QKV and parallel residual branches.
 pub struct FalconBlock {
@@ -197,11 +182,7 @@ impl FalconBlock {
     }
 
     /// Evaluates forward pass over input hidden states, returning the output activations.
-    ///
-    /// GPU-first: RoPE, KV-cache concat and attention run on the tensor's
-    /// device. The fused-QKV split and the GELU activation stay host-side
-    /// (no device column-slice / GELU kernels); each pulls once per call and
-    /// re-uploads only the split pieces.
+    /// GPU-first: RoPE, KV-cache concat and attention run on the tensor's device.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -280,9 +261,8 @@ impl FalconBlock {
         };
         let kv_len = k_all.shape().dims()[0];
 
-        // GQA attention on-device; the shared helper applies the causal mask
-        // at cache_offset + s. On backends that reject the kernel call fall
-        // back to the host-history entry (scalar reference on CPU).
+        // GQA attention on-device; the shared helper applies the causal mask at cache_offset + s.
+        // On backends that reject the kernel call fall back to the host-history entry (scalar reference.
         let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q_rot,
             &k_all,
@@ -331,9 +311,7 @@ impl FalconBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct Falcon {
     pub cfg: FalconConfig,
@@ -475,6 +453,7 @@ impl CausalLm for Falcon {
 mod tests {
     use super::*;
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_falcon_config_serialization() {
         let cfg = FalconConfig::default();
@@ -485,6 +464,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_falcon_session_kv_cache_persistence() {
         let mut cfg = FalconConfig::default();
         cfg.vocab_size = 32;
@@ -510,9 +490,12 @@ mod tests {
             cpu_tensor(vec![0.01f32; 32 * 16], Shape::new(vec![32, 16])),
             None,
         );
-        let qkv_out_dim = (2 + 2 * 1) * 8; // 32
+        let qkv_out_dim = (2 + 2) * 8; // 32
         let fused_qkv = Linear::from_tensor(
-            cpu_tensor(vec![0.01f32; 16 * qkv_out_dim], Shape::new(vec![qkv_out_dim, 16])),
+            cpu_tensor(
+                vec![0.01f32; 16 * qkv_out_dim],
+                Shape::new(vec![qkv_out_dim, 16]),
+            ),
             None,
         );
         let dense = Linear::from_tensor(

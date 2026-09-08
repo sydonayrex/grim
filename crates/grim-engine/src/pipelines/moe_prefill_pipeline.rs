@@ -1,12 +1,5 @@
 //! Full-layer double-buffered MoE prefill transfer pipelining.
-//!
 //! During prompt prefill, thousands of tokens per layer activate almost the complete expert set.
-//! On-demand loading serializes expert transfers against GPU compute, exposing large PCIe latency stalls.
-//!
-//! This pipeline maintains two full-layer weight buffers in GPU cache (`BufferA` and `BufferB`).
-//! While the GPU compute stream evaluates layer $l$ from one buffer, a dedicated asynchronous
-//! transfer stream prefetches the complete expert set of layer $l+1$ into the alternate buffer.
-//! Once both finish, buffers swap roles, making prefill execution bandwidth-bound rather than latency-bound.
 
 use grim_tensor::error::Result;
 
@@ -42,10 +35,7 @@ pub struct MoePrefillPipeline {
 
 impl MoePrefillPipeline {
     /// Create a new prefill pipeline for a model.
-    ///
-    /// # Contract
-    /// `total_layers` and `num_experts` must be > 0.
-    /// If `available_vram_bytes < 2 * layer_bytes`, falls back to single-buffer mode to prevent OOM.
+    /// # Contract `total_layers` and `num_experts` must be > 0.
     pub fn new(
         total_layers: usize,
         num_experts: usize,
@@ -69,9 +59,7 @@ impl MoePrefillPipeline {
     }
 
     /// Prime the pipeline by initiating prefetch of Layer 0 (and Layer 1 if double-buffering).
-    ///
-    /// # Contract
-    /// Returns the target layer index to kick off on the transfer stream.
+    /// # Contract Returns the target layer index to kick off on the transfer stream.
     pub fn prime(&mut self) -> Result<Vec<usize>> {
         self.current_compute_layer = 0;
         if self.total_layers == 0 {
@@ -89,10 +77,7 @@ impl MoePrefillPipeline {
     }
 
     /// Advance the pipeline after completing computation for `current_compute_layer`.
-    ///
-    /// # Contract
-    /// Swaps buffer roles and returns `Some(next_layer_to_prefetch)` if more layers remain,
-    /// or `None` when prefetch is complete.
+    /// # Contract Swaps buffer roles and returns `Some(next_layer_to_prefetch)` if more layers remain, or `None` when.
     pub fn step_and_swap(&mut self) -> Result<Option<usize>> {
         if self.current_compute_layer >= self.total_layers {
             return Ok(None);
@@ -121,10 +106,7 @@ impl MoePrefillPipeline {
     }
 
     /// Execute a full-model prefill pass with pipelined DMA transfers overlapping GPU compute.
-    ///
-    /// # Contract
-    /// `compute_fn(layer_idx, buffer_idx)` runs GPU kernel on the compute stream.
-    /// `dma_fn(layer_idx, buffer_idx)` initiates asynchronous DMA on the transfer stream.
+    /// # Contract `compute_fn(layer_idx, buffer_idx)` runs GPU kernel on the compute stream.
     pub fn execute_pipelined<C, D>(&mut self, mut compute_fn: C, mut dma_fn: D) -> Result<()>
     where
         C: FnMut(usize, usize) -> Result<()>,

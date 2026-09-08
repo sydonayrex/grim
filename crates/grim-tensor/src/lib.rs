@@ -15,11 +15,10 @@ pub mod tensor;
 pub mod wavefront;
 
 pub use backend::{
-    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
-    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, GpuCapability,
-    MemAdvice, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
-    QuantizedMatmulBackwardResiduals, ReadyHandle, RopeConfig, ScytheLink, ScythePlacement,
-    YaRNParams,
+    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps, CoreTensorOps,
+    ElementwiseOps, FusionOps, GpuCapability, GraphCaptureOps, MemAdvice, MemoryOps, OptimizerOps,
+    QuantOps, QuantizedMatmulBackwardResiduals, ReadyHandle, RecurrentOps, RopeConfig, SamplingOps,
+    ScytheLink, ScythePlacement, YaRNParams,
 };
 
 pub use dtype::{

@@ -1,8 +1,5 @@
-//! Charon Backward — MoE backward pass kernels for CUDA.
-//!
-//! Computes gradients d_gate_w, d_up_w, d_down_w, and d_x for the fused
-//! SwiGLU MoE layer. One backward kernel per projection, organized the same
-//! way as `charon_backward.rs` in grim-backend-rocm.
+//! Charon Backward - MoE backward pass kernels for CUDA.
+//! Computes gradients d_gate_w, d_up_w, d_down_w, and d_x for the fused SwiGLU MoE layer.
 
 pub const CHARON_BACKWARD_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -10,14 +7,7 @@ pub const CHARON_BACKWARD_SOURCE: &str = r#"
 
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// grim_moe_backward_dx — Gradient w.r.t. input activations.
-//
-// d_x[tok, i] += sum_j( silu'(gate[j]) * up[j] * d_out[tok, :] @ down_w[exp, :, j]
-//               + silu(gate[j]) * d_up @ up_w[exp, j, i] ) * routing_weight
-//
-// Contract: all arrays float32. Same (token, expert) pair indexing as forward.
-// ---------------------------------------------------------------------------
+// grim_moe_backward_dx - Gradient w.r.t. input activations.
 __global__ void grim_moe_backward_dx(
     const float* __restrict__ activations,    // [batch, hidden]
     const float* __restrict__ expert_gate_w,  // [num_experts, inter, hidden]
@@ -74,12 +64,7 @@ __global__ void grim_moe_backward_dx(
     }
 }
 
-// ---------------------------------------------------------------------------
-// grim_moe_backward_dw — Gradient w.r.t. expert weights (gate, up, down).
-//
-// Accumulates outer products into weight gradient buffers using the recomputed
-// forward values, matching `charon_backward::moe_backward_dw` on ROCm.
-// ---------------------------------------------------------------------------
+// grim_moe_backward_dw - Gradient w.r.t. expert weights (gate, up, down).
 __global__ void grim_moe_backward_dw(
     const float* __restrict__ activations,
     const float* __restrict__ expert_gate_w,

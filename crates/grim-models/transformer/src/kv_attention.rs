@@ -1,18 +1,5 @@
 //! Reusable CPU reference-attention helpers for cache-aware decode.
-//!
-//! Several transformer families in this crate implement their attention as a
-//! hand-rolled CPU loop with no KV-cache integration, so a single-token decode
-//! step silently attended only over itself (the model's prior context was
-//! invisible). These helpers give those loops a single, correct cache-append +
-//! cache-aware causal-attention implementation so each model file wires it the
-//! same way. [Group B fix.]
-//!
-//! The cache stores post-RoPE keys and raw values in one contiguous flat buffer
-//! per layer: `(past_len, row_elems)` where `row_elems` is `num_heads*head_dim`
-//! (MHA/MLA) or `num_kv_heads*head_dim` (GQA). `KvCache::current_k`/`current_v`
-//! are scoped to the most-recently-appended slot and the paged variant is
-//! block-addressed, so neither fits a naive full-history reference loop — hence
-//! this per-layer buffer parked in `session.model_state` (mirroring `lfm2.rs`).
+//! Several transformer families in this crate implement their attention as a hand-rolled CPU loop with.
 
 use grim_tensor::{DType, Device, Shape, Tensor};
 use std::sync::Arc;
@@ -44,9 +31,8 @@ pub fn append_and_get<'a>(
     k_new: &Tensor,
     v_new: &[f32],
 ) -> Result<(&'a [f32], &'a [f32], usize)> {
-    // Audit fix (grim-models M12): require an explicit row width — the old
-    // `.unwrap_or(0).max(1)` fallback divided by 1 for malformed inputs and
-    // mis-derived total_len from the raw element count.
+    // Audit fix (grim-models M12): require an explicit row width - the old `.unwrap_or(0).max(1)` fallback
+    // divided by 1 for malformed inputs and mis-derived total_len from the raw element count.
     let dims = k_new.shape().dims();
     let Some(&row_elems) = dims.get(1).filter(|&&d| d > 0) else {
         return Err(grim_core::error::Error::Shape(format!(
@@ -69,14 +55,7 @@ pub fn append_and_get<'a>(
 }
 
 /// Cache-aware scaled-dot-product causal attention over the full K/V history.
-///
 /// * `q` is `(new_tokens, q_row_elems)` where `q_row_elems = num_heads*head_dim`.
-/// * `k`/`v` are the full history `(total_len, kv_row_elems)`.
-/// * `past_len` is the number of history tokens already present before this
-///   call, so query index `t` (0-based within this call) attends over absolute
-///   positions `0..=past_len+t` — i.e. it can see the current token and all
-///   prior ones, which a stateless single-token forward could not.
-/// * `kv_head` maps each query head to its KV head index for GQA.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_attention(
     q: &[f32],
@@ -195,18 +174,20 @@ impl DevKvArena {
     }
 }
 
-/// Append one step's K/V to the arena entirely on-device. Returns the arena
-/// K/V storages (shared; callers read, never free) and the new token count.
-///
-/// On CPU this degrades to the same behavior via vector-push; correctness is
-/// preserved because the arena is just a flat [tokens, row_elems] tensor.
+/// Append one step's K/V to the arena entirely on-device.
+/// Returns the arena K/V storages (shared; callers read, never free) and the new token count.
+#[allow(clippy::type_complexity)]
 pub fn arena_append(
     arena: &mut DevKvArena,
     k_new: &Tensor,
     v_new: &Tensor,
     dev: &dyn grim_tensor::BackendDevice,
     tokens_this_step: usize,
-) -> Result<(Arc<dyn grim_tensor::BackendStorage>, Arc<dyn grim_tensor::BackendStorage>, usize)> {
+) -> Result<(
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    usize,
+)> {
     let row_elems = arena.row_elems;
     let total = arena.tokens + tokens_this_step;
 
@@ -217,16 +198,10 @@ pub fn arena_append(
         let k_new = dev.alloc_storage(&shape, DType::F32)?;
         let v_new = dev.alloc_storage(&shape, DType::F32)?;
         if let Some(ref k_old) = arena.k_dev {
-            dev.copy_slice_range(
-                &*k_new, 0, &**k_old, 0,
-                arena.tokens * row_elems,
-            )?;
+            dev.copy_slice_range(&*k_new, 0, &**k_old, 0, arena.tokens * row_elems)?;
         }
         if let Some(ref v_old) = arena.v_dev {
-            dev.copy_slice_range(
-                &*v_new, 0, &**v_old, 0,
-                arena.tokens * row_elems,
-            )?;
+            dev.copy_slice_range(&*v_new, 0, &**v_old, 0, arena.tokens * row_elems)?;
         }
         arena.k_dev = Some(Arc::from(k_new));
         arena.v_dev = Some(Arc::from(v_new));
@@ -236,13 +211,17 @@ pub fn arena_append(
     // Append the new rows at the tail offset, no host round-trip.
     let tail_off = arena.tokens * row_elems;
     dev.copy_slice_range(
-        arena.k_dev.as_ref().unwrap().as_ref(), tail_off,
-        k_new.storage().as_ref(), 0,
+        arena.k_dev.as_ref().unwrap().as_ref(),
+        tail_off,
+        k_new.storage().as_ref(),
+        0,
         tokens_this_step * row_elems,
     )?;
     dev.copy_slice_range(
-        arena.v_dev.as_ref().unwrap().as_ref(), tail_off,
-        v_new.storage().as_ref(), 0,
+        arena.v_dev.as_ref().unwrap().as_ref(),
+        tail_off,
+        v_new.storage().as_ref(),
+        0,
         tokens_this_step * row_elems,
     )?;
     arena.tokens = total;

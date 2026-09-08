@@ -1,9 +1,5 @@
-//! WI-E6 UX half: training recipe (YAML) loader and dataset registry with
-//! sha256 verification.
-//!
-//! A recipe file maps onto `TrainOptions` fields; the dataset registry
-//! (`data/dataset_info.json`) resolves a registry id to a real path and
-//! verifies its content hash before training consumes it.
+//! WI-E6 UX half: training recipe (YAML) loader and dataset registry with sha256 verification.
+//! A recipe file maps onto `TrainOptions` fields; the dataset registry (`data/dataset_info.json`) resolves a registry id.
 
 use grim_core::error::{Error, Result};
 use serde::Deserialize;
@@ -59,10 +55,8 @@ fn default_max_grad_norm() -> f32 {
     1.0
 }
 
-/// Minimal flat-YAML scalar map parser. Recipes are 2-level documents of
-/// `key: value` lines with 2-space nesting and optional `>-` folded strings;
-/// that subset is all this loader supports (no anchors, no flow styles, no
-/// multi-doc).
+/// Minimal flat-YAML scalar map parser. Recipes are 2-level documents of `key: value` lines with 2-space nesting and
+/// optional `>-` folded strings; that subset is all this loader supports (no anchors, no flow styles, no multi-doc).
 fn parse_flat_yaml(text: &str) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     let mut section = String::new();

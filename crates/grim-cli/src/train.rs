@@ -22,10 +22,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Master-parameter compute precision for training (salamander.md P1).
-///
-/// bf16/fp16 roughly halve VRAM and double matmul throughput vs f32 on
-/// consumer RDNA (gfx103x/110x/120x) — the single biggest lever for fitting
-/// models on 8–16 GB cards. Optimizer moment buffers stay f32 regardless.
+/// bf16/fp16 roughly halve VRAM and double matmul throughput vs f32 on consumer RDNA (gfx103x/110x/120x) -.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "kebab-case")]
 pub enum TrainDtype {
@@ -100,10 +97,8 @@ pub struct TrainOptions {
     pub olora_lambda: f32,
     /// SPECTRAL-QLORA: semi-orthogonal A/B init + Muon optimizer.
     pub use_spectral_qlora: bool,
-    /// WI-E5: MXFP4 quantization-aware training. When set, Linear weights are
-    /// fake-quantized through `grim_quant::qat_mxfp4::fake_quant_mxfp4` in the
-    /// training forward (STE identity backward), and saved adapters run real
-    /// `quant_mxfp4_matrix` packing at export.
+    /// WI-E5: MXFP4 quantization-aware training.
+    /// When set, Linear weights are fake-quantized through `grim_quant::qat_mxfp4::fake_quant_mxfp4` in the training forward (STE identity backward),.
     pub qat_mxfp4: bool,
     /// Number of gradient checkpointing segments across layers (0 = disabled).
     pub checkpoint_segs: usize,
@@ -169,11 +164,7 @@ struct ShareGptEntry {
 }
 
 /// Pack short dataset token sequences into unified target sequence buffers up to `max_seq_len`.
-///
-/// Concatenates sequences greedily: each output batch is the concatenation of
-/// one or more input sequences, truncated to `max_seq_len`.  When a sequence
-/// does not fit into the current batch, the current batch is flushed and the
-/// sequence starts a new batch (or is truncated if it alone exceeds the limit).
+/// Concatenates sequences greedily: each output batch is the concatenation of one or more input sequences,.
 pub fn pack_dataset_tokens(token_sequences: &[Vec<u32>], max_seq_len: usize) -> Vec<Vec<u32>> {
     let mut packed_batches = Vec::new();
     let mut current_pack = Vec::new();
@@ -199,11 +190,7 @@ pub fn pack_dataset_tokens(token_sequences: &[Vec<u32>], max_seq_len: usize) -> 
 }
 
 /// Pack aligned `(tokens, labels)` training examples into efficient batches.
-///
-/// Each example is a `(tokens, labels)` pair.  This function greedily packs
-/// consecutive examples into batches of up to `max_seq_len` tokens, keeping
-/// tokens and labels aligned so that the training loop can slice them
-/// identically (`input_ids = tokens[..n-1]`, `targets = labels[1..]`).
+/// Each example is a `(tokens, labels)` pair.
 fn pack_training_examples(
     examples: Vec<(Vec<u32>, Vec<u32>)>,
     max_seq_len: usize,
@@ -863,12 +850,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
     let mut streaming = StreamingBlockForward::new(num_layers, model_config.hidden_size);
 
-    // ── WI-F4-close: Build the model head (embedding + final norm + lm_head) ──
-    // Standard Llama-family pattern (mirrors `gpt2.rs`, `gemma.rs`,
-    // `deepseek.rs`). For LFM2, the lm_head is tied to `token_embd`
-    // (see `transformer/src/lfm2.rs`); for plain Llama, it's a separate
-    // `output.weight` tensor. Detect by trying to load `output.weight` first
-    // and falling back to tied embedding reuse.
+    // ── WI-F4-close: Build the model head (embedding + final norm + lm_head) ── Standard Llama-family pattern (mirrors `gpt2.rs`, `gemma.rs`, `deepseek.rs`).
+    // For LFM2, the lm_head is tied to `token_embd` (see `transformer/src/lfm2.rs`); for plain Llama, it's a.
     let target_device = match opts.device.as_str() {
         "cpu" => grim_tensor::Device::Cpu,
         d if d.starts_with("rocm") => {
@@ -992,8 +975,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let mut num_batches = 0u32;
 
         for (tokens, labels) in dataset.iter() {
-            // F8 note: single-replica process — dropping batches here would
-            // train on 1/N of the data for zero benefit, so every batch runs.
+            // F8 note: single-replica process - dropping batches here would train on 1/N of the data for zero benefit, so every batch runs.
             // Per-GPU replicas remain garage-side until in-process fanout lands.
             if tokens.len() < 2 {
                 continue;
@@ -1009,10 +991,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             let mut last_good_len = 0usize;
 
             while !step_succeeded && oom_retry_count < 3 {
-                // WI-X14: on each OOM retry, halve the effective micro-batch by
-                // truncating the packed sequence to a prefix, so the retry
-                // genuinely allocates less activation memory instead of
-                // repeating an identical failing step.
+                // WI-X14: on each OOM retry, halve the effective micro-batch by truncating the packed sequence to a
+                // prefix, so the retry genuinely allocates less activation memory instead of repeating an identical failing step.
                 let eff_len = (seq_len >> oom_retry_count).clamp(2, seq_len);
                 let step_input_ids = &input_ids[..eff_len];
                 let step_targets = &targets[..eff_len];
@@ -1275,9 +1255,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
                     .step(&mut autograd_reg.params)
                     .map_err(|e| Error::Session(e.to_string()))?;
 
-                // F2: full-parameter write-back — without this, stepped base
-                // weights stay in the registry and every later forward reads
-                // the original provider weights from the block cache.
+                // F2: full-parameter write-back - without this, stepped base weights stay in the registry
+                // and every later forward reads the original provider weights from the block cache.
                 if scope == AutogradScope::FullParameter {
                     streaming
                         .overwrite_base_weights(&autograd_reg)
@@ -1471,8 +1450,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         .write(sidecar_path)
         .map_err(|e| Error::Session(e.to_string()))?;
 
-    // P1 §8: tag the `.grim` artifact with the training-time dtype and
-    // multi-GPU strategy so serving/catalog can pick the right path.
+    // P1 §8: tag the `.grim` artifact with the training-time dtype and multi-GPU strategy so serving/catalog can pick the right path.
     // Non-fatal: `.gguf` inputs simply keep their original metadata.
     let multi_gpu_strategy = if opts.num_gpus > 1 {
         Some("replica-dp".to_string())
@@ -1646,22 +1624,14 @@ mod tests {
         Err(Error::Session("not Alpaca format".into()))
     }
 
-    // ── WI-F4-close: F4 invariants ────────────────────────────────────────
-    // The bug being closed: the old loop built a fake "embedding" by
-    // casting raw token IDs to f32 and stuffing them into a `[seq_len, hidden]`
-    // tensor (wrong element count), then silently used `hidden_state` as
-    // logits. These two regression tests pin both halves:
-    //   1. `cpu_tensor` catches the deliberate-reintroduction pattern.
-    //   2. The wired head produces `[seq_len, vocab]` shape (NOT `[seq_len, hidden]`).
+    // ── WI-F4-close: F4 invariants ──────────────────────────────────────── The bug being closed: the old loop built a fake "embedding" by casting raw token IDs to f32 and stuffing them into a `[seq_len, hidden]` tensor (wrong element count), then silently used `hidden_state` as logits.
+    // These two regression tests pin both halves: 1.
 
     use grim_tensor::dtype::{DType, QuantProvenance};
     use grim_tensor::{RawTensor, TensorMeta, TensorProvider};
 
     /// Minimal in-memory `TensorProvider` exposing only the head tensors.
-    /// Provides `token_embd.weight`, `output_norm.weight`, and (optionally)
-    /// `output.weight`. Layout matches Llama's GGUF convention:
-    /// `token_embd.weight` is `[hidden, vocab]` (column-major GGUF native),
-    /// `output.weight` (when separate) is `[vocab, hidden]`.
+    /// Provides `token_embd.weight`, `output_norm.weight`, and (optionally) `output.weight`.
     struct HeadProvider {
         vocab: usize,
         hidden: usize,
@@ -1791,9 +1761,8 @@ mod tests {
     fn fake_embedding_pattern_is_now_caught() {
         use grim_backend_cpu::cpu_tensor;
         use grim_tensor::Shape;
-        // Exact pattern from the bug: cast raw IDs to f32 and try to fit
-        // `seq_len` elements into a `[seq_len, hidden]` tensor. cpu_tensor's
-        // debug-assertion catches it immediately now.
+        // Exact pattern from the bug: cast raw IDs to f32 and try to fit `seq_len` elements into a `[seq_len, hidden]` tensor.
+        // cpu_tensor's debug-assertion catches it immediately now.
         let seq_len = 4usize;
         let hidden = 8usize;
         let ids = [1u32, 2, 3, 4];
@@ -1941,9 +1910,8 @@ mod tests {
         );
     }
 
-    /// F2 regression: full-parameter write-back must push stepped registry
-    /// weights into the streaming block cache, so forwards after a step read
-    /// updated weights instead of the original provider tensors.
+    /// F2 regression: full-parameter write-back must push stepped registry weights into the streaming block cache,
+    /// so forwards after a step read updated weights instead of the original provider tensors.
     #[test]
     fn full_parameter_write_back_updates_cached_block() {
         use grim_autograd::{
@@ -2010,9 +1978,8 @@ mod tests {
             out.to_vec_f32().ok()
         }
 
-        // Materialize the cache. The standalone block forward stops at
-        // attention (no session KV context here) — that's fine: the block is
-        // inserted into the cache before any math, which is all this test needs.
+        // Materialize the cache. The standalone block forward stops at attention (no session KV context here) - that's
+        // fine: the block is inserted into the cache before any math, which is all this test needs.
         let _ = run(&mut sfb, &provider, &cfg, &reg, &h);
         let before = sfb
             .cached_qproj_weight(0, &grim_tensor::Device::Cpu)

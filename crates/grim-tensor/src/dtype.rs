@@ -2,9 +2,7 @@
 
 use std::fmt;
 
-/// A hardware compute target. Grim's primary GPU is ROCm; Vulkan is the
-/// platform-agnostic fallback; CPU is the always-available reference; CUDA
-/// and Metal are optional.
+/// Hardware compute target: ROCm (primary), Vulkan (portable), CPU (reference), or CUDA/Metal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Device {
     Cpu,
@@ -78,11 +76,7 @@ impl ArithType {
     }
 }
 
-/// Physical storage encoding. When storage differs from the arithmetic type,
-/// dequantization is needed before compute. Splitting dtype into
-/// `ArithType` + `Storage` keeps variants bounded — adding a new low-bit
-/// format (MXFP4, NVFP4, ...) is one Storage variant, not a new DType that
-/// forks dispatch everywhere.
+/// Physical storage encoding, separating on-disk/in-VRAM representations from arithmetic compute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Storage {
     /// Stored in native encoding — no dequant needed.
@@ -91,58 +85,25 @@ pub enum Storage {
     KQuant(KQuantScheme),
     /// Grouped INT weights from an external QAT pipeline (EfficientQAT, GPTQ).
     GroupInt(GpuIntConfig),
-    /// Low-bit floating-point pack formats (FP4 E2M1, NF4, FP8 E4M3/E5M2).
-    /// Kept as packed bytes on-device for residency-capable backends (ROCm /
-    /// CUDA / CPU), which dequantize in-kernel; only backends without a packed
-    /// residency path dequantize to F32 on load. Kept distinct from KQuant so
-    /// the dequant kernel selects the correct float-pack layout.
+    /// Low-bit floating-point pack formats (FP4, NF4, FP8) dequantized in-kernel.
     FloatPack(FloatPackScheme),
     /// Block-quantized formats mapping FP4/NF4/FP8.
     Block(BlockDtype),
-    /// Generic variable-bitwidth packed codes with a per-column uint8 scale,
-    /// optional outlier overrides, and optional backup1/backup2 residual
-    /// layers — the `.grim` native packed + SpQR-residual layout consumed by
-    /// `grim_fused_dequant_gemm_f16` (WI-C / WI-T8). Outlier/backup metadata
-    /// rides in `QuantProvenance::WithResiduals`.
+    /// Variable-bitwidth packed codes with column scale and optional outliers/residuals.
     ResidualPacked(ResidualPackedConfig),
-    /// W8A8MXFP8: weight+activation in MXFP8 (OCP E4M3) with per-block E8M0
-    /// shared exponent. Layout matches `FloatPackScheme::MxFp8`: two
-    /// length-prefixed segments [u64 codes_len][codes...][u64 exps_len][exps...].
-    /// The dequant path produces F32 weights and F8 (E4M3) activations.
+    /// W8A8MXFP8: MXFP8 weights and activations with per-block E8M0 shared exponents.
     W8A8Mxfp8,
-    /// CompressedTensors W8A8 with INT8 weights. Per SmoothQuant contract,
-    /// weights are packed int8 bytes with per-channel (per-column) u8/f32
-    /// scales and the activations are int8 with per-token scales applied
-    /// upstream. Layout in `RawTensor.bytes`: one length-prefixed segment
-    /// [u64 scales_len][u8 packed_w8 codes...][scale bytes...] where scales are
-    /// one per output channel (f32) and codes are the dense int8 matrix.
+    /// CompressedTensors W8A8 INT8 with per-channel weight scales and per-token activation scales.
     CompressedTensorsW8A8Int8,
-    /// CompressedTensors W8A8 with FP8 (OCP E4M3) weights. Weights are packed
-    /// fp8 bytes with a per-tensor (or per-block) fp8/f32 scale; activations are
-    /// fp8 (OCP E4M3). Layout: [u64 scale_len][u8 packed_fp8 codes...][scale
-    /// bytes...] — the scale is one fp8 value (or f32 per-block) reused as the
-    /// multiplicative factor for the dequantized weight tiles.
+    /// CompressedTensors W8A8 FP8 (OCP E4M3) with per-tensor or per-block scales.
     CompressedTensorsW8A8Fp8,
-    /// Marlin-style W4A16: 4-bit packed weights + per-group f32 scales.
-    /// Packed layout: `[codes (N*K/8 u32)][scales (N*K/group_size f32)]`.
-    /// Dequantized to F32 at load time on backends without the fused kernel;
-    /// on ROCm the blob stays resident and `launch_marlin_gemm_w4a16` reads
-    /// the two segments via computed byte offsets.
+    /// Marlin-style W4A16: 4-bit packed weights with per-group f32 scales.
     W4A16(W4A16Config),
-    /// WNA16: weight-only N-bit quantization with 16-bit (f16) per-block scale
-    /// and one f32 per-tensor scale. Layout: [u32 n_bit][u32 num_blocks]
-    /// [u8 packed_codes...][f16 per_block_scales...][f32 tensor_scale].
-    /// N is in {2,3,4,5,6,7,8}; codes are packed MSB-first within each byte,
-    /// crossing byte boundaries as needed.
+    /// WNA16: weight-only N-bit quantization with per-block f16 and per-tensor f32 scales.
     WNA16,
-    /// EmbeddingWNA16Int: embedding matrix weights stored as N-bit integers
-    /// (row-major, flattening each embedding dimension). Layout: [u32 n_bit]
-    /// [u32 embedding_dim][u32 num_rows][u8 packed_codes...]. Dequantized to
-    /// F32 at load or on-the-fly in the CPU dequant path.
+    /// EmbeddingWNA16Int: embedding weights stored as row-major N-bit integers.
     EmbeddingWNA16Int,
-    /// AWQ: Activation-aware Weight Quantization format with column-packed
-    /// uint32 codes, raw stored zero-points, and f16 per-group scales.
-    /// Layout: [u64 LE qw_len][qweight][u64 LE qz_len][qzeros][u64 LE sc_len][scales (f16)].
+    /// AWQ: Activation-aware Weight Quantization format with column-packed codes and zero-points.
     Awq(AwqStorageConfig),
 }
 
@@ -181,54 +142,18 @@ pub enum FloatPackScheme {
     Nf4,
     /// FP8 (E4M3 by default; E5M2 recognized).
     Fp8,
-    /// MXFP4 (OCP Microscaling 4-bit float with shared E8M0 scale per 32 elements - Jay tier).
-    ///
-    /// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
-    /// Two length-prefixed segments, matching the kernel in
-    /// `grim-backend-rocm/src/kernels/mxfp_standalone.rs` (codes packed
-    /// 2-per-byte, even element in the low nibble; one E8M0 shared exponent
-    /// byte per 32-element group):
-    ///
-    /// ```text
-    /// [u64 LE: codes_len] [codes...]
-    /// [u64 LE: exps_len]  [exps...]
-    /// ```
+    /// MXFP4: 4-bit float with shared E8M0 scale per 32 elements.
+    /// Packed as length-prefixed codes and exponents.
     MxFp4,
-    /// MXFP8 (OCP Microscaling 8-bit float with shared scale per block - Magpie tier).
-    ///
-    /// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
-    /// Two length-prefixed segments, matching the kernel in
-    /// `grim-backend-rocm/src/kernels/mxfp_standalone.rs` (one E4M3 code byte
-    /// per element; one E8M0 shared exponent byte per 32-element group):
-    ///
-    /// ```text
-    /// [u64 LE: codes_len] [codes...]
-    /// [u64 LE: exps_len]  [exps...]
-    /// ```
+    /// MXFP8: 8-bit float with shared E8M0 scale per 32 elements.
+    /// Packed as length-prefixed codes and exponents.
     MxFp8,
-    /// NVFP4: NVIDIA 4-bit floating point (E2M1 codebook) for Blackwell GPUs.
-    ///
-    /// Uses the same OCP E2M1 encoding as MXFP4 but with NVIDIA's block-scaling
-    /// convention: per-16-element sub-blocks with one E8M0 shared exponent byte
-    /// per sub-block, packed in NVIDIA's native ordering. 256 weights per
-    /// super-block (16 sub-blocks × 16 weights).
-    ///
-    /// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
-    /// NVIDIA packs scales and codes interleaved per sub-block:
-    /// ```text
-    /// [scale_0 (1 byte)] [codes_0 (8 bytes)] [scale_1] [codes_1] ... [scale_15] [codes_15]
-    /// ```
-    /// Total: 16 + 128 = 144 bytes per 256-weight super-block.
-    /// Codes are packed 2 per byte (low nibble = element 2i, high nibble = element 2i+1).
+    /// NVFP4: NVIDIA 4-bit float (E2M1) with interleaved scales per 16-element sub-block.
     NvFp4,
 }
 
-/// Target quantization format for the device-side `quantize` path.
-///
-/// Mirrors the CPU `grim_quant::quant_*` reference functions. Selected
-/// variants (Q8_0, Fp8) have device-side kernels on CUDA/Metal/ROCm/Vulkan;
-/// the rest fall back to `Err(Unimplemented)` when dispatched through
-/// `BackendDevice::quantize`.
+/// Target quantization format for device-side `quantize` path.
+/// Selected variants have kernel acceleration; others fall back to CPU or error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuantFormat {
     Q8_0,
@@ -255,20 +180,8 @@ pub enum GroupQuantScheme {
     Asymmetric,
 }
 
-/// Configuration for GroupInt quantization (used by external QAT pipelines such as GPTQ).
-///
-/// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
-/// When `storage` is `Storage::GroupInt(_)`, all four parallel arrays are concatenated
-/// into a single `Vec<u8>` in `RawTensor.bytes`. Each array segment is prefixed with its length:
-///
-/// ```text
-/// [u64 LE: qweight_len] [qweight_bytes...]
-/// [u64 LE: qzeros_len]  [qzeros_bytes...]
-/// [u64 LE: scales_len]  [scales_bytes...]
-/// [u64 LE: g_idx_len]   [g_idx_bytes...]
-/// ```
-///
-/// If `g_idx` is absent, its segment has `g_idx_len` set to 0.
+/// Configuration for GroupInt quantization (e.g. GPTQ or EfficientQAT).
+/// Carries four length-prefixed parallel arrays (qweight, qzeros, scales, g_idx).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GpuIntConfig {
     pub bits: u8,
@@ -280,20 +193,7 @@ pub struct GpuIntConfig {
 }
 
 /// Bitwidth configuration for `Storage::W4A16` (Marlin-style 4-bit weights).
-///
-/// # Packed layout contract
-///
-/// The `RawTensor.bytes` blob for a `Storage::W4A16` tensor is two contiguous
-/// segments, in that order, with no length prefixes (both lengths are derivable
-/// from `(group_size, k=in_features, n=out_features)`):
-///
-/// ```text
-/// [codes][scales]
-/// codes:  [N, K/8] uint32, row-major. 8 weights per uint32, nibble `i` in bits
-///          [i*4, i*4+4) of `codes[col * (K/8) + w]`. Nibble value is the unsigned
-///          4-bit code; the dequant centering is `(code - 8) * scale`.
-/// scales: [N, K/group_size] f32, row-major. One scale per (output column, group).
-/// ```
+/// Packed as contiguous 4-bit codes followed by group f32 scales without prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct W4A16Config {
     /// Number of input features per group (`k % group_size == 0`).
@@ -301,63 +201,15 @@ pub struct W4A16Config {
 }
 
 /// Bitwidth and grouping configuration for `Storage::Awq`.
-///
-/// # Packed byte layout contract
-///
-/// The `RawTensor.bytes` blob for an `Awq` tensor is 3 length-prefixed segments:
-/// ```text
-/// [u64 LE: qweight_len] [qweight_bytes...]
-/// [u64 LE: qzeros_len]  [qzeros_bytes...]
-/// [u64 LE: scales_len]  [scales_bytes (f16)...]
-/// ```
+/// Packed into 3 length-prefixed segments: qweight, qzeros, and f16 scales.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AwqStorageConfig {
     pub bits: u8,
     pub group_size: usize,
 }
 
-/// Bitwidth configuration for `Storage::ResidualPacked`.
-///
-/// # Packed residual layout contract
-///
-/// `ResidualPacked` is a column-major weight view as consumed by
-/// `grim_fused_dequant_gemm_f16`: for a logical `[K, N]` weight, the packed
-/// stream contains `N` rows, each containing `K` codes.  A code is an unsigned
-/// `bpw`-bit integer, written most-significant-bit first within each byte; a
-/// code which crosses a byte boundary takes its high bits from the low bits of
-/// the first byte and its low bits from the high bits of the next byte.  The
-/// code is normalized as `code / (2^bpw - 1) * 2 - 1`.
-///
-/// Each packed layer has a 256-byte row stride:
-///
-/// ```text
-/// row_bytes(bpw, K) = align_up(ceil(K * bpw / 8), 256)
-/// row_start(layer, row) = layer_codes_offset + row * row_bytes(bpw, K)
-/// ```
-///
-/// The primary code region starts at byte offset zero of the `B_codes`
-/// allocation.  Its per-output-row scale is supplied separately through the
-/// `B_scales` pointer and is one `u8` per output row, decoded as
-/// `scale_byte / 255.0`; a null pointer means scale `1.0` for every row.
-///
-/// `QuantProvenance::WithResiduals` records optional backup regions by byte
-/// offsets.  `backup{1,2}_codes_offset` points to another independently
-/// 256-byte-row-aligned code region using its recorded bitwidth and the same
-/// MSB-first packing rule.  `backup{1,2}_scale_offset` points into the same
-/// `B_codes` allocation at an array of one `u8` scale per output row,
-/// decoded as `/ 255.0`; an offset of zero means unit scale in the ROCm
-/// kernel.  A present backup is added to the primary decoded value.  The
-/// forward kernel consumes backup1; the backward kernel consumes backup1 and
-/// backup2.
-///
-/// Outliers are not stored in the packed code stream.  The provenance carries
-/// their count and the execution path supplies two external arrays: sorted
-/// `u32` flat indices and matching `f32` replacement values.  An index is
-/// `row * K + k` in the logical `[N, K]` packed view.  The replacement value
-/// takes precedence over the primary and backup reconstruction.
-///
-/// This documents the consumer-side ABI; it does not imply that a host-side
-/// writer or dequantizer is implemented.
+/// Bitwidth configuration for `Storage::ResidualPacked` column-major stream.
+/// Supports 256-byte aligned row strides with optional backup layers and outliers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResidualPackedConfig {
     /// Bitwidth of the packed codes in `RawTensor.bytes`.
@@ -396,16 +248,8 @@ impl DType {
         !matches!(self.storage, Storage::Native)
     }
 
-    /// Calculate expected byte size for a given element count or shape under this DType.
-    ///
-    /// EXACT for `Native`, `KQuant`, `FloatPack`, `Block`, `ResidualPacked`
-    /// (primary code region), and `W4A16`. For `GroupInt`, `WNA16`,
-    /// `EmbeddingWNA16Int`, and the CompressedTensors variants the layout
-    /// depends on fields not carried by the type (bit width, channel
-    /// counts, segment prefixes) — the returned value there is an
-    /// `elem_count * arith.byte_size()` UPPER BOUND, not an exact size;
-    /// validate those blobs with `<=` (or extend this function with the
-    /// missing config).
+    /// Calculate expected byte size for a given element count under this DType.
+    /// Exact for fixed-stride formats; upper-bound for variable-metadata formats.
     pub fn expected_bytes(&self, elem_count: usize) -> usize {
         match &self.storage {
             Storage::Native => elem_count * self.arith.byte_size(),
@@ -430,17 +274,17 @@ impl DType {
                 KQuantScheme::IQ2S => (elem_count.div_ceil(256)) * 82,
             },
             Storage::FloatPack(f) => match f {
-                FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => (elem_count + 1) / 2,
+                FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => elem_count.div_ceil(2),
                 FloatPackScheme::Fp8 => elem_count,
-                FloatPackScheme::MxFp4 => (elem_count + 1) / 2 + (elem_count.div_ceil(32)),
+                FloatPackScheme::MxFp4 => elem_count.div_ceil(2) + (elem_count.div_ceil(32)),
                 FloatPackScheme::MxFp8 => elem_count + (elem_count.div_ceil(32)),
                 // NVFP4: 1 byte E8M0 scale per 16-elem sub-block + 0.5 byte per weight.
-                FloatPackScheme::NvFp4 => (elem_count + 1) / 2 + elem_count.div_ceil(16),
+                FloatPackScheme::NvFp4 => elem_count.div_ceil(2) + elem_count.div_ceil(16),
             },
             Storage::Block(b) => match b {
-                BlockDtype::Fp4 | BlockDtype::Nf4 => (elem_count + 1) / 2,
+                BlockDtype::Fp4 | BlockDtype::Nf4 => elem_count.div_ceil(2),
                 BlockDtype::Fp8 => elem_count,
-                BlockDtype::Fp4Block16 => (elem_count + 1) / 2 + (elem_count.div_ceil(16)) * 2,
+                BlockDtype::Fp4Block16 => elem_count.div_ceil(2) + (elem_count.div_ceil(16)) * 2,
                 BlockDtype::Fp8Block16 => elem_count + (elem_count.div_ceil(16)) * 2,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
@@ -509,10 +353,7 @@ impl TryFrom<&Storage> for QuantFormat {
     }
 }
 
-/// Per-tensor quantization provenance. Resolved at load time by
-/// `WeightSource::get` and carried on every tensor so the dequant kernel
-/// selects the correct layout per tensor (preventing re-quantization of
-/// already-quantization-aware-trained weights).
+/// Per-tensor quantization provenance carrying format origins and dequant parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum QuantProvenance {
     /// Not quantized, or produced by grim-quant's own post-training pass.
@@ -530,9 +371,7 @@ pub enum QuantProvenance {
         outlier_count: usize,
         outlier_indices_offset: usize,
         outlier_values_offset: usize,
-        /// Host-decoded outlier indices/values, when the provider has already
-        /// materialized them. Empty vectors mean the offsets must be decoded
-        /// from the packed payload by the backend loader.
+        /// Host-decoded outlier indices and values; empty when offsets must be read from payload.
         outlier_indices: Vec<u32>,
         outlier_values_bits: Vec<u32>,
         primary_scale_offset: usize,
@@ -617,26 +456,38 @@ mod tests {
     fn test_expected_bytes_golden() {
         // llama.cpp Q8_0: 32 values + f16 scale per block.
         assert_eq!(
-            DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q80) }
-                .expected_bytes(32),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(KQuantScheme::Q80)
+            }
+            .expected_bytes(32),
             34
         );
         // Q4_K: 256 values → 144 bytes.
         assert_eq!(
-            DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q4K) }
-                .expected_bytes(256),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(KQuantScheme::Q4K)
+            }
+            .expected_bytes(256),
             144
         );
         // FP8: 1 byte per element.
         assert_eq!(
-            DType { arith: ArithType::F32, storage: Storage::FloatPack(FloatPackScheme::Fp8) }
-                .expected_bytes(16),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::FloatPack(FloatPackScheme::Fp8)
+            }
+            .expected_bytes(16),
             16
         );
         // MXFP4: nibble codes + one E8M0 exponent per 32-group.
         assert_eq!(
-            DType { arith: ArithType::F32, storage: Storage::FloatPack(FloatPackScheme::MxFp4) }
-                .expected_bytes(32),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::FloatPack(FloatPackScheme::MxFp4)
+            }
+            .expected_bytes(32),
             17
         );
         // W4A16: ceil(n/2) code bytes + n/group f32 scales, no prefixes.

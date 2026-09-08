@@ -13,7 +13,11 @@ fn host_fallback_reductions_compute_correct_values() {
 
     assert_eq!(dev.reduce_sum(x.storage().as_ref()).unwrap(), 3.5);
     assert_eq!(dev.reduce_max(x.storage().as_ref()).unwrap(), 3.5);
-    assert_eq!(dev.argmax(x.storage().as_ref()).unwrap(), 2, "argmax is 2 (value 3.5)");
+    assert_eq!(
+        dev.argmax(x.storage().as_ref()).unwrap(),
+        2,
+        "argmax is 2 (value 3.5)"
+    );
 
     // Last index wins ties (`Iterator::max_by` semantics, matching the
     // greedy sampling path).

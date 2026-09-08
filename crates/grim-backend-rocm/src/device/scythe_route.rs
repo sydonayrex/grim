@@ -1,31 +1,5 @@
-//! WI-SB6: production layer routing through the ScytheRing persistent
-//! dispatch wave — the "last mile" of scythe2.md §3.
-//!
-//! `GRIM_SCYTHE_RING=1` reroutes F32 `matmul_op` GEMMs (the dense-layer op
-//! every decode step executes) from the rocBLAS direct path onto the
-//! device-resident descriptor ring: the host writes one 64-byte
-//! `ScytheTaskDescriptor` (opcode 1 = column-GEMM, `b` row-major `[k, n]` —
-//! byte-identical semantics to the rocBLAS call in `matmul_op`), publishes
-//! the head, and one bounded persistent wave consumes it without any
-//! per-op hipModuleLaunchKernel GEMM dispatch.
-//!
-//! ## Execution mode
-//!
-//! Bounded batch-synchronous (the proven slice-1 semantics of
-//! `ScytheRingExec::run_batch`): each routed GEMM publishes its descriptor,
-//! stream-syncs the publish, then launches a wave with
-//! `max_tasks = 1, resident = 0`. The sync-before-launch is required —
-//! `hipMemcpyAsync` from pinned memory reads the host cell at EXECUTION
-//! time, so the cell could otherwise be overwritten by the next call
-//! before the copy runs. No eternal wave is alive in this mode, so the
-//! eternal-kernel coexistence rules (no blocking hipMemcpy / pageable D2H
-//! / per-call pinned alloc against a live wave) do not apply.
-//!
-//! This path is a BENCHMARK GATE (SB6: "production layer routing behind
-//! benchmark gate"), not a default: the ring GEMM arm is a
-//! 128-thread-per-CU reference kernel, and the per-op publish sync costs a
-//! host round-trip the direct path avoids. `ring_vs_direct_decode`
-//! quantifies both.
+//! WI-SB6: production layer routing through the ScytheRing persistent dispatch wave - the "last mile" of scythe2.md §3.
+//! `GRIM_SCYTHE_RING=1` reroutes F32 `matmul_op` GEMMs (the dense-layer op every decode step executes) from the rocBLAS.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -39,9 +13,8 @@ use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
 use crate::{Error, HipMemcpyKind, Result, hipMemcpyAsync, hipStreamSynchronize};
 
-/// Ring capacity for the production channel. Power of two (ring index
-/// math), large enough that the host never laps the device between the
-/// per-op stream syncs (which bound in-flight work to one wave anyway).
+/// Ring capacity for the production channel.
+/// Power of two (ring index math), large enough that the host never laps the device.
 const RING_CAPACITY: u32 = 8;
 
 /// `true` when `GRIM_SCYTHE_RING=1` is set — the SB6 production routing
@@ -52,11 +25,8 @@ pub fn ring_routing_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// One persistent channel per device ordinal: device-resident slot array
-/// plus the tail/head/stop scalars the wave polls. Owned for the process
-/// lifetime; the head/tail counters are monotonic, so a channel is
-/// single-use per ordinal (mirrors `ScytheRingExec`'s single-lifetime
-/// resident contract, but bounded waves make it effectively unlimited).
+/// One persistent channel per device ordinal: device-resident slot array plus the tail/head/stop scalars the wave polls.
+/// Owned for the process lifetime; the head/tail counters are monotonic, so a channel is single-use.
 struct RingChannel {
     slots: Box<dyn BackendStorage>,
     tail: Box<dyn BackendStorage>,
@@ -120,10 +90,7 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
 }
 
 /// Pack one opcode-1 (column-GEMM) `ScytheTaskDescriptor` into `cell`.
-///
-/// Byte layout (pinned by `test_task_descriptor_size` and the device-gated
-/// ring tests): opcode@0, m@4, n@8, k@12, input_ptr@16, weight_ptr@24,
-/// output_ptr@32, peer_ptr@40, status@48, padded to 64 under align(32).
+/// Byte layout (pinned by `test_task_descriptor_size` and the device-gated ring tests): opcode@0, m@4, n@8, k@12, input_ptr@16,.
 fn pack_gemm_descriptor(
     cell: &mut [u8],
     m: u32,
@@ -145,10 +112,7 @@ fn pack_gemm_descriptor(
 }
 
 /// Route one F32 GEMM through the ring's persistent dispatch wave.
-///
-/// Computes the same `out[m,n] = Σ_k a[m,k]·b[k,n]` (b row-major) as the
-/// rocBLAS path in `matmul_op`. Returns the stream the wave was launched
-/// on — callers wrap it in a `RocmHandle` exactly like the direct path.
+/// Computes the same `out[m,n] = Σ_k a[m,k]·b[k,n]` (b row-major) as the rocBLAS path in `matmul_op`.
 pub(crate) fn route_gemm(
     device: &RocmDevice,
     stream: *mut c_void,
@@ -188,10 +152,8 @@ pub(crate) fn route_gemm(
     let dst = chan.slots_dev + slot as u64 * 64;
     device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
 
-    // Publish the head so the wave sees the new descriptor. Async on the
-    // same stream as the upload (ordered behind it), then a STREAM-scoped
-    // sync: the pinned head cell must not be rewritten for the next op
-    // until this copy has executed.
+    // Publish the head so the wave sees the new descriptor.
+    // Async on the same stream as the upload (ordered behind it), then a STREAM-scoped sync:.
     chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
     let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
     let rc = unsafe {
@@ -212,11 +174,8 @@ pub(crate) fn route_gemm(
         hipStreamSynchronize(stream)
     })?;
 
-    // One bounded wave consumes exactly this task. Everything is ordered on
-    // the caller's stream, so back-to-back routed GEMMs serialize behind
-    // their predecessors' waves. The launcher enqueues on the device active
-    // stream (== `stream` here); the caller wraps the returned stream in a
-    // RocmHandle exactly like the direct path.
+    // One bounded wave consumes exactly this task.
+    // Everything is ordered on the caller's stream, so back-to-back routed GEMMs serialize behind their predecessors'.
     device.launch_scythe_persistent_dispatch(
         chan.slots.as_ref(),
         RING_CAPACITY,
@@ -252,9 +211,8 @@ mod tests {
 
     #[test]
     fn routing_gate_defaults_off() {
-        // The env var is absent in test runs: the gate must read OFF so the
-        // direct rocBLAS path stays the default everywhere. (Read-only
-        // lookup — env mutation is unsafe in edition 2024.)
+        // The env var is absent in test runs: the gate must read OFF so the direct rocBLAS path stays the default everywhere.
+        // (Read-only lookup - env mutation is unsafe in edition 2024.)
         assert!(
             !ring_routing_enabled(),
             "without GRIM_SCYTHE_RING=1 the gate must stay closed"

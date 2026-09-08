@@ -144,8 +144,7 @@ mod cuda_tests {
     fn target_device() -> (Device, Box<dyn BackendDevice>) {
         if std::env::var(GPU_TEST_ENV).is_ok() {
             let ordinal = 0usize;
-            let dev = grim_backend_cuda::CudaDevice::new(ordinal)
-                .expect("CudaDevice::new failed");
+            let dev = grim_backend_cuda::CudaDevice::new(ordinal).expect("CudaDevice::new failed");
             return (Device::Cuda(ordinal), Box::new(dev));
         }
         (Device::Cpu, Box::new(CpuDevice::new()))
@@ -284,7 +283,8 @@ mod cuda_tests {
         }
         let (device, dev) = target_device();
 
-        let model = load_model_from_gguf(&path, device.clone()).expect("load_model_from_gguf failed");
+        let model =
+            load_model_from_gguf(&path, device.clone()).expect("load_model_from_gguf failed");
         let provider = GgufProvider::open(&path).expect("open failed");
         let vocab = provider
             .metadata("lfm2.vocab_size")
@@ -461,7 +461,9 @@ mod minicpm5_tests {
 
     #[test]
     fn minicpm5_simple_user_message_renders_cleanly() {
-        let Some(path) = minicpm5_model_path() else { return };
+        let Some(path) = minicpm5_model_path() else {
+            return;
+        };
         let Some(tmpl) = get_chat_template(&path) else {
             eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
             return;
@@ -476,13 +478,11 @@ mod minicpm5_tests {
         }];
 
         let rendered = render_chat_template(
-            &tmpl,
-            &messages,
-            true,   // add_generation_prompt
-            "",     // bos_token
-            "",     // eos_token
-            None,   // tools
-            None,   // tool_choice
+            &tmpl, &messages, true, // add_generation_prompt
+            "",   // bos_token
+            "",   // eos_token
+            None, // tools
+            None, // tool_choice
         )
         .expect("render_chat_template failed for simple user message");
 
@@ -495,12 +495,17 @@ mod minicpm5_tests {
             rendered.contains("What is the capital of France?"),
             "expected user content in rendered output: {rendered:.200}"
         );
-        eprintln!("[minicpm5] Simple user message rendered ({} chars)", rendered.len());
+        eprintln!(
+            "[minicpm5] Simple user message rendered ({} chars)",
+            rendered.len()
+        );
     }
 
     #[test]
     fn minicpm5_system_message_renders_cleanly() {
-        let Some(path) = minicpm5_model_path() else { return };
+        let Some(path) = minicpm5_model_path() else {
+            return;
+        };
         let Some(tmpl) = get_chat_template(&path) else {
             eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
             return;
@@ -523,16 +528,8 @@ mod minicpm5_tests {
             },
         ];
 
-        let rendered = render_chat_template(
-            &tmpl,
-            &messages,
-            true,
-            "",
-            "",
-            None,
-            None,
-        )
-        .expect("render_chat_template failed for system + user message");
+        let rendered = render_chat_template(&tmpl, &messages, true, "", "", None, None)
+            .expect("render_chat_template failed for system + user message");
 
         assert_no_jinja_leakage(&rendered);
         assert!(
@@ -543,13 +540,18 @@ mod minicpm5_tests {
             rendered.contains("You are a helpful assistant."),
             "expected system content in rendered output: {rendered:.200}"
         );
-        eprintln!("[minicpm5] System + user message rendered ({} chars)", rendered.len());
+        eprintln!(
+            "[minicpm5] System + user message rendered ({} chars)",
+            rendered.len()
+        );
     }
 
     #[test]
     /// Verified 2026-09-06 on NVIDIA RTX 4070 (Ada Lovelace), CUDA 13.3.
     fn minicpm5_tool_calls_renders_cleanly() {
-        let Some(path) = minicpm5_model_path() else { return };
+        let Some(path) = minicpm5_model_path() else {
+            return;
+        };
         let Some(tmpl) = get_chat_template(&path) else {
             eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
             return;
@@ -592,7 +594,7 @@ mod minicpm5_tests {
         let rendered = render_chat_template(
             &tmpl,
             &messages,
-            false,  // no generation prompt (tool response follows)
+            false, // no generation prompt (tool response follows)
             "",
             "",
             Some(&tools),
@@ -610,7 +612,9 @@ mod minicpm5_tests {
 
     #[test]
     fn minicpm5_reasoning_content_renders_cleanly() {
-        let Some(path) = minicpm5_model_path() else { return };
+        let Some(path) = minicpm5_model_path() else {
+            return;
+        };
         let Some(tmpl) = get_chat_template(&path) else {
             eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
             return;
@@ -633,28 +637,25 @@ mod minicpm5_tests {
             },
         ];
 
-        let rendered = render_chat_template(
-            &tmpl,
-            &messages,
-            false,
-            "",
-            "",
-            None,
-            None,
-        )
-        .expect("render_chat_template failed for reasoning content");
+        let rendered = render_chat_template(&tmpl, &messages, false, "", "", None, None)
+            .expect("render_chat_template failed for reasoning content");
 
         assert_no_jinja_leakage(&rendered);
         assert!(
             rendered.contains("<think>"),
             "expected think tag in rendered output: {rendered:.200}"
         );
-        eprintln!("[minicpm5] Reasoning content rendered ({} chars)", rendered.len());
+        eprintln!(
+            "[minicpm5] Reasoning content rendered ({} chars)",
+            rendered.len()
+        );
     }
 
     #[test]
     fn minicpm5_rendered_output_fits_tui_width() {
-        let Some(path) = minicpm5_model_path() else { return };
+        let Some(path) = minicpm5_model_path() else {
+            return;
+        };
         let Some(tmpl) = get_chat_template(&path) else {
             eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
             return;
@@ -674,23 +675,16 @@ mod minicpm5_tests {
                 role: "user".into(),
                 content: "Tell me a very long story about the history of computing, \
                           from the abacus to modern quantum computers, including \
-                          all the key milestones and inventors.".into(),
+                          all the key milestones and inventors."
+                    .into(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
             },
         ];
 
-        let rendered = render_chat_template(
-            &tmpl,
-            &messages,
-            true,
-            "",
-            "",
-            None,
-            None,
-        )
-        .expect("render_chat_template failed for long conversation");
+        let rendered = render_chat_template(&tmpl, &messages, true, "", "", None, None)
+            .expect("render_chat_template failed for long conversation");
 
         assert_no_jinja_leakage(&rendered);
 

@@ -14,9 +14,9 @@ use grim_tensor::{
 use crate::autotune::GemmOp;
 use crate::device::cuda_device::CudaDevice;
 use crate::device::handles::{
-    cublasSgemm_v2, cuLaunchKernel, cuModuleGetFunction, cudaDeviceSynchronize, cudaFree,
-    cudaMalloc, cudaMemcpy, cudaMemcpyHostToDevice, cudaSetDevice, cudaSuccess, CUBLAS_OP_N,
-    CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle,
+    CUBLAS_OP_N, CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle, cuLaunchKernel,
+    cuModuleGetFunction, cublasSgemm_v2, cudaDeviceSynchronize, cudaFree, cudaMalloc, cudaMemcpy,
+    cudaMemcpyHostToDevice, cudaSetDevice, cudaSuccess,
 };
 use crate::device::jit_cache::compile_and_load_kernel;
 use crate::memory::storage::CudaStorage;
@@ -150,7 +150,6 @@ impl CudaDevice {
         Ok((Box::new(out_storage), compute_handle))
     }
 
-
     /// `ShapeClass::TLOLog` (op-identity) regardless of M, so the wide-N tile is selected
     /// instead of relying on the n>=16384 dimension heuristic in the trait `matmul`.
     pub fn matmul_lm_head(
@@ -163,8 +162,7 @@ impl CudaDevice {
     }
 
     /// Fused Add + RMSNorm: `y_out = x + residual`, `norm_out = rms_norm(y_out, w, eps)`.
-    /// Returns `(y_out, res_out, compute_handle)`. Mirrors the ROCm `grim_add_rms_norm` HIP
-    /// kernel and the Metal MSL shader 1:1 — one PTX thread per output element, no shared mem.
+    /// Returns `(y_out, res_out, compute_handle)`.
     pub fn fused_add_rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -226,7 +224,6 @@ impl CudaDevice {
 }
 
 impl CoreTensorOps for CudaDevice {
-
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         if dtype != DType::F32 {
             return Err(Error::DTypeMismatch(format!(
@@ -258,7 +255,6 @@ impl CoreTensorOps for CudaDevice {
         Ok(Box::new(storage))
     }
 
-
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -267,7 +263,6 @@ impl CoreTensorOps for CudaDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_op(a, b, out_shape, None)
     }
-
 
     fn add(
         &self,
@@ -303,7 +298,6 @@ impl CoreTensorOps for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -338,7 +332,6 @@ impl CoreTensorOps for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -372,7 +365,6 @@ impl CoreTensorOps for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_silu_mul", &mut args, n)?;
         Ok((Box::new(out_storage), handle))
     }
-
 
     fn rms_norm(
         &self,
@@ -414,7 +406,6 @@ impl CoreTensorOps for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-
     fn softmax(
         &self,
         x: &dyn BackendStorage,
@@ -443,7 +434,6 @@ impl CoreTensorOps for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_softmax", &mut args, total)?;
         Ok((Box::new(out_storage), handle))
     }
-
 
     fn embedding(
         &self,
@@ -548,7 +538,6 @@ impl CoreTensorOps for CudaDevice {
         Ok((Box::new(out_storage), compute_handle))
     }
 
-
     fn from_cpu(
         &self,
         data: &[f32],
@@ -559,7 +548,6 @@ impl CoreTensorOps for CudaDevice {
         Ok(Box::new(storage))
     }
 
-
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -569,11 +557,7 @@ impl CoreTensorOps for CudaDevice {
     }
 }
 
-
-
 impl ElementwiseOps for CudaDevice {
-
-
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -601,7 +585,6 @@ impl ElementwiseOps for CudaDevice {
         Ok((Box::new(out_storage), handle))
     }
 
-
     fn sqrt(
         &self,
         x: &dyn BackendStorage,
@@ -625,7 +608,6 @@ impl ElementwiseOps for CudaDevice {
         let handle = self.launch_rank1_kernel("grim_sqrt", &mut args, n)?;
         Ok((Box::new(out_storage), handle))
     }
-
 
     fn recip(
         &self,
@@ -708,16 +690,9 @@ impl ElementwiseOps for CudaDevice {
     }
 }
 
-
-
-impl SamplingOps for CudaDevice {
-}
-
-
+impl SamplingOps for CudaDevice {}
 
 impl FusionOps for CudaDevice {
-
-
     /// Override the trait default with the real fused `grim_add_rms_norm` PTX kernel.
     fn fused_add_rms_norm(
         &self,
@@ -735,21 +710,9 @@ impl FusionOps for CudaDevice {
     }
 }
 
-
-
 impl AutogradOps for CudaDevice {
-
-
     /// Fused (non-fused first cut) dequantized matmul backward on CUDA.
-    ///
-    /// Computes `dX[M, K] = dY[M, N] @ B_dequant^T` where `B` is a quantized,
-    /// CUDA-resident weight of shape `[K, N]`. The packed codes are copied to
-    /// the host, dequantized via `grim-quant` (mirroring
-    /// `grim-format::convert::dequant_tensor_data`), re-uploaded as F32, and
-    /// multiplied with `dY` through cuBLAS. This is the CUDA counterpart of the
-    /// ROCm fused path in `RocmDevice::quantized_matmul_backward_dx`; it fires
-    /// from `grim-autograd::matmul_backward` once quantized storage is kept
-    /// resident on CUDA (see `varbuilder::materialize`).
+    /// Computes `dX[M, K] = dY[M, N] @ B_dequant^T` where `B` is a quantized, CUDA-resident weight.
     fn silu_mul_backward(
         &self,
         gate: &dyn BackendStorage,
@@ -828,9 +791,4 @@ impl AutogradOps for CudaDevice {
     }
 }
 
-
-
-impl OptimizerOps for CudaDevice {
-}
-
-
+impl OptimizerOps for CudaDevice {}

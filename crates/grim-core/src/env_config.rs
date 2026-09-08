@@ -1,7 +1,5 @@
 //! Runtime environment configuration for grim.
-//!
-//! A single source of truth for configuration flags loaded from `grim.toml`
-//! (first) and overridden by `GRIM_*` environment variables (second).
+//! A single source of truth for configuration flags loaded from `grim.toml` (first) and overridden by.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};

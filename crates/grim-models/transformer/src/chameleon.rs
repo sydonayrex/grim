@@ -1,8 +1,5 @@
 //! Chameleon multimodal-compatible transformer with per-head Q/K normalization.
-//!
-//! # Architecture Details
-//! - **Per-Head Q/K Normalization (`swin_norm`)**: LayerNorm / RMSNorm applied to each attention head's Q and K independently prior to RoPE.
-//! - **GQA Attention & SwiGLU MLP**: Standard Grouped Query Attention with RoPE and SwiGLU feed-forward networks.
+//! # Architecture Details - **Per-Head Q/K Normalization (`swin_norm`)**: LayerNorm / RMSNorm applied to each attention.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -12,9 +9,7 @@ use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 use crate::falcon::LayerNorm;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Chameleon model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -62,9 +57,7 @@ impl ModelConfig for ChameleonConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Chameleon Block
-// ---------------------------------------------------------------------------
 
 /// A transformer block with per-head normalized attention and SwiGLU feed-forward.
 pub struct ChameleonBlock {
@@ -156,11 +149,7 @@ impl ChameleonBlock {
     }
 
     /// Evaluates one transformer block: Pre-RMSNorm -> Q/K norm -> RoPE -> GQA -> Post-RMSNorm -> SwiGLU.
-    ///
-    /// GPU-first: RoPE, KV-cache concat, attention and the SwiGLU MLP all run
-    /// on the tensor's device. The per-head Q/K LayerNorms stay host-side
-    /// (LayerNorm has no device kernel); their output is re-uploaded to the
-    /// tensor's device before RoPE.
+    /// GPU-first: RoPE, KV-cache concat, attention and the SwiGLU MLP all run on the tensor's device.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -196,12 +185,8 @@ impl ChameleonBlock {
             None => k,
         };
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -222,10 +207,8 @@ impl ChameleonBlock {
         };
         let kv_len = k_all.shape().dims()[0];
 
-        // Shared helper applies the causal mask at cache_offset + s (fixes
-        // future-token leakage during multi-token prefill). GPU-first; on
-        // backends that reject the kernel call fall back to the
-        // host-history entry (scalar reference on CPU).
+        // Shared helper applies the causal mask at cache_offset + s (fixes future-token leakage during multi-token prefill).
+        // GPU-first; on backends that reject the kernel call fall back to the host-history entry (scalar.
         let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q,
             &k_all,
@@ -265,9 +248,7 @@ impl ChameleonBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct Chameleon {
     pub cfg: ChameleonConfig,
@@ -402,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_chameleon_session_kv_cache_persistence() {
         let mut cfg = ChameleonConfig::default();
         cfg.vocab_size = 32;

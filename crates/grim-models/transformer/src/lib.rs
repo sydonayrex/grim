@@ -1,9 +1,7 @@
 //! Dense CausalLm transformer implementations (Llama, Mistral, Qwen, DeepSeek, Gemma, T5, MTP).
 
-/// True when a backend error means "this backend lacks the kernel" — callers
-/// may degrade to the documented host fallback. Any other error must
-/// propagate. GPU-first rule: forwards try the device kernel first and only
-/// take the host path through this guard.
+/// True when a backend error means "this backend lacks the kernel" - callers may degrade to the documented host fallback.
+/// Any other error must propagate.
 pub fn is_unimplemented(e: &grim_core::error::Error) -> bool {
     matches!(
         e,
@@ -103,12 +101,12 @@ pub mod maincoder;
 pub mod maple;
 pub mod mellum;
 pub mod mimo2;
-pub mod mla_common;
 pub mod minicpm;
 pub mod minimax_m2;
 pub mod minimax_m3;
 pub mod mistral3;
 pub mod mistral4;
+pub mod mla_common;
 pub mod model;
 /// Shared MoE block (router + expert bank + optional shared expert).
 pub mod moe_block;
@@ -223,16 +221,16 @@ pub use exaone4::{Exaone4, Exaone4Config};
 pub use exaone4_5::{Exaone45, Exaone45Config};
 pub use falcon_h1::{FalconH1Config, FalconH1LayerCache, FalconH1Model};
 pub use gemma::{Gemma, GemmaConfig};
-pub use gemma2::{Gemma2, Gemma2Config};
 pub use gemma_embedding::{GemmaEmbedding, GemmaEmbeddingConfig};
+pub use gemma2::{Gemma2, Gemma2Config};
 pub use gemma3n::{Gemma3n, Gemma3nConfig};
 pub use gemma4_assistant::{Gemma4Assistant, Gemma4AssistantConfig};
 pub use glm4::{Glm4, Glm4Config};
 pub use glm4_moe_lite::{Glm4MoeLite, Glm4MoeLiteConfig};
 pub use glm4moe::{Glm4Moe, Glm4MoeConfig};
 pub use glmdsa::{GlmDsa, GlmDsaConfig};
-pub use gpt2::{Gpt2, Gpt2Config};
 pub use gpt_oss::{GptOss, GptOssConfig};
+pub use gpt2::{Gpt2, Gpt2Config};
 pub use gptj::{GptJ, GptJConfig};
 pub use gptneox::{GptNeoX, GptNeoXConfig};
 pub use granite::{Granite, GraniteConfig};
@@ -332,9 +330,8 @@ mod tests {
 
     #[test]
     fn smoke_llama_with_empty_adapters_matches_baseline() {
-        // Running with zero adapters must produce the same numerics as
-        // the no-adapter sweep — guards against the fused-LoRA path
-        // accidentally perturbing the base distribution.
+        // Running with zero adapters must produce the same numerics as the no-adapter
+        // sweep - guards against the fused-LoRA path accidentally perturbing the base distribution.
         let cfg = LlamaConfig {
             vocab_size: 64,
             hidden_size: 32,
@@ -365,9 +362,8 @@ mod tests {
 
     #[test]
     fn lora_apply_with_one_adapter_perturbs_logit_distribution() {
-        // A single non-zero LoRA must measurably shift the logits
-        // (preserving the architectural §4.5 contract that adapters
-        // change the per-token distribution).
+        // A single non-zero LoRA must measurably shift the logits (preserving
+        // the architectural §4.5 contract that adapters change the per-token distribution).
         use crate::lora::apply_adapters_to_logits;
         use grim_core::model::AdapterHandle;
         let logits = grim_backend_cpu::cpu_tensor(

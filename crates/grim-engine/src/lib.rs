@@ -17,10 +17,10 @@ pub mod train_packed;
 
 pub use cache_blend::{CacheBlendEngine, CachedSegment, StitchedPromptLayout};
 pub use pipeline_engine::{
-    vpp_async_schedule, InprocVppTransport, PipelinePlan, PipelineStageConfig,
-    PipelineStageExecutor, PipelineStageRunner, PipelinedModelCoordinator, TcpVppTransport,
-    VirtualPipelineCoordinator, VirtualPipelinePlan, VppActivationTransport, VppChannel, VppStep,
-    VppTransfer,
+    InprocVppTransport, PipelinePlan, PipelineStageConfig, PipelineStageExecutor,
+    PipelineStageRunner, PipelinedModelCoordinator, TcpVppTransport, VirtualPipelineCoordinator,
+    VirtualPipelinePlan, VppActivationTransport, VppChannel, VppStep, VppTransfer,
+    vpp_async_schedule,
 };
 pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
 
@@ -42,35 +42,29 @@ type DynModelPtr = Box<SpeculativeCausalLm>;
 pub struct LoadedModel {
     pub model: DynModelPtr,
     pub config: Box<dyn ModelConfig>,
-    /// Device this model's weights live on. Sessions are created on this
-    /// device so decode/GPU work actually lands on the GPU instead of
-    /// silently falling back to CPU.
+    /// Device this model's weights live on. Sessions are created on this device so
+    /// decode/GPU work actually lands on the GPU instead of silently falling back to CPU.
     pub device: grim_tensor::Device,
-    /// Tensor-parallel configuration stamped at registration time. `None`
-    /// means single-device; otherwise carries the per-rank `(rank, world_size)`
-    /// so callers can report or query the shard index of a loaded model.
+    /// Tensor-parallel configuration stamped at registration time.
+    /// `None` means single-device; otherwise carries the per-rank `(rank, world_size)` so callers can report or query.
     pub tp_config: Option<grim_nn::TensorParallelConfig>,
-    /// Architecture hyperparameters, when the model reports them (R4). The
-    /// admission gate re-certifies the request footprint against *current*
-    /// free device memory using these. `None` when the model can't report
-    /// them — the gate is then skipped (fail-open).
+    /// Architecture hyperparameters, when the model reports them (R4).
+    /// The admission gate re-certifies the request footprint against *current* free device memory using these.
     pub arch_hyperparams: Option<grim_core::hyperparams::ArchHyperparameters>,
 }
 
 /// A loaded adapter bundle (one LoRA's A/B matrices + scaling). LoRA batches
 /// keyed by [`AdapterHandle::id`]; the engine resolves lookup at runtime.
 pub struct LoadedAdapter {
-    /// Human-readable name from registration — matched against HTTP request
-    /// body `"adapters"` arrays. The server 400s on unknown names so this
-    /// must be set at register time.
+    /// Human-readable name from registration - matched against HTTP request body `"adapters"` arrays.
+    /// The server 400s on unknown names so this must be set at register time.
     pub name: String,
     pub handle: AdapterHandle,
     pub base_model_id: String,
 }
 
 /// Best-effort current free-device-memory probe for the admission gate (R4).
-/// Returns `None` when the backend cannot probe free memory (CPU/Vulkan/Metal
-/// without a probe), in which case the gate is skipped (fail-open).
+/// Returns `None` when the backend cannot probe free memory (CPU/Vulkan/Metal without a probe), in which.
 fn free_device_memory(device: &grim_tensor::Device) -> Option<u64> {
     // Test/override hook: GRIM_TEST_FREE_DEVICE_BYTES lets tests (and
     // operators) inject a known free-memory value without a live device.
@@ -80,9 +74,7 @@ fn free_device_memory(device: &grim_tensor::Device) -> Option<u64> {
         }
     }
     match device {
-        grim_tensor::Device::Rocm(ordinal) => {
-            grim_backend_rocm::free_device_memory(*ordinal)
-        }
+        grim_tensor::Device::Rocm(ordinal) => grim_backend_rocm::free_device_memory(*ordinal),
         _ => None,
     }
 }
@@ -100,45 +92,30 @@ pub struct EngineConfig {
     pub determinism_mode: DeterminismMode,
     /// Optional KV compressor for runtime KV cache quantization.
     pub kv_compressor: Option<Arc<dyn grim_kvquant::KvCompressor>>,
-    /// Tensor-parallel world size (env `GRIM_TP_SIZE`). `0` or `1` =
-    /// single-device. Values > 1 require a backend collective (RCCL on ROCm)
-    /// and model construction that shards layers — see C2plrController
-    /// (scythe2.md §5) and the `ColumnParallelLinear`/`RowParallelLinear`
-    /// wrappers in `grim-nn`. The engine reads the env here; the comms
-    /// bootstrap is the SCYTHE-2 WI-6 entry point (roc_device.rs:3136).
+    /// Tensor-parallel world size (env `GRIM_TP_SIZE`).
+    /// `0` or `1` = single-device.
     pub tp_size: usize,
     /// Explicit GPU ordinals for TP (`GRIM_GPUS`, empty = all visible).
     pub tp_gpus: Vec<usize>,
-    /// Pipeline-parallel size (`GRIM_PP_SIZE`, 0/1 = off). The stage layout
-    /// (`pipeline_engine::PipelinePlan`) is computed and validated at engine
-    /// startup, but block-level execution is NOT wired yet: a paged KV pool
-    /// is single-device, so per-stage KV pools are a prerequisite. Requesting
-    /// pp_size > 1 hard-fails loudly instead of silently running TP-shaped
-    /// weights through single-device execution.
+    /// Pipeline-parallel size (`GRIM_PP_SIZE`, 0/1 = off).
+    /// The stage layout (`pipeline_engine::PipelinePlan`) is computed and validated at engine startup, but block-level execution is.
     pub pp_size: usize,
-    /// WI-TOOLS-4c-i: hard cap on the total number of tool-call entries across
-    /// every assistant message in a single request's `messages` array. Rejects
-    /// the request with 400 once a conversation has made more tool calls than a
-    /// single agentic loop should reasonably need (default 20 — arbitrary
-    /// starting point; tune against real workloads once 4b's logging exists).
+    /// WI-TOOLS-4c-i: hard cap on the total number of tool-call entries across every assistant message in a single request's `messages` array.
+    /// Rejects the request with 400 once a conversation has made more tool calls than a.
     pub max_tool_calls_per_conversation: usize,
-    /// WI-TOOLS-4c-ii: hard cap on `messages.len()` per request. Catches
-    /// unbounded history growth (agentic loops or client bugs) before any
-    /// tokenization/prefill work happens (default 200 — arbitrary starting
-    /// point, not a considered number).
+    /// WI-TOOLS-4c-ii: hard cap on `messages.len()` per request.
+    /// Catches unbounded history growth (agentic loops or client bugs) before any tokenization/prefill work happens (default.
     pub max_messages_per_request: usize,
     /// Disaggregated serving router context.
     pub disagg_router: Option<Arc<grim_disagg::DisaggRouter>>,
     /// Disaggregation configuration (role, addrs). When set, the engine
     /// starts a background KV receiver server and wires disagg routing.
     pub disagg_config: Option<grim_disagg::DisaggConfig>,
-    /// Externally-constructed cluster orchestrator (§5.6 failover). When
-    /// `None` but `disagg_config` is set, the engine constructs one
-    /// automatically from that config.
+    /// Externally-constructed cluster orchestrator (§5.6 failover).
+    /// When `None` but `disagg_config` is set, the engine constructs one automatically from that config.
     pub disagg_orchestrator: Option<Arc<std::sync::Mutex<grim_disagg::DisaggOrchestrator>>>,
-    /// Heartbeat timeout for disagg failover evaluation: a peer whose last
-    /// observed heartbeat is older than this is presumed dead and the node
-    /// fails over to colocated execution (default 5000 ms).
+    /// Heartbeat timeout for disagg failover evaluation: a peer whose last observed heartbeat is older than
+    /// this is presumed dead and the node fails over to colocated execution (default 5000 ms).
     pub disagg_heartbeat_timeout_ms: u64,
 }
 
@@ -203,33 +180,19 @@ pub struct Engine {
     pub adapters: HashMap<u32, LoadedAdapter>,
     /// Per-request last-emitted logs (cleared on `finish_request`).
     pub last_outcomes: HashMap<u64, StepOutcome>,
-    /// Per-request deterministic RNG, §5.8. Populated when
-    /// `DeterminismMode::Strict` is active. When Relaxed, RNG state is
-    /// still tracked for telemetry but is allowed to differ between
-    /// tick calls.
+    /// Per-request deterministic RNG, §5.8. Populated when `DeterminismMode::Strict` is active.
     pub request_rng: HashMap<u64, DeterministicRng>,
     pub request_model_ids: HashMap<u64, String>,
     pub request_adapters: HashMap<u64, Vec<u32>>,
-    /// Per-request input token buffers. Populated in `enqueue_request`
-    /// from `Request::input_ids`. Used by `drive_prefill` to feed real
-    /// prompt tokens instead of synthetic position indices.
+    /// Per-request input token buffers. Populated in `enqueue_request` from `Request::input_ids`.
     pub request_input_ids: HashMap<u64, Vec<u32>>,
-    /// Per-request count of prompt tokens already prefilled (chunked
-    /// prefill bookkeeping, F9 follow-on). The scheduler's
-    /// `consumed_tokens` says how many tokens the SCHEDULER has budgeted;
-    /// this map says how many the ENGINE has actually run through the
-    /// model. Each pass prefills only `[progress, consumed)` — models
-    /// append KV sequentially, so re-running already-prefilled tokens
-    /// would duplicate their KV entries and corrupt the sequence.
+    /// Per-request count of prompt tokens already prefilled (chunked prefill bookkeeping, F9 follow-on).
+    /// The scheduler's `consumed_tokens` says how many tokens the SCHEDULER has budgeted; this map says how.
     pub prefill_progress: HashMap<u64, usize>,
-    /// Per-request last generated token. Updated after each decode step
-    /// via `record_generated_token`. Used by `drive_decode` to feed the
-    /// previously sampled token instead of the position index.
+    /// Per-request last generated token. Updated after each decode step via `record_generated_token`.
     pub request_last_token: HashMap<u64, u32>,
-    /// Self-tuning knob controller (§5.7). Owns `chunked_prefill_size` and
-    /// `max_batched_tokens` — `tick()` re-applies them every pass, so tests
-    /// that need deterministic chunking pin the knobs HERE (floor = ceiling
-    /// = initial), not on the scheduler.
+    /// Self-tuning knob controller (§5.7). Owns `chunked_prefill_size` and `max_batched_tokens` - `tick()` re-applies them every pass, so tests
+    /// that need deterministic chunking pin the knobs HERE (floor = ceiling = initial), not on the scheduler.
     pub self_tuning_controller: grim_scheduler::SelfTuningController,
     /// Tuned speculative params (MIN-3: applied, not discarded).
     tuned_speculative_block_len: usize,
@@ -240,13 +203,8 @@ pub struct Engine {
     accepted_tokens_total: u64,
     last_ttft_ms: Option<f64>,
     last_itl_ms: Option<f64>,
-    /// Tensor-parallel config stamped onto each `LoadedModel`. Populated in
-    /// `Engine::new` when TP is active (one OS process per rank, Design A);
-    /// `None` for single-device operation. The actual per-rank device + RCCL
-    /// handle is built in `model_loader`'s ROCm branch and
-    /// `RocmDevice::try_new` (auto-inits RCCL from the same `GRIM_TP_*` env).
-    /// This field exists so the engine can report and re-stamp the shard index
-    /// at model registration without depending on grim-nn at the device layer.
+    /// Tensor-parallel config stamped onto each `LoadedModel`.
+    /// Populated in `Engine::new` when TP is active (one OS process per rank, Design A); `None`.
     tp_config: Option<grim_nn::TensorParallelConfig>,
     /// Background KV receiver server handle (started in Engine::new when
     /// disagg_config is Some and role is Decode or Colocated).
@@ -261,48 +219,32 @@ pub struct Engine {
     pub capability_profiler: Option<Arc<grim_backend_rocm::CapabilityProfiler>>,
     /// SCYTHE-2 online router for continuous batching / multi-GPU placement (WI-INF2).
     pub scythe_ctrl: Option<crate::scythe2::C2plrController>,
-    /// SCYTHE-2 farm mode (WI-INF3 serving integration): per-base-model
-    /// replica ids. Replica `r ≥ 1` of `base` is registered as
-    /// `{base}#scythe{r}` and holds a full weight copy on that rank's device;
-    /// rank 0 is the base registration itself.
+    /// SCYTHE-2 farm mode (WI-INF3 serving integration): per-base-model replica ids.
+    /// Replica `r ≥ 1` of `base` is registered as `{base}#scythe{r}` and holds a full weight.
     scythe_replicas: HashMap<String, Vec<String>>,
     /// Request → replica rank, decided by the controller at admission time.
-    /// The pinned replica executes every forward for that request's lifetime,
-    /// so its KV pages stay local to one device.
+    /// The pinned replica executes every forward for that request's lifetime, so its KV pages stay.
     scythe_pin: HashMap<u64, usize>,
-    /// WI-SB1 load-spreading: ranks of recently finished requests with the
-    /// time they were released. Back-to-back admissions must still see the
-    /// predecessor's load or a burst of short requests all lands on rank 0
-    /// (each admission finds the pin map empty again).
+    /// WI-SB1 load-spreading: ranks of recently finished requests with the time they were released.
+    /// Back-to-back admissions must still see the predecessor's load or a burst of short requests all.
     scythe_pin_cooldown: Vec<(usize, std::time::Instant)>,
-    /// WI-SB2: requests held back because no farm rank could hold their KV
-    /// footprint at enqueue time. They never reach the scheduler or own a
-    /// session until a retry (each tick) finds a rank with room, so an
-    /// oversized prompt can never be admitted blind onto a card that cannot
-    /// hold it.
+    /// WI-SB2: requests held back because no farm rank could hold their KV footprint at enqueue time.
+    /// They never reach the scheduler or own a session until a retry (each tick) finds.
     scythe_vram_waitlist: Vec<grim_scheduler::Request>,
     /// Set GRIM_RADIX=on to enable prefix-cache reuse on prefill (WP5).
     pub radix_enabled: bool,
 }
 
-/// Effective-capability view for SCYTHE-2 farm placement: a GPU already
-/// running `load` concurrent sessions contributes roughly `1/(1+load)` of its
-/// solo throughput, so the controller's WaveTune latency argmin doubles as a
-/// load balancer instead of piling every session onto the fastest card.
-/// How long a finished request's rank stays counted as loaded (WI-SB1
-/// load-spreading). Long enough to bridge back-to-back admissions of short
-/// requests; short enough not to skew placement when the farm genuinely idles.
+/// Effective-capability view for SCYTHE-2 farm placement: a GPU already running `load` concurrent sessions contributes roughly `1/(1+load)` of its solo throughput, so the controller's WaveTune latency argmin doubles as a load balancer instead of piling every session onto the fastest card.
+/// How long a finished request's rank stays counted as loaded (WI-SB1 load-spreading).
 pub(crate) const SCYTHE_PIN_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// External (non-farm) GPU utilization converts to equivalent pinned
-/// requests at this weight: a card maxed out by a desktop/game workload
-/// counts as ~2 in-flight farm requests — enough to flip a ~2:1 measured
-/// capability pair toward the idle slower card.
+/// External (non-farm) GPU utilization converts to equivalent pinned requests at this weight: a card maxed out by a desktop/game workload
+/// counts as ~2 in-flight farm requests - enough to flip a ~2:1 measured capability pair toward the idle slower card.
 const SCYTHE_EXTERNAL_BUSY_WEIGHT: f32 = 2.0;
 
-/// WI-SB1: per-rank load seen by admission = active farm pins + pins
-/// released inside the cooldown window + external busy-% converted at
-/// `busy_weight`. Pure so the weighting/expiry rules stay unit-testable.
+/// WI-SB1: per-rank load seen by admission = active farm pins + pins released inside the cooldown window + external busy-% converted at `busy_weight`.
+/// Pure so the weighting/expiry rules stay unit-testable.
 fn scythe_effective_loads(
     active_pins: impl Iterator<Item = usize>,
     released: &[(usize, std::time::Instant)],
@@ -349,11 +291,8 @@ fn load_adjusted_caps(
         .collect()
 }
 
-/// WI-SB2: worst-case device memory one request can reach — its paged KV
-/// (`2·seq·kv_heads·head_dim·layers·4B`, K+V at fp32 page width) plus an
-/// activation working-set floor (`2·seq·hidden·layers·4B`). When the model
-/// doesn't report a hidden width, the KV dimension stands in rather than
-/// inventing one.
+/// WI-SB2: worst-case device memory one request can reach - its paged KV (`2·seq·kv_heads·head_dim·layers·4B`, K+V at fp32 page width) plus an activation working-set floor (`2·seq·hidden·layers·4B`).
+/// When the model doesn't report a hidden width, the KV dimension stands in rather than.
 fn scythe_request_footprint_bytes(
     seq_len: usize,
     max_new_tokens: usize,
@@ -379,11 +318,8 @@ fn scythe_request_footprint_bytes(
     kv_bytes.saturating_add(working_set)
 }
 
-/// WI-SB2: which farm ranks can hold a request's footprint. Headroom for
-/// workspace and fragmentation is covered by [`SCYTHE_VRAM_WATERMARK_BYTES`].
-/// A rank reporting zero free VRAM counts as feasible — that reading means
-/// the probe is unavailable on it, not that the card is full; rejecting those
-/// ranks would dead-lock placement exactly when visibility is worst.
+/// WI-SB2: which farm ranks can hold a request's footprint.
+/// Headroom for workspace and fragmentation is covered by [`SCYTHE_VRAM_WATERMARK_BYTES`].
 fn scythe_vram_feasible(
     caps: &[grim_tensor::backend::GpuCapability],
     footprint_bytes: u64,
@@ -396,9 +332,8 @@ fn scythe_vram_feasible(
         .collect()
 }
 
-/// WI-SB2 admission guard watermark: free-VRAM headroom (512 MiB) a rank must
-/// keep above a request's computed footprint so scratch buffers, logits and
-/// allocator fragmentation never push a pinned request into an OOM.
+/// WI-SB2 admission guard watermark: free-VRAM headroom (512 MiB) a rank must keep above a request's computed
+/// footprint so scratch buffers, logits and allocator fragmentation never push a pinned request into an OOM.
 const SCYTHE_VRAM_WATERMARK_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Outcome of the WI-SB2 admission guard for one request against a farm.
@@ -421,12 +356,8 @@ impl Engine {
             config.head_dim,
         );
 
-        // KV-cache quantization (§kv-int8). `EngineConfig.kv_compressor` takes
-        // precedence; otherwise honor `GRIM_KV_QUANT=int8` which attaches a
-        // Lloyd-Max int4/int8 compressor so the paged KV pool compresses
-        // admitted blocks before spill. Previously this defaulted to `None`,
-        // leaving the real `LloydMaxCompressor` impl (grim-kvquant) unreachable
-        // from the serving path.
+        // KV-cache quantization (§kv-int8). `EngineConfig.kv_compressor` takes precedence; otherwise honor `GRIM_KV_QUANT=int8` which attaches a
+        // Lloyd-Max int4/int8 compressor so the paged KV pool compresses admitted blocks before spill.
         let mut compressor: Option<Arc<dyn grim_kvquant::KvCompressor>> =
             config.kv_compressor.clone();
         if compressor.is_none() {
@@ -468,33 +399,12 @@ impl Engine {
         }
 
         // Tensor-parallel bootstrap (§c-tp-scope, WI-TP-4).
-        //
-        // Design A (multi-process): one OS process per rank. Each process sets
-        // GRIM_TP_SIZE=N + GRIM_TP_RANK=i + (optional) GRIM_GPUS. Here we
-        // resolve *this* process's ordinal from the env for logging and stamp
-        // the derived `tp_config` onto `LoadedModel` at registration time.
-        //
-        // The actual per-rank `RocmDevice` + `RcclAllReduce` is built elsewhere:
-        //   - `model_loader.rs` resolves the rank's ordinal in the ROCm branches
-        //     of `load_from_path`, constructs `Device::Rocm(my_ordinal)`, and
-        //     calls the model's `load_tp` (which shards weights by `ws.tp_config()`).
-        //   - `RocmDevice::try_new` auto-inits RCCL over the full ordinal list
-        //     via `auto_init_rccl()` (roc_device.rs:280), so every rank's
-        //     `ncclAllReduce` rendezvous with its peers.
-        //
-        // We do NOT pre-build RocmDevices or fan out devices in-process here —
-        // that would be the inert `TpRankContext`/`plan_tp_ranks` pattern, which
-        // silently shards weights on one GPU and hangs on `ncclAllReduce` waiting
-        // for peers that never started. Under TP, `Engine::new` must hard-fail
-        // if the config is structurally invalid (rank >= world_size), not
-        // silently degrade to a wrong shard.
+        // Design A (multi-process): one OS process per rank.
         let tp_config: Option<grim_nn::TensorParallelConfig> = if config.tp_size > 1 {
             let tp = grim_nn::TensorParallelConfig::from_env().unwrap_or_default();
             if let Err(msg) = tp.validate() {
-                // TP requested but structurally invalid — hard fail so the
-                // operator sees the mismatch immediately instead of silently
-                // loading the wrong shard. Engine::new returns Self (not Result),
-                // so we panic; this is an unrecoverable config error.
+                // TP requested but structurally invalid - hard fail so the operator sees the mismatch immediately instead of silently loading the wrong shard.
+                // Engine::new returns Self (not Result), so we panic; this is an unrecoverable config error.
                 log::info!(
                     "[grim-engine] INVALID TP config (GRIM_TP_SIZE={}): {msg}",
                     config.tp_size
@@ -526,9 +436,8 @@ impl Engine {
         };
         let block_pool = Arc::new(std::sync::Mutex::new(pool));
 
-        // Disaggregation: start a background KV receiver server when configured
-        // for Decode or Colocated roles. The receiver writes incoming KV blocks
-        // into the engine's block_pool, enabling cross-node KV handoff.
+        // Disaggregation: start a background KV receiver server when configured for Decode or Colocated roles.
+        // The receiver writes incoming KV blocks into the engine's block_pool, enabling cross-node KV handoff.
         let kv_receiver = if let Some(ref dc) = config.disagg_config {
             let role = dc.role;
             let listen_addr = if role == grim_disagg::PoolRole::Decode {
@@ -581,9 +490,8 @@ impl Engine {
             admission,
         );
         scheduler.determinism_mode = config.determinism_mode;
-        // §5.2 real KV pressure: pool occupancy feeds the scheduler's
-        // pressure signal so preemption/chunked draining react to actual
-        // KV exhaustion, not just prompt-token sums.
+        // §5.2 real KV pressure: pool occupancy feeds the scheduler's pressure signal
+        // so preemption/chunked draining react to actual KV exhaustion, not just prompt-token sums.
         scheduler.set_kv_pressure(Arc::new(grim_scheduler::PoolKvPressure::new({
             let block_pool = block_pool.clone();
             move || {
@@ -594,11 +502,8 @@ impl Engine {
         let target_ttft = config.target_ttft_ms as f64;
         let target_itl = config.target_itl_ms as f64;
 
-        // Pipeline-parallel gate. The stage layout is computable now, but
-        // block-level execution is NOT wired: a paged KV pool is single-
-        // device, so per-stage KV pools are the prerequisite. Rather than
-        // load PP-shaped weights and silently run single-device execution,
-        // hard-fail loudly with the path to follow.
+        // Pipeline-parallel gate. The stage layout is computable now, but block-level execution is NOT wired:
+        // a paged KV pool is single- device, so per-stage KV pools are the prerequisite.
         if config.pp_size > 1 {
             panic!(
                 "[grim-engine] INVALID config (GRIM_PP_SIZE={}): pipeline-parallel \
@@ -618,25 +523,16 @@ impl Engine {
             .map(|v| v == "1" || v == "true" || v == "on")
             .unwrap_or(false);
 
-        // WI-INF1: the profiler is the only thing constructed on the default
-        // path, and only when more than one GPU is visible. A single-GPU box
-        // pays zero probe cost (gate: test_single_gpu_capability_profiler_is_none).
+        // WI-INF1: the profiler is the only thing constructed on the default path, and only when more than one GPU is visible.
+        // A single-GPU box pays zero probe cost (gate: test_single_gpu_capability_profiler_is_none).
         let capability_profiler = if is_multi_gpu || scythe_inference_flag {
             Some(Arc::new(grim_backend_rocm::CapabilityProfiler::new()))
         } else {
             None
         };
 
-        // WI-INF2: the controller routes activations across GPUs *in this
-        // process* (SCYTHE-2's P2P-ring execution model), so it is armed on
-        // the count of ROCm devices visible here — not on `TP world_size`,
-        // which under Design A counts one GPU per OS process. Fewer than two
-        // visible GPUs leaves nothing to route between; the controller stays
-        // `None` even with the flag set.
-        //
-        // `num_layers` starts at the placeholder below and is re-sized to the
-        // loaded model's real depth at registration time (see
-        // `register_speculative`), one controller per loaded model.
+        // WI-INF2: the controller routes activations across GPUs *in this process* (SCYTHE-2's P2P-ring execution model), so it is armed on the count of ROCm devices visible here - not on `TP world_size`, which under Design A counts one GPU per OS process.
+        // Fewer than two visible GPUs leaves nothing to route between; the controller stays `None` even.
         const SCYTHE_NUM_LAYERS_PLACEHOLDER: usize = 32;
         let visible_gpus = capability_profiler
             .as_ref()
@@ -698,9 +594,7 @@ impl Engine {
     }
 
     /// Tensor-parallel configuration resolved once at `Engine::new` from the env.
-    /// `GRIM_TP_RANK` selects this process's shard index; `GRIM_TP_SIZE` selects
-    /// the world size. Returns `None` when `GRIM_TP_SIZE` is unset or 1
-    /// (single-device).
+    /// `GRIM_TP_RANK` selects this process's shard index; `GRIM_TP_SIZE` selects the world size.
     pub fn tp_config(&self) -> Option<grim_nn::TensorParallelConfig> {
         self.tp_config
     }
@@ -710,11 +604,8 @@ impl Engine {
         self.kv_receiver.as_ref()
     }
 
-    /// Record an incoming heartbeat from a peer role indicating that the
-    /// peer role is alive (a successful KV transfer to the decode node, an
-    /// ingested block from the prefill node, or a server-layer health probe).
-    /// `tick()` evaluates these timestamps against
-    /// [`EngineConfig::disagg_heartbeat_timeout_ms`].
+    /// Record an incoming heartbeat from a peer role indicating that the peer role is alive (a successful KV transfer to the decode node, an ingested block from the prefill node, or a server-layer health probe).
+    /// `tick()` evaluates these timestamps against [`EngineConfig::disagg_heartbeat_timeout_ms`].
     pub fn disagg_record_peer_heartbeat(&self, role: grim_disagg::PoolRole, now_ms: u64) {
         if let Some(orch) = &self.disagg_orchestrator {
             let mut guard = orch.lock().unwrap_or_else(|p| p.into_inner());
@@ -730,15 +621,24 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .evaluate_failover(now_ms, self.config.disagg_heartbeat_timeout_ms);
-            *self.disagg_effective_role.lock().unwrap_or_else(|p| p.into_inner()) = effective;
+            *self
+                .disagg_effective_role
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = effective;
         }
-        *self.disagg_effective_role.lock().unwrap_or_else(|p| p.into_inner())
+        *self
+            .disagg_effective_role
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// The effective role after failover evaluation: `Colocated` means the
     /// remote peer is presumed dead and remote handoff is gated off.
     pub fn disagg_effective_role(&self) -> grim_disagg::PoolRole {
-        *self.disagg_effective_role.lock().unwrap_or_else(|p| p.into_inner())
+        *self
+            .disagg_effective_role
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Return live snapshot of visible GPU capabilities if profiler is active.
@@ -757,12 +657,8 @@ impl Engine {
         self.scythe_ctrl.is_some()
     }
 
-    /// Hand the engine's SCYTHE-2 controller to a streaming executor as a
-    /// [`ScytheRoute`](crate::streaming_forward::ScytheRoute) (WI-INF3).
-    ///
-    /// The route snapshots capabilities/links from the profiler lazily (on
-    /// capability-epoch change only) and maps rank → `Device::Rocm(rank)`.
-    /// Returns `false` (and touches nothing) when routing isn't armed.
+    /// Hand the engine's SCYTHE-2 controller to a streaming executor as a [`ScytheRoute`](crate::streaming_forward::ScytheRoute) (WI-INF3).
+    /// The route snapshots capabilities/links from the profiler lazily (on capability-epoch change only) and maps rank.
     pub fn attach_scythe_route(
         &mut self,
         sfb: &mut crate::streaming_forward::StreamingBlockForward,
@@ -788,26 +684,13 @@ impl Engine {
     }
 
     /// SCYTHE-2 farm mode (WI-INF3 serving integration).
-    ///
-    /// A dense model's blocks live on one device, so per-layer placement needs
-    /// the weight-sharded ring substrate that doesn't exist yet. What CAN route
-    /// today is whole-pass placement: one full weight replica per visible GPU,
-    /// with the controller pinning each admitted session to a rank. Sessions
-    /// pinned to different ranks run genuinely in parallel; the WaveTune
-    /// estimate steers sessions toward the faster card and the load-adjusted
-    /// capability view spreads them once it saturates.
-    ///
-    /// `primary` has already been loaded by the caller on its env-chosen
-    /// device — it becomes rank 0. The remaining replicas are loaded from
-    /// `path`, one per leftover visible ROCm device. Without an armed
-    /// controller or a second GPU this degrades to plain registration.
+    /// A dense model's blocks live on one device, so per-layer placement needs the weight-sharded ring.
     pub fn register_model_with_farm(&mut self, id: &str, primary: Box<dyn CausalLm>, path: &str) {
         self.register_model_with_farm_inner(id, primary, path, None);
     }
 
-    /// Load a farm while keeping speculative decoding on rank 0. Replica
-    /// models are intentionally plain: the drafter is coupled to rank 0's
-    /// device and is not replicated across the farm.
+    /// Load a farm while keeping speculative decoding on rank 0.
+    /// Replica models are intentionally plain: the drafter is coupled to rank 0's device and is.
     pub fn load_and_register_scythe_farm_speculative(
         &mut self,
         id: &str,
@@ -923,13 +806,7 @@ impl Engine {
     }
 
     /// WI-SB2 admission guard for one request against the farm's live caps.
-    ///
-    /// [`ScytheAdmission::Pin`] carries the controller-chosen rank;
-    /// [`ScytheAdmission::WaitVram`] means every rank failed the footprint
-    /// check (or the profiler sees nothing at all) and the caller must keep
-    /// the request out of the scheduler rather than pin it blind;
-    /// [`ScytheAdmission::Bypass`] means farm routing isn't engaged and the
-    /// plain single-replica path applies unchanged (rollback invariant).
+    /// [`ScytheAdmission::Pin`] carries the controller-chosen rank; [`ScytheAdmission::WaitVram`] means every rank failed the footprint check (or the.
     fn scythe_admission_decision(
         &mut self,
         base: &str,
@@ -1015,11 +892,8 @@ impl Engine {
             ctrl.decide(0, &shape, &caps, &links, epoch)
         };
         let chosen = placement.ranks.first().copied();
-        // WI-SB1 load spreading: ON by default since the P1-3 guard sweep
-        // fixed cross-device FFI (verification 2026-08-23f: rank-1 pins
-        // served cleanly, GPU1 sampled at 88–93 % under sustained load,
-        // 18/17 rank split over 35 live requests). Opt out with
-        // GRIM_SCYTHE_SPREAD=0.
+        // WI-SB1 load spreading: ON by default since the P1-3 guard sweep fixed cross-device FFI (verification 2026-08-23f: rank-1 pins served cleanly, GPU1 sampled at 88-93 % under sustained load, 18/17 rank split over 35 live requests).
+        // Opt out with GRIM_SCYTHE_SPREAD=0.
         let spread_enabled = std::env::var("GRIM_SCYTHE_SPREAD")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -1076,32 +950,27 @@ impl Engine {
         }
     }
 
-    /// Most recent measured prefill time in milliseconds. `None` means no
-    /// completed prefill has been observed yet; callers must not invent a
-    /// latency value for that state.
+    /// Most recent measured prefill time in milliseconds.
+    /// `None` means no completed prefill has been observed yet; callers must not invent a latency.
     pub fn last_ttft_ms(&self) -> Option<f64> {
         self.last_ttft_ms
     }
 
-    /// Most recent measured inter-token latency in milliseconds. `None` means no
-    /// completed decode step has been observed yet; callers must not invent a
-    /// latency value for that state.
+    /// Most recent measured inter-token latency in milliseconds.
+    /// `None` means no completed decode step has been observed yet; callers must not invent a.
     pub fn last_itl_ms(&self) -> Option<f64> {
         self.last_itl_ms
     }
 
-    /// Clear the TTFT/ITL trace so a caller measuring request-by-request (the
-    /// WI-SB3 A/B harness) can distinguish a fresh measurement from the
-    /// previous request's stale one. Without this, `last_ttft_ms()` stays
-    /// `Some` forever and every later sample records the earlier value.
+    /// Clear the TTFT/ITL trace so a caller measuring request-by-request (the WI-SB3 A/B harness) can distinguish a fresh measurement from the previous request's stale one.
+    /// Without this, `last_ttft_ms()` stays `Some` forever and every later sample records the earlier value.
     pub fn clear_latency_trace(&mut self) {
         self.last_ttft_ms = None;
         self.last_itl_ms = None;
     }
 
-    /// Runtime speculative decoding telemetry for a specific model, or the
-    /// first loaded model if `model_id` is None. Returns `None` if no model
-    /// is loaded.
+    /// Runtime speculative decoding telemetry for a specific model, or the first loaded model if `model_id` is None.
+    /// Returns `None` if no model is loaded.
     pub fn speculative_telemetry(
         &self,
         model_id: Option<&str>,
@@ -1168,10 +1037,8 @@ impl Engine {
         self.register_speculative(id, model, None, None, None);
     }
 
-    /// Register a `CausalLm` with an attached DSpark bundle (draft +
-    /// Markov + confidence heads). The engine will pick DSpark
-    /// speculation automatically. Falls back to plain if any of the
-    /// heads is missing.
+    /// Register a `CausalLm` with an attached DSpark bundle (draft + Markov + confidence heads).
+    /// The engine will pick DSpark speculation automatically.
     pub fn register_with_dspark(
         &mut self,
         id: &str,
@@ -1199,23 +1066,19 @@ impl Engine {
             .and_then(|s| s.parse::<usize>().ok());
 
         let dev = model.device().clone();
-        // WI-INF2: one SCYTHE-2 controller per loaded model, sized by the
-        // model's real transformer depth (the `Engine::new` value was a
-        // placeholder — no model is known at construction time).
+        // WI-INF2: one SCYTHE-2 controller per loaded model, sized by the model's real transformer depth
+        // (the `Engine::new` value was a placeholder - no model is known at construction time).
         if let Some(num_layers) = model.num_layers_hint() {
             if let Some(ctrl) = self.scythe_ctrl.as_mut() {
                 let num_gpus = ctrl.num_gpus();
                 *ctrl = crate::scythe2::C2plrController::new(num_layers, num_gpus, ctrl.budget_ms);
             }
         }
-        // Preserve the model's own modality hint (audio enc-dec, TTS, VC,
-        // vocoder, diffusion…) so serving-layer routing sees the truth.
-        // Hardcoding TextInTextOut misreported every non-text model that
-        // registered through this path, including the audio models.
+        // Preserve the model's own modality hint (audio enc-dec, TTS, VC, vocoder, diffusion…) so serving-layer routing sees the truth.
+        // Hardcoding TextInTextOut misreported every non-text model that registered through this path, including the audio models.
         let modality = model.config().modality();
-        // R4 — capture the model's hyperparameters (when reportable) before
-        // `model` is moved into the speculative wrapper, so the admission gate
-        // can re-certify each request's footprint against *current* free memory.
+        // R4 - capture the model's hyperparameters (when reportable) before `model` is moved into the
+        // speculative wrapper, so the admission gate can re-certify each request's footprint against *current* free memory.
         let arch_hyperparams = model.arch_hyperparams();
         let wrapped = SpeculativeCausalLm::auto(
             model,
@@ -1313,11 +1176,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Register a multi-LoRA adapter against a base model. The adapter is
-    /// keyed by its [`AdapterHandle::id`] and dispatched into the forward
-    /// pass when callers pass `&[AdapterHandle]` that references it.
-    /// `name` is the human-readable identifier used for HTTP request-body
-    /// resolution — the server 400s on any name not present here.
+    /// Register a multi-LoRA adapter against a base model.
+    /// The adapter is keyed by its [`AdapterHandle::id`] and dispatched into the forward pass when callers.
     pub fn register_adapter(
         &mut self,
         base_model_id: &str,
@@ -1335,8 +1195,7 @@ impl Engine {
     }
 
     /// Resolve a set of adapter ids into concrete [`AdapterHandle`]s.
-    /// Returns `None` if any id is unknown — the caller should drop the
-    /// affected request rather than synthesize a partial adapter set.
+    /// Returns `None` if any id is unknown - the caller should drop the affected request.
     pub fn resolve_adapters(&self, ids: &[u32]) -> Option<Vec<AdapterHandle>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
@@ -1359,10 +1218,7 @@ impl Engine {
     }
 
     /// Dynamically reconfigure the MoE VRAM budget at a safe point between inference steps.
-    ///
-    /// # Contract
-    /// Dynamically adjusts the split between KV cache pages and MoE expert cache slots
-    /// without restarting the engine or reloading host weights.
+    /// # Contract Dynamically adjusts the split between KV cache pages and MoE expert cache slots.
     pub fn reconfigure_moe_budget(
         &mut self,
         new_kv_envelope_bytes: usize,
@@ -1375,30 +1231,14 @@ impl Engine {
         Ok(new_expert_envelope_bytes)
     }
 
-    /// Look up an adapter handle by its human-readable name. Used by the HTTP
-    /// server to validate names from request body `"adapters"` arrays before
-    /// opening an SSE stream — unknown names must 400 immediately rather than
-    /// silently produce unadapted output.
+    /// Look up an adapter handle by its human-readable name.
+    /// Used by the HTTP server to validate names from request body `"adapters"` arrays before opening.
     pub fn get_adapter_by_name(&self, name: &str) -> Option<&LoadedAdapter> {
         self.adapters.values().find(|a| a.name == name)
     }
 
-    /// Apply fused batched multi-LoRA (S-LoRA / Punica style) deltas to a
-    /// stacked logits matrix, in place.
-    ///
-    /// Each maximal run of equal adapter ids in `row_adapters` becomes one
-    /// segment; adapter 0 marks base-model rows, which are passed through
-    /// untouched. On a ROCm-configured engine the segments run on-device in
-    /// a single residency (one upload of X/Y, one shrink+expand kernel pair
-    /// per segment); any device failure falls back to the CPU reference with
-    /// a logged warning — never silently.
-    ///
-    /// # Contract (MED-5 surrogate)
-    /// `stacked` is the base logits matrix itself: `[rows, dim]` where `dim`
-    /// is the logits width. This mirrors `apply_adapters_to_logits`, which
-    /// uses the final logits row as a surrogate hidden state, so an adapter
-    /// whose A in_dim / B out_dim differs from `dim` is a loud config error,
-    /// not a silent wrong-shape read.
+    /// Apply fused batched multi-LoRA (S-LoRA / Punica style) deltas to a stacked logits matrix, in place.
+    /// Each maximal run of equal adapter ids in `row_adapters` becomes one segment; adapter 0 marks.
     pub fn apply_batched_lora_to_rows(
         &self,
         stacked: &mut [f32],
@@ -1421,15 +1261,8 @@ impl Engine {
             )));
         }
 
-        // Resolve every non-base adapter to its weights up front so shape
-        // failures surface before any device work. We build TWO views of the
-        // same data:
-        //  * `segments` + `weight_bank` — contiguous adapter segments, for the
-        //    CPU reference path (kept as the source of truth the GPU kernels are
-        //    tested against).
-        //  * `dispatched_adapters` + `token_adapter_idx` — dense-indexed
-        //    adapters + a per-row indirection table, for the dispatched GPU
-        //    path that issues just two kernel launches for any adapter count.
+        // Resolve every non-base adapter to its weights up front so shape failures surface before any device work.
+        // We build TWO views of the same data: * `segments` + `weight_bank` - contiguous adapter.
         let mut segments: Vec<(
             grim_backend_rocm::kernels::batched_lora::BatchedLoraSegment,
             usize, // index into weight_bank
@@ -1501,7 +1334,11 @@ impl Engine {
                 if id == 0 {
                     u32::MAX
                 } else {
-                    id_to_idx.get(&id).copied().expect("adapter validated above").0 as u32
+                    id_to_idx
+                        .get(&id)
+                        .copied()
+                        .expect("adapter validated above")
+                        .0 as u32
                 }
             })
             .collect();
@@ -1515,7 +1352,13 @@ impl Engine {
                 let device = grim_backend_rocm::device::roc_device::RocmDevice::new(*ordinal);
                 let x = stacked.to_vec();
                 match grim_backend_rocm::kernels::batched_lora::batched_lora_dispatched_device(
-                    &device, &x, stacked, dim, dim, &token_adapter_idx, &dispatched_adapters,
+                    &device,
+                    &x,
+                    stacked,
+                    dim,
+                    dim,
+                    &token_adapter_idx,
+                    &dispatched_adapters,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -1540,9 +1383,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Rebuild a logits tensor with `data` contents on the same device,
-    /// dtype and provenance as `like`, so downstream device-resident
-    /// sampling (WI-X3) keeps working after the batched LoRA pass.
+    /// Rebuild a logits tensor with `data` contents on the same device, dtype and provenance
+    /// as `like`, so downstream device-resident sampling (WI-X3) keeps working after the batched LoRA pass.
     fn logits_tensor_like(
         data: Vec<f32>,
         shape: grim_tensor::Shape,
@@ -1605,9 +1447,8 @@ impl Engine {
         self.models.get(id).map(|m| m.model.strategy())
     }
 
-    /// Run one engine iteration. For each scheduled prefill or decode
-    /// request, drive the speculative wrapper against the request's
-    /// session and capture per-request outcomes.
+    /// Run one engine iteration. For each scheduled prefill or decode request,
+    /// drive the speculative wrapper against the request's session and capture per-request outcomes.
     pub fn tick(&mut self) -> Result<grim_scheduler::SchedulerOutput> {
         let tick_start = Instant::now();
 
@@ -1615,11 +1456,8 @@ impl Engine {
         if let Some(ref profiler) = self.capability_profiler {
             if profiler.age() >= Duration::from_millis(100) {
                 profiler.tick();
-                // WI-INF2: pull the (possibly bumped) capability epoch into
-                // the placement cache. This is the existing mode-B staleness
-                // path — `sync_epoch` clears the fast slots so the next
-                // forward re-decides against fresh capabilities; it is not
-                // new invalidation logic.
+                // WI-INF2: pull the (possibly bumped) capability epoch into the placement cache.
+                // This is the existing mode-B staleness path - `sync_epoch` clears the fast slots so the.
                 if let Some(ref mut ctrl) = self.scythe_ctrl {
                     ctrl.cache.sync_epoch(grim_backend_rocm::current_epoch());
                 }
@@ -1630,9 +1468,8 @@ impl Engine {
         // admission, so freed VRAM is picked up in the same tick.
         self.retry_scythe_vram_waitlist();
 
-        // Disagg failover (§5.6): refresh the effective role each tick from
-        // observed peer heartbeats. A silent peer fails the node over to
-        // colocated execution, which gates the remote KV handoff below.
+        // Disagg failover (§5.6): refresh the effective role each tick from observed peer heartbeats.
+        // A silent peer fails the node over to colocated execution, which gates the remote KV.
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1644,11 +1481,8 @@ impl Engine {
         let output = self.scheduler.schedule();
         let schedule_elapsed = tick_start.elapsed();
 
-        // Run prefill, then decode in a single deterministic pass — for
-        // §5.3 correctness, prefills share block pool and decode uses
-        // the KV they just wrote. We process them in the order the
-        // scheduler produced them so a paused predicate is monotonically
-        // consistent.
+        // Run prefill, then decode in a single deterministic pass - for §5.3 correctness, prefills share block pool and decode uses the KV they just wrote.
+        // We process them in the order the scheduler produced them so a paused predicate is.
         let prefill = output.prefill_ids.clone();
         let had_prefill = !prefill.is_empty();
         let mut prefill_elapsed = Duration::ZERO;
@@ -1746,11 +1580,8 @@ impl Engine {
         Ok(output)
     }
 
-    /// WI-M2 drift watch (gguf_multigpu_context_plan.md): hold the
-    /// process-wide prefill latch up for the duration of the pass. While it
-    /// is set, ANY HIP context switch to a non-zero device on any thread is
-    /// traced with a forced backtrace under `GRIM_ALLOC_TRACE`, so the setter
-    /// flipping the forward pass onto a foreign GPU is named in the log.
+    /// WI-M2 drift watch (gguf_multigpu_context_plan.md): hold the process-wide prefill latch up for the duration of the pass.
+    /// While it is set, ANY HIP context switch to a non-zero device on any thread.
     fn drive_prefill(&mut self, id: u64) -> Result<()> {
         grim_backend_rocm::set_prefill_in_flight(true);
         let outcome = self.drive_prefill_inner(id);
@@ -1759,9 +1590,8 @@ impl Engine {
     }
 
     fn drive_prefill_inner(&mut self, id: u64) -> Result<()> {
-        // Chunked prefill (F9 follow-on): the scheduler may carry several
-        // running copies of `id` (one per pass, each with the cumulative
-        // consumed count), so take the LATEST bound, not the first copy's.
+        // Chunked prefill (F9 follow-on): the scheduler may carry several running copies of `id` (one per
+        // pass, each with the cumulative consumed count), so take the LATEST bound, not the first copy's.
         let mut prompt_tokens = None;
         let mut consumed_tokens = 0usize;
         for r in self.scheduler.running.iter().filter(|r| r.id == id) {
@@ -1775,18 +1605,15 @@ impl Engine {
         if prompt_tokens == 0 {
             return Ok(());
         }
-        // Only the tokens the scheduler has budgeted but the engine has not
-        // yet prefilled run through the model. Everything else (radix
-        // matching, KV registration, disagg handoff) still sees the full
-        // prompt below.
+        // Only the tokens the scheduler has budgeted but the engine has not yet prefilled run through the model.
+        // Everything else (radix matching, KV registration, disagg handoff) still sees the full prompt below.
         let already = self.prefill_progress.get(&id).copied().unwrap_or(0);
         let target = consumed_tokens.min(prompt_tokens);
         if target <= already {
             return Ok(()); // this pass budgeted no new prompt tokens
         }
         // Build the full input_ids tensor: use real token IDs if provided,
-        // otherwise fall back to synthetic position indices (0..prompt_tokens)
-        // for backward compatibility.
+        // otherwise fall back to synthetic position indices (0..prompt_tokens) for backward compatibility.
         let full_input: Vec<u32> = self
             .request_input_ids
             .get(&id)
@@ -1817,10 +1644,8 @@ impl Engine {
             }
         }
 
-        // The chunk actually prefilled this pass: tokens [already, target)
-        // with their true positions. Models place KV by sequential append,
-        // so the session position after this call equals `target` — each
-        // prompt token is appended exactly once across all passes.
+        // The chunk actually prefilled this pass: tokens [already, target) with their true positions.
+        // Models place KV by sequential append, so the session position after this call equals `target`.
         let chunk: Vec<u32> = full_input[already..target].to_vec();
         let chunk_len = chunk.len();
         let ids = grim_backend_cpu::cpu_tensor(
@@ -1837,8 +1662,7 @@ impl Engine {
             // Record progress only after the forward succeeded — a failed
             // pass must retry the same chunk, not skip it.
             self.prefill_progress.insert(id, target);
-            // `current_pos` is owned by the model/session — the underlying
-            // forward already advanced it via `session.advance_pos(seq_len)`.
+            // `current_pos` is owned by the model/session - the underlying forward already advanced it via `session.advance_pos(seq_len)`.
             // The engine does *not* double-count.
             self.last_outcomes.insert(id, outcome);
 
@@ -1858,18 +1682,14 @@ impl Engine {
                 }
             }
 
-            // Disaggregation handoff: if disagg_router is configured for Prefill role,
-            // stream real KV blocks generated during prefill over the network to the decode node.
-            // Failover gate (§5.6): once the orchestrator fails this node over
-            // to Colocated (decode peer silent past the heartbeat timeout),
-            // stop streaming into a dead peer.
+            // Disaggregation handoff: if disagg_router is configured for Prefill role, stream real KV blocks generated during prefill over the network to the decode node.
+            // Failover gate (§5.6): once the orchestrator fails this node over to Colocated (decode peer silent.
             if let Some(router) = &self.config.disagg_router {
                 if router.pool_role == grim_disagg::PoolRole::Prefill
                     && self.disagg_effective_role() == grim_disagg::PoolRole::Prefill
                 {
-                    // The pool is shared across concurrent requests, so the
-                    // handoff must carry only this request's physical blocks —
-                    // a full-pool scan would leak other requests' KV cache.
+                    // The pool is shared across concurrent requests, so the handoff must carry only
+                    // this request's physical blocks - a full-pool scan would leak other requests' KV cache.
                     let block_ids: Vec<usize> = self
                         .sessions
                         .get(&id)
@@ -1885,9 +1705,8 @@ impl Engine {
                                         if let Some((k_slice, v_slice)) =
                                             kv.layer_block_slice(layer, b_id)
                                         {
-                                            // Carry the block's valid token count on
-                                            // the wire; a partially-filled tail block
-                                            // must not arrive marked as full.
+                                            // Carry the block's valid token count on the wire;
+                                            // a partially-filled tail block must not arrive marked as full.
                                             let num_tokens = kv
                                                 .block_num_tokens(b_id)
                                                 .unwrap_or(0)
@@ -1936,13 +1755,8 @@ impl Engine {
     }
 
     fn drive_decode_with_outcome(&mut self, id: u64) -> Result<Option<StepOutcome>> {
-        // Disaggregated decode: ensure required KV blocks are present in the
-        // local pool before executing the decode step.  When this is a Decode
-        // node, the KV cache was generated on the Prefill node and transferred
-        // over the network.  The background KvReceiverServer (started in
-        // Engine::new) writes incoming blocks into self.block_pool.  Here we
-        // poll for / fetch any blocks that haven't arrived yet so the decode
-        // session has a complete KV context across all layers.
+        // Disaggregated decode: ensure required KV blocks are present in the local pool before executing the decode step.
+        // When this is a Decode node, the KV cache was generated on the Prefill node.
         if let Some(ref router) = self.config.disagg_router {
             if router.pool_role == grim_disagg::PoolRole::Decode {
                 let elem_per_token = self.config.num_kv_heads * self.config.head_dim;
@@ -1971,10 +1785,8 @@ impl Engine {
                     let mut fetch_ok = true;
                     for layer in 0..num_layers {
                         match router.fetch_kv_block(block_id, layer as u32, block_elems) {
-                            // V3 wire carries the block's valid token count;
-                            // storing `block_elems / elem_per_token` instead
-                            // would mark every (partially-filled) block as
-                            // fully valid.
+                            // V3 wire carries the block's valid token count; storing `block_elems
+                            // / elem_per_token` instead would mark every (partially-filled) block as fully valid.
                             Ok((k_data, v_data, num_tokens)) => {
                                 if layer == 0 {
                                     let mut pool =
@@ -1990,9 +1802,8 @@ impl Engine {
                                 }
                             }
                             Err(e) => {
-                                // F3: a failed layer must not leave the block marked
-                                // received (write_keys auto-marks on layer 0), or that
-                                // block would attend stale pages forever.
+                                // F3: a failed layer must not leave the block marked received (write_keys
+                                // auto-marks on layer 0), or that block would attend stale pages forever.
                                 fetch_ok = false;
                                 log::warn!(
                                     "[grim-engine] Disagg decode KV fetch failed for req {id}, layer {layer}, block {block_id}: {e}"
@@ -2045,18 +1856,11 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         let adapters = { self.resolve_adapters(&adapter_ids).unwrap_or_default() };
-        self.drive_forward_with_adapters(
-            model_id,
-            request_id,
-            input_ids,
-            positions,
-            &adapters,
-        )
+        self.drive_forward_with_adapters(model_id, request_id, input_ids, positions, &adapters)
     }
 
-    /// `drive_forward` with explicit adapters: the batched-LoRA decode pass
-    /// (`step_batch`) drives *base* forwards through this with `&[]` and
-    /// applies adapter deltas once per adapter segment afterwards.
+    /// `drive_forward` with explicit adapters: the batched-LoRA decode pass (`step_batch`) drives *base* forwards
+    /// through this with `&[]` and applies adapter deltas once per adapter segment afterwards.
     fn drive_forward_with_adapters(
         &mut self,
         model_id: &str,
@@ -2091,9 +1895,8 @@ impl Engine {
             self.scheduler.running.len(),
             adapters,
         )?;
-        // MIN-2: Report the actual accepted token count from the session
-        // (set by the speculative wrapper's decode_one). Non-speculative
-        // paths default to 1.
+        // MIN-2: Report the actual accepted token count from the session (set by the speculative wrapper's decode_one).
+        // Non-speculative paths default to 1.
         let accepted_tokens = session.last_accepted_tokens();
         let _ = (loaded, was_speculative_path);
         Ok(StepOutcome {
@@ -2103,10 +1906,8 @@ impl Engine {
         })
     }
 
-    /// Public stepping API: drive one forward pass for `request_id`
-    /// against a caller-supplied target model id, with caller-supplied
-    /// adapters and an explicit input tensor. Returns the speculative
-    /// wrapper's emitted logits.
+    /// Public stepping API: drive one forward pass for `request_id` against a caller-supplied target model id, with caller-supplied adapters and an explicit input tensor.
+    /// Returns the speculative wrapper's emitted logits.
     pub fn step_one(
         &mut self,
         request_id: u64,
@@ -2118,27 +1919,7 @@ impl Engine {
     }
 
     /// Execute a grouped batch step across multiple co-scheduled requests (WI-X1).
-    ///
-    /// Drives decoding across up to N requests in a single scheduling tick,
-    /// returning each request's corresponding StepOutcome.
-    ///
-    /// Batched multi-LoRA (§4.5, S-LoRA/Punica style) is applied here in two
-    /// phases so heterogeneous adapters share one kernel dispatch per adapter
-    /// segment instead of one per-request logits pass:
-    ///
-    ///   Phase A — per item, drive a *base* forward (no adapters) and stage
-    ///     the request's logits rows plus its primary adapter id. Only
-    ///     `Strategy::Plain` items with at most one adapter take this path;
-    ///     speculative strategies and multi-adapter requests keep the legacy
-    ///     per-request path (adapters applied inside `decode_one`), which
-    ///     their draft/verify loops depend on.
-    ///   Phase B — per model group, stack the staged rows, plan contiguous
-    ///     row segments from the actual batch layout, and apply all segments
-    ///     in one batched call (`Engine::apply_batched_lora_to_rows`).
-    ///
-    /// Zero-adapter requests go through phase A too (their rows pass through
-    /// the batched apply untouched), so every plain-decode item shares the
-    /// same code path and ordering is deterministic.
+    /// Drives decoding across up to N requests in a single scheduling tick, returning each request's.
     pub fn step_batch(
         &mut self,
         items: &[(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)],
@@ -2179,13 +1960,8 @@ impl Engine {
             }
 
             // Batched-LoRA path: base forward now, delta applied per segment.
-            let outcome = self.drive_forward_with_adapters(
-                model_id,
-                req_id,
-                input_ids,
-                positions,
-                &[],
-            )?;
+            let outcome =
+                self.drive_forward_with_adapters(model_id, req_id, input_ids, positions, &[])?;
             let Some(base) = outcome.logits else {
                 slots.push(Slot::Done(req_id, outcome));
                 continue;
@@ -2209,12 +1985,10 @@ impl Engine {
                 continue;
             };
             staged_count += 1;
-            let entry = groups
-                .entry(model_id.clone())
-                .or_insert_with(|| {
-                    group_order.push(model_id.clone());
-                    Vec::new()
-                });
+            let entry = groups.entry(model_id.clone()).or_insert_with(|| {
+                group_order.push(model_id.clone());
+                Vec::new()
+            });
             entry.push(slot_idx);
         }
 
@@ -2233,9 +2007,8 @@ impl Engine {
                 };
                 sorted.sort_by_key(|&i| adapter_of(&slots[i]));
 
-                // Group width: every staged tensor of the same model shares
-                // its vocab. A mismatch would mean cross-model corruption —
-                // fail loudly instead.
+                // Group width: every staged tensor of the same model shares its vocab.
+                // A mismatch would mean cross-model corruption - fail loudly instead.
                 let dim_of = |s: &Slot| -> usize {
                     match s {
                         Slot::Staged { base, .. } => {
@@ -2269,15 +2042,19 @@ impl Engine {
                     }
                     stacked.extend_from_slice(&data);
                     let adapter = adapter_of(&slots[i]);
-                    row_adapters.extend(std::iter::repeat(adapter).take(rows));
+                    row_adapters.extend(std::iter::repeat_n(adapter, rows));
                     layout.push((i, rows));
                 }
 
                 // The adapter deltas must land on the device the model's
-                // logits live on, so downstream on-device sampling (WI-X3)
-                // keeps working.
+                // logits live on, so downstream on-device sampling (WI-X3) keeps working.
                 let model_device = self.models.get(model_id).map(|m| m.device.clone());
-                self.apply_batched_lora_to_rows(&mut stacked, &row_adapters, dim, model_device.as_ref())?;
+                self.apply_batched_lora_to_rows(
+                    &mut stacked,
+                    &row_adapters,
+                    dim,
+                    model_device.as_ref(),
+                )?;
 
                 // Scatter adapted rows back into the staged slots.
                 let mut offset = 0usize;
@@ -2307,15 +2084,13 @@ impl Engine {
             }
         }
 
-        Ok(
-            slots
-                .into_iter()
-                .map(|slot| match slot {
-                    Slot::Done(id, outcome) => (id, outcome),
-                    Slot::Staged { .. } => unreachable!("staged slot left unfilled by phase B"),
-                })
-                .collect(),
-        )
+        Ok(slots
+            .into_iter()
+            .map(|slot| match slot {
+                Slot::Done(id, outcome) => (id, outcome),
+                Slot::Staged { .. } => unreachable!("staged slot left unfilled by phase B"),
+            })
+            .collect())
     }
 
     /// Check if a model is registered by name.
@@ -2329,9 +2104,8 @@ impl Engine {
 
     /// Allocate a session with a paged KV cache wired in and prefix caching active (§5.1).
     pub fn enqueue_request_with_kv(&mut self, request: grim_scheduler::Request) -> Result<()> {
-        // SCYTHE-2 farm mode: pin the request to a controller-chosen replica
-        // BEFORE the session exists, so its KV pages are allocated on the
-        // pinned replica's device and stay there for the request's lifetime.
+        // SCYTHE-2 farm mode: pin the request to a controller-chosen replica BEFORE the session exists, so its
+        // KV pages are allocated on the pinned replica's device and stay there for the request's lifetime.
         let base_for_pin = request
             .model_id
             .as_deref()
@@ -2363,9 +2137,8 @@ impl Engine {
                         pin_rank = Some(rank);
                     }
                     ScytheAdmission::WaitVram => {
-                        // Hold the request out of the scheduler entirely: no
-                        // session, no pin, no admission — a rank must be able
-                        // to hold it before it enters the queue.
+                        // Hold the request out of the scheduler entirely: no session, no pin, no admission
+                        // - a rank must be able to hold it before it enters the queue.
                         log::info!(
                             "[scythe2] request {} parked on VRAM waitlist (WI-SB2)",
                             request.id
@@ -2416,15 +2189,14 @@ impl Engine {
                     .unwrap_or(grim_tensor::Device::Cpu),
             }
         };
-        log::info!("[grim-engine] admit_placed_request: request {} model_id={:?} resolved device={:?}", request.id, request.model_id, device);
-        // R4 — memory-sovereign admission gate. If the model reported
-        // hyperparameters and the backend can probe current free device
-        // memory, certify this request's footprint (prompt + max_tokens) fits
-        // within what is *currently* free. On failure, return a clear error
-        // instead of admitting a request that would OOM mid-prefill.
-        // Fail-open when either the hyperparams or the memory probe is
-        // unavailable (CPU/Vulkan/Metal without a probe, or models that don't
-        // report hyperparams).
+        log::info!(
+            "[grim-engine] admit_placed_request: request {} model_id={:?} resolved device={:?}",
+            request.id,
+            request.model_id,
+            device
+        );
+        // R4 - memory-sovereign admission gate. If the model reported hyperparameters and the backend can probe current
+        // free device memory, certify this request's footprint (prompt + max_tokens) fits within what is *currently* free.
         if let Some(base_model) = request
             .model_id
             .as_deref()
@@ -2433,8 +2205,7 @@ impl Engine {
             .or_else(|| self.models.values().next())
         {
             if let Some(hparams) = &base_model.arch_hyperparams {
-                let target_seq_len =
-                    request.prompt_tokens.saturating_add(request.max_new_tokens);
+                let target_seq_len = request.prompt_tokens.saturating_add(request.max_new_tokens);
                 if let Some(free_device) = free_device_memory(&device) {
                     let host_allowance = std::env::var("GRIM_HOST_ALLOWANCE_GB")
                         .ok()
@@ -2458,7 +2229,7 @@ impl Engine {
                         target_seq_len,
                         1,
                         2,
-                        &request.id.to_string(),
+                        request.id.to_string(),
                     ) {
                         return Err(Error::Config(format!(
                             "request {} ({} tokens) exceeds current memory envelope: {}",
@@ -2496,10 +2267,8 @@ impl Engine {
         Ok(())
     }
 
-    /// WI-SB2: retry requests parked on the VRAM waitlist at tick start —
-    /// finished sessions have freed their ranks by now. Order-stable backfill:
-    /// entries are scanned in arrival order and admitted individually as soon
-    /// as some rank can hold them; those that still fail stay queued.
+    /// WI-SB2: retry requests parked on the VRAM waitlist at tick start - finished sessions have freed their ranks by now.
+    /// Order-stable backfill: entries are scanned in arrival order and admitted individually as soon as some.
     fn retry_scythe_vram_waitlist(&mut self) {
         if self.scythe_vram_waitlist.is_empty() {
             return;
@@ -2548,20 +2317,14 @@ impl Engine {
         }
     }
 
-    /// Number of requests currently held on the WI-SB2 VRAM waitlist — no
-    /// farm rank could hold their footprint when they arrived. Status and
-    /// observability surface; nonzero means serving capacity is exhausted
-    /// for that prompt size, not that the requests were dropped.
+    /// Number of requests currently held on the WI-SB2 VRAM waitlist - no farm rank could hold their footprint when they arrived.
+    /// Status and observability surface; nonzero means serving capacity is exhausted for that prompt size, not.
     pub fn scythe_vram_waitlist_len(&self) -> usize {
         self.scythe_vram_waitlist.len()
     }
 
-    /// F3b: Enqueue a request whose prefill already ran on a remote Prefill
-    /// node. Creates the local session/KV structures without any local prompt
-    /// forward (`prompt_tokens = 0`, so `drive_prefill` returns immediately),
-    /// advances the position cursor to `prompt_len`, then hydrates session KV
-    /// pages from every pool block the background receiver has already written.
-    /// The next decode tick therefore attends purely transferred KV.
+    /// F3b: Enqueue a request whose prefill already ran on a remote Prefill node.
+    /// Creates the local session/KV structures without any local prompt forward (`prompt_tokens = 0`, so `drive_prefill`.
     pub fn enqueue_remote_prefill_request(
         &mut self,
         id: u64,
@@ -2583,9 +2346,8 @@ impl Engine {
         Ok(())
     }
 
-    /// F3b helper: copy pool layer storage into the session's page tensors for
-    /// every received block (all layers present per block). Mirror of what the
-    /// pull path does for un-received blocks.
+    /// F3b helper: copy pool layer storage into the session's page tensors for every received block (all layers present per block).
+    /// Mirror of what the pull path does for un-received blocks.
     fn hydrate_session_from_pool(&mut self, id: u64) {
         let num_blocks = {
             let pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -2635,10 +2397,7 @@ impl Engine {
         self.prefill_progress.remove(&id);
         self.request_last_token.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
-        // The rank stays counted for a short cooldown (see
-        // `scythe_admission_decision`) so the NEXT admission still sees it —
-        // a burst of short-lived requests otherwise always finds an empty
-        // pin map and piles onto rank 0.
+        // The rank stays counted for a short cooldown (see `scythe_admission_decision`) so the NEXT admission still.
         if let Some(rank) = self.scythe_pin.remove(&id) {
             self.scythe_pin_cooldown
                 .push((rank, std::time::Instant::now()));
@@ -2647,16 +2406,14 @@ impl Engine {
         self.scythe_vram_waitlist.retain(|r| r.id != id);
     }
 
-    /// Deterministic RNG snapshot for a request, used by the speculative
-    /// verifier when the engine's determinism mode is `Strict`. Returns
-    /// `None` when the request isn't tracked.
+    /// Deterministic RNG snapshot for a request, used by the speculative verifier when the engine's determinism mode is `Strict`.
+    /// Returns `None` when the request isn't tracked.
     pub fn request_rng_state(&self, id: u64) -> Option<u64> {
         self.request_rng.get(&id).map(|r| r.state())
     }
 
     /// Replay: deterministically rewind a request's RNG by `steps`.
-    /// Strict mode exposes this so re-running a tick with the same
-    /// input reproduces the same RNG-driven decisions.
+    /// Strict mode exposes this so re-running a tick with the same input reproduces the same.
     pub fn advance_request_rng(&mut self, id: u64, steps: usize) {
         if let Some(r) = self.request_rng.get_mut(&id) {
             for _ in 0..steps {
@@ -2670,22 +2427,19 @@ impl Engine {
         self.last_outcomes.get(&id)
     }
 
-    /// Record the token that was sampled for a request. Called by the
-    /// server after sampling so the next decode step feeds the real
-    /// token instead of a position index.
+    /// Record the token that was sampled for a request.
+    /// Called by the server after sampling so the next decode step feeds the real token.
     pub fn record_generated_token(&mut self, id: u64, token: u32) {
         self.request_last_token.insert(id, token);
     }
 
-    /// Pause a running request — §5.2.1. KV blocks are retained in the
-    /// block pool at zero scheduling priority. Returns true if the request
-    /// was running and is now paused.
+    /// Pause a running request - §5.2.1. KV blocks are
+    /// retained in the block pool at zero scheduling priority.
     pub fn pause_request(&mut self, id: u64) -> bool {
         let moved = self.scheduler.pause(id);
         if moved {
-            // The session is kept; KV blocks remain ref-counted. The
-            // speculative wrapper's mid-step tentative state stays
-            // anchored to the cache and resumes from where it left off.
+            // The session is kept; KV blocks remain ref-counted.
+            // The speculative wrapper's mid-step tentative state stays anchored to the cache and resumes from where.
             if let Some(s) = self.sessions.get_mut(&id) {
                 let _ = s;
             }
@@ -2693,9 +2447,8 @@ impl Engine {
         moved
     }
 
-    /// Resume a previously-paused request — §5.2.1. The request continues
-    /// from the exact token position where it was paused. Returns true if
-    /// the request was paused and is now running.
+    /// Resume a previously-paused request - §5.2.1.
+    /// The request continues from the exact token position where it was paused.
     pub fn resume_request(&mut self, id: u64) -> bool {
         self.scheduler.resume(id)
     }
@@ -2709,10 +2462,8 @@ impl Engine {
         self.models.get(id)
     }
 
-    /// `(model_id, priority)` lookup for the request — a request is
-    /// bound to exactly one model in v1. Under SCYTHE-2 farm mode the
-    /// returned id is the pinned replica, so every caller (prefill drive,
-    /// decode loop) routes to it without knowing farms exist.
+    /// `(model_id, priority)` lookup for the request - a request is bound to exactly one model in v1.
+    /// Under SCYTHE-2 farm mode the returned id is the pinned replica, so every caller (prefill.
     fn model_for_request(&self, id: u64) -> Option<(String, i32)> {
         let model_id = self.request_model_ids.get(&id)?;
         let base = if model_id.is_empty() {
@@ -2890,10 +2641,8 @@ mod tests {
 
     #[test]
     fn engine_wrapper_defaults_to_speculative_path() {
-        // §5.3: registering a plain CausalLm without an attached bundle
-        // gets the autoselected wrapper. With no bundle present the
-        // wrapper falls back to plain autoregressive, *but* the wrapper
-        // itself is always speculative — the path is opt-out, not opt-in.
+        // §5.3: registering a plain CausalLm without an attached bundle gets the autoselected wrapper.
+        // With no bundle present the wrapper falls back to plain autoregressive, *but* the wrapper itself.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
         let strat = engine.strategy_for("small");
@@ -3048,10 +2797,8 @@ mod tests {
 
     #[test]
     fn engine_pause_in_middle_of_decode_keeps_session_kv() {
-        // §5.2.1: a mid-decode pause keeps KV blocks alive, ref-counted
-        // through the block pool. The session's `current_pos` does not
-        // regress, and the speculative wrapper's tentative state stays
-        // anchored to the cache because the cache itself is preserved.
+        // §5.2.1: a mid-decode pause keeps KV blocks alive, ref-counted through the block pool.
+        // The session's `current_pos` does not regress, and the speculative wrapper's tentative state stays anchored to.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
         engine
@@ -3134,11 +2881,8 @@ mod tests {
 
     #[test]
     fn engine_throughput_steps_count_ticks_and_advances() {
-        // The wrapper path is the standard one — count the speculative
-        // flag on the recorded outcomes and assert that every running
-        // request was driven once per tick. v1's Llama forward doesn't
-        // accept extras, but the wrapper contract holds: every decode
-        // tick yields a fresh `StepOutcome`.
+        // The wrapper path is the standard one - count the speculative flag on the recorded outcomes and assert that every running request was driven once per tick.
+        // v1's Llama forward doesn't accept extras, but the wrapper contract holds: every decode tick yields.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
         engine.enqueue_request(Request {
@@ -3164,10 +2908,8 @@ mod tests {
             .unwrap_or(0);
         assert!(pos2 > pos1, "decode tick advances the session position");
 
-        // Plain strategy still counts as "speculative" field = false on
-        // the wrapper output, confirming the structural pipeline is in
-        // place for Strategy::Plain (with a real DSpark bundle attached
-        // the field flips to true).
+        // Plain strategy still counts as "speculative" field = false on the wrapper output, confirming the structural
+        // pipeline is in place for Strategy::Plain (with a real DSpark bundle attached the field flips to true).
         let outcome = engine.last_outcome(1).unwrap();
         assert!(
             !outcome.speculative,
@@ -3193,11 +2935,8 @@ mod tests {
 
     #[test]
     fn engine_with_dspark_bundle_routes_through_dspark_strategy() {
-        // Wiring concrete DraftBackbone / MarkovHead / ConfidenceHead
-        // impls through `register_with_dspark`. This is the test of
-        // whether the speculative decoding pipeline (§5.3.2) is
-        // actually exercisable end-to-end — even if the structural
-        // impls are simple, the strategy-flip proves the path.
+        // Wiring concrete DraftBackbone / MarkovHead / ConfidenceHead impls through `register_with_dspark`.
+        // This is the test of whether the speculative decoding pipeline (§5.3.2) is actually exercisable end-to-end.
         use grim_speculative::{EntropyConfidenceHead, TinyDraftBackbone, UniformMarkovHead};
 
         let mut engine = Engine::new(EngineConfig::default());
@@ -3418,14 +3157,8 @@ mod tests {
 
     #[test]
     fn engine_enqueues_real_input_ids_and_consumes_in_prefill() {
-        // This test validates the fix for the "dummy token" bug where
-        // drive_prefill was feeding synthetic (0..prompt_tokens) instead of
-        // the actual prompt token IDs provided by the caller.
-        //
-        // The test enqueues a request with known input_ids, ticks the engine,
-        // and verifies that the forward pass receives those exact tokens
-        // (by checking that the session's position advances by the number
-        // of real tokens, not by a synthetic range).
+        // This test validates the fix for the "dummy token" bug where drive_prefill was feeding synthetic (0..prompt_tokens) instead of the actual prompt token IDs provided by the caller.
+        // The test enqueues a request with known input_ids, ticks the engine, and verifies that the.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
 
@@ -3444,12 +3177,8 @@ mod tests {
         // First tick: prefill should consume ALL prompt tokens
         let _ = engine.tick().expect("tick must succeed");
 
-        // The session position should advance by the number of REAL tokens,
-        // not by a synthetic range. If the bug exists, it would advance by
-        // prompt_tokens (which happens to match here) but the CONTENT fed
-        // to the model would be wrong. We verify by checking that a second
-        // tick (decode) uses the LAST real token as the next input, not
-        // the position index.
+        // The session position should advance by the number of REAL tokens, not by a synthetic range.
+        // If the bug exists, it would advance by prompt_tokens (which happens to match here) but.
         let pos_after_prefill = engine
             .sessions
             .get(&1)
@@ -3463,9 +3192,8 @@ mod tests {
         // Keep the request in running for decode
         engine.scheduler.running.retain(|r| r.id == 1);
 
-        // Second tick: decode step should use the LAST real token (999) as input,
-        // not the position index (which would be 5). We can't directly observe
-        // the input_ids tensor from here, but we verify the session advances.
+        // Second tick: decode step should use the LAST real token (999) as input, not the position index (which would be 5).
+        // We can't directly observe the input_ids tensor from here, but we verify the session advances.
         let _ = engine.tick().expect("decode tick must succeed");
         let pos_after_decode = engine
             .sessions
@@ -3479,12 +3207,8 @@ mod tests {
         );
     }
 
-    /// Phase-1 correctness proof: a Llama driven through the paged-KV path
-    /// (session carries a `PagedKvCache`) must produce byte-identical logits
-    /// to the same model driven through the classic per-layer
-    /// `LlamaLayerCache` path (no KV session). This is the invariant that
-    /// lets us re-enable prefix-cache/tiering wiring on top of the paged
-    /// path without changing serving numerics.
+    /// Phase-1 correctness proof: a Llama driven through the paged-KV path (session carries a `PagedKvCache`) must produce byte-identical logits to the same model driven through the classic per-layer `LlamaLayerCache` path (no KV session).
+    /// This is the invariant that lets us re-enable prefix-cache/tiering wiring on top of the paged.
     #[test]
     fn paged_llama_forward_matches_non_paged_llama_forward() {
         use grim_core::CausalLm;
@@ -3675,10 +3399,8 @@ mod tests {
         }
     }
 
-    /// WI-INF3 serving gate (farm mode): a pinned request executes on its
-    /// replica. Replicas are built from the same fixed seed, so logits must be
-    /// byte-identical to a plain single-replica engine — the pin decides
-    /// WHERE the pass runs, never WHAT it computes.
+    /// WI-INF3 serving gate (farm mode): a pinned request executes on its replica.
+    /// Replicas are built from the same fixed seed, so logits must be byte-identical to a.
     #[test]
     fn test_scythe_farm_pin_routes_across_replicas() {
         let mut engine = Engine::new(EngineConfig::default());
@@ -3742,15 +3464,11 @@ mod tests {
         assert_eq!(engine.scythe_pin_of(7), None);
     }
 
-    /// WI-INF5 farm corollary: the load-adjusted capability view must spread
-    /// sessions once the fast card saturates instead of pinning everything to
-    /// it — unloaded traffic goes to the 80-TFLOPS card, but with 10 sessions
-    /// already there its effective 80/11 TFLOPS drops below the idle 8-TFLOPS
-    /// card and the next admission lands there.
+    /// WI-INF5 farm corollary: the load-adjusted capability view must spread sessions once the fast card saturates instead of pinning everything to it - unloaded traffic goes
+    /// to the 80-TFLOPS card, but with 10 sessions already there its effective 80/11 TFLOPS drops below the idle 8-TFLOPS card and the next admission lands there.
     #[test]
-    /// WI-SB1 load-spreading: a finished request's rank must stay counted in
-    /// the cooldown window so the next admission sees it — otherwise a burst
-    /// of short requests all observe an empty pin map and pile onto rank 0.
+    /// WI-SB1 load-spreading: a finished request's rank must stay counted in the cooldown window so the next admission sees
+    /// it - otherwise a burst of short requests all observe an empty pin map and pile onto rank 0.
     fn test_finished_pin_enters_cooldown_window() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.scythe_pin.insert(7, 1);
@@ -3759,9 +3477,8 @@ mod tests {
         assert_eq!(engine.scythe_pin_cooldown.len(), 1);
         assert_eq!(engine.scythe_pin_cooldown[0].0, 1);
 
-        // Pruning happens at admission time, not finish time: an aged-out
-        // entry is still physically present until the next decision scans
-        // it, but it must not COUNT toward load anymore (helper gate below).
+        // Pruning happens at admission time, not finish time: an aged-out entry is still physically present until
+        // the next decision scans it, but it must not COUNT toward load anymore (helper gate below).
         engine.scythe_pin_cooldown[0].1 -= std::time::Duration::from_millis(2000);
         engine.scythe_pin.insert(8, 0);
         engine.finish_request(8);
@@ -3838,10 +3555,8 @@ mod tests {
         );
     }
 
-    /// WI-SB1 load-spreading: external GPU utilization folds into the load
-    /// vector at weight 2.0 — a card maxed out by a desktop/game workload
-    /// (100 % busy ≈ +2 effective requests) must lose the fast card to an
-    /// idle slower rank on a ~2:1 measured pair.
+    /// WI-SB1 load-spreading: external GPU utilization folds into the load vector at weight 2.0 - a card maxed out by a desktop/game workload
+    /// (100 % busy ≈ +2 effective requests) must lose the fast card to an idle slower rank on a ~2:1 measured pair.
     #[test]
     fn test_external_busy_flips_placement_to_idle_rank() {
         use grim_tensor::backend::ScytheLink;
@@ -3871,9 +3586,7 @@ mod tests {
             "externally-saturated fast card must yield to the idle slow card"
         );
 
-        // And the original defect: plain decide() caches the idle verdict
-        // keyed only by shape, then serves it verbatim even after the load
-        // vector changed — which is what pinned every request to rank 0.
+        // And the original defect: plain decide() caches the idle verdict keyed only by shape, then serves it verbatim even after the load vector changed - which is what pinned every request to rank 0.
         // decide_forced must re-evaluate under the adjusted caps instead.
         let mut ctrl = crate::scythe2::C2plrController::new(1, 2, 150.0);
         let cached_rank = ctrl
@@ -3922,11 +3635,8 @@ mod tests {
         assert!(engine.has_model("small"));
     }
 
-    /// WI-SB2 host gate (synthetic caps): the footprint formula must exclude
-    /// an 8 GB-class card for a 100k-token prompt, admit the same request on
-    /// a 16 GB card, admit a 1k-token prompt on both, and report every rank
-    /// infeasible when nothing fits — which is the queue signal. A zero
-    /// free-VRAM reading is probe-unavailable and must NOT read as "full".
+    /// WI-SB2 host gate (synthetic caps): the footprint formula must exclude an 8 GB-class card for a 100k-token prompt, admit the same request on a 16 GB card, admit a 1k-token prompt on both, and report every rank infeasible when nothing fits - which is the queue signal.
+    /// A zero free-VRAM reading is probe-unavailable and must NOT read as "full".
     #[test]
     fn test_scythe_vram_footprint_and_rank_filter() {
         let cap_with_vram = |vram: u64| grim_tensor::backend::GpuCapability {
@@ -3982,10 +3692,8 @@ mod tests {
         );
     }
 
-    /// WI-SB2 host gate: the decision layer maps the synthetic-caps guard to
-    /// Pin/WaitVram correctly — mixed pair pins the feasible fast card,
-    /// all-excluded waits, missing profiler data waits, and a 1k prompt is
-    /// never blocked by an 8 GB card.
+    /// WI-SB2 host gate: the decision layer maps the synthetic-caps guard to Pin/WaitVram correctly - mixed pair pins the feasible
+    /// fast card, all-excluded waits, missing profiler data waits, and a 1k prompt is never blocked by an 8 GB card.
     #[test]
     fn test_scythe_admission_decision_vram_guard() {
         // kv_dim = 64·128 = 8192 ⇒ a 132k-token request needs ~8.1 GiB even
@@ -4049,11 +3757,8 @@ mod tests {
         );
     }
 
-    /// WI-SB2 host gate: an enqueue that fails the VRAM guard must leave the
-    /// request queued — no session, no scheduler entry, no pin — and a later
-    /// retry once caps exist must admit it with a pin. Deterministic on any
-    /// box: with no profiler attached, caps are empty ⇒ WaitVram; the retry
-    /// leg runs wherever real GPUs are visible.
+    /// WI-SB2 host gate: an enqueue that fails the VRAM guard must leave the request queued - no session, no scheduler entry, no pin - and a later retry once caps exist must admit it with a pin.
+    /// Deterministic on any box: with no profiler attached, caps are empty ⇒ WaitVram; the retry.
     #[test]
     fn test_scythe_vram_exhaustion_queues_request() {
         let mut engine = Engine::new(EngineConfig::default());
@@ -4147,18 +3852,14 @@ mod tests {
             .unwrap();
 
         // Alpha/rank = 2.0/2.0 = 1.0; deltas accumulate onto the base rows.
-        // Row 0: [1,1,1,1]+[1,1,0,0] = [2,2,1,1]
-        // Row 1: [2,2,2,2]+[2,2,0,0] = [4,4,2,2]
-        // Row 2 untouched.
+        // Row 0: [1,1,1,1]+[1,1,0,0] = [2,2,1,1] Row 1: [2,2,2,2]+[2,2,0,0] = [4,4,2,2] Row 2 untouched.
         assert_eq!(&stacked[0..4], &[2.0, 2.0, 1.0, 1.0]);
         assert_eq!(&stacked[4..8], &[4.0, 4.0, 2.0, 2.0]);
         assert_eq!(&stacked[8..12], &[5.0, 5.0, 5.0, 5.0]);
     }
 
-    /// Batched multi-LoRA contract gate: the grouped decode path
-    /// (`step_batch`, base forwards + one segment apply) must produce the
-    /// same logits as the legacy per-request path (adapters applied inside
-    /// `decode_one`) on identical engines.
+    /// Batched multi-LoRA contract gate: the grouped decode path (`step_batch`, base forwards + one segment apply) must
+    /// produce the same logits as the legacy per-request path (adapters applied inside `decode_one`) on identical engines.
     #[test]
     fn test_step_batch_grouped_lora_matches_per_request_path() {
         // The runtime LoRA surrogate contract (MED-5) requires adapter
@@ -4229,14 +3930,8 @@ mod tests {
         enqueue(&mut grouped);
         let items: Vec<(u64, &str, grim_tensor::Tensor, grim_tensor::Tensor)> = (1..=3)
             .map(|id| {
-                let tok = grim_backend_cpu::cpu_tensor(
-                    vec![3.0],
-                    grim_tensor::Shape::new(vec![1]),
-                );
-                let pos = grim_backend_cpu::cpu_tensor(
-                    vec![1.0],
-                    grim_tensor::Shape::new(vec![1]),
-                );
+                let tok = grim_backend_cpu::cpu_tensor(vec![3.0], grim_tensor::Shape::new(vec![1]));
+                let pos = grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1]));
                 (id, "tiny", tok, pos)
             })
             .collect();
@@ -4259,8 +3954,18 @@ mod tests {
         assert_eq!(grouped_out.len(), legacy_out.len());
         for ((gid, g), (lid, l)) in grouped_out.iter().zip(&legacy_out) {
             assert_eq!(gid, lid);
-            let g_logits = g.logits.as_ref().expect("grouped logits").to_vec_f32().unwrap();
-            let l_logits = l.logits.as_ref().expect("legacy logits").to_vec_f32().unwrap();
+            let g_logits = g
+                .logits
+                .as_ref()
+                .expect("grouped logits")
+                .to_vec_f32()
+                .unwrap();
+            let l_logits = l
+                .logits
+                .as_ref()
+                .expect("legacy logits")
+                .to_vec_f32()
+                .unwrap();
             assert_eq!(g_logits.len(), l_logits.len());
             for (i, (gv, lv)) in g_logits.iter().zip(&l_logits).enumerate() {
                 assert!(
@@ -4274,6 +3979,7 @@ mod tests {
     /// PP gate: requesting pp_size > 1 must hard-fail at Engine::new, not
     /// silently run single-device execution.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     #[should_panic(expected = "pipeline-parallel execution is not yet wired")]
     fn test_engine_rejects_pipeline_parallel_size() {
         let mut cfg = EngineConfig::default();
@@ -4290,54 +3996,51 @@ mod tests {
         let _ = Engine::new(cfg);
     }
 
-    /// R4 validation (deterministic, mock-probed): the admission gate rejects
-    /// a request whose footprint exceeds the current memory envelope and admits
-    /// it when the envelope is large enough. The GRIM_TEST_FREE_DEVICE_BYTES
-    /// override makes the probe deterministic; see
-    /// `test_memory_certificate_admission_gate_real_hw` for the live-probe case.
+    /// R4 validation (deterministic, mock-probed): the admission gate rejects a request whose footprint exceeds the current memory envelope and admits it when the envelope is large enough.
+    /// The GRIM_TEST_FREE_DEVICE_BYTES override makes the probe deterministic; see `test_memory_certificate_admission_gate_real_hw` for the live-probe case.
     #[test]
     fn test_memory_certificate_admission_gate() {
         use grim_scheduler::Request;
 
         // SAFETY: single-threaded test; env vars are set then restored.
         unsafe {
-        let mut engine = Engine::new(EngineConfig::default());
-        engine.register_model("tiny", small_llama());
+            let mut engine = Engine::new(EngineConfig::default());
+            engine.register_model("tiny", small_llama());
 
-        // Tiny envelope: 0.5 MiB free device, 0 host, 0 reserve. A 4096-token
-        // prompt cannot fit -> admission must fail with an envelope error.
-        std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "500000");
-        std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "0");
-        std::env::set_var("GRIM_MEMORY_RESERVE_GB", "0");
-        let big = Request {
-            id: 1,
-            prompt_tokens: 4096,
-            max_new_tokens: 256,
-            model_id: Some("tiny".into()),
-            ..Default::default()
-        };
-        let err = engine
-            .enqueue_request(big)
-            .expect_err("oversize request must be rejected by the admission gate");
-        assert!(
-            err.to_string().contains("exceeds current memory envelope"),
-            "unexpected error: {err}"
-        );
+            // Tiny envelope: 0.5 MiB free device, 0 host, 0 reserve. A 4096-token
+            // prompt cannot fit -> admission must fail with an envelope error.
+            std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "500000");
+            std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "0");
+            std::env::set_var("GRIM_MEMORY_RESERVE_GB", "0");
+            let big = Request {
+                id: 1,
+                prompt_tokens: 4096,
+                max_new_tokens: 256,
+                model_id: Some("tiny".into()),
+                ..Default::default()
+            };
+            let err = engine
+                .enqueue_request(big)
+                .expect_err("oversize request must be rejected by the admission gate");
+            assert!(
+                err.to_string().contains("exceeds current memory envelope"),
+                "unexpected error: {err}"
+            );
 
-        // Large envelope: 128 GiB free device, 64 GiB host. Same request fits.
-        std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "128849018880");
-        std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "64");
-        std::env::set_var("GRIM_MEMORY_RESERVE_GB", "1");
-        let ok = Request {
-            id: 2,
-            prompt_tokens: 4096,
-            max_new_tokens: 256,
-            model_id: Some("tiny".into()),
-            ..Default::default()
-        };
-        engine
-            .enqueue_request(ok)
-            .expect("request must be admitted when envelope is large enough");
+            // Large envelope: 128 GiB free device, 64 GiB host. Same request fits.
+            std::env::set_var("GRIM_TEST_FREE_DEVICE_BYTES", "128849018880");
+            std::env::set_var("GRIM_HOST_ALLOWANCE_GB", "64");
+            std::env::set_var("GRIM_MEMORY_RESERVE_GB", "1");
+            let ok = Request {
+                id: 2,
+                prompt_tokens: 4096,
+                max_new_tokens: 256,
+                model_id: Some("tiny".into()),
+                ..Default::default()
+            };
+            engine
+                .enqueue_request(ok)
+                .expect("request must be admitted when envelope is large enough");
 
             // Cleanup env so other tests are unaffected.
             std::env::remove_var("GRIM_TEST_FREE_DEVICE_BYTES");
@@ -4346,10 +4049,8 @@ mod tests {
         } // unsafe
     }
 
-    /// R4 real-hardware verification: exercises the actual ROCm `hipMemGetInfo` probe
-    /// (not the mock) on the live GPU and confirms the admission gate works
-    /// against real free-VRAM data. Skips (does not fail) when no ROCm device
-    /// is visible, so this is a no-op off-hardware and a real check on-hardware.
+    /// R4 real-hardware verification: exercises the actual ROCm `hipMemGetInfo` probe (not the mock) on the live GPU and confirms the admission gate works against real free-VRAM data.
+    /// Skips (does not fail) when no ROCm device is visible, so this is a no-op.
     #[test]
     fn test_memory_certificate_admission_gate_real_hw() {
         use grim_scheduler::Request;
@@ -4379,9 +4080,8 @@ mod tests {
             "R4 HW: free_device_memory must match vram_info free"
         );
 
-        // Register the model and let the engine build its baseline cert from the
-        // model\'s hyperparams. With a real multi-GB GPU, a small test request
-        // must be admitted against the genuine free-VRAM probe.
+        // Register the model and let the engine build its baseline cert from the model\'s hyperparams.
+        // With a real multi-GB GPU, a small test request must be admitted against the genuine.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("tiny", small_llama());
         let tiny = Request {

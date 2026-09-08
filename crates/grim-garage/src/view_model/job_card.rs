@@ -24,9 +24,8 @@ impl JobCardV1 {
         }
     }
 
-    /// Short label that pairs the status with a tok-flavoured bullet,
-    /// e.g. `"● running"`, `"✓ completed"`, `"✗ failed"`. The badge
-    /// UI element uses this verbatim.
+    /// Short label that pairs the status with a tok-flavoured bullet, e.g.
+    /// `"● running"`, `"✓ completed"`, `"✗ failed"`.
     pub fn badge_label(&self) -> String {
         let bullet = match self.status.as_str() {
             "running" => "●",

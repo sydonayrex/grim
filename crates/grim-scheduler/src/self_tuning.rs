@@ -1,32 +1,5 @@
-//! Self-tuning scheduler controller — §5.7.
-//!
-//! Each knob self-calibrates *independently* (the architecture explicitly
-//! defers coupled multi-knob tuning past per-knob calibration because knobs
-//! correcting against each other's side effects is a real oscillation
-//! risk). When independent per-knob calibration is already good enough,
-//! the coupled controller may not need to exist at all (§11) — that's a
-//! legitimate outcome.
-//!
-//! Per the architecture, the four knobs in scope are:
-//!
-//! 1. **chunked-prefill size** — how many tokens from any one request's
-//!    prompt are drained per tick. Drives prefill-vs-decode TTFT balance.
-//! 2. **`max_batched_tokens`** — across-the-board cap; tight under load,
-//!    loose when the system has margin.
-//! 3. **`speculative_block_len`** — DSpark's parallel draft width per
-//!    step. Tuned to keep confidence under sustain-load while staying
-//!    shallow enough that offload-to-CPU drafts don't go stale.
-//! 4. **`kv_compression_bit_width`** — TurboQuant-style KV value bits
-//!    on free blocks. Lower bits save memory at predictable quality cost.
-//!
-//! Each knob:
-//! - holds an EMA of the metric it tunes against;
-//! - exposes `record_*` and `tune_*`;
-//! - ships with floors/ceilings so the calibration doesn't drift.
-//!
-//! `tune_all` drives each knob independently on the most recent
-//! observations; the architecture's coupling concerns surface only in
-//! future "coupled" revisions of the controller.
+//! Self-tuning scheduler controller - §5.7.
+//! Each knob self-calibrates *independently* (the architecture explicitly defers coupled multi-knob tuning past per-knob calibration because.
 
 // (no imports needed)
 
@@ -102,12 +75,8 @@ impl KnobTuner {
         self.ema_observed = (1.0 - a) * self.ema_observed + a * observed;
     }
 
-    /// One-step tuning: returns the new value the knob should take,
-    /// clamped to `[floor, ceiling]`. Independent per-knob — caller is
-    /// responsible for any cross-knob coordination needed (none required
-    /// in v1). Internally iterates to convergence so a single call
-    /// drives the knob as far toward the floor/ceiling as the
-    /// observed-metric supports.
+    /// One-step tuning: returns the new value the knob should take, clamped to `[floor, ceiling]`.
+    /// Independent per-knob - caller is responsible for any cross-knob coordination needed (none required in v1).
     fn tune(&mut self) -> f64 {
         let sign = (self.ema_observed - self.target).signum();
         let target_bound = if sign > 0.0 {
@@ -122,8 +91,7 @@ impl KnobTuner {
             let next = self.current + (target_bound - self.current) * step;
             let next = next.clamp(self.floor, self.ceiling);
             // Convergence: when we hit the floor or ceiling, or the
-            // absolute residual is below a single step we configured,
-            // stop.
+            // absolute residual is below a single step we configured, stop.
             if (next - self.current).abs() < 1e-9 {
                 self.current = next;
                 return self.current;
@@ -146,10 +114,8 @@ impl KnobTuner {
     }
 }
 
-/// Container for the four independent per-knob tuners and the EMA
-/// decay rate applied to each. Owns the tuners' latest calibrated values
-/// and exposes a single `tune_all` for callers that want a coordinated
-/// autotune pass without coupling any of the knobs.
+/// Container for the four independent per-knob tuners and the EMA decay rate applied to each.
+/// Owns the tuners' latest calibrated values and exposes a single `tune_all` for callers that want.
 #[derive(Debug)]
 pub struct SelfTuningController {
     pub target_ttft_ms: f64,
@@ -177,11 +143,8 @@ impl SelfTuningController {
             ema_itl_ms: target_itl_ms,
             ema_quality: 0.0,
             alpha: 0.15,
-            // Defaults: chunked prefill size starts at 512 tokens,
-            // max_batched_tokens at 4096, speculative block_len at 5,
-            // KV compression bit_width at 4. Each tuner keeps its
-            // observable target — TTFT for the first two, ITL for the
-            // third, quality drift for the fourth.
+            // Defaults: chunked prefill size starts at 512 tokens, max_batched_tokens at 4096, speculative block_len at 5, KV compression bit_width at 4.
+            // Each tuner keeps its observable target - TTFT for the first two, ITL for the.
             chunked_prefill_size: KnobTuner::new_fixed(
                 KnobKind::ChunkedPrefillSize,
                 /* target_pressure_ms */ target_ttft_ms,
@@ -242,9 +205,8 @@ impl SelfTuningController {
         self.ema_quality
     }
 
-    /// Independent per-knob: chunked_prefill_size and max_batched_tokens
-    /// both home in on TTFT; speculative block_len homes in on ITL; KV
-    /// compression bit-width homes in on quality drift.
+    /// Independent per-knob: chunked_prefill_size and max_batched_tokens both home in on TTFT; speculative block_len
+    /// homes in on ITL; KV compression bit-width homes in on quality drift.
     pub fn tune_one(&mut self, knob: KnobKind) -> f64 {
         match knob {
             KnobKind::ChunkedPrefillSize => {
@@ -269,9 +231,8 @@ impl SelfTuningController {
         }
     }
 
-    /// Run all four knob tuners independently. The returns map each
-    /// knob's chosen value so the caller can apply it. Each knob uses
-    /// its own EMA — there is no implicit cross-knob coupling.
+    /// Run all four knob tuners independently. The returns map
+    /// each knob's chosen value so the caller can apply it.
     pub fn tune_all(&mut self) -> KnobValues {
         // chunked_prefill_size: target = TTFT
         self.chunked_prefill_size.ema_observed = self.ema_ttft_ms;
@@ -289,8 +250,7 @@ impl SelfTuningController {
         let sb = self.speculative_block_len.tune();
 
         // kv_compression_bit_width: target = quality drift target.
-        // Higher drift (over target) pushes bits lower; lower drift
-        // (under target) leaves room to widen resolution.
+        // Higher drift (over target) pushes bits lower; lower drift (under target) leaves room to widen.
         self.kv_compression_bit_width
             .record(self.ema_quality, self.alpha);
         let kw = self.kv_compression_bit_width.tune();
@@ -372,9 +332,8 @@ mod tests {
 
     #[test]
     fn chunked_prefill_size_independent_from_max_batched() {
-        // Two knobs, both responsive to TTFT pressure but with different
-        // scale_step/floor — verify the controller does NOT collapse
-        // them into a single value when they have distinct bounds.
+        // Two knobs, both responsive to TTFT pressure but with different scale_step/floor - verify the
+        // controller does NOT collapse them into a single value when they have distinct bounds.
         let mut controller = SelfTuningController::new(100.0, 10.0);
         for _ in 0..10 {
             controller.record_ttft(400.0);

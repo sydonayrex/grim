@@ -1,9 +1,5 @@
 //! Hunyuan-VL multimodal vision-language model with compact ViT encoder and 4-section M-RoPE.
-//!
-//! # Architecture Details
-//! - **Compact ViT Visual Backbone**: Patch extraction and spatial projection into language hidden dimension.
-//! - **4-Section M-RoPE**: Rotary position frequencies split into `[2, 2, 2, 2]` for multidimensional spatio-temporal alignment.
-//! - **Language Decoder**: Grouped Query Attention and SwiGLU activations.
+//! # Architecture Details - **Compact ViT Visual Backbone**: Patch extraction and spatial projection into language.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -11,9 +7,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Tensor};
 
-// ---------------------------------------------------------------------------
 // Vision Config & Encoder
-// ---------------------------------------------------------------------------
 
 /// Configuration for Hunyuan-VL visual feature encoder.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -76,9 +70,7 @@ impl HunyuanVlVisionEncoder {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Hunyuan-VL model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -136,9 +128,7 @@ impl ModelConfig for HunyuanVlConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 /// Transformer block for Hunyuan-VL.
 pub struct HunyuanVlBlock {
@@ -216,9 +206,8 @@ impl HunyuanVlBlock {
         })
     }
 
-    /// GPU-first forward: Q/K/V, RoPE, KV-cache concat, attention and the
-    /// SwiGLU MLP all run on the tensor's device. Host paths are only
-    /// reached through the fused-kernel fallback guards.
+    /// GPU-first forward: Q/K/V, RoPE, KV-cache concat, attention and the SwiGLU MLP all run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -232,12 +221,8 @@ impl HunyuanVlBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -284,9 +269,7 @@ impl HunyuanVlBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct HunyuanVl {
     pub cfg: HunyuanVlConfig,

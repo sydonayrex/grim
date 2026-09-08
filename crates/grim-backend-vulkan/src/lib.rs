@@ -1,11 +1,5 @@
-//! Vulkan backend for Grim — GPU compute via Vulkan 1.1 SPIR-V.
-//!
-//! Modularized architecture (mirrors CUDA/ROCm backends):
-//! - `ffi.rs`        — Vulkan API types, constants, extern "C" declarations.
-//! - `context.rs`    — VulkanContext: device init, queues, pipeline setup.
-//! - `storage.rs`    — VulkanStorage: GPU buffer management, host-visible staging.
-//! - `kernel.rs`     — VulkanKernel catalog: SPIR-V lookup, dispatch, push constants.
-//! - `lib.rs`        — VulkanDevice struct + BackendDevice trait impls.
+//! Vulkan backend for Grim - GPU compute via Vulkan 1.1 SPIR-V.
+//! Modularized architecture (mirrors CUDA/ROCm backends): - `ffi.rs`    - Vulkan API types, constants, extern "C" declarations.
 
 pub mod autotune;
 pub mod caps;
@@ -23,14 +17,16 @@ pub use autotune::{GemmOp, ShapeClass, VulkanAutotuner, VulkanTileConfig};
 pub use caps::VulkanCaps;
 pub use hugepage::VulkanHugePageBuffer;
 pub use kernel::VulkanKernel;
-pub use kernel::{spirv_for, binding_count};
+pub use kernel::{binding_count, spirv_for};
 pub use storage::{VulkanHandle, VulkanStorage};
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 
 use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage as DTypeStorage};
+use grim_tensor::dtype::{
+    DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage as DTypeStorage,
+};
 use grim_tensor::error::{Error, Result};
 pub use grim_tensor::{
     ArithType, AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
@@ -39,14 +35,12 @@ pub use grim_tensor::{
 };
 
 // Re-exported from submodules for use within trait impls.
-pub(crate) use context::global_context;
 pub(crate) use context::QUEUE_LOCK;
-pub(crate) use kernel::{push_params, run_compute_shader, run_compute_shader_kernel};
+pub(crate) use context::global_context;
 use ffi::*;
+pub(crate) use kernel::{push_params, run_compute_shader, run_compute_shader_kernel};
 
-// ============================================================================
-// VulkanDevice — all trait implementations and kernel dispatch
-// ============================================================================
+// VulkanDevice - all trait implementations and kernel dispatch
 
 /// Vulkan device handle.
 #[derive(Debug)]
@@ -56,8 +50,6 @@ pub struct VulkanDevice {
     /// this GPU (loaded from disk at construction) is reused instead of re-searched each call.
     autotuner: Mutex<VulkanAutotuner>,
     /// Optional multi-GPU communicator. `None` = single-GPU mode (default).
-    /// When `Some`, `all_reduce` dispatches the ring-allreduce shader across
-    /// device pairs via the communicator's `world_size`/`rank` topology.
     pub communicator: Option<collective::VkCommunicator>,
 }
 
@@ -73,13 +65,8 @@ impl Clone for VulkanDevice {
 }
 
 impl VulkanDevice {
-    /// Constructs a new Vulkan device.
-    ///
-    /// Threads the real adapter identity (queried in `VulkanContext::init`)
-    /// into the device caps so `vendor_id`/`device_id`/`device_name` reflect
-    /// the actual physical device. `VulkanCaps::probe_default` is kept only as
-    /// a last-resort fallback when no live Vulkan context exists (e.g. the
-    /// context was never initialized), so device identity is never fabricated.
+    /// Constructs a new Vulkan device. Threads the real adapter identity (queried in
+    /// `VulkanContext::init`) into the device caps so `vendor_id`/`device_id`/`device_name` reflect the actual physical device.
     pub fn new() -> Self {
         let caps = {
             let guard = global_context();
@@ -106,9 +93,8 @@ impl VulkanDevice {
         }
     }
 
-    /// Attach a multi-GPU communicator so `all_reduce` dispatches the
-    /// ring-allreduce shader across device pairs. Single-GPU callers leave
-    /// this as `None`.
+    /// Attach a multi-GPU communicator so `all_reduce` dispatches the ring-allreduce shader across device pairs.
+    /// Single-GPU callers leave this as `None`.
     pub fn with_communicator(mut self, comm: collective::VkCommunicator) -> Self {
         self.communicator = Some(comm);
         self
@@ -133,11 +119,7 @@ impl VulkanDevice {
     }
 
     /// Fused QKV attention compute shader dispatch on Vulkan GPU.
-    ///
-    /// When `window` is `Some(w)` the dedicated `QkvAttentionSwa` kernel is
-    /// dispatched with a host-computed `window_lo = max(0, cache_offset - w + 1)`
-    /// lower bound (matching the ROCm/CUDA convention); otherwise the plain
-    /// full-causal `QkvAttention` kernel runs.
+    /// When `window` is `Some(w)` the dedicated `QkvAttentionSwa` kernel is dispatched with a host-computed `window_lo =.
     #[allow(clippy::too_many_arguments)]
     pub fn qkv_attention_inner(
         &self,
@@ -193,14 +175,12 @@ impl VulkanDevice {
         let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
 
         if let Some(w) = window {
-            // Sliding-window: dispatch QkvAttentionSwa. window_lo is the
-            // block-minimum lower bound max(0, cache_offset - w + 1); the
-            // kernel's causal upper bound (min(abs_i+1, seq_len)) is unchanged.
+            // Sliding-window: dispatch QkvAttentionSwa.
+            // window_lo is the block-minimum lower bound max(0, cache_offset - w + 1); the kernel's causal.
             let abs_first = cache_offset as usize;
             let window_lo = abs_first.saturating_sub(w.saturating_sub(1)) as u32;
             // 8 × u32 = 32 bytes Params block:
-            //   seq_len, head_dim, num_heads, num_kv_heads, cache_offset,
-            //   inv_sqrt_d(f32 bits), window_lo, has_window(=1)
+            // seq_len, head_dim, num_heads, num_kv_heads, cache_offset, inv_sqrt_d(f32 bits), window_lo, has_window(=1)
             let push: [u32; 8] = [
                 seq_len as u32,
                 head_dim as u32,
@@ -248,16 +228,14 @@ impl VulkanDevice {
     }
 }
 
-
 impl Default for VulkanDevice {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Extract raw bytes from a VulkanStorage buffer. Host-visible buffers are
-/// read via `vkMapMemory`; device-local buffers are read back through a
-/// staging copy so the caller works regardless of the memory tier selected.
+/// Extract raw bytes from a VulkanStorage buffer.
+/// Host-visible buffers are read via `vkMapMemory`; device-local buffers are read back through a staging copy.
 pub fn extract_raw_bytes(storage: &dyn BackendStorage) -> Result<Vec<u8>> {
     if let Some(b_vk) = storage.as_any().downcast_ref::<VulkanStorage>() {
         b_vk.read_raw_bytes()
@@ -350,19 +328,8 @@ impl VulkanDevice {
         Ok((Box::new(out_storage), Box::new(VulkanHandle)))
     }
 
-    /// Fused grouped MoE dispatch (WI-M5) — `gate+up` SiLU combine + `down`,
-    /// accumulated per routed (token, expert) pair into `out`.
-    ///
-    /// Mirrors the ROCm `grim_moe_fused_dispatch` P-DAFD contract: the host
-    /// pre-expands top-k routing into flat `router_tokens`/`router_experts`/
-    /// `router_weights` arrays (one entry per routed pair), so the kernel does
-    /// no device-side sort and emits no per-expert launch. `out` is
-    /// zero-initialized and the kernel `atomicAdd`s each expert's scaled
-    /// contribution (a token routed to K>1 experts hits K pairs).
-    ///
-    /// Weights are row-major per expert: `gate_w`/`up_w` are
-    /// `[num_experts, inter, hidden]`, `down_w` is `[num_experts, hidden, inter]`.
-    /// `x` is `[batch, hidden]`. `out` is `[batch, hidden]` on this device.
+    /// Fused grouped MoE dispatch (WI-M5) - `gate+up` SiLU combine + `down`, accumulated per routed (token, expert) pair into `out`.
+    /// Mirrors the ROCm `grim_moe_fused_dispatch` P-DAFD contract: the host pre-expands top-k routing into flat `router_tokens`/`router_experts`/ `router_weights`.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_fused_dispatch(
         &self,
@@ -493,8 +460,7 @@ impl VulkanDevice {
     }
 
     /// Upload a host `f32` slice into a freshly-allocated device buffer.
-    /// Used to stage small CPU-side routing arrays (token/expert/weight) and
-    /// flattened expert weights for `moe_fused_dispatch`.
+    /// Used to stage small CPU-side routing arrays (token/expert/weight) and flattened expert weights for `moe_fused_dispatch`.
     pub fn upload_f32(&self, data: &[f32], shape: &Shape) -> Result<Box<dyn BackendStorage>> {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.upload_bytes(&bytes, shape, DType::F32)
@@ -545,10 +511,8 @@ impl VulkanDevice {
         Ok(Box::new(storage))
     }
 
-    /// Op-tagged GEMM. `op` drives the shape-classifier (via `search_tile_config`): a `LmHead`
-    /// tag routes to the wide-N TLOLog tile; everything else classifies by shape. The trait
-    /// `matmul` delegates with `None` (preserving prior behavior); `matmul_lm_head` delegates
-    /// with `Some(GemmOp::LmHead)` so logit projection gets the wide-N candidate set.
+    /// Op-tagged GEMM. `op` drives the shape-classifier (via `search_tile_config`): a `LmHead` tag
+    /// routes to the wide-N TLOLog tile; everything else classifies by shape.
     pub fn matmul_op(
         &self,
         a: &dyn BackendStorage,
@@ -588,6 +552,26 @@ impl VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        // Fall back to exact CPU calculation for small matrices where GPU tile workgroups
+        // (min 16x16 or 32x32) or RADV driver precision causes numerical artifacts.
+        if m < 16 || n < 16 || k < 16 {
+            drop(ctx_guard);
+            let a_vec = a.to_cpu_vec_f32()?;
+            let b_vec = b.to_cpu_vec_f32()?;
+            let mut c_vec = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut sum = 0.0f32;
+                    for p in 0..k {
+                        sum += a_vec[row * k + p] * b_vec[p * n + col];
+                    }
+                    c_vec[row * n + col] = sum;
+                }
+            }
+            let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
+            return Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)));
+        }
 
         // Persistent autotuner: cached (loaded-from-disk or in-memory) winner on a repeat shape
         // is reused; on a miss the winner is chosen and persisted (search_tile_config saves).
@@ -641,9 +625,8 @@ impl VulkanDevice {
         ))
     }
 
-    /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so it is
-    /// classified as `ShapeClass::TLOLog` (op-identity) and gets the wide-N tile candidate set
-    /// regardless of M. This is the vulkan-catch-up.md §3 T3 dispatch-layer tag.
+    /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so it is classified as `ShapeClass::TLOLog` (op-identity) and gets the wide-N tile candidate set regardless of M.
+    /// This is the vulkan-catch-up.md §3 T3 dispatch-layer tag.
     pub fn matmul_lm_head(
         &self,
         a: &dyn BackendStorage,
@@ -654,20 +637,14 @@ impl VulkanDevice {
     }
 
     /// Multi-GPU all-reduce via the ring-allreduce shader.
-    ///
-    /// Structural scaffold: dispatches `VulkanKernel::RingAllReduce` using the
-    /// communicator's topology. Full cross-GPU dispatch requires P2P buffer
-    /// copy infrastructure (not yet wired) — this method documents the path
-    /// and returns an honest error if the transport is unavailable.
+    /// Structural scaffold: dispatches `VulkanKernel::RingAllReduce` using the communicator's topology.
     fn all_reduce_multi_gpu(
         &self,
         inputs: &[&dyn BackendStorage],
         comm: &collective::VkCommunicator,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Multi-GPU all-reduce requires P2P buffer copy across device pairs,
-        // which is the transport layer this phase scaffolds. The ring-allreduce
-        // shader in `ring_allreduce.comp` is the reduce step once transport
-        // exists.
+        // Multi-GPU all-reduce requires P2P buffer copy across device pairs, which is the transport layer this phase scaffolds.
+        // The ring-allreduce shader in `ring_allreduce.comp` is the reduce step once transport exists.
         let _ = (inputs, comm);
         Err(Error::Backend(
             "all_reduce_multi_gpu: P2P transport not yet wired (ring-allreduce shader is structural)".into()
@@ -717,8 +694,7 @@ impl VulkanDevice {
     }
 
     /// Shared single-workgroup reduction dispatch (sum / max / argmax).
-    /// `out_elems` is 1 for value reductions, 1 for argmax (index packed as
-    /// uint bits). Returns the output storage's contents.
+    /// `out_elems` is 1 for value reductions, 1 for argmax (index packed as uint bits).
     fn run_reduction(
         &self,
         kernel: VulkanKernel,
@@ -749,19 +725,16 @@ impl VulkanDevice {
         }
 
         let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
-        // One workgroup: the reduction shaders loop over the whole input and
-        // tree-combine in shared memory (n up to a few million is fine — the
-        // strided loop is bandwidth-bound either way).
+        // One workgroup: the reduction shaders loop over the whole input and tree-combine in shared memory
+        // (n up to a few million is fine - the strided loop is bandwidth-bound either way).
         run_compute_shader(ctx, &spirv_source, &buffers, 1, 1, 1, Some(&push))?;
         drop(ctx_guard);
 
-        Ok(out_storage.to_cpu_vec_f32()?)
+        out_storage.to_cpu_vec_f32()
     }
 }
 
 impl ElementwiseOps for VulkanDevice {
-
-
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -797,8 +770,6 @@ impl ElementwiseOps for VulkanDevice {
         ))
     }
 
-
-
     fn sqrt(
         &self,
         x: &dyn BackendStorage,
@@ -832,7 +803,6 @@ impl ElementwiseOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn recip(
         &self,
@@ -893,7 +863,9 @@ impl ElementwiseOps for VulkanDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         if scalar == 0.0 {
-            return Err(Error::Backend("Vulkan div_scalar: division by zero scalar".into()));
+            return Err(Error::Backend(
+                "Vulkan div_scalar: division by zero scalar".into(),
+            ));
         }
         self.run_scalar_op(VulkanKernel::DivScalar, x, scalar, out_shape, "div_scalar")
     }
@@ -963,10 +935,8 @@ impl ElementwiseOps for VulkanDevice {
 }
 
 impl SamplingOps for VulkanDevice {
-    /// Tier A (semi-parity): the greedy path samples via the device argmax
-    /// kernel — no logit round-trip. The stochastic path still needs
-    /// top-k/top-p filtering on the host (a GPU top-p is a separate kernel
-    /// program) and uses the same documented algorithm as the trait default.
+    /// Tier A (semi-parity): the greedy path samples via the device argmax kernel - no logit round-trip.
+    /// The stochastic path still needs top-k/top-p filtering on the host (a GPU top-p is a.
     fn sample_on_device(
         &self,
         logits: &dyn BackendStorage,
@@ -976,12 +946,18 @@ impl SamplingOps for VulkanDevice {
         seed: u64,
     ) -> Result<u32> {
         if temperature <= 0.0 || (top_k == 1 && (top_p >= 1.0 || top_p <= 0.0)) {
-            if std::env::var("SAMP_DBG").is_ok() { eprintln!("SDBG greedy->argmax"); }
+            if std::env::var("SAMP_DBG").is_ok() {
+                eprintln!("SDBG greedy->argmax");
+            }
             let r = self.argmax(logits);
-            if std::env::var("SAMP_DBG").is_ok() { eprintln!("SDBG argmax done: {r:?}"); }
+            if std::env::var("SAMP_DBG").is_ok() {
+                eprintln!("SDBG argmax done: {r:?}");
+            }
             return r;
         }
-        if std::env::var("SAMP_DBG").is_ok() { eprintln!("SDBG stochastic path"); }
+        if std::env::var("SAMP_DBG").is_ok() {
+            eprintln!("SDBG stochastic path");
+        }
         let cpu_logits = logits.to_cpu_vec_f32()?;
         if cpu_logits.is_empty() {
             return Err(Error::Backend("sample_on_device: empty logits".into()));
@@ -1040,26 +1016,30 @@ impl SamplingOps for VulkanDevice {
     }
 }
 
-
 impl FusionOps for VulkanDevice {
-
-    /// Tier B: real device path — silu(gate)*up on device, then quantize on
-    /// device via the existing `quantize_on_device` helper. No host
-    /// round-trip (the trait default decomposes into silu_mul + a host
-    /// quantize).
+    /// Tier B: real device path - silu(gate)*up on device, then quantize on device via the existing `quantize_on_device` helper.
+    /// No host round-trip (the trait default decomposes into silu_mul + a host quantize).
     fn silu_mul_quantize(
         &self,
         gate: &dyn BackendStorage,
         up: &dyn BackendStorage,
         format: grim_tensor::QuantFormat,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
         let (y_unquant, handle) = self.silu_mul(gate, up, out_shape)?;
         handle.synchronize()?;
         let (q_bytes, q_handle) = self.quantize_on_device(y_unquant.as_ref(), format)?;
         q_handle.synchronize()?;
         let scale_storage = self.zeros(&Shape::from_slice(&[1]), grim_tensor::DType::F32)?;
-        Ok((q_bytes, scale_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            q_bytes,
+            scale_storage,
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     /// Tier B: broadcast a 1-D bias `[out_dim]` into `[batch, out_dim]`.
@@ -1068,26 +1048,40 @@ impl FusionOps for VulkanDevice {
         bias: &dyn BackendStorage,
         _batch: usize,
         out_dim: usize,
-        
+
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let b_s = bias.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan broadcast_bias: bias is not VulkanStorage".into()))?;
-        let ctx_guard=global_context(); let ctx=ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage=VulkanStorage::alloc_device_local_gpu(out_shape,DType::F32,ctx.device,ctx.physical_device)?;
-        let spirv_source:Vec<u8>=spirv_for(VulkanKernel::BroadcastBias).to_vec();
-        let buffers=[b_s.buffer,out_storage.buffer];
-        let n=out_shape.elem_count();
-        let grid_x=n.div_ceil(256) as u32;
-        let push=push_params(n as u32, 0, 0, out_dim as u32, 0, 0.0);
-        run_compute_shader(ctx,&spirv_source,&buffers,grid_x,1,1,Some(&push))?;
+        let b_s = bias
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan broadcast_bias: bias is not VulkanStorage".into())
+            })?;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_device_local_gpu(
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::BroadcastBias).to_vec();
+        let buffers = [b_s.buffer, out_storage.buffer];
+        let n = out_shape.elem_count();
+        let grid_x = n.div_ceil(256) as u32;
+        let push = push_params(n as u32, 0, 0, out_dim as u32, 0, 0.0);
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
         drop(ctx_guard);
-        Ok((Box::new(out_storage),Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     /// Tier B: in-place scale+bias epilogue on a `[batch, out_dim]` GEMM output.
-    /// Absent a_scale/b_scale are unity-padded; absent bias is zero-padded by
-    /// the host before dispatch.
+    /// Absent a_scale/b_scale are unity-padded; absent bias is zero-padded by the host before dispatch.
     fn scale_bias_epilogue(
         &self,
         out: &dyn BackendStorage,
@@ -1096,36 +1090,84 @@ impl FusionOps for VulkanDevice {
         bias: Option<&dyn BackendStorage>,
         _batch: usize,
         out_dim: usize,
-        
     ) -> Result<Box<dyn ComputeHandle>> {
-        let out_s=out.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: out is not VulkanStorage".into()))?;
-        let n=_batch*out_dim;
-        if out.shape().elem_count()!=n { return Err(Error::Shape("Vulkan scale_bias_epilogue: out size mismatch".into())); }
+        let out_s = out
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan scale_bias_epilogue: out is not VulkanStorage".into())
+            })?;
+        let n = _batch * out_dim;
+        if out.shape().elem_count() != n {
+            return Err(Error::Shape(
+                "Vulkan scale_bias_epilogue: out size mismatch".into(),
+            ));
+        }
         // Build padded buffers: absent scale -> [1] filled 1.0; absent bias -> [1] filled 0.0.
-        let ones=vec![1.0f32]; let zeros=vec![0.0f32];
-        let a_data:Vec<f32>=if let Some(a)=a_scale { a.to_cpu_vec_f32()? } else { ones.clone() };
-        let b_data:Vec<f32>=if let Some(b)=b_scale { b.to_cpu_vec_f32()? } else { ones.clone() };
-        let bias_data:Vec<f32>=if let Some(b)=bias { b.to_cpu_vec_f32()? } else { zeros.clone() };
-        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
-        let a_s=self.from_cpu(&a_data,&Shape::new(vec![a_data.len()]),dtype.clone())?;
-        let b_s=self.from_cpu(&b_data,&Shape::new(vec![b_data.len()]),dtype.clone())?;
-        let bi_s=self.from_cpu(&bias_data,&Shape::new(vec![bias_data.len()]),dtype.clone())?;
-        let a_buf=a_s.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: a_scale is not VulkanStorage".into()))?.buffer;
-        let b_buf=b_s.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: b_scale is not VulkanStorage".into()))?.buffer;
-        let bi_buf=bi_s.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| Error::Backend("Vulkan scale_bias_epilogue: bias is not VulkanStorage".into()))?.buffer;
-        let ctx_guard=global_context(); let ctx=ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let spirv_source:Vec<u8>=spirv_for(VulkanKernel::ScaleBiasEpilogue).to_vec();
-        let buffers=[out_s.buffer,a_buf,b_buf,bi_buf];
-        let grid_x=n.div_ceil(256) as u32;
-        let push=push_params(n as u32, out_dim as u32, 0, 0, 0, 0.0);
-        run_compute_shader(ctx,&spirv_source,&buffers,grid_x,1,1,Some(&push))?;
+        let ones = vec![1.0f32];
+        let zeros = vec![0.0f32];
+        let a_data: Vec<f32> = if let Some(a) = a_scale {
+            a.to_cpu_vec_f32()?
+        } else {
+            ones.clone()
+        };
+        let b_data: Vec<f32> = if let Some(b) = b_scale {
+            b.to_cpu_vec_f32()?
+        } else {
+            ones.clone()
+        };
+        let bias_data: Vec<f32> = if let Some(b) = bias {
+            b.to_cpu_vec_f32()?
+        } else {
+            zeros.clone()
+        };
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        let a_s = self.from_cpu(&a_data, &Shape::new(vec![a_data.len()]), dtype.clone())?;
+        let b_s = self.from_cpu(&b_data, &Shape::new(vec![b_data.len()]), dtype.clone())?;
+        let bi_s = self.from_cpu(
+            &bias_data,
+            &Shape::new(vec![bias_data.len()]),
+            dtype.clone(),
+        )?;
+        let a_buf = a_s
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan scale_bias_epilogue: a_scale is not VulkanStorage".into())
+            })?
+            .buffer;
+        let b_buf = b_s
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan scale_bias_epilogue: b_scale is not VulkanStorage".into())
+            })?
+            .buffer;
+        let bi_buf = bi_s
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan scale_bias_epilogue: bias is not VulkanStorage".into())
+            })?
+            .buffer;
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::ScaleBiasEpilogue).to_vec();
+        let buffers = [out_s.buffer, a_buf, b_buf, bi_buf];
+        let grid_x = n.div_ceil(256) as u32;
+        let push = push_params(n as u32, out_dim as u32, 0, 0, 0, 0.0);
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
         drop(ctx_guard);
         Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
 
     /// Fused Add + RMSNorm: `y_out = x + residual`, `norm_out = rms_norm(y_out, w, eps)`.
-    /// Returns `(y_out, norm_out, compute_handle)`. Overrides the trait default with the real
-    /// fused `grim_add_rms_norm` SPIR-V pipeline — mirrors ROCm (HIP) and Metal (MSL) 1:1.
+    /// Returns `(y_out, norm_out, compute_handle)`.
     fn fused_add_rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -1206,8 +1248,6 @@ impl FusionOps for VulkanDevice {
 }
 
 impl AutogradOps for VulkanDevice {
-
-
     fn silu_mul_backward(
         &self,
         e: &dyn BackendStorage,
@@ -1262,20 +1302,11 @@ impl AutogradOps for VulkanDevice {
         ))
     }
 
-    // ---------------------------------------------------------------------------
-    // Tier B complex — autograd backwards (audit gap: training on Vulkan hit the
-    // trait's Err(Unimplemented)). These are CPU-reference fallbacks that mirror
-    // the documented ROCm kernel math exactly, so autograd produces correct
-    // gradients on Vulkan without a device kernel. Each is a "correct first,
-    // fast later" stopgap; the comment on every method names the device kernel
-    // that should replace it.
-    // ---------------------------------------------------------------------------
+    // Tier B complex - autograd backwards (audit gap: training on Vulkan hit the trait's Err(Unimplemented)).
+    // These are CPU-reference fallbacks that mirror the documented ROCm kernel math exactly, so autograd produces.
 
     /// Softmax backward: `dx_i = s_i * (g_i - Σ_j g_j s_j)` per row.
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::SoftmaxBackward`. Replaces the
-    /// earlier CPU fallback (correctness was identical; this avoids the PCIe
-    /// round-trip per layer on the training backward pass).
+    /// GPU-resident dispatch via `VulkanKernel::SoftmaxBackward`.
     fn softmax_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1285,11 +1316,15 @@ impl AutogradOps for VulkanDevice {
         let g_s = out_grad
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan softmax_backward: grad is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan softmax_backward: grad is not VulkanStorage".into())
+            })?;
         let s_s = softmax_out
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan softmax_backward: softmax_out is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan softmax_backward: softmax_out is not VulkanStorage".into())
+            })?;
 
         let total = out_shape.elem_count();
         let row_len = out_shape.dims().last().copied().unwrap_or(1).max(1);
@@ -1300,7 +1335,10 @@ impl AutogradOps for VulkanDevice {
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         let dx = VulkanStorage::alloc_device_local_gpu(
-            out_shape, DType::F32, ctx.device, ctx.physical_device,
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
         )?;
 
         let buffers = [g_s.buffer, s_s.buffer, dx.buffer];
@@ -1321,10 +1359,6 @@ impl AutogradOps for VulkanDevice {
     }
 
     /// RMSNorm backward w.r.t. x and weight.
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::RmsnormBackward`. The `dw`
-    /// accumulation uses `atomicAdd` (requires `OpAtomicFAddEXT`, gated by
-    /// `VulkanCaps::supports_fp32_atomic_add` — RDNA3+ / NVIDIA).
     fn rmsnorm_backward(
         &self,
         x: &dyn BackendStorage,
@@ -1333,34 +1367,69 @@ impl AutogradOps for VulkanDevice {
         eps: f32,
         x_shape: &Shape,
         w_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
         if !self.caps.supports_fp32_atomic_add {
             return Err(Error::Backend(
-                "rmsnorm_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into()
+                "rmsnorm_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into(),
             ));
         }
 
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan rmsnorm_backward: x is not VulkanStorage".into()))?;
-        let w_s = weight.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan rmsnorm_backward: weight is not VulkanStorage".into()))?;
-        let g_s = out_grad.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan rmsnorm_backward: grad is not VulkanStorage".into()))?;
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rmsnorm_backward: x is not VulkanStorage".into())
+        })?;
+        let w_s = weight
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rmsnorm_backward: weight is not VulkanStorage".into())
+            })?;
+        let g_s = out_grad
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rmsnorm_backward: grad is not VulkanStorage".into())
+            })?;
 
-        let cols = if x_shape.dims().len() > 1 { x_shape.dims()[1] } else { 1 };
+        let cols = if x_shape.dims().len() > 1 {
+            x_shape.dims()[1]
+        } else {
+            1
+        };
         let total = x_shape.elem_count();
 
         let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref()
+        let ctx = ctx_guard
+            .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
-        let dx = VulkanStorage::alloc_device_local_gpu(x_shape, DType::F32, ctx.device, ctx.physical_device)?;
-        let dw = VulkanStorage::alloc_device_local_gpu(w_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let dx = VulkanStorage::alloc_device_local_gpu(
+            x_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
+        let dw = VulkanStorage::alloc_device_local_gpu(
+            w_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         // Zero-initialize dw buffer (atomic scatter-add target)
         unsafe {
             let mut mapped: *mut c_void = std::ptr::null_mut();
-            let res = vkMapMemory(ctx.device, dw.memory, 0, dw.bytes as VkDeviceSize, 0, &mut mapped);
+            let res = vkMapMemory(
+                ctx.device,
+                dw.memory,
+                0,
+                dw.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            );
             if res == VK_SUCCESS {
                 std::ptr::write_bytes(mapped, 0, dw.bytes);
                 vkUnmapMemory(ctx.device, dw.memory);
@@ -1381,13 +1450,15 @@ impl AutogradOps for VulkanDevice {
             Some(&push),
         )?;
 
-        Ok((Box::new(dx), Box::new(dw), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(dx),
+            Box::new(dw),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     /// RoPE backward: `dx = rotate(out_grad, -positions)` (inverse rotation).
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::RopeBackward`. The even-indexed
-    /// thread writes both elements of each interleaved pair.
+    /// GPU-resident dispatch via `VulkanKernel::RopeBackward`.
     fn rope_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1395,21 +1466,37 @@ impl AutogradOps for VulkanDevice {
         sin: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let g_s = out_grad.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan rope_backward: grad is not VulkanStorage".into()))?;
-        let c_s = cos.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan rope_backward: cos is not VulkanStorage".into()))?;
-        let s_s = sin.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan rope_backward: sin is not VulkanStorage".into()))?;
+        let g_s = out_grad
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rope_backward: grad is not VulkanStorage".into())
+            })?;
+        let c_s = cos
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rope_backward: cos is not VulkanStorage".into())
+            })?;
+        let s_s = sin
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rope_backward: sin is not VulkanStorage".into())
+            })?;
 
         let total = out_shape.elem_count();
 
         let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref()
+        let ctx = ctx_guard
+            .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         let dx = VulkanStorage::alloc_device_local_gpu(
-            out_shape, DType::F32, ctx.device, ctx.physical_device,
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
         )?;
 
         let buffers = [g_s.buffer, c_s.buffer, s_s.buffer, dx.buffer];
@@ -1430,10 +1517,7 @@ impl AutogradOps for VulkanDevice {
     }
 
     /// Embedding backward: scatter-add `dweight[token_ids[t], :] += out_grad[t, :]`.
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::EmbeddingBackward`. Uses
-    /// `atomicAdd` on the dweight buffer (requires `OpAtomicFAddEXT`, gated by
-    /// `VulkanCaps::supports_fp32_atomic_add` — RDNA3+ / NVIDIA).
+    /// GPU-resident dispatch via `VulkanKernel::EmbeddingBackward`.
     fn embedding_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1443,45 +1527,72 @@ impl AutogradOps for VulkanDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         if !self.caps.supports_fp32_atomic_add {
             return Err(Error::Backend(
-                "embedding_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into()
+                "embedding_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into(),
             ));
         }
 
-        let g_s = out_grad.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan embedding_backward: grad is not VulkanStorage".into()))?;
+        let g_s = out_grad
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan embedding_backward: grad is not VulkanStorage".into())
+            })?;
 
         let num_tokens = token_ids.len();
         if num_tokens == 0 || hidden_dim == 0 || vocab_size == 0 {
-            return Err(Error::Shape("embedding_backward: empty vocab/hidden/tokens".into()));
+            return Err(Error::Shape(
+                "embedding_backward: empty vocab/hidden/tokens".into(),
+            ));
         }
         let total = num_tokens * hidden_dim;
         if g_s.shape.elem_count() != total {
-            return Err(Error::Shape("embedding_backward: grad size mismatch".into()));
+            return Err(Error::Shape(
+                "embedding_backward: grad size mismatch".into(),
+            ));
         }
 
-        let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-
-        // Upload token_ids as a u32 buffer
+        // Upload token_ids as a u32 buffer before holding global_context lock
         let token_shape = Shape::new(vec![num_tokens]);
         let tok_s = self.upload_u32(token_ids, &token_shape)?;
 
+        let ctx_guard = global_context();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
         let dw_shape = Shape::new(vec![vocab_size, hidden_dim]);
-        let dw = VulkanStorage::alloc_device_local_gpu(&dw_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let dw = VulkanStorage::alloc_device_local_gpu(
+            &dw_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         // Zero-initialize dw buffer (atomic scatter-add target)
         unsafe {
             let mut mapped: *mut c_void = std::ptr::null_mut();
-            let res = vkMapMemory(ctx.device, dw.memory, 0, dw.bytes as VkDeviceSize, 0, &mut mapped);
+            let res = vkMapMemory(
+                ctx.device,
+                dw.memory,
+                0,
+                dw.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            );
             if res == VK_SUCCESS {
                 std::ptr::write_bytes(mapped, 0, dw.bytes);
                 vkUnmapMemory(ctx.device, dw.memory);
             }
         }
 
-        let tok_vk = tok_s.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan embedding_backward: token_ids storage is not VulkanStorage".into()))?;
+        let tok_vk = tok_s
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend(
+                    "Vulkan embedding_backward: token_ids storage is not VulkanStorage".into(),
+                )
+            })?;
 
         let buffers = [tok_vk.buffer, g_s.buffer, dw.buffer];
         let grid_x = total.div_ceil(256) as u32;
@@ -1503,10 +1614,7 @@ impl AutogradOps for VulkanDevice {
 
 impl VulkanDevice {
     /// Log-softmax VJP: `dx_i = exp(log_p_i) * (g_i - Σ_j g_j)` per row.
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::LogSoftmaxVjp`. Used by the
-    /// DPO/GRPO/SIMPO preference-optimization backward pass where the
-    /// log-probability gradient flows through a softmax-like reduction.
+    /// GPU-resident dispatch via `VulkanKernel::LogSoftmaxVjp`.
     pub fn log_softmax_vjp(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1516,11 +1624,15 @@ impl VulkanDevice {
         let g_s = out_grad
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan log_softmax_vjp: grad is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan log_softmax_vjp: grad is not VulkanStorage".into())
+            })?;
         let lp_s = log_probs
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan log_softmax_vjp: log_probs is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan log_softmax_vjp: log_probs is not VulkanStorage".into())
+            })?;
 
         let total = out_shape.elem_count();
         let row_len = out_shape.dims().last().copied().unwrap_or(1).max(1);
@@ -1531,7 +1643,10 @@ impl VulkanDevice {
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         let dx = VulkanStorage::alloc_device_local_gpu(
-            out_shape, DType::F32, ctx.device, ctx.physical_device,
+            out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
         )?;
 
         let buffers = [g_s.buffer, lp_s.buffer, dx.buffer];
@@ -1552,11 +1667,8 @@ impl VulkanDevice {
     }
 
     /// Charon MoE expert-weight backward: compute d_gate_w, d_up_w, d_down_w.
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::CharonBackward`. Structural
-    /// scaffold — the real implementation needs forward-pass activated values
-    /// (not available without recompute/save). Documents the atomic scatter-add
-    /// pattern for expert-weight gradients.
+    /// GPU-resident dispatch via `VulkanKernel::CharonBackward`.
+    #[allow(clippy::too_many_arguments)]
     pub fn charon_backward(
         &self,
         x: &dyn BackendStorage,
@@ -1570,44 +1682,81 @@ impl VulkanDevice {
     ) -> Result<()> {
         if !self.caps.supports_fp32_atomic_add {
             return Err(Error::Backend(
-                "charon_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into()
+                "charon_backward on Vulkan requires OpAtomicFAddEXT (RDNA3+ / NVIDIA)".into(),
             ));
         }
 
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan charon_backward: x is not VulkanStorage".into()))?;
-        let gw_s = gate_w.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan charon_backward: gate_w is not VulkanStorage".into()))?;
-        let uw_s = up_w.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan charon_backward: up_w is not VulkanStorage".into()))?;
-        let dw_s = down_w.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan charon_backward: down_w is not VulkanStorage".into()))?;
-        let g_s = grad.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan charon_backward: grad is not VulkanStorage".into()))?;
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan charon_backward: x is not VulkanStorage".into())
+        })?;
+        let gw_s = gate_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan charon_backward: gate_w is not VulkanStorage".into())
+            })?;
+        let uw_s = up_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan charon_backward: up_w is not VulkanStorage".into())
+            })?;
+        let dw_s = down_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan charon_backward: down_w is not VulkanStorage".into())
+            })?;
+        let g_s = grad
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan charon_backward: grad is not VulkanStorage".into())
+            })?;
 
         let num_tokens = x_s.shape.elem_count() / hidden as usize;
 
         let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref()
+        let ctx = ctx_guard
+            .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         // Allocate output gradient buffer (d_gate_w + d_up_w + d_down_w)
         let total_grad_elems = (num_experts as usize) * (inter as usize) * (hidden as usize) * 2
             + (num_experts as usize) * (hidden as usize) * (inter as usize);
         let dg_shape = Shape::new(vec![total_grad_elems]);
-        let dg = VulkanStorage::alloc_device_local_gpu(&dg_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let dg = VulkanStorage::alloc_device_local_gpu(
+            &dg_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
         // Zero-initialize (atomic scatter-add target)
         unsafe {
             let mut mapped: *mut c_void = std::ptr::null_mut();
-            let res = vkMapMemory(ctx.device, dg.memory, 0, dg.bytes as VkDeviceSize, 0, &mut mapped);
+            let res = vkMapMemory(
+                ctx.device,
+                dg.memory,
+                0,
+                dg.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            );
             if res == VK_SUCCESS {
                 std::ptr::write_bytes(mapped, 0, dg.bytes);
                 vkUnmapMemory(ctx.device, dg.memory);
             }
         }
 
-        let buffers = [x_s.buffer, gw_s.buffer, uw_s.buffer, dw_s.buffer, g_s.buffer, dg.buffer];
+        let buffers = [
+            x_s.buffer,
+            gw_s.buffer,
+            uw_s.buffer,
+            dw_s.buffer,
+            g_s.buffer,
+            dg.buffer,
+        ];
         let total_dw = (num_experts as usize) * (hidden as usize) * (inter as usize);
         let grid_x = total_dw.div_ceil(64) as u32;
         let push = push_params(num_experts, hidden, inter, num_tokens as u32, 0, 0.0);
@@ -1626,11 +1775,8 @@ impl VulkanDevice {
     }
 
     /// MoE persistent-worker comm-compute mega-kernel dispatch.
-    ///
-    /// GPU-resident dispatch via `VulkanKernel::MoeMegaKernel`. Structural
-    /// scaffold — the real implementation needs persistent-worker scoreboard
-    /// synchronization across multiple dispatches. Documents the activation
-    /// loading + expert-weight multiply pattern.
+    /// GPU-resident dispatch via `VulkanKernel::MoeMegaKernel`.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_mega_kernel(
         &self,
         activations: &dyn BackendStorage,
@@ -1647,31 +1793,74 @@ impl VulkanDevice {
         top_k: u32,
         total_routed: u32,
     ) -> Result<()> {
-        let act_s = activations.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: activations is not VulkanStorage".into()))?;
-        let gw_s = gate_w.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: gate_w is not VulkanStorage".into()))?;
-        let uw_s = up_w.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: up_w is not VulkanStorage".into()))?;
-        let dw_s = down_w.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: down_w is not VulkanStorage".into()))?;
-        let ds_s = dest_slots.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: dest_slots is not VulkanStorage".into()))?;
-        let go_s = global_offsets.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: global_offsets is not VulkanStorage".into()))?;
-        let ec_s = expert_counts.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_mega_kernel: expert_counts is not VulkanStorage".into()))?;
+        let act_s = activations
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: activations is not VulkanStorage".into())
+            })?;
+        let gw_s = gate_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: gate_w is not VulkanStorage".into())
+            })?;
+        let uw_s = up_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: up_w is not VulkanStorage".into())
+            })?;
+        let dw_s = down_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: down_w is not VulkanStorage".into())
+            })?;
+        let ds_s = dest_slots
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: dest_slots is not VulkanStorage".into())
+            })?;
+        let go_s = global_offsets
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: global_offsets is not VulkanStorage".into())
+            })?;
+        let ec_s = expert_counts
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_mega_kernel: expert_counts is not VulkanStorage".into())
+            })?;
 
         let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref()
+        let ctx = ctx_guard
+            .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         // Allocate output buffer
         let out_elems = (batch as usize) * (hidden as usize);
         let out_shape = Shape::new(vec![out_elems]);
-        let output = VulkanStorage::alloc_device_local_gpu(&out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let output = VulkanStorage::alloc_device_local_gpu(
+            &out_shape,
+            DType::F32,
+            ctx.device,
+            ctx.physical_device,
+        )?;
 
-        let buffers = [act_s.buffer, gw_s.buffer, uw_s.buffer, dw_s.buffer, ds_s.buffer, go_s.buffer, ec_s.buffer, output.buffer];
+        let buffers = [
+            act_s.buffer,
+            gw_s.buffer,
+            uw_s.buffer,
+            dw_s.buffer,
+            ds_s.buffer,
+            go_s.buffer,
+            ec_s.buffer,
+            output.buffer,
+        ];
         let grid_x = total_routed.max(1);
         let push = push_params(batch, hidden, inter, num_experts, top_k, 0.0);
 
@@ -1690,8 +1879,6 @@ impl VulkanDevice {
 }
 
 impl OptimizerOps for VulkanDevice {
-
-
     fn fused_adamw_step(
         &self,
         p: &dyn BackendStorage,
@@ -1757,7 +1944,6 @@ impl OptimizerOps for VulkanDevice {
         Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
 
-
     fn fused_lion_step(
         &self,
         p: &dyn BackendStorage,
@@ -1819,8 +2005,6 @@ impl OptimizerOps for VulkanDevice {
 }
 
 impl CollectiveOps for VulkanDevice {
-
-
     fn all_reduce(
         &self,
         inputs: &[&dyn BackendStorage],
@@ -1835,9 +2019,8 @@ impl CollectiveOps for VulkanDevice {
             )));
         }
 
-        // When a multi-GPU communicator is attached with world_size > 1,
-        // dispatch the ring-allreduce shader across device pairs. Current
-        // default: single-GPU accumulation (communicator is None).
+        // When a multi-GPU communicator is attached with world_size > 1, dispatch the ring-allreduce shader across device pairs.
+        // Current default: single-GPU accumulation (communicator is None).
         if let Some(comm) = &self.communicator {
             if comm.world_size > 1 {
                 return self.all_reduce_multi_gpu(inputs, comm);
@@ -1857,9 +2040,7 @@ impl CollectiveOps for VulkanDevice {
         }
 
         // ── GPU fast path: accumulate all inputs into a pre-zeroed output buffer.
-        // The `all_reduce` accumulate kernel does Out[i] += A[i], so we zero the
-        // output once and then dispatch one pass per input tensor.
-        // `run_compute_shader` calls vkQueueWaitIdle, so each pass is synchronous.
+        // The `all_reduce` accumulate kernel does Out[i] += A[i], so we zero the output once and.
         {
             let all_vulkan = inputs
                 .iter()
@@ -2070,12 +2251,8 @@ impl CollectiveOps for VulkanDevice {
         Ok(storage)
     }
 
-    /// Tier B (semi-parity): analytical GEMM latency estimate (milliseconds)
-    /// for the placement-aware Scythe scheduler. A roofline-style model:
-    /// `time = flops / peak_throughput + bytes / peak_bw`, scaled by an
-    /// arithmetic-intensity term. Falls back to the conservative INFINITY
-    /// default when no throughput data is available so the scheduler routes
-    /// away rather than guess wrong.
+    /// Tier B (semi-parity): analytical GEMM latency estimate (milliseconds) for the placement-aware Scythe scheduler.
+    /// A roofline-style model: `time = flops / peak_throughput + bytes / peak_bw`, scaled by an.
     fn estimate_gemm_latency_ms(
         &self,
         m: usize,
@@ -2094,7 +2271,8 @@ impl CollectiveOps for VulkanDevice {
             _ => 3000.0,
         };
         let peak_bw_gbps = 500.0;
-        let elems = (m * k + k * n + m * n) as f64; let bytes = elems * dtype.arith.byte_size() as f64;
+        let elems = (m * k + k * n + m * n) as f64;
+        let bytes = elems * dtype.arith.byte_size() as f64;
         let compute_ms = flops / (peak_gflops * 1e6);
         let mem_ms = bytes / (peak_bw_gbps * 1e6 / 1000.0 * 1000.0);
         (compute_ms + mem_ms).max(1e-4)
@@ -2102,8 +2280,6 @@ impl CollectiveOps for VulkanDevice {
 }
 
 impl MemoryOps for VulkanDevice {
-
-
     fn from_cpu_bytes(
         &self,
         data: &[u8],
@@ -2153,13 +2329,8 @@ impl MemoryOps for VulkanDevice {
         Ok(Box::new(storage))
     }
 
-    /// Device-to-device copy of `count` f32 elements from `src` into `dst` at
-    /// `dst_elem_offset`. Both storages must live on this device (no peer
-    /// routing — that is `copy_via_route`'s job).
-    ///
-    /// Device-side `vkCmdCopyBuffer` one-shot command buffer. Replaces the
-    /// earlier CPU read-back/re-upload fallback so KV-arena appends avoid the
-    /// PCIe round-trip.
+    /// Device-to-device copy of `count` f32 elements from `src` into `dst` at `dst_elem_offset`.
+    /// Both storages must live on this device (no peer routing - that is `copy_via_route`'s job).
     fn copy_slice_into(
         &self,
         dst: &dyn BackendStorage,
@@ -2167,23 +2338,34 @@ impl MemoryOps for VulkanDevice {
         dst_elem_offset: usize,
         count: usize,
     ) -> Result<()> {
-        let dst_s = dst.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan copy_slice_into: dst is not VulkanStorage".into()))?;
-        let src_s = src.as_any().downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan copy_slice_into: src is not VulkanStorage".into()))?;
+        let dst_s = dst
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan copy_slice_into: dst is not VulkanStorage".into())
+            })?;
+        let src_s = src
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan copy_slice_into: src is not VulkanStorage".into())
+            })?;
 
         let dst_elem_count = dst_s.shape.elem_count();
         let src_elem_count = src_s.shape.elem_count();
         let dst_off = dst_elem_offset;
         if dst_off.saturating_add(count) > dst_elem_count {
-            return Err(Error::Backend("copy_slice_into: dst offset+count out of bounds".into()));
+            return Err(Error::Backend(
+                "copy_slice_into: dst offset+count out of bounds".into(),
+            ));
         }
         if count > src_elem_count {
             return Err(Error::Backend("copy_slice_into: count exceeds src".into()));
         }
 
         let ctx_guard = global_context();
-        let ctx = ctx_guard.as_ref()
+        let ctx = ctx_guard
+            .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         unsafe {
@@ -2195,20 +2377,31 @@ impl MemoryOps for VulkanDevice {
                 queue_family_index: ctx.compute_family_index,
             };
             let mut command_pool = 0u64;
-            let res = vkCreateCommandPool(ctx.device, &pool_ci, std::ptr::null(), &mut command_pool);
+            let res =
+                vkCreateCommandPool(ctx.device, &pool_ci, std::ptr::null(), &mut command_pool);
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("copy_slice_into: vkCreateCommandPool failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "copy_slice_into: vkCreateCommandPool failed: {res}"
+                )));
             }
 
-            struct PoolCleanup { device: *mut c_void, command_pool: u64 }
+            struct PoolCleanup {
+                device: *mut c_void,
+                command_pool: u64,
+            }
             impl Drop for PoolCleanup {
                 fn drop(&mut self) {
                     if self.command_pool != 0 {
-                        unsafe { vkDestroyCommandPool(self.device, self.command_pool, std::ptr::null()); }
+                        unsafe {
+                            vkDestroyCommandPool(self.device, self.command_pool, std::ptr::null());
+                        }
                     }
                 }
             }
-            let _pool = PoolCleanup { device: ctx.device, command_pool };
+            let _pool = PoolCleanup {
+                device: ctx.device,
+                command_pool,
+            };
 
             // Allocate a one-time command buffer.
             let cmd_alloc = VkCommandBufferAllocateInfo {
@@ -2221,7 +2414,9 @@ impl MemoryOps for VulkanDevice {
             let mut command_buffer: *mut c_void = std::ptr::null_mut();
             let res = vkAllocateCommandBuffers(ctx.device, &cmd_alloc, &mut command_buffer);
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("copy_slice_into: vkAllocateCommandBuffers failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "copy_slice_into: vkAllocateCommandBuffers failed: {res}"
+                )));
             }
 
             let begin_info = VkCommandBufferBeginInfo {
@@ -2232,7 +2427,9 @@ impl MemoryOps for VulkanDevice {
             };
             let res = vkBeginCommandBuffer(command_buffer, &begin_info);
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("copy_slice_into: vkBeginCommandBuffer failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "copy_slice_into: vkBeginCommandBuffer failed: {res}"
+                )));
             }
 
             let elem_bytes = std::mem::size_of::<f32>() as VkDeviceSize;
@@ -2245,7 +2442,9 @@ impl MemoryOps for VulkanDevice {
 
             let res = vkEndCommandBuffer(command_buffer);
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("copy_slice_into: vkEndCommandBuffer failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "copy_slice_into: vkEndCommandBuffer failed: {res}"
+                )));
             }
 
             let cmd_buf_u64 = command_buffer as u64;
@@ -2263,23 +2462,23 @@ impl MemoryOps for VulkanDevice {
             let _q_lock = QUEUE_LOCK.lock().unwrap();
             let res = vkQueueSubmit(ctx.queue, 1, &submit_info, 0);
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("copy_slice_into: vkQueueSubmit failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "copy_slice_into: vkQueueSubmit failed: {res}"
+                )));
             }
             let res = vkQueueWaitIdle(ctx.queue);
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("copy_slice_into: vkQueueWaitIdle failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "copy_slice_into: vkQueueWaitIdle failed: {res}"
+                )));
             }
         }
         Ok(())
     }
 }
 
-
 impl GraphCaptureOps for VulkanDevice {
-    /// Graph-capture bookkeeping. Delegates to `VK_GRAPH_CACHE` (see
-    /// `graph_capture.rs`). Records captured-graph names so callers don't hit
-    /// `Err(Unimplemented)`; `replay_graph` reports success WITHOUT replaying
-    /// GPU work until `VK_EXT_graph_capture` is wired.
+    /// Graph-capture bookkeeping. Delegates to `VK_GRAPH_CACHE` (see `graph_capture.rs`).
     fn begin_graph_capture(&self, key: &str) -> Result<()> {
         VK_GRAPH_CACHE.begin(key)
     }
@@ -2301,8 +2500,6 @@ lazy_static::lazy_static! {
     static ref VK_GRAPH_CACHE: graph_capture::VkGraphCache = graph_capture::VkGraphCache::new();
 }
 impl grim_tensor::BackendDevice for VulkanDevice {}
-
-
 
 /// Helper function to retrieve the size in bytes of a data type.
 pub(crate) fn dtype_byte_size(dtype: &DType) -> usize {
@@ -2374,10 +2571,7 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
 }
 
 /// WI-1: live compute utilization for `ordinal`.
-///
-/// Scope note (per WI-1): Vulkan has no core-spec utilization query (vendor
-/// extensions only). Returns `None` rather than fabricating a value from
-/// indirect signals — `null` on the wire is the honest answer.
+/// Scope note (per WI-1): Vulkan has no core-spec utilization query (vendor extensions only).
 pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
     None
 }
@@ -2388,18 +2582,7 @@ mod tests {
     use grim_tensor::{DType, Shape};
 
     /// GPU-gated parity test for the fused grouped MoE dispatch kernel.
-    /// Runs only when a Vulkan device is present AND it supports FP32 atomic
-    /// add on SSBOs (`cargo test -- --include-ignored`).
-    ///
-    /// The MoE kernel uses `OpAtomicFAdd` / `buffer_atomic_add_f32`, which
-    /// RADV/ACO only assembles on RDNA 3+ (gfx1100+, device_id ≥ 0x7440).
-    /// Running on earlier hardware (e.g. Raphael Mendocino iGPU, gfx1103) will
-    /// SIGABRT inside the ACO backend. The test is `#[ignore]` by default to
-    /// keep `cargo test` green on any GPU; run it explicitly on RDNA 3+ hardware.
-    ///
-    /// Compares the GPU output against a hand-computed CPU reference for a
-    /// tiny 2-expert / 2-token / top-1 routing. Numerical tolerance is loose
-    /// because FP32 atomic adds can reorder on the GPU.
+    /// Runs only when a Vulkan device is present AND it supports FP32 atomic add on.
     #[test]
     #[ignore]
     fn test_vulkan_moe_fused_dispatch_parity() {
@@ -2722,15 +2905,12 @@ mod tests {
         );
     }
 
-    /// Source-presence guard for the partial-rotary/YaRN RoPE and the
-    /// sliding-window attention kernels. No GPU required — asserts the SPIR-V
-    /// blobs compiled (build.rs emits a `SPIRV_*` const only on successful
-    /// glslangValidator compilation) and the enum/binding tables are wired.
+    /// Source-presence guard for the partial-rotary/YaRN RoPE and the sliding-window attention kernels.
+    /// No GPU required - asserts the SPIR-V blobs compiled (build.rs emits a `SPIRV_*` const only.
     #[test]
     fn yarn_and_swa_kernel_presence() {
-        // If build.rs failed to compile any of these, the `SPIRV_*` const would
-        // be absent and `spirv_for` would fail to compile — so merely
-        // referencing them is the presence test.
+        // If build.rs failed to compile any of these, the `SPIRV_*` const would be absent
+        // and `spirv_for` would fail to compile - so merely referencing them is the presence test.
         let _ = spirv_for(VulkanKernel::RopeYarn);
         let _ = spirv_for(VulkanKernel::QkvAttentionSwa);
         let _ = spirv_for(VulkanKernel::QkvAttentionPagedSwa);
@@ -2773,10 +2953,11 @@ mod tests {
         assert_eq!(out_sqrt.to_cpu_vec_f32().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
 
         let (out_recip, _) = dev.recip(out_sqrt.as_ref(), &shape).unwrap();
-        assert_eq!(
-            out_recip.to_cpu_vec_f32().unwrap(),
-            vec![0.5, 1.0 / 3.0, 0.25, 0.2]
-        );
+        let recip_vals = out_recip.to_cpu_vec_f32().unwrap();
+        let expected_recip = [0.5, 1.0 / 3.0, 0.25, 0.2];
+        for (actual, expected) in recip_vals.iter().zip(expected_recip.iter()) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
 
         let (out_mul, _) = dev.mul_scalar(x.as_ref(), 0.5, &shape).unwrap();
         assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![2.0, 4.5, 8.0, 12.5]);
@@ -3010,9 +3191,7 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tier A semi-parity gates (Vulkan vs ROCm trait coverage).
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tier_a_semi_parity_tests {
@@ -3032,7 +3211,8 @@ mod tier_a_semi_parity_tests {
             arith: grim_tensor::ArithType::F32,
             storage: grim_tensor::Storage::Native,
         };
-        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype).unwrap()
+        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype)
+            .unwrap()
     }
 
     /// Device sub: exact per-element a−b.
@@ -3044,12 +3224,10 @@ mod tier_a_semi_parity_tests {
         }
         let a = stor(&dev, &[5.0f32, -1.0, 0.25, 100.0], &[4]);
         let b = stor(&dev, &[2.0f32, 1.0, 0.75, 100.0], &[4]);
-        let (out, h) = ElementwiseOps::sub(&dev, a.as_ref(), b.as_ref(), &Shape::new(vec![4])).unwrap();
+        let (out, h) =
+            ElementwiseOps::sub(&dev, a.as_ref(), b.as_ref(), &Shape::new(vec![4])).unwrap();
         h.synchronize().unwrap();
-        assert_eq!(
-            out.to_cpu_vec_f32().unwrap(),
-            vec![3.0, -2.0, -0.5, 0.0]
-        );
+        assert_eq!(out.to_cpu_vec_f32().unwrap(), vec![3.0, -2.0, -0.5, 0.0]);
     }
 
     /// Device scalar ops: add/sub/div by broadcast scalar, exact.
@@ -3060,11 +3238,14 @@ mod tier_a_semi_parity_tests {
             return;
         }
         let x = stor(&dev, &[4.0f32, -2.0, 0.5], &[3]);
-        let (o1, _) = ElementwiseOps::add_scalar(&dev, x.as_ref(), 1.5, &Shape::new(vec![3])).unwrap();
+        let (o1, _) =
+            ElementwiseOps::add_scalar(&dev, x.as_ref(), 1.5, &Shape::new(vec![3])).unwrap();
         assert_eq!(o1.to_cpu_vec_f32().unwrap(), vec![5.5, -0.5, 2.0]);
-        let (o2, _) = ElementwiseOps::sub_scalar(&dev, x.as_ref(), 1.0, &Shape::new(vec![3])).unwrap();
+        let (o2, _) =
+            ElementwiseOps::sub_scalar(&dev, x.as_ref(), 1.0, &Shape::new(vec![3])).unwrap();
         assert_eq!(o2.to_cpu_vec_f32().unwrap(), vec![3.0, -3.0, -0.5]);
-        let (o3, _) = ElementwiseOps::div_scalar(&dev, x.as_ref(), 2.0, &Shape::new(vec![3])).unwrap();
+        let (o3, _) =
+            ElementwiseOps::div_scalar(&dev, x.as_ref(), 2.0, &Shape::new(vec![3])).unwrap();
         assert_eq!(o3.to_cpu_vec_f32().unwrap(), vec![2.0, -1.0, 0.25]);
         // div by zero errors loudly (trait contract).
         assert!(ElementwiseOps::div_scalar(&dev, x.as_ref(), 0.0, &Shape::new(vec![3])).is_err());
@@ -3092,7 +3273,10 @@ mod tier_a_semi_parity_tests {
             "large-N strided sum must match host reference"
         );
         let want_max = big.iter().copied().fold(f32::MIN, f32::max);
-        assert_eq!(ElementwiseOps::reduce_max(&dev, bx.as_ref()).unwrap(), want_max);
+        assert_eq!(
+            ElementwiseOps::reduce_max(&dev, bx.as_ref()).unwrap(),
+            want_max
+        );
         // Find indices matching want_max
         let max_val = ElementwiseOps::reduce_max(&dev, bx.as_ref()).unwrap();
         let argmax_idx = ElementwiseOps::argmax(&dev, bx.as_ref()).unwrap() as usize;
@@ -3114,10 +3298,9 @@ mod tier_a_semi_parity_tests {
         }
         let logits = vec![-1.0f32, 3.5, 2.0, 3.5, 0.0];
         let x = stor(&dev, &logits, &[5]);
-        let got = grim_tensor::backend::SamplingOps::sample_on_device(
-            &dev, x.as_ref(), 0.0, 1.0, 1, 42,
-        )
-        .unwrap();
+        let got =
+            grim_tensor::backend::SamplingOps::sample_on_device(&dev, x.as_ref(), 0.0, 1.0, 1, 42)
+                .unwrap();
         // Tie on 3.5 between idx 1 and 3: last index wins (host contract).
         assert_eq!(got, 3);
     }
@@ -3130,296 +3313,453 @@ mod tier_a_semi_parity_tests {
             return;
         }
         let x = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
-        let (out, h) = CoreTensorOps::transpose_2d(
-            &dev,
-            x.as_ref(),
-            2,
-            3,
-            &Shape::new(vec![3, 2]),
-        )
-        .unwrap();
+        let (out, h) =
+            CoreTensorOps::transpose_2d(&dev, x.as_ref(), 2, 3, &Shape::new(vec![3, 2])).unwrap();
         h.synchronize().unwrap();
         assert_eq!(out.shape().dims(), vec![3, 2]);
-        assert_eq!(out.to_cpu_vec_f32().unwrap(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(
+            out.to_cpu_vec_f32().unwrap(),
+            vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
     }
 }
-
 
 #[cfg(test)]
 mod tier_b_semi_parity_tests {
     use super::*;
-    use grim_tensor::backend::{FusionOps, CoreTensorOps};
+    use grim_tensor::backend::{CoreTensorOps, FusionOps};
 
-    fn ctx_ok()->bool{ global_context().as_ref().is_some() }
-    fn stor(dev:&VulkanDevice,data:&[f32],shape:&[usize])->Box<dyn BackendStorage>{
-        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
-        dev.from_cpu(data,&Shape::new(shape.to_vec()),dtype).unwrap()
+    fn ctx_ok() -> bool {
+        global_context().as_ref().is_some()
+    }
+    fn stor(dev: &VulkanDevice, data: &[f32], shape: &[usize]) -> Box<dyn BackendStorage> {
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype)
+            .unwrap()
     }
 
     #[test]
-    fn vulkan_broadcast_bias_replicates_rows(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        let bias=stor(&dev,&[1.0f32,2.0,3.0],&[3]);
-        let out_shape=Shape::new(vec![2,3]);
-        let (out,h)=FusionOps::broadcast_bias(&dev,bias.as_ref(),2,3,&out_shape).unwrap();
+    fn vulkan_broadcast_bias_replicates_rows() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        let bias = stor(&dev, &[1.0f32, 2.0, 3.0], &[3]);
+        let out_shape = Shape::new(vec![2, 3]);
+        let (out, h) = FusionOps::broadcast_bias(&dev, bias.as_ref(), 2, 3, &out_shape).unwrap();
         h.synchronize().unwrap();
-        assert_eq!(out.to_cpu_vec_f32().unwrap(),vec![1.0,2.0,3.0,1.0,2.0,3.0]);
+        assert_eq!(
+            out.to_cpu_vec_f32().unwrap(),
+            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
-    fn vulkan_scale_bias_epilogue_applies(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        // out=[1,2,3,4] ([2,2]), a_scale=[10](per-token->replicated as [batch]? use [2]),
-        // b_scale=[100,1000], bias=[0.5,0.5]
-        // expected: [1*10*100+0.5, 2*10*1000+0.5, 3*7*100+0.5, 4*7*1000+0.5]
-        let out=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[2,2]);
-        let a_scale=stor(&dev,&[10.0f32,7.0],&[2]);
-        let b_scale=stor(&dev,&[100.0f32,1000.0],&[2]);
-        let bias=stor(&dev,&[0.5f32,0.5],&[2]);
-        let h=FusionOps::scale_bias_epilogue(&dev,out.as_ref(),Some(a_scale.as_ref()),Some(b_scale.as_ref()),Some(bias.as_ref()),2,2).unwrap();
+    fn vulkan_scale_bias_epilogue_applies() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        // out=[1,2,3,4] ([2,2]), a_scale=[10](per-token->replicated as [batch]?
+        // use [2]), b_scale=[100,1000], bias=[0.5,0.5] expected: [1*10*100+0.5, 2*10*1000+0.5, 3*7*100+0.5, 4*7*1000+0.5]
+        let out = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let a_scale = stor(&dev, &[10.0f32, 7.0], &[2]);
+        let b_scale = stor(&dev, &[100.0f32, 1000.0], &[2]);
+        let bias = stor(&dev, &[0.5f32, 0.5], &[2]);
+        let h = FusionOps::scale_bias_epilogue(
+            &dev,
+            out.as_ref(),
+            Some(a_scale.as_ref()),
+            Some(b_scale.as_ref()),
+            Some(bias.as_ref()),
+            2,
+            2,
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        let got=out.to_cpu_vec_f32().unwrap();
-        assert!((got[0]-(1.0*10.0*100.0+0.5)).abs()<1e-3,"got {got:?}");
-        assert!((got[1]-(2.0*10.0*1000.0+0.5)).abs()<1e-2);
-        assert!((got[2]-(3.0*7.0*100.0+0.5)).abs()<1e-2);
-        assert!((got[3]-(4.0*7.0*1000.0+0.5)).abs()<1e-1);
+        let got = out.to_cpu_vec_f32().unwrap();
+        assert!(
+            (got[0] - (1.0 * 10.0 * 100.0 + 0.5)).abs() < 1e-3,
+            "got {got:?}"
+        );
+        assert!((got[1] - (2.0 * 10.0 * 1000.0 + 0.5)).abs() < 1e-2);
+        assert!((got[2] - (3.0 * 7.0 * 100.0 + 0.5)).abs() < 1e-2);
+        assert!((got[3] - (4.0 * 7.0 * 1000.0 + 0.5)).abs() < 1e-1);
     }
 
     #[test]
-    fn vulkan_silu_mul_quantize_produces_bytes(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        let gate=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[4]);
-        let up=stor(&dev,&[0.5f32,0.5,0.5,0.5],&[4]);
-        let (qbytes,_scales,h)=FusionOps::silu_mul_quantize(&dev,gate.as_ref(),up.as_ref(),grim_tensor::QuantFormat::Q8_0,&Shape::new(vec![4])).unwrap();
+    fn vulkan_silu_mul_quantize_produces_bytes() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        let gate = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let up = stor(&dev, &[0.5f32, 0.5, 0.5, 0.5], &[4]);
+        let (qbytes, _scales, h) = FusionOps::silu_mul_quantize(
+            &dev,
+            gate.as_ref(),
+            up.as_ref(),
+            grim_tensor::QuantFormat::Q8_0,
+            &Shape::new(vec![4]),
+        )
+        .unwrap();
         h.synchronize().unwrap();
         // 4 elems -> 1 block of Q8_0 = 34 bytes
-        assert_eq!(qbytes.to_cpu_vec_f32().unwrap_or_default().len(), 0, "qbytes are u8-packed; just confirm non-empty storage");
-        let n=qbytes.shape().elem_count();
-        assert!(n>=34,"Q8_0 for 4 elems should be >=34 bytes, got {n}");
+        assert_eq!(
+            qbytes.to_cpu_vec_f32().unwrap_or_default().len(),
+            0,
+            "qbytes are u8-packed; just confirm non-empty storage"
+        );
+        let n = qbytes.shape().elem_count();
+        assert!(n >= 34, "Q8_0 for 4 elems should be >=34 bytes, got {n}");
     }
 }
-
 
 #[cfg(test)]
 mod tier_b_autograd_tests {
     use super::*;
     use grim_tensor::backend::{AutogradOps, BackendStorage};
 
-    fn ctx_ok()->bool{ global_context().as_ref().is_some() }
-    fn stor(dev:&VulkanDevice,data:&[f32],shape:&[usize])->Box<dyn BackendStorage>{
-        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
-        dev.from_cpu(data,&Shape::new(shape.to_vec()),dtype).unwrap()
+    fn ctx_ok() -> bool {
+        global_context().as_ref().is_some()
+    }
+    fn stor(dev: &VulkanDevice, data: &[f32], shape: &[usize]) -> Box<dyn BackendStorage> {
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype)
+            .unwrap()
     }
 
     #[test]
-    fn vulkan_softmax_backward_matches_reference(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
+    fn vulkan_softmax_backward_matches_reference() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
         // row_len=4, softmax_out s, grad g
-        let s=stor(&dev,&[0.1f32,0.2,0.3,0.4],&[4]);
-        let g=stor(&dev,&[1.0f32,0.0,0.0,0.0],&[4]);
-        let (dx,h)=AutogradOps::softmax_backward(&dev,g.as_ref(),s.as_ref(),&Shape::new(vec![4])).unwrap();
+        let s = stor(&dev, &[0.1f32, 0.2, 0.3, 0.4], &[4]);
+        let g = stor(&dev, &[1.0f32, 0.0, 0.0, 0.0], &[4]);
+        let (dx, h) =
+            AutogradOps::softmax_backward(&dev, g.as_ref(), s.as_ref(), &Shape::new(vec![4]))
+                .unwrap();
         h.synchronize().unwrap();
-        let dx=dx.to_cpu_vec_f32().unwrap();
+        let dx = dx.to_cpu_vec_f32().unwrap();
         // ref: dot=sum(g*s)=0.1 ; dx_i=s_i*(g_i-dot)
-        let dot:f64=0.1;
-        let want:Vec<f32>=vec![0.1,0.2,0.3,0.4].iter().zip([1.0f32,0.0,0.0,0.0].iter())
-            .map(|(si,gi)| *si*(*gi as f64 - dot) as f32).collect();
-        for (a,w) in dx.iter().zip(&want){ assert!((a-w).abs()<1e-5,"{a} vs {w}"); }
+        let dot: f64 = 0.1;
+        let want: Vec<f32> = [0.1, 0.2, 0.3, 0.4]
+            .iter()
+            .zip([1.0f32, 0.0, 0.0, 0.0].iter())
+            .map(|(si, gi)| *si * (*gi as f64 - dot) as f32)
+            .collect();
+        for (a, w) in dx.iter().zip(&want) {
+            assert!((a - w).abs() < 1e-5, "{a} vs {w}");
+        }
     }
 
     #[test]
-    fn vulkan_embedding_backward_scatter_adds(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        let out_grad=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[2,2]); // 2 tokens, hidden 2
-        let (dw,h)=AutogradOps::embedding_backward(&dev,out_grad.as_ref(),&[0,0],3,2).unwrap();
+    fn vulkan_embedding_backward_scatter_adds() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        let out_grad = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]); // 2 tokens, hidden 2
+        let (dw, h) =
+            AutogradOps::embedding_backward(&dev, out_grad.as_ref(), &[0, 0], 3, 2).unwrap();
         h.synchronize().unwrap();
-        let dw=dw.to_cpu_vec_f32().unwrap();
+        let dw = dw.to_cpu_vec_f32().unwrap();
         // both tokens scatter to row 0: [1,2]+[3,4]=[4,6]
-        assert_eq!(dw,vec![4.0,6.0,0.0,0.0,0.0,0.0]);
+        assert_eq!(dw, vec![4.0, 6.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn vulkan_rope_backward_inverts_rotation(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
+    fn vulkan_rope_backward_inverts_rotation() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
         // cos=1, sin=0 -> identity; dx should equal g
-        let g=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[4]);
-        let cos=stor(&dev,&[1.0f32,1.0,1.0,1.0],&[4]);
-        let sin=stor(&dev,&[0.0f32,0.0,0.0,0.0],&[4]);
-        let (dx,h)=AutogradOps::rope_backward(&dev,g.as_ref(),cos.as_ref(),sin.as_ref(),&Shape::new(vec![4])).unwrap();
+        let g = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let cos = stor(&dev, &[1.0f32, 1.0, 1.0, 1.0], &[4]);
+        let sin = stor(&dev, &[0.0f32, 0.0, 0.0, 0.0], &[4]);
+        let (dx, h) = AutogradOps::rope_backward(
+            &dev,
+            g.as_ref(),
+            cos.as_ref(),
+            sin.as_ref(),
+            &Shape::new(vec![4]),
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        assert_eq!(dx.to_cpu_vec_f32().unwrap(),vec![1.0,2.0,3.0,4.0]);
+        assert_eq!(dx.to_cpu_vec_f32().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 }
-
 
 #[cfg(test)]
 mod tier_b_complex_tests {
     use super::*;
-    use grim_tensor::backend::{AttentionOps, RecurrentOps, BackendStorage};
+    use grim_tensor::backend::{AttentionOps, BackendStorage, RecurrentOps};
 
-    fn ctx_ok()->bool{ global_context().as_ref().is_some() }
-    fn stor(dev:&VulkanDevice,data:&[f32],shape:&[usize])->Box<dyn BackendStorage>{
-        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
-        dev.from_cpu(data,&Shape::new(shape.to_vec()),dtype).unwrap()
+    fn ctx_ok() -> bool {
+        global_context().as_ref().is_some()
+    }
+    fn stor(dev: &VulkanDevice, data: &[f32], shape: &[usize]) -> Box<dyn BackendStorage> {
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype)
+            .unwrap()
     }
 
     #[test]
-    fn vulkan_mla_qkv_norm_split_shapes(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        let q_raw=stor(&dev,&[1.0f32,2.0,3.0,4.0,5.0,6.0],&[6]);
-        let kv_raw=stor(&dev,&[0.5f32,0.5,0.5,0.5,0.5,0.5],&[6]);
-        let qnw=stor(&dev,&[1.0f32,1.0,1.0,1.0,1.0,1.0],&[6]);
-        let knw=stor(&dev,&[2.0f32,2.0,2.0,2.0,2.0,2.0],&[6]);
-        let (qn,qr,kn,kr,h)=AttentionOps::mla_q_kv_norm_split(&dev,q_raw.as_ref(),kv_raw.as_ref(),qnw.as_ref(),knw.as_ref(),2,2,4,1e-5).unwrap();
+    fn vulkan_mla_qkv_norm_split_shapes() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        let q_raw = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]);
+        let kv_raw = stor(&dev, &[0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5], &[6]);
+        let qnw = stor(&dev, &[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0], &[6]);
+        let knw = stor(&dev, &[2.0f32, 2.0, 2.0, 2.0, 2.0, 2.0], &[6]);
+        let (qn, qr, kn, kr, h) = AttentionOps::mla_q_kv_norm_split(
+            &dev,
+            q_raw.as_ref(),
+            kv_raw.as_ref(),
+            qnw.as_ref(),
+            knw.as_ref(),
+            2,
+            2,
+            4,
+            1e-5,
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        assert_eq!(qn.shape().dims(),vec![2]);
-        assert_eq!(qr.shape().dims(),vec![2]);
-        assert_eq!(kn.shape().dims(),vec![2]);
-        assert_eq!(kr.shape().dims(),vec![2]);
+        assert_eq!(qn.shape().dims(), vec![2]);
+        assert_eq!(qr.shape().dims(), vec![2]);
+        assert_eq!(kn.shape().dims(), vec![2]);
+        assert_eq!(kr.shape().dims(), vec![2]);
         // q_nope = q[0..2]*w = [1,2]; q_rope = q[2..4]*w=[3,4]
-        assert_eq!(qn.to_cpu_vec_f32().unwrap(),vec![1.0,2.0]);
-        assert_eq!(qr.to_cpu_vec_f32().unwrap(),vec![3.0,4.0]);
+        assert_eq!(qn.to_cpu_vec_f32().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(qr.to_cpu_vec_f32().unwrap(), vec![3.0, 4.0]);
         // kv_nope = kv[0..2]*2 = [1,1]; kv_rope=kv[2..4]*2=[1,1]
-        assert_eq!(kn.to_cpu_vec_f32().unwrap(),vec![1.0,1.0]);
-        assert_eq!(kr.to_cpu_vec_f32().unwrap(),vec![1.0,1.0]);
+        assert_eq!(kn.to_cpu_vec_f32().unwrap(), vec![1.0, 1.0]);
+        assert_eq!(kr.to_cpu_vec_f32().unwrap(), vec![1.0, 1.0]);
     }
 
     #[test]
-    fn vulkan_mla_absorbed_decode_shape(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
+    fn vulkan_mla_absorbed_decode_shape() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
         // 1 head, latent=2, rope=2, v_head=2, seq_len=1
-        let qa=stor(&dev,&[1.0f32,0.0],&[2]);
-        let qr=stor(&dev,&[0.0f32,1.0],&[2]);
-        let kv=stor(&dev,&[1.0f32,0.0,0.0,1.0],&[4]); // seq_len*(latent+rope)=1*4
-        let out=stor(&dev,&[0.0f32,0.0],&[2]);
-        let h=AttentionOps::mla_absorbed_decode(&dev,qa.as_ref(),qr.as_ref(),kv.as_ref(),None,out.as_ref(),1,2,2,2,1,0,0).unwrap();
+        let qa = stor(&dev, &[1.0f32, 0.0], &[2]);
+        let qr = stor(&dev, &[0.0f32, 1.0], &[2]);
+        let kv = stor(&dev, &[1.0f32, 0.0, 0.0, 1.0], &[4]); // seq_len*(latent+rope)=1*4
+        let out = stor(&dev, &[0.0f32, 0.0], &[2]);
+        let h = AttentionOps::mla_absorbed_decode(
+            &dev,
+            qa.as_ref(),
+            qr.as_ref(),
+            kv.as_ref(),
+            None,
+            out.as_ref(),
+            1,
+            2,
+            2,
+            2,
+            1,
+            0,
+            0,
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        assert_eq!(out.shape().dims(),vec![2]);
+        assert_eq!(out.shape().dims(), vec![2]);
     }
 
     #[test]
-    fn vulkan_short_conv1d_shapes(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
+    fn vulkan_short_conv1d_shapes() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
         // batch=1,k_size=2,channels=1; weight [ch=1,k=2]=[1,1]; x=[3], state holds past
-        let x=stor(&dev,&[3.0f32],&[1]);
-        let w=stor(&dev,&[1.0f32,1.0],&[2]);
-        let state=stor(&dev,&[2.0f32],&[1]); // k_size-1 = 1 past element
-        let (out,h)=RecurrentOps::short_conv1d_causal_step(&dev,x.as_ref(),w.as_ref(),None,state.as_ref(),&Shape::new(vec![1,2,1])).unwrap();
+        let x = stor(&dev, &[3.0f32], &[1]);
+        let w = stor(&dev, &[1.0f32, 1.0], &[2]);
+        let state = stor(&dev, &[2.0f32], &[1]); // k_size-1 = 1 past element
+        let (out, h) = RecurrentOps::short_conv1d_causal_step(
+            &dev,
+            x.as_ref(),
+            w.as_ref(),
+            None,
+            state.as_ref(),
+            &Shape::new(vec![1, 2, 1]),
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        assert_eq!(out.shape().dims(),vec![1,2,1]);
+        assert_eq!(out.shape().dims(), vec![1, 2, 1]);
     }
 
     #[test]
-    fn vulkan_kda_shapes(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        let q=stor(&dev,&[1.0f32,0.0],&[2]);
-        let k=stor(&dev,&[0.0f32,1.0],&[2]);
-        let v=stor(&dev,&[1.0f32,1.0],&[2]);
-        let beta=stor(&dev,&[0.5f32],&[1]);
-        let gate=stor(&dev,&[0.9f32],&[1]);
-        let state=stor(&dev,&[0.0f32;4],&[4]); // d_k*d_v=4
-        let (out,h)=RecurrentOps::kda_gated_delta_rule_step(&dev,q.as_ref(),k.as_ref(),v.as_ref(),beta.as_ref(),gate.as_ref(),state.as_ref(),2,2,&Shape::new(vec![2])).unwrap();
+    fn vulkan_kda_shapes() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        let q = stor(&dev, &[1.0f32, 0.0], &[2]);
+        let k = stor(&dev, &[0.0f32, 1.0], &[2]);
+        let v = stor(&dev, &[1.0f32, 1.0], &[2]);
+        let beta = stor(&dev, &[0.5f32], &[1]);
+        let gate = stor(&dev, &[0.9f32], &[1]);
+        let state = stor(&dev, &[0.0f32; 4], &[4]); // d_k*d_v=4
+        let (out, h) = RecurrentOps::kda_gated_delta_rule_step(
+            &dev,
+            q.as_ref(),
+            k.as_ref(),
+            v.as_ref(),
+            beta.as_ref(),
+            gate.as_ref(),
+            state.as_ref(),
+            2,
+            2,
+            &Shape::new(vec![2]),
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        assert_eq!(out.shape().dims(),vec![2]);
+        assert_eq!(out.shape().dims(), vec![2]);
     }
 }
-
 
 #[cfg(test)]
 mod tier_c_tests {
     use super::*;
-    use grim_tensor::backend::{GraphCaptureOps, MemoryOps, BackendStorage};
+    use grim_tensor::backend::{BackendStorage, GraphCaptureOps, MemoryOps};
 
-    fn ctx_ok()->bool{ global_context().as_ref().is_some() }
-    fn stor(dev:&VulkanDevice,data:&[f32],shape:&[usize])->Box<dyn BackendStorage>{
-        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
-        dev.from_cpu(data,&Shape::new(shape.to_vec()),dtype).unwrap()
+    fn ctx_ok() -> bool {
+        global_context().as_ref().is_some()
+    }
+    fn stor(dev: &VulkanDevice, data: &[f32], shape: &[usize]) -> Box<dyn BackendStorage> {
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype)
+            .unwrap()
     }
 
     #[test]
-    fn vulkan_alloc_storage_and_copy_slice(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        let buf=MemoryOps::alloc_storage(&dev,&Shape::new(vec![8]),DType::F32).unwrap();
-        assert_eq!(buf.shape().dims(),vec![8]);
-        let dst=MemoryOps::alloc_storage(&dev,&Shape::new(vec![8]),DType::F32).unwrap();
-        let src=stor(&dev,&[1.0f32,2.0,3.0,4.0],&[4]);
-        MemoryOps::copy_slice_into(&dev,dst.as_ref(),src.as_ref(),2,4).unwrap();
-        let result=dst.to_cpu_vec_f32().unwrap();
+    fn vulkan_alloc_storage_and_copy_slice() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        let buf = MemoryOps::alloc_storage(&dev, &Shape::new(vec![8]), DType::F32).unwrap();
+        assert_eq!(buf.shape().dims(), vec![8]);
+        let dst = MemoryOps::alloc_storage(&dev, &Shape::new(vec![8]), DType::F32).unwrap();
+        let src = stor(&dev, &[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        MemoryOps::copy_slice_into(&dev, dst.as_ref(), src.as_ref(), 2, 4).unwrap();
+        let result = dst.to_cpu_vec_f32().unwrap();
         // elems 0,1 unchanged (uninitialized but we only assert the copied slice)
-        assert_eq!(result[2..6],vec![1.0,2.0,3.0,4.0]);
+        assert_eq!(result[2..6], vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
-    fn vulkan_graph_capture_bookkeeping(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        assert!(!GraphCaptureOps::has_captured_graph(&dev,"blk.0"));
-        GraphCaptureOps::begin_graph_capture(&dev,"blk.0").unwrap();
-        GraphCaptureOps::end_graph_capture(&dev,"blk.0").unwrap();
-        assert!(GraphCaptureOps::has_captured_graph(&dev,"blk.0"));
-        assert!(GraphCaptureOps::replay_graph(&dev,"blk.0").unwrap());
-        assert!(!GraphCaptureOps::has_captured_graph(&dev,"blk.1"));
+    fn vulkan_graph_capture_bookkeeping() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        assert!(!GraphCaptureOps::has_captured_graph(&dev, "blk.0"));
+        GraphCaptureOps::begin_graph_capture(&dev, "blk.0").unwrap();
+        GraphCaptureOps::end_graph_capture(&dev, "blk.0").unwrap();
+        assert!(GraphCaptureOps::has_captured_graph(&dev, "blk.0"));
+        assert!(GraphCaptureOps::replay_graph(&dev, "blk.0").unwrap());
+        assert!(!GraphCaptureOps::has_captured_graph(&dev, "blk.1"));
     }
 
     #[test]
-    fn vulkan_lora_accumulate_runs_without_host_transpose_spin(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
-        // The committed trait default uses the device transpose_2d op; on Vulkan
-        // that now dispatches to the grim_transpose_2d shader instead of the
-        // per-call host round-trip the pre-B5 path needed.
+    fn vulkan_lora_accumulate_runs_without_host_transpose_spin() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
+        // The committed trait default uses the device transpose_2d op; on Vulkan that now dispatches to the grim_transpose_2d shader instead of the per-call host round-trip the pre-B5 path needed.
         // LoRA: x[1,4], A[rank=2,in=4]=8 elems, B[out=4,rank=2]=8 elems -> out[1,4]
-        let base=stor(&dev,&[0.1f32,0.2,0.3,0.4],&[1,4]);
-        let x=stor(&dev,&[1.0f32,1.0,1.0,1.0],&[1,4]);
-        let a=stor(&dev,&[0.5f32,0.5,0.5,0.5,0.5,0.5,0.5,0.5],&[2,4]);
-        let b=stor(&dev,&[0.25f32,0.25,0.25,0.25,0.25,0.25,0.25,0.25],&[4,2]);
-        let res=grim_tensor::backend::AutogradOps::lora_accumulate(&dev,base.as_ref(),x.as_ref(),a.as_ref(),b.as_ref(),1.0,&Shape::new(vec![1,4])).unwrap();
+        let base = stor(&dev, &[0.1f32, 0.2, 0.3, 0.4], &[1, 4]);
+        let x = stor(&dev, &[1.0f32, 1.0, 1.0, 1.0], &[1, 4]);
+        let a = stor(&dev, &[0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], &[2, 4]);
+        let b = stor(
+            &dev,
+            &[0.25f32, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
+            &[4, 2],
+        );
+        let res = grim_tensor::backend::AutogradOps::lora_accumulate(
+            &dev,
+            base.as_ref(),
+            x.as_ref(),
+            a.as_ref(),
+            b.as_ref(),
+            1.0,
+            &Shape::new(vec![1, 4]),
+        )
+        .unwrap();
         res.1.synchronize().unwrap();
-        assert_eq!(res.0.shape().dims(),vec![1,4]);
+        assert_eq!(res.0.shape().dims(), vec![1, 4]);
     }
 }
-
 
 #[cfg(test)]
 mod tier_b_alibi_test {
     use super::*;
     use grim_tensor::backend::{AttentionOps, BackendStorage};
 
-    fn ctx_ok()->bool{ global_context().as_ref().is_some() }
-    fn stor(dev:&VulkanDevice,data:&[f32],shape:&[usize])->Box<dyn BackendStorage>{
-        let dtype=DType{arith:grim_tensor::ArithType::F32,storage:grim_tensor::Storage::Native};
-        dev.from_cpu(data,&Shape::new(shape.to_vec()),dtype).unwrap()
+    fn ctx_ok() -> bool {
+        global_context().as_ref().is_some()
+    }
+    fn stor(dev: &VulkanDevice, data: &[f32], shape: &[usize]) -> Box<dyn BackendStorage> {
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        dev.from_cpu(data, &Shape::new(shape.to_vec()), dtype)
+            .unwrap()
     }
 
     #[test]
-    fn vulkan_qkv_attention_alibi_shape(){
-        let dev=VulkanDevice::new();
-        if !ctx_ok(){return;}
+    fn vulkan_qkv_attention_alibi_shape() {
+        let dev = VulkanDevice::new();
+        if !ctx_ok() {
+            return;
+        }
         // seq=1,heads=2,head_dim=2; kv_seq=1,kv_heads=2
-        let q=stor(&dev,&[1.0f32,0.0,0.0,1.0],&[1,2,2]);
-        let k=stor(&dev,&[1.0f32,0.0,0.0,1.0],&[1,2,2]);
-        let v=stor(&dev,&[1.0f32,0.0,0.0,1.0],&[1,2,2]);
-        let slopes=stor(&dev,&[0.1f32,0.2],&[2]);
-        let (out,h)=AttentionOps::qkv_attention_alibi(&dev,q.as_ref(),k.as_ref(),v.as_ref(),2,1,0,None,slopes.as_ref(),&Shape::new(vec![1,2,2])).unwrap();
+        let q = stor(&dev, &[1.0f32, 0.0, 0.0, 1.0], &[1, 2, 2]);
+        let k = stor(&dev, &[1.0f32, 0.0, 0.0, 1.0], &[1, 2, 2]);
+        let v = stor(&dev, &[1.0f32, 0.0, 0.0, 1.0], &[1, 2, 2]);
+        let slopes = stor(&dev, &[0.1f32, 0.2], &[2]);
+        let (out, h) = AttentionOps::qkv_attention_alibi(
+            &dev,
+            q.as_ref(),
+            k.as_ref(),
+            v.as_ref(),
+            2,
+            1,
+            0,
+            None,
+            slopes.as_ref(),
+            &Shape::new(vec![1, 2, 2]),
+        )
+        .unwrap();
         h.synchronize().unwrap();
-        assert_eq!(out.shape().dims(),vec![1,2,2]);
+        assert_eq!(out.shape().dims(), vec![1, 2, 2]);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Module structure tests — verify modularization correctness
-// ---------------------------------------------------------------------------
+// Module structure tests - verify modularization correctness
 #[cfg(test)]
 mod module_tests {
     use super::*;

@@ -1,10 +1,5 @@
-//! MM-GRPO: modality-aware reward normalization for multimodal group-relative
-//! policy optimization.
-//!
-//! Extends vanilla GRPO by grouping rewards by modality, normalizing within
-//! each group, and applying modality-specific weights before computing the
-//! clipped surrogate objective with an optional KL penalty against a reference
-//! policy.
+//! MM-GRPO: modality-aware reward normalization for multimodal group-relative policy optimization.
+//! Extends vanilla GRPO by grouping rewards by modality, normalizing within each group, and applying modality-specific.
 
 use std::collections::HashMap;
 
@@ -34,11 +29,7 @@ impl Default for MmGrpoConfig {
 }
 
 /// Modality-aware running reward normalizer.
-///
-/// Maintains a running mean/std per modality so rewards can be normalized
-/// before GRPO advantage computation. When the same normalizer is reused
-/// across steps, call `update_stats` with the latest normalized batch to keep
-/// the running estimates moving.
+/// Maintains a running mean/std per modality so rewards can be normalized before GRPO advantage computation.
 #[derive(Debug, Clone, Default)]
 pub struct MmGrpoRewardNormalizer {
     pub config: MmGrpoConfig,
@@ -54,17 +45,8 @@ impl MmGrpoRewardNormalizer {
         }
     }
 
-    /// Group rewards by modality, normalize per group, weight by modality,
-    /// then return modality-weighted values.
-    ///
-    /// Inputs:
-    /// - `rewards`: one reward per sample.
-    /// - `modality_tags`: parallel slice of modality names per sample.
-    /// - `group_size`: minimal group size for meaningful statistics. Smaller
-    ///   groups still get normalized but their stats are noisier.
-    ///
-    /// Outputs:
-    /// - weighted normalized rewards in the same order as the input slices.
+    /// Group rewards by modality, normalize per group, weight by modality, then return modality-weighted values.
+    /// Inputs: - `rewards`: one reward per sample.
     pub fn normalize(
         &mut self,
         rewards: &[f32],
@@ -173,9 +155,8 @@ impl MmGrpoRewardNormalizer {
         if modality_tags.is_empty() {
             return;
         }
-        // In a production path, `rewards` here would be the post-normalize
-        // batch; here we advance the running mean/std estimates modestly so
-        // repeated calls do not stall.
+        // In a production path, `rewards` here would be the post-normalize batch; here
+        // we advance the running mean/std estimates modestly so repeated calls do not stall.
         for tag in modality_tags {
             let entry = self.running_stats.entry(tag.clone()).or_default();
             entry.0 += 0.01;
@@ -184,9 +165,7 @@ impl MmGrpoRewardNormalizer {
     }
 }
 
-/// Compute modality-weighted GRPO losses.
-///
-/// Returns `(scalar_loss, per_sample_losses)`.
+/// Compute modality-weighted GRPO losses. Returns `(scalar_loss, per_sample_losses)`.
 pub fn grpo_modality_loss(
     chosen_logps: &[f32],
     ref_logps: &[f32],

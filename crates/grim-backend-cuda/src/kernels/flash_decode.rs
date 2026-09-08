@@ -1,22 +1,11 @@
-//! FlashDecoding — split-KV parallel attention for long-context single-token decode.
-//!
+//! FlashDecoding - split-KV parallel attention for long-context single-token decode.
 //! Ported verbatim from grim-backend-rocm `kernels/flash_decode.rs`.
-//! Divides KV sequence into `num_splits` chunks, computes partial online
-//! softmax in stage 1, merges in stage 2. Saturates all SMs on long contexts.
-//!
-//! CUDA delta from ROCm: `__syncthreads()` in place of `__syncwarp()`; no
-//! wavefront-width assumptions. extern "C" wrapping for nvcc JIT symbol export.
 
 pub const FLASH_DECODE_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// FlashDecoding Stage 1 — Partial Online Softmax per Sequence Chunk
-//
-// Grid:  (num_heads, num_splits)
-// Block: (head_dim threads, 1)  — one thread per head dimension element.
+// FlashDecoding Stage 1 - Partial Online Softmax per Sequence Chunk Grid: (num_heads, num_splits) Block: (head_dim threads, 1) - one thread per head dimension element.
 // Shared: (head_dim + blockDim.x) * 4 bytes.
-// ---------------------------------------------------------------------------
 __global__ void grim_flash_decode_stage1(
     const float* __restrict__ q,         // [num_heads, head_dim]
     const float* __restrict__ k_tensor,  // [kv_seq_len, num_kv_heads, head_dim]
@@ -88,12 +77,8 @@ __global__ void grim_flash_decode_stage1(
     }
 }
 
-// ---------------------------------------------------------------------------
-// FlashDecoding Stage 2 — Merge Partials Across Splits
-//
-// Grid:  (num_heads, 1)
-// Block: (head_dim threads, 1)
-// ---------------------------------------------------------------------------
+// FlashDecoding Stage 2 - Merge Partials Across
+// Splits Grid: (num_heads, 1) Block: (head_dim threads, 1)
 __global__ void grim_flash_decode_stage2(
     const float* __restrict__ mid_out,  // [num_splits, num_heads, head_dim]
     const float* __restrict__ mid_max,  // [num_splits, num_heads]

@@ -39,9 +39,9 @@ impl CudaDevice {
         let ur_ptr = uniform_rands_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("spec_sample: uniform_rands has no device ptr".into()))?;
-        let at_ptr = accepted_tokens_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("spec_sample: accepted_tokens has no device ptr".into()))?;
+        let at_ptr = accepted_tokens_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("spec_sample: accepted_tokens has no device ptr".into())
+        })?;
         let al_ptr = accepted_lens_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("spec_sample: accepted_lens has no device ptr".into()))?;
@@ -81,8 +81,12 @@ impl CudaDevice {
 
             let res = cuLaunchKernel(
                 kernel,
-                batch_size as u32, 1, 1,
-                256, 1, 1,
+                batch_size as u32,
+                1,
+                1,
+                256,
+                1,
+                1,
                 0,
                 std::ptr::null_mut(),
                 args.as_mut_ptr(),
@@ -98,6 +102,7 @@ impl CudaDevice {
     }
 
     /// Cross-device direct copy between CUDA devices using cudaMemcpyPeer or staging fallback.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn copy_via_route(
         &self,
         src_ordinal: i32,
@@ -120,13 +125,7 @@ impl CudaDevice {
 
         // Try direct peer memcpy
         unsafe {
-            let res = cudaMemcpyPeer(
-                dst_ptr,
-                dst_ordinal,
-                src_ptr,
-                src_ordinal,
-                bytes,
-            );
+            let res = cudaMemcpyPeer(dst_ptr, dst_ordinal, src_ptr, src_ordinal, bytes);
             if res == cudaSuccess {
                 return Ok(());
             }
@@ -159,13 +158,9 @@ impl CudaDevice {
         }
         Ok(())
     }
-
-
 }
 
 impl CollectiveOps for CudaDevice {
-
-
     fn estimate_gemm_latency_ms(
         &self,
         m: usize,
@@ -184,22 +179,15 @@ impl CollectiveOps for CudaDevice {
     }
 }
 
-
-
 impl MemoryOps for CudaDevice {
-
-
     fn from_cpu_bytes(
         &self,
         data: &[u8],
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        // Packed quantized storage (KQuant, FloatPack, Block, GroupInt) is
-        // smaller than `elem_count * arith.byte_size`; allocate the exact byte
-        // length so `CudaStorage::bytes()` reflects the real packed payload.
-        // For Native storage `data.len()` already equals `elem_count * byte_size`,
-        // so this remains correct for both cases.
+        // Packed quantized storage (KQuant, FloatPack, Block, GroupInt) is smaller than `elem_count * arith.byte_size`; allocate the exact byte length so `CudaStorage::bytes()` reflects the real packed payload.
+        // For Native storage `data.len()` already equals `elem_count * byte_size`, so this remains correct for both.
         let storage = CudaStorage::copy_from_host_raw_bytes(data, shape, dtype, self.ordinal)?;
         let dev_ptr = storage.device_ptr.ok_or_else(|| {
             Error::Backend("from_cpu_bytes: device_ptr is null after raw byte alloc".into())
@@ -224,9 +212,4 @@ impl MemoryOps for CudaDevice {
     }
 }
 
-
-
-impl GraphCaptureOps for CudaDevice {
-}
-
-
+impl GraphCaptureOps for CudaDevice {}

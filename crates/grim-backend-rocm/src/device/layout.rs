@@ -88,9 +88,7 @@ pub fn kv_from_block_major(
     out
 }
 
-// ---------------------------------------------------------------------------
 // Weight layout for attention projection tensors
-// ---------------------------------------------------------------------------
 
 /// Memory layout for quantized weights on ROCm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

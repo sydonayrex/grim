@@ -1,12 +1,5 @@
 //! CPU training-correctness smoke test (salamander.md P0.1 / WI-F4 gate).
-//!
-//! A tiny two-stage LoRA network must overfit a fixed `(input, target)`
-//! through the *real* autograd tape, LoRA backward, cross-entropy, and the
-//! AdamW optimizer. Proves the training stack learns end-to-end.
-//!
-//! The tape is bookkeeping-only: `record_lora_apply` takes the *precomputed*
-//! LoRA output, so this test recomputes the forward each step via
-//! `BackendDevice::lora_accumulate` (the same device kernel `train.rs` uses).
+//! A tiny two-stage LoRA network must overfit a fixed `(input, target)` through the *real* autograd.
 
 #![cfg(test)]
 

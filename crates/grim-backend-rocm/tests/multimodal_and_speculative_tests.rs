@@ -3,9 +3,7 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::eplb::EplbRouter;
-use grim_tensor::{Shape, dtype::DType,
-    CoreTensorOps, MemoryOps,
-};
+use grim_tensor::{CoreTensorOps, MemoryOps, Shape, dtype::DType};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
@@ -151,8 +149,7 @@ fn test_mrope_numerical_parity() -> TestResult {
 
     let q_dev = CoreTensorOps::from_cpu(&dev, &q_data, &q_shape, DType::F32)?;
     let k_dev = CoreTensorOps::from_cpu(&dev, &k_data, &k_shape, DType::F32)?;
-    let pos_dev =
-        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_s = grim_backend_rocm::device::util::as_rocm(q_dev.as_ref())?;
     let k_s = grim_backend_rocm::device::util::as_rocm(k_dev.as_ref())?;

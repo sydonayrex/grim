@@ -1,9 +1,9 @@
 //! Integration test for VulkanHugePageBuffer.
 
 use grim_backend_vulkan::{VulkanDevice, VulkanHugePageBuffer};
+use grim_tensor::CoreTensorOps;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
-use grim_tensor::CoreTensorOps;
 
 #[test]
 fn test_vulkan_hugepage_buffer_allocation_and_dma_roundtrip() {
@@ -14,9 +14,8 @@ fn test_vulkan_hugepage_buffer_allocation_and_dma_roundtrip() {
     assert_eq!(host_buf.size() % (2 * 1024 * 1024), 0);
 
     let count = 512 * 1024; // 512K floats = 2MB
-    let host_f32: &mut [f32] = unsafe {
-        std::slice::from_raw_parts_mut(host_buf.as_mut_ptr() as *mut f32, count)
-    };
+    let host_f32: &mut [f32] =
+        unsafe { std::slice::from_raw_parts_mut(host_buf.as_mut_ptr() as *mut f32, count) };
     for (i, val) in host_f32.iter_mut().enumerate() {
         *val = ((i as f32 + 1.0) * 0.05).sin();
     }

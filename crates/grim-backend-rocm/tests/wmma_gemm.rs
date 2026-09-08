@@ -20,9 +20,7 @@
 //!   tied to this test shape.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{DType, Shape,
-    CoreTensorOps,
-};
+use grim_tensor::{CoreTensorOps, DType, Shape};
 use std::panic;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;

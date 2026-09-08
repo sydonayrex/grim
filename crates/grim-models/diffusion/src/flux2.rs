@@ -1,10 +1,5 @@
 //! Flux 2 Flow-Matching Multi-Modal Diffusion Transformer (MM-DiT) Architecture.
-//!
-//! Features:
-//! - Double-Stream Joint Transformer Blocks (separate text/image QKV with joint attention).
-//! - Single-Stream Unified Transformer Blocks (concatenated text + image token stream).
-//! - 4D Axial Rotary Positional Embeddings (2D spatial + 2D frame coordinate axes).
-//! - AdaLN-Zero Timestep & Context Modulation.
+//! Features: - Double-Stream Joint Transformer Blocks (separate text/image QKV with joint attention).
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -571,16 +566,11 @@ impl Model for Flux2Transformer2D {
 
 impl DiffusionModel for Flux2Transformer2D {
     fn denoise_step(&self, latents: &Tensor, timestep: &Tensor, cond: &Tensor) -> Result<Tensor> {
-        // A malformed timestep tensor (wrong shape / empty) previously fell
-        // back to t=0.0 SILENTLY — a denoising call at the wrong noise level
-        // produces plausible-looking garbage. Error instead.
-        let t_val = timestep
-            .to_vec_f32()?
-            .first()
-            .copied()
-            .ok_or_else(|| grim_core::error::Error::Shape(
-                "denoise_step: timestep tensor is empty".into(),
-            ))?;
+        // A malformed timestep tensor (wrong shape / empty) previously fell back to t=0.0 SILENTLY - a denoising call at the wrong noise level produces plausible-looking garbage.
+        // Error instead.
+        let t_val = timestep.to_vec_f32()?.first().copied().ok_or_else(|| {
+            grim_core::error::Error::Shape("denoise_step: timestep tensor is empty".into())
+        })?;
         self.forward(latents, cond, t_val)
     }
 

@@ -41,9 +41,8 @@ pub async fn cmd_bench(
         return cmd_bench_serve(port, concurrency, duration_secs).await;
     }
     let device = Device::Cpu;
-    // F-5: resolve catalog/cache names ("LFM2.5-350M-Q8_0", "name:gguf") to
-    // real paths before the extension dispatch, mirroring `grim run`. A bare
-    // filename without an extension previously failed with "No such file".
+    // F-5: resolve catalog/cache names ("LFM2.5-350M-Q8_0", "name:gguf") to real paths before the extension dispatch, mirroring `grim run`.
+    // A bare filename without an extension previously failed with "No such file".
     let model: Box<dyn CausalLm> = if let Some(path) = model_path {
         let resolved = crate::catalog::resolve_model_path(path).ok_or_else(|| {
             grim_core::error::Error::Config(format!(
@@ -93,17 +92,8 @@ pub async fn cmd_bench(
     let start = std::time::Instant::now();
 
     for _ in 0..concurrency {
-        // P1-3.6: Llama `forward` expects a 1-D `[seq_len]` input_ids tensor
-        // (token IDs as f32, cast to u32 internally) and a matching positions
-        // tensor. The original bench passed a flat `[tokens]` tensor for both,
-        // which worked for `run` but caused a ShapeMismatch when the model's
-        // RmsNorm / Linear layers flattened the 3-D hidden state to 2-D
-        // `[batch, hidden]` before matmul — the residual add then saw
-        // `[tokens, hidden]` where `[head_dim, hidden]` was expected.
-        //
-        // Reshape to `[1, tokens]` (explicit batch=1) so the model's
-        // shape arithmetic (`elem_count / in_dim`) lands on the correct batch
-        // dimension instead of collapsing 3-D to a flat 2-D.
+        // P1-3.6: Llama `forward` expects a 1-D `[seq_len]` input_ids tensor (token IDs as f32, cast to u32 internally) and a matching positions tensor.
+        // The original bench passed a flat `[tokens]` tensor for both, which worked for `run` but.
         let input_data: Vec<f32> = (0..tokens).map(|t| (t % 512) as f32).collect();
         let inp =
             grim_backend_cpu::cpu_tensor(input_data, grim_tensor::Shape::new(vec![1, tokens]));
@@ -122,10 +112,8 @@ pub async fn cmd_bench(
     Ok(())
 }
 
-/// WI-E2 serving mode: drive concurrent `/v1/chat/completions` load against a
-/// running server, measure per-request wall time and inter-token latency
-/// percentiles. Non-streaming requests; ITL is approximated as
-/// request_wall_time / completion_tokens (per-request mean ITL).
+/// WI-E2 serving mode: drive concurrent `/v1/chat/completions` load against a running server, measure per-request wall time and inter-token latency percentiles.
+/// Non-streaming requests; ITL is approximated as request_wall_time / completion_tokens (per-request mean ITL).
 async fn cmd_bench_serve(port: u16, concurrency: usize, duration_secs: u64) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     // Health check first — fail loudly if the server isn't up.

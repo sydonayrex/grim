@@ -77,8 +77,7 @@ extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
 }
 
 // Fused Add + RMSNorm: y_out = x + residual; norm_out = rms_norm(y_out, w, eps).
-// Mirrors the ROCm `grim_add_rms_norm` HIP kernel and the Metal `grim_add_rms_norm` MSL shader
-// 1:1 — no cross-invocation shared memory; one thread per output element.
+// Mirrors the ROCm `grim_add_rms_norm` HIP kernel and the Metal `grim_add_rms_norm` MSL shader 1:1 - no.
 extern "C" __global__ void grim_add_rms_norm(const float* x, const float* residual,
                                              float* w, float* y_out, float* norm_out,
                                              int row_len, float eps, int total) {
@@ -357,23 +356,8 @@ extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out,
     out[i1] = v0 * sin_v + v1 * cos_v;
 }
 
-// Partial-rotary + YaRN kernel. Mirrors the ROCm `grim_rope_yarn` so the two
-// devices produce bit-identical results for the same input.
-//
-// CONTRACT:
-//   x        – [B, S, D] f32 input
-//   positions– [S] absolute token positions
-//   inv_freq – [rotary_half] pre-computed YaRN / plain inv-frequencies
-//   out      – [B, S, D] f32 output (non-rotary dims copied verbatim)
-//   b, s, d  – batch / seq / full head dim
-//   rotary_half – half of rotary_dim (= rotary_dim/2); dims [rotary_half, d)
-//               are NOT rotated (copied verbatim)
-//   mscale   – attention_factor (1.0 for plain RoPE; YaRN sets this)
-//
-// One thread per (batch, step, rotary-pair). Non-rotary dims are handled
-// by a second pass over the copy range [rotary_dim, d). The launch grid
-// (sized by the host) covers max(b*s*rotary_half, b*s*copy_len) threads so
-// both passes are handled in a single launch.
+// Partial-rotary + YaRN kernel. Mirrors the ROCm `grim_rope_yarn` so
+// the two devices produce bit-identical results for the same input.
 extern "C" __global__ void grim_rope_yarn(
     const float* __restrict__ x,
     const unsigned int* __restrict__ positions,
@@ -403,10 +387,8 @@ extern "C" __global__ void grim_rope_yarn(
         out[b_idx] = x1 * sin_val + x2 * cos_val;
     }
 
-    // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim. The same
-    // thread pool is reused; threads with idx in [0, b*s*(d-2*rotary_half))
-    // handle the copy dimension. For full rotary (rotary_dim == d) copy_len
-    // is 0 and this pass is a no-op.
+    // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim.
+    // The same thread pool is reused; threads with idx in [0, b*s*(d-2*rotary_half)) handle the copy.
     int copy_start = 2 * rotary_half;
     int copy_len   = d - copy_start;
     if (copy_len > 0) {
@@ -446,26 +428,16 @@ extern "C" __global__ void grim_quantized_matmul_q8_0(const float* a, const unsi
     out[row * n + col] = sum;
 }
 
-// ===========================================================================
-//  Standalone dequantization kernels (one thread per 256-weight super-block,
-//  except where noted). These are bit-accurate ports of the CPU reference in
-//  `crates/grim-quant/src/lib.rs` — NOT the ROCm `iq_dequant.rs` device fns,
-//  which are simplified and do not match the CPU oracle (see audit notes).
-//
-//  Shared device helpers reproduced from grim-quant with the bit-accurate
-//  f16 subnormal path (the ROCm `fp16_to_float_device` rounds subnormals to a
-//  different scale; the CPU oracle uses `mant * 2^-24`).
-// ===========================================================================
+// Standalone dequantization kernels (one thread per 256-weight super-block, except where noted).
+// These are bit-accurate ports of the CPU reference in `crates/grim-quant/src/lib.rs` - NOT the ROCm `iq_dequant.rs`.
 
 __device__ inline float grim_f16_to_f32(unsigned short h) {
     unsigned int sign = (h >> 15) & 1u;
     unsigned int exp  = (h >> 10) & 0x1Fu;
     unsigned int mant = h & 0x3FFu;
     if (exp == 0u) {
-        // Subnormal or zero: value = ± mant * 2^-24 (bit-accurate vs
-        // grim_quant::f16_to_f32, lib.rs:1372). __int_as_float(0x33800000)
-        // = 2^-24 exactly; multiplying by the integer mantissa keeps the
-        // rounding identical to the CPU `mant as f32 * 2f32.powi(-24)`.
+        // Subnormal or zero: value = ± mant * 2^-24 (bit-accurate vs grim_quant::f16_to_f32, lib.rs:1372).
+        // __int_as_float(0x33800000) = 2^-24 exactly; multiplying by the integer mantissa keeps the rounding identical to the.
         float value = (float)mant * __int_as_float(0x33800000u);
         return sign ? -value : value;
     } else if (exp == 31u) {
@@ -1152,10 +1124,8 @@ extern "C" __global__ void grim_dequant_iq2s(const unsigned char* __restrict__ p
     }
 }
 
-// ---- FP8 E4M3 (1 byte/weight + 4-byte f32 global scale header) ---------------
-// Signature: grim_dequant_fp8(packed, out, n_weights). One thread per weight.
-// Matches grim_quant::dequant_fp8 (`lib.rs:1106`): first 4 bytes are the LE
-// f32 global scale, then 1 E4M3 byte per weight, value = fp8(byte)*scale.
+// ---- FP8 E4M3 (1 byte/weight + 4-byte f32 global scale header) --------------- Signature: grim_dequant_fp8(packed, out, n_weights).
+// One thread per weight.
 extern "C" __global__ void grim_dequant_fp8(const unsigned char* __restrict__ packed,
                                              float* __restrict__ out, int n_weights) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1167,12 +1137,8 @@ extern "C" __global__ void grim_dequant_fp8(const unsigned char* __restrict__ pa
     out[i] = grim_fp8_e4m3_to_f32(packed[4 + i]) * scale;
 }
 
-// ---- MXFP4 (length-prefixed codes + E8M0 shared exponents) -----------------
-// Signature: grim_dequant_mxfp4(codes, exps, out, n_values).
-//   codes:  E2M1 packed nibbles, 2 per byte (low nibble = even i).
-//   exps:   1 byte per 32-element group (E8M0 shared exponent).
-// Matches grim_quant::dequant_mxfp4 (`lib.rs:1177`). The length-prefix framing
-// is split host-side before launch (see lib.rs dequant dispatch).
+// ---- MXFP4 (length-prefixed codes + E8M0 shared exponents) ----------------- Signature: grim_dequant_mxfp4(codes, exps, out, n_values).
+// codes: E2M1 packed nibbles, 2 per byte (low nibble = even i).
 extern "C" __global__ void grim_dequant_mxfp4(const unsigned char* __restrict__ codes,
                                                const unsigned char* __restrict__ exps,
                                                float* __restrict__ out, int n_values) {
@@ -1253,11 +1219,8 @@ extern "C" __global__ void grim_dequant_q8_0(const unsigned char* __restrict__ p
     out[id] = d * (float)q;
 }
 
-// ===========================================================================
-//  Device-side quantization kernels — bit-accurate ports of the CPU reference
-//  `grim_quant::quant_*` (lib.rs). These enable per-step activation/gradient
-//  quantization without a D2H/H2D round-trip.
-// ===========================================================================
+// Device-side quantization kernels - bit-accurate ports of the CPU reference `grim_quant::quant_*` (lib.rs).
+// These enable per-step activation/gradient quantization without a D2H/H2D round-trip.
 
 // f32 → f16 conversion (mirrors grim_quant::f32_to_f16, lib.rs:2531).
 // Truncating rounding (no round-to-nearest), matching the CPU reference exactly.
@@ -1300,10 +1263,8 @@ __device__ inline unsigned char grim_f32_to_fp8_e4m3(float v) {
     return sign | ((unsigned char)e4m3_exp << 3) | (mant & 0x07u);
 }
 
-// ---- Standalone Q8_0 quantization (34 B / 32 weights) ------------------------
-// Mirrors grim_quant::quant_q80 (lib.rs:1397). One CUDA block (32 threads) per
-// Q8_0 block. Thread 0 finds amax via warp shuffle, computes the f16 scale, and
-// writes it; all 32 threads then encode their i8 code in parallel.
+// ---- Standalone Q8_0 quantization (34 B / 32 weights) ------------------------ Mirrors grim_quant::quant_q80 (lib.rs:1397).
+// One CUDA block (32 threads) per Q8_0 block.
 extern "C" __global__ void grim_quant_q8_0(const float* __restrict__ x,
                                             unsigned char* __restrict__ out, int n_blocks) {
     int blk = blockIdx.x;
@@ -1340,9 +1301,8 @@ extern "C" __global__ void grim_quant_q8_0(const float* __restrict__ x,
     bout[2 + lane] = (unsigned char)(signed char)q_f;
 }
 
-// ---- Standalone FP8 E4M3 quantization (4-byte f32 scale + 1 byte/weight) -----
-// Mirrors grim_quant::quant_fp8 (lib.rs:1647). One thread per weight. The
-// scale header is always 1.0f (matching the CPU reference).
+// ---- Standalone FP8 E4M3 quantization (4-byte f32 scale + 1 byte/weight) ----- Mirrors grim_quant::quant_fp8 (lib.rs:1647).
+// One thread per weight.
 extern "C" __global__ void grim_quant_fp8(const float* __restrict__ x,
                                           unsigned char* __restrict__ out, int n_weights) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1360,10 +1320,8 @@ extern "C" __global__ void grim_quant_fp8(const float* __restrict__ x,
     out[4 + i] = grim_f32_to_fp8_e4m3(x[i]);
 }
 
-// ---- Fused quantize + GEMM: Q8_0 activations ---------------------------------
-// Computes C = A_quant @ B where A is quantized to Q8_0 on-the-fly per
-// 32-element K-block. Each thread computes one output element C[row, col].
-// Grid: (ceil(N/32), ceil(M/8)), Block: (32, 8).
+// ---- Fused quantize + GEMM: Q8_0 activations --------------------------------- Computes C = A_quant @ B where A is quantized to Q8_0 on-the-fly per 32-element K-block.
+// Each thread computes one output element C[row, col].
 extern "C" __global__ void grim_fused_quant_gemm_q8_0(const float* __restrict__ A,
                                                        const float* __restrict__ B,
                                                        float* __restrict__ C,
@@ -1399,11 +1357,8 @@ extern "C" __global__ void grim_fused_quant_gemm_q8_0(const float* __restrict__ 
     C[row * N + col] = sum;
 }
 
-// ---- Fused quantize + GEMM: Q8_0 activations (packed, on-device dequant) ------
-// Computes C = A_quant @ B where B is stored as Q8_0 packed blocks.
+// ---- Fused quantize + GEMM: Q8_0 activations (packed, on-device dequant) ------ Computes C = A_quant @ B where B is stored as Q8_0 packed blocks.
 // Each Q8_0 block is 34 bytes: 2-byte f16 scale + 32 i8 codes.
-// A is f32; the kernel quantizes A on-the-fly per 32-element K-block.
-// Grid: (ceil(N/32), ceil(M/8)), Block: (32, 8).
 extern "C" __global__ void grim_fused_quant_gemm_q8_0_packed(const float* __restrict__ A,
                                                               const unsigned char* __restrict__ B_packed,
                                                               float* __restrict__ C,
@@ -1444,9 +1399,8 @@ extern "C" __global__ void grim_fused_quant_gemm_q8_0_packed(const float* __rest
     C[row * N + col] = sum;
 }
 
-// ---- Fused quantize + GEMM: FP8 E4M3 activations -----------------------------
-// Computes C = A_quant @ B where A is quantized to FP8 E4M3 on-the-fly
-// per-element (round-trip through fp8_e4m3). Each thread computes one output.
+// ---- Fused quantize + GEMM: FP8 E4M3 activations ----------------------------- Computes C = A_quant @ B where A is quantized to FP8 E4M3 on-the-fly per-element (round-trip through fp8_e4m3).
+// Each thread computes one output.
 extern "C" __global__ void grim_fused_quant_gemm_fp8(const float* __restrict__ A,
                                                       const float* __restrict__ B,
                                                       float* __restrict__ C,
@@ -1464,20 +1418,8 @@ extern "C" __global__ void grim_fused_quant_gemm_fp8(const float* __restrict__ A
     C[row * N + col] = sum;
 }
 
-// ---- Fused grouped MoE dispatch (WI-M5) ----------------------------------
-// One CUDA thread block (blockIdx.x) carries one (token, expert) routed pair,
-// exactly like the ROCm `grim_moe_fused_dispatch` / Vulkan `moe_fused_dispatch`
-// P-DAFD path. The host pre-expands top-k routing into flat token/expert/weight
-// arrays (`router_tokens`/`router_experts`/`router_weights`), so there is no
-// device-side sort or per-expert launch.
-//
-// Per pair, each thread computes the full SwiGLU expert contribution for one
-// token (loop over `hidden` output rows, contracting the `inter` dim for
-// gate+up then down) and atomicAdds the `routed_scaling_factor * weight`-scaled
-// result into `out[token]`. atomicAdd(float*) requires sm_70+ (RTX 40 is 8.9).
-//
-// Contract: gate_w/up_w are [e, inter, hidden] (row-major), down_w is
-// [e, hidden, inter] (row-major), x is [batch, hidden].
+// ---- Fused grouped MoE dispatch (WI-M5) ---------------------------------- One CUDA thread block (blockIdx.x) carries one (token, expert) routed pair, exactly like the ROCm `grim_moe_fused_dispatch` / Vulkan `moe_fused_dispatch` P-DAFD path.
+// The host pre-expands top-k routing into flat token/expert/weight arrays (`router_tokens`/`router_experts`/`router_weights`), so there is no device-side.
 extern "C" __global__ void grim_moe_fused_dispatch(
     const float* x,
     const float* gate_w,
@@ -1499,9 +1441,8 @@ extern "C" __global__ void grim_moe_fused_dispatch(
     int dw_base = exp_id * hidden * inter;
     int x_base = tok * hidden;
 
-    // gate/up produce per-expert `inter`-dim intermediates; the contraction is
-    // over `hidden` (the activation input dim). down then maps `inter` -> `hidden`
-    // and atomicAdds the scaled contribution into the shared token output.
+    // gate/up produce per-expert `inter`-dim intermediates; the contraction is over `hidden` (the activation input dim).
+    // down then maps `inter` -> `hidden` and atomicAdds the scaled contribution into the shared token.
     for (int i = 0; i < inter; ++i) {
         float g = 0.0f, u = 0.0f;
         for (int j = 0; j < hidden; ++j) {
@@ -1696,9 +1637,7 @@ extern "C" __global__ void grim_mla_q_kv_norm_split(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Paged Attention & Tree Attention for CUDA
-// ---------------------------------------------------------------------------
 
 struct BlockTableEntry {
     unsigned int block_id;
@@ -1986,4 +1925,3 @@ void grim_tree_attention(
     }
 }
 "#;
-

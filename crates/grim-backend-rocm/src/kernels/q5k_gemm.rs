@@ -15,10 +15,8 @@ extern "C" {
         const unsigned char* qh = block_ptr + 16;   // 32 bytes, 2 high bits/weight
         const unsigned char* qs = block_ptr + 48;   // 128 bytes, 4 low bits/weight
 
-        // ggml layout: four 64-weight groups. Within group n, the first 32
-        // weights take the low nibble of qs[n*32 + l] with high bit
-        // qh[l] & (1 << 2n) and scale sub-block 2n; the next 32 take the high
-        // nibble with bit qh[l] & (1 << (2n+1)) and scale sub-block 2n+1.
+        // ggml layout: four 64-weight groups. Within group n, the first 32 weights take the low nibble of qs[n*32 + l] with high bit qh[l] &
+        // (1 << 2n) and scale sub-block 2n; the next 32 take the high nibble with bit qh[l] & (1 << (2n+1)) and scale sub-block 2n+1.
         int n = in_sb / 64;      // 0..3 group
         int j = in_sb % 64;      // 0..63 within group
         int l = j & 31;          // qs/qh byte index within the group

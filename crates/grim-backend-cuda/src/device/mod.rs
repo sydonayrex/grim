@@ -15,11 +15,11 @@ pub mod parallel_comm;
 pub use cublas::CublasHandle;
 pub use cuda_device::{CudaDevice, compute_utilization, vram_info};
 pub use handles::{
-    cudaDeviceGetAttribute, cudaDeviceSynchronize, cudaFree, cudaGetDeviceCount, cudaGraphCreate,
-    cudaGraphDestroy, cudaGraphExecDestroy, cudaGraphInstantiate, cudaGraphLaunch, cudaMalloc,
-    cudaMemGetInfo, cudaMemcpy, cudaMemcpyDeviceToDevice, cudaMemcpyDeviceToHost,
-    cudaMemcpyHostToDevice, cudaMemcpyPeer, cudaMemset, cudaSetDevice, cudaStreamBeginCapture,
-    cudaStreamCreate, cudaStreamDestroy, cudaStreamEndCapture, cudaStreamSynchronize, cudaSuccess,
-    CudaHandle, CUstream, CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_STATUS_SUCCESS,
+    CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_STATUS_SUCCESS, CUstream, CudaHandle, cudaDeviceGetAttribute,
+    cudaDeviceSynchronize, cudaFree, cudaGetDeviceCount, cudaGraphCreate, cudaGraphDestroy,
+    cudaGraphExecDestroy, cudaGraphInstantiate, cudaGraphLaunch, cudaMalloc, cudaMemGetInfo,
+    cudaMemcpy, cudaMemcpyDeviceToDevice, cudaMemcpyDeviceToHost, cudaMemcpyHostToDevice,
+    cudaMemcpyPeer, cudaMemset, cudaSetDevice, cudaStreamBeginCapture, cudaStreamCreate,
+    cudaStreamDestroy, cudaStreamEndCapture, cudaStreamSynchronize, cudaSuccess,
 };
-pub use jit_cache::{compile_and_load_kernel, SendCmodule};
+pub use jit_cache::{SendCmodule, compile_and_load_kernel};

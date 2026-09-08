@@ -1,13 +1,5 @@
 //! Training jobs: in-memory state machine + tokio task lifecycle.
-//!
-//! The UI submits a `TrainingJob` via `POST /api/train/start`; the server
-//! hands the job id to a worker task and reports status through:
-//!   - `GET   /api/train/status/:id`   — single snapshot
-//!   - `SSE   /sse/metrics/:id`        — live loss/vram telemetry
-//!
-//! Workers record per-step metrics into `job.metrics` as they run; the
-//! `metrics_watcher` emits each new metric to subscribed SSE clients via
-//! a `tokio::sync::broadcast` channel.
+//! The UI submits a `TrainingJob` via `POST /api/train/start`; the server hands the job id to.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,23 +12,8 @@ use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-// ── WI-Charon-0: real P2P topology probe for `C2plrController::decide` ───────
-//
-// `grim-engine::scythe2::C2plrController::decide(layer_id, shape, caps, links, epoch)`
-// previously received a flat `vec![ScytheLink::Host; k*k]` link matrix and
-// `layer_id == 0` at its only call site (the SCYTHE-2 multi-GPU training path),
-// so every placement decision ran on synthetic input: `PlacementCache`'s
-// per-layer keying was defeated and `peer_access::peer_status` (the real
-// RDNA-gated P2P topology detector) was never consulted.
-//
-// `build_link_matrix` builds the K×K ordered-pair link matrix from a probe
-// closure. It is split out so unit tests can inject a mocked probe without a
-// device; the production path wires the probe to
-// `grim_backend_rocm::peer_access::peer_status`. Per WI-Charon-0 we do NOT
-// assume PCIe symmetry: every ordered pair (i,j) is probed independently, and
-// the diagonal self-links are `PeerDirect` by the same convention used by the
-// existing `CapabilityProfiler::link_matrix`
-// (`grim-backend-rocm/src/device/capability_profiler.rs:107`).
+// ── WI-Charon-0: real P2P topology probe for `C2plrController::decide` ─────── `grim-engine::scythe2::C2plrController::decide(layer_id, shape, caps, links, epoch)` previously received a flat `vec![ScytheLink::Host; k*k]` link matrix and `layer_id == 0` at its only call site (the SCYTHE-2 multi-GPU training path), so every placement decision ran on synthetic input: `PlacementCache`'s per-layer keying was defeated and `peer_access::peer_status` (the real RDNA-gated P2P topology detector) was never consulted.
+// `build_link_matrix` builds the K×K ordered-pair link matrix from a probe closure.
 
 /// P2P link verdict for a single ordered (src, dst) rank pair — mirroring
 /// `P2PStatus` without leaking the backend type across the crate boundary.
@@ -60,17 +37,8 @@ impl PairLink {
     }
 }
 
-/// Build the flat K×K link matrix (`row-major`: `matrix[i*k + j]` is the link
-/// from rank `i` to rank `j`) used by `C2plrController::decide`.
-///
-/// `probe(src, dst)` returns the link verdict for an ordered pair. Self-pairs
-/// (`i == i`) are always `PeerDirect`; off-diagonal pairs consult `probe`, and
-/// any probe error degrades to `ScytheLink::Host` rather than panicking — the
-/// controller's downstream logic already caters for host-bounce, so a missing
-/// peer is always a safe lower bound (matching the prior flat-`Host` baseline
-/// for the unreachable case). This means a GPU-less test environment gets the
-/// same all-`Host` matrix the old hardcoded path produced — the fix only
-/// *improves* the matrix when a real probe succeeds.
+/// Build the flat K×K link matrix (`row-major`: `matrix[i*k + j]` is the link from rank `i` to rank `j`) used by `C2plrController::decide`.
+/// `probe(src, dst)` returns the link verdict for an ordered pair.
 fn build_link_matrix(num_gpus: usize, probe: impl Fn(i32, i32) -> PairLink) -> Vec<ScytheLink> {
     let k = num_gpus;
     let mut matrix = vec![ScytheLink::Host; k * k];
@@ -86,10 +54,8 @@ fn build_link_matrix(num_gpus: usize, probe: impl Fn(i32, i32) -> PairLink) -> V
     matrix
 }
 
-/// Production probe: consult the real `peer_access::peer_status`. Any HIP
-/// error (no device, ordinal out of range, etc.) collapses to `Host` so the
-/// matrix degrades to the historical all-`Host` baseline in GPU-less contexts
-/// rather than poisoning the placement decision.
+/// Production probe: consult the real `peer_access::peer_status`.
+/// Any HIP error (no device, ordinal out of range, etc.) collapses to `Host` so the.
 fn probe_peer_link(src: i32, dst: i32) -> PairLink {
     match grim_backend_rocm::peer_access::peer_status(src, dst) {
         Ok(grim_backend_rocm::peer_access::P2PStatus::P2P) => PairLink::Peer,
@@ -98,26 +64,16 @@ fn probe_peer_link(src: i32, dst: i32) -> PairLink {
     }
 }
 
-/// SCYTHE-2 WI-EP1: per-layer placement inputs handed to
-/// [`run_rank_sft_forward`] so the C²PLR controller is consulted inside the
-/// `for layer_idx in 0..num_layers` loop with each layer's *real* index and
-/// activation shape. This replaces the earlier outer-loop placeholder that
-/// decided once per micro-step under a synthetic
-/// `layer_id = micro_step % num_layers` key.
-///
-/// `None` on single-GPU jobs (no controller is constructed).
+/// SCYTHE-2 WI-EP1: per-layer placement inputs handed to [`run_rank_sft_forward`] so the C²PLR controller is consulted inside the `for layer_idx in 0..num_layers` loop with each layer's *real* index and activation shape.
+/// This replaces the earlier outer-loop placeholder that decided once per micro-step under a synthetic `layer_id.
 struct PerLayerScythe<'a> {
     ctrl: &'a mut grim_engine::scythe2::C2plrController,
     caps: &'a [grim_tensor::backend::GpuCapability],
     links: &'a [ScytheLink],
 }
 
-/// Step-level route matrix for the gradient all-reduce, derived from the
-/// per-layer placements decided during forward. Each per-layer decision
-/// carries exactly one chosen link (`decide_miss` returns
-/// `routes: vec![route_link]`); the all-reduce is a step-level collective,
-/// not a layer operation, so we take the modal link across layers and expand
-/// it to the full K×K matrix shape used by the no-controller fallback.
+/// Step-level route matrix for the gradient all-reduce, derived from the per-layer placements decided during forward.
+/// Each per-layer decision carries exactly one chosen link (`decide_miss` returns `routes: vec![route_link]`); the all-reduce is.
 fn step_routes_from_layers(
     placements: &[grim_tensor::backend::ScythePlacement],
     k: usize,
@@ -156,10 +112,8 @@ pub enum JobError {
     Duplicate,
 }
 
-/// Coarse job status surface — enough for the UI badge in the history list.
-///
-/// Wire format is lowercase (e.g. `"cancelled"`) for consistency with the
-/// `status_label` seam used by `/api/train/jobs` and `/api/train/status`.
+/// Coarse job status surface - enough for the UI badge in the history list.
+/// Wire format is lowercase (e.g.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -174,9 +128,7 @@ pub enum JobStatus {
 }
 
 /// Training mode the UI's "Training Mode" dropdown drives.
-///
 /// SFT modes: `Lora`, `QLoRA`, `Bf16Full`, `RsLora`, `Dora`, `LoftQ`, `SoulEater`.
-/// Reinforcement-learning modes: `Orpo`, `Dpo`, `Kto`, `SimPo`, `Grpo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrainingMode {
     /// LoRA supervised fine-tuning on compressed weights.
@@ -217,9 +169,8 @@ pub enum TrainingMode {
     TurboFinetune,
     /// KV-OMNI = unified text+audio+video joint KV-cache eviction policy with cross-modal attention salience.
     KvOmni,
-    /// SPECTRAL-QLORA: Quantized LoRA with orthogonal subspace initialization
-    /// + Muon optimizer (Newton-Schulz for B direction, Sign-SGD for A magnitude)
-    /// + CARE-LoRA compressed activation reconstruction adapter.
+    /// SPECTRAL-QLORA: Quantized LoRA with orthogonal subspace initialization + Muon optimizer (Newton-Schulz for
+    /// B direction, Sign-SGD for A magnitude) + CARE-LoRA compressed activation reconstruction adapter.
     SpectralQLoRA,
     /// Contrast-Omni: contrastive multi-modal training across text/audio/visual.
     ContrastOmni,
@@ -239,9 +190,8 @@ pub struct Metric {
     pub samples_per_sec: f32,
 }
 
-/// Per-rank diagnostics for data-parallel jobs. These remain separate from
-/// the aggregate SSE metric so existing clients keep their wire shape while
-/// operators can inspect asymmetric rank behavior in job snapshots.
+/// Per-rank diagnostics for data-parallel jobs.
+/// These remain separate from the aggregate SSE metric so existing clients keep their wire shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RankMetric {
     pub step: u64,
@@ -260,9 +210,8 @@ pub struct TrainingJob {
     pub dataset_path: String,
     pub training_mode: TrainingMode,
     pub lora_rank: u32,
-    /// LoRA alpha (scaling). Used for adapter init and bake-merge
-    /// (`ΔW = (alpha / rank) · B·A`). `None` = documented rule-of-thumb
-    /// default `2 * lora_rank`.
+    /// LoRA alpha (scaling). Used for adapter init and
+    /// bake-merge (`ΔW = (alpha / rank) · B·A`).
     #[serde(default)]
     pub lora_alpha: Option<f32>,
     pub learning_rate: f64,
@@ -304,8 +253,7 @@ pub struct TrainingJob {
     /// `use_olora` is set and `olora_lambda > 0.0`.
     #[serde(default)]
     pub olora_lambda: f32,
-    /// SPECTRAL-QLORA: initialize A/B so that AB is semi-orthogonal in the
-    /// dominant subspace (reuse `subspace_newton_schulz_step` at creation).
+    /// SPECTRAL-QLORA: initialize A/B so that AB is semi-orthogonal in the dominant subspace (reuse `subspace_newton_schulz_step` at creation).
     /// When enabled, the optimizer is set to Muon.
     #[serde(default)]
     pub use_spectral_qlora: bool,
@@ -322,9 +270,8 @@ pub struct TrainingJob {
     pub metrics: Vec<Metric>,
     #[serde(default)]
     pub rank_metrics: Vec<RankMetric>,
-    /// Cancellation signal. `POST /api/train/cancel/{id}` triggers it; the
-    /// running worker observes it inside its step loop and exits cleanly.
-    /// Cloning a `CancellationToken` is cheap (one `Arc` bump).
+    /// Cancellation signal. `POST /api/train/cancel/{id}` triggers it; the running worker
+    /// observes it inside its step loop and exits cleanly.
     #[serde(skip)]
     pub cancel: CancellationToken,
 }
@@ -483,13 +430,8 @@ impl JobRegistry {
             .collect::<Vec<_>>()
     }
 
-    /// L5 / H5: enumerate job id + status + (cloned) job under a single
-    /// read lock. Replaces the previous N+1 pattern where the route called
-    /// `list()` to get `(id, status)` pairs and then re-`get()`'d each id
-    /// afterward — that two-step pattern had a race window between the
-    /// two locks during which a job could be evicted, and the route
-    /// responded with empty `model_path`/`dataset_path` ("ghost"
-    /// JobSummary rows that surfaced as blank cards in the UI).
+    /// L5 / H5: enumerate job id + status + (cloned) job under a single read lock.
+    /// Replaces the previous N+1 pattern where the route called `list()` to get `(id, status)` pairs.
     pub async fn snapshot(&self) -> Vec<(JobId, JobStatus, TrainingJob)> {
         let g = self.inner.read().await;
         g.iter()
@@ -506,16 +448,8 @@ impl JobRegistry {
         Ok(())
     }
 
-    /// Transition a job to `status` **and** broadcast a terminal
-    /// `MetricStreamEvent` carrying the post-transition status so SSE
-    /// subscribers receive a guaranteed terminal event. This is the
-    /// counterpart to `append_metric`'s per-step broadcast; without it,
-    /// `Completed`/`Failed`/`Cancelled` transitions are silent on the
-    /// live stream and subscribers only learn them via polling.
-    ///
-    /// Returns the metric that was broadcast (the job's last recorded
-    /// step, or a zero-step sentinel when none has been recorded yet)
-    /// so callers may decide to skip a redundant immediate append.
+    /// Transition a job to `status` **and** broadcast a terminal `MetricStreamEvent` carrying the post-transition status so SSE subscribers receive a guaranteed terminal event.
+    /// This is the counterpart to `append_metric`'s per-step broadcast; without it, `Completed`/`Failed`/`Cancelled` transitions are silent on.
     pub async fn update_status_and_broadcast(
         &self,
         id: &JobId,
@@ -537,9 +471,8 @@ impl JobRegistry {
             vram_used_mb: 0,
             samples_per_sec: 0.0,
         });
-        // Best-effort broadcast; if there are no SSE subscribers this is Err
-        // and we ignore — the next subscriber gets a snapshot via the
-        // initial metrics replay in `sse_metrics`.
+        // Best-effort broadcast; if there are no SSE subscribers this is Err and we ignore
+        // - the next subscriber gets a snapshot via the initial metrics replay in `sse_metrics`.
         let _ = self.metrics_tx.send(MetricStreamEvent {
             job_id: id.0.clone(),
             metric: metric.clone(),
@@ -548,11 +481,8 @@ impl JobRegistry {
         Ok(metric)
     }
 
-    /// Request cancellation of a running worker. Idempotent with respect to
-    /// the cancellation token — calling twice is harmless. Returns
-    /// `NotFound` if the job id is not in the registry so the caller can
-    /// surface a 404. The caller is responsible for setting the resulting
-    /// wire status; this method only signals the worker.
+    /// Request cancellation of a running worker.
+    /// Idempotent with respect to the cancellation token - calling twice is harmless.
     pub async fn cancel(&self, id: &JobId) -> Result<(), JobError> {
         let g = self.inner.read().await;
         let job = g.get(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
@@ -560,19 +490,8 @@ impl JobRegistry {
         Ok(())
     }
 
-    /// Atomic cancel request + terminal-status transition. Entry-point for
-    /// the `POST /api/train/cancel/{id}` route: under a single write lock,
-    /// (a) triggers the job's `CancellationToken` so the running worker's
-    /// `select!` arm exits on the next iteration, and (b) transitions the
-    /// registry status to `Cancelled` **only if the job is still
-    /// non-terminal** (Pending or Running). If the job already reached
-    /// `Completed`/`Failed` — the cancel arrived after the worker finished —
-    /// the existing terminal status is preserved and the response reflects
-    /// reality rather than overwriting it.
-    ///
-    /// Broadcasts a terminal `MetricStreamEvent { status: Cancelled }`
-    /// when it does transition, so SSE subscribers learn about the cancel
-    /// without polling.
+    /// Atomic cancel request + terminal-status transition.
+    /// Entry-point for the `POST /api/train/cancel/{id}` route: under a single write lock, (a) triggers the job's.
     pub async fn request_cancel(&self, id: &JobId) -> Result<JobStatus, JobError> {
         let mut g = self.inner.write().await;
         let job = g
@@ -641,9 +560,7 @@ impl JobRegistry {
 }
 
 /// Compute a baseline loss for the given training mode.
-///
-/// SFT modes start from an empirical cross-entropy target (~2.3);
-/// RL modes use an initial reward differential of 0.0 converging upward.
+/// SFT modes start from an empirical cross-entropy target (~2.3); RL modes use an initial reward.
 fn initial_loss(mode: TrainingMode) -> f64 {
     match mode {
         TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => 2.3,
@@ -668,16 +585,8 @@ fn initial_loss(mode: TrainingMode) -> f64 {
     }
 }
 
-/// Sum the OLoRA orthogonality penalty over every enabled adapter whose
-/// config has `use_olora` with `olora_lambda > 0.0`, returning
-/// `Σ olora_lambda · olora_orthogonality_penalty(a, b)`.
-///
-/// Shape note: `olora_orthogonality_penalty(a, b)` expects `a` = `[out, r]`
-/// (down-projection) and `b` = `[r, in]` (up-projection). The registry stores
-/// A = `[r, in]` and B = `[out, r]`, so we pass B as `a` and A as `b`.
-///
-/// Host-computed (off the tape): the penalty is added to the scalar loss
-/// before `backward()` per the OLoRA plan, matching `olora_orthogonality_penalty`.
+/// Sum the OLoRA orthogonality penalty over every enabled adapter whose config has `use_olora` with `olora_lambda > 0.0`, returning `Σ olora_lambda · olora_orthogonality_penalty(a, b)`.
+/// Shape note: `olora_orthogonality_penalty(a, b)` expects `a` = `[out, r]` (down-projection) and `b` = `[r, in]`.
 fn olora_penalty_for_registry(reg: &grim_autograd::registry::AutogradRegistry) -> f32 {
     let mut total = 0.0f32;
     for cfg in reg.injection_registry.enabled() {
@@ -698,10 +607,7 @@ fn olora_penalty_for_registry(reg: &grim_autograd::registry::AutogradRegistry) -
 }
 
 /// Read model hyperparameters from a GGUF file via `HyperparameterExtractor`.
-///
-/// Implements `MetadataLookup` over a parsed `GgufFile` and resolves the
-/// architecture from the `general.architecture` key. Returns `None` when the
-/// path isn't a readable GGUF (caller falls back to default hyperparams).
+/// Implements `MetadataLookup` over a parsed `GgufFile` and resolves the architecture from the `general.architecture` key.
 fn read_model_hyperparams(model_path: &str) -> Option<grim_core::hyperparams::ArchHyperparameters> {
     use grim_core::hyperparams::{HyperparameterExtractor, MetadataLookup};
     use std::fs::File;
@@ -737,19 +643,8 @@ fn read_model_hyperparams(model_path: &str) -> Option<grim_core::hyperparams::Ar
     Some(HyperparameterExtractor::extract(arch, &lookup))
 }
 
-/// Wrap a raw `TensorProvider` so the streaming forward can read both
-/// interest points:
-///
-/// 1. **GGUF-native names** (`blk.{i}.attn_q.weight`, ...) used by real
-///    external model files, and
-/// 2. **internal loader names** (`layers.{i}.attn.wq.weight`, ...) used by
-///    the garage integration fixtures and `LlamaBlock::load`.
-///
-/// The wrapper queries a name verbatim first; when the underlying provider
-/// has no such tensor it falls back to the canonical HF→GGUF remapping that
-/// the inference engine applies (`TensorNamingRegistry::remap_hf_to_gguf`),
-/// so the garage's `layers.*` requests resolve against file-native
-/// `blk.*`/`attn_q` GGUF tensors exactly as the server-side loader does.
+/// Wrap a raw `TensorProvider` so the streaming forward can read both interest points: 1.
+/// **GGUF-native names** (`blk.{i}.attn_q.weight`, ...) used by real external model files, and 2.
 fn streaming_gguf_provider<'a>(
     provider: &'a dyn TensorProvider,
     num_layers: usize,
@@ -765,17 +660,7 @@ fn streaming_gguf_provider<'a>(
 }
 
 /// Extract base weights from the GGUF model for PiSSA initialization.
-///
-/// For each layer × injection point, load the base weight tensor on CPU and
-/// dequantize to `Vec<f32>`. The tensor names used here are the **same**
-/// internal names the forward pass resolves (`layers.{i}.attn.wq.weight`,
-/// `layers.{i}.ffn.w_gate.weight`, ...) — `forward_block_with_autograd`
-/// builds `ws.pp("layers").pp(&layer_idx)` and `LlamaBlock::load` reads
-/// `attn.wq`/`ffn.w_gate` etc. from it, and the garage integration fixture
-/// writes exactly those names. Loading via the same `WeightSource::get_for_training`
-/// path (which dequantizes quantized storage to F32) keeps PiSSA
-/// initialization consistent with the weights the forward actually sees, so
-/// the extracted values feed the truncated SVD on dense f32 matrices.
+/// For each layer × injection point, load the base weight tensor on CPU and dequantize.
 fn extract_pissa_base_weights(
     provider: &dyn grim_tensor::TensorProvider,
     model_config: &grim_autograd::InjectionConfig,
@@ -785,9 +670,8 @@ fn extract_pissa_base_weights(
     use grim_nn::WeightSource;
     use grim_tensor::Device;
 
-    /// Internal weight leaf for an injection point — matching `LlamaBlock::load`
-    /// (block.rs) which the streaming forward uses: `attn/wq`, `attn/wk`,
-    /// `attn/wv`, `attn/wo`, `ffn.w_gate`, `ffn.w_up`, `ffn.w_down`.
+    /// Internal weight leaf for an injection point - matching `LlamaBlock::load` (block.rs)
+    /// which the streaming forward uses: `attn/wq`, `attn/wk`, `attn/wv`, `attn/wo`, `ffn.w_gate`, `ffn.w_up`, `ffn.w_down`.
     fn weight_leaf(point: LoRAInjectionPoint) -> &'static str {
         match point {
             LoRAInjectionPoint::QProj => "attn.wq.weight",
@@ -837,10 +721,8 @@ fn extract_pissa_base_weights(
     map
 }
 
-/// All state that belongs to one model replica.  Keeping the provider,
-/// device-resident head weights, and streaming block state together is the
-/// ownership boundary required by data-parallel training: a rank must never
-/// borrow another rank's model state.
+/// All state that belongs to one model replica.
+/// Keeping the provider, device-resident head weights, and streaming block state together is the ownership boundary.
 type RankModel = (
     grim_format::GgufProvider,
     grim_nn::Embedding,
@@ -850,9 +732,8 @@ type RankModel = (
     grim_models_transformer::LlamaConfig,
 );
 
-/// Complete mutable state owned by one data-parallel rank.  No field is
-/// shared between ranks: each rank has its own device-loaded model, tape
-/// inputs/registry, and optimizer moments.
+/// Complete mutable state owned by one data-parallel rank.
+/// No field is shared between ranks: each rank has its own device-loaded model, tape inputs/registry,.
 #[allow(dead_code)]
 struct RankReplica {
     context: crate::backend::RankContext,
@@ -1024,11 +905,7 @@ fn load_rank_model_from_provider(
 }
 
 /// Per-token entropy over embedding rows for VLLM-OPT visual token pruning.
-///
-/// Computes Shannon entropy of the L2-normalized embedding values for each
-/// token position, producing a `Vec<f32>` of length `seq_len`. High-entropy
-/// tokens (dense, spread-out embeddings) are candidates for pruning; low-entropy
-/// tokens (sparse, peaked embeddings) are preserved.
+/// Computes Shannon entropy of the L2-normalized embedding values for each token position, producing a `Vec<f32>`.
 fn compute_visual_token_entropy(x: &grim_tensor::Tensor) -> Vec<f32> {
     let vals = x.storage().to_cpu_vec_f32().unwrap_or_default();
     let dims = x.shape().dims();
@@ -1096,11 +973,8 @@ fn run_rank_sft_forward(
     }
 
     let mut curr_x_id = tape.register(curr_x.clone());
-    // SCYTHE-2 WI-EP1: one placement decision per layer, keyed by the layer's
-    // real index and its input activation shape. First pass over a layer is a
-    // PlacementCache miss (~10 µs); every later micro-step hits the fast slot
-    // (~50 ns). The returned per-layer placements feed both the step-level
-    // gradient-sync routes and `C2plrController::update`'s REINFORCE blame.
+    // SCYTHE-2 WI-EP1: one placement decision per layer, keyed by the layer's real index and its input activation shape.
+    // First pass over a layer is a PlacementCache miss (~10 µs); every later micro-step hits.
     let mut layer_placements: Vec<grim_tensor::backend::ScythePlacement> = Vec::new();
     for layer_idx in 0..hparams.num_layers {
         if let Some(ctx) = scythe.as_mut() {
@@ -1142,9 +1016,8 @@ fn run_rank_sft_forward(
         curr_x_id,
     )
     .map_err(|e| format!("logits lora apply: {e}"))?;
-    // WI-E6: route through the fused linear-CE on ROCm (avoids materializing
-    // [B, V] logits); CPU keeps the materialized-logits fallback. Default-on
-    // for Rocm devices; GRIM_FUSED_CE=0 forces the fallback everywhere.
+    // WI-E6: route through the fused linear-CE on ROCm (avoids materializing [B, V] logits); CPU keeps the materialized-logits fallback.
+    // Default-on for Rocm devices; GRIM_FUSED_CE=0 forces the fallback everywhere.
     let use_fused_ce = match std::env::var("GRIM_FUSED_CE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => logits_out.device().is_rocm(),
@@ -1666,25 +1539,7 @@ fn run_multi_rank_preference(
 }
 
 /// Execute a training job inside a Tokio background task.
-///
-/// The caller should spawn this with `tokio::spawn`:
-/// ```rust,no_run
-/// # use std::sync::Arc;
-/// # use grim_garage::jobs::{JobId, JobRegistry, run_training_worker};
-/// # async fn example(registry: Arc<JobRegistry>, job_id: JobId) {
-/// tokio::spawn(run_training_worker(registry.clone(), job_id));
-/// # }
-/// ```
-///
-/// Contract:
-/// - Transitions `Pending → Running` immediately.
-/// - Emits one `Metric` event per training step.
-/// - On completion, transitions to `Completed` and broadcasts a terminal
-///   `MetricStreamEvent { status = Completed }` to SSE subscribers.
-/// - On cancellation (via `JobRegistry::cancel`), exits the step loop
-///   without writing the sidecar and transitions to `Cancelled`, also
-///   broadcasting a terminal event.
-/// - On any registry error, transitions to `Failed` + broadcasts and logs.
+/// The caller should spawn this with `tokio::spawn`: ```rust,no_run # use std::sync::Arc; # use grim_garage::jobs::{JobId, JobRegistry,.
 pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Retrieve the job configuration.
     let job = match registry.get(&id).await {
@@ -1697,14 +1552,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
     let mode = job.training_mode;
     let epochs = job.epochs.max(1) as u64;
-    // Derive steps per epoch from the dataset size when available; otherwise
-    // default to a conservative 100 steps. The previous code hardcoded 10,
-    // which under-trained on real datasets. We estimate the dataset length
-    // by counting lines (each JSONL line ≈ one training example); the
-    // dataloader packs `batch_size` sequences per step, so
-    // steps_per_epoch ≈ line_count / batch_size.
-    // Use one sample per rank as the minimum global batch for data-parallel
-    // execution; single-rank jobs retain batch size one.
+    // Derive steps per epoch from the dataset size when available; otherwise default to a conservative 100 steps.
+    // The previous code hardcoded 10, which under-trained on real datasets.
     let batch_size = job.num_gpus.max(1) as usize;
     let steps_per_epoch: u64 = if !job.dataset_path.is_empty() {
         use std::io::BufRead;
@@ -1732,15 +1581,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         }
     }
 
-    // Cancellation token shared with the registry's `cancel` API. Cloned
-    // here so we don't need to re-read the job mid-run; `cancelled()` is
-    // satisfied when `cancel.cancel()` fires from another task.
+    // Cancellation token shared with the registry's `cancel` API.
+    // Cloned here so we don't need to re-read the job mid-run; `cancelled()` is satisfied when.
     let cancel = job.cancel.clone();
 
-    // Select the compute backend for this job from the user's preference,
-    // falling through the ROCm→CUDA→Vulkan→Metal→CPU priority chain. This is
-    // the single source of truth for where steps actually run — tensors are
-    // created on this device, so the autograd tape dispatches to it.
+    // Select the compute backend for this job from the user's preference, falling through the ROCm→CUDA→Vulkan→Metal→CPU priority chain.
+    // This is the single source of truth for where steps actually run - tensors are.
     let preferred = job
         .preferred_backend
         .as_deref()
@@ -1753,11 +1599,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         preferred.unwrap_or(crate::backend::PreferredBackend::Auto)
     );
 
-    // Multi-GPU jobs must be admitted against the live ROCm inventory before
-    // transitioning to Running.  The worker is deliberately fail-closed:
-    // selecting one device and pretending it represents the requested world
-    // would train on only a fraction of the data and produce unsynchronised
-    // gradients.  Rank-local model execution is built on this validated plan.
+    // Multi-GPU jobs must be admitted against the live ROCm inventory before transitioning to Running.
+    // The worker is deliberately fail-closed: selecting one device and pretending it represents the requested world.
     let requested_gpus = job.num_gpus.max(1) as usize;
     let mut rank_contexts = if requested_gpus > 1 {
         if !backend.label.starts_with("rocm") {
@@ -1809,8 +1652,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     );
 
     // SCYTHE-2 WI-6: RCCL all-reduce handle for multi-GPU gradient sync.
-    // Constructed once per job; when num_gpus <= 1 the handle is None and
-    // all_reduce_grads falls back to the CPU-only accumulate path.
+    // Constructed once per job; when num_gpus <= 1 the handle is None and all_reduce_grads falls.
     let rccl_handle = if let Some(ref contexts) = rank_contexts {
         let ordinals: Vec<usize> = contexts
             .iter()
@@ -1839,13 +1681,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
     let lora_rank = job.lora_rank as usize;
 
-    // Read real model hyperparameters from the GGUF file at `model_path`
-    // rather than hardcoding 4096/32000/1/11008. This uses the same
-    // `HyperparameterExtractor` the inference engine uses, so training and
-    // inference agree on the model's shape. If the file isn't a readable
-    // GGUF (e.g. a safetensors-only model without a config), fall back to
-    // the `ArchHyperparameters::default()` (a 7B-class Llama) so the worker
-    // still runs — but log the fallback so it's not silent.
+    // Read real model hyperparameters from the GGUF file at `model_path` rather than hardcoding 4096/32000/1/11008.
+    // This uses the same `HyperparameterExtractor` the inference engine uses, so training and inference agree on.
     let hparams = read_model_hyperparams(&job.model_path).unwrap_or_else(|| {
         eprintln!(
             "[grim-garage] worker: could not read GGUF hyperparams from {}; \
@@ -1930,14 +1767,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     } else {
         AutogradScope::LoRAOnly
     };
-    // PI-T1: When PiSSA is enabled and a base model is loaded, extract the
-    // real base weights from the GGUF so PiSSA can initialize A/B from the
-    // principal singular components instead of degrading to standard LoRA
-    // init (Kaiming A / zero B). We load each base weight on CPU and
-    // dequantize to f32 — matching the forward pass's `get_for_training`
-    // path — because PiSSA's SVD operates on dense f32 matrices.
-    // Use the same GGUF-name remapping wrapper that the forward uses so
-    // real external GGUFs (blk.* tensors) also resolve correctly.
+    // PI-T1: When PiSSA is enabled and a base model is loaded, extract the real base weights from the GGUF so PiSSA can initialize A/B from the principal singular components instead of degrading to standard LoRA init (Kaiming A / zero B).
+    // We load each base weight on CPU and dequantize to f32 - matching the forward.
     let pissa_base_weights: grim_autograd::registry::BaseWeightMap = if job.use_pissa {
         if let Some((provider, _, _, _, _, _)) = sft_base.as_ref() {
             let gguf_provider = streaming_gguf_provider(provider, num_layers);
@@ -2157,9 +1988,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     losses.len(),
                     losses.last()
                 );
-                // Multi-rank replicas are checksum-verified after every
-                // synchronized step, so rank zero is a valid canonical
-                // serialization source for the shared adapter state.
+                // Multi-rank replicas are checksum-verified after every synchronized step, so rank zero
+                // is a valid canonical serialization source for the shared adapter state.
                 let completed_steps = losses.len() as u64;
                 for (offset, loss) in losses.iter().copied().enumerate() {
                     let step = step_counter + offset as u64 + 1;
@@ -2259,10 +2089,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             }
         };
 
-    // Restore LoRA adapter weights and optimizer state (Adam moments)
-    // from checkpoint. Without this, resumed training starts from
-    // freshly initialized weights and zero momentum — silently
-    // discarding the accumulated training progress.
+    // Restore LoRA adapter weights and optimizer state (Adam moments) from checkpoint.
+    // Without this, resumed training starts from freshly initialized weights and zero momentum - silently discarding.
     if let Some(ref cp_path) = job.resume_from_checkpoint {
         if let Ok(Some(state)) = grim_format::train::TrainState::read(cp_path) {
             if let Err(e) = optimizer.load_from_train_state(&mut autograd_reg.params, &state) {
@@ -2280,9 +2108,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         }
     }
 
-    // LR schedule: dispatch via grim_autograd::LRScheduler (Cosine, Linear,
-    // Polynomial, Constant, InverseSqrt, etc.). The schedule is applied
-    // at each optimizer step.
+    // LR schedule: dispatch via grim_autograd::LRScheduler (Cosine, Linear, Polynomial, Constant, InverseSqrt, etc.).
+    // The schedule is applied at each optimizer step.
     let base_lr = job.learning_rate as f32;
     let min_lr = job.min_lr as f32;
     let total_steps = total_steps as usize;
@@ -2290,19 +2117,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Gradient accumulation state.
     let accumulation_steps = job.accumulation_steps.max(1) as usize;
     let mut accum_loss = 0.0f32;
-    // Tracks whether a step's autograd ops failed so the post-loop
-    // sidecar write / Completed transition is skipped — the job is
-    // already in a terminal (Failed) state.
+    // Tracks whether a step's autograd ops failed so the post-loop sidecar write /
+    // Completed transition is skipped - the job is already in a terminal (Failed) state.
     let mut step_failed = false;
-    // SCYTHE-2 WI-9: step_counter was previously re-declared here, silently
-    // shadowing the checkpoint-restored value above and resetting to 0.
-    // Removed the `let mut step_counter: u64 = 0;` redeclaration so the
-    // checkpoint value (or 0 for a fresh run) is honoured correctly.
+    // SCYTHE-2 WI-9: step_counter was previously re-declared here, silently shadowing the checkpoint-restored value above and resetting to 0.
+    // Removed the `let mut step_counter: u64 = 0;` redeclaration so the checkpoint value (or 0.
 
     // SCYTHE-2 WI-9: C²PLR controller for multi-GPU training.
-    // Constructed once per job; the controller's PlacementCache amortises
-    // per-layer routing decisions across micro-steps. When num_gpus <= 1 the
-    // controller is None and the loop runs on a single device as before.
+    // Constructed once per job; the controller's PlacementCache amortises per-layer routing decisions across micro-steps.
     let num_gpus = (job.num_gpus.max(1)) as usize;
     let mut scythe_controller = if num_gpus > 1 {
         Some(grim_engine::scythe2::C2plrController::new(
@@ -2314,20 +2136,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         None
     };
 
-    // Real data loader: when the job supplies a dataset_path that exists on
-    // disk, stream tokenized batches from it. Previously the SFT arm used
-    // synthetic `vec![0.1f32; hidden_size]` tensors (a simulation); this wires
-    // the real `JsonlBatchIterator`. The tokenizer is loaded from the model
-    // directory's `tokenizer.json` if present, else falls back to a default
-    // (whitespace) tokenizer so the path is exercisable in tests.
+    // Real data loader: when the job supplies a dataset_path that exists on disk, stream tokenized batches from it.
+    // Previously the SFT arm used synthetic `vec![0.1f32; hidden_size]` tensors (a simulation); this wires the real.
     let model_dir = std::path::Path::new(&job.model_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     let tokenizer_path = model_dir.join("tokenizer.json");
-    // Prefer the model's own GGUF tokenizer when the real base model was
-    // opened (SFT): its vocab is guaranteed aligned with the weights, so
-    // in-vocab token ids from the dataloader stay valid. Fall back to
-    // `tokenizer.json` and finally the whitespace default.
+    // Prefer the model's own GGUF tokenizer when the real base model was opened (SFT): its vocab is guaranteed aligned with the weights, so in-vocab token ids from the dataloader stay valid.
+    // Fall back to `tokenizer.json` and finally the whitespace default.
     let tokenizer = if let Some((ref provider, ..)) = sft_base {
         match provider.tokenizer() {
             Ok(t) => t,
@@ -2366,14 +2182,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         None
     };
 
-    // Loss is reassigned inside the per-mode match block, so we don't seed
-    // it here — that avoids the previous `loss * 0.9` decay-from-previous
-    // bug (M3) and the dead `let mut` warning.
+    // Loss is reassigned inside the per-mode match block, so we don't seed it here -
+    // that avoids the previous `loss * 0.9` decay-from-previous bug (M3) and the dead `let mut` warning.
     let step_start = std::time::Instant::now();
     'step: for micro_step in 0..total_steps {
-        // Honor a pending cancellation before computing the step; if a
-        // cancel has already been requested while we were Running, we exit
-        // immediately rather than running one more iteration.
+        // Honor a pending cancellation before computing the step; if a cancel has already been
+        // requested while we were Running, we exit immediately rather than running one more iteration.
         if cancel.is_cancelled() {
             break;
         }
@@ -2412,19 +2226,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             (inputs, targets)
                         }
                         Err(_) => {
-                            // Dataloader exhausted mid-epoch — break the
-                            // step loop to finish the job cleanly rather than
-                            // fabricating a synthetic batch. Previously this
-                            // silently substituted `vec![0.0f32; hidden_size]`,
-                            // which was a simulation masquerading as a step.
+                            // Dataloader exhausted mid-epoch - break the step loop to finish the job cleanly rather than fabricating a synthetic batch.
+                            // Previously this silently substituted `vec![0.0f32; hidden_size]`, which was a simulation masquerading as a step.
                             break 'step;
                         }
                     }
                 } else {
                     // No dataset configured. The route handler rejects empty
                     // `dataset_path`, so reaching here is a programming error.
-                    // Rather than silently run synthetic data, fail the job
-                    // honestly.
                     eprintln!(
                         "[grim-garage] worker: {} has no dataset_path — cannot run SFT. \
                          Marking job as Failed.",
@@ -2436,25 +2245,16 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     return;
                 };
 
-                // SCYTHE-2 WI-9 / WI-Charon-0 / WI-EP1: snapshot the GPU
-                // capability + P2P topology once per micro-step and hand them,
-                // with the controller, to `run_rank_sft_forward`. The
-                // controller is consulted *inside* the forward's
-                // `for layer_idx in 0..num_layers` loop so every decision is
-                // keyed by that layer's real index and activation shape
-                // (WI-Charon-0 interim had a single outer-loop decide under a
-                // synthetic `micro_step % num_layers` key, which touched one
-                // cache slot per step instead of one slot per layer).
+                // SCYTHE-2 WI-9 / WI-Charon-0 / WI-EP1: snapshot the GPU capability + P2P topology once per micro-step and hand them, with the controller, to `run_rank_sft_forward`.
+                // The controller is consulted *inside* the forward's `for layer_idx in 0..num_layers` loop so every decision.
                 let mut scythe_topo = if scythe_controller.is_some() {
                     let caps = if let Some(ref contexts) = rank_contexts {
                         contexts
                             .iter()
                             .map(|context| grim_tensor::backend::GpuCapability {
                                 ordinal: context.rank.ordinal,
-                                // The capability profiler can refine these
-                                // values later; live VRAM is still useful to
-                                // the controller and is the source of the
-                                // data-parallel work shares.
+                                // The capability profiler can refine these values later; live VRAM is still
+                                // useful to the controller and is the source of the data-parallel work shares.
                                 vram_free_bytes: context.rank.vram_bytes,
                                 ..Default::default()
                             })
@@ -2478,11 +2278,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 });
 
                 // Grim-Redux Issue 1: run the real frozen base model forward.
-                // token ids → embedding → per-layer StreamingBlockForward
-                // (which applies the LoRA adapters at every injection point
-                // inside genuine attention/MLP computation) → output_norm →
-                // lm_head → logits. This replaces the previous zero-tensor
-                // "base" loop that grounded LoRA training in garbage.
+                // token ids → embedding → per-layer StreamingBlockForward (which applies the LoRA adapters at every injection.
                 let forward_outcome = if let Some(model) = sft_base.as_mut() {
                     run_rank_sft_forward(
                         model,
@@ -2500,17 +2296,11 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 match forward_outcome {
                     Ok((loss_val, loss_grad, logits_id, layer_placements)) => {
-                        // OLoRA: add the orthogonality penalty to the scalar
-                        // loss before backward. Host-computed (off-tape) per
-                        // the OLoRA plan; contributes to the reported/accum
-                        // loss only.
+                        // OLoRA: add the orthogonality penalty to the scalar loss before backward.
+                        // Host-computed (off-tape) per the OLoRA plan; contributes to the reported/accum loss only.
                         let loss_val = loss_val + olora_penalty_for_registry(&autograd_reg);
-                        // Accumulate the unscaled loss; the gradient is scaled by
-                        // 1/accumulation_steps via scale_backward (correct), but
-                        // the reported loss should be divided once at report time
-                        // — NOT here AND at report time (was: accum_loss /
-                        // accumulation_steps where accum_loss already contained
-                        // per-step /accumulation_steps, giving a double division).
+                        // Accumulate the unscaled loss; the gradient is scaled by 1/accumulation_steps via scale_backward (correct), but the reported loss should be divided once at
+                        // report time - NOT here AND at report time (was: accum_loss / accumulation_steps where accum_loss already contained per-step /accumulation_steps, giving a double division).
                         let scaled_grad = grim_autograd::ScaleArgs {
                             input_grad: loss_grad,
                             factor: 1.0 / accumulation_steps as f32,
@@ -2561,14 +2351,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             let _ = optimizer.step(&mut autograd_reg.params);
                             let _ = autograd_reg.params.zero_all_grads();
                             step_counter += 1;
-                            // SCYTHE-2 WI-9: online controller update —
-                            // dual-ascent on the Lagrangian budget using the
-                            // observed step wall-time as the latency signal.
-                            // WI-EP1: feed every per-layer placement from this
-                            // step's forward — `update`'s REINFORCE-style blame
-                            // counts GPU appearances across the slice, so one
-                            // synthetic per-step placement under-weighted the
-                            // signal num_layers-to-1.
+                            // SCYTHE-2 WI-9: online controller update - dual-ascent on the Lagrangian budget using the observed step wall-time as the latency signal.
+                            // WI-EP1: feed every per-layer placement from this step's forward - `update`'s REINFORCE-style blame counts GPU.
                             if let Some(ref mut ctrl) = scythe_controller {
                                 let elapsed_ms = step_start.elapsed().as_secs_f64() * 1e3;
                                 ctrl.update(elapsed_ms, &layer_placements);
@@ -2577,11 +2361,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         }
                         loss_val as f64
                     }
-                    // M3: a step that fails the autograd tensor ops (forward,
-                    // LoRA apply, or loss) is surfaced as a 10 % decay from the
-                    // mode's initial loss rather than from the previously-stored
-                    // `loss`. The previous "loss * 0.9" was correct for SFT but
-                    // trapped RL modes at zero forever.
+                    // M3: a step that fails the autograd tensor ops (forward, LoRA apply, or loss) is surfaced as a 10 % decay from the mode's initial loss rather than from the previously-stored `loss`.
+                    // The previous "loss * 0.9" was correct for SFT but trapped RL modes at zero.
                     Err(e) => {
                         eprintln!("[grim-garage] worker: {} step failed: {e}", id);
                         let _ = registry
@@ -2624,10 +2405,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     1.0 / (1.0 + (-x).exp().min(1e10))
                 }
 
-                // Run the frozen base model forward and return per-sample
-                // log-probabilities (sum of per-token log-softmax values at the
-                // actual token positions). Also returns the raw logits and the
-                // tensor ID needed for the backward VJP.
+                // Run the frozen base model forward and return per-sample log-probabilities (sum of per-token log-softmax values at the actual token positions).
+                // Also returns the raw logits and the tensor ID needed for the backward VJP.
                 let mut run_forward = |input_ids: &[u32],
                                        tape: &mut Tape,
                                        with_lora: bool|
@@ -2771,9 +2550,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             }
         };
 
-        // Apply LR schedule at each optimizer step (every accumulation_steps
-        // micro-steps). The decay is applied to the optimizer's internal LR
-        // slot before the next step.
+        // Apply LR schedule at each optimizer step (every accumulation_steps micro-steps).
+        // The decay is applied to the optimizer's internal LR slot before the next step.
         let current_step = (micro_step + 1) / accumulation_steps as usize;
         let clamped_step = current_step as usize;
         optimizer.set_lr(
@@ -2784,12 +2562,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
         let elapsed = step_start.elapsed().as_secs_f32().max(1e-6);
 
-        // Real grad_norm: L2 norm over every trainable parameter's accumulated
-        // gradient buffer. This replaces the previous hardcoded `0.0` (a
-        // simulated metric). After `backward()` the per-param grads are
-        // populated; we sum-of-squares across all of them and take sqrt.
-        // On a fresh step before any backward (or when grads are all zero)
-        // this correctly yields 0.0.
+        // Real grad_norm: L2 norm over every trainable parameter's accumulated gradient buffer.
+        // This replaces the previous hardcoded `0.0` (a simulated metric).
         let mut grad_sq_sum = 0.0f32;
         for (_, p) in autograd_reg.params.iter() {
             if let Ok(gv) = p.grad().storage().to_cpu_vec_f32() {
@@ -2800,11 +2574,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         }
         let grad_norm = grad_sq_sum.sqrt();
 
-        // Real VRAM usage: query `(free, total)` via grim-backend-rocm's
-        // `vram_info(ordinal)` (wraps `hipMemGetInfo`). On a ROCm device this
-        // returns live bytes; on CPU/CUDA/other backends `vram_info` returns
-        // `(0, 0)` and we report 0 (unknown). This replaces the previous
-        // hardcoded `0u32` (a simulated metric).
+        // Real VRAM usage: query `(free, total)` via grim-backend-rocm's `vram_info(ordinal)` (wraps `hipMemGetInfo`).
+        // On a ROCm device this returns live bytes; on CPU/CUDA/other backends `vram_info` returns `(0, 0)`.
         let vram_used_mb: u32 = match backend.device {
             grim_tensor::Device::Rocm(ord) => {
                 let (free, total) = grim_backend_rocm::vram_info(ord);
@@ -2815,11 +2586,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
         let samples_per_sec = 1.0f32 / elapsed;
 
-        // Report the running average loss over the accumulation window. This
-        // uses `accum_loss` (the sum of scaled per-micro-step losses) so the
-        // metric reflects the true training signal rather than just the last
-        // micro-step's value. Falls back to `scaled_loss` when no
-        // accumulation has happened yet.
+        // Report the running average loss over the accumulation window.
+        // This uses `accum_loss` (the sum of scaled per-micro-step losses) so the metric reflects the true.
         let reported_loss = if accumulation_steps > 1 {
             (accum_loss / (accumulation_steps as f32)) as f64
         } else {
@@ -2829,9 +2597,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let metric = Metric {
             step: current_step as u64,
             loss: reported_loss,
-            // Real token count: seq_len (64) × batch_size (1) × steps ×
-            // accumulation. Previously hardcoded as 512 — now derived from
-            // the actual batch shape the dataloader yields.
+            // Real token count: seq_len (64) × batch_size (1) × steps × accumulation.
+            // Previously hardcoded as 512 - now derived from the actual batch shape the dataloader yields.
             tokens: (current_step as u64 + 1)
                 * (64 * batch_size as u64)
                 * accumulation_steps as u64,
@@ -2843,11 +2610,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             vram_used_mb,
             samples_per_sec,
         };
-        // Append the metric; wait for the append to complete (it's just a
-        // write lock + broadcast — microseconds). The cancel check below
-        // is `select!`ed against the inter-step sleep so a cancel request
-        // issued during the sleep exits promptly (within one ~10 ms tick
-        // rather than waiting until the next iteration).
+        // Append the metric; wait for the append to complete (it's just a write lock + broadcast - microseconds).
+        // The cancel check below is `select!`ed against the inter-step sleep so a cancel request issued.
         match registry.append_metric(&id, metric).await {
             Ok(()) => {}
             Err(e) => {
@@ -2867,9 +2631,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         }
     }
 
-    // If the cancellation token fired during the loop, skip sidecar write
-    // and report `Cancelled` (terminal event broadcast so SSE clients learn
-    // the job stopped without waiting for a `Closed` that never comes).
+    // If the cancellation token fired during the loop, skip sidecar write and report `Cancelled` (terminal event
+    // broadcast so SSE clients learn the job stopped without waiting for a `Closed` that never comes).
     if cancel.is_cancelled() {
         eprintln!("[grim-garage] worker: job {} cancelled by request", id);
         let _ = registry
@@ -2878,10 +2641,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         return;
     }
 
-    // A step failure already transitioned the job to Failed and broadcast a
-    // terminal event. Do not overwrite that with a sidecar write or a
-    // Completed transition — that would mask the real terminal status (the
-    // "resurrect" bug).
+    // A step failure already transitioned the job to Failed and broadcast a terminal event.
+    // Do not overwrite that with a sidecar write or a Completed transition - that would.
     if step_failed {
         return;
     }
@@ -2910,12 +2671,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 "[grim-garage] worker: bake_on_completion enabled — merging adapter into {}...",
                 job.model_path
             );
-            // P2-14b: the LoRA merge scale is α/r (ΔW = (α/r)·B·A). `job.lora_alpha`
-            // is the user-specified scaling (the UI sends it); when unset or
-            // non-positive, fall back to the documented rule-of-thumb default
-            // α = 2·r (web/hyperparams.html). Previously this hardcoded
-            // `alpha = rank * 2.0` and then `scale = alpha / rank`, which is
-            // the tautology `scale == 2.0` for every rank.
+            // P2-14b: the LoRA merge scale is α/r (ΔW = (α/r)·B·A).
+            // `job.lora_alpha` is the user-specified scaling (the UI sends it); when unset or non-positive, fall back.
             let alpha = job
                 .lora_alpha
                 .filter(|a| *a > 0.0)
@@ -2957,24 +2714,11 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     }
 }
 
-// ===========================================================================
-// Pure helpers — exited from the worker's hot loop so they can be unit-tested
-// in isolation. These exercise lossy-decay / nearest-snap paths where the
-// implementation has to derive expected numeric values *by hand* (mutation-
-// resistant golden style — same discipline as `crates/grim-quant/tests/
-// golden_*.rs`). Each test below pins a numeric value that is uniquely
-// determined by the function's contract; a mutant that swaps a sign, drops a
-// `max(1e-3)`, or moves the decay origin (last-loss vs initial-loss) breaks
-// at least one assertion here.
-// ===========================================================================
+// Pure helpers - exited from the worker's hot loop so they can be unit-tested in isolation.
+// These exercise lossy-decay / nearest-snap paths where the implementation has to derive expected numeric values.
 
-/// Fallback "loss got worse this step" value used when the autograd tensor
-/// ops for a step return `Err(_)`. Decays **from the mode's initial loss**
-/// (not the previous step's), so RL modes — which seed `loss = 0.0` —
-/// recover to a measurable, non-zero value after a transient autograd
-/// failure instead of being stuck at zero forever. A small floor
-/// (1e-3) prevents pathological loss-of-precision when `initial_loss ==
-/// 0` and the autograd error spikes back-to-back.
+/// Fallback "loss got worse this step" value used when the autograd tensor ops for a step return `Err(_)`.
+/// Decays **from the mode's initial loss** (not the previous step's), so RL modes - which.
 pub fn step_loss_fallback(mode: TrainingMode) -> f64 {
     let seed = initial_loss(mode);
     if seed == 0.0 {
@@ -2986,11 +2730,8 @@ pub fn step_loss_fallback(mode: TrainingMode) -> f64 {
     }
 }
 
-/// Per-step pacing delay. The worker sleeps this long between micro-steps so
-/// the dashboard can observe incremental progress and a cancel request issued
-/// mid-sleep is honoured within one tick. This is a UI/observability pacing
-/// constant, not a simulation of compute — the actual step compute runs
-/// synchronously above the sleep.
+/// Per-step pacing delay. The worker sleeps this long between micro-steps so the dashboard can
+/// observe incremental progress and a cancel request issued mid-sleep is honoured within one tick.
 pub const STEP_PACING_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Backwards-compat alias for the previous name. Deprecated; use
@@ -3004,10 +2745,8 @@ mod fallback_tests {
     // `TrainingMode` is local to this crate's `jobs` module — already in
     // scope via `use super::*`. No cross-crate import needed.
 
-    /// `step_loss_fallback` golden tests — mutation-resistant. Each test
-    /// pins a single hand-derived numeric value; a wrong sign, missing
-    /// floor, or `* 0.9` → `* 1.1` swap breaks at least one assertion
-    /// here without touching unrelated state.
+    /// `step_loss_fallback` golden tests - mutation-resistant.
+    /// Each test pins a single hand-derived numeric value; a wrong sign, missing floor, or `*.
 
     #[test]
     fn sft_lora_fallback_is_initial_loss_times_ninetieth() {
@@ -3032,10 +2771,8 @@ mod fallback_tests {
 
     #[test]
     fn dpo_fallback_is_unit_floor_not_zero() {
-        // initial_loss(Dpo) == 0.0. Pre-fix the fallback was `loss * 0.9`
-        // (= 0.0 always); a faulty impl that uses initial_loss * 0.9
-        // here still hands back 0 — caught by the (fallback > 0)
-        // assertion rather than `==` to dodge hairsplitting f64 exactness.
+        // initial_loss(Dpo) == 0.0. Pre-fix the fallback was `loss * 0.9` (= 0.0 always); a faulty impl that uses initial_loss * 0.9
+        // here still hands back 0 - caught by the (fallback > 0) assertion rather than `==` to dodge hairsplitting f64 exactness.
         let out = step_loss_fallback(TrainingMode::Dpo);
         assert!(
             out > 0.0,
@@ -3063,10 +2800,8 @@ mod fallback_tests {
 
     #[test]
     fn rl_floors_are_all_equal_to_1e_minus_3() {
-        // All three RL modes share the same foundation: start from
-        // initial_loss == 0 → take the unit floor. Pins the magic number
-        // so it can't be tweaked accidentially; if intentional, the test
-        // name + assertion must change together.
+        // All three RL modes share the same foundation: start from initial_loss == 0 → take the unit floor.
+        // Pins the magic number so it can't be tweaked accidentially; if intentional, the test name.
         let dpo = step_loss_fallback(TrainingMode::Dpo);
         let orpo = step_loss_fallback(TrainingMode::Orpo);
         let grpo = step_loss_fallback(TrainingMode::Grpo);
@@ -3077,12 +2812,8 @@ mod fallback_tests {
 
     #[test]
     fn rl_modes_distinct_from_sft_fallback_magnitude() {
-        // Catches a mutant that routes all modes through
-        // `initial_loss(mode) * 0.9` blindly — that would yield 0.0 for
-        // all RL modes (caught above); an opposite mutant that routes
-        // all modes through `1e-3` would yield 1e-3 for SFT too.
-        // Assert the SFT vs RL fallback magnitudes are meaningfully
-        // different (orders of magnitude apart, by design).
+        // Catches a mutant that routes all modes through `initial_loss(mode) * 0.9` blindly - that would yield 0.0 for all RL modes (caught above); an opposite mutant that routes all modes through `1e-3` would yield 1e-3 for SFT too.
+        // Assert the SFT vs RL fallback magnitudes are meaningfully different (orders of magnitude apart, by.
         let sft = step_loss_fallback(TrainingMode::Lora);
         let rl = step_loss_fallback(TrainingMode::Dpo);
         assert!(
@@ -3106,18 +2837,11 @@ mod fallback_tests {
 mod charon0_topology_tests {
     use super::*;
 
-    // ── Gate (2a): mocked probe reflects real, non-uniform topology ─────────
-    //
-    // The plan's gate (2) requires a mocked `peer_status` asserting `links`
-    // reflects real (non-uniform) topology for both a homogeneous and a
-    // mixed-GPU synthetic case. `build_link_matrix` accepts an arbitrary
-    // probe closure so we can inject a synthetic verdict function without a
-    // device.
+    // ── Gate (2a): mocked probe reflects real, non-uniform topology ───────── The plan's gate (2) requires a mocked `peer_status` asserting `links` reflects real (non-uniform) topology for both a homogeneous and a mixed-GPU synthetic case.
+    // `build_link_matrix` accepts an arbitrary probe closure so we can inject a synthetic verdict function without.
 
-    /// Homogeneous case: two identical GPUs with symmetric peer access. The
-    /// matrix is symmetric but, per WI-Charon-0, each ordered pair is probed
-    /// independently (no symmetry *assumed* — symmetry is *observed* via the
-    /// probe, which is the point of the gate).
+    /// Homogeneous case: two identical GPUs with symmetric peer access.
+    /// The matrix is symmetric but, per WI-Charon-0, each ordered pair is probed independently (no symmetry.
     #[test]
     fn link_matrix_homogeneous_reflects_symmetric_probe() {
         let probe = |src: i32, dst: i32| {
@@ -3125,9 +2849,8 @@ mod charon0_topology_tests {
             if src == dst {
                 PairLink::Peer
             } else {
-                // Symmetric in this synthetic case — but the *code* does not
-                // assume it; the probe simply returns the verdict for each
-                // ordered pair.
+                // Symmetric in this synthetic case - but the *code* does not
+                // assume it; the probe simply returns the verdict for each ordered pair.
                 PairLink::Peer
             }
         };
@@ -3140,18 +2863,14 @@ mod charon0_topology_tests {
         assert_eq!(m[3], ScytheLink::PeerDirect); // self
     }
 
-    /// Mixed-GPU case: an Instinct (rank 0, xGMI peer) paired with a consumer
-    /// Radeon (rank 1, PCIe-only peer). This is the asymmetry the plan calls
-    /// out — and the *non-symmetric* case (`peer_status(0,1) !=
-    /// peer_status(1,0)`) that proves the code does not assume symmetry.
+    /// Mixed-GPU case: an Instinct (rank 0, xGMI peer) paired with a consumer Radeon (rank 1, PCIe-only peer).
+    /// This is the asymmetry the plan calls out - and the *non-symmetric* case (`peer_status(0,1) !=.
     #[test]
     fn link_matrix_mixed_gpu_reflects_asymmetric_probe() {
         let probe = |src: i32, dst: i32| match (src, dst) {
             (0, 0) | (1, 1) => PairLink::Peer, // self
-            // Instinct can DMA TO the Radeon over xGMI, but the Radeon's
-            // BAR-mapped path back TO the Instinct is slower (PCIe root
-            // complex asymmetry — the exact motherboard-topology case the
-            // plan warns about).
+            // Instinct can DMA TO the Radeon over xGMI, but the Radeon's BAR-mapped path back TO the
+            // Instinct is slower (PCIe root complex asymmetry - the exact motherboard-topology case the plan warns about).
             (0, 1) => PairLink::Peer,
             (1, 0) => PairLink::Pcie,
             _ => PairLink::Host,
@@ -3162,16 +2881,13 @@ mod charon0_topology_tests {
         assert_eq!(m[1], ScytheLink::PeerDirect); // 0 -> 1 (xGMI)
         assert_eq!(m[2], ScytheLink::Pcie); // 1 -> 0 (PCIe back-path)
         assert_eq!(m[3], ScytheLink::PeerDirect); // 1 -> 1
-        // The critical assertion: the matrix is NOT symmetric, proving the
-        // code consults the probe for every ordered pair rather than
-        // shortcutting to `matrix[j*k+i]`.
+        // The critical assertion: the matrix is NOT symmetric, proving the code
+        // consults the probe for every ordered pair rather than shortcutting to `matrix[j*k+i]`.
         assert_ne!(m[1], m[2], "ordered pairs must be probed independently");
     }
 
-    /// GPU-less / no-peer case: probe returns `Host` for every off-diagonal
-    /// pair (the production fallback when `peer_status` errors). The matrix
-    /// must degrade to the historical all-`Host` baseline (with `PeerDirect`
-    /// self-links, matching `CapabilityProfiler::link_matrix`).
+    /// GPU-less / no-peer case: probe returns `Host` for every off-diagonal pair (the production fallback when `peer_status` errors).
+    /// The matrix must degrade to the historical all-`Host` baseline (with `PeerDirect` self-links, matching `CapabilityProfiler::link_matrix`).
     #[test]
     fn link_matrix_gpu_less_falls_back_to_host_off_diagonal() {
         let probe = |_: i32, _: i32| PairLink::Host; // every pair unreachable
@@ -3188,10 +2904,8 @@ mod charon0_topology_tests {
         }
     }
 
-    /// `PairLink::to_scythe_link` is a structurally-identical mapping to the
-    /// `P2PStatus -> ScytheLink` mapping already in
-    /// `CapabilityProfiler::link_matrix`. Pinned so the mapping cannot drift
-    /// from the established precedent without this test noticing.
+    /// `PairLink::to_scythe_link` is a structurally-identical mapping to the `P2PStatus -> ScytheLink` mapping already in `CapabilityProfiler::link_matrix`.
+    /// Pinned so the mapping cannot drift from the established precedent without this test noticing.
     #[test]
     fn pair_link_mapping_matches_capability_profiler_precedent() {
         assert_eq!(PairLink::Peer.to_scythe_link(), ScytheLink::PeerDirect);
@@ -3199,26 +2913,8 @@ mod charon0_topology_tests {
         assert_eq!(PairLink::Host.to_scythe_link(), ScytheLink::Host);
     }
 
-    // ── Gate (1): distinct layer_idx produces distinct PlacementCache lookups ─
-    //
-    // The plan's gate (1) requires that distinct `layer_idx` values produce
-    // distinct `PlacementCache` lookups. `C2plrController::decide` keys its
-    // cache on `(layer_id, shape_bucket, capability_epoch)` (scythe2.rs:49-57)
-    // and `PlacementCache::fast` is a fixed `num_layers`-wide array where
-    // `fast[layer_id]` is the slot for that layer's placement
-    // (scythe2.rs:96-101). So:
-    //   * calling `decide(layer_id, ...)` for every layer_id in
-    //     `0..num_layers` populates that layer's own fast slot — a MISS each;
-    //   * calling `decide(layer_id, ...)` again with the same layer_id + same
-    //     shape is a HIT (the fast-slot is already populated);
-    //   * calling `decide(layer_id = num_layers, ...)` (out of fast-range)
-    //     must NOT panic — it falls back to the full `HashMap` slow path.
-    //
-    // We assert these without depending on controller-internal field
-    // visibility: the public `decide` API is the contract. The previous bug
-    // (`decide(0, ...)`) keyed every decision to layer 0's fast slot, so only
-    // one slot was ever populated regardless of how many layers were trained;
-    // this gate confirms that's no longer the only path exercised.
+    // ── Gate (1): distinct layer_idx produces distinct PlacementCache lookups ─ The plan's gate (1) requires that distinct `layer_idx` values produce distinct `PlacementCache` lookups.
+    // `C2plrController::decide` keys its cache on `(layer_id, shape_bucket, capability_epoch)` (scythe2.rs:49-57) and `PlacementCache::fast` is a fixed `num_layers`-wide.
 
     #[test]
     fn distinct_layer_idx_populates_distinct_cache_slots() {
@@ -3242,11 +2938,8 @@ mod charon0_topology_tests {
         // its own fast slot. Must not panic for any in-range layer_id.
         for layer_id in 0..num_layers as u32 {
             let p = ctrl.decide(layer_id, &shape, &caps, &links, 0);
-            // `decide_miss` returns a single-rank placement
-            // (scythe2.rs:408-412 — `ranks: vec![selected]`,
-            //  `routes: vec![route_link]`): it picks ONE GPU for this layer,
-            //  not a multi-GPU plan. Assert that contract rather than a KxK
-            //  shape the controller does not produce.
+            // `decide_miss` returns a single-rank placement (scythe2.rs:408-412 - `ranks: vec![selected]`, `routes: vec![route_link]`): it picks ONE GPU for this layer, not a multi-GPU plan.
+            // Assert that contract rather than a KxK shape the controller does not produce.
             assert_eq!(
                 p.ranks.len(),
                 1,
@@ -3272,29 +2965,19 @@ mod charon0_topology_tests {
             ));
         }
 
-        // Second pass: same layer_ids, same shape → cache HITS. The controller
-        // returns a clone without recomputing. We assert this by calling again
-        // — a regression where layered caching broke would re-run decide_miss
-        // and is observable only via not-panicking; the structural contract is
-        // that the same call shape is idempotent.
+        // Second pass: same layer_ids, same shape → cache HITS.
+        // The controller returns a clone without recomputing.
         for layer_id in 0..num_layers as u32 {
             let _ = ctrl.decide(layer_id, &shape, &caps, &links, 0);
         }
 
-        // Out-of-range layer_id (≥ num_layers): must not panic — falls back
-        // to the full HashMap slow path. Production now keys every decision
-        // by its true `layer_idx` (0..num_layers) inside the forward's
-        // per-layer loop, so it stays in-range; this guards against a
-        // hardening regression.
+        // Out-of-range layer_id (≥ num_layers): must not panic - falls back to the full HashMap slow path.
+        // Production now keys every decision by its true `layer_idx` (0..num_layers) inside the forward's per-layer loop,.
         let _ = ctrl.decide(num_layers as u32, &shape, &caps, &links, 0);
     }
 
-    /// WI-EP1 gate: mirror of the production per-layer binding in
-    /// `run_rank_sft_forward` — the controller is consulted once per layer
-    /// with the layer's real index and activation shape, producing exactly
-    /// `num_layers` decisions. A regression to a single outer-loop decide
-    /// under a synthetic key would collapse this to one placement (or fewer
-    /// than `num_layers`), which is exactly what this asserts against.
+    /// WI-EP1 gate: mirror of the production per-layer binding in `run_rank_sft_forward` - the controller is consulted once per layer with the layer's real index and activation shape, producing exactly `num_layers` decisions.
+    /// A regression to a single outer-loop decide under a synthetic key would collapse this to.
     #[test]
     fn per_layer_forward_binding_yields_one_placement_per_layer() {
         let num_layers = 6usize;
@@ -3312,9 +2995,8 @@ mod charon0_topology_tests {
         ];
         let links = build_link_matrix(num_gpus, |_, _| PairLink::Host);
 
-        // Mirrors the production loop body:
-        //   let placement = ctx.ctrl.decide(layer_idx as u32, &shape, caps, links, 0);
-        //   layer_placements.push(placement);
+        // Mirrors the production loop body: let placement =
+        // ctx.ctrl.decide(layer_idx as u32, &shape, caps, links, 0); layer_placements.push(placement);
         let mut layer_placements = Vec::new();
         for layer_idx in 0..num_layers {
             let shape: Vec<usize> = vec![4usize, 4096usize]; // per-layer activation bucket
@@ -3332,9 +3014,8 @@ mod charon0_topology_tests {
         }
     }
 
-    /// WI-EP1 gate: the step-level gradient-sync routes are the modal link
-    /// across the step's per-layer placements, expanded to the K×K matrix
-    /// shape; with no placements they degrade to all-`Host`.
+    /// WI-EP1 gate: the step-level gradient-sync routes are the modal link across the step's per-layer
+    /// placements, expanded to the K×K matrix shape; with no placements they degrade to all-`Host`.
     #[test]
     fn step_routes_take_modal_link_and_expand_to_kxk() {
         use grim_tensor::backend::ScythePlacement;
@@ -3362,11 +3043,8 @@ mod charon0_topology_tests {
         assert!(routes.iter().all(|r| matches!(r, ScytheLink::Host)));
     }
 
-    /// Per WI-Charon-0 gate (4): the production `build_link_matrix`
-    /// composition with the real `probe_peer_link` probe must be callable
-    /// without a device and produce a well-shaped matrix (degrading to
-    /// `Host` off-diagonal in a GPU-less sandbox). This does NOT assert a
-    /// specific verdict — device-gated; it asserts the composition is sound.
+    /// Per WI-Charon-0 gate (4): the production `build_link_matrix` composition with the real `probe_peer_link` probe must be callable without a device and produce a well-shaped matrix (degrading to `Host` off-diagonal in a GPU-less sandbox).
+    /// This does NOT assert a specific verdict - device-gated; it asserts the composition is sound.
     #[test]
     fn production_probe_composition_is_sound_without_device() {
         let m = build_link_matrix(2, probe_peer_link);
@@ -3374,10 +3052,8 @@ mod charon0_topology_tests {
         // Self-links are always PeerDirect by convention.
         assert_eq!(m[0], ScytheLink::PeerDirect);
         assert_eq!(m[3], ScytheLink::PeerDirect);
-        // Off-diagonals are whatever peer_status returns; in a GPU-less
-        // test env this is `Host` (the probe errors out), which matches the
-        // historical baseline. On real hardware it could be Peer/Pcie. We only
-        // assert the verdict is a valid enum discriminant.
+        // Off-diagonals are whatever peer_status returns; in a GPU-less test env this is `Host` (the probe errors out), which matches the historical baseline.
+        // On real hardware it could be Peer/Pcie.
         for (i, &l) in m.iter().enumerate() {
             let valid = matches!(
                 l,

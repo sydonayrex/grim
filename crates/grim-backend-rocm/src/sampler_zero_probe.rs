@@ -1,15 +1,5 @@
-//! Root-cause probe: first-JIT zero-logits on the device sampler (scythe2
-//! plan validation log 2026-08-23e). In-crate so it can reach
-//! `RocmDevice::try_new` + allocator internals directly.
-//!
-//! Known-good logits with a deterministic weighted support are sampled N
-//! times through the PRODUCTION entry (`sample_logits_on_device_at`); every
-//! token must land inside the support. Token 0 on every trial, an error, or
-//! a fault reproduces the serve-surface zero-logit crash in isolation.
-//!
-//! ```text
-//! GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm --lib sampler_zero -- --nocapture
-//! ```
+//! Root-cause probe: first-JIT zero-logits on the device sampler (scythe2 plan validation log 2026-08-23e).
+//! In-crate so it can reach `RocmDevice::try_new` + allocator internals directly.
 
 #[cfg(test)]
 mod tests {
@@ -39,10 +29,8 @@ mod tests {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(8);
         let vocab = 65536usize;
-        // Overwhelming support: tokens 0..64 carry huge mass (score/0.7 ≈
-        // 142 >> Gumbel-max noise ~13 over 64k entries), everything else is
-        // exactly zero. A healthy kernel can ONLY pick from the support; a
-        // zero-reading kernel picks uniformly (token >= 64 almost surely).
+        // Overwhelming support: tokens 0..64 carry huge mass (score/0.7 ≈ 142 >> Gumbel-max noise ~13 over 64k entries), everything else is exactly zero.
+        // A healthy kernel can ONLY pick from the support; a zero-reading kernel picks uniformly (token.
         let data: Vec<f32> = (0..vocab)
             .map(|i| if i < 64 { 100.0 - i as f32 } else { 0.0 })
             .collect();

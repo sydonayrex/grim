@@ -59,10 +59,8 @@ pub struct DatasetEntry {
     pub size_bytes: u64,
 }
 
-/// Minimal GGUF header sanity check: the 4-byte `GGUF` magic at bytes 0-3
-/// plus a little-endian u32 version >= 1 at bytes 4-7. Reads only the first
-/// 8 bytes — never the whole file — so a renamed/truncated file is caught
-/// cheaply without loading the model.
+/// Minimal GGUF header sanity check: the 4-byte `GGUF` magic at bytes 0-3 plus a little-endian u32 version >= 1 at bytes 4-7.
+/// Reads only the first 8 bytes - never the whole file - so a renamed/truncated.
 fn has_gguf_magic(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -168,10 +166,8 @@ fn scan_dir_recursive_inner(
             if is_convertible_only {
                 if let Some(fmt) = classify_convertible_format(filename) {
                     let path_str = path.to_string_lossy().to_string();
-                    // P2-17b: O(1) dedup via a shared HashSet — threaded from
-                    // the discover_* entry points so it also covers the
-                    // multiple roots scanned there — instead of the previous
-                    // O(n²) `out.iter().any(...)` scan per file.
+                    // P2-17b: O(1) dedup via a shared HashSet - threaded from the discover_* entry points so it
+                    // also covers the multiple roots scanned there - instead of the previous O(n²) `out.iter().any(...)` scan per file.
                     if seen.insert(path.clone()) {
                         out.push(ModelEntry::new(filename, &path_str, fmt, false));
                     }
@@ -180,10 +176,8 @@ fn scan_dir_recursive_inner(
                 if let Some(format) = classify_model_format(filename) {
                     let path_str = path.to_string_lossy().to_string();
                     if seen.insert(path.clone()) {
-                        // P2-17a: `.grim` files are GGUF under the hood — a
-                        // renamed/truncated file is caught by the cheap 8-byte
-                        // header check (magic `GGUF` + u32 version) instead of
-                        // trusting the extension alone.
+                        // P2-17a: `.grim` files are GGUF under the hood - a renamed/truncated file is caught by
+                        // the cheap 8-byte header check (magic `GGUF` + u32 version) instead of trusting the extension alone.
                         let is_grim = format == "grim" && has_gguf_magic(&path);
                         out.push(ModelEntry::new(filename, &path_str, format, is_grim));
                     }

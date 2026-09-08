@@ -69,11 +69,8 @@ impl QkvAttentionFusionConfig {
         self
     }
 
-    /// Launch geometry for Phase-1 QKV attention. Parallel implementation:
-    /// block = (wavefront_size, 1, 1) with 256 threads covering head_dim up to
-    /// 256 in parallel. Wavefront-level online-softmax reduction produces
-    /// numerically stable results; small rounding differences vs the CPU
-    /// sequential reference are expected and covered by test tolerances.
+    /// Launch geometry for Phase-1 QKV attention.
+    /// Parallel implementation: block = (wavefront_size, 1, 1) with 256 threads covering head_dim up to 256.
     pub fn hip_launch_params(&self) -> HipKernelLaunch {
         let block_dim_x = if self.wavefront_size == 32 { 128 } else { 256 };
         let grid_x = self.max_seq_len as u32;
@@ -87,9 +84,7 @@ impl QkvAttentionFusionConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// KI — WRECK-5: KV-cache quantization format enum (replaces legacy quant_bits integer).
-// -------------------------------------------------------------------------
+// KI - WRECK-5: KV-cache quantization format enum (replaces legacy quant_bits integer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeGemmConfig {
     /// Runtime gate: `false` = always use rocBLAS, `true` = dispatch to the [see: `grim_decode_gemm_f16`, `RocmDevice::matmul`]
@@ -138,10 +133,8 @@ impl Default for SplitKGemmConfig {
     }
 }
 
-/// KV-cache quantization format enum (WRECK-5). Replaces the legacy
-/// `quant_bits: u8` integer with explicit format descriptors that map to the
-/// block/super-block dequant formulas in `kernels::q8_0_dequant` (Q8_0) and
-/// `kernels::q4k_dequant` (Q4K).
+/// KV-cache quantization format enum (WRECK-5).
+/// Replaces the legacy `quant_bits: u8` integer with explicit format descriptors that map to the block/super-block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KvQuantFormat {
     /// Dense FP16 K/V (no dequant needed in-kernel; kernel reads fp16 directly).
@@ -149,8 +142,7 @@ pub enum KvQuantFormat {
     /// Q8_0 block-quantized KV: each 32-element block is 34 bytes (2-byte fp16
     /// delta + 32× int8 codes). Per-block scale is the fp16 delta; k_scales[] unused.
     Q8_0,
-    /// Q4K super-block-quantized KV: each 256-element super-block is 144 bytes
-    /// (2-byte fp16 d + 2-byte fp16 min + 12-byte packed scales + 128 bytes nibbles).
+    /// Q4K super-block-quantized KV: each 256-element super-block is 144 bytes (2-byte fp16 d + 2-byte fp16 min + 12-byte packed scales + 128 bytes nibbles).
     /// Per-super-block scale embedded in block; k_scales[] unused.
     Q4K,
     /// Legacy nibble dequant path (quant_bits == 4): 4-bit per nibble, 2 nibbles per byte,
@@ -162,10 +154,8 @@ pub enum KvQuantFormat {
 }
 
 impl KvQuantFormat {
-    /// Convert a legacy `quant_bits` integer to a KvQuantFormat for backward
-    /// compat. `quant_bits == 4` with `use_legacy_nibble_path == true` maps to
-    /// Q4K so the existing nibble-dequant behavior is preserved until call sites
-    /// migrate to explicit KvQuantFormat::Q4K. `quant_bits == 8` maps to Q8_0.
+    /// Convert a legacy `quant_bits` integer to a KvQuantFormat for backward compat.
+    /// `quant_bits == 4` with `use_legacy_nibble_path == true` maps to Q4K so the existing nibble-dequant behavior.
     pub fn from_legacy_quant_bits(quant_bits: u8, use_legacy_path: bool) -> Self {
         match quant_bits {
             4 => {
@@ -197,9 +187,8 @@ impl KvQuantFormat {
         }
     }
 
-    /// In-kernel dequant kind selector, passed as the `quant_format` arg to the
-    /// kernel so it can select the right dequant formula. 0 = Fp16, 1 = Q8_0,
-    /// 2 = Q4K, -1 = legacy nibble (quant_bits == 4), -2 = legacy int8 (quant_bits == 8).
+    /// In-kernel dequant kind selector, passed as the `quant_format` arg to the kernel so it can select the right dequant formula.
+    /// 0 = Fp16, 1 = Q8_0, 2 = Q4K, -1 = legacy nibble (quant_bits ==.
     pub fn kernel_arg(&self) -> i32 {
         match self {
             Self::Fp16 => 0,
@@ -242,11 +231,8 @@ impl Default for KvDequantAttentionConfig {
 }
 
 impl KvDequantAttentionConfig {
-    /// Build a config from a legacy `quant_bits` integer, preserving backward
-    /// compat for existing call sites that haven't migrated to KvQuantFormat yet.
-    /// When `quant_bits == 4`, maps to Q4K (the existing nibble-dequant behavior
-    /// is preserved via the kernel's quant_format==2 path until the kernel source
-    /// is updated). When `quant_bits == 8`, maps to Q8_0. Otherwise Fp16.
+    /// Build a config from a legacy `quant_bits` integer, preserving backward compat for existing call sites that haven't migrated to KvQuantFormat yet.
+    /// When `quant_bits == 4`, maps to Q4K (the existing nibble-dequant behavior is preserved via the.
     pub fn from_legacy_quant_bits(quant_bits: u8) -> Self {
         Self {
             enabled: true,
@@ -277,9 +263,7 @@ impl Default for WmmaGemmConfig {
     }
 }
 
-/// WI-F1 — Load-time concatenation of the per-layer Q/K/V projection weights
-/// into a single row-major `[hidden, q_dim + k_dim + v_dim]` matrix, so all
-/// three projections run as one GEMM launch (`RocmDevice::fused_qkv_proj`).
+/// WI-F1 - Load-time concatenation of the per-layer Q/K/V projection weights into a single row-major `[hidden, q_dim + k_dim + v_dim]` matrix, so all three projections run as one GEMM launch (`RocmDevice::fused_qkv_proj`).
 /// One-time host cost at model load; must never run per forward pass.
 pub fn concat_qkv_weights(
     q_w: &[f32],

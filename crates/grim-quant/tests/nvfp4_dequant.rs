@@ -115,10 +115,7 @@ fn test_dequant_nvfp4_zero_code() {
 
     let result = dequant_nvfp4(&block, 16).expect("dequant_nvfp4");
     for (i, &val) in result.iter().enumerate() {
-        assert!(
-            val.abs() < 1e-6,
-            "index {i}: expected 0.0, got {val}"
-        );
+        assert!(val.abs() < 1e-6, "index {i}: expected 0.0, got {val}");
     }
 }
 
@@ -153,10 +150,10 @@ fn test_dequant_nvfp4_multi_subblock() {
 fn test_dequant_nvfp4_full_super_block() {
     // Full 256-weight super-block with varying codes per sub-block.
     let mut sub_blocks: [[u8; 9]; 16] = [[0u8; 9]; 16];
-    for sb in 0..16 {
+    for (sb, block) in sub_blocks.iter_mut().enumerate() {
         // Each sub-block uses code = sb (0..15), exponent = 127 (scale 1.0).
         let codes = [sb as u8; 16];
-        sub_blocks[sb] = build_nvfp4_sub_block(127, &codes);
+        *block = build_nvfp4_sub_block(127, &codes);
     }
     let super_block = build_nvfp4_super_block(&sub_blocks);
 
@@ -208,8 +205,11 @@ fn test_reframe_nvfp4_to_mxfp4_preserves_codes() {
 
     // MXFP4 framing: [u64 codes_len][codes...][u64 exps_len][exps...].
     let codes_len = u64::from_le_bytes(reframe[0..8].try_into().unwrap()) as usize;
-    let exps_len =
-        u64::from_le_bytes(reframe[8 + codes_len..8 + codes_len + 8].try_into().unwrap()) as usize;
+    let exps_len = u64::from_le_bytes(
+        reframe[8 + codes_len..8 + codes_len + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
 
     assert_eq!(codes_len, 16); // 32 weights / 2 per byte
     assert_eq!(exps_len, 1); // 1 group of 32
@@ -220,7 +220,11 @@ fn test_reframe_nvfp4_to_mxfp4_preserves_codes() {
     for i in 0..32 {
         let byte_idx = i / 2;
         let byte = codes[byte_idx];
-        let nibble = if i % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+        let nibble = if i % 2 == 0 {
+            byte & 0x0F
+        } else {
+            (byte >> 4) & 0x0F
+        };
         let expected = if i < 16 { 2 } else { 4 };
         assert_eq!(nibble, expected, "element {i}");
     }

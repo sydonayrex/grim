@@ -1,8 +1,5 @@
-//! `DraftBackbone` trait — the O(1) parallel drafter.
-//!
-//! §5.3.2. Drafts a block of candidate tokens in one forward pass rather
-//! than autoregressively; the speed is what suppresses the cost of the
-//! speculative draft step.
+//! `DraftBackbone` trait - the O(1) parallel drafter.
+//! §5.3.2.
 
 use grim_core::error::Result;
 use grim_tensor::Tensor;

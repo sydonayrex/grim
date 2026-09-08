@@ -1,8 +1,5 @@
-//! ROCm device probe — thin Rust wrapper around `grim-backend-rocm::RocmDevice`.
-//!
-//! Returns device metadata for the React dashboard's ROCm panel. When the
-//! host has no AMD GPU / HIP runtime, returns an empty Vec rather than
-//! erroring — the UI then renders the "no GPU available" path.
+//! ROCm device probe - thin Rust wrapper around `grim-backend-rocm::RocmDevice`.
+//! Returns device metadata for the React dashboard's ROCm panel.
 
 use grim_backend_rocm::{RocmDevice, WavefrontSize};
 use serde::{Deserialize, Serialize};
@@ -204,15 +201,8 @@ pub fn query_nvidia_smi_gpus() -> Vec<(String, u64, u64)> {
     results
 }
 
-/// Pure clamping helper for L3 — extractable for unit testing.
-///
-/// Pre-fix `query_amd_vram_used` clamped `(ordinal as usize).min(len -
-/// 1)`, aliasing distinct AMD cards to the last slot whenever `ordinal ≥
-/// used_bytes.len()` (e.g. an iGPU without the `mem_info_vram_used`
-/// sysfs node + a dGPU with it). The post-fix contract is: return the
-/// slot at `ordinal` if it exists; otherwise 0 (unknown — not somebody
-/// else's measurement). Pin a hand-derived 5-slot example below so a
-/// mutant that swaps the predicate limbs is caught.
+/// Pure clamping helper for L3 - extractable for unit testing.
+/// Pre-fix `query_amd_vram_used` clamped `(ordinal as usize).min(len - 1)`, aliasing distinct AMD cards to the last.
 pub fn pick_vram_used_slot(used_bytes: &[u64], ordinal: u32) -> u64 {
     let idx = ordinal as usize;
     if idx < used_bytes.len() {
@@ -297,8 +287,7 @@ pub fn query_amd_vram_used(ordinal: u32) -> u64 {
 }
 
 /// Query live AMD GPU busy percent from the sysfs gpu_busy_percent interface.
-/// Returns 0 when unavailable (non-Linux, iGPU without the node) — the panel
-/// then simply shows 0% rather than pretending telemetry is absent.
+/// Returns 0 when unavailable (non-Linux, iGPU without the node) - the panel then simply shows.
 pub fn query_amd_gpu_busy(ordinal: u32) -> u32 {
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
         let mut busy: Vec<u32> = Vec::new();
@@ -482,21 +471,6 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
 
 /// Query official AMD `rocminfo` tool for installed ROCm HIP GPUs.
 /// Pure parser for `rocminfo` output.
-///
-/// L1 fix: every `Agent N` boundary resets `compute_units`,
-/// `wavefront_size`, and `vram_bytes` so per-agent fields cannot leak
-/// from the previous agent's incomplete record. Pre-fix the parser
-/// declared those three variables once outside the loop and only
-/// reset `is_gpu`, `name`, and `marketing_name` on each new agent,
-/// so a second agent that lacked `Compute Unit:`, `Wavefront Size:`,
-/// or `Memory Size:` would silently inherit the prior agent's
-/// values.
-///
-/// L2 fix: the VRAM key is `Memory Size:`, not `Size:`. The earlier
-/// `Size: …KB` matcher matched cache sizes too, so vram_bytes was
-/// almost always left at the default 8 GiB regardless of the
-/// module's actual frame-buffer size; any consumer (UI panel,
-/// scheduler, telemetry) would silently report the wrong number.
 pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
     // Defaults applied on every Agent boundary.
     fn fresh_agent_state() -> RocmDeviceInfo {
@@ -520,9 +494,8 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
     }
 
     let mut devices: Vec<RocmDeviceInfo> = Vec::new();
-    // Per-agent state — declared INSIDE the agent scope so each
-    // `Agent N` boundary starts from the canonical defaults rather
-    // than leaking prior-agent values (L1 fix).
+    // Per-agent state - declared INSIDE the agent scope so each `Agent N`
+    // boundary starts from the canonical defaults rather than leaking prior-agent values (L1 fix).
     let mut is_gpu = false;
     let mut current = fresh_agent_state();
     let mut ordinal: u32 = 0;
@@ -550,10 +523,8 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
                 devices.push(dev);
                 ordinal += 1;
             }
-            // Reset every per-agent field including the three that the
-            // pre-fix code forgot (compute_units, wavefront_size,
-            // vram_bytes). The RocmDeviceInfo constructor on
-            // `Default` does this for us.
+            // Reset every per-agent field including the three that the pre-fix code forgot (compute_units, wavefront_size, vram_bytes).
+            // The RocmDeviceInfo constructor on `Default` does this for us.
             is_gpu = false;
             has_name = false;
             has_marketing = false;
@@ -561,9 +532,8 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
             continue;
         }
 
-        // Capture Name/Marketing unconditionally — they appear before
-        // `Device Type: GPU` in real rocminfo output and the parser
-        // must not lose them across the type-marker gate.
+        // Capture Name/Marketing unconditionally - they appear before `Device Type: GPU` in real
+        // rocminfo output and the parser must not lose them across the type-marker gate.
         if let Some(rest) = line.strip_prefix("Name:") {
             let val = rest.trim();
             if !val.contains("amdgcn") {
@@ -604,19 +574,16 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
                 current.wavefront_size = wf;
             }
         } else if let Some(rest) = line.strip_prefix("Memory Size:") {
-            // L2: prefer the explicit `Memory Size:` key. rocminfo
-            // emits this in KB; any cache line beginning with
-            // `Size:` is ignored entirely.
+            // L2: prefer the explicit `Memory Size:` key.
+            // rocminfo emits this in KB; any cache line beginning with `Size:` is ignored entirely.
             let raw = rest.trim().trim_end_matches("KB").trim();
             let clean = raw.split('(').next().unwrap_or(raw).trim();
             if let Ok(kb) = clean.parse::<u64>() {
                 current.vram_bytes = kb * 1024;
             }
         }
-        // Note: pre-fix the parser also matched `Size:` (cache) but
-        // refused values <=100_000. Dropping that path entirely is
-        // the cleanest L2 fix; if VRAM somehow falls through, the
-        // default in `fresh_agent_state` is 8 GiB exactly.
+        // Note: pre-fix the parser also matched `Size:` (cache) but refused values <=100_000.
+        // Dropping that path entirely is the cleanest L2 fix; if VRAM somehow falls through, the.
     }
 
     // Flush the trailing agent (no following `Agent N` line).
@@ -640,9 +607,8 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
     devices
 }
 
-/// Overlay live sysfs telemetry (exact VRAM size/usage, busy %) onto
-/// rocminfo-parsed devices. Kept out of [`parse_rocminfo_text`] so the
-/// parser stays a pure function of its input (unit-testable on fixtures).
+/// Overlay live sysfs telemetry (exact VRAM size/usage, busy %) onto rocminfo-parsed devices.
+/// Kept out of [`parse_rocminfo_text`] so the parser stays a pure function of its input (unit-testable.
 fn enrich_with_live_sysfs(devices: &mut [RocmDeviceInfo]) {
     for dev in devices.iter_mut() {
         let sysfs_total = query_amd_vram_total(dev.ordinal);
@@ -699,22 +665,15 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
     // 2. Query official rocminfo tool for installed AMD ROCm GPUs.
     let rocminfo_devs = query_rocminfo_gpus();
     for mut amd_dev in rocminfo_devs {
-        // `parse_rocminfo_text` already resolved `vram_used_bytes` against the
-        // AMD-local sysfs slot (correct per-card mapping, using a 0-based ordinal
-        // that lines up with the AMD cards rocminfo enumerated). Do NOT re-query
-        // here with the *global* running `ordinal`: whenever NVIDIA GPUs precede
-        // AMD (or any non-AMD device is counted first), that ordinal is offset and
-        // `query_amd_vram_used` would return the wrong card's live usage — or 0
-        // for an out-of-range slot — silently mislabeling VRAM. Keep the parser's
-        // value; only renumber `ordinal` for display ordering.
+        // `parse_rocminfo_text` already resolved `vram_used_bytes` against the AMD-local sysfs slot (correct per-card mapping, using a 0-based ordinal that lines up with the AMD cards rocminfo enumerated).
+        // Do NOT re-query here with the *global* running `ordinal`: whenever NVIDIA GPUs precede AMD (or.
         amd_dev.ordinal = ordinal;
         devices.push(amd_dev);
         ordinal += 1;
     }
 
-    // 3. Query system PCI bus via lspci to detect GPUs if telemetry tools didn't catch them.
-    // If telemetry tools found some GPUs (e.g. nvidia-smi found NVIDIA cards or rocminfo found AMD cards),
-    // we only look for additional GPUs from other vendors or ones not captured by official CLI tools.
+    // 3. Query system PCI bus via lspci to
+    // detect GPUs if telemetry tools didn't catch them.
     if let Ok(output) = Command::new("lspci").arg("-nn").output() {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -970,24 +929,13 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Mutation-resistant golden tests for `pick_vram_used_slot` (L3).
-    //
-    // The pre-fix implementation was `idx = ordinal.min(len - 1)`,
-    // aliasing distinct AMD cards to the last slot whenever
-    // `ordinal ≥ used_bytes.len()`. The post-fix contract is: return
-    // `used_bytes[ordinal]` when in range; otherwise 0 (unknown).
-    //
-    // The 5-slot hand-derived table below pins each index's expected
-    // return so a mutant that swaps the predicate order, switches `<`
-    // to `<=`, or moves the `0` fallback is caught.
-    // -----------------------------------------------------------------
+    // The pre-fix implementation was `idx = ordinal.min(len - 1)`, aliasing distinct AMD cards to the.
 
     #[test]
     fn pick_vram_used_slot_hand_derived_5slot_returns_per_index_bytes() {
-        // Hand-chosen slots: representative of iGPU plus dGPU plus
-        // multiple cards all visible via sysfs; indices 0..=4 are in
-        // range and index >= 5 is out of range.
+        // Hand-chosen slots: representative of iGPU plus dGPU plus multiple cards all visible via
+        // sysfs; indices 0..=4 are in range and index >= 5 is out of range.
         let used = [
             1_073_741_824u64,  // 1 GiB   slot 0
             16_106_127_360u64, // 15 GiB  slot 1
@@ -1002,10 +950,8 @@ mod tests {
         assert_eq!(pick_vram_used_slot(&used, 3), 25_769_803_776);
         assert_eq!(pick_vram_used_slot(&used, 4), 49_061_453_824);
 
-        // Out-of-range ordinals must return 0, NOT alias to the last slot
-        // (`used[4] == 49_061_453_824`). Pre-fix this was `min(len-1)` =
-        // the last slot, which made the iGPU card falsely report the
-        // dGPU's usage.
+        // Out-of-range ordinals must return 0, NOT alias to the last slot (`used[4] == 49_061_453_824`).
+        // Pre-fix this was `min(len-1)` = the last slot, which made the iGPU card falsely report.
         assert_eq!(pick_vram_used_slot(&used, 5), 0);
         assert_eq!(pick_vram_used_slot(&used, 9), 0);
         assert_eq!(pick_vram_used_slot(&used, u32::MAX), 0);
@@ -1014,10 +960,7 @@ mod tests {
     #[test]
     fn pick_vram_used_slot_empty_returns_zero_for_every_ordinal() {
         // Edge case: no devices have a mem_info_vram_used sysfs node.
-        // Returning a clamped-index alias would mean the empty slice
-        // returns 0 anyway — but pre-fix used `.min(len - 1)` which
-        // would have underflowed (subtract with overflow) for
-        // `len == 0`. Catch that with a direct `==` assertion.
+        // Returning a clamped-index alias would mean the empty slice returns 0 anyway - but pre-fix.
         let empty: [u64; 0] = [];
         assert_eq!(pick_vram_used_slot(&empty, 0), 0);
         // The implementation must not panic on overflow; explicitly
@@ -1027,11 +970,8 @@ mod tests {
 
     #[test]
     fn pick_vram_used_slot_indices_never_alias_to_other_slots() {
-        // Generalized invariant: if `ordinal < len` then
-        // `pick(used, ordinal) == used[ordinal]`. Pre-fix a slot swap
-        // (e.g. alias-to-last) would silently break this invariant for
-        // out-of-range ordinals — assert against the hand-derived
-        // 3-slot table.
+        // Generalized invariant: if `ordinal < len` then `pick(used, ordinal) == used[ordinal]`.
+        // Pre-fix a slot swap (e.g.
         let used = [100u64, 200u64, 300u64];
         for ordinal in 0..3 {
             let idx = ordinal as usize;
@@ -1049,10 +989,8 @@ mod tests {
 
     #[test]
     fn pick_vram_used_slot_does_not_leak_max_value_at_zero() {
-        // Edge case: a single-element slice holding `u64::MAX` would
-        // previously have alias confusion. Assert that the in-range
-        // path still returns the expected max value (no truncation
-        // bug).
+        // Edge case: a single-element slice holding `u64::MAX` would previously have alias confusion.
+        // Assert that the in-range path still returns the expected max value (no truncation bug).
         let max_only: [u64; 1] = [u64::MAX];
         assert_eq!(pick_vram_used_slot(&max_only, 0), u64::MAX);
         // Out-of-range with the same input must NOT leak the max
@@ -1060,56 +998,8 @@ mod tests {
         assert_eq!(pick_vram_used_slot(&max_only, 1), 0);
     }
 
-    // -----------------------------------------------------------------
-    // Mutation-resistant golden tests for `parse_rocminfo_text`
-    // covering L1 (per-agent state reset) and L2 (explicit VRAM marker).
-    //
-    // The pre-fix `query_rocminfo_gpus` parser had two intertwined bugs:
-    //   - L1: `compute_units`, `wavefront_size`, `vram_bytes` were
-    //     declared once outside the agent loop and not reset on
-    //     `Agent N` boundaries — agent 2 inherited agent 1's values.
-    //   - L2: `Size: …KB` matched cache sizes, not VRAM. VRAM is
-    //     actually emitted as `Memory Size:` in rocminfo.
-    //
-    // The hand-crafted fixtures below pin specific expected outputs so
-    // a mutant that swaps resets, leaks state between agents, or
-    // parses the wrong `Size:` key is caught by a single failing
-    // assertion's specific expected value.
-    // -----------------------------------------------------------------
-    //
-    // For compute_units / wavefront_size we run two back-to-back
-    // agents where agent 2 *omits* those keys. Pre-fix, agent 2 would
-    // inherit agent 1's values. Post-fix, agent 2 must reset to the
-    // documented defaults (compute_units = 36, wavefront_size = 32,
-    // vram_bytes = 8 GiB; but these are internal contract values,
-    // tested by checking the parsed `RocmDeviceInfo` does NOT carry
-    // agent 1's compute_units).
-    //
-    // For VRAM (L2) use `Memory Size:` to pin down the explicit
-    // rocm-format key. The out-of-the-loop default of 8 GiB is what
-    // ships pre-fix; the test exercises a 24 GiB device and asserts it
-    // round-trips.
-    //
-    // The hand-built rocminfo fixture is realistic:
-    //
-    // ```
-    // *** ROCk
-    // ==============================
-    // Agent 1
-    //   Name: gfx1100
-    //   Marketing Name: AMD Radeon RX 7900 XTX
-    //   Device Type: GPU
-    //   Compute Unit: 96
-    //   Wavefront Size: 32
-    //   Memory Size: 25165824 KB   <-- 24 GiB exactly
-    // ------------------------------
-    // Agent 2
-    //   Name: gfx000
-    //   Marketing Name: AMD Radeon 610M
-    //   Device Type: GPU
-    //   (no Compute Unit / Wavefront / Memory Size lines for agent 2)
-    // ==============================
-    // ```
+    // Mutation-resistant golden tests for `parse_rocminfo_text` covering L1 (per-agent state reset) and L2 (explicit VRAM marker).
+    // The pre-fix `query_rocminfo_gpus` parser had two intertwined bugs: - L1: `compute_units`, `wavefront_size`, `vram_bytes` were declared.
 
     const ROCMINFO_TWO_AGENTS_RESET_FIXTURE: &str = "\
 *** ROCk
@@ -1130,24 +1020,17 @@ Agent 2
 
     #[test]
     fn parse_rocminfo_resets_compute_units_between_agents() {
-        // L1: agent 2 (no `Compute Unit:` line) must NOT inherit
-        // agent 1's 96. The post-fix default after a reset is 36
-        // (an internal contract value, defined alongside the parser).
-        // Pre-fix this field would have leaked as 96.
+        // L1: agent 2 (no `Compute Unit:` line) must NOT inherit agent 1's 96.
+        // The post-fix default after a reset is 36 (an internal contract value, defined alongside the.
         let devs = parse_rocminfo_text(ROCMINFO_TWO_AGENTS_RESET_FIXTURE);
         assert!(!devs.is_empty(), "expected 2 GPU devices, got {devs:?}");
         let first = &devs[0];
-        // agent 1: explicitly set to 96. The friendly arch/naming
-        // helpers turn "gfx1100"/"RX 7900 XTX" into RDNA3 etc., so
-        // we only assert the family/wavefront here (L2-specific
-        // assertion follows).
+        // agent 1: explicitly set to 96. The friendly arch/naming helpers turn "gfx1100"/"RX 7900
+        // XTX" into RDNA3 etc., so we only assert the family/wavefront here (L2-specific assertion follows).
         assert_eq!(first.wavefront_size, 32);
         let second = &devs[1];
-        // agent 2: in the post-fix code, `compute_units` and
-        // `wavefront_size` reset to the agent-loop's defaults on each
-        // `Agent N` line. The test pins those defaults explicitly:
-        // 36 CUs and a 32-wide wave is the documented ROCm fallback
-        // we've observed across remaining-devices queries.
+        // agent 2: in the post-fix code, `compute_units` and `wavefront_size` reset to the agent-loop's defaults on each `Agent N` line.
+        // The test pins those defaults explicitly: 36 CUs and a 32-wide wave is the documented.
         assert_eq!(
             second.wavefront_size, 32,
             "agent 2 wavefront must not inherit agent 1 — L1 reset"
@@ -1156,12 +1039,8 @@ Agent 2
 
     #[test]
     fn parse_rocminfo_parses_explicit_memory_size_key_for_vram() {
-        // L2: the parser must read `Memory Size:` (KB) and convert to
-        // bytes. Pre-fix `Size: …KB` matched cache sizes, leaving the
-        // device's reported vram stuck at the 8 GiB default — i.e.
-        // any 24 GiB device would be reported as 8 GiB, a silent
-        // 3× error. Pin the expected conversion: 25165824 KB → 24 GiB
-        // exactly (25165824 * 1024 == 25_769_803_776 bytes).
+        // L2: the parser must read `Memory Size:` (KB) and convert to bytes.
+        // Pre-fix `Size: …KB` matched cache sizes, leaving the device's reported vram stuck at the 8.
         let devs = parse_rocminfo_text(ROCMINFO_TWO_AGENTS_RESET_FIXTURE);
         let first = &devs[0];
         assert_eq!(
@@ -1172,12 +1051,8 @@ Agent 2
 
     #[test]
     fn parse_rocminfo_ignores_size_cache_lines_when_memory_size_present() {
-        // L2 defense: even when both `Size: 4096 KB` (cache) and
-        // `Memory Size: 8388608 KB` (8 GiB) appear, the parser must
-        // pick the larger — the canonical VRAM value. Hand-derived:
-        // rocminfo emits BOTH cache sizes and a Memory Size line for
-        // a real GPU; the pre-fix `.starts_with("Size:")` matcher
-        // would have matched the cache.
+        // L2 defense: even when both `Size: 4096 KB` (cache) and `Memory Size: 8388608 KB` (8 GiB) appear, the parser must pick the larger - the canonical VRAM value.
+        // Hand-derived: rocminfo emits BOTH cache sizes and a Memory Size line for a real GPU;.
         const BOTH_SIZE_KEYS: &str = "\
 *** ROCk
 Agent 1
@@ -1199,10 +1074,8 @@ Agent 1
 
     #[test]
     fn parse_rocminfo_handles_two_agents_vram_independently() {
-        // L1 + L2 commit check end-to-end: agent 1 sets VRAM
-        // (24 GiB) and agent 2 has neither Memory Size nor Size — so
-        // agent 2 falls back to the documented post-fix default
-        // (8 GiB), not to agent 1's 24 GiB.
+        // L1 + L2 commit check end-to-end: agent 1 sets VRAM (24 GiB) and agent 2 has neither Memory Size nor
+        // Size - so agent 2 falls back to the documented post-fix default (8 GiB), not to agent 1's 24 GiB.
         let devs = parse_rocminfo_text(ROCMINFO_TWO_AGENTS_RESET_FIXTURE);
         assert_eq!(devs.len(), 2);
         assert_eq!(devs[0].vram_bytes, 25_769_803_776);
@@ -1212,15 +1085,8 @@ Agent 1
         );
     }
 
-    // -----------------------------------------------------------------
     // Mutation-resistant golden tests for `user_friendly_amd_name`.
-    // The function merges RDNA/CDNA version tag and a product name; the
-    // existing top-level test only spot-checks a handful of values.
-    // Each pinning test below asserts one specific exact expected
-    // string so a mutant that flips a version tag, swaps RDNA order,
-    // or short-circuits the product-name lookup fails at least one
-    // hand-derived expected value.
-    // -----------------------------------------------------------------
+    // The function merges RDNA/CDNA version tag and a product name; the existing top-level test only.
 
     #[test]
     fn user_friendly_amd_name_rdna5_pins_9070_and_rnna5_tag() {
@@ -1230,9 +1096,8 @@ Agent 1
 
     #[test]
     fn user_friendly_amd_name_rdna3_with_onchip_gcn1036_uses_substring_match() {
-        // The function keys off `name_lower.contains("rdna3")` as
-        // well; this grocery list case pins both name AND path where
-        // name drives the version tag.
+        // The function keys off `name_lower.contains("rdna3")` as well; this grocery list case
+        // pins both name AND path where name drives the version tag.
         let s = user_friendly_amd_name("gfx1101", "ROG Ally Z1 Extreme (RDNA3)");
         assert_eq!(s, "ROG Ally Z1 Extreme (RDNA3) (RDNA 3)");
     }
@@ -1259,20 +1124,14 @@ Agent 1
 
     #[test]
     fn user_friendly_amd_name_drops_when_marketing_unknown_and_arch_empty() {
-        // Empty arch + placeholder name must fall back rather than
-        // panic. The post-fix contract puts "Radeon GPU" as the
-        // generic name.
+        // Empty arch + placeholder name must fall back rather than panic.
+        // The post-fix contract puts "Radeon GPU" as the generic name.
         let s = user_friendly_amd_name("", "");
         assert_eq!(s, "Radeon GPU (RDNA)");
     }
 
-    // -----------------------------------------------------------------
     // Mutation-resistant golden tests for `extract_clean_gpu_name`.
-    // The function strips `lspci` PCI bracket annotations like
-    // `[AMD/ATI]` and `[Device 73bf]` to surface the marketing GPU
-    // string. Pin each stage so a mutant can't accidentally promote
-    // an empty/at-prefix segment.
-    // -----------------------------------------------------------------
+    // The function strips `lspci` PCI bracket annotations like `[AMD/ATI]` and `[Device 73bf]` to surface the.
 
     #[test]
     fn extract_clean_gpu_name_drops_amdati_bracket_and_returns_trailing() {

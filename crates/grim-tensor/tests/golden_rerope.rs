@@ -27,8 +27,8 @@ fn test_rerope_cpu_parity_vs_fresh_rope() {
     let s = 4usize;
     let d = 8usize;
     let mut data = vec![0.0f32; b * s * d];
-    for i in 0..data.len() {
-        data[i] = ((i as f32 + 1.0) * 0.1).sin();
+    for (i, val) in data.iter_mut().enumerate() {
+        *val = ((i as f32 + 1.0) * 0.1).sin();
     }
 
     let k_orig = make_cpu_tensor(data, Shape::new(vec![b, s, d]));
@@ -52,7 +52,13 @@ fn test_rerope_cpu_parity_vs_fresh_rope() {
 
     // 3. Re-RoPE K_old directly from old_pos to new_pos -> K_rerope
     let (k_rerope_storage, _) = dev
-        .rerope(k_old_storage.as_ref(), &old_pos, &new_pos, &cfg, k_orig.shape())
+        .rerope(
+            k_old_storage.as_ref(),
+            &old_pos,
+            &new_pos,
+            &cfg,
+            k_orig.shape(),
+        )
         .unwrap();
     let rerope_vec = k_rerope_storage.to_cpu_vec_f32().unwrap();
 

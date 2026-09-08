@@ -1,11 +1,5 @@
 //! WI-3b: JSON-Schema → FSM/grammar compiler.
-//!
-//! `response_format: {"type": "json_schema", "json_schema": {...}}` constrains
-//! generation to outputs that conform to a JSON Schema.
-//!
-//! Scope (per the plan): `type`, `properties`, `required`, `enum`, `items`,
-//! nested `object`/`array`. Unsupported schema features are rejected with a
-//! clear error rather than silently under-constraining.
+//! `response_format: {"type": "json_schema", "json_schema": {...}}` constrains generation to outputs that conform to a JSON Schema.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -26,19 +20,13 @@ impl std::fmt::Display for JsonSchemaCompilerError {
 impl std::error::Error for JsonSchemaCompilerError {}
 
 /// A compiled JSON-Schema constraint with memoized token validity masking.
-///
-/// At each step we check whether the partial JSON produced so far is consistent
-/// with the schema, and mask tokens whose continuation would violate it.
-/// Computed masks are cached per distinct output prefix to prevent redundant
-/// O(V) re-validations.
+/// At each step we check whether the partial JSON produced so far is consistent with.
 #[derive(Debug, Clone)]
 pub struct JsonSchemaConstraint {
     schema: Value,
     cache: Arc<Mutex<HashMap<String, Arc<[bool]>>>>,
-    /// F9: true when any `pattern` or string-`enum` exists anywhere in the
-    /// schema. When false, tokens appended INSIDE an unterminated string can
-    /// never change schema validity (plain strings accept any content), so
-    /// the per-step O(vocab) validate pass is skippable entirely.
+    /// F9: true when any `pattern` or string-`enum` exists anywhere in the schema.
+    /// When false, tokens appended INSIDE an unterminated string can never change schema validity (plain strings.
     has_string_constraint: bool,
 }
 
@@ -48,13 +36,8 @@ impl JsonSchemaConstraint {
     }
 }
 
-/// WI-3b: compile a JSON Schema value into a constraint. Unsupported
-/// features are rejected explicitly (a `400` at the request layer) rather
-/// than silently ignored.
-///
-/// Supported subset: `type`, `properties`, `required`, `enum`, `items`,
-/// `pattern`, `additionalProperties`, `$ref` (internal pointers `#/...`), `oneOf`/`anyOf`/`allOf`, nested `object`/`array`.
-/// `format` is rejected if present.
+/// WI-3b: compile a JSON Schema value into a constraint.
+/// Unsupported features are rejected explicitly (a `400` at the request layer) rather than silently ignored.
 const SUPPORTED_KEYWORDS: &[&str] = &[
     "type",
     "properties",
@@ -210,9 +193,8 @@ fn resolve_pointer(pointer: &str, root: &Value) -> Result<Value, JsonSchemaCompi
 }
 
 impl JsonSchemaConstraint {
-    /// WI-3b: validate that `partial_json` is a prefix of some value that
-    /// conforms to the schema. Conservative: returns `true` when it cannot
-    /// prove a violation (so we never mask a token that could still be valid).
+    /// WI-3b: validate that `partial_json` is a prefix of some value that conforms to the schema.
+    /// Conservative: returns `true` when it cannot prove a violation (so we never mask a token.
     pub fn is_consistent(&self, partial_json: &str) -> bool {
         let value: Value = match serde_json::from_str(partial_json) {
             Ok(v) => v,
@@ -226,11 +208,8 @@ impl JsonSchemaConstraint {
         validate(&value, &self.schema)
     }
 
-    /// F9 fast path: while the cursor is INSIDE an unterminated JSON string
-    /// and the schema imposes no pattern/enum on strings, appending any token
-    /// keeps the output as consistent as it was when the string opened — so
-    /// the whole O(vocab) parse+validate pass is skipped. The structural PDA
-    /// mask still applies upstream.
+    /// F9 fast path: while the cursor is INSIDE an unterminated JSON string and the schema imposes no pattern/enum on strings, appending any token keeps the output as consistent as it was when the string opened - so the whole O(vocab) parse+validate pass is skipped.
+    /// The structural PDA mask still applies upstream.
     pub fn inside_string_fast_path(&self, current_output: &str) -> bool {
         !self.has_string_constraint && inside_unterminated_string(current_output)
     }
@@ -263,10 +242,8 @@ impl JsonSchemaConstraint {
     }
 }
 
-/// Heuristic: is this serde error a "truncated/incomplete input" error
-/// rather than a genuine syntax error? serde_json's error type doesn't
-/// expose the category directly, so we key off the message — imperfect
-/// but adequate for a conservative accept.
+/// Heuristic: is this serde error a "truncated/incomplete input" error rather than a genuine syntax error?
+/// serde_json's error type doesn't expose the category directly, so we key off the message -.
 fn is_truncated_error(e: &serde_json::Error) -> bool {
     let msg = e.to_string();
     msg.contains("EOF")
@@ -718,10 +695,10 @@ fn validate(value: &Value, schema: &Value) -> bool {
                 }
             } else if additional.is_object() {
                 for (key, val) in obj {
-                    if props.map(|p| !p.contains_key(key)).unwrap_or(true) {
-                        if !validate(val, additional) {
-                            return false;
-                        }
+                    if props.map(|p| !p.contains_key(key)).unwrap_or(true)
+                        && !validate(val, additional)
+                    {
+                        return false;
                     }
                 }
             }

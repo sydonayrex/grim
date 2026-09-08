@@ -39,8 +39,7 @@ pub fn run_doctor(
     check_configuration(&mut report);
 
     // WI-2: optional pre-flight model/hardware compatibility check.
-    // Runs *after* the existing system checks so the full suite still
-    // prints; the model section is additive and never masks a system error.
+    // Runs *after* the existing system checks so the full suite still prints; the model section.
     if let Some(path) = model_path {
         check_model_preflight(&mut report, path);
     }
@@ -444,15 +443,7 @@ fn check_configuration(_report: &mut DoctorReport) {
 }
 
 /// WI-2: pre-flight model/hardware compatibility check.
-///
-/// Reads the model **header only** (no tensor data), computes a
-/// `ModelFootprint`, then predicts:
-///   - VRAM fit vs. detected free VRAM (fits / tight / doesn't fit)
-///   - codec-vs-arch compat (native / fallback / unsupported)
-///
-/// Note: This is an instant pre-flight prediction based on static headers, not a
-/// runtime execution test. Actual allocation/runtime verification occurs when loading
-/// and executing the model.
+/// Reads the model **header only** (no tensor data), computes a `ModelFootprint`, then predicts: - VRAM.
 fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
     println!("\n=== Model Pre-Flight (WI-2) ===");
     println!("  Model: {}", path.display());
@@ -558,9 +549,7 @@ fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
     }
 }
 
-/// Read a model file's header only. Dispatches on extension: `.gguf` via
-/// `read_gguf`, `.grim` via `GrimFile::read`. Both avoid loading tensor
-/// data — this is a hard requirement (WI-2 gate 4).
+/// Read a model file's header only. Dispatches on extension: `.gguf` via `read_gguf`, `.grim` via `GrimFile::read`.
 fn read_model_header(path: &Path) -> Result<ModelFootprint> {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "gguf" => {
@@ -600,14 +589,11 @@ fn detect_hardware() -> Option<(grim_backend_rocm::GcnArch, u64)> {
     Some((arch, total))
 }
 
-/// Conservative heuristics for KV-cache sizing when the header doesn't
-/// carry them. Each returns 0 when unknown so the estimate stays honest
-/// rather than guessing a large number and alarming the user.
+/// Conservative heuristics for KV-cache sizing when the header doesn't carry them.
+/// Each returns 0 when unknown so the estimate stays honest rather than guessing a large.
 fn estimate_num_layers(_footprint: &ModelFootprint) -> u32 {
-    // `general.num_layers` is not a standard GGUF key; real models carry
-    // it under various family-specific names. Without loading tensor tables
-    // per family, we return 0 so the estimate stays a conservative, honest
-    // weight-byte lower bound.
+    // `general.num_layers` is not a standard GGUF key; real models carry it under various family-specific names.
+    // Without loading tensor tables per family, we return 0 so the estimate stays a conservative,.
     0
 }
 
@@ -678,12 +664,8 @@ fn print_report(report: &DoctorReport) {
     }
 }
 
-/// Probe compiler and runtime toolchain dependencies required for HIPRTC
-/// and JIT compilation (WI-X17).
-///
-/// Verifies presence of Clang, LLVM tools, ROCm runtime shared libraries,
-/// write access to the HSACO cache directory, and flags potential rustup
-/// toolchain collisions in target/.
+/// Probe compiler and runtime toolchain dependencies required for HIPRTC and JIT compilation (WI-X17).
+/// Verifies presence of Clang, LLVM tools, ROCm runtime shared libraries, write access to the HSACO.
 pub fn check_toolchain(report: &mut DoctorReport) {
     let clang_res = std::process::Command::new("clang")
         .arg("--version")

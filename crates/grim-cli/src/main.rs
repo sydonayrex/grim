@@ -94,9 +94,8 @@ impl Drop for TpChildGuard {
     }
 }
 
-/// Liveness probe for a TP peer pid. Linux-only by way of /proc; other
-/// platforms conservatively report alive (the peer's own HTTP port going
-/// silent is then the operator's signal).
+/// Liveness probe for a TP peer pid. Linux-only by way of /proc; other platforms
+/// conservatively report alive (the peer's own HTTP port going silent is then the operator's signal).
 fn tp_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -153,11 +152,8 @@ enum Commands {
         /// binding to a wildcard address is refused for safety.
         #[arg(long)]
         allow_public: bool,
-        /// Tensor-parallel size (Design A: one OS process per rank). This
-        /// process is rank 0; ranks 1..N spawn as children with
-        /// GRIM_TP_SIZE/GRIM_TP_RANK stamped and HTTP ports offset by rank.
-        /// All ranks must receive the same request stream in the same order —
-        /// rank 0's collectives rendezvous with its peers on every forward.
+        /// Tensor-parallel size (Design A: one OS process per rank).
+        /// This process is rank 0; ranks 1..N spawn as children with GRIM_TP_SIZE/GRIM_TP_RANK stamped and HTTP.
         #[arg(long, default_value = "1")]
         tp_size: usize,
     },
@@ -259,9 +255,8 @@ enum Commands {
         /// Optional destination path.
         #[arg(short, long)]
         output: Option<String>,
-        /// Preferred ROCm profile to suggest for ROCm-tuned conversion after
-        /// the pull (cdna2, cdna3, rdna2, rdna3, rdna4, or "auto"). See
-        /// `Pull` for semantics; `dl` shares the same flag.
+        /// Preferred ROCm profile to suggest for ROCm-tuned conversion after the pull (cdna2, cdna3, rdna2, rdna3, rdna4, or "auto").
+        /// See `Pull` for semantics; `dl` shares the same flag.
         #[arg(long)]
         rocml_profile: Option<String>,
     },
@@ -456,18 +451,8 @@ enum Commands {
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
-        /// Training mode:
-        ///  - qlora (default): 4-bit base weights + LoRA adapter (lowest VRAM)
-        ///  - lora: 16-bit LoRA adapter on unquantized base
-        ///  - full-bf16: full parameter fine-tuning in bfloat16
-        ///  - full-fp16: full parameter fine-tuning in float16
-        ///  - soul-eater: orthogonal weight matrix evolution
-        ///  - oft: orthogonal fine-tuning preserving representation norms
-        ///  - dpo: direct preference optimization with paired chosen/rejected targets
-        ///  - orpo: odds ratio preference optimization
-        ///  - simpo: simple reference-free preference optimization
-        ///  - kto: kahneman-tversky optimization
-        ///  - grpo: group relative policy optimization
+        /// Training mode: - qlora (default): 4-bit base weights + LoRA adapter (lowest VRAM) - lora: 16-bit LoRA adapter on unquantized base - full-bf16: full parameter fine-tuning in bfloat16 - full-fp16: full parameter fine-tuning in float16 - soul-eater: orthogonal weight
+        /// matrix evolution - oft: orthogonal fine-tuning preserving representation norms - dpo: direct preference optimization with paired chosen/rejected targets - orpo: odds ratio preference optimization - simpo: simple reference-free preference optimization - kto: kahneman-tversky optimization - grpo: group relative policy optimization
         #[arg(long, default_value = "qlora")]
         mode: String,
         /// Enable SCALE-ECHO echo training mode. Bypasses the autograd tape
@@ -481,9 +466,8 @@ enum Commands {
         /// bf16/fp16 halve VRAM vs f32 on consumer RDNA (salamander.md P1).
         #[arg(long, value_enum, default_value = "f32")]
         train_dtype: train::TrainDtype,
-        /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
-        /// lion-8bit, adafactor, qgalore-8bit, galore-8bit, muon, madam,
-        /// lion-vote, lomo, adalomo, came, sophia, scythe, sickle).
+        /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, qgalore-8bit,
+        /// galore-8bit, muon, madam, lion-vote, lomo, adalomo, came, sophia, scythe, sickle).
         #[arg(long, default_value = "adamw")]
         optimizer: grim_autograd::OptimizerKind,
         /// LR scheduler (cosine-warmup, linear, polynomial, constant,
@@ -549,9 +533,8 @@ enum Commands {
     },
     /// Query live continuous batching scheduler queues and KV cache memory tiers.
     Scheduler {
-        /// Server address to query. Defaults to GRIM_HOST/GRIM_PORT env (or
-        /// 127.0.0.1:11434) so a server started on a non-default port is found
-        /// without re-typing the address (F-2).
+        /// Server address to query. Defaults to GRIM_HOST/GRIM_PORT env (or 127.0.0.1:11434) so a
+        /// server started on a non-default port is found without re-typing the address (F-2).
         #[arg(short, long, default_value = "")]
         addr: String,
     },
@@ -568,7 +551,6 @@ enum Commands {
     },
     /// Convert a model file to ROCm-optimized .grim format using Oxidizer.
     /// Supports GGUF (.gguf), GGML (.ggml), safetensors (.safetensors), and PyTorch (.bin).
-    /// Tip: Use `grim oxidizer convert` for the full calibrate -> search -> write evolutionary pipeline.
     Convert {
         /// Path to input model file (.gguf, .ggml, .safetensors, or .bin).
         #[arg(short, long)]
@@ -618,12 +600,8 @@ enum Commands {
         #[command(subcommand)]
         subcommand: PluginCommands,
     },
-    /// Generate and install an architecture compatibility plugin (.grimplugin) from a
-    /// HuggingFace model repo. Fetches config.json via the HF Hub API, validates the
-    /// required fields, and installs the plugin into `grim_plugins_dir()` where
-    /// `model_loader.rs` can discover it at model-load time.
-    ///
-    /// Example: `grim arch-plugin generate hf:Qwen/Qwen3.8-27B`
+    /// Generate and install an architecture compatibility plugin (.grimplugin) from a HuggingFace model repo.
+    /// Fetches config.json via the HF Hub API, validates the required fields, and installs the plugin.
     ArchPlugin {
         #[command(subcommand)]
         subcommand: ArchPluginCommands,
@@ -634,13 +612,7 @@ enum Commands {
         subcommand: ServiceCommands,
     },
     /// Re-verify every claim Grim makes about itself (§13.5).
-    /// Checks: unit on disk, OS service visibility, HTTP health, GPU backend,
-    /// WASM grant enforcement, and ExecStart consistency.
-    ///
-    /// WI-2: `--model <path>` additionally runs a pre-flight model/hardware
-    /// compatibility check *before* the user attempts a load — predicts
-    /// fit (fits / tight / doesn't fit) and native/fallback/unsupported
-    /// verdicts from the existing `resolve_quant_mode` arch gate.
+    /// Checks: unit on disk, OS service visibility, HTTP health, GPU backend, WASM grant enforcement, and.
     Doctor {
         /// Address the server is expected to be reachable on.
         #[arg(long, default_value = "127.0.0.1:11434")]
@@ -735,9 +707,8 @@ enum ServiceCommands {
     Run {
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
-        /// Plugin directory to load samplers/processors from at startup — the
-        /// same `--plugins <dir>` surface the interactive `serve` and
-        /// `run --serve` commands honor. Empty (default) means no plugins.
+        /// Plugin directory to load samplers/processors from at startup - the same `--plugins <dir>` surface the interactive `serve` and `run --serve` commands honor.
+        /// Empty (default) means no plugins.
         #[arg(long, default_value = "")]
         plugins: String,
     },
@@ -775,10 +746,7 @@ enum PluginCommands {
 #[derive(Subcommand)]
 enum ArchPluginCommands {
     /// Generate and install a .grimplugin from a HuggingFace model repo.
-    ///
-    /// `model_id` is an `hf:org/repo` reference (e.g. `hf:Qwen/Qwen3.8-27B`).
-    /// The command fetches config.json via the HF Hub API, validates required fields,
-    /// and installs the plugin into `grim_plugins_dir()`.
+    /// `model_id` is an `hf:org/repo` reference (e.g.
     Generate {
         /// HuggingFace model reference (hf:org/repo).
         model_id: String,
@@ -979,13 +947,8 @@ async fn main() -> Result<()> {
                     std::env::set_var("GRIM_BACKEND", b);
                 }
             }
-            // Tensor-parallel launcher (Design A, one OS process per rank):
-            // this process is rank 0; peers 1..tp_size-1 run as children with
-            // their rank and HTTP port stamped. Children never re-spawn —
-            // launching is gated on GRIM_TP_RANK being unset. Peers die with
-            // this process (ChildGuard) and this process dies with any peer
-            // (fail-stop monitor): a TP rank set missing one rank deadlocks
-            // the survivors' collectives on the next forward.
+            // Tensor-parallel launcher (Design A, one OS process per rank): this process is rank 0; peers 1..tp_size-1 run as children with their rank and HTTP port stamped.
+            // Children never re-spawn - launching is gated on GRIM_TP_RANK being unset.
             let mut tp_children: Vec<std::process::Child> = Vec::new();
             let mut tp_peer_pids: Vec<u32> = Vec::new();
             if tp_size > 1 {
@@ -1016,9 +979,7 @@ async fn main() -> Result<()> {
                         std::process::exit(2);
                     });
                     let mut pass_args: Vec<String> = std::env::args().skip(1).collect();
-                    let port_flag = pass_args
-                        .iter()
-                        .position(|a| a == "--port" || a == "-p");
+                    let port_flag = pass_args.iter().position(|a| a == "--port" || a == "-p");
                     match port_flag {
                         Some(pos) => {
                             if let Some(next) = pass_args.get_mut(pos + 1) {
@@ -1061,26 +1022,26 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    // Fail-stop monitor: any peer dying breaks rank 0's
-                    // collectives on the next all-reduce, so take rank 0
-                    // down instead of hanging the next forward.
+                    // Fail-stop monitor: any peer dying breaks rank 0's collectives on the next
+                    // all-reduce, so take rank 0 down instead of hanging the next forward.
                     let watched = tp_peer_pids.clone();
-                    std::thread::spawn(move || loop {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        for pid in &watched {
-                            if !tp_pid_alive(*pid) {
-                                eprintln!(
-                                    "[grim] TP peer pid {pid} died; rank set is broken,                                      rank 0 exiting instead of hanging on collectives"
-                                );
-                                std::process::exit(3);
+                    std::thread::spawn(move || {
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            for pid in &watched {
+                                if !tp_pid_alive(*pid) {
+                                    eprintln!(
+                                        "[grim] TP peer pid {pid} died; rank set is broken,                                      rank 0 exiting instead of hanging on collectives"
+                                    );
+                                    std::process::exit(3);
+                                }
                             }
                         }
                     });
                 }
             }
-            // Children are killed whenever this arm's scope exits (server
-            // shutdown, error return) — a surviving rank is worse than a
-            // dead one.
+            // Children are killed whenever this arm's scope exits (server shutdown, error
+            // return) - a surviving rank is worse than a dead one.
             let _tp_child_guard = TpChildGuard(tp_children);
             // Build EngineConfig with optional disaggregation wiring.
             let mut engine_config = grim_engine::EngineConfig::default();
@@ -1103,11 +1064,8 @@ async fn main() -> Result<()> {
                     prefill_addr: prefill_addr.clone(),
                     decode_addr: decode_addr.clone(),
                 };
-                // Build a router for cross-node KV transfers.  The engine
-                // supplies its own shared KvBlockPool to transfer_kv_cache_real
-                // directly; the router's `pool` field is left None for
-                // standalone trait-method use (the engine always passes the
-                // pool as a parameter).
+                // Build a router for cross-node KV transfers.
+                // The engine supplies its own shared KvBlockPool to transfer_kv_cache_real directly; the router's `pool` field is.
                 let router = std::sync::Arc::new(grim_disagg::DisaggRouter::new(
                     if prefill_addr.is_empty() {
                         &decode_addr
@@ -1146,10 +1104,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // Load plugins into a registry that is *kept* and threaded into
-            // `serve()` so request handlers can look up registered samplers by
-            // name. Prior behavior loaded then dropped the registry before a
-            // single request was served — the whole pipeline ran for nothing.
+            // Load plugins into a registry that is *kept* and threaded into `serve()` so request handlers can look up registered samplers by name.
+            // Prior behavior loaded then dropped the registry before a single request was served - the.
             let plugin_registry = if !plugins.is_empty() {
                 let mut registry = grim_plugin::PluginRegistry::new();
                 match plugin::load_plugins(&plugins, &mut registry) {
@@ -1161,9 +1117,7 @@ async fn main() -> Result<()> {
                 None
             };
             // Precedence: explicit --address > --host/--port > GRIM_HOST/GRIM_PORT > default.
-            // If --port is given without --host, default host to 127.0.0.1 so the
-            // port is not silently ignored (a missing --host was the most common
-            // cause of "port ignored" reports).
+            // If --port is given without --host, default host to 127.0.0.1 so the port is not.
             let effective = if !address.is_empty() {
                 let host_part = address.split(':').next().unwrap_or("");
                 if host_part == "0.0.0.0" || host_part == "::" {
@@ -1269,10 +1223,8 @@ async fn main() -> Result<()> {
                 }
             }
             if let Some(ref dev) = device {
-                // SAFETY: env::set_var is UB if other threads concurrently read the
-                // environment. At this point no background worker tasks exist yet
-                // (engine hasn't been constructed), so no concurrent reader of
-                // GRIM_BACKEND is possible within this process.
+                // SAFETY: env::set_var is UB if other threads concurrently read the environment.
+                // At this point no background worker tasks exist yet (engine hasn't been constructed), so no.
                 unsafe {
                     std::env::set_var("GRIM_BACKEND", dev);
                 }
@@ -1319,8 +1271,7 @@ async fn main() -> Result<()> {
                 };
                 let r_addr = grim_core::RuntimeEnv::resolve_bind(Some(&address));
                 // Symmetric to the `Serve` arm: honor `--plugins <dir>` here too.
-                // Prior behavior ignored `plugins` entirely in the `run --serve`
-                // path, so a plugin directory was silently dropped.
+                // Prior behavior ignored `plugins` entirely in the `run --serve` path, so a plugin directory was.
                 let plugin_registry = if !plugins.is_empty() {
                     let mut registry = grim_plugin::PluginRegistry::new();
                     match plugin::load_plugins(&plugins, &mut registry) {
@@ -1577,9 +1528,8 @@ async fn main() -> Result<()> {
             // Load grim.toml defaults if available
             let cfg_toml = grim_cli::config::GrimToml::from_path("grim.toml").unwrap_or_default();
 
-            // WI-E6: load the training recipe and resolve its dataset registry
-            // entry (sha256-verified when pinned). Recipe values apply only to
-            // arguments still at their defaults; explicit flags win.
+            // WI-E6: load the training recipe and resolve its dataset registry entry (sha256-verified when pinned).
+            // Recipe values apply only to arguments still at their defaults; explicit flags win.
             let loaded_recipe = match recipe.as_deref() {
                 Some(path) => match grim_cli::recipe::load_recipe(std::path::Path::new(path)) {
                     Ok(r) => {
@@ -1889,10 +1839,8 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // F2b: full-parameter sidecars carry base-weight blobs
-            // (`param_{layer}_0_{point}_a`, no `_b` partner). Overwrite the
-            // matching GGUF tensors so the merged checkpoint IS the trained
-            // model, not just an adapter delta.
+            // F2b: full-parameter sidecars carry base-weight blobs (`param_{layer}_0_{point}_a`, no `_b` partner).
+            // Overwrite the matching GGUF tensors so the merged checkpoint IS the trained model, not just.
             let base_blobs = state.base_weight_blobs();
             if !base_blobs.is_empty() {
                 println!(

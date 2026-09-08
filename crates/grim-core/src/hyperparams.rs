@@ -1,7 +1,5 @@
 //! Centralized hyperparameter extraction for all supported model architectures.
-//!
-//! Provides `ArchHyperparameters` and a metadata extraction table that resolves model parameters
-//! from GGUF and HuggingFace config metadata keys.
+//! Provides `ArchHyperparameters` and a metadata extraction table that resolves model parameters from GGUF and HuggingFace.
 
 use crate::architecture::ModelArchitecture;
 
@@ -65,7 +63,6 @@ impl Default for ArchHyperparameters {
 
 impl ArchHyperparameters {
     /// Computes the semantic-demand lower bound $U_{\text{sum}}$ for worst-case prefill sequence.
-    ///
     /// Returns: (static_parameter_bytes, semantic_demand_bytes, kv_cache_bytes, peak_activation_bytes, demanded_experts, total_experts)
     pub fn compute_detailed_memory_bounds(
         &self,
@@ -91,7 +88,9 @@ impl ArchHyperparameters {
         let (total_static_bytes, semantic_demand_bytes, demanded_experts, total_experts) =
             if let Some(num_experts) = self.expert_count {
                 let top_k = self.expert_used_count.unwrap_or(2) as u64;
-                let exp_ffn = self.expert_feed_forward_length.unwrap_or(self.intermediate_size) as u64;
+                let exp_ffn = self
+                    .expert_feed_forward_length
+                    .unwrap_or(self.intermediate_size) as u64;
                 let per_expert_ffn = 3 * d * exp_ffn; // SwiGLU: gate + up + down
                 let shared_ffn = 3 * d * intermediate;
 
@@ -113,16 +112,12 @@ impl ArchHyperparameters {
             } else {
                 let dense_ffn = 3 * d * intermediate;
                 let static_params = (2 * v * d) + l * (attn_layer_params + dense_ffn);
-                (
-                    static_params * bpe,
-                    static_params * bpe,
-                    0,
-                    0,
-                )
+                (static_params * bpe, static_params * bpe, 0, 0)
             };
 
         // KV cache reservation: 2 * L * B * S * N_kv * H_dim * bpe
-        let kv_cache_bytes = 2 * l * (batch_size as u64) * (target_seq_len as u64) * kv_heads * head_dim * bpe;
+        let kv_cache_bytes =
+            2 * l * (batch_size as u64) * (target_seq_len as u64) * kv_heads * head_dim * bpe;
 
         // Peak working activation buffer: 2 * B * S * D * bpe
         let peak_activation_bytes = 2 * (batch_size as u64) * (target_seq_len as u64) * d * bpe;
@@ -138,8 +133,14 @@ impl ArchHyperparameters {
     }
 
     /// Returns the semantic-demand lower bound in bytes for a target context and batch size.
-    pub fn semantic_demand_lower_bound(&self, target_seq_len: usize, batch_size: usize, bytes_per_elem: usize) -> u64 {
-        let (_, demand, kv, act, _, _) = self.compute_detailed_memory_bounds(target_seq_len, batch_size, bytes_per_elem);
+    pub fn semantic_demand_lower_bound(
+        &self,
+        target_seq_len: usize,
+        batch_size: usize,
+        bytes_per_elem: usize,
+    ) -> u64 {
+        let (_, demand, kv, act, _, _) =
+            self.compute_detailed_memory_bounds(target_seq_len, batch_size, bytes_per_elem);
         demand + kv + act
     }
 }
@@ -163,11 +164,8 @@ impl HyperparameterExtractor {
         arch: ModelArchitecture,
         metadata: &M,
     ) -> ArchHyperparameters {
-        // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"`
-        // and carries `llama.*` hyperparameter keys. Use those as the lookup
-        // prefix and prefer them over the often-stale `tokenizer.ggml.vocab_size`
-        // key (which some SmolLM2 exports populate with a wrong value and would
-        // otherwise swap vocab/hidden).
+        // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"` and carries `llama.*` hyperparameter keys.
+        // Use those as the lookup prefix and prefer them over the often-stale `tokenizer.ggml.vocab_size` key (which.
         let is_smollm2 = arch == ModelArchitecture::SmolLm2;
         let arch_name = if is_smollm2 { "llama" } else { arch.as_str() };
 
@@ -430,7 +428,10 @@ mod extract_reference_tests {
             ("llama.embedding_length", 576),
         ]);
         let hp = HyperparameterExtractor::extract(ModelArchitecture::SmolLm2, &meta);
-        assert_eq!(hp.vocab_size, 49152, "llama.vocab_size must win over the stale tokenizer key");
+        assert_eq!(
+            hp.vocab_size, 49152,
+            "llama.vocab_size must win over the stale tokenizer key"
+        );
         assert_eq!(hp.hidden_size, 576);
     }
 

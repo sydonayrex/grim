@@ -1,17 +1,5 @@
 //! Low-level GGUF v3 binary reader. Handles the file header, metadata
 //! key-value map, tensor info index, and aligned tensor data region.
-//!
-//! GGUF is the format standardized by llama.cpp:
-//!   <header> <metadata_kv*> <tensor_info*> <aligned_tensor_data>
-//!
-//! This is a minimal, no-unsafe reader — we parse the file into a
-//! `GgufFile` struct, then seek to offsets during `TensorProvider::get`.
-//!
-//! ## `.grim` ROCm Extension
-//!
-//! `.grim` files extend GGUF v3 with `grim.`-prefixed metadata keys.
-//! Any GGUF reader ignores unknown keys silently, so `.grim` is fully
-//! backward-compatible. Grim-specific keys are parsed by `read_grim_metadata()`.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -24,12 +12,7 @@ pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
 pub const GGUF_VERSION: u32 = 3;
 
 /// Maximum nesting depth for GGUF array values during parsing.
-///
-/// Real-world GGUF metadata arrays are effectively always depth 1 (a flat list
-/// of scalars). Even unusually structured metadata is very unlikely to need more
-/// than a handful of nesting levels. This limit bounds worst-case stack usage to
-/// something the default thread stack size comfortably survives, preventing a
-/// crafted file with deeply nested arrays from causing a stack overflow.
+/// Real-world GGUF metadata arrays are effectively always depth 1 (a flat list of scalars).
 const MAX_GGUF_ARRAY_NESTING_DEPTH: u32 = 64;
 
 /// Metadata value type tags from GGUF spec.
@@ -53,10 +36,8 @@ pub enum GgufValue {
 static WARNED_AS_U32_TRUNCATED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Warn once when `as_u32` drops an integer metadata value that falls
-/// outside the `u32` range (negative or > u32::MAX). Previously these were
-/// silently truncated with `as u32`, which produced nonsense values
-/// (e.g. -1 → 4294967295).
+/// Warn once when `as_u32` drops an integer metadata value that falls outside the `u32` range (negative or > u32::MAX).
+/// Previously these were silently truncated with `as u32`, which produced nonsense values (e.g.
 fn warn_as_u32_truncated() {
     if !WARNED_AS_U32_TRUNCATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
@@ -167,9 +148,7 @@ pub enum GgufDType {
     #[allow(non_camel_case_types)]
     MXFP4 = 39,
     /// NVFP4: NVIDIA 4-bit floating point (E2M1 codebook) for Blackwell.
-    /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling
-    /// convention (per-16-element block with E8M0 shared exponent, NVIDIA
-    /// packing). GGUF tag is provisional (0x4E = 78, "NVFP4" fourCC).
+    /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling convention (per-16-element block with.
     #[allow(non_camel_case_types)]
     NVFP4 = 78,
 }
@@ -268,9 +247,8 @@ impl GgufDType {
         }
     }
 
-    /// Number of weights stored per quantization block. Quant layouts package
-    /// N weights together with shared scales/deltas; this is the N. F32/F16/I*/BF16
-    /// are stored as 1-element blocks.
+    /// Number of weights stored per quantization block.
+    /// Quant layouts package N weights together with shared scales/deltas; this is the N.
     pub fn block_size(self) -> u64 {
         match self {
             GgufDType::F32
@@ -306,9 +284,8 @@ impl GgufDType {
         }
     }
 
-    /// Bytes consumed by ONE quantization block. For F32/F16/I* kinds this is
-    /// just `elem_size`. For block-quantized kinds it's the literal block layout
-    /// size in the GGUF stream (scales + codebook + packed nibbles).
+    /// Bytes consumed by ONE quantization block.
+    /// For F32/F16/I* kinds this is just `elem_size`.
     pub fn type_size_per_block(self) -> u64 {
         match self {
             GgufDType::F32 => 4,
@@ -384,9 +361,7 @@ pub struct GgufFile {
     pub data_start: u64,
 }
 
-// ---------------------------------------------------------------------------
 // `.grim` ROCm extension types
-// ---------------------------------------------------------------------------
 
 /// AMD GCN architecture identifiers for ROCm profile hints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -519,14 +494,8 @@ impl GrimFusionOp {
     }
 }
 
-/// `.grim` file metadata — parsed from `grim.*` GGUF metadata keys.
+/// `.grim` file metadata - parsed from `grim.*` GGUF metadata keys.
 /// Absent keys indicate the file is a plain GGUF (no ROCm hints).
-///
-/// The on-disk file format stays at version 1 (`GRIM\x01`); the spec's
-/// per-tensor capability fields (per-row scales, mixed-bitwidth rows,
-/// backup streams, GPTQ-ORDERED, fusion mask, ...) ride this metadata
-/// layer instead of changing the registry wire layout. See
-/// `GrimTensorExt` in `spec.rs` for the capability surface.
 #[derive(Debug, Clone)]
 pub struct GrimMetadata {
     /// `"grim-v1"` if this is a `.grim` file; absent otherwise.
@@ -564,14 +533,10 @@ pub struct GrimMetadata {
     /// Whether the registry entries contain KV fields.
     pub has_kv_registry: Option<bool>,
     /// Per-tensor capability extensions attached via the JSON metadata layer.
-    /// Each entry declares capabilities (per-row scales, mixed bitwidth,
-    /// backup streams, GPTQ-ORDERED, fusion mask) without changing the
-    /// on-disk registry layout. See `spec.rs` for the descriptor schema.
+    /// Each entry declares capabilities (per-row scales, mixed bitwidth, backup streams, GPTQ-ORDERED, fusion mask) without changing.
     pub ext_entries: Vec<crate::spec::GrimTensorExt>,
-    /// Raw GGUF key-value pairs preserved from the source GGUF file during
-    /// conversion. This carries `tokenizer.ggml.*` and other metadata that
-    /// the native `.grim` format does not otherwise track. Embedded as a JSON
-    /// object under the `"_gguf_metadata"` key in the `.grim` metadata blob.
+    /// Raw GGUF key-value pairs preserved from the source GGUF file during conversion.
+    /// This carries `tokenizer.ggml.*` and other metadata that the native `.grim` format does not otherwise track.
     pub gguf_metadata: Option<HashMap<String, GgufValue>>,
     /// Target WeightFormat codec to use during conversion. When `None`,
     /// `Bf16` (the default codec) is used.
@@ -635,9 +600,7 @@ impl Default for GrimMetadata {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Format v2 extension payload helpers
-// ---------------------------------------------------------------------------
 
 /// Extension payloads for rotation, reconstruction, and KV cache metadata.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -690,9 +653,7 @@ impl GrimMetadata {
     }
 }
 
-// ---------------------------------------------------------------------------
 // GgufValue ↔ JSON conversion helpers
-// ---------------------------------------------------------------------------
 
 fn gguf_value_to_json(v: &GgufValue) -> serde_json::Value {
     match v {
@@ -1023,11 +984,7 @@ impl GrimMetadata {
     }
 
     /// Serialize to a JSON object for the native `.grim` metadata layer.
-    ///
-    /// The native format stores metadata as a JSON blob between the header
-    /// and the tensor registry (spec §1 "Metadata JSON Layer"). This is the
-    /// same information `to_gguf_metadata` encodes as GGUF KV pairs, but in
-    /// a self-describing representation that does not require a GGUF reader.
+    /// The native format stores metadata as a JSON blob between the header and the tensor.
     pub fn to_json(&self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         if let Some(magic) = &self.magic {
@@ -1137,9 +1094,8 @@ impl GrimMetadata {
             obj.insert("has_kv_registry".into(), serde_json::Value::Bool(has_kv));
         }
         if !self.ext_entries.is_empty() {
-            // Capability extensions are tucked under a namespaced key so the
-            // on-disk wire layout (header + JSON metadata + tensor registry)
-            // stays unchanged.
+            // Capability extensions are tucked under a namespaced key so the on-disk
+            // wire layout (header + JSON metadata + tensor registry) stays unchanged.
             obj.insert(
                 "grim.ext.entries".into(),
                 serde_json::Value::Array(
@@ -1220,9 +1176,7 @@ impl GrimMetadata {
     }
 
     /// Deserialize from a JSON object produced by [`to_json`](Self::to_json).
-    ///
-    /// Missing keys fall back to [`Default`] values, so a partial or empty
-    /// JSON object yields a valid (if uninformative) `GrimMetadata`.
+    /// Missing keys fall back to [`Default`] values, so a partial or empty JSON object yields.
     pub fn from_json(value: &serde_json::Value) -> Self {
         let empty = serde_json::Map::new();
         let obj = value.as_object().unwrap_or(&empty);
@@ -1595,8 +1549,7 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
                 Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
             })?
         } else if type_size == 0 {
-            // Unimplemented/unsupported dtype — don't silently produce a zero-byte
-            // tensor (which loads as empty data with no error anywhere in the chain).
+            // Unimplemented/unsupported dtype - don't silently produce a zero-byte tensor (which loads as empty data with no error anywhere in the chain).
             // [P1-22 fix: error on Q4_2/Q8_1Hx instead of silent zero bytes.]
             return Err(Error::Backend(format!(
                 "GGUF tensor '{name}': dtype {:?} has no implemented block size — \
@@ -1707,11 +1660,7 @@ fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
 }
 
 /// Read a single GGUF metadata value given its type tag.
-///
-/// GGUF stores scalars at their natural byte widths (UINT8/INT8/BOOL = 1
-/// byte, UINT16/INT16 = 2, UINT32/INT32/FLOAT32 = 4, UINT64/INT64/FLOAT64
-/// = 8). ARRAY elements are stored WITHOUT a repeated type tag — only the
-/// array's element type (read once) precedes the count and the raw elements.
+/// GGUF stores scalars at their natural byte widths (UINT8/INT8/BOOL = 1 byte, UINT16/INT16 = 2,.
 fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32, depth: u32) -> Result<GgufValue> {
     match tag {
         // GGUF metadata value type tags
@@ -1753,12 +1702,8 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32, depth: u32) -> Result<
         })),
         8 => Ok(GgufValue::String(read_gguf_string(r)?)),
         9 => {
-            // Array: element type tag (u32) + count (u64) + `count` raw
-            // elements of that type (no per-element tag). Elements may
-            // themselves be arrays (nested), so recurse on the element tag.
-            //
-            // Guard against deeply nested arrays that could cause a stack
-            // overflow on a crafted file.
+            // Array: element type tag (u32) + count (u64) + `count` raw elements of that type (no per-element tag).
+            // Elements may themselves be arrays (nested), so recurse on the element tag.
             if depth >= MAX_GGUF_ARRAY_NESTING_DEPTH {
                 return Err(Error::Backend(format!(
                     "GGUF array nesting exceeds max depth of {MAX_GGUF_ARRAY_NESTING_DEPTH}"
@@ -1808,15 +1753,7 @@ fn warn_dtype_lossy(kind: &str, flag: &std::sync::atomic::AtomicBool) {
 }
 
 /// Canonical GGUF dtype → grim `DType` mapping, preserving quantization storage.
-///
-/// This is the single source of truth for how GGUF tensor dtypes map to grim's
-/// `DType` (arithmetic type + storage encoding). Both `map_gguf_dtype_to_grim`
-/// (provenance-aware) and `tprov::dtype_from_gguf` delegate here so they cannot
-/// disagree.
-///
-/// Unquantized types map to `Storage::Native`. Block-quantized K-quants map to
-/// the appropriate `Storage::KQuant`/`Storage::Block` variant so dequant kernels
-/// can select the correct layout.
+/// This is the single source of truth for how GGUF tensor dtypes map to grim's.
 pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
     match gguf_dtype {
         GgufDType::F32 => DType::F32,
@@ -1928,9 +1865,7 @@ impl GgufDType {
 }
 
 /// GGUF dtype → `(DType, effective_bpw)` for provenance tracking.
-///
-/// Delegates to [`map_gguf_dtype_to_storage`] for the DType, then attaches
-/// the effective bits-per-weight as provenance metadata.
+/// Delegates to [`map_gguf_dtype_to_storage`] for the DType, then attaches the effective bits-per-weight as provenance metadata.
 pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
     let dtype = map_gguf_dtype_to_storage(gguf_dtype);
     let bpw = match gguf_dtype {
@@ -2147,10 +2082,8 @@ mod tests {
         assert_eq!(restored.wavefront_size, 0);
     }
 
-    /// WI-S5: the RDNA2 (gfx1036) profile parses from both `rdna2` and
-    /// `gfx1036` aliases, returns the RDNA-family numeric hints
-    /// (wavefront 64, LDS 32 kB), and round-trips through JSON metadata
-    /// exactly like its RDNA3/RDNA4 siblings.
+    /// WI-S5: the RDNA2 (gfx1036) profile parses from both `rdna2` and `gfx1036` aliases, returns the RDNA-family numeric
+    /// hints (wavefront 64, LDS 32 kB), and round-trips through JSON metadata exactly like its RDNA3/RDNA4 siblings.
     #[test]
     fn rocml_profile_rdna2_parses_aliases_and_round_trips() {
         assert_eq!(GrimRocmlProfile::parse("rdna2"), GrimRocmlProfile::Rdna2);
@@ -2170,9 +2103,8 @@ mod tests {
         assert_eq!(restored.lds_size, Some(32768));
     }
 
-    /// The spec capability extensions ride the JSON metadata layer under
-    /// `grim.ext.entries`. This test proves a populated `ext_entries`
-    /// round-trips through `to_json`/`from_json` with all fields intact.
+    /// The spec capability extensions ride the JSON metadata layer under `grim.ext.entries`.
+    /// This test proves a populated `ext_entries` round-trips through `to_json`/`from_json` with all fields intact.
     #[test]
     fn metadata_ext_entries_round_trip_through_json() {
         use crate::spec::{
@@ -2306,16 +2238,8 @@ mod tests {
     /// Test that legitimately nested arrays (2-3 levels deep) still parse correctly.
     #[test]
     fn test_gguf_nested_array_parsing() {
-        // Build a buffer for nested array [[1, 2], [3, 4]]
-        // When read_gguf_value_with_tag is called with tag=9 (Array), it reads:
-        //   - elem_tag (u32): the type tag of elements in this array
-        //   - count (u64): number of elements
-        //   - count elements, each read via read_gguf_value_with_tag(r, elem_tag, depth+1)
-        //
-        // For [[1, 2], [3, 4]]:
-        //   - Outer array: elem_tag=9 (elements are arrays), count=2
-        //   - Element 1 (an array): elem_tag=4 (Uint32), count=2, values=[1, 2]
-        //   - Element 2 (an array): elem_tag=4 (Uint32), count=2, values=[3, 4]
+        // Build a buffer for nested array [[1, 2], [3, 4]] When read_gguf_value_with_tag is called with tag=9 (Array), it reads: - elem_tag (u32): the type tag of elements in this array - count (u64): number of elements - count elements,
+        // each read via read_gguf_value_with_tag(r, elem_tag, depth+1) For [[1, 2], [3, 4]]: - Outer array: elem_tag=9 (elements are arrays), count=2 - Element 1 (an array): elem_tag=4 (Uint32), count=2, values=[1, 2] - Element 2 (an array): elem_tag=4 (Uint32), count=2, values=[3, 4]
         let mut buf = Vec::new();
 
         // Outer array header: elements are arrays (tag 9), count = 2
@@ -2364,15 +2288,8 @@ mod tests {
         // Build a buffer for an array nested 65 levels deep (exceeds MAX_GGUF_ARRAY_NESTING_DEPTH = 64)
         let mut buf = Vec::new();
 
-        // GGUF array format when called via read_gguf_value_with_tag(tag=9, ...):
-        //   [elem_type_tag(u32), count(u64), elements...]
-        // For nested arrays, each element is itself an array.
-        //
+        // GGUF array format when called via read_gguf_value_with_tag(tag=9, ...): [elem_type_tag(u32), count(u64), elements...] For nested arrays, each element is itself an array.
         // The buffer is read from the beginning, so the outermost level comes first.
-        //
-        // We'll build 65 nested arrays (1 outermost + 64 wrapping + 1 innermost = 66 total calls)
-        // The outermost call is at depth=0, so 65 more calls brings us to depth=65,
-        // which exceeds MAX_GGUF_ARRAY_NESTING_DEPTH (64) and triggers the error.
 
         // Outermost level: elem_type = 9 (Array), count = 1
         buf.extend_from_slice(&9u32.to_le_bytes()); // elem_type = 9 (Array)

@@ -1,7 +1,5 @@
 //! Slash command descriptors, registry, and autocomplete matching.
-//!
-//! Provides a single source of truth for command metadata, input parsing,
-//! and candidate completion during interactive chat sessions.
+//! Provides a single source of truth for command metadata, input parsing, and candidate completion during.
 
 /// Metadata descriptor for a slash command.
 #[derive(Debug, Clone, PartialEq, Eq)]

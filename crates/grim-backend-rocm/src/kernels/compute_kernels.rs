@@ -134,10 +134,7 @@ extern "C" __global__ void grim_fused_madam_step(
 }
 
 // In-memory transpose of a contiguous [a, b] f32 matrix to [b, a].
-// Patch-indexed: each thread writes OUT[j*a + i] = IN[i*b + j], so the
-// transposed output is produced directly in device memory — no DtoH + H2D
-// round trip for weights that must be available in both [out,in] and
-// [in,out] layouts. One thread per output element.
+// Patch-indexed: each thread writes OUT[j*a + i] = IN[i*b + j], so the transposed output.
 extern "C" __global__ void grim_transpose_2d_f32(const float* __restrict__ in,
                                                  float* __restrict__ out,
                                                  int a, int b) {
@@ -154,12 +151,8 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
                                      float* out,
                                      int b, int s, int d, int half, float base,
                                      int interleaved) {
-    // One thread per (batch, step, dim-half-pair) element. Pairing follows
-    // RopeConfig.interleaved: GPT-J style (x[2i], x[2i+1]) when set — the CPU
-    // reference convention, used by LFM2 — else NeoX half-split (x[i],
-    // x[i+half]).
-    // CONTRACT: plain full-rotary only (rotary_dim == d). Use grim_rope_yarn
-    // for partial rotary or YaRN-modified frequencies.
+    // One thread per (batch, step, dim-half-pair) element.
+    // Pairing follows RopeConfig.interleaved: GPT-J style (x[2i], x[2i+1]) when set - the CPU reference convention, used.
     int total = b * s * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -182,11 +175,7 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
 }
 
 // Fused Re-RoPE (Position Retargeting) kernel.
-// Un-rotates Key vectors from old_positions and re-rotates them to new_positions
-// in a single pass via compound Delta-p angle arithmetic:
-//   Delta_p = p_new - p_old
-//   x1'' = x1' * cos(Delta_p * freq) - x2' * sin(Delta_p * freq)
-//   x2'' = x1' * sin(Delta_p * freq) + x2' * cos(Delta_p * freq)
+// Un-rotates Key vectors from old_positions and re-rotates them to new_positions in a single pass via.
 extern "C" __global__ void grim_rerope(const float* k,
                                        const unsigned int* old_positions,
                                        const unsigned int* new_positions,
@@ -228,21 +217,7 @@ extern "C" __global__ void grim_rerope(const float* k,
     out[b_idx] = k2_orig * new_cos + k1_orig * new_sin;
 }
 
-// Partial-rotary + YaRN kernel.
-// Handles rotary_dim <= d (partial) and pre-computed YaRN-ramp frequencies.
-//
-// CONTRACT:
-//   x        – [B, S, D] f32 input
-//   positions– [S] absolute token positions
-//   inv_freq – [rotary_half] pre-computed YaRN / plain inv-frequencies
-//   out      – [B, S, D] f32 output (non-rotary dims copied verbatim)
-//   b, s, d  – batch / seq / full head dim
-//   rotary_half – half of rotary_dim (= rotary_dim/2); dims [rotary_half, d)
-//               are NOT rotated (copied verbatim)
-//   mscale   – attention_factor (1.0 for plain RoPE; YaRN sets this)
-//
-// One thread per (batch, step, rotary-pair). Non-rotary dims are handled
-// by a second pass over the copy range [rotary_dim, d).
+// Partial-rotary + YaRN kernel. Handles rotary_dim <= d (partial) and pre-computed YaRN-ramp frequencies.
 extern "C" __global__ void grim_rope_yarn(
     const float* __restrict__ x,
     const unsigned int* __restrict__ positions,
@@ -273,8 +248,7 @@ extern "C" __global__ void grim_rope_yarn(
         out[b_idx] = x2 * cos_val + x1 * sin_val;
     }
     // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim.
-    // We reuse the same thread pool; threads with idx in [0, b*s*(d-2*rotary_half))
-    // handle the copy dimension.
+    // We reuse the same thread pool; threads with idx in [0, b*s*(d-2*rotary_half)) handle the copy.
     int copy_start = 2 * rotary_half;
     int copy_len   = d - copy_start;  // may be 0 for full rotary
     if (copy_len > 0) {
@@ -340,8 +314,7 @@ extern "C" __global__ void grim_silu_mul_backward(
 }
 
 // On-device all_reduce accumulator: out[i] = sum_k inputs[k][i].
-// `inputs` is a device array of `n_inputs` device pointers (each points to
-// `n_elements` floats on the device). One thread per output element.
+// `inputs` is a device array of `n_inputs` device pointers (each points to `n_elements` floats on.
 extern "C" __global__ void grim_all_reduce_accum(
     float* out,
     const float* const* inputs,
@@ -357,10 +330,8 @@ extern "C" __global__ void grim_all_reduce_accum(
     out[i] = acc;
 }
 
-// Warp-per-row RMS norm: one warp owns a row; the sum of squares reduces
-// with 5 __shfl_xor butterflies (no barriers). The previous one-thread-per-
-// element form made EVERY thread walk the whole row — O(row_len^2) loads per
-// row (16.7M redundant reads at hidden=4096).
+// Warp-per-row RMS norm: one warp owns a row; the sum of squares reduces with 5 __shfl_xor butterflies (no barriers).
+// The previous one-thread-per- element form made EVERY thread walk the whole row - O(row_len^2) loads.
 extern "C" __global__ void __launch_bounds__(256)
 grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
               int row_len, float eps, int total) {
@@ -501,12 +472,8 @@ extern "C" __global__ void grim_split_k_reduction(
     out[idx] = (_Float16)sum;
 }
 
-// Split-K partial reduction, dtype-specialized. The f16 kernel above is
-// the historical entry point; F32 and BF16 GEMMs must reduce their OWN
-// element types — routing them through the _Float16 entry read each f32
-// partial as half-precision pairs and wrote f16 bits into an f32 output
-// buffer (silent garbage for every F32 split-K GEMM, i.e. m > 1 or
-// k > 8192; found by the WI-SB6 ring-vs-direct benchmark 2026-08-25).
+// Split-K partial reduction, dtype-specialized.
+// The f16 kernel above is the historical entry point; F32 and BF16 GEMMs must reduce.
 extern "C" __global__ void grim_split_k_reduction_f32(
     const float* __restrict__ partials,
     float* __restrict__ out,
@@ -638,9 +605,8 @@ extern "C" __global__ void grim_mla_q_kv_norm_split(
     }
 }
 
-// Reverse-mode autodiff for RMSNorm (salamander.md Phase 3 & G3):
-// dx[i] = (w[i] / rms) * g[i] - x[i] * (sum_j g[j] * w[j] * x[j]) / (hidden_dim * rms^3)
-// dw[i] = sum_rows g[row, i] * (x[row, i] / rms)
+// Reverse-mode autodiff for RMSNorm (salamander.md Phase 3 & G3): dx[i] = (w[i] / rms) * g[i] - x[i] *
+// (sum_j g[j] * w[j] * x[j]) / (hidden_dim * rms^3) dw[i] = sum_rows g[row, i] * (x[row, i] / rms)
 extern "C" __global__ void __launch_bounds__(256)
 grim_rmsnorm_backward(const float* __restrict__ x, const float* __restrict__ w,
                       const float* __restrict__ out_grad, float* __restrict__ dx,
@@ -677,10 +643,8 @@ grim_rmsnorm_backward(const float* __restrict__ x, const float* __restrict__ w,
     }
 }
 
-// Reverse-mode autodiff for Rotary Position Embedding (RoPE) (salamander.md Phase 3 & G3):
-// Orthogonal rotation matrix backward is R(-theta).
-// dx0 = g0 * cos + g1 * sin
-// dx1 = -g0 * sin + g1 * cos
+// Reverse-mode autodiff for Rotary Position Embedding (RoPE) (salamander.md Phase 3 & G3): Orthogonal rotation matrix backward is R(-theta).
+// dx0 = g0 * cos + g1 * sin dx1 = -g0 * sin +.
 extern "C" __global__ void __launch_bounds__(256)
 grim_rope_backward(const float* __restrict__ out_grad, const float* __restrict__ cos_tab,
                    const float* __restrict__ sin_tab, float* __restrict__ dx,
@@ -730,10 +694,8 @@ grim_softmax_backward(const float* __restrict__ out_grad, const float* __restric
     }
 }
 
-// Reverse-mode autodiff for token-embedding lookup (salamander.md P3, the
-// 4th fused backward kernel): dweight[token_ids[t], :] += out_grad[t, :].
-// Two kernels: a plain zero-fill of the [vocab, hidden] gradient buffer,
-// then a grid-strided atomic scatter-add over token x hidden elements.
+// Reverse-mode autodiff for token-embedding lookup (salamander.md P3, the 4th fused backward kernel): dweight[token_ids[t], :] += out_grad[t, :].
+// Two kernels: a plain zero-fill of the [vocab, hidden] gradient buffer, then a grid-strided atomic.
 extern "C" __global__ void __launch_bounds__(256)
 grim_zero_f32(float* __restrict__ dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

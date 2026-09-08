@@ -1,17 +1,5 @@
-//! Muse-Glimmer temporal-patch ViT vision encoder — `Encoder` trait impl.
-//!
-//! pipeline:
-//!   temporal patch_embed (patch_temporal × patch_size²) → N × encoder block
-//!   (with token-merging every `merge_size` blocks) → optional final norm
-//!
-//! Muse-Glimmer's vision tower (from `MuseVisionConfig`): a temporal ViT with
-//! `hidden_size=768`, `patch_size=16`, `patch_temporal=1`, `merge_size=2`,
-//! `use_vision_norm=true`, `n_layers=24`. `merge_size` controls how often a
-//! deterministic adjacent-token merge halves the token count, mirroring the
-//! token-merging graph in the reference implementation.
-//!
-//! All in F32 CPU for the structural layer; kernel backends land with
-//! grim-backend-rocm in phase 4.
+//! Muse-Glimmer temporal-patch ViT vision encoder - `Encoder` trait impl.
+//! pipeline: temporal patch_embed (patch_temporal × patch_size²) → N × encoder block (with token-merging every `merge_size`.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -367,9 +355,8 @@ impl GlimmerVision {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry. Vision encoders do not run on the serving
-    /// engine's text-out path; TP here is refused until an encoder consumer
-    /// with an all-reduce hook arrives (mirrors `Vit`).
+    /// Tensor-parallel load entry. Vision encoders do not run on the serving engine's text-out path;
+    /// TP here is refused until an encoder consumer with an all-reduce hook arrives (mirrors `Vit`).
     pub fn load_tp(
         device: Device,
         ws: &WeightSource<'_>,

@@ -34,7 +34,16 @@ fn get_chat_template(path: &str) -> Option<String> {
 fn assert_no_jinja_leakage(rendered: &str) {
     // Check for Jinja control markers. Note: we do NOT check for standalone
     // `}}` because JSON content like `{"key":"value"}}` legitimately contains `}}`.
-    for marker in ["{%-", "{%", "-%}", "%}", "{{", "raise_exception", "namespace(", "set ns"] {
+    for marker in [
+        "{%-",
+        "{%",
+        "-%}",
+        "%}",
+        "{{",
+        "raise_exception",
+        "namespace(",
+        "set ns",
+    ] {
         assert!(
             !rendered.contains(marker),
             "rendered output contains raw Jinja marker '{marker}': {rendered:.200}"
@@ -58,7 +67,9 @@ fn assert_tui_safe(rendered: &str) {
 // ===========================================================================
 #[test]
 fn minicpm5_simple_user_message_renders_cleanly() {
-    let Some(path) = minicpm5_model_path() else { return };
+    let Some(path) = minicpm5_model_path() else {
+        return;
+    };
     let Some(tmpl) = get_chat_template(&path) else {
         eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
         return;
@@ -73,13 +84,11 @@ fn minicpm5_simple_user_message_renders_cleanly() {
     }];
 
     let rendered = render_chat_template(
-        &tmpl,
-        &messages,
-        true,   // add_generation_prompt
-        "",     // bos_token
-        "",     // eos_token
-        None,   // tools
-        None,   // tool_choice
+        &tmpl, &messages, true, // add_generation_prompt
+        "",   // bos_token
+        "",   // eos_token
+        None, // tools
+        None, // tool_choice
     )
     .expect("render_chat_template failed for simple user message");
 
@@ -105,7 +114,9 @@ fn minicpm5_simple_user_message_renders_cleanly() {
 // ===========================================================================
 #[test]
 fn minicpm5_system_message_renders_cleanly() {
-    let Some(path) = minicpm5_model_path() else { return };
+    let Some(path) = minicpm5_model_path() else {
+        return;
+    };
     let Some(tmpl) = get_chat_template(&path) else {
         eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
         return;
@@ -128,16 +139,8 @@ fn minicpm5_system_message_renders_cleanly() {
         },
     ];
 
-    let rendered = render_chat_template(
-        &tmpl,
-        &messages,
-        true,
-        "",
-        "",
-        None,
-        None,
-    )
-    .expect("render_chat_template failed for system + user message");
+    let rendered = render_chat_template(&tmpl, &messages, true, "", "", None, None)
+        .expect("render_chat_template failed for system + user message");
 
     assert_no_jinja_leakage(&rendered);
     assert_tui_safe(&rendered);
@@ -160,7 +163,9 @@ fn minicpm5_system_message_renders_cleanly() {
 // ===========================================================================
 #[test]
 fn minicpm5_tool_calls_renders_cleanly() {
-    let Some(path) = minicpm5_model_path() else { return };
+    let Some(path) = minicpm5_model_path() else {
+        return;
+    };
     let Some(tmpl) = get_chat_template(&path) else {
         eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
         return;
@@ -203,7 +208,7 @@ fn minicpm5_tool_calls_renders_cleanly() {
     let rendered = render_chat_template(
         &tmpl,
         &messages,
-        false,  // no generation prompt (tool response follows)
+        false, // no generation prompt (tool response follows)
         "",
         "",
         Some(&tools),
@@ -217,10 +222,7 @@ fn minicpm5_tool_calls_renders_cleanly() {
         rendered.contains("get_weather"),
         "expected tool name in rendered output: {rendered:.200}"
     );
-    eprintln!(
-        "[minicpm5] Tool calls rendered ({} chars)",
-        rendered.len()
-    );
+    eprintln!("[minicpm5] Tool calls rendered ({} chars)", rendered.len());
 }
 
 // ===========================================================================
@@ -228,7 +230,9 @@ fn minicpm5_tool_calls_renders_cleanly() {
 // ===========================================================================
 #[test]
 fn minicpm5_reasoning_content_renders_cleanly() {
-    let Some(path) = minicpm5_model_path() else { return };
+    let Some(path) = minicpm5_model_path() else {
+        return;
+    };
     let Some(tmpl) = get_chat_template(&path) else {
         eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
         return;
@@ -251,16 +255,8 @@ fn minicpm5_reasoning_content_renders_cleanly() {
         },
     ];
 
-    let rendered = render_chat_template(
-        &tmpl,
-        &messages,
-        false,
-        "",
-        "",
-        None,
-        None,
-    )
-    .expect("render_chat_template failed for reasoning content");
+    let rendered = render_chat_template(&tmpl, &messages, false, "", "", None, None)
+        .expect("render_chat_template failed for reasoning content");
 
     assert_no_jinja_leakage(&rendered);
     assert_tui_safe(&rendered);
@@ -279,7 +275,9 @@ fn minicpm5_reasoning_content_renders_cleanly() {
 // ===========================================================================
 #[test]
 fn minicpm5_long_conversation_fits_tui() {
-    let Some(path) = minicpm5_model_path() else { return };
+    let Some(path) = minicpm5_model_path() else {
+        return;
+    };
     let Some(tmpl) = get_chat_template(&path) else {
         eprintln!("[test-skip] MiniCPM5 has no chat_template metadata");
         return;
@@ -297,23 +295,16 @@ fn minicpm5_long_conversation_fits_tui() {
             role: "user".into(),
             content: "Tell me a very long story about the history of computing, \
                       from the abacus to modern quantum computers, including \
-                      all the key milestones and inventors.".into(),
+                      all the key milestones and inventors."
+                .into(),
             tool_calls: None,
             tool_call_id: None,
             name: None,
         },
     ];
 
-    let rendered = render_chat_template(
-        &tmpl,
-        &messages,
-        true,
-        "",
-        "",
-        None,
-        None,
-    )
-    .expect("render_chat_template failed for long conversation");
+    let rendered = render_chat_template(&tmpl, &messages, true, "", "", None, None)
+        .expect("render_chat_template failed for long conversation");
 
     assert_no_jinja_leakage(&rendered);
     assert_tui_safe(&rendered);

@@ -1,8 +1,5 @@
 //! CacheBlend non-prefix KV cache stitching and selective attention recalibration.
-//!
-//! Allows reusing cached KV blocks from non-prefix positions (e.g. multi-document RAG,
-//! injected context, and tool responses) by stitching block ranges and computing
-//! cross-boundary attention adjustments.
+//! Allows reusing cached KV blocks from non-prefix positions (e.g.
 
 /// A contiguous segment of tokens that matches a cached chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
