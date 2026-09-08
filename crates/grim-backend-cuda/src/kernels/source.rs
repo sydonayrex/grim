@@ -1924,4 +1924,156 @@ void grim_tree_attention(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// NVFP4 Fused GEMM / GEMV
+// ---------------------------------------------------------------------------
+// Sub-block is 16 elements: 1 byte E8M0 scale + 8 bytes E2M1 packed codes
+// Total 9 bytes per 16 elements.
+__device__ __forceinline__ float dequant_nvfp4_val(
+    const unsigned char* __restrict__ col_bytes,
+    int k_idx
+) {
+    const float lut[16] = {
+        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+       -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+
+    int sb_idx = k_idx / 16;
+    int in_sb = k_idx % 16;
+    const unsigned char* blk = col_bytes + sb_idx * 9;
+
+    unsigned char shared_exp = blk[0];
+    float scale = exp2f((float)(int)shared_exp - 127.0f);
+
+    unsigned char code_byte = blk[1 + (in_sb / 2)];
+    unsigned char code = (in_sb % 2 == 0) ? (code_byte & 0x0F) : ((code_byte >> 4) & 0x0F);
+
+    return lut[code] * scale;
+}
+
+extern "C" __global__ void grim_nvfp4_gemm(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_bytes,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    int blocks_per_col = K / 16;
+    int col_stride_bytes = blocks_per_col * 9;
+    const unsigned char* col_bytes = B_bytes + col * col_stride_bytes;
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float b_val = dequant_nvfp4_val(col_bytes, k);
+        acc += A[row * K + k] * b_val;
+    }
+
+    C[row * N + col] = acc;
+}
+
+extern "C" __global__ void grim_nvfp4_gemv(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_bytes,
+    float* __restrict__ C,
+    int N, int K
+) {
+    int col = blockIdx.x;
+    if (col >= N) return;
+
+    int lane = threadIdx.x;
+    int blocks_per_col = K / 16;
+    int col_stride_bytes = blocks_per_col * 9;
+    const unsigned char* col_bytes = B_bytes + col * col_stride_bytes;
+
+    float sum = 0.0f;
+    for (int k = lane; k < K; k += blockDim.x) {
+        float b_val = dequant_nvfp4_val(col_bytes, k);
+        sum += A[k] * b_val;
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+
+    if (lane == 0) {
+        C[col] = sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CompressedTensors W8A8 FP8 & INT8 Fused GEMM
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float fp8_e4m3_to_f32_src(unsigned char byte) {
+    bool sign = (byte & 0x80) != 0;
+    int exp = (byte >> 3) & 0x0F;
+    int mant = byte & 0x07;
+
+    if (exp == 15 && mant == 7) {
+        return 0.0f;
+    }
+    float val;
+    if (exp == 0) {
+        val = (float)mant / 512.0f;
+    } else {
+        val = (1.0f + (float)mant / 8.0f) * exp2f((float)(exp - 7));
+    }
+    return sign ? -val : val;
+}
+
+extern "C" __global__ void grim_w8a8_fp8_dequant_gemm(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_bytes,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    unsigned long long scale_len = *((const unsigned long long*)B_bytes);
+    const float* scales = (const float*)(B_bytes + 8);
+    const unsigned char* codes = B_bytes + 8 + scale_len;
+
+    float scale = (scale_len >= (unsigned long long)(N * 4)) ? scales[col] : scales[0];
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        unsigned char code = codes[col * K + k];
+        float w_val = fp8_e4m3_to_f32_src(code) * scale;
+        acc += A[row * K + k] * w_val;
+    }
+
+    C[row * N + col] = acc;
+}
+
+extern "C" __global__ void grim_w8a8_int8_dequant_gemm(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_bytes,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    unsigned long long scale_len = *((const unsigned long long*)B_bytes);
+    const float* scales = (const float*)(B_bytes + 8);
+    const signed char* codes = (const signed char*)(B_bytes + 8 + scale_len);
+
+    float scale = (scale_len >= (unsigned long long)(N * 4)) ? scales[col] : scales[0];
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        signed char code = codes[col * K + k];
+        float w_val = (float)code * scale;
+        acc += A[row * K + k] * w_val;
+    }
+
+    C[row * N + col] = acc;
+}
 "#;

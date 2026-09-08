@@ -25,6 +25,8 @@ fn test_all_vulkan_spirv_blobs_compiled_and_non_empty() {
         VulkanKernel::FusedDequantGemmQ4K,
         VulkanKernel::FusedDequantGemmQ80,
         VulkanKernel::FusedDequantGemmNvFp4,
+        VulkanKernel::FusedDequantGemmW8A8Fp8,
+        VulkanKernel::FusedDequantGemmW8A8Int8,
         VulkanKernel::KvDequantAttention,
         VulkanKernel::SelectiveScan,
         VulkanKernel::QkvAttentionPaged,
@@ -279,6 +281,156 @@ fn test_vulkan_fused_dequant_gemm_nvfp4_parity() {
         assert!(
             diff < 1e-4,
             "NVFP4 GEMM mismatch at {i}: gpu={gpu}, cpu={cpu}, diff={diff}"
+        );
+    }
+}
+
+#[test]
+fn test_vulkan_fused_dequant_gemm_w8a8_fp8_parity() {
+    let dev = VulkanDevice::new();
+
+    let m = 2usize;
+    let k = 16usize;
+    let n = 2usize;
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.15).cos()).collect();
+
+    // Layout: [u64 scale_len (8 bytes)][scales F32 (N*4 bytes)][FP8 codes (K*N bytes)]
+    let scale_len = (n * 4) as u64;
+    let mut b_bytes = Vec::new();
+    b_bytes.extend_from_slice(&scale_len.to_le_bytes());
+    // Two scales
+    let scales = [0.5f32, 2.0f32];
+    for s in &scales {
+        b_bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    // FP8 codes for K*N elements
+    for col in 0..n {
+        for row in 0..k {
+            let code = ((col * k + row) % 15 + 1) as u8;
+            b_bytes.push(code);
+        }
+    }
+
+    let shape_a = Shape::new(vec![m, k]);
+    let shape_b = Shape::new(vec![k, n]);
+    let shape_out = Shape::new(vec![m, n]);
+
+    let w8a8_dtype = DType {
+        arith: ArithType::U8,
+        storage: Storage::CompressedTensorsW8A8Fp8,
+    };
+
+    let a_storage = dev.from_cpu(&a_data, &shape_a, DType::F32).unwrap();
+    let b_storage = dev.from_cpu_bytes(&b_bytes, &shape_b, w8a8_dtype).unwrap();
+
+    let (out_storage, _) = dev
+        .quantized_matmul(
+            &*a_storage,
+            &*b_storage,
+            &[],
+            grim_tensor::QuantFormat::Fp8,
+            &shape_out,
+        )
+        .unwrap();
+
+    let gpu_result = out_storage.to_cpu_vec_f32().unwrap();
+    assert_eq!(gpu_result.len(), m * n);
+
+    let codes = &b_bytes[8 + n * 4..];
+    let mut cpu_expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let scale = scales[col];
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                let code = codes[col * k + p];
+                let w_val = grim_quant::fp8_e4m3_to_f32(code) * scale;
+                sum += a_data[row * k + p] * w_val;
+            }
+            cpu_expected[row * n + col] = sum;
+        }
+    }
+
+    for (i, (gpu, cpu)) in gpu_result.iter().zip(cpu_expected.iter()).enumerate() {
+        let diff = (gpu - cpu).abs();
+        assert!(
+            diff < 1e-4,
+            "W8A8 FP8 GEMM mismatch at {i}: gpu={gpu}, cpu={cpu}, diff={diff}"
+        );
+    }
+}
+
+#[test]
+fn test_vulkan_fused_dequant_gemm_w8a8_int8_parity() {
+    let dev = VulkanDevice::new();
+
+    let m = 2usize;
+    let k = 16usize;
+    let n = 2usize;
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.12).sin()).collect();
+
+    let scale_len = (n * 4) as u64;
+    let mut b_bytes = Vec::new();
+    b_bytes.extend_from_slice(&scale_len.to_le_bytes());
+    let scales = [0.25f32, 1.5f32];
+    for s in &scales {
+        b_bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    // Signed int8 codes for K*N elements
+    for col in 0..n {
+        for row in 0..k {
+            let val = ((col * k + row) as i8 % 17) - 8;
+            b_bytes.push(val as u8);
+        }
+    }
+
+    let shape_a = Shape::new(vec![m, k]);
+    let shape_b = Shape::new(vec![k, n]);
+    let shape_out = Shape::new(vec![m, n]);
+
+    let w8a8_dtype = DType {
+        arith: ArithType::U8,
+        storage: Storage::CompressedTensorsW8A8Int8,
+    };
+
+    let a_storage = dev.from_cpu(&a_data, &shape_a, DType::F32).unwrap();
+    let b_storage = dev.from_cpu_bytes(&b_bytes, &shape_b, w8a8_dtype).unwrap();
+
+    let (out_storage, _) = dev
+        .quantized_matmul(
+            &*a_storage,
+            &*b_storage,
+            &[],
+            grim_tensor::QuantFormat::Q8_0,
+            &shape_out,
+        )
+        .unwrap();
+
+    let gpu_result = out_storage.to_cpu_vec_f32().unwrap();
+    assert_eq!(gpu_result.len(), m * n);
+
+    let codes = &b_bytes[8 + n * 4..];
+    let mut cpu_expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let scale = scales[col];
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                let code = codes[col * k + p] as i8;
+                let w_val = (code as f32) * scale;
+                sum += a_data[row * k + p] * w_val;
+            }
+            cpu_expected[row * n + col] = sum;
+        }
+    }
+
+    for (i, (gpu, cpu)) in gpu_result.iter().zip(cpu_expected.iter()).enumerate() {
+        let diff = (gpu - cpu).abs();
+        assert!(
+            diff < 1e-4,
+            "W8A8 INT8 GEMM mismatch at {i}: gpu={gpu}, cpu={cpu}, diff={diff}"
         );
     }
 }

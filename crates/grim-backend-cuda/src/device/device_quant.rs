@@ -679,6 +679,97 @@ impl CudaDevice {
         }))
     }
 
+    pub(crate) fn launch_nvfp4_gemm(
+        &self,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        self.launch_fused_quant_gemm("grim_nvfp4_gemm", a_ptr, b_ptr, out_ptr, m, n, k)
+    }
+
+    pub(crate) fn launch_w8a8_fp8_gemm(
+        &self,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        self.launch_fused_quant_gemm("grim_w8a8_fp8_dequant_gemm", a_ptr, b_ptr, out_ptr, m, n, k)
+    }
+
+    pub(crate) fn launch_w8a8_int8_gemm(
+        &self,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        self.launch_fused_quant_gemm(
+            "grim_w8a8_int8_dequant_gemm",
+            a_ptr,
+            b_ptr,
+            out_ptr,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub(crate) fn gptq_segment_offsets(
+        bits: u8,
+        group_size: usize,
+        k: usize,
+        n: usize,
+        blob_bytes: usize,
+    ) -> Result<(i64, i64, i64, i64, bool)> {
+        let vpw: usize = match bits {
+            2 => 16,
+            4 => 8,
+            8 => 1,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "gptq gemm: unsupported bit width {bits}"
+                )));
+            }
+        };
+        let qw_len = k.div_ceil(vpw) * n * 4;
+        let groups = k.div_ceil(group_size);
+        let qz_len = groups * n.div_ceil(vpw) * 4;
+        let sc_len = groups * n * 4;
+
+        let qz_data = 8 + qw_len + 8;
+        let sc_data = qz_data + qz_len + 8;
+        let gi_data = sc_data + sc_len + 8;
+
+        let no_gi_total = gi_data;
+        let gi_total_u32 = gi_data + k * 4;
+        let gi_total_u64 = gi_data + k * 8;
+
+        let has_g_idx = if blob_bytes == no_gi_total {
+            false
+        } else if blob_bytes == gi_total_u32 {
+            true
+        } else if blob_bytes == gi_total_u64 {
+            return Err(Error::Backend(
+                "gptq gemm: 64-bit g_idx entries not supported by the fused kernel".into(),
+            ));
+        } else {
+            return Err(Error::Backend(format!(
+                "gptq gemm: packed blob size {blob_bytes} matches no valid GroupInt layout for bits={bits} group_size={group_size} k={k} n={n}"
+            )));
+        };
+
+        Ok((8, qz_data as i64, sc_data as i64, gi_data as i64, has_g_idx))
+    }
+
     /// Dequantize Q8_0 packed bytes to an f32 host Vec via host / GPU.
     pub fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
         let packed = CudaStorage::copy_from_host_raw_bytes(
@@ -990,6 +1081,127 @@ impl QuantOps for CudaDevice {
             }
         }
 
+        // ── GPU fast path: NVFP4, CompressedTensors, GroupInt dispatch by storage dtype ──
+        let a_storage_opt = a.as_any().downcast_ref::<CudaStorage>();
+        let b_storage_opt = b_packed.as_any().downcast_ref::<CudaStorage>();
+        if let (Some(a_s), Some(b_s)) = (a_storage_opt, b_storage_opt) {
+            use grim_tensor::dtype::{FloatPackScheme, Storage};
+            match &b_s.dtype.storage {
+                Storage::FloatPack(FloatPackScheme::NvFp4) => {
+                    let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                    let a_ptr = Self::dev_ptr_or_err("quantized_matmul(nvfp4) a", a_s)?;
+                    let b_ptr = Self::dev_ptr_or_err("quantized_matmul(nvfp4) b", b_s)?;
+                    let out_ptr =
+                        Self::dev_ptr_or_err("quantized_matmul(nvfp4) out", &out_storage)?;
+                    let handle = self.launch_nvfp4_gemm(a_ptr, b_ptr, out_ptr, m, n, k)?;
+                    return Ok((Box::new(out_storage), handle));
+                }
+                Storage::CompressedTensorsW8A8Fp8 => {
+                    let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                    let a_ptr = Self::dev_ptr_or_err("quantized_matmul(w8a8_fp8) a", a_s)?;
+                    let b_ptr = Self::dev_ptr_or_err("quantized_matmul(w8a8_fp8) b", b_s)?;
+                    let out_ptr =
+                        Self::dev_ptr_or_err("quantized_matmul(w8a8_fp8) out", &out_storage)?;
+                    let handle = self.launch_w8a8_fp8_gemm(a_ptr, b_ptr, out_ptr, m, n, k)?;
+                    return Ok((Box::new(out_storage), handle));
+                }
+                Storage::CompressedTensorsW8A8Int8 => {
+                    let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                    let a_ptr = Self::dev_ptr_or_err("quantized_matmul(w8a8_int8) a", a_s)?;
+                    let b_ptr = Self::dev_ptr_or_err("quantized_matmul(w8a8_int8) b", b_s)?;
+                    let out_ptr =
+                        Self::dev_ptr_or_err("quantized_matmul(w8a8_int8) out", &out_storage)?;
+                    let handle = self.launch_w8a8_int8_gemm(a_ptr, b_ptr, out_ptr, m, n, k)?;
+                    return Ok((Box::new(out_storage), handle));
+                }
+                Storage::GroupInt(cfg) if matches!(cfg.bits, 2 | 4 | 8) => {
+                    let (qw_off, qz_off, sc_off, gi_off, has_g_idx) =
+                        Self::gptq_segment_offsets(cfg.bits, cfg.group_size, k, n, b_s.bytes())?;
+                    let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                    let a_ptr = Self::dev_ptr_or_err("quantized_matmul(gptq) a", a_s)?;
+                    let b_ptr = Self::dev_ptr_or_err("quantized_matmul(gptq) b", b_s)?;
+                    let out_ptr = Self::dev_ptr_or_err("quantized_matmul(gptq) out", &out_storage)?;
+
+                    let vpw = match cfg.bits {
+                        2 => 16,
+                        4 => 8,
+                        8 => 1,
+                        _ => 8,
+                    };
+                    let module =
+                        compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+                    let mut func: CUfunction = std::ptr::null_mut();
+                    unsafe {
+                        let func_name = std::ffi::CString::new("grim_gptq_dequant_gemm")
+                            .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+                        let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+                        if res != 0 {
+                            return Err(Error::Backend(format!(
+                                "cuModuleGetFunction(grim_gptq_dequant_gemm) failed: {res}"
+                            )));
+                        }
+                        let mut a_arg = a_ptr as *const c_void;
+                        let mut b_arg = b_ptr as *const c_void;
+                        let mut out_arg = out_ptr;
+                        let mut m_arg = m as i32;
+                        let mut n_arg = n as i32;
+                        let mut k_arg = k as i32;
+                        let mut bits_arg = cfg.bits as i32;
+                        let mut gs_arg = cfg.group_size as i32;
+                        let mut vpw_arg = vpw as i32;
+                        let mut hgi_arg = if has_g_idx { 1i32 } else { 0i32 };
+                        let mut qw_arg = qw_off;
+                        let mut qz_arg = qz_off;
+                        let mut sc_arg = sc_off;
+                        let mut gi_arg = gi_off;
+                        let mut args: [*mut c_void; 14] = [
+                            &raw mut a_arg as *mut c_void,
+                            &raw mut b_arg as *mut c_void,
+                            &raw mut out_arg as *mut c_void,
+                            &mut m_arg as *mut i32 as *mut c_void,
+                            &mut n_arg as *mut i32 as *mut c_void,
+                            &mut k_arg as *mut i32 as *mut c_void,
+                            &mut bits_arg as *mut i32 as *mut c_void,
+                            &mut gs_arg as *mut i32 as *mut c_void,
+                            &mut vpw_arg as *mut i32 as *mut c_void,
+                            &mut hgi_arg as *mut i32 as *mut c_void,
+                            &mut qw_arg as *mut i64 as *mut c_void,
+                            &mut qz_arg as *mut i64 as *mut c_void,
+                            &mut sc_arg as *mut i64 as *mut c_void,
+                            &mut gi_arg as *mut i64 as *mut c_void,
+                        ];
+                        const BLOCK_SIZE: u32 = 256;
+                        let grid = ((m * n) as u32).div_ceil(BLOCK_SIZE);
+                        let launch_res = cuLaunchKernel(
+                            func,
+                            grid,
+                            1,
+                            1,
+                            BLOCK_SIZE,
+                            1,
+                            1,
+                            0,
+                            std::ptr::null_mut(),
+                            args.as_mut_ptr() as *mut *mut c_void,
+                            std::ptr::null_mut(),
+                        );
+                        if launch_res != 0 {
+                            return Err(Error::Backend(format!(
+                                "cuLaunchKernel(grim_gptq_dequant_gemm) failed: {launch_res}"
+                            )));
+                        }
+                    }
+                    return Ok((
+                        Box::new(out_storage),
+                        Box::new(CudaHandle {
+                            completed: Arc::new(Mutex::new(false)),
+                        }),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         // ── CPU fallback: format-accurate dequantization via grim_quant ────── Dispatches on `format` so every supported variant uses its canonical bit-unpacking algorithm.
         // Non-supported formats return Err immediately rather than producing silently wrong output.
         tracing::warn!(
@@ -1124,11 +1336,81 @@ impl QuantOps for CudaDevice {
                     Error::Backend(format!("quantized_matmul FP4Block16 dequant: {e}"))
                 })?
             }
+            grim_tensor::QuantFormat::Fp8 => grim_quant::dequant_fp8(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul FP8 dequant: {e}")))?,
             unsupported => {
-                return Err(Error::Backend(format!(
-                    "CUDA quantized_matmul: no GPU kernel or CPU dequant path \
-                     for format {unsupported:?}"
-                )));
+                use grim_tensor::dtype::{FloatPackScheme, Storage};
+                if let Some(cs) = b_packed.as_any().downcast_ref::<CudaStorage>() {
+                    match &cs.dtype.storage {
+                        Storage::FloatPack(FloatPackScheme::NvFp4) => {
+                            grim_quant::dequant_nvfp4(&b_bytes, k * n).map_err(|e| {
+                                Error::Backend(format!("quantized_matmul NVFP4 dequant: {e}"))
+                            })?
+                        }
+                        Storage::CompressedTensorsW8A8Fp8 => {
+                            let scale_len =
+                                u64::from_le_bytes(b_bytes[..8].try_into().unwrap()) as usize;
+                            let scales = &b_bytes[8..8 + scale_len];
+                            let codes = &b_bytes[8 + scale_len..];
+                            let mut out = Vec::with_capacity(k * n);
+                            for col in 0..n {
+                                let scale = if scale_len >= n * 4 {
+                                    f32::from_le_bytes(
+                                        scales[col * 4..col * 4 + 4].try_into().unwrap(),
+                                    )
+                                } else {
+                                    f32::from_le_bytes(scales[..4].try_into().unwrap())
+                                };
+                                for r in 0..k {
+                                    let code = codes[col * k + r];
+                                    out.push(grim_quant::fp8_e4m3_to_f32(code) * scale);
+                                }
+                            }
+                            out
+                        }
+                        Storage::CompressedTensorsW8A8Int8 => {
+                            let scale_len =
+                                u64::from_le_bytes(b_bytes[..8].try_into().unwrap()) as usize;
+                            let scales = &b_bytes[8..8 + scale_len];
+                            let codes = &b_bytes[8 + scale_len..];
+                            let mut out = Vec::with_capacity(k * n);
+                            for col in 0..n {
+                                let scale = if scale_len >= n * 4 {
+                                    f32::from_le_bytes(
+                                        scales[col * 4..col * 4 + 4].try_into().unwrap(),
+                                    )
+                                } else {
+                                    f32::from_le_bytes(scales[..4].try_into().unwrap())
+                                };
+                                for r in 0..k {
+                                    let code = codes[col * k + r] as i8;
+                                    out.push((code as f32) * scale);
+                                }
+                            }
+                            out
+                        }
+                        Storage::GroupInt(cfg) => grim_quant::dequant_gptq_group_int(
+                            &b_bytes,
+                            &[],
+                            &[],
+                            None,
+                            &[k, n],
+                            cfg.bits as u32,
+                            cfg.group_size,
+                        )?,
+                        _ => {
+                            return Err(Error::Backend(format!(
+                                "CUDA quantized_matmul: no GPU kernel or CPU dequant path \
+                                 for format {unsupported:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(Error::Backend(format!(
+                        "CUDA quantized_matmul: no GPU kernel or CPU dequant path \
+                         for format {unsupported:?}"
+                    )));
+                }
             }
         };
 
