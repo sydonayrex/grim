@@ -449,6 +449,7 @@ pub enum VulkanKernel {
     FusedDequantGemmIQ2S,
     FusedDequantGemmFp8E4M3,
     FusedDequantGemmMxFp4,
+    FusedDequantGemmNvFp4,
     KvDequantAttention,
     SelectiveScan,
     QkvAttentionPaged,
@@ -568,6 +569,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::FusedDequantGemmIQ2S => SPIRV_FUSED_DEQUANT_GEMM_IQ2S,
         VulkanKernel::FusedDequantGemmFp8E4M3 => SPIRV_FUSED_DEQUANT_GEMM_FP8_E4M3,
         VulkanKernel::FusedDequantGemmMxFp4 => SPIRV_FUSED_DEQUANT_GEMM_MXFP4,
+        VulkanKernel::FusedDequantGemmNvFp4 => SPIRV_FUSED_DEQUANT_GEMM_NVFP4,
         VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
         VulkanKernel::LogSoftmaxVjp => SPIRV_LOG_SOFTMAX_VJP,
         VulkanKernel::SelectiveScan => SPIRV_SELECTIVE_SCAN,
@@ -645,6 +647,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedDequantGemmIQ2S
         | VulkanKernel::FusedDequantGemmFp8E4M3
         | VulkanKernel::FusedDequantGemmMxFp4
+        | VulkanKernel::FusedDequantGemmNvFp4
         | VulkanKernel::FusedQuantGemmQ80
         | VulkanKernel::FusedQuantGemmFp8
         | VulkanKernel::FusedLion
