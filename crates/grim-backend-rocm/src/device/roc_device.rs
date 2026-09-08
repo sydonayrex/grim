@@ -199,6 +199,10 @@ pub struct RocmDevice {
     pub(crate) wmma_gemm_enabled: AtomicBool,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
+    /// Cached pinned staging buffer for `copy_cross_device_bounce` (SPEED-ROC-15).
+    /// Allocated once per distinct size and reused, avoiding a per-call
+    /// `hipHostMalloc`/`hipHostFree` pair on the hot cross-device path.
+    pub(crate) bounce_staging: Mutex<Option<(usize, RocmPinnedBuffer<u8>)>>,
     /// Pinned host buffers backing in-flight stream-ordered H2D copies.
     /// A `hipMemcpyAsync` reads these pages on the copy engine *after* the CPU returns, so the.
     pub(crate) retained_pins: Mutex<Vec<RocmPinnedBuffer<f32>>>,
@@ -289,13 +293,24 @@ impl RocmDevice {
         bytes: usize,
     ) -> Result<()> {
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let mut staging = RocmPinnedBuffer::<u8>::alloc(bytes)?;
+        // SPEED-ROC-15: reuse a cached pinned staging buffer keyed by size. The
+        // old per-call hipHostMalloc/hipHostFree pair taxed the host allocator
+        // on the hot cross-device (fan-in/gather) path.
+        let mut staging = self
+            .bounce_staging
+            .lock()
+            .map_err(|_| Error::Backend("bounce_staging mutex poisoned".into()))?;
+        if staging.as_ref().map_or(true, |(cap, _)| *cap < bytes) {
+            *staging = Some((bytes, RocmPinnedBuffer::<u8>::alloc(bytes)?));
+        }
+        let staging_buf = &mut staging.as_mut().unwrap().1;
+
         // Leg 1: src device -> pinned host.
         {
             let _leg = crate::device::util::DeviceGuard::set(src_ordinal as i32);
             check_hip("cross-bounce D2H", unsafe {
                 hipMemcpyAsync(
-                    staging.as_mut_ptr() as *mut c_void,
+                    staging_buf.as_mut_ptr() as *mut c_void,
                     src_ptr,
                     bytes,
                     HipMemcpyKind::DeviceToHost,
@@ -312,7 +327,7 @@ impl RocmDevice {
             check_hip("cross-bounce H2D", unsafe {
                 hipMemcpyAsync(
                     dst_ptr,
-                    staging.as_ptr() as *const c_void,
+                    staging_buf.as_ptr() as *const c_void,
                     bytes,
                     HipMemcpyKind::HostToDevice,
                     self.active_stream(),
@@ -690,6 +705,7 @@ impl RocmDevice {
             stream_pool: Mutex::new(streams),
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
+            bounce_staging: Mutex::new(None),
             retained_pins: Mutex::new(Vec::new()),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
