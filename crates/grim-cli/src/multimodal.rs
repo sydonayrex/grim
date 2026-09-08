@@ -66,9 +66,8 @@ pub enum DiffusionCmd {
 }
 
 pub fn cmd_multimodal(cmd: MultimodalCmd) -> Result<()> {
-    // Every arm validates inputs against the real catalog and fails with a
-    // precise, actionable error. No arm prints a success banner for an
-    // unwired pipeline (registry item 1 in fit-it-damn-you.md §9).
+    // Every arm validates inputs against the real catalog and fails with a precise, actionable error.
+    // No arm prints a success banner for an unwired pipeline (registry item 1 in fit-it-damn-you.md.
     match cmd {
         MultimodalCmd::Vision { cmd } => match cmd {
             VisionCmd::Encode { image, model } => {

@@ -1,24 +1,11 @@
 //! DeepSeek Multi-Head Latent Attention (MLA) matrix-absorbed decode kernel.
-//!
 //! Ported from grim-backend-rocm `kernels/mla_decode.rs`.
-//! Operates directly on the compressed 576-dim latent KV-cache
-//! (512-dim c_kv + 64-dim k_pe) using pre-absorbed query projections
-//! (Q_C = Q * W_UK) to eliminate per-head KV materialization.
 
 pub const MLA_DECODE_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// DeepSeek MLA Matrix-Absorbed Decode Kernel
-//
-// Grid:  (num_heads, 1)
-// Block: (256, 1) or (512, 1) — threads stride over latent dimension.
+// DeepSeek MLA Matrix-Absorbed Decode Kernel Grid: (num_heads, 1) Block: (256, 1) or (512, 1) - threads stride over latent dimension.
 // Shared: blockDim.x * 4 bytes for dot-product reduction.
-//
-// Contract:
-//   kv_cache layout per token: [c_kv (kv_lora_rank), k_pe (qk_rope_dim)]
-//   items_per_thread must be <= 8 (local register array bound).
-// ---------------------------------------------------------------------------
 __global__ void grim_mla_absorbed_decode(
     const float* __restrict__ q_absorbed, // [num_heads, kv_lora_rank]
     const float* __restrict__ q_rope,     // [num_heads, qk_rope_dim]

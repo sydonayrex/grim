@@ -18,9 +18,8 @@ pub use gsq::{GsqBlockFit, GsqConfig, gsq_fit_block};
 pub use rco::{RcoConfig, rco_search};
 pub use spqr::{SpqrSalientResidual, spqr_identify_salient};
 
-/// Re-exported from `grim_tensor` so the `BackendDevice::quantize` trait method
-/// (which lives in `grim-tensor`) and the CPU `quant_*` reference functions
-/// (which live here) share one canonical enum without a circular dependency.
+/// Re-exported from `grim_tensor` so the `BackendDevice::quantize` trait method (which lives in `grim-tensor`) and the
+/// CPU `quant_*` reference functions (which live here) share one canonical enum without a circular dependency.
 pub use grim_tensor::dtype::QuantFormat;
 
 pub const BLOCK_SIZE_Q8: usize = 32;
@@ -46,16 +45,7 @@ pub struct RewrittenTensorData {
 }
 
 /// Dequantize grouped INT weights (EfficientQAT/GPTQ format).
-///
-/// # Layout
-/// - `qweight`: packed low-bit weights (strided)
-/// - `qzeros`: per-group zero-points (uint16 for 2/3/4-bit, uint8 for 8-bit)
-/// - `scales`: per-group scales (f32 or f16)
-/// - `g_idx`: sequential group indices (EfficientQAT) or permutation (classic GPTQ)
-///
-/// # 3-bit cross-word packing
-/// 32 values are packed across 3 consecutive u32 words using GPTQ/BitBLAS layout:
-/// values 0-10 in word 0, 11-21 in word 1, 22-31 in word 2
+/// # Layout - `qweight`: packed low-bit weights (strided) - `qzeros`: per-group zero-points (uint16 for 2/3/4-bit,.
 pub fn dequant_gptq_group_int(
     qweight: &[u8],
     qzeros: &[u8],
@@ -65,8 +55,7 @@ pub fn dequant_gptq_group_int(
     bits: u32,
     group_size: usize,
 ) -> Result<Vec<f32>> {
-    // QNT-6 fix: `shape` is caller-supplied and was indexed with `shape[0]` /
-    // `shape[1]` directly, which panics on a slice shorter than 2 elements.
+    // QNT-6 fix: `shape` is caller-supplied and was indexed with `shape[0]` / `shape[1]` directly, which panics on a slice shorter than 2 elements.
     // Bounds-check and return a proper error instead.
     let in_features = *shape.first().ok_or_else(|| {
         Error::Backend("dequant_gptq_group_int: shape missing in_features".into())
@@ -192,12 +181,7 @@ pub fn dequant_gptq_group_int(
 }
 
 /// Dequantize AWQ format group-quantized weights to f32.
-///
-/// Layout conventions for AWQ:
-/// - `qweight`: `[in_features / values_per_word, out_features]` uint32 words
-/// - `qzeros`: `[in_features / group_size, out_features / values_per_word]` uint32 words (raw stored zeros, no `+1` offset)
-/// - `scales`: `[in_features / group_size, out_features]` f16 (little-endian half floats)
-/// - `shape`: `[in_features, out_features]`
+/// Layout conventions for AWQ: - `qweight`: `[in_features / values_per_word, out_features]` uint32 words - `qzeros`: `[in_features.
 pub fn dequant_awq_group_int(
     qweight: &[u8],
     qzeros: &[u8],
@@ -329,17 +313,7 @@ const IQ4_NL_CODEBOOK: [f32; 16] = [
 ];
 
 /// Dequantize IQ4_NL (ggml non-linear 4-bit) bytes to f32.
-///
-/// Per 256-weight super-block (170 bytes), matching `quant_iq4nl`:
-///   -  2 bytes `d`      : f16 global scale
-///   - 32 bytes `q8`     : one sign bit per weight (bit `i % 8` of byte `i / 8`)
-///   - 128 bytes `q4`    : 256 4-bit codebook indices (nibbles)
-///   -  8 bytes `scales` : per-subblock scale factors (8 sub-blocks of 32 weights)
-///
-/// QNT-3 fix: the previous decoder used a flat 144-byte layout and read `qs`
-/// at the wrong offset (colliding with the sign/scales region), never applied
-/// the 8 sub-block scales, and ignored the per-weight sign. It now matches the
-/// on-disk producer layout and applies `subblock_scale * sign * codebook`.
+/// Per 256-weight super-block (170 bytes), matching `quant_iq4nl`: - 2 bytes `d` : f16 global scale.
 pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 170;
@@ -366,9 +340,8 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
             } else {
                 (qs[i / 2] >> 4) & 0x0F
             };
-            // Per-subblock scale (8 sub-blocks of 32 weights). The producer
-            // stores the raw scale so 0 maps to 1.0 (identity), keeping the
-            // round-trip stable for blocks that don't populate sub-block scales.
+            // Per-subblock scale (8 sub-blocks of 32 weights).
+            // The producer stores the raw scale so 0 maps to 1.0 (identity), keeping the round-trip.
             let sb = i / 32;
             let sb_scale = scales[sb] as f32 + 1.0;
             let code = KVALUES_IQ4NL[nibble as usize];
@@ -389,14 +362,9 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 
 // IQ4_XS uses the same 16-entry codebook as IQ4_NL (llama.cpp `iq4nl_table`).
 // The sign comes from bit 3 of the nibble; bits 0-2 index the codebook.
-// Note: IQ4_XS has 8 subblocks, 32 weights each = 256 weights per superblock.
 
 /// Dequantize IQ4_XS (llama.cpp importance-matrix 4-bit Extra Small) bytes to f32.
-///
-/// Per 256-weight super-block (136 bytes):
-///   - `d`      : f16 global scale (2 bytes)
-///   - `scales` : 6-bit per-subblock scale factors (6 bytes = 8 subblocks × 6 bits)
-///   - `qs`     : 128 bytes = 256 4-bit codebook magnitude indices
+/// Per 256-weight super-block (136 bytes): - `d` : f16 global scale (2 bytes) - `scales`.
 pub fn dequant_iq4xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 136;
@@ -445,11 +413,7 @@ pub fn dequant_iq4xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize IQ3_XXS (llama.cpp importance-matrix 3-bit Extra Extra Small) bytes to f32.
-///
-/// Per 256-weight super-block (96 bytes):
-///   - `d`    : f16 global scale (2 bytes)
-///   - `qs`   : 64 bytes = 32 8-D vector codebook indices
-///   - `signs`: 30 bytes = sign matrix
+/// Per 256-weight super-block (96 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
 pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 96;
@@ -488,12 +452,7 @@ pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize IQ3_S (llama.cpp importance-matrix 3-bit Small) bytes to f32.
-///
-/// Per 256-weight super-block (110 bytes):
-///   - `d`     : f16 global scale (2 bytes)
-///   - `qs`    : 64 bytes grid indices
-///   - `scales`: 12 bytes sub-block scales
-///   - `signs` : 32 bytes sign bits
+/// Per 256-weight super-block (110 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
 pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 110;
@@ -540,11 +499,7 @@ pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize IQ2_XXS (llama.cpp importance-matrix 2-bit Extra Extra Small) bytes to f32.
-///
-/// Per 256-weight super-block (66 bytes):
-///   - `d`    : f16 global scale (2 bytes)
-///   - `qs`   : 32 bytes 8D grid indices (1 byte per 8 weights)
-///   - `signs`: 32 bytes sign bits
+/// Per 256-weight super-block (66 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
 pub fn dequant_iq2xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 66;
@@ -581,12 +536,7 @@ pub fn dequant_iq2xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize IQ2_XS (llama.cpp importance-matrix 2-bit Extra Small) bytes to f32.
-///
-/// Per 256-weight super-block (74 bytes):
-///   - `d`     : f16 global scale (2 bytes)
-///   - `qs`    : 32 bytes 8D grid indices
-///   - `scales`: 8 bytes scale shifts
-///   - `signs` : 32 bytes sign bits
+/// Per 256-weight super-block (74 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
 pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 74;
@@ -634,12 +584,7 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize IQ2_S (llama.cpp importance-matrix 2-bit Small) bytes to f32.
-///
-/// Per 256-weight super-block (82 bytes):
-///   - `d`     : f16 global scale (2 bytes at offset 0..2)
-///   - `qs`    : 48 bytes grid indices (offset 2..50)
-///   - `scales`: 8 bytes scale shifts (offset 50..58)
-///   - `signs` : 24 bytes sign bits (offset 58..82)
+/// Per 256-weight super-block (82 bytes): - `d` : f16 global scale (2 bytes at offset.
 pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
     const BLOCK_BYTES: usize = 82;
@@ -687,12 +632,7 @@ pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 /// Dequantize Q4_K bytes to f32 per the ggml/llama.cpp super-block specification.
-///
-/// Each 256-weight super-block consumes 144 bytes:
-/// - 2 bytes f16 `d` (super-block scale)
-/// - 2 bytes f16 `dmin` (super-block minimum scale)
-/// - 12 bytes packed 6-bit scales (`sc` and `m`) for 8 sub-blocks of 32 weights
-/// - 128 bytes packed 4-bit quants (`qs`) for 256 weights
+/// Each 256-weight super-block consumes 144 bytes: - 2 bytes f16 `d` (super-block scale) - 2.
 pub fn dequant_q4k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 144;
@@ -903,17 +843,8 @@ pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dequantize Q2_K bytes to f32 per the ggml/llama.cpp super-block specification
-/// (84 bytes / 256 weights).
-///
-/// On-disk super-block layout (84 bytes total):
-///   - 16 bytes `scales` : 16 sub-blocks, each a `(min << 4) | scale` nibble pair
-///   - 64 bytes `qs`     : 256 2-bit quants (4 weights per byte, 4 bytes/sub-block)
-///   -  2 bytes `d`      : f16 main scale   (at offset 80)
-///   -  2 bytes `dmin`   : f16 min scale   (at offset 82)
-///
-/// Each sub-block of 16 weights dequantizes as `x = d * sc * q - dmin * m`,
-/// where `sc`/`m` are the low/high nibbles of `scales[sb]`.
+/// Dequantize Q2_K bytes to f32 per the ggml/llama.cpp super-block specification (84 bytes / 256 weights).
+/// On-disk super-block layout (84 bytes total): - 16 bytes `scales` : 16 sub-blocks, each a.
 pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 84;
@@ -940,12 +871,8 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         let d = f16_to_f32(data[pos + 80], data[pos + 81]);
         let dmin = f16_to_f32(data[pos + 82], data[pos + 83]);
 
-        // 16 sub-blocks of 16 weights. QNT-1 fix: `dmin` now reads its own
-        // 2 bytes at offset 82/83 (previously aliased to `d`'s bytes at 80/81,
-        // so every min scale was wrong). QNT-2 fix: each sub-block walks its
-        // own `scales[sb]` nibble pair instead of the
-        // previous `l / 16` index, which collapsed all sub-blocks onto two
-        // scale bytes and produced garbage weights.
+        // 16 sub-blocks of 16 weights. QNT-1 fix: `dmin` now reads its own 2 bytes at
+        // offset 82/83 (previously aliased to `d`'s bytes at 80/81, so every min scale was wrong).
         let mut block_out = [0.0f32; 256];
         let mut q_off = 0usize;
         for sb in 0..16 {
@@ -973,19 +900,8 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dequantize Q3_K bytes to f32 per the ggml/llama.cpp super-block specification
-/// (110 bytes / 256 weights).
-///
-/// Matches llama.cpp `dequantize_row_q3_K` byte-for-byte. The format has:
-///
-/// - 32 bytes `hmask` at offset 0 (one sign/high-bit per weight)
-/// - 64 bytes `qs` at offset 32 (4-bit packed quants)
-/// - 12 bytes `scales` at offset 96 (16 6-bit sub-block scales packed into 12 bytes)
-/// - 2 bytes `d` (f16 super-block scale) at offset 108
-///
-/// The 12-byte `scales` field is decoded via the ggml `memcpy(aux, scales, 12)`
-/// followed by a bit-shuffle shuffle of the packed bytes, into 16 i8 values. There is no `dmin` field and no
-/// `m` (minimum) array in the real format; every value is `x = d * (sc[is] - 32) * q`.
+/// Dequantize Q3_K bytes to f32 per the ggml/llama.cpp super-block specification (110 bytes / 256 weights).
+/// Matches llama.cpp `dequantize_row_q3_K` byte-for-byte.
 pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 110;
@@ -1009,23 +925,13 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     for _ in 0..num_blocks {
         let hmask = &data[pos..pos + 32];
         let qs = &data[pos + 32..pos + 96];
-        // ggml decodes the 12-byte `scales` field into 16 i8 values via a
-        // `memcpy` into a 16-byte `uint32_t aux[4]` and a bit shuffle. The
-        // final 4 bytes of aux are zero-extended (uninitialized in C but the
-        // shuffle only reads bits from the first 12 bytes via `tmp`, so the
-        // result is equivalent to zero-padding). We therefore slice exactly
-        // the 12 format bytes [96..108] and zero the upper aux quad.
+        // ggml decodes the 12-byte `scales` field into 16 i8 values via a `memcpy` into a 16-byte `uint32_t aux[4]` and a bit shuffle.
+        // The final 4 bytes of aux are zero-extended (uninitialized in C but the shuffle only.
         let scales = &data[pos + 96..pos + 108];
         let d = f16_to_f32(data[pos + 108], data[pos + 109]);
 
-        // Decode the 12-byte `scales` into 16 i8 values using the ggml
-        // bit-shuffle (dequantize_row_q3_K):
-        //   memcpy(aux, scales, 12);
-        //   tmp = aux[2];
-        //   aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
-        //   aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
-        //   aux[0] = (aux[0]          & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4);
-        //   aux[1] = (aux[1]          & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
+        // Decode the 12-byte `scales` into 16 i8 values using the ggml bit-shuffle (dequantize_row_q3_K): memcpy(aux, scales, 12); tmp = aux[2]; aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4); aux[3] = ((aux[1]
+        // >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4); aux[0] = (aux[0] & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4); aux[1] = (aux[1] & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
         let kmask1: u32 = 0x0303_0303u32;
         let kmask2: u32 = 0x0F0F_0F0Fu32;
         let aux0 = u32::from_le_bytes([scales[0], scales[1], scales[2], scales[3]]);
@@ -1087,17 +993,8 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Uniform-step 16-entry lookup table for the **non-standard "uniform FP4"** format
-/// used by `quant_fp4` / `dequant_fp4` / `dequant_fp4_block16` in this crate.
-///
-/// This is NOT the OCP E2M1 format. Its 16 entries span -1.0 .. +0.875 in equal
-/// 0.125 steps (codes 0-7 negative, codes 8-15 positive). The real OCP E2M1
-/// format (2-bit exponent, 1-bit mantissa) has non-uniform magnitudes
-/// {0, 0.5, 1, 1.5, 2, 3, 4, 6} and is decoded by `mxfp4_e2m1_to_f32` (used
-/// by MXFP4/MXFP8 paths only).
-///
-/// Name deliberately includes "UNIFORM" to prevent confusion with the real E2M1
-/// decode function. Do not feed these values into any MXFP4 kernel.
+/// Uniform-step 16-entry lookup table for the **non-standard "uniform FP4"** format used by `quant_fp4` / `dequant_fp4` / `dequant_fp4_block16` in this crate.
+/// This is NOT the OCP E2M1 format.
 const FP4_UNIFORM_LUT: [f32; 16] = [
     -1.0,   // 0000 -> -1.0
     -0.875, // 0001
@@ -1257,22 +1154,8 @@ pub fn dequant_fp8_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Convert GGUF-native MXFP4 tensor bytes (llama.cpp layout) into the
-/// length-prefixed `[codes][exps]` framing consumed by `dequant_mxfp4` and the
-/// ROCm/CUDA `grim_dequant_mxfp4` kernels.
-///
-/// GGUF (llama.cpp `block_mxfp4`) stores, per 32-element block: one E8M0
-/// scale byte FIRST, then 16 packed code bytes where the LOW nibbles hold
-/// elements 0–15 and the HIGH nibbles hold elements 16–31. Grim's framing
-/// instead packs element `i` in the low nibble when even / high when odd, and
-/// stores all codes and all exponents as separate length-prefixed segments.
-///
-/// Verified against llama.cpp source (ggml-org/llama.cpp, `ggml-quants.c`):
-/// `quantize_row_mxfp4_ref` writes `qs[j] = code(j) | (code(j+16) << 4)` and
-/// `dequantize_row_mxfp4` reads `y[j] = kvalues_mxfp4[qs[j] & 0xF] * d`,
-/// `y[j+16] = kvalues_mxfp4[qs[j] >> 4] * d`, with `e` first in
-/// `block_mxfp4 { uint8_t e; uint8_t qs[QK_MXFP4/2]; }` — matching the split
-/// packing below. [P1-2: layout confirmed correct against upstream.]
+/// Convert GGUF-native MXFP4 tensor bytes (llama.cpp layout) into the length-prefixed `[codes][exps]` framing consumed by `dequant_mxfp4` and the ROCm/CUDA `grim_dequant_mxfp4` kernels.
+/// GGUF (llama.cpp `block_mxfp4`) stores, per 32-element block: one E8M0 scale byte FIRST, then 16 packed.
 pub fn reframe_mxfp4_gguf(raw: &[u8], num_values: usize) -> Result<Vec<u8>> {
     if num_values == 0 {
         return Ok(Vec::new());
@@ -1292,10 +1175,8 @@ pub fn reframe_mxfp4_gguf(raw: &[u8], num_values: usize) -> Result<Vec<u8>> {
 
     use rayon::prelude::*;
 
-    // Vectorized block-by-block reframing:
-    // llama.cpp 17-byte block: byte 0 is scale; bytes 1..17 are 16-byte qs.
+    // Vectorized block-by-block reframing: llama.cpp 17-byte block: byte 0 is scale; bytes 1..17 are 16-byte qs.
     // qs[0..16] low nibbles -> elements 0..15; high nibbles -> elements 16..31.
-    // Grim output: 16 bytes per block, even element in low nibble, odd in high nibble.
     if blocks >= 512 {
         const CHUNK_BLOCKS: usize = 256;
         codes
@@ -1352,15 +1233,7 @@ pub fn reframe_mxfp4_gguf(raw: &[u8], num_values: usize) -> Result<Vec<u8>> {
 }
 
 /// Dequantize MXFP4 (OCP Microscaling, Jay tier) single-buffer bytes to f32.
-///
-/// # Layout
-/// Length-prefixed segments (same framing as the GPTQ group-int fix):
-/// - `[u64 LE]` codes_len
-/// - `codes`: packed E2M1 4-bit codes, 2 per byte. Element `i` of a group is
-///   in the low nibble when `i` is even and the high nibble when odd, matching
-///   the ROCm `grim_dequant_mxfp4` kernel.
-/// - `[u64 LE]` exps_len
-/// - `exps`: one E8M0 shared exponent byte per 32-element group.
+/// # Layout Length-prefixed segments (same framing as the GPTQ group-int fix): - `[u64 LE]` codes_len.
 pub fn dequant_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     if num_values == 0 {
         return Ok(Vec::new());
@@ -1418,20 +1291,7 @@ pub fn dequant_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize NVFP4 (NVIDIA Blackwell 4-bit float, E2M1 codebook) bytes to f32.
-///
-/// Uses the same OCP E2M1 codebook as MXFP4 (`mxfp4_e2m1_to_f32`) but
-/// NVIDIA's native packing convention: per-16-element sub-blocks with one
-/// E8M0 shared exponent byte per sub-block, interleaved.
-///
-/// # Layout (per 256-weight super-block = 144 bytes)
-/// 16 sub-blocks of 16 weights each. Per sub-block:
-///   - 1 byte E8M0 shared exponent
-///   - 8 bytes packed E2M1 codes (2 per byte, low nibble = even, high = odd)
-///
-/// Total: 16 × (1 + 8) = 144 bytes per 256 weights.
-///
-/// This is structurally distinct from MXFP4's length-prefixed framing and
-/// its 32-element groups, hence a dedicated path rather than a flag.
+/// Uses the same OCP E2M1 codebook as MXFP4 (`mxfp4_e2m1_to_f32`) but NVIDIA's native packing convention: per-16-element.
 pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     if num_values == 0 {
         return Ok(Vec::new());
@@ -1440,9 +1300,8 @@ pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     const CODES_PER_SUB: usize = 8; // 16 weights / 2 per byte
     const SUB_BLOCK_BYTES: usize = 1 + CODES_PER_SUB; // 1 scale + 8 code bytes = 9
 
-    // NVFP4 data is a sequence of sub-blocks. The number of sub-blocks is
-    // determined by the weight count, not by full 256-weight super-blocks —
-    // real tensors may have any number of weights.
+    // NVFP4 data is a sequence of sub-blocks. The number of sub-blocks is determined by the
+    // weight count, not by full 256-weight super-blocks - real tensors may have any number of weights.
     let num_sub_blocks = num_values.div_ceil(SUB_BLOCK);
     let expected_bytes = num_sub_blocks * SUB_BLOCK_BYTES;
     if data.len() < expected_bytes {
@@ -1481,25 +1340,8 @@ pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Reframe NVFP4 native packing into the length-prefixed `[codes][exps]`
-/// framing consumed by `dequant_mxfp4` (ROCm/CUDA kernel input).
-///
+/// Reframe NVFP4 native packing into the length-prefixed `[codes][exps]` framing consumed by `dequant_mxfp4` (ROCm/CUDA kernel input).
 /// NVFP4 packs per-16-element sub-blocks interleaved (scale + 8 code bytes).
-/// MXFP4's kernel framing expects all codes first, then all exponents, with
-/// 32-element groups.
-///
-/// # Lossless-only contract
-///
-/// Two adjacent NVFP4 sub-blocks map onto one 32-element MXFP4 group. This
-/// reframing is **only lossless when both sub-blocks share the same E8M0
-/// exponent**. When they differ, the function returns `Err` rather than
-/// silently dropping one exponent (which would produce a 2x scaling error
-/// for half the group). Callers can then fall back to `dequant_nvfp4` directly,
-/// which preserves per-16-element exponents exactly.
-///
-/// This makes the MXFP4 kernel path opt-in for NVFP4 tensors where adjacent
-/// sub-blocks happen to share exponents (e.g. uniformly-scaled weights), and
-/// forces the precise `dequant_nvfp4` path otherwise.
 pub fn reframe_nvfp4_to_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<u8>> {
     if num_values == 0 {
         return Ok(Vec::new());
@@ -1524,8 +1366,7 @@ pub fn reframe_nvfp4_to_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<u8>>
     }
 
     // First pass: collect per-sub-block exponents and verify losslessness.
-    // Each pair of adjacent sub-blocks maps to one MXFP4 group. If their
-    // exponents differ, the reframing would silently mis-scale half the group.
+    // Each pair of adjacent sub-blocks maps to one MXFP4 group.
     let mut sub_exps = Vec::with_capacity(num_sub_blocks);
     let mut pos = 0usize;
     for _ in 0..num_sub_blocks {
@@ -1592,13 +1433,7 @@ pub fn reframe_nvfp4_to_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<u8>>
 }
 
 /// Dequantize MXFP8 (OCP Microscaling, Magpie tier) single-buffer bytes to f32.
-///
-/// # Layout
-/// Length-prefixed segments (same framing as the GPTQ group-int fix):
-/// - `[u64 LE]` codes_len
-/// - `codes`: one E4M3 FP8 code byte per element.
-/// - `[u64 LE]` exps_len
-/// - `exps`: one E8M0 shared exponent byte per 32-element group.
+/// # Layout Length-prefixed segments (same framing as the GPTQ group-int fix): - `[u64 LE]` codes_len.
 pub fn dequant_mxfp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     if num_values == 0 {
         return Ok(Vec::new());
@@ -1651,17 +1486,7 @@ pub fn dequant_mxfp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantize WNA16 (weight-only N-bit with per-block f16 scale + per-tensor f32 scale).
-///
-/// # Layout
-/// `[u32 n_bit][u32 num_blocks][u8 packed_codes...][f16 per_block_scales...][f32 tensor_scale]`
-///
-/// - `n_bit`: bits per weight (2..=8).
-/// - `num_blocks`: number of 256-weight blocks.
-/// - `packed_codes`: MSB-first N-bit codes, ceil(256*n_bit/8) bytes per block.
-/// - `per_block_scales`: one f16 scale per block, 2 bytes each.
-/// - `tensor_scale`: one f32 per-tensor scale.
-///
-/// Each weight is reconstructed as `code * block_scale * tensor_scale`.
+/// # Layout `[u32 n_bit][u32 num_blocks][u8 packed_codes...][f16 per_block_scales...][f32 tensor_scale]` - `n_bit`: bits per weight (2..=8).
 pub fn dequant_wna16(data: &[u8], elem_count: usize) -> Result<Vec<f32>> {
     if data.len() < 12 {
         return Err(Error::Backend(
@@ -1714,19 +1539,8 @@ pub fn dequant_wna16(data: &[u8], elem_count: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dequantize EmbeddingWNA16Int (embedding matrix stored as N-bit integers,
-/// row-major, with one f32 per-tensor scale).
-///
-/// # Layout
-/// `[u32 n_bit][u32 embedding_dim][u32 num_rows][u8 packed_codes...][f32 tensor_scale]`
-///
-/// - `n_bit`: bits per entry (2..=8).
-/// - `embedding_dim`: entries per row.
-/// - `num_rows`: number of rows.
-/// - `packed_codes`: MSB-first N-bit codes, ceil(embedding_dim*n_bit/8) bytes per row.
-/// - `tensor_scale`: one f32 per-tensor scale (last 4 bytes).
-///
-/// Each entry is reconstructed as `code * tensor_scale`.
+/// Dequantize EmbeddingWNA16Int (embedding matrix stored as N-bit integers, row-major, with one f32 per-tensor scale).
+/// # Layout `[u32 n_bit][u32 embedding_dim][u32 num_rows][u8 packed_codes...][f32 tensor_scale]` - `n_bit`: bits per entry (2..=8).
 pub fn dequant_embedding_wna16_int(data: &[u8], elem_count: usize) -> Result<Vec<f32>> {
     if data.len() < 16 {
         return Err(Error::Backend(
@@ -1774,10 +1588,8 @@ pub fn dequant_embedding_wna16_int(data: &[u8], elem_count: usize) -> Result<Vec
     }
     Ok(out)
 }
-///
-/// Codes are packed MSB-first within each byte, crossing byte boundaries as
-/// needed. `bit_pos = lane * n_bit`, and the decoder reads across the bytes
-/// that contain those bits.
+/// Codes are packed MSB-first within each byte, crossing byte boundaries as needed.
+/// `bit_pos = lane * n_bit`, and the decoder reads across the bytes that contain those.
 fn decode_msb_nbit(code_bytes: &[u8], block_offset_bytes: usize, lane: usize, n_bit: u8) -> u32 {
     let bit_pos = (lane as u32).wrapping_mul(n_bit as u32);
     let byte_idx = (bit_pos / 8) as usize;
@@ -1831,7 +1643,6 @@ pub const NF4_LUT: [f32; 16] = [
 
 /// Dequantize NF4 (normalized float-4) bytes to f32.
 /// NF4 format (Quanto/Unsloth): asymmetric 4-bit quantization with per-tensor scale and min.
-/// Layout: packed 4-bit values, one f32 scale per tensor.
 pub fn dequant_nf4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(num_values);
 
@@ -1860,8 +1671,7 @@ pub fn dequant_nf4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
 }
 
 /// FP8 formats: E4M3 (5 exp, 3 mantissa, no inf) and E5M2 (5 exp, 2 mantissa, with inf).
-/// E4M3: exponent bias = 7, max value ≈ 240, min normalized ≈ 0.03125
-/// E5M2: exponent bias = 15, max value = 31, supports infinity
+/// E4M3: exponent bias = 7, max value ≈ 240, min normalized ≈ 0.03125 E5M2: exponent.
 const FP8_E4M3_BIAS: i32 = 7;
 
 /// Convert FP8 E4M3 (4-bit exponent, 3-bit mantissa) to f32.
@@ -1897,13 +1707,8 @@ fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
     if exp == 0 {
-        // Subnormal or zero. An f16 subnormal encodes `mant * 2^-24`
-        // (exponent unbiased 1-14, with 10 mantissa bits). Rebuilding it as
-        // `f32::from_bits((sign<<31)|(mant<<13))` instead yields
-        // `mant * 2^-136`, which is ~2^112 too small — a real silent-wrong
-        // scale bug masked by the fact that real model scales are always
-        // normalized. Build the correct value: `± mant * 2^-24`, with zero
-        // (mant == 0) mapping to signed zero.
+        // Subnormal or zero. An f16 subnormal encodes `mant
+        // * 2^-24` (exponent unbiased 1-14, with 10 mantissa bits).
         let value = (mant as f32) * 2f32.powi(-24);
         if sign != 0 { -value } else { value }
     } else if exp == 31 {
@@ -1935,7 +1740,6 @@ pub fn quant_q80(data: &[f32]) -> Result<Vec<u8>> {
 }
 
 /// Quantize a slice of f32 values to Q4_K bytes per the ggml super-block format.
-///
 /// Encodes 256-weight blocks into 144-byte Q4_K super-blocks using 6-bit sub-block scale and min packing.
 pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
     const BLOCK_SIZE: usize = 256;
@@ -2053,10 +1857,7 @@ fn pack_scale_min_k4(scales_sc: &[u8; 8], scales_m: &[u8; 8]) -> [u8; 12] {
 }
 
 /// Quantize a slice of f32 values to Q5_K bytes per the ggml super-block format.
-///
 /// Encodes 256-weight blocks into 176-byte Q5_K super-blocks.
-/// Layout: d(f16,2) + dmin(f16,2) + scales(12B) + qh(32B) + qs(128B) = 176 bytes.
-/// Each weight is 5 bits: low 4 bits in `qs` (nibble), high bit in `qh`.
 pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 176;
@@ -2170,10 +1971,7 @@ pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
 }
 
 /// Quantize a slice of f32 values to Q6_K bytes per the ggml super-block format.
-///
 /// Encodes 256-weight blocks into 210-byte Q6_K super-blocks.
-/// Layout: ql(128B) + qh(64B) + scales(16B, i8) + d(f16, 2B) = 210 bytes.
-/// Each weight is 6 bits: low 4 bits in `ql`, high 2 bits in `qh`.
 pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 210;
@@ -2223,11 +2021,6 @@ pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
 
         // Q6_K layout: 2 super-groups of 128 weights each.
         // Each super-group: 4 sub-blocks of 32 weights.
-        // Within each sub-block of 32: pairs of 16, interleaved:
-        //   q1 = (ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)   - offset 0
-        //   q2 = (ql[l+32] & 0x0F) | ((qh[l] & 0x0C) << 2) - offset 32
-        //   q3 = (ql[l] >> 4) | ((qh[l] & 0x30) >> 0)      - offset 64
-        //   q4 = (ql[l+32] >> 4) | ((qh[l] & 0xC0) >> 2)   - offset 96
         for sg in 0..2 {
             let sg_base = sg * 128;
             for l in 0..32 {
@@ -2276,7 +2069,6 @@ pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
 
 /// Quantize f32 values to FP4 (E2M1) bytes.
 /// Each f32 is clamped and mapped to the nearest E2M1 value.
-/// Output: f32 scale followed by packed FP4 bytes.
 pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
     // Find scale using max absolute value mapped to FP4 range
     let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -2340,7 +2132,6 @@ pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
 
 /// Quantize f32 values to NF4 (normalized float-4) bytes.
 /// NF4 is optimized for normally-distributed weights.
-/// Output: f32 scale followed by packed NF4 bytes using canonical nearest-neighbor search.
 pub fn quant_nf4(data: &[f32]) -> Result<Vec<u8>> {
     let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let scale = if max_abs == 0.0 { 1.0 } else { max_abs };
@@ -2377,7 +2168,6 @@ pub fn quant_nf4(data: &[f32]) -> Result<Vec<u8>> {
 
 /// Quantize f32 values to FP8 (E4M3) bytes.
 /// E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa bits.
-/// Output: f32 scale followed by packed FP8 bytes.
 pub fn quant_fp8(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(4 + data.len());
 
@@ -2478,17 +2268,8 @@ pub fn f32_to_mxfp4_e2m1(v: f32, shared_exp: u8) -> u8 {
     sign_bit | (exp << 1) | mant
 }
 
-/// Quantize a row-major `[rows, k]` f32 matrix to MXFP4 (E2M1 weights + E8M0
-/// shared exponents) in the exact layout consumed by the ROCm/CUDA
-/// `grim_mxfp4_gemm_tiled` kernel:
-/// - `codes`: `rows * k / 2` bytes, two E2M1 codes per byte (even element in
-///   the low nibble, odd in the high nibble), grouped contiguously per row.
-/// - `exps`: `rows * (k / 32)` bytes, one E8M0 shared exponent per 32-element
-///   block, grouped contiguously per row.
-///
-/// The per-block shared exponent is chosen so the largest magnitude in the
-/// block decodes to at most `6.0 * 2^(exp - 127)` (the E2M1 max), avoiding
-/// overflow/clamping. `k` must be a multiple of 32.
+/// Quantize a row-major `[rows, k]` f32 matrix to MXFP4 (E2M1 weights + E8M0 shared exponents) in the exact layout consumed by the ROCm/CUDA `grim_mxfp4_gemm_tiled` kernel: - `codes`: `rows * k / 2` bytes, two E2M1 codes per byte (even element in the low nibble, odd in the high nibble), grouped contiguously per row.
+/// - `exps`: `rows * (k / 32)` bytes, one E8M0 shared exponent per 32-element block,.
 pub fn quant_mxfp4_matrix(data: &[f32], rows: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     assert!(
         k % 32 == 0,
@@ -2656,9 +2437,7 @@ fn quant_packed_symmetric(
 }
 
 /// Rewrite a tensor payload to a target quantized format.
-/// This is the first Pass 4 substrate: it materializes the tensor into
-/// a logical f32 view, optionally refines per-block scales using importance
-/// weights, and then emits a new packed payload.
+/// This is the first Pass 4 substrate: it materializes the tensor into a logical f32.
 pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<RewrittenTensorData> {
     let rewritten_bytes = match plan.target {
         QuantFormat::Q8_0 => quant_q80(data)?,
@@ -3343,8 +3122,7 @@ fn f32_to_f16(v: f32) -> u16 {
 }
 
 /// Randomized SVD algorithm for importance matrix calculation (§0 / §19).
-/// Replicates `scirs2_linalg` randomized SVD projection strategy:
-/// Projects high-dimensional weight arrays to lower-rank spaces with Gaussian matrices.
+/// Replicates `scirs2_linalg` randomized SVD projection strategy: Projects high-dimensional weight arrays to lower-rank spaces with Gaussian.
 pub fn randomized_svd_importance(
     matrix: &[f32],
     rows: usize,
@@ -3447,14 +3225,10 @@ pub fn randomized_svd_importance(
     Ok((u_trunc, s, vt_trunc))
 }
 
-// ---------------------------------------------------------------------------
 // Phase 2: Importance-Matrix Calibration
-// ---------------------------------------------------------------------------
 
 /// Per-layer importance scores from calibration.
-///
-/// `layer_scores[i]` is the importance of tensor `i` (higher = more
-/// quantization-sensitive — should use more bits).
+/// `layer_scores[i]` is the importance of tensor `i` (higher = more quantization-sensitive - should use more.
 #[derive(Debug, Clone)]
 pub struct ImportanceScores {
     pub tensor_names: Vec<String>,
@@ -3481,11 +3255,7 @@ impl ImportanceScores {
 }
 
 /// Compute per-tensor importance scores using randomized SVD.
-///
-/// For each tensor, runs randomized SVD and returns the column-norm-based
-/// importance: the Frobenius norm of each singular vector weighted by its
-/// singular value. Tensors with higher importance scores are more
-/// quantization-sensitive and should receive higher bitwidth in EvoPress.
+/// For each tensor, runs randomized SVD and returns the column-norm-based importance: the Frobenius norm of.
 pub fn compute_importance_scores(tensors: &[(String, Vec<f32>, usize, usize)]) -> Vec<f32> {
     let mut scores = Vec::with_capacity(tensors.len());
     for (_name, data, rows, cols) in tensors {
@@ -3524,42 +3294,18 @@ pub fn compute_importance_scores(tensors: &[(String, Vec<f32>, usize, usize)]) -
     scores
 }
 
-// ---------------------------------------------------------------------------
 // Phase 4: Fisher/GGN Diagonal Computation for GPTQ Error-Correcting Updates
-// ---------------------------------------------------------------------------
 
-/// One calibration sample: input activations and output gradients for a specific
-/// tensor. Populated by running the calibration dataset forward+backward through
-/// the model and capturing intermediate activations/gradients via Hook.
-/// For a linear layer, `input_activations` has shape (batch, in_features) and
-/// `output_gradients` has shape (batch, out_features).
+/// One calibration sample: input activations and output gradients for a specific tensor.
+/// Populated by running the calibration dataset forward+backward through the model and capturing intermediate activations/gradients via.
 #[derive(Debug, Clone)]
 pub struct FisherCalibrationSample {
     pub input_activations: Vec<f32>,
     pub output_gradients: Vec<f32>,
 }
 
-/// Compute the diagonal of the Generalized Gauss-Newton (GGN) matrix for a
-/// weight matrix using a batch of pre-computed calibration activations and gradients.
-///
-/// This is the "true" curvature for GPTQ error-correcting updates, replacing
-/// `build_curvature_proxy`. The GGN diagonal is:
-///
-///   diag(H) ≈ (1/M) Σ_m (x_m ⊗ x_m) where x_m is the input activation
-///   (ignoring cross-term correlations — this is the standard GPTQ diagonal).
-///
-/// Each calibration sample contributes `diag(grad_out_m @ grad_out_m^T) ⊗ (x_m @ x_m^T)`.
-/// Summing over samples and averaging gives the GGN diagonal.
-///
-/// # Arguments
-/// * `weights` — the f32 weight matrix, row-major (rows × cols)
-/// * `calibration_samples` — per-sample (activations, gradients) pairs
-/// * `rows` — number of output features (out_features)
-/// * `cols` — number of input features (in_features)
-/// * `group_size` — GPTQ group size for grouped diagonal (default 128)
-///
-/// # Returns
-/// Per-element diagonal curvature of shape (rows × cols), same shape as `weights`.
+/// Compute the diagonal of the Generalized Gauss-Newton (GGN) matrix for a weight matrix using a batch of pre-computed calibration activations and gradients.
+/// This is the "true" curvature for GPTQ error-correcting updates, replacing `build_curvature_proxy`.
 pub fn compute_fisher_diagonal(
     _weights: &[f32],
     calibration_samples: &[FisherCalibrationSample],
@@ -3620,15 +3366,8 @@ pub fn compute_fisher_diagonal(
     out
 }
 
-/// Compute per-group GGN diagonal — one curvature value per quantization group.
-///
-/// This is the format actually used in GPTQ re-quantization: each group of
-/// `group_size` columns shares one diagonal entry, reducing storage and
-/// matching how GPTQ applies correction (per-group scale factors).
-///
-/// # Returns
-/// `num_groups` curvature values, one per group. The group assignment is:
-///   group_idx = col_idx / group_size
+/// Compute per-group GGN diagonal - one curvature value per quantization group.
+/// This is the format actually used in GPTQ re-quantization: each group of `group_size` columns shares.
 pub fn compute_grouped_fisher_diagonal(
     _weights: &[f32],
     calibration_samples: &[FisherCalibrationSample],
@@ -3683,12 +3422,8 @@ pub fn compute_grouped_fisher_diagonal(
     group_h_diag
 }
 
-/// Compute an importance-weighted curvature proxy when calibration data is
-/// not available (CPU fallback).
-///
-/// This is a first-order approximation of the GGN diagonal using activation
-/// magnitude as a proxy for second-order importance. Used when
-/// `calibration_samples` is empty or unavailable.
+/// Compute an importance-weighted curvature proxy when calibration data is not available (CPU fallback).
+/// This is a first-order approximation of the GGN diagonal using activation magnitude as a proxy.
 pub fn compute_curvature_proxy(data: &[f32], layer_importance: f32) -> Vec<f32> {
     let layer_scale = layer_importance.abs().max(1e-3);
     data.iter()
@@ -3697,16 +3432,7 @@ pub fn compute_curvature_proxy(data: &[f32], layer_importance: f32) -> Vec<f32> 
 }
 
 /// Refined Scale Fit (RSF) for K-quant blocks.
-///
-/// Re-fits the per-block scales using importance-weighted L2 reconstruction
-/// error minimization. The original K-quant scales are a rough estimate;
-/// RSF uses the importance scores to give more weight to sensitive regions.
-///
-/// # Arguments
-/// * `data` — flat f32 weight data (row-major)
-/// * `importance` — per-element importance weights (same shape as data)
-/// * `block_size` — K-quant block size (32)
-/// * `n_levels` — quantization levels (16 for Q4_K, 32 for Q5_K, 64 for Q6_K)
+/// Re-fits the per-block scales using importance-weighted L2 reconstruction error minimization.
 pub fn refined_scale_fit(
     data: &[f32],
     importance: &[f32],
@@ -3744,10 +3470,7 @@ pub fn refined_scale_fit(
     Ok(scales)
 }
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Phase 3: RCO (Riemannian Constrained Optimization) Bitwidth Search
-// ---------------------------------------------------------------------------
 
 /// Legacy configuration alias for EvoPress, routed directly into RCO.
 #[derive(Debug, Clone)]
@@ -3791,33 +3514,10 @@ pub fn evopress_search(
     rco_search(&rco_config, importance_scores, tensor_sizes, progress)
 }
 
-// ===========================================================================
 // SmoothQuant channel scaling (mockdud.md §3N3b, §6P1)
-// ===========================================================================
 
 /// SmoothQuant: channel-wise activation-aware weight scaling.
-///
-/// Shifts quantization difficulty from activations to weights by
-/// scaling weight columns by the inverse of activation channel
-/// magnitudes. After scaling, weight quantization sees a more uniform
-/// distribution across channels because the activation outliers
-/// have been smoothed.
-///
-/// From: Xiao et al., "SmoothQuant: Accurate and Efficient Post-Training
-/// Quantization for Large Language Models", ICML 2023, arXiv:2211.10438.
-///
-/// # Arguments
-/// - `weights`: mutable slice `[out_channels * in_channels]`, row-major
-///   (weight[row * in_channels + col])
-/// - `out_channels`: number of output channels
-/// - `in_channels`: number of input channels
-/// - `calibration_acts`: optional `[out_channels]` pre-computed
-///   activation magnitudes (e.g. channel-wise L2 norm of calibration
-///   data). When `None`, scales are estimated from weight statistics.
-///
-/// # Returns
-/// Normalized per-output-channel scale factors (length `out_channels`).
-/// The scales are normalized so `max(scale) == 1.0`.
+/// Shifts quantization difficulty from activations to weights by scaling weight columns by the inverse of.
 pub fn apply_smoothquant_scale(
     weights: &mut [f32],
     out_channels: usize,
@@ -3875,31 +3575,10 @@ pub fn apply_smoothquant_scale(
     scales
 }
 
-// ===========================================================================
 // SpinQuant Cayley rotation (mockdud.md §3N3a, §6P2)
-// ===========================================================================
 
 /// SpinQuant: learn rotation matrices via Cayley SGD on the Stiefel manifold.
-///
-/// Rotates weight matrices before quantization so outlier dimensions
-/// spread across all channels, producing outlier-free weights that
-/// quantize with near-FP16 accuracy.
-///
-/// From: Liu et al., "SpinQuant: LLM Quantization with Learned Rotations",
-/// ICLR 2025, arXiv:2405.16406v4.
-///
-/// # Arguments
-/// - `weights`: mutable slice of shape `[dim * dim]` (blocked square matrix)
-/// - `dim`: rotation matrix dimension (must be a positive power of 2)
-/// - `lr`: Cayley SGD learning rate (typical 0.01–0.1)
-/// - `steps`: number of Cayley SGD iterations
-///
-/// Operates entirely in-place on `weights`. Scratch buffers are
-/// allocated once and reused across all blocks.
-///
-/// # Panics
-/// Panics if `dim` is not a positive power of two, or if the
-/// caller supplies a non-square weight slice.
+/// Rotates weight matrices before quantization so outlier dimensions spread across all channels, producing outlier-free weights.
 pub fn spinquant_rotate(weights: &mut [f32], dim: usize, lr: f32, steps: usize) {
     assert!(
         dim > 0 && dim.is_power_of_two(),
@@ -4000,12 +3679,7 @@ pub fn spinquant_rotate(weights: &mut [f32], dim: usize, lr: f32, steps: usize) 
 }
 
 /// Convenience wrapper: apply SmoothQuant then SpinQuant in sequence.
-///
-/// Use this as the single entry point in `convert.rs` before calling
-/// `pack_tensors()`. Both transforms are in-place and discarded after
-/// conversion — no format change is needed.
-///
-/// See mockdud.md §6 for the full integration checklist.
+/// Use this as the single entry point in `convert.rs` before calling `pack_tensors()`.
 pub fn pre_quantize_transform(
     weights: &mut [f32],
     out_channels: usize,
@@ -4039,18 +3713,10 @@ pub fn pre_quantize_transform(
     smooth_scales
 }
 
-// ===========================================================================
 // Attention projection role detection & precision policy (WI-SPINQUANT-AttentionGate)
-// ===========================================================================
 
 /// Returns true if `tensor_name` corresponds to an attention projection layer.
-///
-/// Matches standard attention projection substring conventions across GGUF,
-/// HuggingFace / SafeTensors, and native formats:
-/// - `attn_q`, `attn_k`, `attn_v`, `attn_o`
-/// - `.wq.weight`, `.wk.weight`, `.wv.weight`, `.wo.weight`
-/// - `q_proj`, `k_proj`, `v_proj`, `o_proj`
-/// - `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`
+/// Matches standard attention projection substring conventions across GGUF, HuggingFace / SafeTensors, and native formats: -.
 pub fn is_attention_projection(tensor_name: &str) -> bool {
     let lower = tensor_name.to_lowercase();
     lower.contains("attn_q")
@@ -4309,9 +3975,8 @@ mod tests {
         assert_eq!(codes.len(), rows * k / 2);
         assert_eq!(exps.len(), rows * (k / 32));
 
-        // Decode every element with mxfp4_e2m1_to_f32 and check the layout
-        // matches the GEMM kernel (even element = low nibble, odd = high,
-        // exps grouped per 32-element block per row).
+        // Decode every element with mxfp4_e2m1_to_f32 and check the layout matches the GEMM kernel (even
+        // element = low nibble, odd = high, exps grouped per 32-element block per row).
         let mut max_err = 0.0f32;
         let exps_per_row = k / 32;
         for r in 0..rows {
@@ -4500,8 +4165,7 @@ mod tests {
 
     #[test]
     fn gptq_3bit_cross_word_packing() {
-        // Test 3-bit GPTQ dequant with known non-zero codes packed at
-        // 3-bit word-boundary positions (in_idx 0-9 fit within one u32 word).
+        // Test 3-bit GPTQ dequant with known non-zero codes packed at 3-bit word-boundary positions (in_idx 0-9 fit within one u32 word).
         // 3 u32 words span 96 bits, packing up to 32 values.
         let in_features = 32;
         let out_features = 1;
@@ -4736,9 +4400,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------------
     // FP4/NF4/FP8 dequantization tests
-    // ------------------------------------------------------------------------
 
     #[test]
     fn roundtrip_fp4() {
@@ -5005,9 +4667,7 @@ mod tests {
         assert_eq!(rewritten.target, QuantFormat::Fp8);
     }
 
-    // ------------------------------------------------------------------------
-    // Pass 4: Fisher/Hessian diagonal — unit tests
-    // ------------------------------------------------------------------------
+    // Pass 4: Fisher/Hessian diagonal - unit tests
 
     #[test]
     fn test_compute_fisher_diagonal_empty_calibration() {
@@ -5071,10 +4731,8 @@ mod tests {
     fn test_compute_curvature_proxy_zero_importance() {
         let data = vec![1.0f32, 2.0, 3.0];
         let result = compute_curvature_proxy(&data, 0.0);
-        // Minimum scale is 1e-3 even when importance is 0 (safeguard against degenerate values)
-        // value=1.0: 1.0 + 0.001 * (1+1) = 1.002
-        // value=2.0: 1.0 + 0.001 * (2+4) = 1.006
-        // value=3.0: 1.0 + 0.001 * (3+9) = 1.012
+        // Minimum scale is 1e-3 even when importance is 0 (safeguard against degenerate values) value=1.0: 1.0 + 0.001 *
+        // (1+1) = 1.002 value=2.0: 1.0 + 0.001 * (2+4) = 1.006 value=3.0: 1.0 + 0.001 * (3+9) = 1.012
         assert!((result[0] - 1.002).abs() < 1e-5);
         assert!((result[1] - 1.006).abs() < 1e-5);
         assert!((result[2] - 1.012).abs() < 1e-5);
@@ -5082,22 +4740,13 @@ mod tests {
         assert!(result.iter().all(|v| *v >= 1.0));
     }
 
-    // -------------------------------------------------------------------------
     // Edge-case + boundary tests (P1 strengthening).
-    //
-    // The existing tests above cover happy paths with 64-element inputs. These
-    // add the boundary cases that mutation testing surfaces: empty, sub-block,
-    // exact-block, all-zeros, all-same, and reject-truncated-buffer. Each one
-    // is the kind of input a mutant (flipped < to <=, dropped +1, etc.) would
-    // slip past the happy-path-only suite.
-    // -------------------------------------------------------------------------
+    // The existing tests above cover happy paths with 64-element inputs.
 
     #[test]
     fn q80_round_trip_preserves_length_across_block_boundary() {
-        // Q8_0 block size is 32. Test inputs that cross the boundary: 31
-        // (sub-block tail), 32 (exact block), 33 (block + 1). A flipped
-        // `chunks(BLOCK_Q8_WEIGHTS)` or dropped `+1` in num_blocks math
-        // would corrupt the length contract.
+        // Q8_0 block size is 32. Test inputs that cross the
+        // boundary: 31 (sub-block tail), 32 (exact block), 33 (block + 1).
         for &n in &[31usize, 32, 33, 63, 64, 65] {
             let data: Vec<f32> = (0..n)
                 .map(|i| (i as f32 - (n as f32 / 2.0)) * 0.1)
@@ -5111,8 +4760,7 @@ mod tests {
     #[test]
     fn q80_round_trip_all_zeros_does_not_produce_nan() {
         // All-zero input → amax = 0 → scale guard picks 1.0 (line 518).
-        // A mutant that dropped the `amax == 0.0` guard would divide by
-        // zero and produce NaN/Inf.
+        // A mutant that dropped the `amax == 0.0` guard would divide by zero and produce.
         let data = vec![0.0f32; 64];
         let q = quant_q80(&data).expect("quant");
         let d = dequant_q80(&q, 64).expect("dequant");
@@ -5142,9 +4790,8 @@ mod tests {
 
     #[test]
     fn q4k_rejects_truncated_buffer() {
-        // Q4_K stride is 4 (scale) + 16 (packed 4-bit) = 20 bytes per 32-weight
-        // block. A buffer shorter than `num_blocks * 20` must error, not
-        // silently read past the end (the dequant loop indexes raw bytes).
+        // Q4_K stride is 4 (scale) + 16 (packed 4-bit) = 20 bytes per 32-weight block.
+        // A buffer shorter than `num_blocks * 20` must error, not silently read past the end.
         let short_buf = vec![0u8; 10]; // claims 64 weights but only 10 bytes
         let res = dequant_q4k(&short_buf, 64);
         assert!(res.is_err(), "dequant_q4k must reject truncated buffer");
@@ -5152,9 +4799,8 @@ mod tests {
 
     #[test]
     fn q80_rejects_truncated_buffer() {
-        // Q8_0 stride is 2 (f16 scale) + 32 (i8 weights) = 34 bytes per
-        // 32-weight block. Handing in 5 bytes while claiming 32 weights must
-        // error rather than reading out of bounds.
+        // Q8_0 stride is 2 (f16 scale) + 32 (i8 weights) = 34 bytes per 32-weight block.
+        // Handing in 5 bytes while claiming 32 weights must error rather than reading out of.
         let short_buf = vec![0u8; 5];
         let res = dequant_q80(&short_buf, 32);
         assert!(res.is_err(), "dequant_q80 must reject truncated buffer");
@@ -5171,9 +4817,8 @@ mod tests {
 
     #[test]
     fn fp4_round_trip_preserves_sign() {
-        // FP4 E2M1 has a sign bit; quant → dequant must not flip the sign of
-        // a clearly positive or clearly negative input. A mutant that
-        // dropped the sign-bit branch in the quantizer would surface here.
+        // FP4 E2M1 has a sign bit; quant → dequant must not flip the sign of a clearly positive or clearly negative input.
+        // A mutant that dropped the sign-bit branch in the quantizer would surface here.
         let pos = vec![0.5f32; 16];
         let neg = vec![-0.5f32; 16];
         let q_pos = quant_fp4(&pos).expect("quant pos");
@@ -5192,11 +4837,8 @@ mod tests {
 
     #[test]
     fn nf4_round_trip_preserves_zero_crossing() {
-        // NF4 is asymmetric with no exact zero code; the smallest positive
-        // code is +0.1 and the largest negative is -0.1. Quantizing a
-        // mixed-sign input must produce a dequant vector that has both
-        // signs — a mutant that collapsed the code lookup to all-positive
-        // or all-negative would fail here.
+        // NF4 is asymmetric with no exact zero code; the smallest positive code is +0.1 and the largest negative is -0.1.
+        // Quantizing a mixed-sign input must produce a dequant vector that has both signs - a.
         let data: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.1).collect();
         let q = quant_nf4(&data).expect("quant");
         let d = dequant_nf4(&q, 16).expect("dequant");
@@ -5211,9 +4853,8 @@ mod tests {
 
     #[test]
     fn fp8_quant_clamps_to_representable_range() {
-        // E4M3 max representable is ~240. Quantizing +1e6 must clamp, not
-        // overflow the 4-bit exponent field — a mutant that dropped the
-        // `.min(240.0)` clamp at line 727 would corrupt the bit pattern.
+        // E4M3 max representable is ~240. Quantizing +1e6 must clamp, not overflow the 4-bit exponent field
+        // - a mutant that dropped the `.min(240.0)` clamp at line 727 would corrupt the bit pattern.
         let data = vec![1.0e6f32, -1.0e6, 0.0, 1.0];
         let q = quant_fp8(&data).expect("quant");
         let d = dequant_fp8(&q, 4).expect("dequant");
@@ -5295,13 +4936,8 @@ mod tests {
         }
     }
 
-    /// P2-WI-1 gate: `RowScaleDtype::Fp8` with `block_size = 16` must
-    /// round-trip a non-trivial tensor with bounded error relative to the
-    /// legacy single-global-scale (`fp8` only). The two-level scale structure
-    /// is what enables a future kernel to reach NVFP4-level accuracy on
-    /// outlier channels; this test asserts that the *existing* `block16`
-    /// path does not regress relative to the global-scale `fp8` path on the
-    /// same buffer (i.e. block-scaling never hurts single-scale).
+    /// P2-WI-1 gate: `RowScaleDtype::Fp8` with `block_size = 16` must round-trip a non-trivial tensor with bounded error relative to the legacy single-global-scale (`fp8` only).
+    /// The two-level scale structure is what enables a future kernel to reach NVFP4-level accuracy on.
     #[test]
     fn fp8_block_round_trip_is_no_worse_than_single_scale() {
         let mut data: Vec<f32> = Vec::with_capacity(32);
@@ -5326,11 +4962,8 @@ mod tests {
             err_block += (data[i] - d_block[i]).abs();
             err_single += (data[i] - d_single[i]).abs();
         }
-        // The block path must be within a small multiple of the single-scale
-        // path (no regression; equal-or-better). The spec's "must have lower
-        // error" claim is reserved for the future NVFP4-equivalent kernel
-        // that uses Fp8 scales adaptively per block — the current stub is
-        // allowed to match.
+        // The block path must be within a small multiple of the single-scale path (no regression; equal-or-better).
+        // The spec's "must have lower error" claim is reserved for the future NVFP4-equivalent kernel that.
         assert!(
             err_block <= err_single * 1.2 + 1e-3,
             "block path must not regress vs single-scale: block={} single={}",
@@ -5523,17 +5156,8 @@ mod tests {
         assert_eq!(deq[0], -88.0f32);
     }
 
-    /// Host-side mirror of the corrected ROCm `q6k_gemm.rs::dequant_q6k_element`
-    /// HIP kernel. Kept line-for-line equivalent to the kernel so this test
-    /// actually exercises the kernel's bit-math derivation, not a re-derivation.
-    ///
-    /// Q6_K super-block is 210 bytes / 256 weights:
-    ///   ql  128 B @ +0    — low 4 bits per weight
-    ///   qh   64 B @ +128  — high 2 bits per weight
-    ///   scales 16 B @ +192 — **signed** i8
-    ///   d     2 B @ +208  — f16
-    /// value = d * sc * (q - 32)   (no `dmin` term — Q6_K is *not* min-offset
-    /// like Q4_K/Q5_K; the per-element code is centred by 32 instead).
+    /// Host-side mirror of the corrected ROCm `q6k_gemm.rs::dequant_q6k_element` HIP kernel.
+    /// Kept line-for-line equivalent to the kernel so this test actually exercises the kernel's bit-math derivation,.
     fn host_dequant_q6k_element(block: &[u8], in_sb: usize) -> f32 {
         assert!(in_sb < 256 && block.len() >= 210);
         let ql = &block[0..128];
@@ -5565,14 +5189,8 @@ mod tests {
         d * sc * (q_code as f32 - 32.0)
     }
 
-    /// Golden-vector check: across 256 `in_sb`, the host-mirrored GPU
-    /// per-element formula must produce byte-identical values to the CPU
-    /// reference `dequant_q6k`. Also asserts the old (broken) Q5_K-style
-    /// layout the kernel previously used would NOT match — i.e. this test
-    /// fails against the pre-fix kernel formula, confirming it actually
-    /// catches the regression. Uses a deliberately non-trivial deterministic
-    /// block (non-uniform scales, mixed nibbles, varied qh bits, both
-    /// strides) so every branch is exercised.
+    /// Golden-vector check: across 256 `in_sb`, the host-mirrored GPU per-element formula must produce byte-identical values to the CPU reference `dequant_q6k`.
+    /// Also asserts the old (broken) Q5_K-style layout the kernel previously used would NOT match -.
     #[test]
     fn test_q6k_gpu_kernel_element_matches_cpu_reference() {
         let mut data = vec![0u8; 210];
@@ -5627,14 +5245,8 @@ mod tests {
         assert!(any_neg, "golden block has no negative outputs");
     }
 
-    /// Host-side mirror of the corrected ROCm
-    /// `shared_device_fns.rs::dequant_q4k_element` HIP kernel.
-    ///
-    /// Q4_K super-block: 144 bytes / 256 weights. Four 64-weight groups. Within
-    /// group g, the first 32 outputs use low nibbles (qs[l] & 0xF, scale 2g),
-    /// the next 32 use high nibbles (qs[l] >> 4, scale 2g+1), both reading the
-    /// *same* 32-byte `qs` window (qs advances 32 bytes per 64-output group).
-    /// value = d*sc*q - dmin*m.
+    /// Host-side mirror of the corrected ROCm `shared_device_fns.rs::dequant_q4k_element` HIP kernel.
+    /// Q4_K super-block: 144 bytes / 256 weights.
     fn host_dequant_q4k_element(block: &[u8], in_sb: usize) -> f32 {
         assert!(in_sb < 256 && block.len() >= 144);
         let d = f16_to_f32(block[0], block[1]);
@@ -5660,10 +5272,8 @@ mod tests {
         d * (sc as f32) * (q as f32) - dmin * (m as f32)
     }
 
-    /// Golden-vector check for the Q4_K GPU element kernel: across 256 `in_sb`,
-    /// the host-mirrored formula must match the CPU reference `dequant_q4k`.
-    /// Uses a non-trivial deterministic block exercising all four groups and
-    /// both nibble halves.
+    /// Golden-vector check for the Q4_K GPU element kernel: across 256 `in_sb`, the host-mirrored formula must match the CPU reference `dequant_q4k`.
+    /// Uses a non-trivial deterministic block exercising all four groups and both nibble halves.
     #[test]
     fn test_q4k_gpu_kernel_element_matches_cpu_reference() {
         let mut data = vec![0u8; 144];
@@ -5698,10 +5308,8 @@ mod tests {
         }
     }
 
-    /// Definitive check: extract a real Q4_K weight from an on-disk GGUF model
-    /// and dequantize it two ways - grim's `dequant_q4k` and an independent
-    /// ggml-faithful reimplementation. They MUST agree. Skipped if the model
-    /// file is absent.
+    /// Definitive check: extract a real Q4_K weight from an on-disk GGUF model and dequantize it two ways - grim's `dequant_q4k` and an independent ggml-faithful reimplementation.
+    /// They MUST agree.
     #[test]
     fn test_q4k_real_model_matches_ggml_reference() {
         let path = std::env::var("GRIM_Q4K_MODEL")
@@ -5803,9 +5411,8 @@ mod tests {
 
     #[test]
     fn test_iq4nl_dequant_exact_block_size_and_codebook_values() {
-        // QNT-3 fix: IQ4_NL super-block is now 170 bytes — d(2) + q8 sign(32)
-        // + q4 nibbles(128) + scales(8). The old test used the broken 144-byte
-        // layout and conflated the sign byte with the first quant nibble.
+        // QNT-3 fix: IQ4_NL super-block is now 170 bytes - d(2) + q8 sign(32) + q4 nibbles(128) + scales(8).
+        // The old test used the broken 144-byte layout and conflated the sign byte with the.
         let mut data = vec![0u8; 170];
         // d = f16 1.0 = [0x00, 0x3c]
         data[0] = 0x00;
@@ -5995,10 +5602,6 @@ mod tests {
 
 /// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed Q8_0 weights.
 /// A has shape [m, k], B has shape [n, k] (in packed Q8_0 bytes).
-///
-/// Dispatches once per call to an AVX2 kernel on x86-64 (runtime-detected) or
-/// a NEON kernel on aarch64; the scalar loop below is the always-available
-/// fallback and the mathematical reference for the SIMD kernels.
 pub fn gemm_q8_0_packed(
     a: &[f32],
     b_q80_bytes: &[u8],
@@ -6084,11 +5687,7 @@ fn gemm_q8_0_packed_scalar(
 }
 
 /// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed Q4_K weights.
-/// A has shape [m, k], B has shape [n, k] (in packed Q4_K bytes: 144 bytes per 256 weights).
-///
-/// Dispatches once per call to an AVX2 kernel on x86-64 (runtime-detected);
-/// the scalar loop below is the always-available fallback and the mathematical
-/// reference for the SIMD kernel. (Q4_K stays scalar on aarch64.)
+/// A has shape [m, k], B has shape [n, k] (in packed Q4_K bytes: 144.
 pub fn gemm_q4k_packed(
     a: &[f32],
     b_q4k_bytes: &[u8],

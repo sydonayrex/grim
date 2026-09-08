@@ -1,7 +1,5 @@
 //! EAGLE-3 integration as an accelerated speculative `DraftBackbone`.
-//!
-//! Exposes [`grim_models_transformer::Eagle3`] with multi-layer target feature fusion
-//! and autoregressive draft rollout.
+//! Exposes [`grim_models_transformer::Eagle3`] with multi-layer target feature fusion and autoregressive draft rollout.
 
 use std::sync::Arc;
 
@@ -34,10 +32,7 @@ impl Eagle3Drafter {
     }
 
     /// Perform multi-step speculative draft rollout fused with multi-layer target hidden features.
-    ///
-    /// Real EAGLE-3 takes the target model's intermediate layer representations (e.g. low, mid, high),
-    /// projects them through `fc: 3 * D_target -> D_draft` to form initial hidden state $H_0$,
-    /// and expands $K$ draft tokens autoregressively by concatenating $[E_t, H_{t-1}]$ at each step.
+    /// Real EAGLE-3 takes the target model's intermediate layer representations (e.g.
     pub fn draft_block_with_fusion(
         &self,
         target_hiddens: &[&Tensor],

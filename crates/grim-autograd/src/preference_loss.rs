@@ -1,23 +1,10 @@
 //! DPO, ORPO, and GRPO preference optimization loss functions (WI-T7).
-//!
-//! Provides loss routines for alignment fine-tuning on top of scoped autograd:
-//! - `dpo_loss`: Direct Preference Optimization loss.
-//! - `orpo_loss`: Odds Ratio Preference Optimization loss.
-//! - `grpo_normalize_rewards`: Group-relative reward normalization for GRPO.
-//! - `olora_orthogonality_penalty`: OLoRA regularization loss.
+//! Provides loss routines for alignment fine-tuning on top of scoped autograd: - `dpo_loss`: Direct Preference.
 
 use grim_tensor::error::{Error, Result};
 
 /// Compute Direct Preference Optimization (DPO) loss.
-///
-/// Inputs:
-/// - `policy_chosen_logps`: `log π_θ(y_w | x)`
-/// - `policy_rejected_logps`: `log π_θ(y_l | x)`
-/// - `ref_chosen_logps`: `log π_ref(y_w | x)`
-/// - `ref_rejected_logps`: `log π_ref(y_l | x)`
-/// - `beta`: scaling parameter (e.g. `0.1`)
-///
-/// Returns `(loss_float, chosen_rewards, rejected_rewards)`.
+/// Inputs: - `policy_chosen_logps`: `log π_θ(y_w | x)` - `policy_rejected_logps`: `log π_θ(y_l | x)` - `ref_chosen_logps`:.
 pub fn dpo_loss(
     policy_chosen_logps: &[f32],
     policy_rejected_logps: &[f32],
@@ -48,11 +35,8 @@ pub fn dpo_loss(
         rejected_rewards.push(rejected_r);
 
         let logits = chosen_r - rejected_r;
-        // `-sigmoid(logits).ln()` == `ln(1 + exp(-logits))` == softplus(-logits),
-        // but the direct form underflows to ±inf for |logits| > ~88 (sigmoid
-        // saturates to 0/1, then ln(0) = -inf). Use the numerically-stable
-        // softplus with the max trick: `max(-x,0) + ln(1+exp(-|x|))`, which is
-        // exact for all finite inputs and never produces inf/NaN here.
+        // `-sigmoid(logits).ln()` == `ln(1 + exp(-logits))` == softplus(-logits), but the direct form underflows to ±inf for |logits| > ~88 (sigmoid saturates to 0/1, then ln(0) = -inf).
+        // Use the numerically-stable softplus with the max trick: `max(-x,0) + ln(1+exp(-|x|))`, which is exact for.
         let loss = softplus(-logits);
         total_loss += loss;
     }
@@ -62,9 +46,7 @@ pub fn dpo_loss(
 }
 
 /// Compute Odds Ratio Preference Optimization (ORPO) odds ratio loss.
-///
 /// `policy_chosen_logps` and `policy_rejected_logps` are averaged log probabilities of chosen and rejected tokens.
-/// Returns `loss_float`.
 pub fn orpo_odds_ratio_loss(
     policy_chosen_logps: &[f32],
     policy_rejected_logps: &[f32],
@@ -94,8 +76,7 @@ pub fn orpo_odds_ratio_loss(
 }
 
 // Normalize rollout rewards for Group Relative Policy Optimization (GRPO).
-//
-// Computes `r_norm_i = (r_i - mean(r)) / (std(r) + eps)` across candidate outputs for a prompt.
+// Computes `r_norm_i = (r_i - mean(r)) / (std(r) + eps)` across candidate outputs for a.
 
 /// Compute Kahneman-Tversky Optimization (KTO) loss.
 pub fn kto_loss(
@@ -226,7 +207,6 @@ pub fn grpo_normalize_rewards(rewards: &[f32], eps: f32) -> Vec<f32> {
 }
 
 /// Compute DPO loss and gradient tensors for autograd backward traversal.
-///
 /// Returns `(avg_loss_val, chosen_grad_tensor, rejected_grad_tensor)`.
 pub fn dpo_loss_autograd(
     policy_chosen_logps: &grim_tensor::Tensor,
@@ -289,7 +269,6 @@ pub fn dpo_loss_autograd(
 }
 
 /// Compute ORPO odds ratio loss and gradient tensors for autograd backward traversal.
-///
 /// Returns `(loss_val, chosen_grad_tensor, rejected_grad_tensor)`.
 pub fn orpo_odds_ratio_loss_autograd(
     policy_chosen_logps: &grim_tensor::Tensor,
@@ -346,7 +325,6 @@ pub fn orpo_odds_ratio_loss_autograd(
 }
 
 /// Compute GRPO policy loss and gradient tensor for autograd backward traversal.
-///
 /// Returns `(mean_loss_val, policy_grad_tensor)`.
 pub fn grpo_loss_autograd(
     policy_logps: &grim_tensor::Tensor,
@@ -390,14 +368,7 @@ pub fn grpo_loss_autograd(
 }
 
 /// OLoRA orthogonality penalty: `||AᵀA − I||_F² + ||BBᵀ − I||_F²`.
-///
-/// `a` has shape `[out, r]` (the LoRA down-projection) and `b` has shape
-/// `[r, in]` (the LoRA up-projection). The penalty encourages the columns of
-/// `A` and the rows of `B` to be orthonormal, which keeps the low-rank
-/// subspace of the adapter well-conditioned during training.
-///
-/// Computed on host floats (via `to_vec_f32`) so it can be added to the scalar
-/// CE/DPO/GRPO loss before `backward()` without extending the autograd tape.
+/// `a` has shape `[out, r]` (the LoRA down-projection) and `b` has shape `[r, in]` (the.
 pub fn olora_orthogonality_penalty(
     a: &grim_tensor::Tensor,
     b: &grim_tensor::Tensor,
@@ -430,9 +401,8 @@ pub fn olora_orthogonality_penalty(
     Ok(a_gram + b_gram)
 }
 
-/// Compute `||AᵀA − I||_F²` (when `transpose_a = true`) or `||BBᵀ − I||_F²`
-/// (when `transpose_a = false`). `rows`/`cols` describe the raw matrix layout;
-/// `rank` is the LoRA rank `r` (the size of the Gram matrix).
+/// Compute `||AᵀA − I||_F²` (when `transpose_a = true`) or `||BBᵀ − I||_F²` (when `transpose_a = false`).
+/// `rows`/`cols` describe the raw matrix layout; `rank` is the LoRA rank `r` (the size of.
 fn gram_penalty(m: &[f32], rows: usize, cols: usize, rank: usize, transpose_a: bool) -> f32 {
     let mut total = 0.0f32;
     for i in 0..rank {
@@ -458,12 +428,7 @@ fn gram_penalty(m: &[f32], rows: usize, cols: usize, rank: usize, transpose_a: b
 }
 
 /// Numerically-stable softplus: `ln(1 + exp(x))` = `max(x, 0) + ln(1 + exp(-|x|))`.
-///
-/// Equivalent to `-sigmoid(-x).ln()` (and to `-sigmoid(x).ln()` when called with
-/// `-x`), but never overflows to ±inf for large |x| because the `max`/abs trick
-/// bounds the argument to `exp` to `[0, ∞)` — for very negative inputs the
-/// two-term form collapses toward 0 (the true softplus value), and for very
-/// positive inputs it collapses toward `x`.
+/// Equivalent to `-sigmoid(-x).ln()` (and to `-sigmoid(x).ln()` when called with `-x`), but never overflows to ±inf.
 fn softplus(x: f32) -> f32 {
     let max_term = x.max(0.0);
     max_term + (1.0 + (-x.abs()).exp()).ln()

@@ -138,21 +138,17 @@ pub enum QuantMode {
     Fp8Native,
     /// Rook: MXFP4 E2M1 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
     MxFp4Emulated,
+    /// NVFP4 E2M1 emulated (dequant in LDS to F32/BF16 with Wave cooperative reduction). Safe RDNA2+.
+    NvFp4Emulated,
     /// Jackdaw: MXFP8 E4M3 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
     MxFp8Emulated,
-    /// W8A8 SmoothQuant-style int8 GEMM — activations quantized per-token, weights quantized
-    /// per-channel. Uses int8 MFMA (CDNA2/3: `__builtin_amdgcn_mfma_i32_32x32x16_i8`)
-    /// or the int8 dot-product path on RDNA3/4.
+    /// W8A8 SmoothQuant-style int8 GEMM - activations quantized per-token, weights quantized per-channel.
+    /// Uses int8 MFMA (CDNA2/3: `__builtin_amdgcn_mfma_i32_32x32x16_i8`) or the int8 dot-product path on RDNA3/4.
     Int8W8A8,
 }
 
-/// The concrete FP8 element format a device is **natively** capable of. This is
-/// the axis a W8A8 GEMM must branch on — the two formats have different packed
-/// code namespaces and different MFMA predicates. One `bool` cannot express it.
-///
-/// NAMING: this "OCP" is the OCP *element format* (e4m3fn), NOT OCP *Microscaling*
-/// (MXFP4/MXFP8 — see the Jay/Magpie tiers in `charon.rs` / `grim-quant`). The
-/// variant is spelled `OcpFn` to avoid that collision.
+/// The concrete FP8 element format a device is **natively** capable of.
+/// This is the axis a W8A8 GEMM must branch on - the two formats have.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Fp8NativeFormat {
     /// No native FP8 path on this arch.
@@ -189,6 +185,7 @@ pub struct QuantCapability {
     /// concrete arches that actually differ. `None` == no native FP8.
     fp8: Fp8NativeFormat,
     mxfp4_emulated: bool,
+    nvfp4_emulated: bool,
     mxfp8_emulated: bool,
     /// Int8 MFMA for W8A8 SmoothQuant (CDNA2+: `mfma_i32_32x32x16_i8`).
     int8_w8a8: bool,
@@ -202,6 +199,7 @@ impl QuantCapability {
             QuantMode::Bf16 => self.bf16,
             QuantMode::Fp8Native => self.fp8.is_native(),
             QuantMode::MxFp4Emulated => self.mxfp4_emulated,
+            QuantMode::NvFp4Emulated => self.nvfp4_emulated,
             QuantMode::MxFp8Emulated => self.mxfp8_emulated,
             QuantMode::Int8W8A8 => self.int8_w8a8,
         }
@@ -218,12 +216,13 @@ impl fmt::Display for QuantCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={} int8_w8a8={}",
+            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} nvfp4_emulated={} mxfp8_emulated={} int8_w8a8={}",
             self.fp32,
             self.f16,
             self.bf16,
             self.fp8,
             self.mxfp4_emulated,
+            self.nvfp4_emulated,
             self.mxfp8_emulated,
             self.int8_w8a8
         )
@@ -239,6 +238,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: true,
             fp8: Fp8NativeFormat::OcpFn,
             mxfp4_emulated: true,
+            nvfp4_emulated: true,
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
@@ -248,6 +248,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: true,
             fp8: Fp8NativeFormat::Fnuz,
             mxfp4_emulated: true,
+            nvfp4_emulated: true,
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
@@ -257,6 +258,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: true,
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: true,
+            nvfp4_emulated: true,
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
@@ -266,6 +268,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: false,
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: false,
+            nvfp4_emulated: false,
             mxfp8_emulated: false,
             int8_w8a8: true,
         },
@@ -275,6 +278,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: false,
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: false,
+            nvfp4_emulated: false,
             mxfp8_emulated: false,
             int8_w8a8: false,
         },
@@ -298,7 +302,7 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
                 QuantMode::Fp32
             }
         }
-        QuantMode::MxFp4Emulated | QuantMode::MxFp8Emulated => {
+        QuantMode::MxFp4Emulated | QuantMode::NvFp4Emulated | QuantMode::MxFp8Emulated => {
             if caps.bf16 {
                 requested
             } else {
@@ -323,10 +327,8 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
     }
 }
 
-/// Per-channel activation scale array for SmoothQuant W8A8 path. Channels ==
-/// output features of a linear/conv. One scale per output channel absorbed from
-/// the activation max via gamma migration. Stored as fp32 so downstream
-/// in-kernel dequant can work from the canonical float value.
+/// Per-channel activation scale array for SmoothQuant W8A8 path.
+/// Channels == output features of a linear/conv.
 #[derive(Debug, Clone, Default)]
 pub struct SmoothQuantActScales {
     /// Flat vec, `len == num_channels`. Must be non-empty when the W8A8 dispatch
@@ -348,9 +350,8 @@ impl SmoothQuantActScales {
     }
 }
 
-/// Offline calibration result from a single forward pass over a calibration
-/// dataset. Collects per-token activation maxes per layer and optionally
-/// applies SmoothQuant gamma migration to derive per-channel scales.
+/// Offline calibration result from a single forward pass over a calibration dataset.
+/// Collects per-token activation maxes per layer and optionally applies SmoothQuant gamma migration to derive per-channel.
 #[derive(Debug, Clone)]
 pub struct SmoothQuantCalibration {
     /// Per-layer per-channel activation scales after calibration. Layer index
@@ -455,15 +456,12 @@ mod self_tests {
         }
     }
 
-    // =========================================================================
-    // WRECK-10: W8A8 SmoothQuant — structure tests, no GPU required.
-    // =========================================================================
+    // WRECK-10: W8A8 SmoothQuant - structure tests, no GPU required.
 
     #[test]
     fn quantmode_int8w8a8_variant_compiles() {
-        // Verify the new QuantMode variant is in enum space and participates
-        // in capability resolution. If it didn't compile, this test wouldn't
-        // exist.
+        // Verify the new QuantMode variant is in enum space and participates in capability resolution.
+        // If it didn't compile, this test wouldn't exist.
         let mode = QuantMode::Int8W8A8;
         assert!(matches!(mode, QuantMode::Int8W8A8));
     }
@@ -535,14 +533,33 @@ mod self_tests {
 
     #[test]
     fn smooth_quant_calibration_scales_not_all_ones_by_default() {
-        // Verify the default constructor sets per-channel scales to 1.0 (the
-        // "no scaling" identity). A real calibration pass would replace these
-        // with observed maxes.
+        // Verify the default constructor sets per-channel scales to 1.0 (the "no scaling" identity).
+        // A real calibration pass would replace these with observed maxes.
         let scales = SmoothQuantActScales::new(32);
         let all_ones = scales.channels.iter().all(|&s| (s - 1.0).abs() < 1e-6);
         assert!(
             all_ones,
             "default calibration should start with 1.0 identity scales"
         );
+    }
+
+    #[test]
+    fn test_quant_capability_nvfp4_emulated() {
+        for arch in [
+            GcnArch::RDNA2,
+            GcnArch::RDNA3,
+            GcnArch::RDNA4,
+            GcnArch::CDNA3,
+            GcnArch::CDNA4,
+            GcnArch::UDNA,
+        ] {
+            let cap = arch_capability(arch);
+            assert!(cap.nvfp4_emulated, "{arch:?} should support NvFp4Emulated");
+            assert!(cap.supports(QuantMode::NvFp4Emulated));
+        }
+
+        let rna1 = arch_capability(GcnArch::RDNA1);
+        assert!(!rna1.nvfp4_emulated);
+        assert!(!rna1.supports(QuantMode::NvFp4Emulated));
     }
 }

@@ -1,10 +1,5 @@
-//! Tencent Hunyuan-V4 (HyV4) Transformer architecture with Grouped Query Attention (GQA),
-//! RoPE positional embeddings, SwiGLU feed-forward networks, and RMSNorm.
-//!
-//! # Architecture Details
-//! - **Attention**: GQA with RoPE rotation.
-//! - **Feed Forward**: SwiGLU activation ($x \cdot \text{SiLU}(x \cdot W_{\text{gate}}) \cdot W_{\text{up}} \cdot W_{\text{down}}$).
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm.
+//! Tencent Hunyuan-V4 (HyV4) Transformer architecture with Grouped Query Attention (GQA), RoPE positional embeddings, SwiGLU feed-forward networks, and RMSNorm.
+//! # Architecture Details - **Attention**: GQA with RoPE rotation.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Tencent Hunyuan-V4 (HyV4).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,9 +56,7 @@ impl ModelConfig for HyV4Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Feed Forward
-// ---------------------------------------------------------------------------
 
 pub struct HyV4Mlp {
     pub gate_proj: Linear,
@@ -93,9 +84,7 @@ impl HyV4Mlp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct HyV4Block {
     pub wq: Linear,
@@ -112,7 +101,11 @@ pub struct HyV4Block {
 }
 
 impl HyV4Block {
-    pub fn load(ws: &WeightSource<'_>, cfg: &HyV4Config, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &HyV4Config,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -161,12 +154,8 @@ impl HyV4Block {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -209,9 +198,7 @@ impl HyV4Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct HyV4 {
     pub cfg: HyV4Config,
@@ -265,7 +252,10 @@ impl HyV4 {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -338,9 +328,7 @@ impl CausalLm for HyV4 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -356,6 +344,7 @@ mod tests {
         assert_eq!(cfg.num_key_value_heads, 8);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_hy_v4_forward_and_session_state() {
         let mut cfg = HyV4Config::default();
@@ -370,7 +359,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

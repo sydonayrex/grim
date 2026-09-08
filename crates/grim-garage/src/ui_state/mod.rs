@@ -1,8 +1,5 @@
-//! UI state — the shared store the reactive frontend observes.
-//!
-//! Display state is split into [`display::DisplayState`] (read-by-view) and
-//! service clients (HTTP fetcher). The frontend views watch
-//! `display` and re-render when fields change.
+//! UI state - the shared store the reactive frontend observes.
+//! Display state is split into [`display::DisplayState`] (read-by-view) and service clients (HTTP fetcher).
 
 pub mod display;
 pub mod http_client;

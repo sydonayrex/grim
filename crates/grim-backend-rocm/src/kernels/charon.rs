@@ -1,91 +1,27 @@
-//! Charon — P-DAFD (Predictive Distribution-Aware Fused Dispatch) MoE kernel.
-//!
-//! Implements the sortless fused dispatch GEMM path for Mixtures-of-Experts
-//! (WI-A of `rocm_kernel_plan.md`). One kernel launch carries every routed
-//! token to its expert via block-to-expert assignment driven by the block
-//! index — no host sort, no per-expert kernel launch. The gate + up GEMMs are
-//! fused with an in-register SiLU combine, followed by the down projection,
-//! and the router combine weights are applied in-kernel.
-//!
-//! Design notes (per the plan's verification discipline):
-//!
-//! * This is the **custom fused dispatch path only** — Rule 0 of
-//!   `rocm-hip-kernels`: vendor BLAS still owns dense per-expert GEMM. The
-//!   fused path is selected at runtime when the activation is on
-//!   `Device::Rocm` (`MoeFfn::forward` → `forward_rocm`, gated on the
-//!   `rocm-mem` feature).
-//! * Block size is a multiple of 64 (Wave64 mandate); tile sizes come from
-//!   `device::gemm_tuning::lookup_gemm_config`, not from per-launch autotune.
-//! * The CPU reference forward (`grim_nn::moe::MoeFfn::forward`) is the parity
-//!   oracle for G-A4 and must pass its own suite (incl.
-//!   `routed_scaling_factor_scales_routed_not_shared`) before any GPU diff.
-//! * Host launcher logic is extracted into a pure `pub(crate) fn` so the
-//!   parameter-blob assembly is provable without a device (G-A2).
-//! * fp8/MFMA mixed-precision variant is gated on `gcnArchName >= gfx1200`
-//!   (RDNA4 only), never on type availability.
+//! Charon - P-DAFD (Predictive Distribution-Aware Fused Dispatch) MoE kernel.
+//! Implements the sortless fused dispatch GEMM path for Mixtures-of-Experts (WI-A of `rocm_kernel_plan.md`).
 
 use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
-// ---------------------------------------------------------------------------
-// HIP source — `grim_moe_fused_dispatch`
-// ---------------------------------------------------------------------------
+// HIP source - `grim_moe_fused_dispatch`
 
 /// HIP source for the Charon fused-dispatch MoE kernel family.
-///
-/// Entries (each `__global__`, Wave64-aligned):
-/// * `grim_moe_fused_dispatch`  — WI-A sortless fused dispatch GEMM,
-///   gate+up fused with in-register SiLU, then down + weighted combine.
-/// * `grim_charon_gmem_bytes`   — WI-A traffic counter (G-A5): returns the
-///   device-side GMEM bytes a fused dispatch *would* touch, so the launcher
-///   can compare against the per-expert rocBLAS baseline without a separate
-///   harness allocation.
+/// Entries (each `__global__`, Wave64-aligned): * `grim_moe_fused_dispatch` - WI-A sortless fused dispatch GEMM, gate+up fused with.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    // ────────────────────────────────────────────────────────────────────
-    // charon_atomic_add2 — packed 2xfloat atomic epilogue for the grouped
-    // kernels (grim_moe_fused_grouped*). A token's [hidden] output row is
-    // accumulated into `out` by per-element float atomicAdd (all routed
-    // tokens share the row, so atomics are mandatory). When `hidden` is
-    // even, columns (2k, 2k+1) share one 8-byte word: a lane that has both
-    // addends issues a single 64-bit atomicAdd of a packed 2xfloat
-    // register. The CAS loop serializes the 64-bit add exactly like two
-    // independent 32-bit atomicAdds to the same word, and float addition
-    // is associativity-tolerant at identical precision, so the packed
-    // result is bit-exact versus the scalar path. Odd `hidden` keeps the
-    // per-element path in the kernels. `out` must be 8-byte aligned; the
-    // launcher's even row stride (hidden even) plus the 16-byte allocator
-    // alignment guarantee column 0 of every row starts 8-aligned.
+    // ──────────────────────────────────────────────────────────────────── charon_atomic_add2 - packed 2xfloat atomic epilogue for the grouped kernels (grim_moe_fused_grouped*).
+    // A token's [hidden] output row is accumulated into `out` by per-element float atomicAdd (all routed.
     __device__ __forceinline__ void charon_atomic_add2(
         float* out, unsigned long long idx2, float add0, float add1) {
         atomicAdd(out + idx2, add0);
         atomicAdd(out + idx2 + 1, add1);
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // grim_moe_fused_dispatch — sortless fused MoE dispatch (WI-A).
-    //
-    // One launch carries every routed token to its expert. The grid is
-    // organized as [num_token_expert_pairs / tokens_per_block] blocks; each
-    // block reads its assigned (token, expert) pair from the flattened
-    // routing arrays (router_tokens[], router_experts[], router_weights[])
-    // and performs the SwiGLU fused gate+up GEMM → in-register SiLU → down
-    // projection → weighted accumulate into the token's output row.
-    //
-    // This is "sortless" in the TritonMoE/FlashMoE sense: there is no host
-    // sort and no per-expert kernel launch — the block index directly maps
-    // to a (token, expert) work item, and experts are interleaved across
-    // blocks. The cost model in WI-B keys the variant selection on the live
-    // routing histogram emitted into `router_experts`.
-    //
-    // Weight layout: per-expert gate/up are `[inter, hidden]` row-major
-    // (matching `ExpertBank::gate[e]` / `ExpertBank::up[e]`); down is
-    // `[hidden, inter]` (already transposed by `ExpertBank::load`). The
-    // three expert pointer arrays carry one base pointer per expert and are
-    // indexed by the dispatched expert id.
-    // ────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────── grim_moe_fused_dispatch - sortless fused MoE dispatch (WI-A).
+    // One launch carries every routed token to its expert.
     __global__ void grim_moe_fused_dispatch(
         const float* __restrict__ activations,     // [batch, hidden]
         const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
@@ -111,8 +47,7 @@ extern "C" {
         const float* dw = expert_down_w + (unsigned long long)exp * hidden * inter;
 
         // Fused gate + up GEMM with in-register SiLU combine, then down.
-        // The intermediate inter-dimension is reduced in-register (no HBM
-        // round-trip for the activation — the TritonMoE ~35% GMEM cut).
+        // The intermediate inter-dimension is reduced in-register (no HBM round-trip for the activation - the TritonMoE.
         for (int j = 0; j < inter; ++j) {
             float g = 0.0f;
             float u = 0.0f;
@@ -133,20 +68,8 @@ extern "C" {
         }
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // grim_charon_gmem_bytes — WI-A traffic counter (G-A5).
-    //
-    // Pure arithmetic: returns the GMEM bytes a fused dispatch would touch
-    // for the given shape, so the host can prove the ≤70%-of-rocBLAS claim
-    // without a separate device allocation. The formula counts, per
-    // (token, expert) pair:
-    //   - gate + up weights read once each: 2 * inter * hidden * sizeof(f32)
-    //   - down weights read once:           hidden * inter * sizeof(f32)
-    //   - activation read once per pair:    hidden * sizeof(f32)
-    //   - output written once per token:    hidden * sizeof(f32) (amortized)
-    // vs the per-expert rocBLAS baseline which re-reads the activation per
-    // expert launch.
-    // ────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────── grim_charon_gmem_bytes - WI-A traffic counter (G-A5).
+    // Pure arithmetic: returns the GMEM bytes a fused dispatch would touch for the given shape,.
     __device__ unsigned long long charon_fused_bytes(int hidden, int inter, int num_pairs, int batch) {
         const unsigned long long bytes_per_pair =
             (unsigned long long)(2ULL * inter * hidden   // gate + up
@@ -157,28 +80,8 @@ extern "C" {
         return bytes_per_pair * (unsigned long long)num_pairs + out_bytes;
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // grim_moe_fused_grouped — WI-A grouped (token-sorted) fused dispatch.
-    //
-    // Same in-register fused math as `grim_moe_fused_dispatch` (gate+up GEMM
-    // → SiLU combine → down, no HBM round-trip for the activation) but the
-    // work is RE-ORDERED by expert: the host pre-sorts routed tokens so each
-    // thread block owns one expert's contiguous token slice (length
-    // `block_size`, padded). This is the grouped-GEMM structure — each
-    // expert's weights are read once per block and reused across all its
-    // tokens, cutting the per-pair weight re-reads the sortless path pays.
-    //
-    // Token layout (from `moe_align_block_size`):
-    //   sorted_token_ids : [num_tokens_post_padded]   token index per slot
-    //   sorted_expert_ids: [num_tokens_post_padded]   expert index per slot
-    //   sorted_weights   : [num_tokens_post_padded]   combine weight per slot
-    // `blockIdx.x` = expert-block index; its token window is
-    //   [blockIdx.x*block_size, min((blockIdx.x+1)*block_size, num_tokens)].
-    // Padding slots have token index == num_tokens (>= num_tokens) and are
-    // skipped. A token routed to K>1 experts appears in K distinct blocks, so
-    // the weighted accumulate into `out[token]` still uses atomicAdd — but the
-    // weight reads are now grouped per expert, which is the MoE win.
-    // ────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────── grim_moe_fused_grouped - WI-A grouped (token-sorted) fused dispatch.
+    // Same in-register fused math as `grim_moe_fused_dispatch` (gate+up GEMM → SiLU combine → down, no HBM.
     __device__ void grim_moe_fused_grouped_device(
         const float* __restrict__ activations,     // [batch, hidden]
         const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
@@ -191,10 +94,8 @@ extern "C" {
         int hidden, int inter, int num_tokens, int block_size,
         float routed_scaling_factor)
     {
-        // `blockDim.x` is the effective worker width supplied by the
-        // persistent dispatcher. It need not equal block_size: the stride
-        // below handles smaller and larger routed blocks without dropping
-        // tokens, while keeping the launch contract fixed and bounded.
+        // `blockDim.x` is the effective worker width supplied by the persistent dispatcher.
+        // It need not equal block_size: the stride below handles smaller and larger routed blocks without.
         if (block_size <= 0) return;
         const int blk = blockIdx.x;
         {
@@ -254,10 +155,8 @@ extern "C" {
     }
 }
 
-// --- #2 FP8 W8A8 helpers + grouped kernel ---------------------------------
-// E4M3 (4 exp, 3 mant, bias 7) decode, mirroring grim-quant::fp8_e4m3_to_f32
-// so the device path matches the host quantizer exactly (no hip_fp8.h include
-// needed for the JIT). NaN/overflow semantics preserved.
+// --- #2 FP8 W8A8 helpers + grouped kernel --------------------------------- E4M3 (4 exp, 3 mant, bias 7) decode, mirroring grim-quant::fp8_e4m3_to_f32 so the device path matches the host quantizer exactly (no hip_fp8.h include needed for the JIT).
+// NaN/overflow semantics preserved.
 __device__ __forceinline__ float fp8e4m3_to_f32(unsigned char b) {
     int sign = (b & 0x80) ? 1 : 0;
     int exp  = (b >> 3) & 0x0F;
@@ -286,17 +185,8 @@ __device__ __forceinline__ float mxfp8_e4m3_to_f32(unsigned char b, unsigned cha
     return v * scale;
 }
 
-// #2 FP8 W8A8 grouped fused MoE dispatch. Reuses the identical token-sorted
-// grouped structure + in-register gate/up/SiLU/down math as
-// `grim_moe_fused_grouped`, but weights arrive as FP8 E4M3 bytes with
-// per-block-16 weight scales and a per-token activation scale. The dequant is
-// fused inline (one mul per output element, NOT per MAC) so the high-perf
-// structure is preserved across quantization — exactly the vLLM W8A8 contract.
-//
-// Scale indexing (block size 16 along the contraction dim, matching
-// grim-quant::quantize_f32_to_fp8_block16):
-//   gate/up: w_scale[exp*inter*(hidden/16) + j*(hidden/16) + i/16]
-//   down:    w_scale[exp*hidden*(inter/16) + h*(inter/16) + j/16]
+// #2 FP8 W8A8 grouped fused MoE dispatch. Reuses the identical token-sorted grouped structure + in-register gate/up/SiLU/down math
+// as `grim_moe_fused_grouped`, but weights arrive as FP8 E4M3 bytes with per-block-16 weight scales and a per-token activation scale.
 extern "C" __global__ void grim_moe_fused_grouped_fp8(
     const float* __restrict__ activations,    // [batch, hidden]
     const unsigned char* __restrict__ egate_w,// [num_experts, inter*hidden] FP8
@@ -341,9 +231,8 @@ extern "C" __global__ void grim_moe_fused_grouped_fp8(
             for (int j = 0; j < inter; ++j) {
                 float gate = 0.0f;
                 float up = 0.0f;
-                // Contract over the activation dimension (dot product), reusing
-                // the identical structure as grim_moe_fused_grouped. The FP8
-                // weight bytes are dequantized inline with their per-block scale.
+                // Contract over the activation dimension (dot product), reusing the identical structure as grim_moe_fused_grouped.
+                // The FP8 weight bytes are dequantized inline with their per-block scale.
                 for (int i = 0; i < hidden; ++i) {
                     const int gidx = j * h16 + (i / 16);
                     const int uidx = j * h16 + (i / 16);
@@ -371,13 +260,8 @@ extern "C" __global__ void grim_moe_fused_grouped_fp8(
     }
 }
 
-// --- #3 MXFP4 (E2M1 + E8M0) grouped kernel --------------------------------
-// OCP Microscaling FP4 (Jay tier): weights packed 2x E2M1 4-bit codes per byte,
-// with one E8M0 shared-exponent byte per 32-element group. Dequant inline:
-//   value = mxfp4_e2m1_to_f32(code, shared_exp)
-// where code is the 4-bit E2M1 nibble and shared_exp the E8M0 byte
-// (scale = 2^(shared_exp - 127)). Reuses the identical token-sorted grouped
-// structure + in-register gate/up/SiLU/down math as the fp8 and fp32 paths.
+// --- #3 MXFP4 (E2M1 + E8M0) grouped kernel -------------------------------- OCP Microscaling FP4 (Jay tier): weights packed 2x E2M1 4-bit codes per byte, with one E8M0 shared-exponent byte per 32-element group.
+// Dequant inline: value = mxfp4_e2m1_to_f32(code, shared_exp) where code is the 4-bit E2M1 nibble and shared_exp.
 __device__ __forceinline__ float mxfp4_e2m1_to_f32(unsigned char code, unsigned char shared_exp) {
     int sign = (code >> 3) & 1;
     int exp  = (code >> 1) & 3;
@@ -462,10 +346,8 @@ extern "C" __global__ void grim_moe_fused_grouped_mxfp4(
     }
 }
 
-// --- #4 MXFP8 (E4M3 + E8M0) grouped kernel --------------------------------
-// OCP Microscaling FP8 (Magpie tier): weights are E4M3 codes (1 byte each,
-// NOT packed) with one E8M0 shared-exponent byte per 32-element group. We
-// reuse the already-corrected `fp8e4m3_to_f32` decoder from the WI-2 path.
+// --- #4 MXFP8 (E4M3 + E8M0) grouped kernel -------------------------------- OCP Microscaling FP8 (Magpie tier): weights are E4M3 codes (1 byte each, NOT packed) with one E8M0 shared-exponent byte per 32-element group.
+// We reuse the already-corrected `fp8e4m3_to_f32` decoder from the WI-2 path.
 extern "C" __global__ void grim_moe_fused_grouped_mxfp8(
     const float* activations,
     const unsigned char* egate_w, const unsigned char* eup_w, const unsigned char* edown_w,
@@ -526,13 +408,8 @@ extern "C" __global__ void grim_moe_fused_grouped_mxfp8(
     }
 }
 
-// --- #5 Q8_0 grouped kernel ------------------------------------------------
-// GGUF block-quantized weights: per 32 weights a `half` (f16) scale followed by
-// 32 `int8` codes. value = scale * code. Reuses the identical token-sorted
-// grouped structure + in-register gate/up/SiLU/down math as all sibling paths.
-// The only difference from fp32 is the weight decode (per-block f16 scale * i8).
-// GGUF Q8_0 f16 scale decode — mirrors grim-quant's f16_to_f32(lo,hi) exactly
-// (LE u16, f32::from_bits, including the correct subnormal path).
+// --- #5 Q8_0 grouped kernel ------------------------------------------------ GGUF block-quantized weights: per 32 weights a `half` (f16) scale followed by 32 `int8` codes.
+// value = scale * code.
 __device__ __forceinline__ float f16_to_f32(unsigned short h) {
     unsigned int sign = (h >> 15) & 1u;
     unsigned int exp  = (h >> 10) & 0x1Fu;
@@ -616,12 +493,7 @@ extern "C" __global__ void grim_moe_fused_grouped_q80(
 }
 
 // IQ + K-quant unified grouped fused dispatch kernel.
-// `format_id` selects the super-block decode (mirrors grim-quant dequant_*):
-//   0 iq4nl  1 iq4xs  2 iq3xxs 3 iq3s 4 iq2xxs 5 iq2xs 6 iq2s
-//   7 q4k    8 q5k    9 q6k    10 q2k   11 q3k
-// Each expert's weights occupy ONE 256-weight super-block: byte stride
-// BLOCK_BYTES[format] within the u8 weight buffer. Per-weight decode is
-// identical to the matching grim-quant dequant_*, so the kernel is bit-faithful.
+// `format_id` selects the super-block decode (mirrors grim-quant dequant_*): 0 iq4nl 1 iq4xs 2 iq3xxs 3.
 __device__ __forceinline__ float iq4nl_codebook(int n) {
     const float CB[16] = {
         127.0f, 104.0f, 83.0f, 65.0f, 49.0f, 35.0f, 22.0f, 10.0f,
@@ -792,9 +664,8 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
         float qs[4] = {q1, q2, q3, q4};
         return dd * sc * qs[quad];
     } else if (fmt == 10) { // q2k (MoE single-superblock, 76 bytes / 64 weights)
-        // Layout: d[0..2] f16, dmin[2..4] f16, scales[4..12] (4 u8, scale/2 in
-        // nibble), qs[12..76] (64 bytes, one 2-bit quant per byte). local in
-        // [0,63] -> quad = local/16 (0..3), l = local%16.
+        // Layout: d[0..2] f16, dmin[2..4] f16, scales[4..12] (4 u8, scale/2 in nibble), qs[12..76] (64 bytes, one 2-bit quant per byte).
+        // local in [0,63] -> quad = local/16 (0..3), l = local%16.
         float dd = f16_to_f32(*(const unsigned short*)(d + 0));
         float dmin = f16_to_f32(*(const unsigned short*)(d + 2));
         const unsigned char* scales = d + 4;
@@ -807,9 +678,8 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
         int qv = qs[quad * 16 + l] & 3;
         return dd * (float)sce * (float)qv - dmin * (float)m;
     } else { // fmt == 11 q3k (MoE single-superblock, 82 bytes / 64 weights)
-        // Layout: d[0..2] f16, scales[2..10] (4 u8, scale/2 in nibble),
-        // hmask[10..18] (4 u8, sign bit per quad), qs[18..82] (64 bytes, one
-        // 3-bit quant per byte). local in [0,63] -> quad=local/16, l=local%16.
+        // Layout: d[0..2] f16, scales[2..10] (4 u8, scale/2 in nibble), hmask[10..18] (4 u8, sign bit per quad), qs[18..82] (64 bytes, one 3-bit quant per byte).
+        // local in [0,63] -> quad=local/16, l=local%16.
         float dd = f16_to_f32(*(const unsigned short*)(d + 0));
         const unsigned char* scales = d + 2;
         const unsigned char* hmask = d + 10;
@@ -826,14 +696,8 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
     }
 }
 
-// kernel-hygiene-plan item 1: batched decode helper for the k-quant formats
-// (7 = Q4_K, 8 = Q5_K, 9 = Q6_K). `iqk_weight` decodes one weight at a time and
-// re-unpacks the per-sub-block scalar fields on every call. This helper hoists
-// that unpack out of the per-weight loop and emits both nibbles from each qs[]
-// byte, so the per-element cost in the batched path is two fmaf-class loads and
-// a multiply — no f16_to_f32, no bit extraction, in the inner loop. `count`
-// weights starting at global index `g0` within the expert's super-block buffer
-// are written to out[0..count]. Arithmetic mirrors iqk_weight bit-for-bit.
+// kernel-hygiene-plan item 1: batched decode helper for the k-quant formats (7 = Q4_K, 8 = Q5_K, 9 = Q6_K).
+// `iqk_weight` decodes one weight at a time and re-unpacks the per-sub-block scalar fields on every.
 __device__ __forceinline__ void iqk_batch_decode(
     int fmt, const unsigned char* b, int g0, int count, float* out) {
     const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,82,110};
@@ -1300,13 +1164,10 @@ extern "C" __global__ void grim_moe_fused_grouped_awq(
 
 "#;
 
-// ---------------------------------------------------------------------------
-// Host launcher (parameter marshalling — pure, unit-testable without GPU)
-// ---------------------------------------------------------------------------
+// Host launcher (parameter marshalling - pure, unit-testable without GPU)
 
-/// A flattened (token, expert, weight) routing assignment produced from the
-/// `MoeRouter::route` output. This is the sortless work list the kernel
-/// consumes: block `i` reads `tokens[i]`, `experts[i]`, `weights[i]`.
+/// A flattened (token, expert, weight) routing assignment produced from the `MoeRouter::route` output.
+/// This is the sortless work list the kernel consumes: block `i` reads `tokens[i]`, `experts[i]`, `weights[i]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutingAssignment {
     /// Token index per pair. Length == number of (token, expert) pairs.
@@ -1318,11 +1179,8 @@ pub struct RoutingAssignment {
 }
 
 impl RoutingAssignment {
-    /// Flatten a per-token `(indices, weights)` routing result (as produced
-    /// by `grim_nn::moe::MoeRouter::route`) into the sortless work list.
-    ///
-    /// `indices[t]` and `weights[t]` are the selected experts and combine
-    /// weights for token `t`; both must have the same length (`top_k`).
+    /// Flatten a per-token `(indices, weights)` routing result (as produced by `grim_nn::moe::MoeRouter::route`) into the sortless work list.
+    /// `indices[t]` and `weights[t]` are the selected experts and combine weights for token `t`; both must.
     pub fn from_route(indices: &[Vec<usize>], weights: &[Vec<f32>]) -> Result<Self> {
         if indices.len() != weights.len() {
             return Err(Error::Backend(format!(
@@ -1385,13 +1243,8 @@ impl RoutingAssignment {
     }
 }
 
-/// Token-sorted routing layout for the grouped fused dispatch
-/// (`grim_moe_fused_grouped`). Produced by `moe_align_block_size` from a
-/// `RoutingAssignment`. This is the vLLM `moe_align_block_size` algorithm,
-/// ported to Rust host logic: tokens are bucketed by expert and each expert's
-/// token run is padded to `block_size` so the grouped GEMM tiles divide
-/// evenly. Padding slots carry a sentinel token index (`num_tokens`) the
-/// kernel skips.
+/// Token-sorted routing layout for the grouped fused dispatch (`grim_moe_fused_grouped`).
+/// Produced by `moe_align_block_size` from a `RoutingAssignment`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SortedRouting {
     /// Token index per sorted slot. Length == `num_tokens_post_padded`.
@@ -1406,13 +1259,8 @@ pub struct SortedRouting {
     pub block_size: usize,
 }
 
-/// Pure, device-free port of vLLM `moe_align_block_size` (counting sort by
-/// expert + per-expert block padding). Unit-testable without a GPU (G-A2).
-///
-/// Algorithm: count tokens per expert, prefix-sum to expert start offsets,
-/// scatter each (token, expert, weight) into its expert's contiguous run, pad
-/// each expert's run to `block_size`. Padding slots get the sentinel token
-/// index `n_token` (>= any real token) so the kernel skips them.
+/// Pure, device-free port of vLLM `moe_align_block_size` (counting sort by expert + per-expert block padding).
+/// Unit-testable without a GPU (G-A2).
 pub fn moe_align_block_size(
     assignment: &RoutingAssignment,
     block_size: usize,
@@ -1450,10 +1298,8 @@ pub fn moe_align_block_size(
     let num_tokens_post_padded = cum;
 
     let mut sorted_token_ids = vec![n_token as u32; num_tokens_post_padded];
-    // Padding slots must carry the block's real expert id (not 0) so the
-    // per-block "expert constant within block" invariant the kernel relies on
-    // holds for the whole padded run, and the sentinel `n_token` token index
-    // alone marks skip slots.
+    // Padding slots must carry the block's real expert id (not 0) so the per-block "expert constant within block" invariant
+    // the kernel relies on holds for the whole padded run, and the sentinel `n_token` token index alone marks skip slots.
     let mut sorted_expert_ids = vec![0u32; num_tokens_post_padded];
     for e in 0..num_experts {
         let run = counts[e].div_ceil(block_size) * block_size;
@@ -1501,11 +1347,7 @@ pub struct CharonLaunchPlan {
 }
 
 /// Choose the wave-aligned block dimension for a fused dispatch.
-///
-/// Picks the smallest multiple of `wave_size` (32 on gfx1036/RDNA Wave32,
-/// 64 on CDNA Wave64) that is ≥ a small decode-friendly occupancy target,
-/// capped at `wave_size * 4` (4 wavefronts — matches the autotune default
-/// `AutotuneConfig::default_block_dim()` = 256 on W64, 128 on W32).
+/// Picks the smallest multiple of `wave_size` (32 on gfx1036/RDNA Wave32, 64 on CDNA Wave64) that.
 pub(crate) fn choose_block_dim(num_pairs: usize, wave_size: u32) -> u32 {
     const WAVES_MAX: u32 = 4; // cap at 4 wavefronts
     let one_wave = wave_size.max(1);
@@ -1520,12 +1362,8 @@ pub(crate) fn choose_block_dim(num_pairs: usize, wave_size: u32) -> u32 {
     block.min(one_wave * WAVES_MAX)
 }
 
-/// Pure planner: resolve the grid/block for a fused dispatch given the
-/// routing assignment and the device's wavefront size. Extracted from the
-/// launcher so G-A2 can prove the parameter blob is built correctly without
-/// a GPU.
-///
-/// Returns `(plan, num_pairs)`.
+/// Pure planner: resolve the grid/block for a fused dispatch given the routing assignment and the device's wavefront size.
+/// Extracted from the launcher so G-A2 can prove the parameter blob is built correctly without.
 #[allow(dead_code)]
 pub(crate) fn plan_fused_dispatch(
     assignment: &RoutingAssignment,
@@ -1541,10 +1379,8 @@ pub(crate) fn plan_fused_dispatch(
     CharonLaunchPlan { grid_x, block_x }
 }
 
-/// MoE autotune-aware launch planner.
-///
-/// Consults `tuner` for a measured `MoeKernelKey` launch parameter before falling
-/// back to `choose_block_dim`.
+/// MoE autotune-aware launch planner. Consults `tuner` for a
+/// measured `MoeKernelKey` launch parameter before falling back to `choose_block_dim`.
 #[allow(dead_code)]
 pub(crate) fn plan_fused_dispatch_with_autotuner(
     assignment: &RoutingAssignment,
@@ -1597,12 +1433,7 @@ impl SortedRouting {
 }
 
 /// Pure planner for the grouped (token-sorted) fused dispatch.
-///
-/// Grid x = number of expert-blocks in the sorted layout (one block per
-/// `block_size` slot). Block x is the wave-aligned dimension reused from the
-/// sortless planner — the grouped kernel strides `blockDim.x` threads across
-/// its token window, identical wave-alignment contract. Extracted so G-A2 can
-/// prove the blob without a GPU.
+/// Grid x = number of expert-blocks in the sorted layout (one block per `block_size` slot).
 #[allow(dead_code)]
 pub(crate) fn plan_grouped_dispatch(sorted: &SortedRouting, wave_size: u32) -> CharonLaunchPlan {
     let grid_x = sorted.num_blocks();
@@ -1617,9 +1448,8 @@ pub(crate) fn plan_grouped_dispatch(sorted: &SortedRouting, wave_size: u32) -> C
     }
 }
 
-/// Validate the host-side inputs to a grouped fused dispatch *before* any
-/// device pointer is dereferenced. Pure, allocation-free, unit-testable
-/// without a GPU (G-A2).
+/// Validate the host-side inputs to a grouped fused dispatch *before* any device pointer is dereferenced.
+/// Pure, allocation-free, unit-testable without a GPU (G-A2).
 #[allow(dead_code)]
 pub(crate) fn validate_grouped_inputs(
     activations: *mut c_void,
@@ -1663,15 +1493,8 @@ pub(crate) fn validate_grouped_inputs(
     Ok(())
 }
 
-/// Validate the host-side inputs to a fused dispatch *before* any device
-/// pointer is dereferenced. Pure, allocation-free, unit-testable without a
-/// GPU (G-A2). The real launcher (`RocmDevice::launch_charon_fused_dispatch`)
-/// calls this on its device pointers + routing assignment so that a bad shape
-/// or null pointer is reported as an `Err` rather than a HIP fault.
-///
-/// SAFETY contract (FFI discipline per `rust-ffi-grim`): the caller must
-/// pass the device pointers it intends to launch with; this function only
-/// checks nullness and shape consistency, it does not touch the memory.
+/// Validate the host-side inputs to a fused dispatch *before* any device pointer is dereferenced.
+/// Pure, allocation-free, unit-testable without a GPU (G-A2).
 #[allow(dead_code)]
 pub(crate) fn validate_launch_inputs(
     activations: *mut c_void,
@@ -1696,9 +1519,8 @@ pub(crate) fn validate_launch_inputs(
             )));
         }
     }
-    // Shape sanity: every routed expert index must be in range. The caller
-    // owns the expert-count invariant; here we only reject obviously-broken
-    // assignments (empty, or indices that would read past `inter*hidden`).
+    // Shape sanity: every routed expert index must be in range.
+    // The caller owns the expert-count invariant; here we only reject obviously-broken assignments (empty, or indices.
     if hidden == 0 || inter == 0 {
         return Err(Error::Backend(format!(
             "charon_fused_dispatch: degenerate shape (hidden={hidden}, inter={inter})"
@@ -1708,34 +1530,11 @@ pub(crate) fn validate_launch_inputs(
     Ok(())
 }
 
-// ===========================================================================
-// WI-B — Polymorphic population + GPU-resident variant selector
-// ===========================================================================
-//
-// Two pieces, both pure and unit-testable without a device (G-B1):
-//
-//  1. `WaveCostModel` — a 4-param linear model predicting per-dispatch cycle
-//     cost from `(active_warps, bytes_per_wave, flops_per_wave, stall_rate)`.
-//     The *form* is borrowed from RaMP (2604.26039); the four coefficients
-//     are ours to fit on RDNA against grim's own offline argmin over the
-//     variant table. **No RaMP constant is a target** — RaMP validated only
-//     NVIDIA Ada/Hopper.
-//
-//  2. `CharonSelector` — matches the live routing histogram to offline-tuned
-//     distribution buckets (DA-MoE 2607.23099) and emits a `variant_idx`
-//     with **zero CPU readback** (the histogram stays device-resident; the
-//     selector reads a small staging value the kernel wrote). Includes the
-//     DA-MoE de-sync guard (min-hold-count) so adjacent layers don't thrash
-//     variants.
-//
-// G-B2 (synthetic-distribution regret ≤5% vs local argmin) and G-B3 (zero
-// `hipMemcpy` D2H per dispatch) are verified in tests/moe_autotune_gpu.rs and
-// tests/moe_ffn_device_chaining_parity.rs.
+// WI-B - Polymorphic population + GPU-resident variant selector Two pieces, both pure and unit-testable without a device (G-B1): 1.
+// `WaveCostModel` - a 4-param linear model predicting per-dispatch cycle cost from `(active_warps, bytes_per_wave, flops_per_wave, stall_rate)`.
 
-/// A polymorphic kernel variant in the Charon population. The plan caps the
-/// v1 population at three (small-batch/decode, large-group prefill,
-/// high-skew) — collapsed from RaMP's ~130 configs to the ones that matter
-/// for RDNA Wave64.
+/// A polymorphic kernel variant in the Charon population.
+/// The plan caps the v1 population at three (small-batch/decode, large-group prefill, high-skew) - collapsed from.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CharonVariant {
@@ -1747,12 +1546,8 @@ pub enum CharonVariant {
     HighSkew,
 }
 
-/// WI-F3 — dispatch-target resolution for the grouped MoE forward: the JIT
-/// kernel entry a `CharonVariant` routes to. Only `LargeGroupPrefill` (the
-/// compute-bound, many-tokens-per-expert regime where tensor-core tiling
-/// pays) resolves to the WMMA grouped kernel (`grim_moe_fused_grouped_wmma`
-/// in `charon_wmma.rs`); decode and high-skew keep the scalar grouped kernel,
-/// which is the right primitive for their launch-overhead-dominated regimes.
+/// WI-F3 - dispatch-target resolution for the grouped MoE forward: the JIT kernel entry a `CharonVariant` routes to.
+/// Only `LargeGroupPrefill` (the compute-bound, many-tokens-per-expert regime where tensor-core tiling pays) resolves to the WMMA grouped.
 pub fn grouped_dispatch_entry(variant: CharonVariant) -> &'static str {
     match variant {
         CharonVariant::SmallBatchDecode | CharonVariant::HighSkew => "grim_moe_fused_grouped",
@@ -1779,19 +1574,7 @@ impl CharonVariant {
 }
 
 /// Four-parameter wave cost model (RaMP form, RDNA-fit coefficients).
-///
-/// Predicts relative per-dispatch cycle cost from:
-/// * `active_warps`   — number of in-flight wavefronts (occupancy proxy).
-/// * `bytes_per_wave` — GMEM bytes touched per wave (memory-bound proxy).
-/// * `flops_per_wave` — FP ops per wave (compute-bound proxy).
-/// * `stall_rate`     — fraction of cycles stalled on data dependencies.
-///
-/// `cost = c0*active_warps + c1*bytes_per_wave + c2*flops_per_wave + c3*stall_rate`
-///
-/// Coefficients are per-variant and default to a memory-leaning prior
-/// (`c1` dominant) — they MUST be re-fit on RDNA against grim's own offline
-/// argmin before G-B2 regret is claimed. The defaults are deliberately
-/// generic so the selector's monotonicity (G-B1) is provable without a fit.
+/// Predicts relative per-dispatch cycle cost from: * `active_warps`  - number of in-flight wavefronts (occupancy proxy).
 #[derive(Debug, Clone, Copy)]
 pub struct WaveCostModel {
     /// `c0` — occupancy weight.
@@ -1806,9 +1589,8 @@ pub struct WaveCostModel {
 
 impl Default for WaveCostModel {
     fn default() -> Self {
-        // Memory-leaning prior: GMEM traffic dominates on RDNA consumer
-        // parts (Infinity Cache helps but HBM bandwidth is the ceiling).
-        // These are priors, not fitted values — G-B2 re-fits on-device.
+        // Memory-leaning prior: GMEM traffic dominates on RDNA consumer parts (Infinity Cache helps but HBM bandwidth is the ceiling).
+        // These are priors, not fitted values - G-B2 re-fits on-device.
         Self {
             c_active_warps: 0.1,
             c_bytes_per_wave: 1.0,
@@ -1819,9 +1601,7 @@ impl Default for WaveCostModel {
 }
 
 impl WaveCostModel {
-    /// Predict relative cycle cost. Higher = slower. All inputs must be
-    /// non-negative finite; the model is linear so it is monotonic in each
-    /// parameter when the corresponding coefficient is positive (G-B1).
+    /// Predict relative cycle cost. Higher = slower.
     pub fn predict(
         &self,
         active_warps: f32,
@@ -1836,9 +1616,8 @@ impl WaveCostModel {
     }
 }
 
-/// One row of the selector's per-variant fitted cost model + the
-/// distribution bucket it was tuned for. Built offline (G-B2 device-gated);
-/// the selector reads it at runtime with no CPU readback.
+/// One row of the selector's per-variant fitted cost model + the distribution bucket it was tuned for.
+/// Built offline (G-B2 device-gated); the selector reads it at runtime with no CPU readback.
 #[derive(Debug, Clone, Copy)]
 pub struct VariantRow {
     pub variant: CharonVariant,
@@ -1887,9 +1666,7 @@ pub fn default_variant_table() -> Vec<VariantRow> {
 }
 
 /// Build `CharonSelector`'s `Vec<VariantRow>` from measured `Autotuner` configurations.
-///
-/// `moe_autotuning_design.md` §3: replaces static priors in `default_variant_table`
-/// with measured launch parameters from `Autotuner` per skew bucket.
+/// `moe_autotuning_design.md` §3: replaces static priors in `default_variant_table` with measured launch parameters from `Autotuner` per skew.
 #[allow(dead_code)]
 pub fn build_variant_table_from_autotuner(
     tuner: &crate::autotune::Autotuner,
@@ -1919,7 +1696,6 @@ pub fn build_variant_table_from_autotuner(
 }
 
 /// Select autotuned launch configuration for Charon kernel using t-pain model.
-///
 /// Falls back to default wave-aligned planning if no tuned entry is found in `Autotuner`.
 pub fn charon_autotune_launch_config(
     tuner: &crate::autotune::Autotuner,
@@ -1960,9 +1736,8 @@ pub fn charon_autotune_launch_config(
     })
 }
 
-/// Compute the routing skew of a histogram — the fraction of tokens going
-/// to the single hottest expert. `0.0` = perfectly uniform, `1.0` = all
-/// tokens to one expert. Used by the reactive matcher; pure, no device.
+/// Compute the routing skew of a histogram - the fraction of tokens going to the single hottest expert.
+/// `0.0` = perfectly uniform, `1.0` = all tokens to one expert.
 #[allow(dead_code)]
 pub fn routing_skew(per_expert_token_counts: &[u32]) -> f32 {
     let total: u32 = per_expert_token_counts.iter().sum();
@@ -1982,22 +1757,7 @@ pub fn routing_skew(per_expert_token_counts: &[u32]) -> f32 {
 }
 
 /// GPU-resident variant selector with a de-sync (min-hold) guard.
-///
-/// The selector emits the `variant_idx` for the next launch from the live
-/// routing skew, **without a CPU↔GPU round-trip**: the caller stages only
-/// the scalar `skew` (one f32 the kernel atomically wrote) into this
-/// selector. A min-hold count prevents thrashing variants between adjacent
-/// layers (DA-MoE caution, plan §5): a newly-preferred variant only takes
-/// over after it has been the argmin for `min_hold` *consecutive* calls.
-///
-/// The de-sync guard tracks the *specific challenger* that is accumulating
-/// wins — if a different variant wins between hold calls, the streak resets
-/// to 1 (the new challenger starts from scratch). This prevents an
-/// alternating-challenger pattern from earning a spurious switch: without
-/// per-challenger tracking, two different non-current variants taking turns
-/// as argmin would each increment the same counter, eventually crossing
-/// `min_hold` and switching to whichever variant happened to win last,
-/// despite neither sustaining `min_hold` consecutive wins.
+/// The selector emits the `variant_idx` for the next launch from the live routing skew, **without.
 #[allow(dead_code)]
 pub struct CharonSelector {
     table: Vec<VariantRow>,
@@ -2028,14 +1788,8 @@ impl CharonSelector {
         }
     }
 
-    /// The variant the next launch should use. Reads the staged `skew`
-    /// scalar (device-resident in production; a plain f32 here) and the
-    /// per-wave cost inputs the caller also staged.
-    ///
-    /// Returns the chosen variant **and** updates the de-sync counter. The
-    /// selector never blocks on the device — the caller is responsible for
-    /// staging `skew`/`active_warps`/etc. via a single small device→host
-    /// scalar copy (one f32 each), not a histogram readback (G-B3).
+    /// The variant the next launch should use. Reads the staged `skew` scalar (device-resident in
+    /// production; a plain f32 here) and the per-wave cost inputs the caller also staged.
     pub fn select(
         &mut self,
         skew: f32,
@@ -2044,12 +1798,8 @@ impl CharonSelector {
         flops_per_wave: f32,
         stall_rate: f32,
     ) -> CharonVariant {
-        // Find the variant whose bucket is closest to the live skew AND
-        // whose model predicts the lowest cost (reactive DA-MoE matching).
-        // Distance is the primary signal (form matching); cost breaks ties
-        // among near-equidistant buckets. The 1e-6 scale ensures distance
-        // always dominates — a 0.1 bucket gap (0.1) outweighs any realistic
-        // cost difference (which is ~1e3 unnormalized × 1e-6 = ~1e-3).
+        // Find the variant whose bucket is closest to the live skew AND whose model predicts the lowest cost (reactive DA-MoE matching).
+        // Distance is the primary signal (form matching); cost breaks ties among near-equidistant buckets.
         let mut best = self.current_variant;
         let mut best_score = f32::INFINITY;
         for row in &self.table {
@@ -2070,9 +1820,8 @@ impl CharonSelector {
             self.hold_counter = 0;
             self.challenger = None;
         } else {
-            // A challenger won. Only accumulate credit for the *same*
-            // challenger across consecutive calls — a different challenger
-            // resets the streak to 1 (the new challenger starts from scratch).
+            // A challenger won. Only accumulate credit for the *same* challenger across consecutive calls -
+            // a different challenger resets the streak to 1 (the new challenger starts from scratch).
             match self.challenger {
                 Some(c) if c == best => {
                     self.hold_counter += 1;
@@ -2099,17 +1848,14 @@ impl CharonSelector {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — host logic only (G-A2), no GPU required
-// ---------------------------------------------------------------------------
+// Tests - host logic only (G-A2), no GPU required
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The HIP source must be JIT-discoverable by the canonical entry name.
-    /// The repo convention is `grim_*`-prefixed entries; the plan also names
-    /// the short alias `charon_fused_dispatch`.
+    /// The repo convention is `grim_*`-prefixed entries; the plan also names the short alias `charon_fused_dispatch`.
     #[test]
     fn source_contains_fused_dispatch_entry() {
         assert!(
@@ -2134,11 +1880,8 @@ mod tests {
         );
     }
 
-    /// kernel-hygiene-plan item 1: the grouped IQK kernel must expose the
-    /// batched k-quant decode helper and route Q4_K/Q5_K/Q6_K (formats 7,8,9)
-    /// through it, while keeping the per-element `iqk_weight` path for the
-    /// other formats. The helper's inner loop must not call f16_to_f32 (the
-    /// per-sub-block unpack is hoisted out).
+    /// kernel-hygiene-plan item 1: the grouped IQK kernel must expose the batched k-quant decode helper and route Q4_K/Q5_K/Q6_K (formats 7,8,9) through it, while keeping the per-element `iqk_weight` path for the other formats.
+    /// The helper's inner loop must not call f16_to_f32 (the per-sub-block unpack is hoisted out).
     #[test]
     fn grouped_iqk_has_batched_kquant_decode() {
         assert!(
@@ -2172,9 +1915,8 @@ mod tests {
         );
     }
 
-    /// Wave mandate: block size must be a multiple of the device's wavefront
-    /// size. gfx1036 (this sandbox) is W32; CDNA MI-series is W64. The
-    /// planner must produce correct-per-wavefront blocks on both.
+    /// Wave mandate: block size must be a multiple of the device's wavefront size.
+    /// gfx1036 (this sandbox) is W32; CDNA MI-series is W64.
     #[test]
     fn block_dim_is_wave_aligned() {
         for &wave in &[32u32, 64] {
@@ -2195,10 +1937,8 @@ mod tests {
         }
     }
 
-    /// #1 (WI-A grouped): vLLM `moe_align_block_size` port buckets tokens by
-    /// expert and pads each expert run to `block_size`. Padding slots carry
-    /// the sentinel token index (max+1) and every real (token,expert,weight)
-    /// triple appears exactly once, sorted by expert.
+    /// #1 (WI-A grouped): vLLM `moe_align_block_size` port buckets tokens by expert and pads each expert run to `block_size`.
+    /// Padding slots carry the sentinel token index (max+1) and every real (token,expert,weight) triple appears exactly.
     #[test]
     fn moe_align_block_size_buckets_and_pads() {
         // 4 tokens, top-2 routing into 3 experts, uneven distribution.
@@ -2312,10 +2052,8 @@ mod tests {
         assert_eq!(plan.grid_x, 0, "no pairs → no blocks");
     }
 
-    /// G-A2: `from_route` flattens a per-token route into (token, expert,
-    /// weight) triples, grouped by token (token-major layout). The order is
-    /// a structural property of the struct — the kernel does not rely on it
-    /// for correctness; atomicAdd handles all cross-block accumulation.
+    /// G-A2: `from_route` flattens a per-token route into (token, expert, weight) triples, grouped by token (token-major layout).
+    /// The order is a structural property of the struct - the kernel does not rely.
     #[test]
     fn from_route_flattens_in_token_expert_order() {
         let indices = vec![vec![3, 1], vec![0, 2]];
@@ -2408,10 +2146,8 @@ mod tests {
         assert!(err.is_err(), "hidden=0 must be rejected");
     }
 
-    /// G-A2 parity with the CPU oracle shape: the routing assignment from a
-    /// synthetic SoftmaxTopK route matches the indices the CPU reference
-    /// (`grim_nn::moe::MoeRouter::route`) would produce. This is the host
-    /// shape the GPU kernel will consume in G-A4.
+    /// G-A2 parity with the CPU oracle shape: the routing assignment from a synthetic SoftmaxTopK route matches the indices the CPU reference (`grim_nn::moe::MoeRouter::route`) would produce.
+    /// This is the host shape the GPU kernel will consume in G-A4.
     #[test]
     fn assignment_shape_matches_cpu_route() {
         // Mirror the `softmax_topk_selects_expected_experts` test in
@@ -2427,9 +2163,8 @@ mod tests {
 
     // ── WI-B: cost model + selector host logic (G-B1) ──────────────────
 
-    /// G-B1: the cost model is monotonic in each parameter when its
-    /// coefficient is positive (the form RaMP borrows; coefficients are
-    /// ours). This is the log-parity precondition for G-B2 regret.
+    /// G-B1: the cost model is monotonic in each parameter when its coefficient is positive (the form RaMP borrows; coefficients are ours).
+    /// This is the log-parity precondition for G-B2 regret.
     #[test]
     fn wave_cost_model_is_monotonic_in_each_param() {
         let m = WaveCostModel::default();
@@ -2468,9 +2203,8 @@ mod tests {
         assert!(s > 0.0 && s < 1.0, "mild skew must be in (0,1), got {s}");
     }
 
-    /// G-B1: the selector picks the small-batch row for low skew + light
-    /// occupancy (decode shape) and the large-group row for high occupancy
-    /// (prefill shape), with no CPU readback of the histogram.
+    /// G-B1: the selector picks the small-batch row for low skew + light occupancy (decode shape)
+    /// and the large-group row for high occupancy (prefill shape), with no CPU readback of the histogram.
     #[test]
     fn selector_picks_decode_for_low_skew_prefill_for_high_occupancy() {
         let mut sel = CharonSelector::new(default_variant_table(), 1);
@@ -2482,9 +2216,8 @@ mod tests {
         assert_eq!(v1, CharonVariant::HighSkew);
     }
 
-    /// G-B1 / §5 de-sync guard: the selector does NOT thrash between
-    /// adjacent layers — a challenger must win `min_hold` consecutive calls
-    /// before taking over.
+    /// G-B1 / §5 de-sync guard: the selector does NOT thrash between adjacent
+    /// layers - a challenger must win `min_hold` consecutive calls before taking over.
     #[test]
     fn selector_min_hold_prevents_variant_thrashing() {
         let mut sel = CharonSelector::new(default_variant_table(), 3);
@@ -2509,10 +2242,8 @@ mod tests {
         );
     }
 
-    /// G-B1 / §5 de-sync guard (alternating-challenger case): when two
-    /// different non-current variants take turns as argmin, the per-challenger
-    /// streak resets each time — no spurious switch can fire until one
-    /// variant wins `min_hold` consecutive calls on its own.
+    /// G-B1 / §5 de-sync guard (alternating-challenger case): when two different non-current variants take turns as argmin, the per-challenger streak
+    /// resets each time - no spurious switch can fire until one variant wins `min_hold` consecutive calls on its own.
     #[test]
     fn selector_min_hold_alternating_challengers_does_not_switch() {
         let mut sel = CharonSelector::new(default_variant_table(), 3);
@@ -2520,9 +2251,8 @@ mod tests {
         let _ = sel.select(0.1, 1.0, 512.0, 1e5, 0.1);
         assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
 
-        // Alternating challengers: HighSkew (skew=0.95), LargeGroupPrefill
-        // (skew=0.5), HighSkew again.  Per-challenger streaks: HS=1, LGP=1,
-        // HS=1 — none reach min_hold=3, so no switch fires.
+        // Alternating challengers: HighSkew (skew=0.95), LargeGroupPrefill (skew=0.5), HighSkew again.
+        // Per-challenger streaks: HS=1, LGP=1, HS=1 - none reach min_hold=3, so no switch fires.
         let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5); // challenger: HighSkew
         assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
         let _ = sel.select(0.5, 4.0, 1024.0, 1e6, 0.3); // challenger: LargeGroupPrefill

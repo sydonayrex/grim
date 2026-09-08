@@ -1,7 +1,5 @@
 //! End-to-end numerical accuracy & perplexity regression guard.
-//!
-//! Evaluates and enforces layer-wise cosine fidelity, relative L2 error,
-//! and perplexity degradation bounds across all 18 supported quantization formats.
+//! Evaluates and enforces layer-wise cosine fidelity, relative L2 error, and perplexity degradation bounds across all.
 
 use grim_tensor::dtype::QuantFormat;
 use grim_tensor::error::{Error, Result};

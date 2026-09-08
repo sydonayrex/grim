@@ -7,17 +7,13 @@ use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendStorage, Shape};
 
-use crate::ffi::*;
 use crate::context::{QUEUE_LOCK, global_context};
 use crate::dtype_byte_size;
+use crate::ffi::*;
 
 // Vulkan crate structs
 
-/// A handle to a Vulkan compute operation.
-///
-/// INVARIANT: `run_compute_shader` calls `vkQueueWaitIdle` synchronously during dispatch.
-/// Therefore, operations associated with `VulkanHandle` are already completed when returned,
-/// making `synchronize()` a safe no-op and `is_ready()` always true.
+/// A handle to a Vulkan compute operation. INVARIANT: `run_compute_shader` calls `vkQueueWaitIdle` synchronously during dispatch.
 #[derive(Debug)]
 pub struct VulkanHandle;
 
@@ -76,11 +72,8 @@ impl VulkanStorage {
         )
     }
 
-    /// Allocates a buffer preferring `DEVICE_LOCAL` VRAM for compute outputs,
-    /// falling back to a host-visible type where no suitable device-local type
-    /// exists (e.g. some UMA/APU configs). `host_visible` on the result
-    /// records what was actually selected so readback can route through a
-    /// staging copy.
+    /// Allocates a buffer preferring `DEVICE_LOCAL` VRAM for compute outputs, falling back to a host-visible type where no suitable device-local type exists (e.g.
+    /// some UMA/APU configs).
     pub fn alloc_device_local_gpu(
         shape: &Shape,
         dtype: DType,
@@ -143,9 +136,8 @@ impl VulkanStorage {
             vkGetBufferMemoryRequirements(device, buffer, &mut reqs);
         }
 
-        // Select a memory type for the requested tier. HostVisible requires a
-        // mappable+coherent type; DeviceLocal prefers VRAM and falls back to a
-        // mappable type (UMA/APU) so allocation never hard-fails on those.
+        // Select a memory type for the requested tier.
+        // HostVisible requires a mappable+coherent type; DeviceLocal prefers VRAM and falls back to a mappable type.
         let (memory_type_index, host_visible) = {
             let mut mem_properties = VkPhysicalDeviceMemoryProperties {
                 memory_type_count: 0,
@@ -238,9 +230,8 @@ impl VulkanStorage {
         })
     }
 
-    /// Read the raw backing bytes, routing device-local buffers through a
-    /// staging copy. Prefer this over direct `vkMapMemory` for readback so
-    /// the caller works regardless of which memory tier was selected.
+    /// Read the raw backing bytes, routing device-local buffers through a staging copy.
+    /// Prefer this over direct `vkMapMemory` for readback so the caller works regardless of which memory.
     pub(crate) fn read_raw_bytes(&self) -> Result<Vec<u8>> {
         if self.host_visible {
             let mut mapped: *mut c_void = std::ptr::null_mut();
@@ -268,10 +259,8 @@ impl VulkanStorage {
             };
             Ok(bytes)
         } else {
-            // Device-local buffers are not host-mappable: route through a
-            // staging buffer copy on the compute queue. `read_back_via_staging`
-            // acquires the global context itself, so callers must not hold the
-            // context lock (BackendStorage trait methods never do).
+            // Device-local buffers are not host-mappable: route through a staging buffer copy on the compute queue.
+            // `read_back_via_staging` acquires the global context itself, so callers must not hold the context lock (BackendStorage.
             read_back_via_staging(self)
         }
     }
@@ -313,12 +302,8 @@ impl BackendStorage for VulkanStorage {
                 expected
             )));
         }
-        // Safe byte-to-f32 reinterpretation: no raw pointer cast. A Vec<u8>'s
-        // backing allocation is only 1-byte aligned by Rust guarantees, so
-        // casting `raw.as_ptr()` to `*const f32` and copying through it is UB
-        // (and the CodeQL "Access of invalid pointer" root cause). Chunked
-        // `from_ne_bytes` is alignment-agnostic and matches the GPU's native
-        // little-endian layout on every supported target.
+        // Safe byte-to-f32 reinterpretation: no raw pointer cast.
+        // A Vec<u8>'s backing allocation is only 1-byte aligned by Rust guarantees, so casting `raw.as_ptr()` to.
         Ok(raw
             .chunks_exact(4)
             .take(self.shape.elem_count())
@@ -326,10 +311,8 @@ impl BackendStorage for VulkanStorage {
             .collect())
     }
 
-    /// Dtype-aware u32 readback: U32 buffers are chunked straight from
-    /// bytes (native layout — no f32 reinterpretation garbage), I64
-    /// truncates through `i64`, everything else falls back to the f32
-    /// path + cast (F32-backed scratch tensors).
+    /// Dtype-aware u32 readback: U32 buffers are chunked straight from bytes (native layout - no f32 reinterpretation garbage),
+    /// I64 truncates through `i64`, everything else falls back to the f32 path + cast (F32-backed scratch tensors).
     fn to_cpu_vec_u32(&self) -> Result<Vec<u32>> {
         match self.dtype.arith {
             ArithType::U32 => {
@@ -343,7 +326,9 @@ impl BackendStorage for VulkanStorage {
                 let raw = self.read_raw_bytes()?;
                 Ok(raw
                     .chunks_exact(8)
-                    .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as u32)
+                    .map(|c| {
+                        i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as u32
+                    })
                     .collect())
             }
             _ => Ok(self
@@ -442,9 +427,8 @@ fn alloc_host_visible_staging_buffer(
     }
 }
 
-/// Synchronously copy `size` bytes from `src_buffer` (device) into
-/// `dst_buffer` (host-visible staging) using a one-shot command buffer on the
-/// compute queue. Compute queues support transfer operations.
+/// Synchronously copy `size` bytes from `src_buffer` (device) into `dst_buffer` (host-visible staging) using a one-shot command buffer on the compute queue.
+/// Compute queues support transfer operations.
 fn copy_device_buffer_to_host(
     device: *mut c_void,
     queue: *mut c_void,
@@ -556,9 +540,8 @@ fn copy_device_buffer_to_host(
     Ok(())
 }
 
-/// Read back a device-local `VulkanStorage` by copying into a host-visible
-/// staging buffer. Acquires the global context for the compute queue; callers
-/// must NOT hold the context lock when invoking readback.
+/// Read back a device-local `VulkanStorage` by copying into a host-visible staging buffer.
+/// Acquires the global context for the compute queue; callers must NOT hold the context lock.
 fn read_back_via_staging(storage: &VulkanStorage) -> Result<Vec<u8>> {
     let (device, queue, compute_family_index, physical_device) = {
         let guard = global_context();
@@ -632,4 +615,3 @@ fn read_back_via_staging(storage: &VulkanStorage) -> Result<Vec<u8>> {
     };
     Ok(bytes)
 }
-

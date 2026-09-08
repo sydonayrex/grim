@@ -1,8 +1,5 @@
 //! Compatibility loader and native implementation for `thinkingmachines/Inkling-Small`.
-//!
-//! # Architecture Details
-//! - **GQA Attention**: Grouped query self-attention with RoPE positional embeddings.
-//! - **SwiGLU FFN**: RMSNorm pre-layer normalization and SwiGLU feed-forward network.
+//! # Architecture Details - **GQA Attention**: Grouped query self-attention with RoPE positional embeddings.
 
 use std::sync::Arc;
 
@@ -11,15 +8,12 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Device helpers
-// ---------------------------------------------------------------------------
 
-/// Upload host f32 rows onto `device` (GPU-first). Used to hand results of
-/// documented kernel-gap host loops back to the device residency of their
-/// inputs instead of leaving the residual stream on CPU.
+/// Upload host f32 rows onto `device` (GPU-first).
+/// Used to hand results of documented kernel-gap host loops back to the device residency of.
 fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -> Result<Tensor> {
     let shape = Shape::new(vec![rows, cols]);
     let dev = grim_nn::modules::pick_device_for_storage_device(device);
@@ -33,9 +27,7 @@ fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Inkling-Small model architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,9 +92,7 @@ impl InklingSmallConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct InklingSmallBlock {
     pub wq: Linear,
@@ -175,12 +165,8 @@ impl InklingSmallBlock {
         })
     }
 
-    /// Forward pass. NOTE: the hand-rolled attention loop is BIDIRECTIONAL
-    /// (no causal mask, epsilon-weighted softmax), which the causal-only
-    /// device `qkv_attention` kernel cannot express — so the attention core,
-    /// RoPE and the KV history stay host-side (documented kernel gap, kept
-    /// byte-for-byte for semantics). Embedding, residual adds and the SwiGLU
-    /// MLP run device-first around it.
+    /// Forward pass. NOTE: the hand-rolled attention loop is BIDIRECTIONAL (no causal mask, epsilon-weighted softmax), which the causal-only device `qkv_attention` kernel
+    /// cannot express - so the attention core, RoPE and the KV history stay host-side (documented kernel gap, kept byte-for-byte for semantics).
     pub fn forward(
         &self,
         x: &Tensor,
@@ -292,9 +278,7 @@ impl InklingSmallBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct InklingSmall {
     pub cfg: InklingSmallConfig,

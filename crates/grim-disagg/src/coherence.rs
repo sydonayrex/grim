@@ -1,12 +1,9 @@
 //! Multi-node distributed cache coherence protocol.
-//!
-//! Synchronizes cache invalidation events across cluster nodes so that when
-//! a prefix or KV block is modified or evicted on one node, peer nodes drop
-//! their stale cached copies before subsequent accesses.
+//! Synchronizes cache invalidation events across cluster nodes so that when a prefix or KV block.
 
+use grim_core::error::{Error, Result};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use grim_core::error::{Error, Result};
 
 /// Compact binary invalidation message for cross-node broadcast.
 #[derive(Debug, Clone, PartialEq, Eq)]

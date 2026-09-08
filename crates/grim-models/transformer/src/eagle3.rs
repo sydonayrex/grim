@@ -1,9 +1,5 @@
 //! EAGLE-3 draft model architecture with multi-layer target feature fusion.
-//!
-//! Real EAGLE-3 fuses intermediate layer representations (typically 3 layers: low, mid, high)
-//! from the target base model via a linear projection `fc: 3 * D_target -> D_draft`,
-//! and decodes autoregressively using a lightweight decoder layer with concatenated
-//! token embedding + hidden state attention projection [E_t, H_{t-1}].
+//! Real EAGLE-3 fuses intermediate layer representations (typically 3 layers: low, mid, high) from the target.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -15,9 +11,7 @@ use grim_nn::{
 };
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Eagle3Config {
@@ -66,9 +60,7 @@ impl ModelConfig for Eagle3Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // EAGLE-3 Decoder Layer (concatenated [E_t, H_{t-1}] input attention)
-// ---------------------------------------------------------------------------
 
 pub struct Eagle3DecoderLayer {
     pub hidden_norm: RmsNorm,
@@ -326,9 +318,7 @@ impl Eagle3DecoderLayer {
     }
 }
 
-// ---------------------------------------------------------------------------
 // EAGLE-3 Model
-// ---------------------------------------------------------------------------
 
 pub struct Eagle3 {
     pub cfg: Eagle3Config,
@@ -446,9 +436,7 @@ impl Eagle3 {
     }
 
     /// Fuse multi-layer target feature activations into initial draft hidden state H_0.
-    ///
-    /// Concatenates `target_layer_hiddens` (e.g. 3 layers) along the feature channel and
-    /// projects through `self.fc: 3 * D_target -> D_draft`.
+    /// Concatenates `target_layer_hiddens` (e.g.
     pub fn fuse_target_layers(&self, target_layer_hiddens: &[&Tensor]) -> Result<Tensor> {
         if target_layer_hiddens.is_empty() {
             return Err(Error::Config(
@@ -473,7 +461,9 @@ impl Eagle3 {
                 } else {
                     target_layer_hiddens[target_layer_hiddens.len() - 1]
                 };
-                layer_tensor.to_vec_f32().map_err(grim_core::error::Error::from)
+                layer_tensor
+                    .to_vec_f32()
+                    .map_err(grim_core::error::Error::from)
             })
             .collect::<Result<_>>()?;
 
@@ -569,9 +559,7 @@ impl CausalLm for Eagle3 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 struct SimpleEagleRng {
     state: u64,

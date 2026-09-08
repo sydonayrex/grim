@@ -4,22 +4,8 @@ use grim_tensor::DType;
 use grim_tensor::error::{Error, Result};
 use std::ffi::{c_char, c_void};
 
-/// Opaque NCCL communicator handle.
-///
-/// # Safety
-///
-/// `NcclComm` wraps a raw NCCL communicator pointer that is valid process-wide
-/// once initialized via `ncclCommInitRank` or `ncclCommInitAll`. Moving the
-/// handle between threads (Send) is safe because NCCL communicators are
-/// process-global resources. The handle is also Sync because NCCL collectives
-/// (`ncclAllReduce`, etc.) are designed to be called from any thread that holds
-/// a valid communicator — the library internally synchronizes access.
-///
-/// Current enforcement: all live call paths into this type pass through
-/// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
-/// possible through the server's actual API today. Do NOT remove that lock or add
-/// a second concurrent access path without verifying that the underlying NCCL
-/// usage is thread-safe for the specific collective pattern being used.
+/// Opaque NCCL communicator handle. # Safety `NcclComm` wraps a raw NCCL
+/// communicator pointer that is valid process-wide once initialized via `ncclCommInitRank` or `ncclCommInitAll`.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
 pub struct NcclComm(pub *mut c_void);
@@ -38,10 +24,8 @@ pub const NCCL_SUCCESS: NcclResult = 0;
 pub type NcclDataType = i32;
 pub const NCCL_FLOAT16: NcclDataType = 6;
 pub const NCCL_FLOAT32: NcclDataType = 7;
-/// `ncclBfloat16` — supported by RCCL shipped with ROCm 5.x+. Mapping BF16
-/// buffers to `NCCL_FLOAT16` instead would reinterpret the bits and corrupt
-/// every collective, so BF16 gets its real type (older RCCL builds return an
-/// error status we surface instead of silently producing garbage).
+/// `ncclBfloat16` - supported by RCCL shipped with ROCm 5.x+.
+/// Mapping BF16 buffers to `NCCL_FLOAT16` instead would reinterpret the bits and corrupt every collective, so.
 pub const NCCL_BFLOAT16: NcclDataType = 9;
 
 pub type NcclRedOp = i32;
@@ -494,17 +478,7 @@ pub fn p2p_memcpy_async(
 }
 
 /// Tensor-parallel all-reduce hook for the serving path (P2-WI-2 / WI-R3).
-///
-/// This is the **single, canonical call site** for TP all-reduce so that:
-/// 1. The serving path has one place to enable/disable/profile the collective.
-/// 2. A future `CommComputeOverlapConfig` can intercept here for stream-overlap.
-///
-/// Delegates directly to `comm.all_reduce`; the thin wrapper exists to keep
-/// call sites unaware of the `RocmComm` API details, and to serve as the
-/// correct hook point for comm-compute overlap (P2-WI-2 Phase 2).
-///
-/// Returns `Err(Unsupported)` when the `rccl` feature is disabled so
-/// single-GPU builds compile cleanly without `#[cfg]` at every call site.
+/// This is the **single, canonical call site** for TP all-reduce so that: 1.
 #[allow(unused_variables)]
 pub fn tp_all_reduce(
     comm: &RocmComm,
@@ -515,9 +489,8 @@ pub fn tp_all_reduce(
 ) -> Result<()> {
     #[cfg(feature = "rccl")]
     {
-        // Safety: buf must be a valid GPU device buffer for `count` elements of
-        // the given dtype; stream must be a valid HIP stream. These invariants
-        // are upheld by the caller (the serving scheduler that owns the buffer).
+        // Safety: buf must be a valid GPU device buffer for `count` elements of the given dtype; stream must be a valid HIP stream.
+        // These invariants are upheld by the caller (the serving scheduler that owns the buffer).
         comm.all_reduce(buf as *const std::ffi::c_void, buf, count, dtype, stream)
     }
     #[cfg(not(feature = "rccl"))]
@@ -531,13 +504,7 @@ pub fn tp_all_reduce(
 }
 
 /// Multi-GPU data-parallel all-reduce for training gradients.
-///
 /// Wraps the RCCL `allReduce` collective across `num_gpus` devices.
-/// When `num_gpus <= 1`, this is a no-op (gradients are not modified).
-///
-/// The struct owns an `NcclComm` handle initialised via `ncclCommInitAll`
-/// so that `sum_gradients` can perform a real all-reduce before applying
-/// the `1/num_gpus` averaging scale.
 #[derive(Debug)]
 pub struct RcclAllReduce {
     /// Number of GPUs participating in the data-parallel group.
@@ -550,12 +517,7 @@ pub struct RcclAllReduce {
 
 impl RcclAllReduce {
     /// Create a communicator over the explicitly selected device ordinals.
-    ///
-    /// The old constructor inferred ordinals as `0..num_gpus`, which is not a
-    /// valid contract once rank selection can be non-contiguous. Multi-GPU
-    /// callers must now provide the same ordinals used to construct replicas;
-    /// initialization failure is returned instead of becoming a silent
-    /// local-only training run.
+    /// The old constructor inferred ordinals as `0..num_gpus`, which is not a valid contract once rank.
     pub fn try_new(device_ordinals: &[usize]) -> Result<Self> {
         let num_gpus = device_ordinals.len() as u32;
         if num_gpus <= 1 {
@@ -596,15 +558,7 @@ impl RcclAllReduce {
     }
 
     /// Sum gradients across all GPUs using RCCL all-reduce on device memory.
-    ///
-    /// When `num_gpus <= 1`, this is a no-op. When multi-GPU with a valid
-    /// communicator, `ncclAllReduce` performs an in-place sum across all
-    /// devices directly in GPU memory, then each gradient element is divided
-    /// by `num_gpus` to produce the averaged gradient.
-    ///
-    /// `send_dev_ptr` / `recv_dev_ptr` are raw HIP device pointers (`u64`)
-    /// to `count` contiguous `f32` elements. Both may alias (in-place reduce).
-    /// `stream` is a HIP stream handle (`u64`); pass `0` for the default stream.
+    /// When `num_gpus <= 1`, this is a no-op.
     pub fn sum_gradients_device(
         &self,
         send_dev_ptr: u64,
@@ -628,10 +582,8 @@ impl RcclAllReduce {
                     "RCCL communicator is unavailable for a multi-GPU reduction".into(),
                 ));
             }
-            // SAFETY: send/recv must be valid device pointers for `count`
-            // f32 elements; comm must be a valid NCCL communicator; stream
-            // must be a valid HIP stream (0 = default). These invariants
-            // are upheld by the caller (the training gradient sync path).
+            // SAFETY: send/recv must be valid device pointers for `count` f32 elements; comm must be a valid NCCL communicator; stream must be a valid HIP stream (0 = default).
+            // These invariants are upheld by the caller (the training gradient sync path).
             let status = unsafe {
                 ncclAllReduce(
                     send_dev_ptr as *const c_void,
@@ -662,8 +614,7 @@ impl RcclAllReduce {
         }
     }
 
-    /// All-reduce device buffers of an explicit NCCL dtype on `rank`'s
-    /// communicator (used by the TP activation path for F16/BF16 tensors).
+    /// All-reduce device buffers of an explicit NCCL dtype on `rank`'s communicator (used by the TP activation path for F16/BF16 tensors).
     /// See `sum_gradients_device` for the F32 gradient special case.
     pub fn all_reduce_device(
         &self,
@@ -689,9 +640,8 @@ impl RcclAllReduce {
                     "RCCL communicator is unavailable for a multi-GPU reduction".into(),
                 ));
             }
-            // SAFETY: send/recv must be valid device pointers for `count`
-            // elements of `nccl_dtype`; comm and stream are owned by the
-            // caller's device/rank pairing.
+            // SAFETY: send/recv must be valid device pointers for `count` elements of
+            // `nccl_dtype`; comm and stream are owned by the caller's device/rank pairing.
             let status = unsafe {
                 ncclAllReduce(
                     send_dev_ptr as *const c_void,
@@ -767,9 +717,17 @@ impl RcclAllReduce {
         }
         #[cfg(not(feature = "rccl"))]
         {
-            let _ = (send_dev_ptr, recv_dev_ptr, send_count, nccl_dtype, stream, rank);
+            let _ = (
+                send_dev_ptr,
+                recv_dev_ptr,
+                send_count,
+                nccl_dtype,
+                stream,
+                rank,
+            );
             Err(Error::Backend(
-                "RcclAllReduce::all_gather_device: multi-GPU RCCL requires `rccl` feature flag".into(),
+                "RcclAllReduce::all_gather_device: multi-GPU RCCL requires `rccl` feature flag"
+                    .into(),
             ))
         }
     }
@@ -820,18 +778,23 @@ impl RcclAllReduce {
         }
         #[cfg(not(feature = "rccl"))]
         {
-            let _ = (send_dev_ptr, recv_dev_ptr, recv_count, nccl_dtype, stream, rank);
+            let _ = (
+                send_dev_ptr,
+                recv_dev_ptr,
+                recv_count,
+                nccl_dtype,
+                stream,
+                rank,
+            );
             Err(Error::Backend(
-                "RcclAllReduce::reduce_scatter_device: multi-GPU RCCL requires `rccl` feature flag".into(),
+                "RcclAllReduce::reduce_scatter_device: multi-GPU RCCL requires `rccl` feature flag"
+                    .into(),
             ))
         }
     }
 
     /// Average already-reduced gradients in-place by `1/num_gpus`.
-    ///
-    /// This operates on host memory and is useful when the caller has
-    /// already performed the cross-GPU reduction via another path (e.g.
-    /// `sum_gradients_device`) and just needs to scale the result.
+    /// This operates on host memory and is useful when the caller has already performed the.
     pub fn scale_gradients(&self, grads: &mut [f32]) -> Result<()> {
         if self.num_gpus <= 1 || grads.is_empty() {
             return Ok(());

@@ -1,8 +1,5 @@
-//! Qwen3-MoE transformer — routes every layer through a shared `MoeBlock`.
-//!
+//! Qwen3-MoE transformer - routes every layer through a shared `MoeBlock`.
 //! Qwen3-MoE uses a softmax router (no correction bias) and no shared expert.
-//! Attention towers are plain Llama-style; the MoE routing replaces the dense
-//! FFN per layer.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -14,9 +11,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::model::{Llama, LlamaConfig};
 use crate::moe_block::MoESpec;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Qwen3MoeConfig {
@@ -48,9 +43,7 @@ impl ModelConfig for Qwen3MoeConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Qwen3Moe {
     pub cfg: Qwen3MoeConfig,

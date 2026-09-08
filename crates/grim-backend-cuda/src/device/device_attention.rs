@@ -10,17 +10,15 @@ use grim_tensor::{AttentionOps, BackendStorage, Shape};
 
 use crate::device::cuda_device::CudaDevice;
 use crate::device::handles::{
-    cuLaunchKernel, cuModuleGetFunction, cudaDeviceSynchronize, cudaFree, cudaMalloc, cudaMemcpy,
-    cudaMemcpyHostToDevice, cudaSuccess, CUfunction, CudaHandle,
+    CUfunction, CudaHandle, cuLaunchKernel, cuModuleGetFunction, cudaDeviceSynchronize, cudaFree,
+    cudaMalloc, cudaMemcpy, cudaMemcpyHostToDevice, cudaSuccess,
 };
 use crate::device::jit_cache::compile_and_load_kernel;
 use crate::memory::storage::CudaStorage;
 
 impl CudaDevice {
     /// Fused QKV attention (Phase-1, mirrors `RocmDevice::qkv_attention`).
-    ///
     /// Parameters (q: [S, H, D], k/v: [kv_S, kv_H, D], f32).
-    /// Uses grim_qkv_attention kernel (online softmax, per-wave partials merged by wave-0).
     #[allow(clippy::too_many_arguments)]
     pub fn qkv_attention(
         &self,
@@ -249,15 +247,21 @@ impl AttentionOps for CudaDevice {
         let bt_s = block_tables
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("qkv_attention_paged: block_tables is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_paged: block_tables is not CudaStorage".into())
+            })?;
         let k_s = k_pages
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("qkv_attention_paged: k_pages is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_paged: k_pages is not CudaStorage".into())
+            })?;
         let v_s = v_pages
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("qkv_attention_paged: v_pages is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_paged: v_pages is not CudaStorage".into())
+            })?;
 
         if q_s.device_ptr.is_none()
             || bt_s.device_ptr.is_none()
@@ -352,7 +356,10 @@ impl AttentionOps for CudaDevice {
             }
         }
 
-        Ok((Box::new(out_storage), Box::new(CudaHandle::ready(self.ordinal))))
+        Ok((
+            Box::new(out_storage),
+            Box::new(CudaHandle::ready(self.ordinal)),
+        ))
     }
 
     fn rope(
@@ -727,7 +734,10 @@ impl AttentionOps for CudaDevice {
             }
         }
 
-        Ok((Box::new(out_storage), Box::new(CudaHandle::ready(self.ordinal))))
+        Ok((
+            Box::new(out_storage),
+            Box::new(CudaHandle::ready(self.ordinal)),
+        ))
     }
 
     fn qkv_attention_alibi(
@@ -757,7 +767,9 @@ impl AttentionOps for CudaDevice {
         let slopes_s = alibi_slopes
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("qkv_attention_alibi: alibi_slopes is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_alibi: alibi_slopes is not CudaStorage".into())
+            })?;
 
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 {
@@ -845,7 +857,10 @@ impl AttentionOps for CudaDevice {
             }
         }
 
-        Ok((Box::new(out_storage), Box::new(CudaHandle::ready(self.ordinal))))
+        Ok((
+            Box::new(out_storage),
+            Box::new(CudaHandle::ready(self.ordinal)),
+        ))
     }
 
     fn kv_dequant_attention(
@@ -868,25 +883,35 @@ impl AttentionOps for CudaDevice {
         let k_s = k_tensor
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kv_dequant_attention: k_tensor is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention: k_tensor is not CudaStorage".into())
+            })?;
         let ks_s = k_scales
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kv_dequant_attention: k_scales is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention: k_scales is not CudaStorage".into())
+            })?;
         let v_s = v_tensor
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kv_dequant_attention: v_tensor is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention: v_tensor is not CudaStorage".into())
+            })?;
         let vs_s = v_scales
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("kv_dequant_attention: v_scales is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention: v_scales is not CudaStorage".into())
+            })?;
 
         let out_dims = out_shape.dims();
         let (seq_len, num_heads, head_dim) = if out_dims.len() == 3 {
             (out_dims[0], out_dims[1], out_dims[2])
         } else {
-            return Err(Error::Shape("kv_dequant_attention: out_shape must be 3-D".into()));
+            return Err(Error::Shape(
+                "kv_dequant_attention: out_shape must be 3-D".into(),
+            ));
         };
 
         let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
@@ -959,7 +984,10 @@ impl AttentionOps for CudaDevice {
             }
         }
 
-        Ok((Box::new(out_storage), Box::new(CudaHandle::ready(self.ordinal))))
+        Ok((
+            Box::new(out_storage),
+            Box::new(CudaHandle::ready(self.ordinal)),
+        ))
     }
 
     fn mla_absorbed_decode(
@@ -980,15 +1008,21 @@ impl AttentionOps for CudaDevice {
         let q_abs = q_absorbed
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_absorbed is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: q_absorbed is not CudaStorage".into())
+            })?;
         let q_r = q_rope
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_rope is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: q_rope is not CudaStorage".into())
+            })?;
         let kv = kv_cache
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_decode: kv_cache is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: kv_cache is not CudaStorage".into())
+            })?;
         let o = out
             .as_any()
             .downcast_ref::<CudaStorage>()
@@ -1001,10 +1035,9 @@ impl AttentionOps for CudaDevice {
 
         let (mut wuv_ptr, has_w_uv_val) = match w_uv {
             Some(w) => {
-                let ws = w
-                    .as_any()
-                    .downcast_ref::<CudaStorage>()
-                    .ok_or_else(|| Error::Backend("mla_absorbed_decode: w_uv is not CudaStorage".into()))?;
+                let ws = w.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+                    Error::Backend("mla_absorbed_decode: w_uv is not CudaStorage".into())
+                })?;
                 (Self::dev_ptr_or_err("mla_absorbed_decode w_uv", ws)?, 1i32)
             }
             None => (std::ptr::null_mut(), 0i32),
@@ -1092,24 +1125,36 @@ impl AttentionOps for CudaDevice {
         let q_s = q_raw
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_q_kv_norm_split: q_raw is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_q_kv_norm_split: q_raw is not CudaStorage".into())
+            })?;
         let kv_s = kv_raw
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_q_kv_norm_split: kv_raw is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_q_kv_norm_split: kv_raw is not CudaStorage".into())
+            })?;
         let qw_s = q_norm_w
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_q_kv_norm_split: q_norm_w is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_q_kv_norm_split: q_norm_w is not CudaStorage".into())
+            })?;
         let kvw_s = kv_norm_w
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("mla_q_kv_norm_split: kv_norm_w is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_q_kv_norm_split: kv_norm_w is not CudaStorage".into())
+            })?;
 
-        let q_nope_st = CudaStorage::alloc_gpu(&Shape::new(vec![qk_nope_dim]), DType::F32, self.ordinal)?;
-        let q_rope_st = CudaStorage::alloc_gpu(&Shape::new(vec![qk_rope_dim]), DType::F32, self.ordinal)?;
-        let kv_nope_st = CudaStorage::alloc_gpu(&Shape::new(vec![qk_nope_dim]), DType::F32, self.ordinal)?;
-        let kv_rope_st = CudaStorage::alloc_gpu(&Shape::new(vec![qk_rope_dim]), DType::F32, self.ordinal)?;
+        let q_nope_st =
+            CudaStorage::alloc_gpu(&Shape::new(vec![qk_nope_dim]), DType::F32, self.ordinal)?;
+        let q_rope_st =
+            CudaStorage::alloc_gpu(&Shape::new(vec![qk_rope_dim]), DType::F32, self.ordinal)?;
+        let kv_nope_st =
+            CudaStorage::alloc_gpu(&Shape::new(vec![qk_nope_dim]), DType::F32, self.ordinal)?;
+        let kv_rope_st =
+            CudaStorage::alloc_gpu(&Shape::new(vec![qk_rope_dim]), DType::F32, self.ordinal)?;
 
         let mut q_ptr = Self::dev_ptr_or_err("mla_q_kv_norm_split q_raw", q_s)?;
         let mut kv_ptr = Self::dev_ptr_or_err("mla_q_kv_norm_split kv_raw", kv_s)?;

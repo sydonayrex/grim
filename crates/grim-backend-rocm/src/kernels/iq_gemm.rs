@@ -216,11 +216,8 @@ extern "C" {
         return d * sub_sc * (float)q_code - dmin * sub_m;
     }
 
-    // ===================== Q3_K standalone =====================
-    // Mirrors the corrected `dequant_q3k_element` in q3k_gemm.rs and the
-    // authoritative CPU reference `grim_quant::dequant_q3k`. block_q3_K is
-    // 110 bytes / 256 weights with NO `dmin` and NO `m` array; the value is
-    // x = d * sc_i * q with the high bit of each 4-bit q taken from hmask.
+    // ===================== Q3_K standalone ===================== Mirrors the corrected `dequant_q3k_element` in q3k_gemm.rs and the authoritative CPU reference `grim_quant::dequant_q3k`.
+    // block_q3_K is 110 bytes / 256 weights with NO `dmin` and NO `m` array; the.
     __device__ inline float dequant_q3k_standalone(const unsigned char* block_ptr, int in_sb) {
         const unsigned char* hmask  = block_ptr + 0;
         const unsigned char* qs     = block_ptr + 32;
@@ -259,9 +256,7 @@ extern "C" {
         return d * (float)qs[in_sb];
     }
 
-    // ============================================
-    //  Fused GEMM kernels — one per quant format
-    // ============================================
+    // Fused GEMM kernels - one per quant format
 
     // --- IQ2_XXS ---
     __global__ void grim_fused_dequant_gemm_iq2xxs(
@@ -601,14 +596,8 @@ extern "C" {
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
 
-        // P4: hoist every loop-invariant decode index out of the per-MAC N
-        // loop. dX[row][k] = sum_n dY[row][n] * B[n][k] walks one packed
-        // superblock per output row n (B varies with n), so the work that CAN
-        // be hoisted per thread is the superblock/sub-block/nibble index math
-        // — the old kernel recomputed `k/256`, `k%256`, `in_sb/2`, `%2`,
-        // `(group*6)/8`, `%8` inside the N loop via a full `dequant_iq4xs`
-        // call per MAC. The decode below is byte-for-byte the same as
-        // `dequant_iq4xs`, with those indices precomputed once.
+        // P4: hoist every loop-invariant decode index out of the per-MAC N loop.
+        // dX[row][k] = sum_n dY[row][n] * B[n][k] walks one packed superblock per output row n (B.
         const int superblock_idx = k_idx >> 8;      // k_idx / 256
         const int k_in_superblock = k_idx & 255;    // k_idx % 256
         const int group = k_in_superblock >> 5;     // 32-weight sub-block

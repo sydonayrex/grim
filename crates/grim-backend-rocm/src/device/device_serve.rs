@@ -5,26 +5,20 @@ use std::ffi::c_void;
 use grim_tensor::backend::{ReadyHandle, ScythePlacement};
 use grim_tensor::dtype::{ArithType, DType};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendStorage, CollectiveOps, CoreTensorOps, GraphCaptureOps, MemoryOps, Shape};
+use grim_tensor::{
+    BackendStorage, CollectiveOps, CoreTensorOps, GraphCaptureOps, MemoryOps, Shape,
+};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, as_rocm, check_hip, detect_gpu_arch, dev_ptr, dtype_f32, hipMemcpyAsync, HipDim3,
-    HipMemcpyKind, RocmHandle,
+    HipDim3, HipMemcpyKind, RocmHandle, arg, as_rocm, check_hip, detect_gpu_arch, dev_ptr,
+    dtype_f32, hipMemcpyAsync,
 };
 
 impl CollectiveOps for RocmDevice {
-
-
-    /// SCYTHE-2 WI-5: BackendDevice::all_reduce for RocmDevice. [see: `RowParallelLinear::forward`, `BackendDevice::all_reduce`]
-    ///
-    /// Performs the sum collective entirely on the ROCm device:
-    /// - Cross-GPU: when an RCCL handle is attached and `num_gpus > 1`, uses
-    ///   `RcclAllReduce::sum_gradients_device` for a device-side `ncclAllReduce`.
-    /// - Intra-process: sums multiple partial shards on-device via the
-    ///   `grim_all_reduce_accum` kernel (F32), avoiding the D2H/H2D round-trip.
-    /// - Fallback: CPU fan-in for non-F32 dtypes or mismatched shard shapes.
+    /// SCYTHE-2 WI-5: BackendDevice::all_reduce for RocmDevice.
+    /// [see: `RowParallelLinear::forward`, `BackendDevice::all_reduce`] Performs the sum collective entirely on the ROCm device: - Cross-GPU: when.
     fn all_reduce(
         &self,
         inputs: &[&dyn grim_tensor::BackendStorage],
@@ -52,9 +46,8 @@ impl CollectiveOps for RocmDevice {
         let stream_u64 = stream as u64;
         let rccl = self.rccl.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let is_f32 = dtype.arith == ArithType::F32;
-        // TP activations arrive as F16/BF16 single tensors per rank; routing
-        // them through RCCL (instead of the old host round-trip) needs the
-        // matching NCCL dtype.
+        // TP activations arrive as F16/BF16 single tensors per rank; routing them through
+        // RCCL (instead of the old host round-trip) needs the matching NCCL dtype.
         let rccl_dtype = match dtype.arith {
             ArithType::F32 => Some(crate::rccl::NCCL_FLOAT32),
             ArithType::F16 => Some(crate::rccl::NCCL_FLOAT16),
@@ -62,9 +55,8 @@ impl CollectiveOps for RocmDevice {
             _ => None,
         };
 
-        // ── Cross-GPU all-reduce via RCCL (device-side) ───────────────────
-        // When an RCCL handle is attached and we have multiple GPUs, perform
-        // the collective directly on device memory via ncclAllReduce.
+        // ── Cross-GPU all-reduce via RCCL (device-side) ─────────────────── When an RCCL handle is attached
+        // and we have multiple GPUs, perform the collective directly on device memory via ncclAllReduce.
         if let Some(rccl_handle) = &rccl {
             if rccl_handle.num_gpus > 1 && is_f32 {
                 let out_storage =
@@ -102,9 +94,8 @@ impl CollectiveOps for RocmDevice {
                 ));
             }
 
-            // F16/BF16 single-shard TP activations: all-reduce in the native
-            // dtype — previously this fell through to a full D2H→CPU-sum→H2D
-            // round trip per RowParallel layer per token.
+            // F16/BF16 single-shard TP activations: all-reduce in the native dtype - previously this
+            // fell through to a full D2H→CPU-sum→H2D round trip per RowParallel layer per token.
             if rccl_handle.num_gpus > 1 && !is_f32 && inputs.len() == 1 {
                 if let Some(nccl_dt) = rccl_dtype {
                     let out_storage = RocmStorage::alloc_gpu(
@@ -170,9 +161,8 @@ impl CollectiveOps for RocmDevice {
             }
         }
 
-        // ── CPU fallback ───────────────────────────────────────────────────
-        // Used for non-F32 dtypes or mismatched shard shapes where the device
-        // accum kernel cannot apply.
+        // ── CPU fallback ─────────────────────────────────────────────────── Used for non-F32 dtypes or
+        // mismatched shard shapes where the device accum kernel cannot apply.
         let mut acc = inputs[0].to_cpu_vec_f32()?;
         for other in &inputs[1..] {
             let v = other.to_cpu_vec_f32()?;
@@ -190,7 +180,6 @@ impl CollectiveOps for RocmDevice {
         let storage = self.from_cpu(&acc, &shape, dtype)?;
         Ok((storage, Box::new(ReadyHandle)))
     }
-
 
     /// SCYTHE-2 WI-1/WI-6: WaveTune bilinear latency predictor for RocmDevice. [see: `(M, N, K)`, `2604.10187`]
     fn estimate_gemm_latency_ms(
@@ -227,15 +216,8 @@ impl CollectiveOps for RocmDevice {
         flops / peak * 1e3 // ms
     }
 
-
-    /// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in override. [see: `crate::comm_fuse::comm_fuse_fan_in`, `to_cpu_vec_f32`]
-    ///
-    /// Assembles column-shard partials entirely on the ROCm device:
-    /// - Device-side: places each partial at its column offset via row-by-row
-    ///   `hipMemcpy` D2D, avoiding the D2H/H2D round-trip. When an RCCL handle
-    ///   is attached and `num_gpus > 1`, a cross-GPU `ncclAllReduce` is issued
-    ///   after assembly.
-    /// - Fallback: CPU fan-in for non-F32 dtypes.
+    /// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in override.
+    /// [see: `crate::comm_fuse::comm_fuse_fan_in`, `to_cpu_vec_f32`] Assembles column-shard partials entirely on the ROCm device: - Device-side: places each.
     fn comm_fuse_reduce(
         &self,
         partials: &[(&dyn BackendStorage, &ScythePlacement)],
@@ -259,10 +241,8 @@ impl CollectiveOps for RocmDevice {
 
         // ── Device-side assembly + optional RCCL all-reduce ────────────────
         if is_f32 {
-            // WI-M1 context discipline: the synchronous D2D memcpys below
-            // execute in the calling thread's current device context; pin
-            // THIS device or a drifted thread assembles the fan-in buffer
-            // against foreign mappings.
+            // WI-M1 context discipline: the synchronous D2D memcpys below execute in the calling thread's current device
+            // context; pin THIS device or a drifted thread assembles the fan-in buffer against foreign mappings.
             let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             let out_shape = Shape::from_slice(&[m, n_total]);
             let out_storage =
@@ -333,11 +313,7 @@ impl CollectiveOps for RocmDevice {
     }
 }
 
-
-
 impl MemoryOps for RocmDevice {
-
-
     fn from_cpu_bytes(
         &self,
         data: &[u8],
@@ -348,12 +324,10 @@ impl MemoryOps for RocmDevice {
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
 
-
     fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         RocmStorage::alloc_gpu(shape, dtype, &self.allocator, self.ordinal)
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
-
 
     fn copy_slice_into(
         &self,
@@ -425,16 +399,9 @@ impl MemoryOps for RocmDevice {
     }
 }
 
-
-
-impl GraphCaptureOps for RocmDevice {
-}
-
-
-
+impl GraphCaptureOps for RocmDevice {}
 
 impl RocmDevice {
-
     /// Launch GPU Speculative Rejection Sampling kernel.
     pub fn launch_speculative_rejection_sample(
         &self,

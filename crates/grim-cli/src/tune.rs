@@ -1,15 +1,11 @@
 //! Hardware JIT kernel tuning and autotune persistence command.
-//!
-//! Evaluates empirical FCP tile selection and JIT compilation across canonical GEMM workload shapes
-//! on the host ROCm GPU to pre-populate `{gpu_arch}.json` autotuner maps and compiled `.hsaco` files.
+//! Evaluates empirical FCP tile selection and JIT compilation across canonical GEMM workload shapes on the.
 
 use grim_tensor::error::Result;
 use std::path::PathBuf;
 
 /// Run hardware-tuned JIT compilation and empirical FCP tile search for canonical shapes.
-///
-/// Sweeps inference GEMM shapes on the selected ROCm device and saves the resulting
-/// autotune configs and `.hsaco` binaries to `output_dir`.
+/// Sweeps inference GEMM shapes on the selected ROCm device and saves the resulting autotune configs.
 pub fn cmd_tune(device_ordinal: usize, output_dir: Option<String>) -> Result<()> {
     println!("=== Grim Hardware-Adaptive Kernel Tuner ===");
     println!("Targeting GPU device ordinal: {}", device_ordinal);

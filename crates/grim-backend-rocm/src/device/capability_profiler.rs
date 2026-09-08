@@ -14,11 +14,8 @@ use libloading::Symbol;
 
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────
 
-/// HIP device attribute: active clock throttle reasons. **No such attribute
-/// exists in ROCm 7.x** — the old constant here (74) actually selected
-/// `MaxSharedMemoryPerBlock`, whose ~64 KB reading clamped to "100%
-/// throttled" and zeroed every GPU's effective TFLOPS. Kept only to document
-/// the removal; `query_throttle_pct` now reports honest absence.
+/// HIP device attribute: active clock throttle reasons.
+/// **No such attribute exists in ROCm 7.x** - the old constant here (74) actually selected.
 #[allow(dead_code)]
 const HIP_DEVICE_ATTR_THROTTLE_REMOVED: i32 = 74;
 
@@ -151,13 +148,8 @@ impl CapabilityProfiler {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Measure one GPU's capability snapshot.
-///
-/// WI-SB0: the snapshot prefers *measured* numbers — one small FP16 GEMM plus
-/// a device-to-device copy sweep per device, run once per process and cached
-/// by `(gcn_arch, clock_mhz)` in [`calibrate_capability`]. The static
-/// architecture table is the fallback for GPU-less/ROCm-absent builds and any
-/// calibration error; a failed measurement never fabricates zeros here.
+/// Measure one GPU's capability snapshot. WI-SB0: the snapshot prefers *measured* numbers - one small FP16 GEMM plus
+/// a device-to-device copy sweep per device, run once per process and cached by `(gcn_arch, clock_mhz)` in [`calibrate_capability`].
 pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
     // Base probe from the existing infrastructure.
     let host_cap = match probe_host_gpu(ordinal) {
@@ -172,9 +164,8 @@ pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
         }
     };
 
-    // Prefer a measured result when the optional calibration backend is
-    // available; the static row is deliberately retained for GPU-less/ROCm
-    // installations and calibration failures.
+    // Prefer a measured result when the optional calibration backend is available;
+    // the static row is deliberately retained for GPU-less/ROCm installations and calibration failures.
     let (tflops_fp16, tflops_fp8, hbm_gbps) = calibrate_capability(ordinal, &host_cap.gcn)
         .unwrap_or_else(|| arch_tflops_table(&host_cap.gcn));
 
@@ -198,18 +189,7 @@ pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
 }
 
 /// Run the one-shot device calibration (WI-SB0).
-///
-/// Measures effective FP16 TFLOPS with a small rocBLAS GEMM (f16 inputs, f32
-/// accumulation — the shape class inference actually runs) and effective HBM
-/// bandwidth with a device-to-device copy sweep. ~ms per device, once per
-/// process per `(gcnArchName, 500 MHz clock bucket)`: identical silicon at a
-/// similar clock hits the cache instead of re-benchmarking on every profiler
-/// tick.
-///
-/// FP8 has no rocBLAS-exercisable path on consumer RDNA parts, so its entry
-/// is *derived*: measured-FP16 scaled by the static row's fp8/fp16 ratio.
-/// Any HIP/rocBLAS error returns `None` so the caller falls back to the
-/// architecture row rather than trusting a partial measurement.
+/// Measures effective FP16 TFLOPS with a small rocBLAS GEMM (f16 inputs, f32 accumulation - the.
 fn calibrate_capability(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
     // Kill switch for the root-cause hunt (2026-08-23e): does disabling the
     // micro-benchmark change second-device GEMM behavior?
@@ -217,10 +197,8 @@ fn calibrate_capability(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
         return None;
     }
     static CACHE: OnceLock<Mutex<HashMap<(String, u32), (f32, f32, f32)>>> = OnceLock::new();
-    // Clock is bucketed to 500 MHz: DVFS jitters tens of MHz between calls,
-    // and an exact-clock key would re-run the micro-benchmark on every
-    // profiler tick. Big downclocks (thermal) still cross buckets, which is
-    // exactly when re-measuring matters.
+    // Clock is bucketed to 500 MHz: DVFS jitters tens of MHz between calls, and an exact-clock key would re-run the micro-benchmark on every profiler tick.
+    // Big downclocks (thermal) still cross buckets, which is exactly when re-measuring matters.
     let clock_bucket = query_clock_mhz(ordinal)? / 500;
     let key = (gcn.to_string(), clock_bucket);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -331,8 +309,7 @@ fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32
     }
 
     // Row-major C[M,N] = A[M,K]·B[K,N] maps to column-major as Cᵀ[N,M] =
-    // Bᵀ[N,K]·A[K,M] — operands swapped, leading dims n/k/n (same convention
-    // as `RocmDevice::matmul`).
+    // Bᵀ[N,K]·A[K,M] - operands swapped, leading dims n/k/n (same convention as `RocmDevice::matmul`).
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
     let n_dim = GEMM_DIM as i32;
@@ -523,12 +500,7 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
 }
 
 /// Query the thermal throttle fraction [0, 1] for `ordinal`.
-///
-/// HIP exposes **no** thermal-throttle device attribute on this stack (see
-/// `HIP_DEVICE_ATTR_THROTTLE_REMOVED`): the query that used to live here read
-/// shared-memory size and reported every GPU as 100% throttled, zeroing all
-/// effective TFLOPS. Until rsmi throttle-reason bindings land, report honest
-/// absence — the A/B harness records this field alongside every sample.
+/// HIP exposes **no** thermal-throttle device attribute on this stack (see `HIP_DEVICE_ATTR_THROTTLE_REMOVED`): the query that used.
 fn query_throttle_pct(_ordinal: usize) -> f32 {
     0.0
 }
@@ -539,20 +511,10 @@ fn query_vram_free(ordinal: usize) -> u64 {
 }
 
 /// Free device memory probe for the memory-sovereign admission gate (R4).
-///
-/// Returns the current free VRAM in bytes for `ordinal`, or `None` if the
-/// backend cannot probe it. The engine uses this to certify, per request at
-/// admission, that a new request's footprint fits within what is *currently*
-/// free rather than what was free at model load. Backends without a probe
-/// return `None`, in which case the admission gate is skipped (fail-open — the
-/// request is admitted and bounded by the KV pool instead).
+/// Returns the current free VRAM in bytes for `ordinal`, or `None` if the backend cannot.
 pub fn free_device_memory(ordinal: usize) -> Option<u64> {
     let (free, total) = vram_info(ordinal);
-    if total == 0 {
-        None
-    } else {
-        Some(free)
-    }
+    if total == 0 { None } else { Some(free) }
 }
 
 /// Query `(free_bytes, total_bytes)` VRAM via `hipMemGetInfo`. [see: `(0, 0)`]
@@ -573,16 +535,7 @@ pub fn vram_info(ordinal: usize) -> (u64, u64) {
 // ── ROCm SMI (rsmi) dynamic load — compute utilization ──────────────────────
 
 /// WI-1: live GPU compute/busy utilization [0, 100] for `ordinal`.
-///
-/// ROCm exposes no utilization query through the HIP runtime API, so this
-/// goes through `librocm_smi64.so` (`rsmi_dev_busy_percent_get`), the same
-/// source `rocm-smi --showuse` reads. The library is dynamically loaded — no
-/// link-time dependency, and `None` is returned cleanly when rsmi is absent
-/// rather than fabricating a value from indirect signals.
-///
-/// The handle is cached process-wide behind a `OnceLock` so the stats
-/// endpoint never re-dlopens or re-initializes rsmi per request (WI-1 gate 4:
-/// the query must not block the endpoint for more than ~5ms).
+/// ROCm exposes no utilization query through the HIP runtime API, so this goes through `librocm_smi64.so`.
 pub fn compute_utilization(ordinal: usize) -> Option<u32> {
     if let Some(lib) = RsmiLib::load() {
         let mut busy: u32 = 0;
@@ -685,9 +638,8 @@ mod tests {
         assert_eq!(arch_tflops_table("gfx1202"), (80.0, 160.0, 960.0));
     }
 
-    /// WI-SB0 host gate: calibration must fall back cleanly (`None`, no
-    /// panic) when the ordinal is not a live HIP device — the GPU-less-box
-    /// stand-in for "HIP absent".
+    /// WI-SB0 host gate: calibration must fall back cleanly (`None`, no panic) when the
+    /// ordinal is not a live HIP device - the GPU-less-box stand-in for "HIP absent".
     #[test]
     fn test_calibration_falls_back_on_bad_ordinal() {
         assert!(calibrate_capability(usize::MAX - 1, "gfx0000").is_none());
@@ -696,10 +648,8 @@ mod tests {
         assert_eq!(cap.ordinal, usize::MAX - 1);
     }
 
-    /// WI-SB0 measured-capability gate (needs ≥1 real ROCm device): the
-    /// profiler must report *measured* numbers that beat the tie-collapse
-    /// problem — non-zero TFLOPS/bandwidth, cached across calls, and on an
-    /// asymmetric pair strictly ordered fast > slow in both fields.
+    /// WI-SB0 measured-capability gate (needs ≥1 real ROCm device): the profiler must report *measured* numbers that beat the tie-collapse problem
+    /// - non-zero TFLOPS/bandwidth, cached across calls, and on an asymmetric pair strictly ordered fast > slow in both fields.
     #[test]
     fn test_measured_caps_are_real_and_distinct() {
         let n = enumerate_devices().unwrap_or(0);
@@ -763,11 +713,8 @@ mod tests {
         profiler.tick(); // Must not panic.
     }
 
-    /// WI-1: `compute_utilization` must never fabricate a value. On a box
-    /// without rsmi (or with no devices) it returns `None`; on a real ROCm
-    /// device it returns `Some(0..=100)`. Never returns a value outside the
-    /// valid range — that would be the lying-zero problem this WI exists to
-    /// fix, just in the opposite direction.
+    /// WI-1: `compute_utilization` must never fabricate a value.
+    /// On a box without rsmi (or with no devices) it returns `None`; on a real.
     #[test]
     fn test_compute_utilization_range_or_none() {
         let n = enumerate_devices().unwrap_or(0);

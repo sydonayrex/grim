@@ -1,5 +1,4 @@
 //! Config definitions for RWKV and SSM architecture variants.
-//!
 //! Includes `Rwkv6Config`, `Rwkv7Config`, `Mamba2Config`, `JambaConfig`, `NemotronHConfig`, `GraniteHybridConfig`.
 
 use grim_core::model::{ModalityHint, ModelConfig};

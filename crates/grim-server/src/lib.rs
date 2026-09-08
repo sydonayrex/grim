@@ -1,16 +1,5 @@
-//! Grim HTTP server — axum-based, OpenAI-compatible endpoints.
-//!
-//! Phase 3 deliverable: `/v1/chat/completions` that wires an `Engine`,
-//! resolves per-request LoRA adapters, and streams tokens via SSE.
-//!
-//! §5.2.1: `POST /v1/requests/{id}/pause` and `.../resume` move requests
-//! between the scheduler's `running` and `paused` queues. The KV state
-//! stays alive in the block pool during paused mode.
-//!
-//! Adapter routing (§4.5): the `"adapters"` key in the request body accepts
-//! a JSON array of string adapter names registered with the engine. Unknown
-//! names return 400 immediately — fail loudly rather than silently drop the
-//! adapter and produce unadapted output.
+//! Grim HTTP server - axum-based, OpenAI-compatible endpoints.
+//! Phase 3 deliverable: `/v1/chat/completions` that wires an `Engine`, resolves per-request LoRA adapters, and streams tokens.
 #![allow(
     clippy::too_many_arguments,
     clippy::type_complexity,
@@ -86,25 +75,13 @@ pub fn unregister_diffusion_model(name: &str) {
 }
 
 /// Cancellation token registry for active chat requests.
-///
-/// WI-CANCEL-1: `/v1/requests/:id/cancel` needs to signal the streaming loop
-/// driving request `id` to stop. Rather than a bespoke signal mechanism, we
-/// reuse `grim-garage`'s established `CancellationToken` idiom: a token is
-/// created per streaming request, stored here keyed by request id, and the
-/// `stream::unfold` closure checks it each step. The cancel endpoint looks up
-/// the token and calls `cancel()`, which sets the shared flag the loop polls.
-///
-/// This is the *trigger* for an explicit cancel — WI-CANCEL-2's `Drop` guard
-/// on the same state tuple is what guarantees `finish_request` actually runs
-/// once the loop exits (whether due to the token, a stop condition, or a
-/// client disconnect dropping the stream).
+/// WI-CANCEL-1: `/v1/requests/:id/cancel` needs to signal the streaming loop driving request `id` to stop.
 static CANCEL_TOKENS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, CancellationToken>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Register a fresh `CancellationToken` for `request_id` and return it. If a
-/// token already exists for this id (should not happen in practice — a request
-/// id is unique per generation session), the old one is replaced.
+/// Register a fresh `CancellationToken` for `request_id` and return it.
+/// If a token already exists for this id (should not happen in practice - a.
 pub fn register_cancel_token(request_id: u64) -> CancellationToken {
     let token = CancellationToken::new();
     if let Ok(mut registry) = CANCEL_TOKENS.lock() {
@@ -121,26 +98,8 @@ pub fn take_cancel_token(request_id: u64) -> Option<CancellationToken> {
         .and_then(|mut registry| registry.remove(&request_id))
 }
 
-/// WI-CANCEL-2: RAII guard ensuring `Engine::finish_request(id)` runs exactly
-/// once when the streaming SSE future is dropped — covering *all* exit paths
-/// uniformly:
-///   - normal completion (`max_tokens`, stop-sequence early return)
-///   - explicit cancel via `/v1/requests/:id/cancel` (WI-CANCEL-1, the
-///     `CancellationToken` causes the unfold closure to return `None`)
-///   - client disconnect (the SSE stream future is dropped, firing this `Drop`)
-///
-/// The guard lives inside the `stream::unfold` state tuple so its lifetime is
-/// exactly the stream's lifetime — no earlier, no later than the last poll of
-/// the sink side. This is the placement trap called out in the spec
-/// (axum discussion tokio-rs/axum#1060): a guard must be *held by* the stream's
-/// per-poll state, not referenced from outside, to fire at drop time.
-///
-/// `finish_request` is safe to call from `Drop` because:
-/// - `Scheduler::finish` uses `retain` filtering (idempotent, no panic).
-/// - `rollback_kv_to(0)` decrements block-pool ref-counts; blocks shared with
-///   other live requests (prefix cache) stay alive until their last reference
-///   drops.
-/// - every `HashMap` removal in `finish_request` is a no-op on a missing key.
+/// WI-CANCEL-2: RAII guard ensuring `Engine::finish_request(id)` runs exactly once when the streaming SSE future is dropped - covering *all* exit paths uniformly: - normal completion (`max_tokens`, stop-sequence early return) - explicit cancel via `/v1/requests/:id/cancel` (WI-CANCEL-1, the `CancellationToken` causes the unfold closure to return `None`) - client disconnect (the SSE stream future is dropped, firing this `Drop`) The guard lives inside the `stream::unfold` state tuple so its lifetime is exactly the stream's lifetime - no earlier, no later than the last poll of the sink side.
+/// This is the placement trap called out in the spec (axum discussion tokio-rs/axum#1060): a guard.
 pub struct RequestCleanupGuard {
     /// `true` once cleanup has run, preventing a double-call if both an
     /// explicit early-return path *and* the guard's `Drop` could fire.
@@ -192,11 +151,7 @@ impl Drop for RequestCleanupGuard {
 pub static LIVE_CLEANUP_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
 /// Shared engine state for the HTTP server.
-///
-/// `tokenizer` is populated from the active model's GGUF metadata when
-/// `serve()` is called with a `model_path`. It is used to encode
-/// `messages` into token IDs and to decode generated token IDs back into
-/// text. When `None`, raw token IDs are emitted as `<tok:N>` placeholders.
+/// `tokenizer` is populated from the active model's GGUF metadata when `serve()` is called with a.
 pub struct AppState {
     pub engine: Mutex<Engine>,
     pub tokenizer: Mutex<Option<grim_format::GgufTokenizer>>,
@@ -206,12 +161,8 @@ pub struct AppState {
     /// Architecture string (e.g. "lfm2", "llama") of the loaded model —
     /// drives the per-arch tool-call detector registry (WI-E8).
     pub model_arch: std::sync::Mutex<Option<String>>,
-    /// Plugin samplers loaded from `--plugins <dir>` at startup. Read-only at
-    /// request time via `get_sampler(name)`; `None` when no plugins were loaded.
-    /// `Arc<PluginRegistry>` is `Send + Sync` (the `Sampler` trait is
-    /// `Send + Sync` and the registry's fields are plain `HashMap`/`Vec`), so
-    /// it embeds safely in `Arc<AppState>` shared across axum tasks with no
-    /// interior locking — the registry is mutated only at load time.
+    /// Plugin samplers loaded from `--plugins <dir>` at startup.
+    /// Read-only at request time via `get_sampler(name)`; `None` when no plugins were loaded.
     pub plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 }
 
@@ -224,9 +175,8 @@ impl AppState {
     }
 }
 
-/// WI-E8: read `general.architecture` from a GGUF file's metadata. Returns
-/// None when the path is missing, unreadable, or lacks the key — the caller
-/// then falls back to template heuristics.
+/// WI-E8: read `general.architecture` from a GGUF file's metadata.
+/// Returns None when the path is missing, unreadable, or lacks the key - the caller.
 fn state_arch_hint(path: Option<&std::path::Path>) -> Option<String> {
     let p = path?;
     // Primary artifact carries the arch; a `.grim` primary keeps it in the
@@ -348,26 +298,16 @@ fn validate_metrics_bind_policy_with_opt_in(
     Ok(())
 }
 
-/// Chat completions endpoint — SSE streaming (§8, §4.5).
-///
+/// Chat completions endpoint - SSE streaming (§8, §4.5).
 /// §13.3 contract: no silent partial fulfillment.
-///   - Unknown top-level request fields → 400 with the offending key.  Strict
-///     default catches client typos and version skew.
-///   - `"adapters"` names not registered in the engine → 400 immediately.
-///   - `"determinism": "strict"` when the engine is in Relaxed mode → 400.
-/// Default upper bound on generated tokens when the client does not specify
-/// `max_tokens`. Deliberately non-infinite: a missing bound must still
-/// terminate, but 2048 covers the vast majority of chat/completion prompts.
 const DEFAULT_MAX_TOKENS: u64 = 2048;
 
 /// Salt mixed into the per-request sampling seed so two requests with the
 /// same model name produce independent draws.
 const REQUEST_SEED_SALT: u64 = 0x5A17_C0DE_1337_BEEF;
 
-/// F-4 (WI-TOOLS): synthetic system instruction prepended when a request
-/// carries `tools` but the model's chat template provides no output contract
-/// of its own. Names the exact delimiters the post-hoc parser understands so
-/// the model's completion can actually be extracted into `tool_calls`.
+/// F-4 (WI-TOOLS): synthetic system instruction prepended when a request carries `tools` but the model's chat template provides no output contract of its own.
+/// Names the exact delimiters the post-hoc parser understands so the model's completion can actually be.
 const TOOL_INSTRUCTION_PROMPT: &str = "You have access to the tools listed in this conversation. \
 When the user's request requires a tool, respond with ONLY the tool call in this exact format and no other text:\n\
 <tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n\
@@ -381,20 +321,14 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Advance the engine one step for `request_id` and sample the next token
-/// from the produced logits using `sampler`.
-///
-/// Encapsulates the fixed-REQUEST_ID prefill-on-step-0 / decode-thereafter
-/// contract the server already relies on, plus the formerly-inline argmax
-/// extraction. Both the streaming and non-streaming paths call this so token
-/// selection (and its sampling policy) lives in exactly one place.
+/// Advance the engine one step for `request_id` and sample the next token from the produced logits using `sampler`.
+/// Encapsulates the fixed-REQUEST_ID prefill-on-step-0 / decode-thereafter contract the server already relies on, plus the formerly-inline.
 static REQUEST_HISTORIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Client-supplied sampler overrides for one request. `None` fields fall
-/// back to the corresponding `GRIM_SAMPLE_*` env default (the env vars are
-/// no longer the primary path — explicit request params win when present).
+/// Client-supplied sampler overrides for one request.
+/// `None` fields fall back to the corresponding `GRIM_SAMPLE_*` env default (the env vars are no.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SamplerParams {
     pub temperature: Option<f32>,
@@ -403,10 +337,8 @@ pub struct SamplerParams {
     pub seed: Option<u64>,
 }
 
-/// Per-request sampler params, keyed by request id. Filled at request
-/// ingestion (chat and completions — OpenAI and Ollama shapes both funnel
-/// through those), read by `sample_next_token`/`sample_on_device`, removed
-/// by [`RequestCleanupGuard`].
+/// Per-request sampler params, keyed by request id.
+/// Filled at request ingestion (chat and completions - OpenAI and Ollama shapes both funnel through.
 static REQUEST_SAMPLER_PARAMS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, SamplerParams>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -470,13 +402,8 @@ fn cpu_sample_fallback(
     Ok(sampled.min((vocab_size as u32).saturating_sub(1)))
 }
 
-/// WI-X3 device-side stochastic sampling: launch the Gumbel-max kernel on the
-/// resident ROCm logits (temperature/top-k/top-p on device) and copy back only
-/// the 4-byte token id. Sampling params come from the request registry
-/// (`register_request_sampler_params`); the `GRIM_SAMPLE_TEMPERATURE` /
-/// `GRIM_SAMPLE_TOP_K` / `GRIM_SAMPLE_SEED` env vars remain as fallbacks for
-/// fields the client did not set. `GRIM_CPU_SAMPLER=1` at the call site
-/// disables this path entirely.
+/// WI-X3 device-side stochastic sampling: launch the Gumbel-max kernel on the resident ROCm logits (temperature/top-k/top-p on device) and copy back only the 4-byte token id.
+/// Sampling params come from the request registry (`register_request_sampler_params`); the `GRIM_SAMPLE_TEMPERATURE` / `GRIM_SAMPLE_TOP_K` / `GRIM_SAMPLE_SEED` env.
 fn sample_on_device(
     t: &grim_tensor::Tensor,
     vocab_size: usize,
@@ -542,10 +469,8 @@ fn sample_on_device(
     .map_err(|e| format!("sample_on_device: kernel: {e}"))
 }
 
-/// WI-1 (defense-in-depth): returns `Err(message)` instead of panicking when
-/// the engine cannot advance. A network request must never be able to unwind
-/// this task while the engine mutex is held — that poisons the mutex and takes
-/// down every subsequent request on the process.
+/// WI-1 (defense-in-depth): returns `Err(message)` instead of panicking when the engine cannot advance.
+/// A network request must never be able to unwind this task while the engine mutex.
 fn sample_next_token(
     engine: &mut grim_engine::Engine,
     request_id: u64,
@@ -580,9 +505,8 @@ fn sample_next_token(
         let _ = engine.enqueue_request(req);
     }
 
-    // WI-1: propagate instead of panicking. Panicking here unwound the stream
-    // task while the engine mutex was held, poisoning it for every later
-    // request and preventing the `[DONE]` SSE terminator from ever being sent.
+    // WI-1: propagate instead of panicking. Panicking here unwound the stream task while the engine mutex was
+    // held, poisoning it for every later request and preventing the `[DONE]` SSE terminator from ever being sent.
     if let Err(e) = engine.tick() {
         return Err(format!("engine tick failed: {e}"));
     }
@@ -619,12 +543,8 @@ fn sample_next_token(
             }
         }
     }
-    // The engine's logits table is 65536 entries wide; a model with a smaller
-    // vocab (e.g. 32000) must slice to the last `vocab_size` positions before
-    // sampling, otherwise the sampler scores against near-zero noise and picks
-    // PAD tokens. This mirrors the `last_start / last_logits` slice in `cmd_run`
-    // (run.rs:535-543). Clamp the sampled token ID to `[0, vocab_size)` as
-    // defense-in-depth after sampling.
+    // The engine's logits table is 65536 entries wide; a model with a smaller vocab (e.g.
+    // 32000) must slice to the last `vocab_size` positions before sampling, otherwise the sampler scores against.
     let token = match logits {
         Some(t) => {
             // WI-X3: when logits live on a ROCm device, run temperature/top-k
@@ -666,12 +586,8 @@ fn sample_next_token(
     Ok(token)
 }
 
-/// Trim the first matched stop sequence from the end of `text`. Returns the
-/// trimmed text and whether a stop sequence was found and removed. Only
-/// trims if the stop sequence is a suffix of `text` (the stop string is a
-/// terminator, not a substring to strip from the middle). This is applied
-/// to non-streaming completions so the client never sees the stop string
-/// in the returned content (OpenAI convention).
+/// Trim the first matched stop sequence from the end of `text`.
+/// Returns the trimmed text and whether a stop sequence was found and removed.
 fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     for seq in stop_seqs {
         if text.ends_with(seq) {
@@ -682,11 +598,8 @@ fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     (text.to_string(), false)
 }
 
-/// WI-P9: strip every occurrence of any stop sequence from `text`. The stop
-/// string is a signal, not content (OpenAI convention); non-streaming and
-/// streaming both apply this so the final client-visible content is identical
-/// for the same generated tokens. Kept separate from `trim_stop_sequences`
-/// (suffix-only, used for tool-parse text) so both semantics stay explicit.
+/// WI-P9: strip every occurrence of any stop sequence from `text`.
+/// The stop string is a signal, not content (OpenAI convention); non-streaming and streaming both apply.
 fn strip_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     let mut out = text.to_string();
     let mut hit = false;
@@ -702,13 +615,8 @@ fn strip_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     (out, hit)
 }
 
-/// Split model-generated chain-of-thought preambles from the main response
-/// text.  The model is expected to wrap its reasoning in `<think>`...`</think>`
-/// tags (DeepSeek-R1 / Qwen3-Thinking convention).  Returns
-/// `(reasoning_content, clean_content)`: `reasoning_content` is the
-/// concatenation of all text inside think tags; `clean_content` is the
-/// input with all think blocks removed.  When no think blocks are found,
-/// both fields contain the original text.
+/// Split model-generated chain-of-thought preambles from the main response text.
+/// The model is expected to wrap its reasoning in `<think>`...`</think>` tags (DeepSeek-R1 / Qwen3-Thinking convention).
 fn split_think_content(text: &str) -> (Option<String>, String) {
     let mut reasoning = String::new();
     let mut clean = String::new();
@@ -737,18 +645,12 @@ fn split_think_content(text: &str) -> (Option<String>, String) {
     }
 }
 
-/// WI-1 — Remote-provider scheme allowlist.
-///
-/// Only these prefixes (used as `"<scheme>:<model>"`) denote a remote provider
-/// route. Kept in sync with the provider keys understood by
-/// [`grim_core::client::load_login_token`], which derives its credential key
-/// from `requested_model.split(':').next()`.
+/// WI-1 - Remote-provider scheme allowlist.
+/// Only these prefixes (used as `"<scheme>:<model>"`) denote a remote provider route.
 const REMOTE_PROVIDER_SCHEMES: &[&str] = &["ollama", "openai", "hf", "huggingface", "anthropic"];
 
-/// Cached snapshot of local catalog names, refreshed at most once per
-/// [`CATALOG_CACHE_TTL`]. `list_local_models()` performs a filesystem scan, so
-/// calling it unconditionally per request would add real latency to the
-/// request-handling hot path (WI-1 gate 4).
+/// Cached snapshot of local catalog names, refreshed at most once per [`CATALOG_CACHE_TTL`].
+/// `list_local_models()` performs a filesystem scan, so calling it unconditionally per request would add real latency.
 static LOCAL_CATALOG_CACHE: std::sync::LazyLock<
     Mutex<Option<(std::time::Instant, std::collections::HashSet<String>)>>,
 > = std::sync::LazyLock::new(|| Mutex::new(None));
@@ -756,10 +658,7 @@ static LOCAL_CATALOG_CACHE: std::sync::LazyLock<
 const CATALOG_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// True when `name` exactly matches an entry in the local model catalog.
-///
-/// The catalog names files as `"{stem}:{ext}"` (`catalog.rs`), so local names
-/// routinely contain a colon — this check is what keeps them from being
-/// misrouted to the remote-provider branch.
+/// The catalog names files as `"{stem}:{ext}"` (`catalog.rs`), so local names routinely contain a colon -.
 pub fn is_local_catalog_model(name: &str) -> bool {
     let now = std::time::Instant::now();
     let mut guard = match LOCAL_CATALOG_CACHE.lock() {
@@ -781,14 +680,8 @@ pub fn is_local_catalog_model(name: &str) -> bool {
         .is_some_and(|(_, names)| names.contains(name))
 }
 
-/// WI-1 — Decide whether a requested model name should be routed to the remote
-/// provider proxy instead of being served locally.
-///
-/// A name is remote only when it carries a known provider scheme *and* does not
-/// collide with a local catalog entry. Local catalog entries always win: the
-/// catalog's own `"{stem}:{ext}"` naming convention would otherwise make every
-/// locally-pulled model permanently unreachable through the OpenAI-compatible
-/// endpoint (the WI-1 root cause).
+/// WI-1 - Decide whether a requested model name should be routed to the remote provider proxy instead of being served locally.
+/// A name is remote only when it carries a known provider scheme *and* does not.
 pub fn is_remote_provider_model(name: &str) -> bool {
     if is_local_catalog_model(name) {
         return false;
@@ -802,20 +695,8 @@ pub fn is_remote_provider_model(name: &str) -> bool {
     }
 }
 
-/// Build the OpenAI `choices[0]` payload for one generated completion,
-/// applying WI-TOOLS-4/5 and the WI-TOOLS-4b soft guard:
-/// - when tool calling is active, run the raw completion through the per-family
-///   output parser (WI-TOOLS-4). A clean parse yields `message.tool_calls` with
-///   `finish_reason: "tool_calls"`; otherwise the completion is returned as
-///   ordinary content (a failed parse is never a request failure).
-/// - when the parser produced calls that already appeared in `messages` two or
-///   more times (WI-TOOLS-4b soft threshold, `count >= 2 && < 4`), the
-///   duplicate call's `arguments` are substituted with the diagnostic payload so
-///   the next turn can self-correct without ending the exchange.
-///
-/// The hard guard (`count >= 4`) is handled separately by
-/// [`check_repeated_call_hard_guard`], which must be invoked *before* this
-/// function so a `400` can short-circuit response construction.
+/// Build the OpenAI `choices[0]` payload for one generated completion, applying WI-TOOLS-4/5 and the WI-TOOLS-4b soft guard: - when tool calling is active, run the raw completion through the per-family output parser (WI-TOOLS-4).
+/// A clean parse yields `message.tool_calls` with `finish_reason: "tool_calls"`; otherwise the completion is returned as ordinary.
 fn build_choice_payload(
     content: &str,
     reasoning_content: Option<&str>,
@@ -882,12 +763,8 @@ fn build_choice_payload(
     })
 }
 
-/// WI-TOOLS-4b hard guard. Returns `Some((tool_name, repeat_count))` when the
-/// most recent parsed call for `name`/`arguments` has already appeared >= 4
-/// times in `prior_messages` (i.e. this would be the 5th identical call), at
-/// which point the spec mandates a hard `400` before constructing the response.
-/// Callers should check this *before* [`build_choice_payload`] and return a 400
-/// if it returns `Some`.
+/// WI-TOOLS-4b hard guard. Returns `Some((tool_name, repeat_count))` when the most recent parsed
+/// call for `name`/`arguments` has already appeared >= 4 times in `prior_messages` (i.e.
 fn check_repeated_call_hard_guard(
     prior_messages: &[grim_format::ChatMessage],
     name: &str,
@@ -897,10 +774,8 @@ fn check_repeated_call_hard_guard(
     if count >= 4 { Some(count) } else { None }
 }
 
-/// WI-TOOLS-4b soft-guard diagnostic payload. Replaces the call's `arguments`
-/// with a JSON-encoded string carrying the duplicate flag, the repeat count,
-/// and the original arguments — keeping the `tool_calls` wire shape identical to
-/// a normal call while signaling the duplication to the model's next turn.
+/// WI-TOOLS-4b soft-guard diagnostic payload.
+/// Replaces the call's `arguments` with a JSON-encoded string carrying the duplicate flag, the repeat count,.
 fn diagnostic_arguments(original: &str, repeat_count: usize) -> String {
     let original_value: serde_json::Value =
         serde_json::from_str(original).unwrap_or(serde_json::Value::String(original.to_string()));
@@ -913,22 +788,8 @@ fn diagnostic_arguments(original: &str, repeat_count: usize) -> String {
     .unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Terminal SSE emitter for the streaming path (WI-TOOLS-5 buffered
-/// streaming). Runs the buffered completion through [`build_choice_payload`]
-/// and, if a clean tool-call parse was produced, emits a single final delta
-/// chunk carrying `choices[0].delta.tool_calls` plus the `"tool_calls"`
-/// `finish_reason`. When no tool call is detected it returns `None`, which lets
-/// the stream fall through to the `[DONE]` terminator unchanged — preserving
-/// existing plain-content streaming behavior.
-///
-/// NOTE (WI-TOOLS-4b hard guard): the buffered streaming MVP cannot enforce the
-/// hard guard (count >= 4 → 400) *before* generation completes, because the
-/// call being guarded isn't known until the model's completion is parsed at
-/// end-of-generation. Cancelling an in-flight stream mid-generation is out of
-/// scope for the first cut (per the spec's explicit scoping note). The soft
-/// guard (diagnostic substitution) is applied here via `build_choice_payload`;
-/// the hard guard is fully enforced on the non-streaming path where the entire
-/// completion is available before any response is returned.
+/// Terminal SSE emitter for the streaming path (WI-TOOLS-5 buffered streaming).
+/// Runs the buffered completion through [`build_choice_payload`] and, if a clean tool-call parse was produced, emits.
 fn terminal_tool_delta(
     parse_ctx: &(bool, Option<String>, Option<String>),
     emitted: &str,
@@ -959,16 +820,8 @@ fn terminal_tool_delta(
     None
 }
 
-/// WI-TOOLS-4b/4c — stable, machine-readable error codes for every rejection
-/// `chat_completions` can produce. Each variant serializes to the `code` field
-/// on the structured `{"error": {...}}` object, so clients can branch on a
-/// fixed enum value rather than string-matching a prose `message`. The three
-/// tool-calling guards (`duplicate_tool_call_limit`,
-/// `total_tool_call_limit`, `message_count_limit`) share this vocabulary, and
-/// the four pre-existing `chat_completions`-internal checks are migrated to
-/// use it too so the handler is internally consistent (see the spec's
-/// "Making the error/diagnostic shape actually machine-actionable" § under
-/// WI-TOOLS-4c).
+/// WI-TOOLS-4b/4c - stable, machine-readable error codes for every rejection `chat_completions` can produce.
+/// Each variant serializes to the `code` field on the structured `{"error": {...}}` object, so clients.
 pub enum ErrorCode {
     InvalidRequest,
     UnknownField,
@@ -995,11 +848,8 @@ impl ErrorCode {
     }
 }
 
-/// Build a structured `chat_completions` rejection body matching OpenAI's
-/// `{"error": {"type": ..., "code": ..., "message": ...}}` object shape, with
-/// a stable `code` discriminant the client can branch on. `type` reuses
-/// OpenAI's own `invalid_request_error` taxonomy so OpenAI-compatible client
-/// SDKs behave sensibly even before they learn grim-specific codes.
+/// Build a structured `chat_completions` rejection body matching OpenAI's `{"error": {"type": ..., "code": ..., "message": ...}}` object shape, with a stable `code` discriminant the client can branch on.
+/// `type` reuses OpenAI's own `invalid_request_error` taxonomy so OpenAI-compatible client SDKs behave sensibly even before they.
 fn request_error(code: ErrorCode, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({
         "error": {
@@ -1010,14 +860,8 @@ fn request_error(code: ErrorCode, message: impl Into<String>) -> serde_json::Val
     })
 }
 
-/// WI-3: build a `ConstrainedSampler` from an OpenAI-compatible
-/// `response_format` field, wrapping the given inner sampler.
-///
-/// Returns `Ok(arc)` on success, `Err(message)` on an unsupported schema
-/// feature (callers return a structured 400 rather than silently
-/// under-constraining — silently under-constraining is worse than a clear
-/// rejection, since callers relying on schema conformance would get
-/// malformed output with no signal).
+/// WI-3: build a `ConstrainedSampler` from an OpenAI-compatible `response_format` field, wrapping the given inner sampler.
+/// Returns `Ok(arc)` on success, `Err(message)` on an unsupported schema feature (callers return a structured 400.
 fn build_constrained_sampler(
     inner: std::sync::Arc<dyn grim_core::sampler::Sampler>,
     body: &serde_json::Map<String, serde_json::Value>,
@@ -1062,20 +906,8 @@ fn build_constrained_sampler(
     }
 }
 
-/// Chat completions endpoint — SSE streaming (§8, §4.5).
-///
+/// Chat completions endpoint - SSE streaming (§8, §4.5).
 /// §13.3 contract: no silent partial fulfillment.
-///   - Unknown top-level request fields → 400 with the offending key.
-///   - `"adapters"` names not registered in the engine → 400 immediately.
-///   - `"determinism": "strict"` when the engine is in Relaxed mode → 400.
-///
-/// WI-TOOLS-1 through -5: when `tools`/`tool_choice` are present in the
-/// request body, the prompt is rendered through the tokenizer's embedded chat
-/// template with the `tools` Jinja variable, the generated completion is run
-/// through [`build_choice_payload`] / [`tool_parse::parse_tool_calls`] to
-/// extract structured tool calls, and the OpenAI `message.tool_calls` field
-/// is populated accordingly. `tool_choice: "none"` suppresses the whole
-/// pipeline.
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -1088,11 +920,8 @@ async fn chat_completions(
         .unwrap_or("default")
         .to_string();
 
-    // WI-1: Remote Provider Routing — route only names carrying a *known*
-    // remote provider scheme (e.g. "ollama:cloud", "openai:gpt-4",
-    // "hf/meta-llama/..."). The previous `contains(':')` heuristic collided
-    // with the local catalog's own `"{stem}:{ext}"` naming convention
-    // (catalog.rs), making every locally-cataloged model unroutable.
+    // WI-1: Remote Provider Routing - route only names carrying a *known* remote provider scheme (e.g.
+    // "ollama:cloud", "openai:gpt-4", "hf/meta-llama/...").
     if is_remote_provider_model(&requested_model) {
         let provider_key = requested_model.split(':').next().unwrap_or("default");
         let token = grim_core::client::load_login_token(provider_key)
@@ -1105,10 +934,8 @@ async fn chat_completions(
             token.is_some()
         );
     } else {
-        // Dynamic model loading — if the requested model is not yet registered,
-        // try to resolve it from the local catalog and load its GGUF file.
-        // If the model cannot be resolved, return 404 immediately so the user
-        // gets a clear error instead of silently running a random toy model.
+        // Dynamic model loading - if the requested model is not yet registered, try to resolve it from the local catalog and load its GGUF file.
+        // If the model cannot be resolved, return 404 immediately so the user gets a clear.
         let mut engine = state.lock_engine();
         if !engine
             .loaded_models()
@@ -1151,11 +978,8 @@ async fn chat_completions(
         }
     }
 
-    // §13.3 — Exhaustive whitelist of known top-level request fields.
-    // Any field outside this set is an immediate 400.  Unknown fields are
-    // treated as errors, not silently ignored, so client typos and
-    // version-skew (an old client sending a renamed field) surface immediately
-    // instead of producing subtly wrong output.
+    // §13.3 - Exhaustive whitelist of known top-level request fields.
+    // Any field outside this set is an immediate 400.
     const KNOWN_FIELDS: &[&str] = &[
         "model",
         "messages",
@@ -1212,13 +1036,8 @@ async fn chat_completions(
         }
     }
 
-    // WI-TOOLS-4c-ii: cap `messages.len()` before any tokenization/prefill work
-    // happens — this is a conversation-shape check, not tool-call-specific, so
-    // it runs alongside the other pre-generation §13.3 validations above. Uses
-    // the raw body field count so the check is available before the messages
-    // are parsed into typed `ChatMessage`s below. Reject with 400 (the file's
-    // established "reject before generating" status) rather than introducing a
-    // 413 — see the spec's reasoning for that convention.
+    // WI-TOOLS-4c-ii: cap `messages.len()` before any tokenization/prefill work happens - this is a conversation-shape check, not tool-call-specific, so it runs alongside the other pre-generation §13.3 validations above.
+    // Uses the raw body field count so the check is available before the messages are.
     {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let max_messages = engine.config.max_messages_per_request;
@@ -1245,9 +1064,8 @@ async fn chat_completions(
         }
     }
 
-    // §13.3 — Determinism mismatch: if the client requests strict determinism
-    // but the engine is in Relaxed mode, return 400.  Silently falling back to
-    // non-deterministic output would be a silent correctness bug.
+    // §13.3 - Determinism mismatch: if the client requests strict determinism but the engine is in Relaxed mode, return 400.
+    // Silently falling back to non-deterministic output would be a silent correctness bug.
     if let Some(det) = body_obj.get("determinism").and_then(|v| v.as_str()) {
         if det == "strict" {
             let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
@@ -1318,9 +1136,7 @@ async fn chat_completions(
     }
 
     // Read sampling / length controls from the whitelisted request fields.
-    // These were already accepted by the KNOWN_FIELDS gate above; here we
-    // actually honor them instead of ignoring them (prior behavior was a
-    // fixed 5-token argmax regardless of the request).
+    // These were already accepted by the KNOWN_FIELDS gate above; here we actually honor them instead.
     let thinking_str = body_obj
         .get("reasoning_effort")
         .or_else(|| body_obj.get("thinking"))
@@ -1363,12 +1179,8 @@ async fn chat_completions(
     };
     let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
         if let Some(name) = body_obj.get("sampler").and_then(|v| v.as_str()) {
-            // A named plugin sampler was requested. Look it up in the
-            // registry threaded in from `grim_server::serve()`; if the name
-            // is unknown (or no registry is attached), degrade gracefully and
-            // warn loudly rather than 400-ing — matching the repo's posture
-            // for optional features. The strict `KNOWN_FIELDS` gate above
-            // still 400s on genuinely unknown *field names*.
+            // A named plugin sampler was requested. Look it up in the registry threaded in from `grim_server::serve()`; if the name is unknown
+            // (or no registry is attached), degrade gracefully and warn loudly rather than 400-ing - matching the repo's posture for optional features.
             state
                 .plugin_registry
                 .as_ref()
@@ -1384,14 +1196,8 @@ async fn chat_completions(
             std::sync::Arc::from(sampling.into_sampler(sample_seed))
         };
 
-    // WI-3: `response_format` wraps the chosen sampler in a
-    // `ConstrainedSampler` so generated tokens stay on a valid JSON/JSON-Schema
-    // path. The inner sampler (plugin or SamplingParams) is unmodified —
-    // this is wrapping, not altering, per the plan.
-    //
-    // The tokenizer's vocabulary is passed in so the constrained sampler can
-    // simulate per-token FSM paths; without it the mask is conservative
-    // (all-valid), which is honest but doesn't actually constrain anything.
+    // WI-3: `response_format` wraps the chosen sampler in a `ConstrainedSampler` so generated tokens stay on a valid JSON/JSON-Schema path.
+    // The inner sampler (plugin or SamplingParams) is unmodified - this is wrapping, not altering, per.
     let vocab = state
         .tokenizer
         .lock()
@@ -1429,15 +1235,8 @@ async fn chat_completions(
         })
         .unwrap_or_default();
 
-    // Parse `messages` into typed structs and render the prompt once,
-    // before the streaming / non-streaming split.  If the tokenizer
-    // carries a Jinja chat template, use it; otherwise fall back to the
-    // last message's content (best-effort, pre-existing behaviour).
-    //
-    // OpenAI multimodal shape: `content` may be a plain string OR an array
-    // of typed parts. Text parts are concatenated into the prompt content;
-    // image parts are counted and rejected with 422 unless the loaded model
-    // actually has a vision encoder — never silently dropped.
+    // Parse `messages` into typed structs and render the prompt once, before the streaming / non-streaming split.
+    // If the tokenizer carries a Jinja chat template, use it; otherwise fall back to the.
     let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
     let mut image_parts: usize = 0;
     if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
@@ -1507,10 +1306,8 @@ async fn chat_completions(
         )
             .into_response();
     }
-    // Image parts are only servable by a model whose modality hint includes
-    // vision. No such model is loadable in the serving path today, so this
-    // fires for every image request until a vision encoder is wired — an
-    // honest 422 beats silently generating text-only output.
+    // Image parts are only servable by a model whose modality hint includes vision.
+    // No such model is loadable in the serving path today, so this fires for every.
     if image_parts > 0 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1524,10 +1321,8 @@ async fn chat_completions(
             .into_response();
     }
 
-    // §WI-TOOLS-1 — Parse `tools` / `tool_choice` into the typed shapes the
-    // template renderer and output parser consume. Field-by-field extraction
-    // with explicit error messages on malformed input (matching the existing
-    // `adapters` pattern above, not a whole-body serde deserialize).
+    // §WI-TOOLS-1 - Parse `tools` / `tool_choice` into the typed shapes the template renderer and output parser consume.
+    // Field-by-field extraction with explicit error messages on malformed input (matching the existing `adapters` pattern above,.
     let tools: Vec<grim_format::ToolDef> = body_obj
         .get("tools")
         .and_then(|v| v.as_array())
@@ -1541,17 +1336,12 @@ async fn chat_completions(
         .get("tool_choice")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .or(None);
-    // `tool_choice: "none"` suppresses tool calling entirely (WI-TOOLS-1),
-    // matching OpenAI semantics: the template gets no `tools` and the parser
-    // is bypassed, so the model produces an ordinary completion.
+    // `tool_choice: "none"` suppresses tool calling entirely (WI-TOOLS-1), matching OpenAI semantics: the template gets
+    // no `tools` and the parser is bypassed, so the model produces an ordinary completion.
     let tools_active = !tools.is_empty() && tool_choice != Some(grim_format::ToolChoice::None);
 
-    // F-4 (WI-TOOLS): when tool calling is active and the model's embedded
-    // template does not itself instruct the model on the output convention,
-    // prepend a synthetic system message spelling out the exact wire format.
-    // Without this, a template that merely renders "List of tools: [...]"
-    // gives the model no output contract, so it answers in prose and the
-    // parser never sees a call.
+    // F-4 (WI-TOOLS): when tool calling is active and the model's embedded template does not itself instruct the model on the output convention, prepend a synthetic system message spelling out the exact wire format.
+    // Without this, a template that merely renders "List of tools: [...]" gives the model no.
     let messages = if tools_active && !messages.iter().any(|m| m.role == "system") {
         let mut with_tools = Vec::with_capacity(messages.len() + 1);
         with_tools.push(grim_format::ChatMessage {
@@ -1567,10 +1357,8 @@ async fn chat_completions(
         messages.to_vec()
     };
 
-    // `template_family` drives WI-TOOLS-4's per-family output parsing. We
-    // resolve it from the loaded tokenizer's embedded chat template so the same
-    // model template that shapes the prompt also selects the extraction
-    // convention for its own tool-call output.
+    // `template_family` drives WI-TOOLS-4's per-family output parsing.
+    // We resolve it from the loaded tokenizer's embedded chat template so the same model template.
     let (prompt_text, template_family) = {
         let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
         match tok.as_ref() {
@@ -1611,9 +1399,8 @@ async fn chat_completions(
         );
     }
 
-    // P0-3.2: Vocab size for clamping sampled tokens into the model's actual
-    // range. The engine's internal logits table is fixed at 65536 entries; a
-    // model with a smaller vocab can otherwise emit out-of-bounds token IDs.
+    // P0-3.2: Vocab size for clamping sampled tokens into the model's actual range.
+    // The engine's internal logits table is fixed at 65536 entries; a model with a smaller.
     let vocab_size: usize = state
         .tokenizer
         .lock()
@@ -1623,9 +1410,7 @@ async fn chat_completions(
         .unwrap_or(65536);
 
     // EOS token ID for early termination. When the model emits this token,
-    // generation stops immediately (the EOS token is not included in the
-    // returned content). This mirrors the OpenAI convention where EOS is a
-    // signal, not part of the output.
+    // generation stops immediately (the EOS token is not included in the returned content).
     let eos_token_id: Option<u32> = state
         .tokenizer
         .lock()
@@ -1633,10 +1418,8 @@ async fn chat_completions(
         .as_ref()
         .and_then(|t| t.eos_token_id);
 
-    // Enforce the model's context window: reject requests whose total
-    // token count (prompt + max_tokens) exceeds the model's reported
-    // context_length. Models that don't report context_length (return 0)
-    // fall back to a best-effort warning for obviously excessive lengths.
+    // Enforce the model's context window: reject requests whose total token count (prompt + max_tokens) exceeds the model's reported context_length.
+    // Models that don't report context_length (return 0) fall back to a best-effort warning for obviously.
     let model_context_length = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine
@@ -1703,27 +1486,13 @@ async fn chat_completions(
         let max_tokens_clone = max_tokens;
         let eos_token_id_clone = eos_token_id;
 
-        // WI-TOOLS-5 (streaming MVP, buffered): true incremental tool-call
-        // streaming is not achievable while parsing is still post-hoc (WI-
-        // TOOLS-4) — you cannot confidently detect a marker-delimited call is
-        // complete until you see the closing tag, which only happens at or near
-        // end-of-generation. So we buffer the full completion in `emitted`
-        // (already done for stop-sequence detection) and, once generation
-        // terminates, run the parser once on the whole string. If a clean
-        // parse is found we emit a single final delta carrying
-        // `choices[0].delta.tool_calls` and the `finish_reason`; otherwise the
-        // stream closes as plain content. This is functionally correct for any
-        // client that concatenates delta fragments, and degrades to the
-        // existing behavior for non-tool requests.
+        // WI-TOOLS-5 (streaming MVP, buffered): true incremental tool-call streaming is not achievable while parsing is still post-hoc (WI- TOOLS-4) - you cannot confidently detect a marker-delimited call is complete until you see the closing tag, which only happens at or near end-of-generation.
+        // So we buffer the full completion in `emitted` (already done for stop-sequence detection) and, once.
         let tools_active_clone = tools_active;
         let template_family_clone = template_family.clone();
 
-        // CRIT-1: generate ONE request_id for the entire streaming session so
-        // sample_next_token enqueues a request on step 0 and can look up the
-        // outcome on every subsequent step. The previous code created a new id
-        // per step, meaning no request existed under that id on steps > 0, so
-        // engine.last_outcome() returned None and the token fell back to the
-        // step index (not a real sampled token).
+        // CRIT-1: generate ONE request_id for the entire streaming session so sample_next_token enqueues a request on step 0 and can look up the outcome on every subsequent step.
+        // The previous code created a new id per step, meaning no request existed under that.
         let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         // T1.3: request params feed the device-side sampler for this stream.
         register_request_sampler_params(session_request_id, &body_obj);
@@ -1732,9 +1501,8 @@ async fn chat_completions(
         // can signal this specific stream to stop.
         let cancel_token = register_cancel_token(session_request_id);
 
-        // WI-CANCEL-2: RAII guard that calls finish_request on drop — fires on
-        // every exit path (max_tokens, stop-sequence, explicit cancel, client
-        // disconnect) since it's threaded through the unfold state tuple.
+        // WI-CANCEL-2: RAII guard that calls finish_request on drop - fires on every exit path
+        // (max_tokens, stop-sequence, explicit cancel, client disconnect) since it's threaded through the unfold state tuple.
         let cleanup_guard = RequestCleanupGuard::new(state.clone(), session_request_id);
 
         let stream = futures::stream::unfold(
@@ -1772,10 +1540,7 @@ async fn chat_completions(
                 let stream_model = requested_model.clone();
                 async move {
                     // WI-CANCEL-1: check for explicit cancel before doing work.
-                    // The cancel endpoint calls cancel_token.cancel(); we poll it
-                    // cooperatively each tick (matching the spec's tick-boundary
-                    // granularity). Returning None ends the unwind stream; the
-                    // cleanup_guard's Drop runs immediately afterward.
+                    // The cancel endpoint calls cancel_token.cancel(); we poll it cooperatively each tick (matching the spec's tick-boundary.
                     if cancel_token.is_cancelled() {
                         let _ = cleanup_guard; // consumed; Drop fires on move-into-scope end
                         return None;
@@ -1784,11 +1549,8 @@ async fn chat_completions(
                     // Honor `max_tokens` (was a hardcoded 256). Stop early if a
                     // configured stop sequence appears in the emitted text.
                     if step >= max_tokens_clone {
-                        // End of generation reached — attempt WI-TOOLS-4 post-hoc
-                        // tool-call extraction on the buffered completion. The
-                        // result (Some terminal delta, or None to close) becomes
-                        // the final unfold item; the stream then yields to the
-                        // `[DONE]` terminator chained after.
+                        // End of generation reached - attempt WI-TOOLS-4 post-hoc tool-call extraction on the buffered completion.
+                        // The result (Some terminal delta, or None to close) becomes the final unfold item; the.
                         let (reasoning_content, clean_emitted) =
                             if thinking_level != grim_core::sampler::ThinkingLevel::Off {
                                 split_think_content(&emitted)
@@ -1835,9 +1597,8 @@ async fn chat_completions(
                             Some(req_model),
                         )
                     };
-                    // WI-1: a generation failure ends the stream with a
-                    // terminal OpenAI-shaped error event; the chained `[DONE]`
-                    // sentinel still fires because the task does not unwind.
+                    // WI-1: a generation failure ends the stream with a terminal OpenAI-shaped error
+                    // event; the chained `[DONE]` sentinel still fires because the task does not unwind.
                     let token_id = match sampled {
                         Ok(t) => t,
                         Err(msg) => {
@@ -1865,9 +1626,8 @@ async fn chat_completions(
                         }
                     };
 
-                    // Token pacing: configurable inter-token delay to avoid overwhelming
-                    // clients or the engine. Set GRIM_TOKEN_PACING_MS=0 to disable.
-                    // Default 10ms provides gentle pacing for SSE stream stability.
+                    // Token pacing: configurable inter-token delay to avoid overwhelming clients or the engine.
+                    // Set GRIM_TOKEN_PACING_MS=0 to disable.
                     let pacing_ms = std::env::var("GRIM_TOKEN_PACING_MS")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
@@ -1888,9 +1648,8 @@ async fn chat_completions(
                     };
                     emitted.push_str(&token_text);
                     let hit_stop = stop_seqs.iter().any(|s| emitted.contains(s));
-                    // EOS check: if the model emitted the EOS token, terminate
-                    // generation without including it in the output (the EOS
-                    // token is a signal, not content — OpenAI convention).
+                    // EOS check: if the model emitted the EOS token, terminate generation without including it
+                    // in the output (the EOS token is a signal, not content - OpenAI convention).
                     let hit_eos = eos_token_id_clone == Some(token_id);
                     if hit_eos {
                         // Trim the EOS token's text from the emitted buffer
@@ -1901,9 +1660,8 @@ async fn chat_completions(
                             .to_string();
                     }
                     if hit_stop {
-                        // Trim the stop string from the buffered text used for
-                        // terminal tool-call parsing (suffix-trim is enough for
-                        // parse purposes).
+                        // Trim the stop string from the buffered text used
+                        // for terminal tool-call parsing (suffix-trim is enough for parse purposes).
                         let (trimmed, _) = trim_stop_sequences(&emitted, &stop_seqs);
                         emitted = trimmed;
                     }
@@ -1935,14 +1693,8 @@ async fn chat_completions(
                                 ),
                             ));
                         }
-                        // WI-P9: no tool call — the stop-triggering token's text
-                        // must still reach the client, or stream:true silently
-                        // drops the final content the non-streaming path returns.
-                        // Emit it stop-stripped (signal, not content) in the same
-                        // chunk shape as every other delta, then close. Setting
-                        // step to max_tokens makes the next unfold iteration hit
-                        // the max-tokens terminal branch, which produces no
-                        // further event, so the stream ends after this delta.
+                        // WI-P9: no tool call - the stop-triggering token's text must still reach the client, or stream:true silently drops the final content the non-streaming path returns.
+                        // Emit it stop-stripped (signal, not content) in the same chunk shape as every other delta,.
                         if hit_stop && !clean_emitted.is_empty() {
                             let (stripped, _) = strip_stop_sequences(&clean_emitted, &stop_seqs);
                             let prior_raw_len = emitted.len() - token_text.len();
@@ -2082,9 +1834,8 @@ async fn chat_completions(
                 format!("<tok:{token_id}>")
             };
             content.push_str(&token_text);
-            // EOS check: stop generation if the model emitted the EOS token,
-            // and strip the EOS token's text from the output (it's a signal,
-            // not content — OpenAI convention).
+            // EOS check: stop generation if the model emitted the EOS token, and strip the
+            // EOS token's text from the output (it's a signal, not content - OpenAI convention).
             if eos_token_id == Some(token_id) {
                 content = content
                     .strip_suffix(&token_text)
@@ -2097,17 +1848,12 @@ async fn chat_completions(
             }
         }
 
-        // Strip stop-sequence occurrences from the returned content (OpenAI
-        // convention: the stop string is a signal, not part of the output).
-        // WI-P9: uses the same occurrence-strip as the streaming path's
-        // terminal delta, so stream:true and stream:false agree on content.
+        // Strip stop-sequence occurrences from the returned content (OpenAI convention: the stop string is a signal, not part of the output).
+        // WI-P9: uses the same occurrence-strip as the streaming path's terminal delta, so stream:true and stream:false.
         let (content, _hit_stop) = strip_stop_sequences(&content, &stop_sequences);
 
-        // Thinking output handling: when the model emits <think> blocks,
-        // split them into reasoning_content (chain-of-thought) and clean
-        // content (the actual response). This mirrors DeepSeek-R1 /
-        // Qwen3-Thinking convention where the think preamble is surfaced
-        // separately. Only applies when thinking_level is not Off.
+        // Thinking output handling: when the model emits <think> blocks, split them into reasoning_content (chain-of-thought) and clean content (the actual response).
+        // This mirrors DeepSeek-R1 / Qwen3-Thinking convention where the think preamble is surfaced separately.
         let (reasoning_content, content) =
             if thinking_level != grim_core::sampler::ThinkingLevel::Off {
                 split_think_content(&content)
@@ -2121,13 +1867,8 @@ async fn chat_completions(
         }
         take_request_sampler_params(request_id);
 
-        // WI-TOOLS-4/5/4b: when tool calling is active, run the completion
-        // through the per-family output parser. Before constructing the
-        // response, apply the WI-TOOLS-4b hard guard — if the parsed call would
-        // be the 5th identical one (>= 4 prior), reject the request with 400
-        // before returning a response (the spec's "hard block" threshold).
-        // The soft guard (>= 2 prior) is applied inside build_choice_payload
-        // via diagnostic-argument substitution.
+        // WI-TOOLS-4/5/4b: when tool calling is active, run the completion through the per-family output parser.
+        // Before constructing the response, apply the WI-TOOLS-4b hard guard - if the parsed call would.
         if tools_active {
             let family = tool_parse::resolve_effective_tool_family(
                 template_family.as_deref().unwrap_or(""),
@@ -2166,10 +1907,8 @@ async fn chat_completions(
                             .into_response();
                     }
                 }
-                // WI-TOOLS-4c-i: total tool-call budget across the whole
-                // conversation. If the newly parsed calls would push the
-                // cumulative count past the engine-config cap, reject with 400
-                // (hard threshold only — no soft tier, per the spec's rationale).
+                // WI-TOOLS-4c-i: total tool-call budget across the whole conversation.
+                // If the newly parsed calls would push the cumulative count past the engine-config cap, reject.
                 {
                     let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
                     let max_tool_calls = engine.config.max_tool_calls_per_conversation;
@@ -2210,21 +1949,15 @@ async fn chat_completions(
             model_arch.as_deref(),
             &messages,
         );
-        // WI-CANCEL-0: tear down engine-side request state on every exit
-        // path — non-streaming has no Drop guard, so we call finish_request
-        // directly here, on both the normal-completion and stop-sequence
-        // break paths (the loop above falls through to this point in both
-        // cases). Idempotent per the audit: retain-based queue removal and
-        // refcount-decrement rollback are no-ops if state is already gone.
+        // WI-CANCEL-0: tear down engine-side request state on every exit path - non-streaming has no Drop guard, so we call finish_request directly here, on both the normal-completion and stop-sequence break paths (the loop above falls through to this point in both cases).
+        // Idempotent per the audit: retain-based queue removal and refcount-decrement rollback are no-ops if state is.
         {
             let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.finish_request(request_id);
         }
         take_request_sampler_params(request_id);
-        // WI-2: echo back exactly the model name the client requested, per
-        // OpenAI API semantics. The previous hardcoded "grim" broke any client
-        // that validates `response.model` against what it sent.
-        // Generate a unique chat completion ID (SRV-13).
+        // WI-2: echo back exactly the model name the client requested, per OpenAI API semantics.
+        // The previous hardcoded "grim" broke any client that validates `response.model` against what it sent.
         use std::sync::atomic::{AtomicU64, Ordering};
         static COMPLETION_COUNTER: AtomicU64 = AtomicU64::new(1);
         let completion_id = COMPLETION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2246,10 +1979,8 @@ async fn chat_completions(
     }
 }
 
-/// §5.2.1 — pause a running request. Idempotent: if the request is
-/// already paused (or finished), the response is `200 OK` with
-/// `{"state": "paused"}` regardless. Returns `404 Not Found` only if
-/// the engine has no record of the id at all.
+/// §5.2.1 - pause a running request. Idempotent: if the request is already
+/// paused (or finished), the response is `200 OK` with `{"state": "paused"}` regardless.
 async fn pause_request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u64>,
@@ -2345,17 +2076,8 @@ fn resume_request_inner(
     }
 }
 
-/// §5.2 — cancel a running request (`POST /v1/requests/:id/cancel`).
-///
-/// Unlike `pause_request` (which retains KV blocks for a future resume),
-/// cancel performs full teardown via `Engine::finish_request` — freeing block-
-/// pool ref-counts and clearing all per-request `HashMap` entries.
-///
-/// The streaming loop notices the cancellation at the next scheduler-tick
-/// boundary via the `CancellationToken` registered in `register_cancel_token`
-/// (WI-CANCEL-1), and WI-CANCEL-2's `RequestCleanupGuard` ensures
-/// `finish_request` runs exactly once whether the exit is cancel-driven, a
-/// normal stop, or a client disconnect.
+/// §5.2 - cancel a running request (`POST /v1/requests/:id/cancel`).
+/// Unlike `pause_request` (which retains KV blocks for a future resume), cancel performs full teardown via.
 async fn cancel_request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u64>,
@@ -2378,32 +2100,22 @@ fn cancel_request_inner(
         .lock()
         .map_err(|_| grim_core::Error::Config("engine mutex poisoned".into()))?;
 
-    // Check scheduler queues the same way pause_request_inner does — if the
-    // id isn't in any queue we can't cancel it (it may have already been
-    // cleaned up or never existed).
-    //
-    // If a running stream has registered a CancellationToken for this id
-    // (WI-CANCEL-1), signal it to stop; finish_request will be invoked by
-    // the RequestCleanupGuard's Drop when the stream unwinds. If no token
-    // exists (no active stream for this id), call finish_request directly
-    // to cover the non-streaming path and the "already finished" case.
+    // Check scheduler queues the same way pause_request_inner does - if the id isn't in any queue we can't cancel it (it may have already been cleaned up or never existed).
+    // If a running stream has registered a CancellationToken for this id (WI-CANCEL-1), signal it to.
     let known = engine.scheduler.waiting.iter().any(|r| r.id == id)
         || engine.scheduler.running.iter().any(|r| r.id == id)
         || engine.scheduler.paused.iter().any(|r| r.id == id)
         || engine.scheduler.swapped.iter().any(|r| r.id == id);
 
-    // Signal any active streaming loop to stop. The actual finish_request
-    // call is handled by RequestCleanupGuard (streaming) or falls through
-    // to the explicit call below (non-streaming / already-finished).
+    // Signal any active streaming loop to stop.
+    // The actual finish_request call is handled by RequestCleanupGuard (streaming) or falls through to the explicit.
     if let Some(token) = take_cancel_token(id) {
         token.cancel();
     }
 
     if !known {
-        // No active streaming token was found — the request is either unknown
-        // or already torn down. finish_request is idempotent, so calling it
-        // again is harmless and ensures we don't return 404 for a race where
-        // the stream's guard is mid-drop.
+        // No active streaming token was found - the request is either unknown or already torn down.
+        // finish_request is idempotent, so calling it again is harmless and ensures we don't return 404.
         engine.finish_request(id);
         return Ok((
             StatusCode::NOT_FOUND,
@@ -2533,7 +2245,6 @@ pub struct SpeechRequest {
 }
 
 /// OpenAI-compatible text-to-speech synthesis endpoint.
-///
 /// Synthesizes raw audio waveform samples from input text using loaded TextToSpeechModel.
 async fn audio_speech(
     State(state): State<Arc<AppState>>,
@@ -2774,10 +2485,8 @@ async fn audio_translations(
 
 /// OpenAI-compatible image generation endpoint.
 async fn images_generations() -> (StatusCode, Json<serde_json::Value>) {
-    // F5 stage-1 honesty: a loaded Flux2 transformer alone cannot generate —
-    // the pipeline needs prompt text-encoder conditioning and a trained VAE.
-    // Returning unconditioned pixels decoded through a random VAE would
-    // fabricate output, so fail loudly instead (same contract as embeddings).
+    // F5 stage-1 honesty: a loaded Flux2 transformer alone cannot generate - the pipeline needs prompt text-encoder conditioning and a trained VAE.
+    // Returning unconditioned pixels decoded through a random VAE would fabricate output, so fail loudly instead.
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({
@@ -2995,8 +2704,7 @@ fn validate_model_capabilities(
 }
 
 /// P0-WI-3: OpenAI clients send the model identifier under `model`, not `name`.
-/// Accept both via serde rename so existing `grim pull`-style callers using
-/// `name` keep working while OpenAI-shaped clients (which emit `model`) also parse.
+/// Accept both via serde rename so existing `grim pull`-style callers using `name` keep working while.
 #[derive(serde::Deserialize)]
 struct LoadModelRequest {
     #[serde(alias = "name")]
@@ -3015,9 +2723,8 @@ async fn load_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadModelRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // P0-WI-3: prefer a `.grim` sibling when both exist; centralize resolution
-    // in `catalog::resolve_model_preferring_grim` so `/v1/models/load` shares
-    // the same lookup logic as the CLI's on-demand model loader.
+    // P0-WI-3: prefer a `.grim` sibling when both exist; centralize resolution in `catalog::resolve_model_preferring_grim`
+    // so `/v1/models/load` shares the same lookup logic as the CLI's on-demand model loader.
     let resolved_path = grim_core::catalog::resolve_model_preferring_grim(&req.model);
 
     let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
@@ -3025,10 +2732,8 @@ async fn load_model(
     let model_path = match resolved_path {
         Some(p) => p,
         None => {
-            // No on-disk model found — return an explicit error rather than
-            // silently substituting a random-weight mock model (sims.md issue #8).
-            // Returning Ok with a mock would mask the missing artifact and
-            // produce garbage output without any indication of failure.
+            // No on-disk model found - return an explicit error rather than silently substituting a random-weight mock model (sims.md issue #8).
+            // Returning Ok with a mock would mask the missing artifact and produce garbage output without.
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
@@ -3049,10 +2754,8 @@ async fn load_model(
     } else {
         "gguf"
     };
-    // No CPU-retry fallback here: load_from_path owns device selection and
-    // hard-errors when an explicitly requested backend (GRIM_BACKEND /
-    // GRIM_FORCE_DEVICE) is unavailable — retrying on a hardcoded CPU device
-    // would silently defeat that guard (WS-E1).
+    // No CPU-retry fallback here: load_from_path owns device selection and hard-errors when an explicitly requested backend (GRIM_BACKEND
+    // / GRIM_FORCE_DEVICE) is unavailable - retrying on a hardcoded CPU device would silently defeat that guard (WS-E1).
     match model_loader::load_from_path(&model_path_str) {
         Ok(m) => {
             // Tokenizer lives in GGUF metadata; if a .grim is the primary model,
@@ -3081,9 +2784,7 @@ async fn load_model(
                     })
                 });
             *state.model_arch.lock().unwrap_or_else(|e| e.into_inner()) = arch;
-            // SCYTHE-2 farm mode: when GRIM_SCYTHE_INFERENCE is armed and more
-            // than one ROCm GPU is visible, this registers a full weight
-            // replica per GPU and lets the controller pin sessions to ranks.
+            // SCYTHE-2 farm mode: when GRIM_SCYTHE_INFERENCE is armed and more than one ROCm GPU is visible, this registers a full weight replica per GPU and lets the controller pin sessions to ranks.
             // Otherwise identical to register_model (WI-INF3 serving path).
             engine.register_model_with_farm(&req.model, m, &model_path_str);
 
@@ -3267,15 +2968,8 @@ struct LoadAdapterRequest {
     base_model: Option<String>,
 }
 
-/// Load a trained LoRA sidecar (`grim train` output) and register it for
-/// per-request routing WITHOUT an engine restart.
-///
-/// Runtime LoRA application (`lora.rs::apply_adapters_to_logits`) applies
-/// adapter pairs to the logits projection. Sidecars whose pairs target
-/// per-layer projections (Q/K/V/O/Gate/Up/Down — the standard QLoRA sites)
-/// cannot be applied at runtime by that path; for those this endpoint
-/// returns 409 with a per-tensor breakdown and the `grim merge` bake path,
-/// rather than registering inert weights and pretending success.
+/// Load a trained LoRA sidecar (`grim train` output) and register it for per-request routing WITHOUT an engine restart.
+/// Runtime LoRA application (`lora.rs::apply_adapters_to_logits`) applies adapter pairs to the logits projection.
 async fn load_adapter_endpoint(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LoadAdapterRequest>,
@@ -3345,9 +3039,8 @@ async fn load_adapter_endpoint(
             }));
             continue;
         };
-        // Runtime contract (lora.rs): A=[rank, in], B=[out, rank], applied at
-        // the logits projection. Per-layer projections (q_proj/k_proj/…)
-        // never fit that site regardless of shapes.
+        // Runtime contract (lora.rs): A=[rank, in], B=[out, rank], applied at the logits projection.
+        // Per-layer projections (q_proj/k_proj/…) never fit that site regardless of shapes.
         let is_layer_proj = [
             "q_proj",
             "k_proj",
@@ -3619,9 +3312,8 @@ async fn completions(
         .unwrap_or_else(|| "default".to_string());
     let req_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-    // T1.3 param plumbing: honor per-request temperature/top_p/top_k/seed on
-    // BOTH sampling paths — the CPU sampler below and the device-side
-    // sampler (via the request registry).
+    // T1.3 param plumbing: honor per-request temperature/top_p/top_k/seed on BOTH sampling paths -
+    // the CPU sampler below and the device-side sampler (via the request registry).
     let request_params = SamplerParams {
         temperature: payload.temperature,
         top_k: payload.top_k,
@@ -3879,19 +3571,18 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let models = engine.loaded_models();
 
     // Probe VRAM via platform-specific backend
-    let (total_vram_used, total_vram_max, gpu_info) = if let Ok(rocm_devs) =
-        grim_backend_rocm::RocmDevice::probe()
-    {
-        if !rocm_devs.is_empty() {
-            probe_vram_and_gpus(rocm_devs.len())
+    let (total_vram_used, total_vram_max, gpu_info) =
+        if let Ok(rocm_devs) = grim_backend_rocm::RocmDevice::probe() {
+            if !rocm_devs.is_empty() {
+                probe_vram_and_gpus(rocm_devs.len())
+            } else {
+                // Try CUDA first (if compiled in), then Metal, then CPU.
+                probe_gpu_or_cpu()
+            }
         } else {
-            // Try CUDA first (if compiled in), then Metal, then CPU.
+            // No ROCm devices: try CUDA (if compiled in), then Metal, then CPU.
             probe_gpu_or_cpu()
-        }
-    } else {
-        // No ROCm devices: try CUDA (if compiled in), then Metal, then CPU.
-        probe_gpu_or_cpu()
-    };
+        };
 
     let has_gpu = total_vram_max > 0;
     let backend = active_backend(has_gpu);
@@ -4001,12 +3692,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     }))
 }
 
-/// `GET /v1/models` — OpenAI-compatible model catalog endpoint.
-///
-/// Scans the configured models directory for files with recognised
-/// extensions (`.grim`, `.gguf`, `.safetensors`, `.bin`) and returns them
-/// as an OpenAI-style `{ "object": "list", "data": [...] }` response.
-/// Also includes any models currently loaded in the engine.
+/// `GET /v1/models` - OpenAI-compatible model catalog endpoint.
+/// Scans the configured models directory for files with recognised extensions (`.grim`, `.gguf`, `.safetensors`, `.bin`) and.
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entries: Vec<serde_json::Value> = Vec::new();
@@ -4081,11 +3768,8 @@ fn translate_options(req: &serde_json::Value, payload: &mut serde_json::Value) {
     }
 }
 
-/// WI-S6: detect the local host GPU's ROCm profile name for startup/serve
-/// conversion suggestions. Maps the probed `gfx` target to a profile string
-/// (`gfx103x`→`rdna2`, `gfx12xx`→`rdna4`, `gfx11xx`→`rdna3`, `gfx90x`→`cdna3`,
-/// `gfx9xx`→`cdna2`); returns `None` when no ROCm GPU is present so callers
-/// stay silent on non-ROCm hosts.
+/// WI-S6: detect the local host GPU's ROCm profile name for startup/serve conversion suggestions.
+/// Maps the probed `gfx` target to a profile string (`gfx103x`→`rdna2`, `gfx12xx`→`rdna4`, `gfx11xx`→`rdna3`, `gfx90x`→`cdna3`, `gfx9xx`→`cdna2`); returns.
 fn detect_host_rocml_profile() -> Option<String> {
     match grim_backend_rocm::probe_host_gpu(0) {
         Ok(caps) => {
@@ -4186,10 +3870,8 @@ async fn grim_chat(
         payload["adapters"] = adapters.clone();
     }
     translate_options(&req, &mut payload);
-    // Ollama /api/chat carries tool definitions under `tools`; forward them
-    // into the OpenAI-shaped payload so chat_completions engages the WI-TOOLS
-    // 1-5 pipeline (template `tools` variable + output parsing + response
-    // `tool_calls`).
+    // Ollama /api/chat carries tool definitions under `tools`; forward them into the OpenAI-shaped payload so
+    // chat_completions engages the WI-TOOLS 1-5 pipeline (template `tools` variable + output parsing + response `tool_calls`).
     if let Some(tools) = req.get("tools") {
         payload["tools"] = tools.clone();
     }
@@ -4236,9 +3918,8 @@ async fn grim_chat(
                                     .as_str()
                                     .unwrap_or("")
                                     .to_string();
-                                // WI-TOOLS-5: forward OpenAI-side `tool_calls` on
-                                // the terminal delta chunk (the buffered streaming
-                                // MVP emits it once, at end of generation).
+                                // WI-TOOLS-5: forward OpenAI-side `tool_calls` on the terminal delta chunk (the
+                                // buffered streaming MVP emits it once, at end of generation).
                                 let tool_calls = val["choices"][0]["delta"]["tool_calls"].clone();
                                 let mut message = serde_json::json!({
                                     "role": "assistant",
@@ -4327,9 +4008,8 @@ async fn grim_chat(
                 "created_at": utc_now_rfc3339(),
                 "message": message,
                 "done": true,
-                // F-6: real wall-clock measurement; eval_count approximated
-                // from the response content (≈4 chars/token) so Ollama
-                // clients that throttle on these fields get usable data.
+                // F-6: real wall-clock measurement; eval_count approximated from the response content (≈4
+                // chars/token) so Ollama clients that throttle on these fields get usable data.
                 "total_duration": chat_start.elapsed().as_nanos() as u64,
                 "load_duration": 0,
                 "prompt_eval_count": messages.as_array().map(|m| {
@@ -4622,12 +4302,8 @@ async fn grim_pull(
         .unwrap()
 }
 
-/// POST /api/upload?filename=<name>.gguf — save an uploaded model file into the
-/// local catalog (`grim_models_dir()`), then write the JSON sidecar so
-/// `grim run <name>` / `/api/tags` resolve it like any pulled model.
-///
-/// The request body is the raw file bytes (the browser streams it with an
-/// XHR so the dashboard can show native upload-progress events).
+/// POST /api/upload?filename=<name>.gguf - save an uploaded model file into the local catalog (`grim_models_dir()`), then write the JSON sidecar so `grim run <name>` / `/api/tags` resolve it like any pulled model.
+/// The request body is the raw file bytes (the browser streams it with an XHR.
 async fn grim_upload(
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     body: axum::body::Bytes,
@@ -4822,9 +4498,8 @@ pub fn build_router_with_auth(state: Arc<AppState>, api_keys: Vec<String>) -> Ro
         // F-6: alias so `GET /adapters` returns the same JSON list as
         // `/v1/adapters` instead of an empty 200 from a missing route.
         .route("/adapters", get(list_adapters))
-        // F-2: scheduler queue/admission state must be reachable at the same
-        // origin as the server itself — the CLI `grim scheduler` subcommand
-        // and dashboards poll this instead of guessing ports.
+        // F-2: scheduler queue/admission state must be reachable at the same origin as the server
+        // itself - the CLI `grim scheduler` subcommand and dashboards poll this instead of guessing ports.
         .route("/scheduler", get(get_status))
         .route("/api/scheduler", get(get_status));
     let router = if api_keys.is_empty() {
@@ -4919,14 +4594,7 @@ fn load_tls_config_from_file(path: &str) -> Option<TlsConfig> {
 }
 
 /// Start the server on `addr`, optionally pre-loading a model by file path.
-///
-/// `model_path`: when `Some`, the tokenizer and model are loaded from this
-/// GGUF file before the first request arrives, giving clients immediate
-/// availability without waiting for the first chat request to trigger a load.
-/// When `None`, the server starts with an empty engine and loads models
-/// on demand from the local catalog when they are first requested.
-/// F4: keys come from env (`GRIM_API_KEY`, or comma-separated `GRIM_API_KEYS`).
-/// Empty = open server, matching the loopback-by-default posture.
+/// `model_path`: when `Some`, the tokenizer and model are loaded from this GGUF file before the.
 fn load_api_keys_from_env() -> Vec<String> {
     let mut keys: Vec<String> = std::env::var("GRIM_API_KEY")
         .ok()
@@ -4959,11 +4627,8 @@ pub async fn serve(
             api_keys.len()
         );
     }
-    // Attempt to load the tokenizer from the explicitly-given model path,
-    // or by scanning the models directory for the first available GGUF.
-    // For `.grim` files, fall back to a sibling `.gguf` (same stem, `.gguf`
-    // extension) — this mirrors the resolution `grim run` performs at
-    // run.rs:390-398 so `run --serve` and `serve` agree on tokenizer source.
+    // Attempt to load the tokenizer from the explicitly-given model path, or by scanning the models directory for the first available GGUF.
+    // For `.grim` files, fall back to a sibling `.gguf` (same stem, `.gguf` extension) - this.
     let (tokenizer, resolved_path) = if let Some(ref p) = model_path {
         let path_str = p.display().to_string();
         // Try the path directly (works for .gguf files).
@@ -4981,10 +4646,8 @@ pub async fn serve(
         }
         (tok, Some(p.clone()))
     } else {
-        // Scan the models directory for the first available model, preferring
-        // an existing ROCm-tuned `.grim` conversion over a sibling `.gguf`
-        // (WI-S6: once a conversion exists it is used automatically, the same
-        // preference `grim run` applies).
+        // Scan the models directory for the first available model, preferring an existing ROCm-tuned `.grim` conversion over a
+        // sibling `.gguf` (WI-S6: once a conversion exists it is used automatically, the same preference `grim run` applies).
         let models_dir = grim_models_dir();
         let tok_and_path = std::fs::read_dir(&models_dir)
             .ok()
@@ -5036,9 +4699,8 @@ pub async fn serve(
                 tok.map(|t| (t, preferred))
             });
         if let Some((tok, p)) = tok_and_path {
-            // WI-S6: if we auto-loaded a `.gguf` that has no tuned `.grim`
-            // sibling, offer (never silently run) the ROCm conversion on the
-            // detected local GPU profile.
+            // WI-S6: if we auto-loaded a `.gguf` that has no tuned `.grim` sibling,
+            // offer (never silently run) the ROCm conversion on the detected local GPU profile.
             if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
                 if let Some(profile) = detect_host_rocml_profile() {
                     let name = p
@@ -5094,13 +4756,8 @@ pub async fn serve(
 
     let app = build_router_with_auth(state, api_keys);
 
-    // Incoming SSRF posture (§network): the server defaults to loopback
-    // (`127.0.0.1:11434`) so it is never reachable from a routable network
-    // unless the operator explicitly opts in via `GRIM_HOST`/`--address`.
-    // A user-supplied public bind is honored by design (mirrors Ollama's
-    // posture); the guard above is therefore advisory, not enforced here, and
-    // lives in `grim_core::client::is_bind_address_allowed` for callers that
-    // want a hard refusal.
+    // Incoming SSRF posture (§network): the server defaults to loopback (`127.0.0.1:11434`) so it is never reachable from a routable network unless the operator explicitly opts in via `GRIM_HOST`/`--address`.
+    // A user-supplied public bind is honored by design (mirrors Ollama's posture); the guard above is.
     let custom_cfg_path = std::env::var("GRIM_CONFIG_PATH").ok();
     let tls_config = custom_cfg_path
         .as_deref()
@@ -5117,10 +4774,8 @@ pub async fn serve(
                     grim_core::Error::Config(format!("failed to load TLS certificates: {e}"))
                 })?;
 
-        // Resolve the bind address the same way the non-TLS path does
-        // (TcpListener::bind accepts hostnames; addr.parse() only accepts
-        // numeric IPs). This ensures `--address localhost:11434` works
-        // identically over HTTP and HTTPS.
+        // Resolve the bind address the same way the non-TLS path does (TcpListener::bind accepts hostnames; addr.parse() only accepts numeric IPs).
+        // This ensures `--address localhost:11434` works identically over HTTP and HTTPS.
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| grim_core::Error::Config(format!("bind failed: {e}")))?;
@@ -5167,14 +4822,8 @@ pub async fn serve(
     Ok(())
 }
 
-/// Catalog/path resolution shared by `load_model_for_server` and the SCYTHE-2
-/// farm loader (which needs the on-disk path to pull additional replicas).
-///
-/// P0-WI-3: prefers the `.grim` sibling whenever both exist for the same model
-/// name (set after `grim oxidize convert --rocml-profile <target>`). Direct
-/// paths still resolve directly; resolution is centralized in
-/// `catalog::resolve_model_preferring_grim` so `/v1/models/load` shares the
-/// same lookup rules as the CLI.
+/// Catalog/path resolution shared by `load_model_for_server` and the SCYTHE-2 farm loader (which needs the on-disk path to pull additional replicas).
+/// P0-WI-3: prefers the `.grim` sibling whenever both exist for the same model name (set after.
 fn resolve_catalog_model_path(name: &str) -> Option<std::path::PathBuf> {
     if std::path::Path::new(name).exists() {
         return grim_core::catalog::resolve_model_preferring_grim(name);
@@ -5185,9 +4834,7 @@ fn resolve_catalog_model_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Resolve a model name from the local catalog and load it as a `CausalLm`.
-///
 /// Returns `(model_box, Option<tokenizer>)` on success.
-/// Called by `chat_completions` when a requested model is not yet in the engine.
 fn load_model_for_server(
     name: &str,
 ) -> grim_core::error::Result<(
@@ -5217,18 +4864,14 @@ fn load_model_for_server(
                 .and_then(|gg| GgufProvider::open(gg).ok().and_then(|p| p.tokenizer().ok()))
         });
 
-    // WI-3 self-heal: backfill the catalog sidecar from the GGUF header if it
-    // still carries empty arch/zero context_length (older pull or a manually-
-    // placed file whose sidecar predates this fix). Header-only read; failure
-    // is non-fatal since we already have the model loaded for serving.
+    // WI-3 self-heal: backfill the catalog sidecar from the GGUF header if it still carries empty arch/zero context_length (older pull or a manually- placed file whose sidecar predates this fix).
+    // Header-only read; failure is non-fatal since we already have the model loaded for serving.
     grim_core::catalog::self_heal_sidecar(path.as_path());
 
     Ok((model, tokenizer))
 }
 
-// ============================================================================
-// Dashboard endpoint — live stats for the server status page.
-// ============================================================================
+// Dashboard endpoint - live stats for the server status page.
 
 /// `GET /api/stats` — JSON stats snapshot polled by the dashboard at `/`.
 #[doc(hidden)]
@@ -5489,13 +5132,8 @@ fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) 
     (total_vram_used, total_vram_max, gpus_json)
 }
 
-/// `GET /api/stats` — JSON stats snapshot polled by the dashboard at `/`.
-///
-/// WI-1 wire-shape note: `gpus[].compute` is now `Option<u32>` — a real
-/// per-backend utilization probe, or `null` when the backend has no
-/// utilization API. Consumers that previously read `compute` as an
-/// always-present `u32` must tolerate `null`. A permanently-zero column is
-/// worse than an absent one, so `null` is the honest value here.
+/// `GET /api/stats` - JSON stats snapshot polled by the dashboard at `/`.
+/// WI-1 wire-shape note: `gpus[].compute` is now `Option<u32>` - a real per-backend utilization probe, or `null`.
 async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let models = engine.loaded_models();
@@ -5537,8 +5175,7 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
         }
     }
 
-    // Once we wire real telemetry counters into the engine (tokens generated,
-    // wall-clock time per batch, KV block occupancy), this becomes live data.
+    // Once we wire real telemetry counters into the engine (tokens generated, wall-clock time per batch, KV block occupancy), this becomes live data.
     // For now the fields are present and typed so the frontend contract is fixed.
     let (kv_used, kv_total, kv_blocks_used, kv_blocks_total) = engine.kv_cache_telemetry();
     // F-2: expose the scheduler's live three-queue state on the dashboard
@@ -6425,9 +6062,7 @@ async function pollServerStats() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Acquire Models — Pull from Registry
-// ---------------------------------------------------------------------------
+// Acquire Models - Pull from Registry
 (function initAcquireModels() {
   const srcBtns = { ollama: document.getElementById('pull-src-ollama'),
                     hf:     document.getElementById('pull-src-hf') };
@@ -6544,9 +6179,7 @@ async function pollServerStats() {
   btn.addEventListener('click', startPull);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') startPull(); });
 
-  // ---------------------------------------------------------------------------
   // Upload Model File
-  // ---------------------------------------------------------------------------
   const dropzone  = document.getElementById('upload-dropzone');
   const fileInput = document.getElementById('upload-file-input');
   const fileLabel = document.getElementById('upload-filename');
@@ -6717,9 +6350,8 @@ mod tests {
         let _ = (used, total);
     }
 
-    /// WI-1 regression: `compute` must never be a hardcoded `0u32`. On a
-    /// GPU-less box (no ROCm devices) the probe returns `null`, not a
-    /// fabricated zero — a permanently-zero column is worse than absent.
+    /// WI-1 regression: `compute` must never be a hardcoded `0u32`.
+    /// On a GPU-less box (no ROCm devices) the probe returns `null`, not a fabricated zero.
     #[test]
     fn test_probe_compute_is_not_fabricated_zero() {
         // No ROCm devices on this host: the probe falls through to CPU entry.
@@ -7454,10 +7086,8 @@ mod tests {
         );
     }
 
-    /// WI-1 unit test: the local-vs-remote decision must not treat the
-    /// catalog's own `"{stem}:{ext}"` naming convention as a remote provider
-    /// route. This is the exact defect that made every locally-cataloged model
-    /// unusable through `/v1/chat/completions`.
+    /// WI-1 unit test: the local-vs-remote decision must not treat the catalog's own `"{stem}:{ext}"` naming convention as a remote provider route.
+    /// This is the exact defect that made every locally-cataloged model unusable through `/v1/chat/completions`.
     #[test]
     fn test_colon_local_model_name_is_not_remote() {
         // Catalog-style local names: colon-bearing but not a provider scheme.
@@ -7472,9 +7102,8 @@ mod tests {
         assert!(!is_remote_provider_model("openai:"));
     }
 
-    /// WI-1 correctness gate: posting a colon-bearing local catalog-style model
-    /// name that is registered with the engine must be served locally — 200
-    /// with real decoded content, no panic, no 404, no remote-provider detour.
+    /// WI-1 correctness gate: posting a colon-bearing local catalog-style model name that is registered with the engine
+    /// must be served locally - 200 with real decoded content, no panic, no 404, no remote-provider detour.
     #[tokio::test]
     async fn test_chat_completions_serves_colon_bearing_local_model() {
         let state = test_state_with_model("sleipnir:gguf");
@@ -7515,10 +7144,8 @@ mod tests {
         assert_eq!(body["model"].as_str(), Some("sleipnir:gguf"));
     }
 
-    /// WI-1 regression guard on the fix itself: an actual remote-style name
-    /// that is *not* in the local catalog must still take the remote-provider
-    /// branch (which does not register a model), so generation falls through
-    /// to the engine's already-loaded default rather than 404-ing.
+    /// WI-1 regression guard on the fix itself: an actual remote-style name that is *not* in the local catalog must still take
+    /// the remote-provider branch (which does not register a model), so generation falls through to the engine's already-loaded default rather than 404-ing.
     #[tokio::test]
     async fn test_chat_completions_remote_style_name_takes_remote_branch() {
         assert!(is_remote_provider_model("openai:gpt-4"));
@@ -7627,11 +7254,8 @@ mod tests {
         );
     }
 
-    /// E2E test: build .wasm fixture from .wat, register in PluginRegistry,
-    /// and serve a chat request routed via the sampler field. Gated on the
-    /// `wasm-sandbox` feature (opt-in, since it pulls in wasmtime). The
-    /// default-on `test_chat_completions_routes_through_named_plugin_sampler`
-    /// test below verifies the same wire without wasmtime.
+    /// E2E test: build .wasm fixture from .wat, register in PluginRegistry, and serve a chat request routed via the sampler field.
+    /// Gated on the `wasm-sandbox` feature (opt-in, since it pulls in wasmtime).
     #[cfg(feature = "wasm-sandbox")]
     #[tokio::test]
     async fn test_server_wasm_plugin_sampler_routed_chat_request() {
@@ -7737,13 +7361,8 @@ mod tests {
         assert!(body.get("choices").is_some());
     }
 
-    /// Default-on E2E test of the plugin-sampler wire: register a Rust mock
-    /// `Sampler` into a `PluginRegistry`, thread it through `AppState`, send
-    /// a chat request with a `"sampler": "<name>"` field, and assert the
-    /// generated tokens are exactly what the mock returned — proving the
-    /// request-time `state.plugin_registry.get_sampler(name)` lookup actually
-    /// drives sampling instead of dropping the registry. No wasmtime, so
-    /// this runs under `cargo test` with no feature flags.
+    /// Default-on E2E test of the plugin-sampler wire: register a Rust mock `Sampler` into a `PluginRegistry`, thread it through `AppState`, send a chat request with a `"sampler": "<name>"` field, and assert the generated tokens are exactly what the mock returned - proving the request-time `state.plugin_registry.get_sampler(name)` lookup actually drives sampling instead of dropping the registry.
+    /// No wasmtime, so this runs under `cargo test` with no feature flags.
     #[tokio::test]
     async fn test_chat_completions_routes_through_named_plugin_sampler() {
         use grim_core::sampler::Sampler as SamplerTrait;
@@ -7835,9 +7454,8 @@ mod tests {
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .expect("choices[0].message.content is a string");
-        // With `tokenizer: None` the server emits `<tok:N>` per token; the
-        // mock sampler returned 42 for every step, so we expect three
-        // `<tok:42>` markers (one per generated token, bounded by max_tokens).
+        // With `tokenizer: None` the server emits `<tok:N>` per token; the mock sampler returned 42 for
+        // every step, so we expect three `<tok:42>` markers (one per generated token, bounded by max_tokens).
         let count_42 = content.matches("<tok:42>").count();
         assert_eq!(
             count_42, 3,
@@ -7845,11 +7463,8 @@ mod tests {
         );
     }
 
-    /// Negative test: when `sampler` names a missing plugin, the request
-    /// still succeeds (warn-and-fallback to SamplingParams), so the response
-    /// is not a 400. This preserves the strict §13.3 contract (only truly
-    /// unknown *field names* 400) while degrading gracefully for an unknown
-    /// sampler *value*.
+    /// Negative test: when `sampler` names a missing plugin, the request still succeeds (warn-and-fallback to SamplingParams), so the response is not a 400.
+    /// This preserves the strict §13.3 contract (only truly unknown *field names* 400) while degrading gracefully.
     #[tokio::test]
     async fn test_chat_completions_missing_sampler_name_falls_back() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -8028,8 +7643,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // WI-TOOLS-4b/4c error-shape: every chat_completions rejection now
-        // returns OpenAI's structured `{"error": {"type","code","message"}}`
+        // WI-TOOLS-4b/4c error-shape: every chat_completions rejection now returns OpenAI's structured `{"error": {"type","code","message"}}`
         // object with a stable `code` discriminant, not a bare prose string.
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -8333,10 +7947,8 @@ mod tests {
         assert!(body_val_gen.get("response").is_some());
     }
 
-    /// P0-WI-1: `max_tokens` actually bounds generation. The mock model emits
-    /// one `<tok:N>` per generated token, so counting those markers equals the
-    /// token count. With `max_tokens: 7` and no stop sequence we expect exactly
-    /// 7 tokens — not the old hardcoded 5, and not unbounded.
+    /// P0-WI-1: `max_tokens` actually bounds generation.
+    /// The mock model emits one `<tok:N>` per generated token, so counting those markers equals the.
     #[tokio::test]
     async fn test_chat_completions_honors_max_tokens() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -8400,9 +8012,8 @@ mod tests {
         assert_eq!(token_count, 7, "max_tokens: 7 must yield exactly 7 tokens");
     }
 
-    /// Convenience: run one chat_completions request and return the final
-    /// client-visible content — `message.content` for non-streaming, or the
-    /// concatenation of all `delta.content` SSE fragments for streaming.
+    /// Convenience: run one chat_completions request and return the final client-visible content -
+    /// `message.content` for non-streaming, or the concatenation of all `delta.content` SSE fragments for streaming.
     async fn send_and_get_content(app: axum::Router, request_body: &serde_json::Value) -> String {
         let response = app
             .oneshot(
@@ -8444,9 +8055,8 @@ mod tests {
         }
     }
 
-    /// WI-P9 (b): `reasoning_effort` and `thinking` are fully wired into
-    /// `ThinkingLevel` parsing — they must be accepted by KNOWN_FIELDS (not
-    /// 400-rejected) so the parsing code is reachable at all.
+    /// WI-P9 (b): `reasoning_effort` and `thinking` are fully wired into `ThinkingLevel` parsing - they must
+    /// be accepted by KNOWN_FIELDS (not 400-rejected) so the parsing code is reachable at all.
     #[tokio::test]
     async fn test_reasoning_effort_accepted_and_parsed() {
         let state = test_app_state();
@@ -8519,11 +8129,8 @@ mod tests {
         );
     }
 
-    /// WI-P9 (a): the same generation request hitting the same stop sequence
-    /// must produce the same client-visible content whether `stream` is true
-    /// or false. RED before the fix: the streaming path drops the
-    /// stop-triggering token's delta entirely while the non-streaming path
-    /// includes it, so the two diverge.
+    /// WI-P9 (a): the same generation request hitting the same stop sequence must produce the same client-visible content whether `stream` is true or false.
+    /// RED before the fix: the streaming path drops the stop-triggering token's delta entirely while the.
     #[tokio::test]
     async fn test_stop_sequence_stream_matches_non_streaming_content() {
         let state = test_app_state();
@@ -8546,11 +8153,8 @@ mod tests {
             streaming["stream"] = serde_json::Value::Bool(true);
             let streaming_content = send_and_get_content(app.clone(), &streaming).await;
 
-            // The mock engine samples a fresh random token id per request, so
-            // compare digit-normalized content (ids stripped): post-fix both
-            // paths must reduce to exactly ">". Pre-fix the streaming path
-            // emitted nothing (stop-triggering delta dropped), so it reduced
-            // to "" and the assertion failed.
+            // The mock engine samples a fresh random token id per request, so compare digit-normalized content (ids stripped): post-fix both paths must reduce to exactly ">".
+            // Pre-fix the streaming path emitted nothing (stop-triggering delta dropped), so it reduced to "" and.
             let normalize = |c: &str| {
                 c.chars()
                     .filter(|ch| !ch.is_ascii_digit())
@@ -8610,9 +8214,8 @@ mod tests {
         })
     }
 
-    /// P0-WI-1: a `stop` sequence that matches every generated token (the
-    /// mock emits `<tok:N>`) must terminate generation after the first token,
-    /// regardless of `max_tokens`. This proves stop is honored, not ignored.
+    /// P0-WI-1: a `stop` sequence that matches every generated token (the mock emits `<tok:N>`) must terminate generation after the first token, regardless of `max_tokens`.
+    /// This proves stop is honored, not ignored.
     #[tokio::test]
     async fn test_chat_completions_honors_stop_sequence() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -8686,9 +8289,8 @@ mod tests {
         );
     }
 
-    /// P0-WI-1: streaming mode stop sequence test — asserts that when a stop
-    /// sequence is hit during streaming, the stop sequence string itself is
-    /// absent from the concatenated SSE deltas.
+    /// P0-WI-1: streaming mode stop sequence test - asserts that when a stop sequence is
+    /// hit during streaming, the stop sequence string itself is absent from the concatenated SSE deltas.
     #[tokio::test]
     async fn test_chat_completions_streaming_honors_stop_sequence() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -8768,9 +8370,8 @@ mod tests {
         );
     }
 
-    /// WI-TOOLS-1: `tools` and `tool_choice` are now accepted by KNOWN_FIELDS
-    /// (previously hard-400'd). A non-tool-capable model produces an ordinary
-    /// completion, but the request must succeed rather than be rejected.
+    /// WI-TOOLS-1: `tools` and `tool_choice` are now accepted by KNOWN_FIELDS (previously hard-400'd).
+    /// A non-tool-capable model produces an ordinary completion, but the request must succeed rather than be.
     #[tokio::test]
     async fn test_server_accepts_tools_field() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -8905,12 +8506,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// WI-TOOLS-4b hard guard: a tool call that has already appeared 4 times in
-    /// the conversation history (making this the 5th) must be rejected with
-    /// 400, while a genuinely distinct call must not trigger. Asserted directly
-    /// against the guard logic — the spec's gate is a fixture of prior call
-    /// counts, and the random mock model cannot emit a deterministic tool-call
-    /// completion to exercise the HTTP path.
+    /// WI-TOOLS-4b hard guard: a tool call that has already appeared 4 times in the conversation history (making this the 5th) must be rejected with 400, while a genuinely distinct call must not trigger.
+    /// Asserted directly against the guard logic - the spec's gate is a fixture of prior.
     #[test]
     fn test_hard_guard_thresholds() {
         // Build a history of 4 prior identical assistant tool calls.
@@ -8977,9 +8574,8 @@ mod tests {
         );
     }
 
-    /// WI-TOOLS-4c-ii: a `messages` array exceeding the engine-config cap must
-    /// be rejected with 400 *before* any generation — exercising the early
-    /// pre-generation check co-located with KNOWN_FIELDS validation.
+    /// WI-TOOLS-4c-ii: a `messages` array exceeding the engine-config cap must be rejected with 400
+    /// *before* any generation - exercising the early pre-generation check co-located with KNOWN_FIELDS validation.
     #[tokio::test]
     async fn test_messages_len_cap_rejects_before_generation() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig {
@@ -9119,13 +8715,10 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // WI-CANCEL tests
-    // -----------------------------------------------------------------------
 
-    /// WI-CANCEL-2: `RequestCleanupGuard` calls `finish_request` exactly once
-    /// when dropped. Proves the Drop guard fires its cleanup and that a
-    /// double-drop doesn't double-call finish_request.
+    /// WI-CANCEL-2: `RequestCleanupGuard` calls `finish_request` exactly once when dropped.
+    /// Proves the Drop guard fires its cleanup and that a double-drop doesn't double-call finish_request.
     #[test]
     fn test_cleanup_guard_runs_finish_request_on_drop() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -9208,9 +8801,8 @@ mod tests {
         assert_eq!(val["error"]["code"], "unknown_request");
     }
 
-    /// WI-CANCEL-1: cancelling a known-but-not-streaming request (no
-    /// CancellationToken registered) returns 200 with `state: cancelled`
-    /// and tears down the request via finish_request.
+    /// WI-CANCEL-1: cancelling a known-but-not-streaming request (no CancellationToken registered) returns 200
+    /// with `state: cancelled` and tears down the request via finish_request.
     #[tokio::test]
     async fn test_cancel_known_request_returns_200() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -9262,8 +8854,7 @@ mod tests {
     }
 
     /// WI-CANCEL-0: non-streaming request teardown calls finish_request.
-    /// After a non-streaming chat completion completes, every per-request
-    /// HashMap entry on Engine must be empty.
+    /// After a non-streaming chat completion completes, every per-request HashMap entry on Engine must be empty.
     #[tokio::test]
     async fn test_non_streaming_finish_request_called() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
@@ -9328,19 +8919,8 @@ mod tests {
         assert!(engine.request_last_token.is_empty());
     }
 
-    /// Safety regression guard: `AppState.engine` must remain `Mutex<Engine>`,
-    /// not `RwLock<Engine>` or an unwrapped `Engine`. An `RwLock` would allow
-    /// concurrent *readers*, which is exactly the access pattern the
-    /// `unsafe impl Send + Sync` blocks on ROCm device types
-    /// (`RocmDevice`, `NcclComm`, `HostStagingBuffer`, `StagingCache`,
-    /// `QuantizedMatmulBackwardResiduals`) are NOT proven safe against — those
-    /// types depend on the "exactly one caller at a time" invariant that only a
-    /// `Mutex` (not an `RwLock`) enforces. If a future refactor changes this to
-    /// `RwLock`, add internal locking to those types first.
-    ///
-    /// This is a compile-time assertion via type annotation — if `AppState.engine`
-    /// is ever changed from `Mutex<Engine>` to something else, this binding will
-    /// fail to compile.
+    /// Safety regression guard: `AppState.engine` must remain `Mutex<Engine>`, not `RwLock<Engine>` or an unwrapped `Engine`.
+    /// An `RwLock` would allow concurrent *readers*, which is exactly the access pattern the `unsafe impl.
     #[test]
     fn test_appstate_engine_is_mutex() {
         // Type annotation forces `engine` to be `Mutex<Engine>` — if AppState

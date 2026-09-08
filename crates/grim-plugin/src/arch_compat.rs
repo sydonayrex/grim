@@ -1,22 +1,13 @@
 //! Architecture compatibility generator and spec parser for HuggingFace `config.json`.
-//!
-//! §6 of Grim architecture. Ingests raw HuggingFace model `config.json` files (e.g., Ling-2.6-flash,
-//! Qwen, LFM2, custom models) and generates a structured `ArchCompatSpec` containing parameter mappings,
-//! tensor remapping rules, and architecture capability declarations for dynamic plugin registration.
+//! §6 of Grim architecture.
 
 use grim_core::architecture::{ModelArchitecture, TensorNamingRegistry};
 use grim_core::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Vision encoder sub-specification.
-///
-/// Lenient deserialization: all fields have defaults so that any HF vision_config
-/// shape (e.g. Qwen3.8-27B's `qwen3_5`-type vision_config, older
-/// `vision_encoder`-type configs, or partial configs) parses without error.
-/// Callers should check `vision_spec.is_some()` to detect the presence of a
-/// vision config, then read only the fields they need — missing fields will have
-/// their default values.
+/// Vision encoder sub-specification. Lenient deserialization: all fields have
+/// defaults so that any HF vision_config shape (e.g.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VisionEncoderSpec {
     #[serde(default)]
@@ -53,10 +44,8 @@ impl VisionEncoderSpec {
     }
 }
 
-/// Audio encoder sub-specification.
-///
-/// Lenient deserialization: all fields have defaults so that any HF audio_config
-/// shape parses without error.
+/// Audio encoder sub-specification. Lenient deserialization: all fields have defaults
+/// so that any HF audio_config shape parses without error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioEncoderSpec {
     #[serde(default = "AudioEncoderSpec::default_decoder_dmodel")]
@@ -167,10 +156,8 @@ struct RawHfConfig {
     n_routed_experts: Option<usize>,
     #[serde(rename = "num_experts_per_tok")]
     num_experts_per_tok: Option<usize>,
-    // MoE routed-expert output scaling. HF configs use either
-    // `routed_scaling_factor` (Qwen3-MoE / DeepSeek-V2) or, in some
-    // SmolLM2-derived checkpoints, `expert_gating_func` (a string like "softmax"
-    // or "silu", NOT a float).
+    // MoE routed-expert output scaling. HF configs use either `routed_scaling_factor` (Qwen3-MoE / DeepSeek-V2) or,
+    // in some SmolLM2-derived checkpoints, `expert_gating_func` (a string like "softmax" or "silu", NOT a float).
     #[serde(rename = "routed_scaling_factor")]
     routed_scaling_factor: Option<f32>,
     #[serde(rename = "expert_gating_func")]
@@ -266,11 +253,8 @@ impl ArchCompatSpec {
 
         let tensor_name_mapping = TensorNamingRegistry::remap_hf_to_gguf(model_arch, num_layers);
 
-        // When the model_type doesn't correspond to a native ModelArchitecture
-        // variant, report the base_architecture as "dynamic:{model_type}" rather
-        // than "unknown" — the diagnostic in model_loader.rs's fallback arm will
-        // print this, giving operators a readable hint about what was resolved
-        // rather than a generic "unknown".
+        // When the model_type doesn't correspond to a native ModelArchitecture variant, report the base_architecture as "dynamic:{model_type}" rather than "unknown" - the diagnostic
+        // in model_loader.rs's fallback arm will print this, giving operators a readable hint about what was resolved rather than a generic "unknown".
         let base_architecture = if model_arch == ModelArchitecture::Unknown {
             format!("dynamic:{model_type}")
         } else {
@@ -315,33 +299,8 @@ impl ArchCompatSpec {
             .map_err(|e| Error::Config(format!("Failed to serialize ArchCompatSpec to TOML: {e}")))
     }
 
-    /// Fetch a HuggingFace repo's `config.json` via the Hub `resolve/main/` endpoint
-    /// and build the spec.
-    ///
-    /// Hits `GET https://huggingface.co/{org}/{repo}/resolve/main/config.json` with a
-    /// `User-Agent: hf-cli/0.1` header, which is required by the HF CDN to return the
-    /// full config.json (without it, the response may be a truncated/LFS-pointer subset).
-    /// Delegates to `from_hf_config_json` for parsing.
-    ///
-    /// # Failure modes
-    ///
-    /// - Network / HTTP errors → `Error::Config`.
-    /// - Non-200 response (404, etc.) → `Error::Config` with the status code.
-    /// - Response that doesn't parse as JSON → `Error::Config`.
-    /// - Parsed config missing required fields (model_type, num_hidden_layers, hidden_size)
-    ///   → `Error::Config` via `validate_required_fields`. Unlike `from_hf_config_json`
-    ///   alone (which silently defaults), the network-fetch path rejects incomplete configs
-    ///   because a real HF repo's config.json should always have these fields.
-    ///
-    /// # Why `resolve/main/` and not `/api/models/`?
-    ///
-    /// The `/api/models/{org}/{repo}` endpoint embeds a *deserialised* `config` object,
-    /// but for Qwen3.8-27B that embedded object is missing key fields (`num_hidden_layers`,
-    /// `hidden_size`, `vocab_size`, etc. — only `model_type` and `chat_template_jinja`
-    /// are present). The raw `resolve/main/config.json` file has the complete nested
-    /// structure (including `text_config` sub-object with all the real parameters).
-    /// The raw file is the authoritative source and is what `from_hf_config_json` was
-    /// designed to parse.
+    /// Fetch a HuggingFace repo's `config.json` via the Hub `resolve/main/` endpoint and build the spec.
+    /// Hits `GET https://huggingface.co/{org}/{repo}/resolve/main/config.json` with a `User-Agent: hf-cli/0.1` header, which is required by the HF CDN.
     pub async fn from_hf_model_id(org_repo: &str) -> Result<Self> {
         let config_url = format!("https://huggingface.co/{org_repo}/resolve/main/config.json");
         let client = reqwest::Client::builder()
@@ -374,13 +333,7 @@ impl ArchCompatSpec {
     }
 
     /// Translate a tensor name using the bidirectional mapping table generated for this spec.
-    ///
-    /// Checks forward mapping (`hf -> gguf`) and reverse mapping (`gguf -> hf`). If a match
-    /// is found, returns the translated tensor name; otherwise returns the input name unchanged.
-    ///
-    /// The reverse lookup is deterministic: when multiple HF names map to the same GGUF name,
-    /// the HF standard naming (with `model.` prefix) is preferred over internal loader
-    /// canonical names.
+    /// Checks forward mapping (`hf -> gguf`) and reverse mapping (`gguf -> hf`).
     pub fn remap_tensor_name(&self, name: &str) -> String {
         if let Some(mapped) = self.tensor_name_mapping.get(name) {
             return mapped.clone();
@@ -403,18 +356,8 @@ impl ArchCompatSpec {
     }
 }
 
-/// Validate that a spec parsed from a *real* HF repo's config.json has the
-/// required fields. `from_hf_config_json` silently defaults missing fields
-/// (e.g. `model_type` → `"custom"`, `hidden_size` → 4096), so a network
-/// fetch that returns a genuinely incomplete config must be rejected here
-/// rather than silently installed with wrong defaults.
-///
-/// Rejects:
-/// - `model_type` that is empty OR the `"custom"` sentinel (meaning
-///   `from_hf_config_json` found no `model_type` in the config).
-/// - `num_layers == 0` (a config that specified 0 layers, or a malformed
-///   config where the field parsed as 0).
-/// - `hidden_size == 0` (same logic).
+/// Validate that a spec parsed from a *real* HF repo's config.json has the required fields.
+/// `from_hf_config_json` silently defaults missing fields (e.g.
 fn validate_required_fields(spec: &ArchCompatSpec) -> Result<()> {
     if spec.model_type.is_empty() || spec.model_type == "custom" {
         return Err(Error::Config(
@@ -430,13 +373,9 @@ fn validate_required_fields(spec: &ArchCompatSpec) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -481,27 +420,15 @@ mod tests {
         assert_eq!(spec.rms_norm_eps, 1e-6);
         assert_eq!(spec.max_seq_len, 262144);
         // NOTE: ArchCompatSpec has no partial_rotary_factor field today.
-        // Qwen3.8-27B's config.json specifies partial_rotary_factor: 0.25 in
-        // text_config, but from_hf_config_json does NOT read it (it's not in
-        // RawHfConfig). This is a known gap — see the design question doc and
-        // the model_loader.rs GGUF-load path which reads
-        // config.partial_rotary_factor separately. For the plugin-generation path
-        // this means a Qwen3.8-27B .grimplugin would ship with the default
-        // partial_rotary_factor (1.0, set in Qwen35/Qwen3 wrappers) unless the
-        // loader path is also updated. Flagged for follow-up; not blocking the
-        // plugin-generation work item.
+        // Qwen3.8-27B's config.json specifies partial_rotary_factor: 0.25 in text_config, but from_hf_config_json does NOT read it (it's not.
         assert!(
             spec.rope_theta > 0.0,
             "rope_theta must be set (default 10000.0 if absent)"
         );
     }
 
-    /// Green target: a non-existent org/repo returns `Err`, not a panic or a
-    /// defaulted spec. The error should surface the failed fetch, not silently
-    /// produce garbage.
-    ///
-    /// NOTE: requires network access to huggingface.co. Ignored by default —
-    /// run with `--ignored` to exercise.
+    /// Green target: a non-existent org/repo returns `Err`, not a panic or a defaulted spec.
+    /// The error should surface the failed fetch, not silently produce garbage.
     #[tokio::test]
     #[ignore]
     async fn from_hf_model_id_rejects_nonexistent_repo() {
@@ -532,17 +459,8 @@ mod tests {
         );
     }
 
-    /// Green target: a config missing `num_hidden_layers` (num_layers == 0
-    /// after defaulting? No — from_hf_config_json defaults num_layers to 32 when
-    /// missing, so this test must construct a spec where num_layers is
-    /// *actually* 0, which requires a config with `"num_hidden_layers": 0`).
-    ///
-    /// Note: `from_hf_config_json` will parse `"num_hidden_layers": 0` as 0
-    /// (it's `Option<usize>` deserialized from JSON, and 0 is a valid usize).
-    /// The `.unwrap_or(32)` only fires when the field is *absent*, not when it's
-    /// present and zero. So this test is valid: a config with
-    /// `"num_hidden_layers": 0` produces num_layers == 0, and validation must
-    /// reject it.
+    /// Green target: a config missing `num_hidden_layers` (num_layers == 0 after defaulting?
+    /// No - from_hf_config_json defaults num_layers to 32 when missing, so this test must construct a.
     #[test]
     fn validate_required_fields_rejects_zero_num_layers() {
         let spec = ArchCompatSpec::from_hf_config_json(
@@ -557,12 +475,8 @@ mod tests {
         );
     }
 
-    /// Green target: a config missing `hidden_size` (with hidden_size == 0 after
-    /// the `.unwrap_or(4096)` default — wait, hidden_size defaults to 4096 when
-    /// absent, so this test needs `"hidden_size": 0` to get hidden_size == 0).
-    ///
-    /// Same logic as num_layers: `.unwrap_or(4096)` fires only when the field is
-    /// absent, not when it's present and zero.
+    /// Green target: a config missing `hidden_size` (with hidden_size == 0 after the `.unwrap_or(4096)` default - wait, hidden_size defaults to 4096 when absent, so this test needs `"hidden_size": 0` to get hidden_size == 0).
+    /// Same logic as num_layers: `.unwrap_or(4096)` fires only when the field is absent, not when it's.
     #[test]
     fn validate_required_fields_rejects_zero_hidden_size() {
         let spec = ArchCompatSpec::from_hf_config_json(
@@ -603,29 +517,8 @@ mod tests {
         assert!(json.contains("ling"));
     }
 
-    /// Integration test: pull Inkling-Small's config.json from HF via
-    /// `from_hf_model_id` and verify the spec matches the known values.
-    ///
-    /// NOTE: requires network access to huggingface.co. Ignored by default —
-    /// run with `--ignored` to exercise.
-    ///
-    /// This replaces the local-file `test_inkling_config_json_ingestion` test
-    /// with a real HF API pull, exercising the full `resolve/main/config.json`
-    /// → `from_hf_config_json` → spec pipeline end-to-end.
-    ///
-    /// Known-good values from Inkling-Small's config.json (verified against the
-    /// repo's raw config.json):
-    ///   - text_config.num_hidden_layers: 42
-    ///   - text_config.hidden_size: 4096
-    ///   - text_config.vocab_size: 201024
-    ///   - text_config.num_attention_heads: 32
-    ///   - text_config.num_key_value_heads: 8
-    ///   - text_config.head_dim: 128
-    ///   - model_max_length: 1048576
-    ///   - text_config.n_routed_experts: 256 (expert_count)
-    ///   - text_config.num_experts_per_tok: 6 (expert_used_count)
-    ///   - vision_config.patch_size: 40
-    ///   - audio_config.n_mel_bins: 80
+    /// Integration test: pull Inkling-Small's config.json from HF via `from_hf_model_id` and verify the spec matches the known values.
+    /// NOTE: requires network access to huggingface.co.
     #[tokio::test]
     #[ignore]
     async fn from_hf_model_id_pulls_inkling_small_from_hf() {
@@ -638,9 +531,8 @@ mod tests {
         validate_required_fields(&spec).expect("Inkling-Small config must have required fields");
 
         assert_eq!(spec.model_type, "inkling_mm_model");
-        // base_architecture for an unrecognized model_type is now "dynamic:{model_type}"
-        // (set in from_hf_config_json when model_arch == Unknown), giving operators
-        // a readable diagnostic instead of a generic "unknown".
+        // base_architecture for an unrecognized model_type is now "dynamic:{model_type}" (set in from_hf_config_json when
+        // model_arch == Unknown), giving operators a readable diagnostic instead of a generic "unknown".
         assert_eq!(
             spec.base_architecture, "dynamic:inkling_mm_model",
             "unrecognized model_type should get dynamic:inkling_mm_model base_architecture"

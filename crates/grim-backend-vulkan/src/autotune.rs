@@ -92,9 +92,7 @@ impl VulkanAutotuner {
     }
 
     /// Load autotune cache from disk for a specific hardware fingerprint.
-    /// Restores previously measured winners so a repeat shape on the same GPU hits the
-    /// cache instead of re-searching. JSON object keys must be strings, so the in-memory
-    /// tuple key is flattened to a Vec of records on disk.
+    /// Restores previously measured winners so a repeat shape on the same GPU hits the cache.
     pub fn load_cache(&self, caps: &VulkanCaps) {
         let hash = caps.cache_key_hash();
         let path = Self::cache_path(hash);

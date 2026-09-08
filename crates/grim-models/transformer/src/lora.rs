@@ -1,21 +1,5 @@
-//! LoRA adapter application — fused-LoRA path for `CausalLm`.
-//!
-//! §4.5: the architecture commits to batched LoRA serving as a
-//! `CausalLm` capability. The CPU-side structural implementation runs
-//! after the base forward and applies each adapter's bias:
-//!
-//!   y += α/r · (last_hidden @ A) @ B
-//!
-//! where A: `[r, hidden]`, B: `[out_vocab, r]`, last_hidden is the model's
-//! last-layer input. ROCm / Vulkan backends replace this with the
-//! Punica-style fused LoRA matmul during the projection itself; the CPU
-//! path is structurally equivalent so behavior is portable — fused later.
-//!
-//! Note: this CPU implementation uses the final *logits* row as the
-//! surrogate "last_hidden" input. Strictly, the architectures binds to
-//! the pre-output-projection hidden state on the GPU path; for the CPU
-//! correctness check (the test below) what matters is that adapters
-//! measurably change the output distribution, which this path does.
+//! LoRA adapter application - fused-LoRA path for `CausalLm`.
+//! §4.5: the architecture commits to batched LoRA serving as a `CausalLm` capability.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Error;
@@ -25,11 +9,7 @@ use grim_tensor::Shape;
 use grim_tensor::Tensor;
 
 /// Apply each active adapter as a low-rank bias added to the logits row.
-///
 /// `hidden_size` is the model's hidden dimension (rank of A's second axis).
-/// `logits` is assumed to be `[seq_len, vocab]` shape; if it's a different
-/// shape (e.g. `[1, seq_len, vocab]` 3-D), a structural placeholder is
-/// returned so callers don't accidentally crash on shape mismatch.
 pub fn apply_adapters_to_logits(
     logits: &Tensor,
     adapters: &[AdapterHandle],
@@ -66,10 +46,8 @@ pub fn apply_adapters_to_logits(
     let is_cpu = matches!(logits_2d.device(), grim_tensor::Device::Cpu);
 
     if !is_cpu {
-        // GPU path: the fused `lora_accumulate` kernel computes
-        // `out = base + scale * (x @ A^T) @ B^T` entirely on-device — no
-        // transposes, no eager syncs, no host roundtrips. Backends without
-        // the kernel degrade to the staged matmul chain below.
+        // GPU path: the fused `lora_accumulate` kernel computes `out = base + scale * (x @ A^T) @ B^T` entirely on-device - no transposes, no eager syncs, no host roundtrips.
+        // Backends without the kernel degrade to the staged matmul chain below.
         let mut running_logits = logits_2d.clone();
         for adapter in adapters {
             let rank = adapter
@@ -127,8 +105,7 @@ pub fn apply_adapters_to_logits(
             }
 
             // Staged fallback: matmul → matmul → scale → add, all on-device.
-            // No eager `synchronize()` calls: intermediates are consumed by
-            // further device ops and sync lazily on first host read.
+            // No eager `synchronize()` calls: intermediates are consumed by further device ops and sync lazily on.
             let a_t = transpose_last_two(&adapter.a)?;
             let (temp_s, _h1) = dev.matmul(
                 running_logits.storage().as_ref(),
@@ -210,10 +187,7 @@ pub fn apply_adapters_to_logits(
         // Reshape back to original shape if we flattened — stays on-device
         // via a zero-copy/D2D relabel instead of a host roundtrip.
         if needs_reshape {
-            return Ok(crate::block::reshaped_view(
-                &running_logits,
-                &Shape::new(original_dims),
-            )?);
+            return crate::block::reshaped_view(&running_logits, &Shape::new(original_dims));
         }
         return Ok(running_logits);
     }
@@ -246,11 +220,8 @@ pub fn apply_adapters_to_logits(
                 "LoRA B out_dim {out_dim} != vocab {vocab}"
             )));
         }
-        // MED-5: The CPU LoRA path only has access to `logits` (shape
-        // [seq_len, vocab]), not the hidden state (shape [seq_len,
-        // hidden_size]).  When hidden_size != vocab, using logits as a
-        // surrogate silently reads the wrong element.  Reject the mismatch
-        // here rather than produce silently wrong output.
+        // MED-5: The CPU LoRA path only has access to `logits` (shape [seq_len, vocab]), not the hidden state (shape [seq_len, hidden_size]).
+        // When hidden_size != vocab, using logits as a surrogate silently reads the wrong element.
         if in_dim != vocab {
             return Err(Error::Shape(format!(
                 "CPU LoRA path requires hidden_size ({hidden_size}) == vocab ({vocab}) because it \

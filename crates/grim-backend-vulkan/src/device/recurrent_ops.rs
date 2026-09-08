@@ -1,21 +1,16 @@
 //! `RecurrentOps` implementation for VulkanDevice.
-//!
-//! Extracted from lib.rs (modularization): trait impls live in `device/`,
-//! dispatch plumbing in `kernel.rs`, buffers in `storage.rs`, device init
-//! in `context.rs`.
+//! Extracted from lib.rs (modularization): trait impls live in `device/`, dispatch plumbing in `kernel.rs`, buffers in.
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::DType;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendStorage, Shape, CoreTensorOps, RecurrentOps};
+use grim_tensor::{BackendStorage, CoreTensorOps, RecurrentOps, Shape};
 
 use crate::context::global_context;
-use crate::kernel::{push_params, run_compute_shader_kernel, VulkanKernel};
+use crate::kernel::{VulkanKernel, push_params, run_compute_shader_kernel};
 use crate::{VulkanDevice, VulkanHandle, VulkanStorage};
 
 impl RecurrentOps for VulkanDevice {
-
-
     fn selective_scan(
         &self,
         x: &dyn BackendStorage,
@@ -78,7 +73,6 @@ impl RecurrentOps for VulkanDevice {
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
-
     fn rwkv_time_mix(
         &self,
         x: &dyn BackendStorage,
@@ -134,7 +128,6 @@ impl RecurrentOps for VulkanDevice {
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
-
     fn rwkv_channel_mix(
         &self,
         x: &dyn BackendStorage,
@@ -171,17 +164,11 @@ impl RecurrentOps for VulkanDevice {
         let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
-    // ---------------------------------------------------------------------------
-    // Tier B complex — recurrent/conv-step kernels (audit gap: LFM2/KDA/SSM
-    // decode hit Err(Unimplemented) on Vulkan). CPU-reference fallbacks that
-    // mirror the documented kernel contract. A device kernel is the documented
-    // upgrade for decode-path latency.
-    // ---------------------------------------------------------------------------
+    // Tier B complex - recurrent/conv-step kernels (audit gap: LFM2/KDA/SSM decode hit Err(Unimplemented) on Vulkan).
+    // CPU-reference fallbacks that mirror the documented kernel contract.
 
-    /// Depthwise 1D causal convolution decode step with a rolling conv-state
-    /// buffer. `state` holds the past `k_size-1` inputs; the new `x` is the
-    /// current input. Output = conv(state ++ [x], weight) + bias, then state
-    /// shifts by one. ROCm kernel: `grim_short_conv1d_causal_step`.
+    /// Depthwise 1D causal convolution decode step with a rolling conv-state buffer.
+    /// `state` holds the past `k_size-1` inputs; the new `x` is the current input.
     fn short_conv1d_causal_step(
         &self,
         x: &dyn BackendStorage,
@@ -198,7 +185,11 @@ impl RecurrentOps for VulkanDevice {
         let (batch, k_size, channels) = match dims.len() {
             3 => (dims[0], dims[1], dims[2]),
             2 => (1, dims[0], dims[1]),
-            _ => return Err(Error::Shape("short_conv1d: expected 2-D or 3-D out_shape".into())),
+            _ => {
+                return Err(Error::Shape(
+                    "short_conv1d: expected 2-D or 3-D out_shape".into(),
+                ));
+            }
         };
         // weight layout: [channels, 1, k_size] flattened -> stride k_size.
         if w_v.len() != channels * k_size {
@@ -218,7 +209,11 @@ impl RecurrentOps for VulkanDevice {
                         let src = if t <= k {
                             // current + recent past from x/state
                             let back = k - t;
-                            if back == 0 { x_v[b_idx * channels + c] } else { st_v[c * (k_size - 1) + (back - 1)] }
+                            if back == 0 {
+                                x_v[b_idx * channels + c]
+                            } else {
+                                st_v[c * (k_size - 1) + (back - 1)]
+                            }
                         } else {
                             0.0
                         };
@@ -232,9 +227,8 @@ impl RecurrentOps for VulkanDevice {
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-    /// KDA gated delta-rule recurrent step: `S' = g·S + β·v·kᵀ`,
-    /// `o = q·S'` (gated delta rule, DeltaNet-family). ROCm kernel:
-    /// `grim_kda_gated_delta_rule_step`.
+    /// KDA gated delta-rule recurrent step: `S' = g·S + β·v·kᵀ`, `o = q·S'` (gated delta rule, DeltaNet-family).
+    /// ROCm kernel: `grim_kda_gated_delta_rule_step`.
     fn kda_gated_delta_rule_step(
         &self,
         q: &dyn BackendStorage,
@@ -274,7 +268,9 @@ impl RecurrentOps for VulkanDevice {
         let mut out = vec![0.0f32; out_len];
         for j in 0..d_v.min(out_len) {
             let mut acc = 0.0f32;
-            for i in 0..d_k { acc += q_v[i] * s_new[i * d_v + j]; }
+            for i in 0..d_k {
+                acc += q_v[i] * s_new[i * d_v + j];
+            }
             out[j] = acc;
         }
         let storage = self.from_cpu(&out, out_shape, DType::F32)?;
@@ -296,18 +292,24 @@ impl RecurrentOps for VulkanDevice {
         num_heads: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = q.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan delta_rule: q is not VulkanStorage".into())
-        })?;
-        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan delta_rule: k is not VulkanStorage".into())
-        })?;
-        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan delta_rule: v is not VulkanStorage".into())
-        })?;
-        let state_s = state.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan delta_rule: state is not VulkanStorage".into())
-        })?;
+        let q_s = q
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan delta_rule: q is not VulkanStorage".into()))?;
+        let k_s = k
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan delta_rule: k is not VulkanStorage".into()))?;
+        let v_s = v
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan delta_rule: v is not VulkanStorage".into()))?;
+        let state_s = state
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan delta_rule: state is not VulkanStorage".into())
+            })?;
 
         let ctx_guard = global_context();
         let ctx = ctx_guard
@@ -321,7 +323,13 @@ impl RecurrentOps for VulkanDevice {
             ctx.physical_device,
         )?;
 
-        let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, state_s.buffer, out_storage.buffer];
+        let buffers = [
+            q_s.buffer,
+            k_s.buffer,
+            v_s.buffer,
+            state_s.buffer,
+            out_storage.buffer,
+        ];
         let push = push_params(d_k as u32, d_v as u32, 0, 0, 0, beta);
         let grid_y = num_heads.max(1) as u32;
 
@@ -336,7 +344,10 @@ impl RecurrentOps for VulkanDevice {
         )
         .map_err(|e| Error::Backend(format!("Vulkan delta_rule dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     /// RWKV-4 WKV weighted key-value recurrence.
@@ -353,30 +364,48 @@ impl RecurrentOps for VulkanDevice {
         dim: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: k is not VulkanStorage".into())
-        })?;
-        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: v is not VulkanStorage".into())
-        })?;
-        let r_s = r.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: r is not VulkanStorage".into())
-        })?;
-        let tf_s = time_first.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: time_first is not VulkanStorage".into())
-        })?;
-        let td_s = time_decay.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: time_decay is not VulkanStorage".into())
-        })?;
-        let aa_s = state_aa.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: state_aa is not VulkanStorage".into())
-        })?;
-        let bb_s = state_bb.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: state_bb is not VulkanStorage".into())
-        })?;
-        let pp_s = state_pp.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_wkv: state_pp is not VulkanStorage".into())
-        })?;
+        let k_s = k
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_wkv: k is not VulkanStorage".into()))?;
+        let v_s = v
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_wkv: v is not VulkanStorage".into()))?;
+        let r_s = r
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_wkv: r is not VulkanStorage".into()))?;
+        let tf_s = time_first
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rwkv_wkv: time_first is not VulkanStorage".into())
+            })?;
+        let td_s = time_decay
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rwkv_wkv: time_decay is not VulkanStorage".into())
+            })?;
+        let aa_s = state_aa
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rwkv_wkv: state_aa is not VulkanStorage".into())
+            })?;
+        let bb_s = state_bb
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rwkv_wkv: state_bb is not VulkanStorage".into())
+            })?;
+        let pp_s = state_pp
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rwkv_wkv: state_pp is not VulkanStorage".into())
+            })?;
 
         let ctx_guard = global_context();
         let ctx = ctx_guard
@@ -391,8 +420,15 @@ impl RecurrentOps for VulkanDevice {
         )?;
 
         let buffers = [
-            k_s.buffer, v_s.buffer, r_s.buffer, tf_s.buffer, td_s.buffer,
-            aa_s.buffer, bb_s.buffer, pp_s.buffer, out_storage.buffer,
+            k_s.buffer,
+            v_s.buffer,
+            r_s.buffer,
+            tf_s.buffer,
+            td_s.buffer,
+            aa_s.buffer,
+            bb_s.buffer,
+            pp_s.buffer,
+            out_storage.buffer,
         ];
         let push = [dim as u32, 0, 0, 0, 0, 0];
 
@@ -407,7 +443,10 @@ impl RecurrentOps for VulkanDevice {
         )
         .map_err(|e| Error::Backend(format!("Vulkan rwkv_wkv dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     /// RWKV-4 channel-mix token-shift + gating.
@@ -420,18 +459,22 @@ impl RecurrentOps for VulkanDevice {
         dim: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_cm: x is not VulkanStorage".into())
-        })?;
-        let mk_s = mix_k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_cm: mix_k is not VulkanStorage".into())
-        })?;
-        let mr_s = mix_r.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_cm: mix_r is not VulkanStorage".into())
-        })?;
-        let xx_s = ffn_xx.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rwkv_cm: ffn_xx is not VulkanStorage".into())
-        })?;
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_cm: x is not VulkanStorage".into()))?;
+        let mk_s = mix_k
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_cm: mix_k is not VulkanStorage".into()))?;
+        let mr_s = mix_r
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_cm: mix_r is not VulkanStorage".into()))?;
+        let xx_s = ffn_xx
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rwkv_cm: ffn_xx is not VulkanStorage".into()))?;
 
         let ctx_guard = global_context();
         let ctx = ctx_guard
@@ -445,7 +488,13 @@ impl RecurrentOps for VulkanDevice {
             ctx.physical_device,
         )?;
 
-        let buffers = [x_s.buffer, mk_s.buffer, mr_s.buffer, xx_s.buffer, out_storage.buffer];
+        let buffers = [
+            x_s.buffer,
+            mk_s.buffer,
+            mr_s.buffer,
+            xx_s.buffer,
+            out_storage.buffer,
+        ];
         let push = [dim as u32, 0, 0, 0, 0, 0];
 
         run_compute_shader_kernel(
@@ -459,7 +508,9 @@ impl RecurrentOps for VulkanDevice {
         )
         .map_err(|e| Error::Backend(format!("Vulkan rwkv_cm dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 }
-

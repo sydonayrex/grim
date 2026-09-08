@@ -1,8 +1,5 @@
 //! Fused RoPE + Scatter KV Cache Blending Kernel.
-//!
-//! Reuses partially-matched prefix block contents (tokens `0..divergence_token`),
-//! computes rotary positional embeddings (RoPE) only for the divergent token tail
-//! (`divergence_token..block_size`), and scatters the merged result into the target block.
+//! Reuses partially-matched prefix block contents (tokens `0..divergence_token`), computes rotary positional embeddings (RoPE) only for the.
 
 use grim_tensor::error::{Error, Result};
 
@@ -16,9 +13,7 @@ pub struct BlendConfig {
 }
 
 /// Fused KV cache blending CPU reference implementation.
-///
-/// Preserves `k_dst[..divergence_token]` and `v_dst[..divergence_token]` from existing cache,
-/// and applies RoPE to `k_src[divergence_token..]` before scattering into `k_dst` and `v_dst`.
+/// Preserves `k_dst[..divergence_token]` and `v_dst[..divergence_token]` from existing cache, and applies RoPE to `k_src[divergence_token..]` before scattering into.
 pub fn blend_kv_rope_cpu(
     cfg: &BlendConfig,
     k_src: &[f32],
@@ -49,8 +44,7 @@ pub fn blend_kv_rope_cpu(
     if cfg.divergence_token > cfg.block_size {
         return Err(Error::Backend(format!(
             "blend_kv_rope: divergence_token {} exceeds block_size {}",
-            cfg.divergence_token,
-            cfg.block_size
+            cfg.divergence_token, cfg.block_size
         )));
     }
 

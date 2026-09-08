@@ -1,14 +1,11 @@
-//! `Sampler` trait — token selection from logits.
-//!
-//! Concrete samplers (greedy, top-k, nucleus, mirostat, ...) implement this
-//! trait; plugins (§6) provide extensions via either the dylib or WASM path.
+//! `Sampler` trait - token selection from logits.
+//! Concrete samplers (greedy, top-k, nucleus, mirostat, ...) implement this trait; plugins (§6) provide extensions via.
 
 use grim_tensor::Tensor;
 use grim_tensor::error::Result;
 
-/// History-aware token sampler. The `history` argument carries the most
-/// recently emitted tokens (typically the last 64 tokens) for samplers
-/// that need repetition context (DRY, mirostat variants, etc.).
+/// History-aware token sampler. The `history` argument carries the most recently emitted tokens (typically
+/// the last 64 tokens) for samplers that need repetition context (DRY, mirostat variants, etc.).
 pub trait Sampler: Send + Sync {
     /// Sample one token from the logits distribution.
     fn sample(&self, logits: &Tensor, history: &[u32]) -> Result<u32>;
@@ -75,19 +72,14 @@ impl ThinkingLevel {
 }
 
 /// Sampling parameters parsed from an OpenAI/Ollama request.
-///
-/// `temperature == 0.0` is the canonical "greedy / deterministic" signal and
-/// must produce argmax output (see `GreedySampler`); any positive temperature
-/// enables stochastic sampling. `top_p` (nucleus) clips the cumulative
-/// probability mass; `top_k` bounds the candidate set before the top-p pass.
+/// `temperature == 0.0` is the canonical "greedy / deterministic" signal and must produce argmax output.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
-    /// Repetition penalty (CTRL paper, Keskar 2019): logits for tokens already
-    /// present in `history` are divided by this value before temperature scaling.
-    /// 1.0 = disabled. Ollama default is 1.10; grim CLI default is 1.10 to match.
+    /// Repetition penalty (CTRL paper, Keskar 2019): logits for tokens already present in `history` are divided by this value before temperature scaling.
+    /// 1.0 = disabled.
     pub repeat_penalty: f32,
     /// Controls model reasoning / thinking effort (Off, Default, Low, Medium, High, Custom).
     pub thinking_level: ThinkingLevel,
@@ -108,9 +100,8 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
-    /// Resolve an explicit greedy sampler when temperature is zero, otherwise
-    /// a stochastic top-p sampler seeded from `seed`. Both implement `Sampler`
-    /// so callers hold a single trait object regardless of mode.
+    /// Resolve an explicit greedy sampler when temperature is zero, otherwise a stochastic top-p sampler seeded from `seed`.
+    /// Both implement `Sampler` so callers hold a single trait object regardless of mode.
     pub fn into_sampler(self, seed: u64) -> Box<dyn Sampler> {
         if self.temperature <= 0.0 {
             Box::new(GreedySampler::new(self.repeat_penalty))
@@ -120,17 +111,11 @@ impl SamplingParams {
     }
 }
 
-/// Greedy (argmax) sampler — used when `temperature == 0`.
-///
-/// Deterministic: always returns the highest-logit token. This preserves the
-/// historical `chat_completions` behavior for callers that request
-/// deterministic output, and is the test oracle for the stochastic path.
+/// Greedy (argmax) sampler - used when `temperature == 0`.
+/// Deterministic: always returns the highest-logit token.
 pub struct GreedySampler {
-    /// Repetition penalty to apply before argmax. Forwarded via
-    /// [`SamplingParams::repeat_penalty`] — without it, greedy decoding
-    /// gets stuck emitting the same token forever (`<|pad|>` then EOS issue).
-    /// Stored as `Option` so callers can construct a `GreedySampler` with
-    /// no repetition penalty (the historical behavior, preserved for tests).
+    /// Repetition penalty to apply before argmax.
+    /// Forwarded via [`SamplingParams::repeat_penalty`] - without it, greedy decoding gets stuck emitting the same token forever.
     pub repeat_penalty: Option<f32>,
 }
 
@@ -162,10 +147,7 @@ impl Sampler for GreedySampler {
 }
 
 /// Stochastic top-p (nucleus) sampler with temperature scaling.
-///
-/// Owns its RNG state so sampling is reproducible for a given seed + call
-/// order. No external RNG dependency is pulled in for this — a xorshift64
-/// state is sufficient for token selection and keeps the crate portable.
+/// Owns its RNG state so sampling is reproducible for a given seed + call order.
 pub struct TopPSampler {
     params: SamplingParams,
     rng_state: std::sync::Mutex<u64>,
@@ -224,11 +206,8 @@ fn argmax_first(v: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Apply repetition penalty to logits. For every token id present in `history`,
-/// divide its logit by `repeat_penalty`. No-op when `repeat_penalty <= 1.0`.
-/// Numbered tokens above `logits.len()` (out-of-vocab) are silently skipped.
-/// The penalty is applied to every occurrence in history (taking the worst
-/// penalty = smallest adjusted logit), matching llama.cpp / Ollama behavior.
+/// Apply repetition penalty to logits. For every token
+/// id present in `history`, divide its logit by `repeat_penalty`.
 fn apply_repeat_penalty(logits: &[f32], repeat_penalty: f32, history: &[u32]) -> Vec<f32> {
     if repeat_penalty <= 1.0 || history.is_empty() {
         return logits.to_vec();
@@ -251,17 +230,8 @@ fn apply_repeat_penalty(logits: &[f32], repeat_penalty: f32, history: &[u32]) ->
     out
 }
 
-/// Pure, dependency-free token sampler.
-///
-/// Pipeline: temperature-scale the logits → optional top-k truncation →
-/// softmax → top-p (nucleus) cumulative-mass cutoff → weighted choice driven
-/// by `rng`. `temperature <= 0` short-circuits to argmax so this single
-/// function covers both the greedy and stochastic paths (the caller chooses
-/// which via `SamplingParams::into_sampler`, but the function itself stays
-/// branch-free on the greedy case for testability).
-///
-/// `rng` is only invoked when sampling is stochastic; callers that want
-/// argmax behavior should pass `temperature <= 0` and may supply a no-op rng.
+/// Pure, dependency-free token sampler. Pipeline: temperature-scale the logits → optional top-k truncation
+/// → softmax → top-p (nucleus) cumulative-mass cutoff → weighted choice driven by `rng`.
 pub fn sample_logits<F>(
     logits: &[f32],
     temperature: f32,
@@ -331,9 +301,8 @@ where
         .collect();
     let sum: f32 = exps.iter().sum();
     if sum <= 0.0 || !max.is_finite() {
-        // `INF - INF` is NaN, so a +INF-dominant logit makes `sum` NaN; in that
-        // case the softmax is a one-hot on the max-logit token(s). Delegate to
-        // argmax over the (already NaN-masked) scaled logits.
+        // `INF - INF` is NaN, so a +INF-dominant logit makes `sum` NaN; in that case the softmax is a one-hot on the max-logit token(s).
+        // Delegate to argmax over the (already NaN-masked) scaled logits.
         return argmax_first(&masked);
     }
     let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
@@ -402,9 +371,8 @@ mod tests {
 
     #[test]
     fn stochastic_draw_respects_distribution() {
-        // With a sharply peaked distribution the sampled token is the max almost
-        // always; over many draws it must never leave the support and must hit
-        // the dominant token the vast majority of the time.
+        // With a sharply peaked distribution the sampled token is the max almost always; over many draws it
+        // must never leave the support and must hit the dominant token the vast majority of the time.
         let logits = vec![0.0, 10.0, 0.0, 0.0];
         let mut seed: u64 = 0x1234_5678;
         let mut rng = || {

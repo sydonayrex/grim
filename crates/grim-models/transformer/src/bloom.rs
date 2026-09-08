@@ -1,11 +1,5 @@
-//! BigScience BLOOM architecture with ALiBi positional biases,
-//! GeLU feed-forward networks, and LayerNorm with learnable biases.
-//!
-//! # Architecture Details
-//! - **Positional Bias**: ALiBi (Attention with Linear Biases) computed from geometric slopes:
-//!   $m = 2^{-8/n}$, bias added to attention matrix: $A_{i,j} = \frac{q_i k_j^T}{\sqrt{d}} - m \cdot (i - j)$.
-//! - **Activation**: Standard GeLU activation ($x \cdot \Phi(x)$).
-//! - **Normalization**: Pre-attention and pre-FFN LayerNorm with biases.
+//! BigScience BLOOM architecture with ALiBi positional biases, GeLU feed-forward networks, and LayerNorm with learnable biases.
+//! # Architecture Details - **Positional Bias**: ALiBi (Attention with Linear Biases) computed from geometric slopes:.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -14,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for BigScience BLOOM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,9 +44,7 @@ impl ModelConfig for BloomConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ALiBi Slopes
-// ---------------------------------------------------------------------------
 
 /// Calculates exact geometric ALiBi slopes for attention heads.
 pub fn get_alibi_slopes(n_heads: usize) -> Vec<f32> {
@@ -65,7 +55,8 @@ pub fn get_alibi_slopes(n_heads: usize) -> Vec<f32> {
         slopes.push(base.powi(i as i32));
     }
     if closest_power_of_2 != n_heads {
-        let extra_base = 2.0f32.powf(-(2.0f32.powf(-(((2 * closest_power_of_2) as f32).log2() - 3.0))));
+        let extra_base =
+            2.0f32.powf(-(2.0f32.powf(-(((2 * closest_power_of_2) as f32).log2() - 3.0))));
         let num_remaining = (n_heads - closest_power_of_2).min(closest_power_of_2);
         for i in 0..num_remaining {
             slopes.push(extra_base.powi((1 + 2 * i) as i32));
@@ -74,9 +65,7 @@ pub fn get_alibi_slopes(n_heads: usize) -> Vec<f32> {
     slopes
 }
 
-// ---------------------------------------------------------------------------
 // MLP
-// ---------------------------------------------------------------------------
 
 pub struct BloomMlp {
     pub dense_h_to_4h: Linear,
@@ -85,8 +74,10 @@ pub struct BloomMlp {
 
 impl BloomMlp {
     pub fn load(ws: &WeightSource<'_>, hidden_size: usize) -> Result<Self> {
-        let dense_h_to_4h = Linear::load_shape(&ws.scoped("dense_h_to_4h"), [hidden_size, 4 * hidden_size])?;
-        let dense_4h_to_h = Linear::load_shape(&ws.scoped("dense_4h_to_h"), [4 * hidden_size, hidden_size])?;
+        let dense_h_to_4h =
+            Linear::load_shape(&ws.scoped("dense_h_to_4h"), [hidden_size, 4 * hidden_size])?;
+        let dense_4h_to_h =
+            Linear::load_shape(&ws.scoped("dense_4h_to_h"), [4 * hidden_size, hidden_size])?;
         Ok(Self {
             dense_h_to_4h,
             dense_4h_to_h,
@@ -101,17 +92,16 @@ impl BloomMlp {
         let mut act = vec![0.0f32; h_vec.len()];
         for i in 0..act.len() {
             let val = h_vec[i];
-            let cdf = 0.5 * (1.0 + (val * 0.7071067811865475).tanh());
+            let cdf = 0.5 * (1.0 + (val * 0.707_106_77).tanh());
             act[i] = val * cdf;
         }
-        let act_tensor = grim_nn::modules::move_to_device(&cpu_tensor(act, h.shape().clone()), x.device())?;
+        let act_tensor =
+            grim_nn::modules::move_to_device(&cpu_tensor(act, h.shape().clone()), x.device())?;
         Ok(self.dense_4h_to_h.forward(&act_tensor)?)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct BloomBlock {
     pub query_key_value: Linear,
@@ -125,14 +115,19 @@ pub struct BloomBlock {
 }
 
 impl BloomBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &BloomConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &BloomConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let head_dim = cfg.hidden_size / cfg.n_head;
         let attn_ws = ws.scoped("self_attention");
         let query_key_value = Linear::load_shape(
             &attn_ws.scoped("query_key_value"),
             [cfg.hidden_size, 3 * cfg.hidden_size],
         )?;
-        let dense = Linear::load_shape(&attn_ws.scoped("dense"), [cfg.hidden_size, cfg.hidden_size])?;
+        let dense =
+            Linear::load_shape(&attn_ws.scoped("dense"), [cfg.hidden_size, cfg.hidden_size])?;
 
         let input_layernorm = RmsNorm::load(
             &ws.scoped("input_layernorm"),
@@ -160,9 +155,8 @@ impl BloomBlock {
         })
     }
 
-    /// GPU-first forward. The fused-QKV column split has no device kernel,
-    /// so it pulls once per call and uploads only the q/k/v pieces; the
-    /// attention itself runs on-device via `fused_attention_tensors`.
+    /// GPU-first forward. The fused-QKV column split has no device kernel, so it pulls once
+    /// per call and uploads only the q/k/v pieces; the attention itself runs on-device via `fused_attention_tensors`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -244,9 +238,7 @@ impl BloomBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Bloom {
     pub cfg: BloomConfig,
@@ -277,7 +269,11 @@ impl Bloom {
             layers.push(BloomBlock::load(&layer_ws, &cfg, tp)?);
         }
 
-        let ln_f = RmsNorm::load(&root.scoped("ln_f"), cfg.hidden_size, cfg.layer_norm_epsilon)?;
+        let ln_f = RmsNorm::load(
+            &root.scoped("ln_f"),
+            cfg.hidden_size,
+            cfg.layer_norm_epsilon,
+        )?;
         let lm_head = Linear::load_shape(&ws.scoped("lm_head"), [cfg.hidden_size, cfg.vocab_size])
             .unwrap_or_else(|_| Linear::from_tensor(tok_embeddings.w_t.clone(), None));
 
@@ -300,7 +296,10 @@ impl Bloom {
             None,
         );
         let ln_f = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.layer_norm_epsilon,
         };
         let lm_head = Linear::from_tensor(
@@ -370,9 +369,7 @@ impl CausalLm for Bloom {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -397,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_bloom_forward_and_session_state() {
         let mut cfg = BloomConfig::default();
         cfg.vocab_size = 32;
@@ -410,7 +408,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

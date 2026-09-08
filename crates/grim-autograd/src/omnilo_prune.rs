@@ -1,8 +1,5 @@
 //! OMNILO-PRUNE: joint rank allocation across modalities in LoRA adapter training.
-//!
-//! Distributes a global LoRA rank budget across transformer layers based on
-//! modality weights (e.g. text vs vision tokens) and layer salience. Supports
-//! iterative reallocation from gradient-norm feedback.
+//! Distributes a global LoRA rank budget across transformer layers based on modality weights (e.g.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -67,13 +64,8 @@ impl OmniloRankAllocator {
         }
     }
 
-    /// Distribute `total_budget` across `num_layers` layers according to
-    /// modality weights and optional per-layer salience values.
-    ///
+    /// Distribute `total_budget` across `num_layers` layers according to modality weights and optional per-layer salience values.
     /// Importance score per layer = `modality_weight[modality] * salience`.
-    /// Raw allocation = importance / sum(importance) * total_budget.
-    /// After clamping to [min_rank, max_rank], an iterative correction loop
-    /// restores the sum to exactly `total_budget`.
     pub fn allocate(
         &mut self,
         total_budget: usize,
@@ -153,10 +145,7 @@ impl OmniloRankAllocator {
     }
 
     /// Reallocate ranks based on observed gradient norms.
-    ///
-    /// Layers with higher gradient norms receive more rank. Uses the heuristic:
-    /// rank_i = clamp(min_rank + (grad_norm_i / max_grad_norm) * avg_budget,
-    ///                min_rank, max_rank), then renormalized to total_budget.
+    /// Layers with higher gradient norms receive more rank.
     pub fn update_ranks_from_grad_norms(
         &mut self,
         grad_norms: &[f32],

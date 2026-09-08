@@ -1,4 +1,4 @@
-use grim_memory::{KvBlockPool, BLOCK_SIZE};
+use grim_memory::{BLOCK_SIZE, KvBlockPool};
 
 #[test]
 fn test_blend_reuses_partial_block() {

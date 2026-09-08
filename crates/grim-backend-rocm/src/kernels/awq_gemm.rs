@@ -1,17 +1,5 @@
 //! AWQ GroupInt fused dequant-GEMM HIP kernels.
-//!
-//! Consumes the length-prefixed three-segment packed layout documented on
-//! [`grim_tensor::dtype::AwqStorageConfig`]:
-//!
-//! ```text
-//! [u64 LE: qweight_len][qweight][u64 LE: qzeros_len][qzeros][u64 LE: scales_len][scales (f16)]
-//! ```
-//!
-//! AWQ conventions:
-//! - `qweight`: column-packed uint32 words `[K / values_per_word, N]`.
-//! - `qzeros`: packed uint32 words `[K / group_size, N / values_per_word]`, with RAW stored zero points (no +1 offset).
-//! - `scales`: f16 per-(group, output-column) half floats.
-//! - `g_idx`: absent (AWQ uses sequential grouping `k / group_size`).
+//! Consumes the length-prefixed three-segment packed layout documented on [`grim_tensor::dtype::AwqStorageConfig`]: ```text [u64 LE: qweight_len][qweight][u64 LE: qzeros_len][qzeros][u64.
 
 pub const AWQ_GEMM_KERNEL_SOURCE: &str = r#"
 // ---- AWQ dequant helpers (device-only, unique symbol prefix) ----

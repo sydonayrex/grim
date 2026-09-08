@@ -1,20 +1,13 @@
-//! Autograd tape (WI-T1 item 2).
-//!
-//! Records only the ops touching adapter parameters during forward —
-//! matmul, elementwise add, scale, and the fused LoRA application. The
-//! recorded tensor values are held by reference-style id; the inputs and
-//! outputs are stored in the tape's own `TensorRegistry`. Backward walks
-//! the tape in reverse (entries are popped from the back) and routes
-//! gradients through the recorded ops.
+//! Autograd tape (WI-T1 item 2). Records only the ops touching adapter parameters
+//! during forward - matmul, elementwise add, scale, and the fused LoRA application.
 
 use crate::param::ParamId;
 use grim_tensor::Tensor;
 use grim_tensor::error::Result;
 use std::collections::{HashMap, HashSet};
 
-/// Identifier for a tensor in the tape's registry. Id-only (no reference)
-/// because the tape owns the tensor data and the graph rewrites itself
-/// during replay.
+/// Identifier for a tensor in the tape's registry.
+/// Id-only (no reference) because the tape owns the tensor data and the graph rewrites itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TensorId(pub u32);
 
@@ -42,10 +35,7 @@ pub enum TapeKind {
 }
 
 /// A single recorded operation on the tape.
-///
-/// Holds the data needed to replay its backward pass *without* needing the
-/// input tensors to still be alive — the forward pass stores them in the
-/// tape's tensor registry as it goes.
+/// Holds the data needed to replay its backward pass *without* needing the input tensors to.
 #[derive(Debug, Clone)]
 pub struct TapeEntry {
     pub kind: TapeKind,
@@ -183,26 +173,7 @@ impl Tape {
     }
 
     /// Free non-boundary intermediate activations to reduce VRAM during gradient checkpointing (WI-X13).
-    ///
-    /// Retention policy — a tensor survives if any of the following hold:
-    ///
-    /// 1. It is a segment-boundary input (`checkpoint_boundaries`), i.e. the
-    ///    replay anchor for the segment that starts there.
-    /// 2. It is a parameter tensor (`param_tensors`) — LoRA A/B (and
-    ///    FullParameter base weights) are needed by backward *and* by LoRA
-    ///    replay.
-    /// 3. It is a cross-segment input: some entry consumes it while its
-    ///    producing entry lives in an EARLIER segment, so that later
-    ///    segments' backward/replay can always resolve it.
-    /// 4. It has no producing entry at all but is consumed by the tape —
-    ///    externally computed values (cos/sin tables, embedding outputs,
-    ///    norm outputs, base projection outputs registered with `register`
-    ///    rather than produced by a recorded op). Replay cannot recompute
-    ///    these because the tape never recorded how they were made.
-    ///
-    /// Everything else (produced and consumed entirely within one segment)
-    /// is freed; [`crate::replay::replay_segment`] reconstructs those on
-    /// demand when backward first touches their segment.
+    /// Retention policy - a tensor survives if any of the following hold: 1.
     pub fn free_intermediate_activations(&mut self) {
         if !self.is_checkpointing_enabled() {
             return;
@@ -245,9 +216,7 @@ impl Tape {
     }
 
     /// Record a MatMul `output = a @ b` (possibly transposed).
-    ///
-    /// `m`, `k`, `n` are the matmul dims before any transpose so that
-    /// backward can reconstruct the gradient shapes.
+    /// `m`, `k`, `n` are the matmul dims before any transpose so that backward can reconstruct.
     #[allow(clippy::too_many_arguments)]
     pub fn record_matmul(
         &mut self,
@@ -460,9 +429,7 @@ impl Tape {
         self.entries.iter().rev()
     }
 
-    /// Drains the tape and executes the backward pass, directly dispatching
-    /// on-device fused optimizer step updates into `trainable_params` using `optimizer`.
-    ///
+    /// Drains the tape and executes the backward pass, directly dispatching on-device fused optimizer step updates into `trainable_params` using `optimizer`.
     /// This eliminates host synchronization barriers and CPU-GPU roundtrips during training epochs.
     pub fn drain_and_step(
         &mut self,
@@ -643,9 +610,8 @@ mod tests {
         assert_eq!(tape.checkpoint_boundaries.len(), 2);
     }
 
-    // WI-X13: build the same two-segment graph on a fresh tape. Segment 0:
-    // y = x @ w1. Segment 1 (boundary input y): z = 2*y; out = z + s, where s
-    // is a registered cross-segment constant.
+    // WI-X13: build the same two-segment graph on a fresh tape.
+    // Segment 0: y = x @ w1.
     fn build_two_segment_tape(tape: &mut Tape) -> (TensorId, TensorId, TensorId) {
         let x = tape.register(t(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
         let w1 = tape.register(t(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]));

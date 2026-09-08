@@ -1,13 +1,5 @@
 //! Persistent tool-permission rules for the agentic TUI.
-//!
-//! When the user answers "a" (always allow) on a tool approval prompt, a rule
-//! is appended here and saved to `$XDG_CONFIG_HOME/grim/permissions.toml`
-//! (falling back to `~/.config/grim/`). The worker consults the shared rules
-//! before asking for approval, so an allowed tool runs without prompting.
-//!
-//! Rules are name-based for file tools and binary-prefix-based for
-//! `run_command`: allowing `run_command` with prefix `cargo` permits any
-//! command whose first shell word is `cargo`.
+//! When the user answers "a" (always allow) on a tool approval prompt, a rule is.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -40,9 +32,7 @@ pub fn shared(rules: PermissionRules) -> SharedPermissions {
 }
 
 /// Build the rule implied by approving a tool call with "always allow".
-///
-/// For run_command the rule is pinned to the command's first word; for other
-/// tools it covers the whole tool.
+/// For run_command the rule is pinned to the command's first word; for other tools it.
 pub fn rule_for_tool_call(name: &str, arguments: &str) -> AllowRule {
     let command_prefix = if name == "run_command" {
         serde_json::from_str::<serde_json::Value>(arguments)

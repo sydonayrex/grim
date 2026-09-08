@@ -1,19 +1,17 @@
 //! 1F1B Pipeline Parallel (PP) stage execution engine.
-//!
-//! Partitions transformer layers across multiple pipeline stages/GPUs and schedules
-//! activation transfers between adjacent stages using point-to-point communication.
+//! Partitions transformer layers across multiple pipeline stages/GPUs and schedules activation transfers between adjacent stages using.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use grim_backend_cpu::storage::CpuStorage;
+use grim_backend_rocm::device::parallel_comm::ParallelCommunicator;
 use grim_core::error::{Error, Result};
 use grim_kvtransport::TcpActivationTransport;
 use grim_memory::KvBlockPool;
-use grim_tensor::tensor::Tensor;
-use grim_tensor::shape::Shape;
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
-use grim_backend_cpu::storage::CpuStorage;
-use grim_backend_rocm::device::parallel_comm::ParallelCommunicator;
+use grim_tensor::shape::Shape;
+use grim_tensor::tensor::Tensor;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 fn tensor_from_f32_vec(vec: Vec<f32>, shape: Shape) -> Tensor {
     let storage = Arc::new(CpuStorage::new(vec, shape.clone(), DType::F32));
@@ -41,10 +39,8 @@ pub struct PipelineStageConfig {
     pub device_ordinal: usize,
 }
 
-/// Computed pipeline layout: stage boundaries plus per-stage device
-/// placement, ready to drive a partitioned execution. `Engine::new`
-/// validates one against the loaded model depth and visible GPUs when
-/// `pp_size > 1` (see `EngineConfig::pp_size` for the execution gate).
+/// Computed pipeline layout: stage boundaries plus per-stage device placement, ready to drive a partitioned execution.
+/// `Engine::new` validates one against the loaded model depth and visible GPUs when `pp_size > 1`.
 #[derive(Debug, Clone)]
 pub struct PipelinePlan {
     /// One config per stage, in order.
@@ -52,18 +48,9 @@ pub struct PipelinePlan {
 }
 
 impl PipelinePlan {
-    /// Evenly partition `total_layers` across `num_stages` stages pinned to
-    /// `device_ordinals[stage]`.
-    ///
-    /// # Contracts
-    /// * `num_stages >= 1` and `total_layers >= num_stages` (a stage with no
-    ///   layers is a config error, not a degenerate pass-through).
-    /// * `device_ordinals.len() == num_stages`.
-    pub fn plan(
-        total_layers: usize,
-        num_stages: usize,
-        device_ordinals: &[usize],
-    ) -> Result<Self> {
+    /// Evenly partition `total_layers` across `num_stages` stages pinned to `device_ordinals[stage]`.
+    /// # Contracts * `num_stages >= 1` and `total_layers >= num_stages` (a stage with no layers.
+    pub fn plan(total_layers: usize, num_stages: usize, device_ordinals: &[usize]) -> Result<Self> {
         if total_layers < num_stages {
             return Err(Error::Config(format!(
                 "PipelinePlan: {total_layers} layers cannot fill {num_stages} stages"
@@ -101,7 +88,9 @@ impl PipelineStageConfig {
         device_ordinals: &[usize],
     ) -> Result<Vec<Self>> {
         if num_stages == 0 {
-            return Err(Error::Config("PipelineStageConfig: num_stages must be >= 1".into()));
+            return Err(Error::Config(
+                "PipelineStageConfig: num_stages must be >= 1".into(),
+            ));
         }
         let layers_per_stage = total_layers / num_stages;
         let remainder = total_layers % num_stages;
@@ -201,13 +190,9 @@ impl PipelineStageRunner {
         num_heads: usize,
         head_dim: usize,
     ) -> Self {
-        let pool = KvBlockPool::new_on_device(
-            pool_capacity,
-            num_heads,
-            head_dim,
-            config.device_ordinal,
-        )
-        .with_layer_range(config.start_layer, config.end_layer);
+        let pool =
+            KvBlockPool::new_on_device(pool_capacity, num_heads, head_dim, config.device_ordinal)
+                .with_layer_range(config.start_layer, config.end_layer);
 
         let executor = PipelineStageExecutor::new(config.clone(), comm);
         Self {
@@ -238,7 +223,7 @@ impl PipelineStageRunner {
             })?;
 
             for layer_idx in self.config.start_layer..self.config.end_layer {
-                h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+                h = layer_forward_fn(layer_idx, &h, &mut pool)?;
             }
         }
 
@@ -269,24 +254,14 @@ impl PipelinedModelCoordinator {
             .stages
             .iter()
             .map(|cfg| {
-                PipelineStageRunner::new(
-                    cfg.clone(),
-                    None,
-                    pool_capacity,
-                    num_heads,
-                    head_dim,
-                )
+                PipelineStageRunner::new(cfg.clone(), None, pool_capacity, num_heads, head_dim)
             })
             .collect();
         Self { plan, runners }
     }
 
     /// Execute a forward pass across all pipeline stages in sequence.
-    pub fn forward_pipeline<F>(
-        &self,
-        initial_input: Tensor,
-        layer_forward_fn: F,
-    ) -> Result<Tensor>
+    pub fn forward_pipeline<F>(&self, initial_input: Tensor, layer_forward_fn: F) -> Result<Tensor>
     where
         F: Fn(usize, &Tensor, &mut KvBlockPool) -> Result<Tensor>,
     {
@@ -298,7 +273,7 @@ impl PipelinedModelCoordinator {
                     Error::KvCache(format!("Failed to lock stage KV block pool: {}", e))
                 })?;
                 for layer_idx in runner.config.start_layer..runner.config.end_layer {
-                    h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+                    h = layer_forward_fn(layer_idx, &h, &mut pool)?;
                 }
             }
             curr = h;
@@ -347,13 +322,7 @@ impl VirtualStageConfig {
 }
 
 /// Computed V-shaped Virtual Pipeline Parallel Plan (VPP).
-///
-/// Partitions $L$ layers into $2N$ virtual stages $\{s_0, s_1, \dots, s_{2N-1}\}$
-/// mapped onto $N$ physical ranks:
-/// - Rank 0: $\{s_0, s_{2N-1}\}$ (model head and final tail)
-/// - Rank 1: $\{s_1, s_{2N-2}\}$
-/// - ...
-/// - Rank $N-1$: $\{s_{N-1}, s_N\}$ (middle fold-back stages)
+/// Partitions $L$ layers into $2N$ virtual stages $\{s_0, s_1, \dots, s_{2N-1}\}$ mapped onto $N$ physical.
 #[derive(Debug, Clone)]
 pub struct VirtualPipelinePlan {
     /// Virtual stages in forward traversal order ($0 \dots 2N-1$).
@@ -364,11 +333,7 @@ pub struct VirtualPipelinePlan {
 
 impl VirtualPipelinePlan {
     /// Generate a V-shaped virtual pipeline plan.
-    ///
-    /// # Contracts
-    /// * `num_physical_ranks >= 1`
-    /// * `total_layers >= 2 * num_physical_ranks`
-    /// * `device_ordinals.len() == num_physical_ranks`
+    /// # Contracts * `num_physical_ranks >= 1` * `total_layers >= 2 * num_physical_ranks` * `device_ordinals.len() ==.
     pub fn plan(
         total_layers: usize,
         num_physical_ranks: usize,
@@ -399,8 +364,7 @@ impl VirtualPipelinePlan {
             let end = curr_layer + count;
             curr_layer = end;
 
-            // Fold-back rank mapping:
-            // Forward arm: vs 0..N-1 -> rank vs
+            // Fold-back rank mapping: Forward arm: vs 0..N-1 -> rank vs
             // Return arm: vs N..2N-1 -> rank (2N - 1 - vs)
             let phys_rank = if vs < num_physical_ranks {
                 vs
@@ -427,7 +391,10 @@ impl VirtualPipelinePlan {
     }
 
     /// Retrieve the two virtual stages assigned to a physical rank.
-    pub fn stages_for_rank(&self, physical_rank: usize) -> (VirtualStageConfig, VirtualStageConfig) {
+    pub fn stages_for_rank(
+        &self,
+        physical_rank: usize,
+    ) -> (VirtualStageConfig, VirtualStageConfig) {
         let first = self.virtual_stages[physical_rank].clone();
         let second = self.virtual_stages[2 * self.num_physical_ranks - 1 - physical_rank].clone();
         (first, second)
@@ -459,13 +426,7 @@ impl VirtualPipelineCoordinator {
                     end_layer: cfg.end_layer,
                     device_ordinal: cfg.device_ordinal,
                 };
-                PipelineStageRunner::new(
-                    stage_cfg,
-                    None,
-                    pool_capacity,
-                    num_heads,
-                    head_dim,
-                )
+                PipelineStageRunner::new(stage_cfg, None, pool_capacity, num_heads, head_dim)
             })
             .collect();
         Self { plan, runners }
@@ -501,18 +462,13 @@ impl VirtualPipelineCoordinator {
             .lock()
             .map_err(|e| Error::KvCache(format!("Failed to lock stage KV block pool: {}", e)))?;
         for layer_idx in runner.config.start_layer..runner.config.end_layer {
-            h = layer_forward_fn(layer_idx, &h, &mut *pool)?;
+            h = layer_forward_fn(layer_idx, &h, &mut pool)?;
         }
         Ok(h)
     }
 
-    /// Execute `chunk_inputs` across `num_physical_ranks` ranks with async
-    /// bidirectional handoffs at the fold points (VPP-Async), so chunk *k*'s
-    /// heavy middle on rank *r* overlaps chunk *k±1*'s tail/head on the peer
-    /// rank. Returns one output per chunk, in chunk order.
-    ///
-    /// Single-rank plans stay on the inline [`Self::forward_vpp`] path —
-    /// per-rank threads and transport would only add overhead.
+    /// Execute `chunk_inputs` across `num_physical_ranks` ranks with async bidirectional handoffs at the fold points (VPP-Async), so chunk *k*'s heavy middle on rank *r* overlaps chunk *k±1*'s tail/head on the peer rank.
+    /// Returns one output per chunk, in chunk order.
     pub fn forward_vpp_multi_rank<F>(
         &self,
         transport: &dyn VppActivationTransport,
@@ -598,11 +554,8 @@ impl VirtualPipelineCoordinator {
             .collect()
     }
 
-    /// Executes one rank's scheduled steps. A rank blocks only where the
-    /// schedule says a cross-rank input is pending; same-rank fold handoffs
-    /// pass through a worker-local map. On any error the worker returns and
-    /// its open transfers close, which unblocks peers with an error instead
-    /// of a hang.
+    /// Executes one rank's scheduled steps. A rank blocks only where the schedule says
+    /// a cross-rank input is pending; same-rank fold handoffs pass through a worker-local map.
     #[allow(clippy::too_many_arguments)]
     fn run_vpp_rank<F>(
         &self,
@@ -687,11 +640,8 @@ pub struct VppTransfer {
     pub chunk: usize,
 }
 
-/// One scheduled execution: run `virtual_stage` on `chunk`, pulling the
-/// input from `recv` and pushing the output to `send`. Both are `None` when
-/// the neighbor stage sits on the same rank — the model head consumes the
-/// chunk input directly, fold pairs hand off locally, and the model tail
-/// produces the chunk output.
+/// One scheduled execution: run `virtual_stage` on `chunk`, pulling the input from `recv` and pushing the output to `send`.
+/// Both are `None` when the neighbor stage sits on the same rank - the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VppStep {
     pub virtual_stage: usize,
@@ -701,14 +651,7 @@ pub struct VppStep {
 }
 
 /// Builds the per-rank VPP-Async execution order for `num_chunks` chunks.
-///
-/// The paper's tail/head swap, made concrete for the fold-back topology:
-/// non-fold ranks run their forward-arm stage for *every* chunk before their
-/// first return-arm stage, so entry-rank sends fire while the interior ranks
-/// are still consuming earlier chunks; the fold rank (which owns two adjacent
-/// stages) interleaves head→tail per chunk so return frames stream back
-/// during the forward drain. With this order a rank is idle only during
-/// warmup, not at every chunk boundary.
+/// The paper's tail/head swap, made concrete for the fold-back topology: non-fold ranks run their forward-arm.
 pub fn vpp_async_schedule(plan: &VirtualPipelinePlan, num_chunks: usize) -> Vec<Vec<VppStep>> {
     let num_ranks = plan.num_physical_ranks;
     let total_stages = plan.virtual_stages.len();
@@ -769,10 +712,8 @@ pub fn vpp_async_schedule(plan: &VirtualPipelinePlan, num_chunks: usize) -> Vec<
     schedule
 }
 
-/// Moves activation payloads between physical ranks. Value-based: the engine
-/// hands over host f32 slices and receives host f32 buffers, so one schedule
-/// runs over in-process channels (single node, multi GPU) or TCP (multi
-/// node) unchanged.
+/// Moves activation payloads between physical ranks.
+/// Value-based: the engine hands over host f32 slices and receives host f32 buffers, so one.
 pub trait VppActivationTransport: Send + Sync {
     /// Pushes one activation frame from `from_rank` toward `xfer.peer_rank`.
     fn send(&self, from_rank: usize, xfer: &VppTransfer, data: &[f32]) -> Result<()>;
@@ -786,9 +727,9 @@ pub trait VppActivationTransport: Send + Sync {
 /// exchange wedged. Bounds the hang a broken schedule could otherwise cause.
 const VPP_RECV_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Same-process transport: one ordered mailbox per directed
-/// (from, to, channel) link. Single-node multi-GPU ranks share address
-/// space, so rank threads need no sockets.
+/// Same-process transport: one ordered mailbox per directed (from, to, channel) link.
+/// Single-node multi-GPU ranks share address space, so rank threads need no sockets.
+#[allow(clippy::type_complexity)]
 pub struct InprocVppTransport {
     mailboxes: Mutex<HashMap<InprocLinkKey, VecDeque<(usize, Vec<f32>)>>>,
     signal: Condvar,
@@ -829,6 +770,7 @@ impl InprocVppTransport {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     fn lock_mailboxes(
         &self,
     ) -> Result<MutexGuard<'_, HashMap<InprocLinkKey, VecDeque<(usize, Vec<f32>)>>>> {
@@ -947,7 +889,6 @@ fn chunk_tag(chunk: usize, rank: usize) -> Result<u32> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,8 +1005,7 @@ mod tests {
     #[test]
     fn test_virtual_pipeline_plan_fold_back_mapping() {
         // 8 layers partitioned across 2 physical ranks -> 4 virtual stages:
-        // Rank 0: s0 (0..2), s3 (6..8)
-        // Rank 1: s1 (2..4), s2 (4..6)
+        // Rank 0: s0 (0..2), s3 (6..8) Rank 1: s1 (2..4), s2 (4..6)
         let vplan = VirtualPipelinePlan::plan(8, 2, &[0, 1]).unwrap();
         assert_eq!(vplan.virtual_stages.len(), 4);
 

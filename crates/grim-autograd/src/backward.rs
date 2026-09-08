@@ -1,13 +1,5 @@
 //! Reverse-mode tape autograd traversal (WI-T1 item 3).
-//!
-//! Iterates over the tape entries in reverse order, executing backward functions
-//! for each recorded operation and accumulating gradients into `TrainableParams`.
-//!
-//! WI-X13: when gradient checkpointing dropped a segment's intermediates
-//! (`Tape::free_intermediate_activations`), the affected segment is replayed
-//! on demand into a per-pass overlay (see [`crate::replay`]). Every tensor
-//! lookup consults the overlay before the tape, so checkpointed and
-//! non-checkpointed runs take identical code paths.
+//! Iterates over the tape entries in reverse order, executing backward functions for each recorded operation.
 
 use crate::ops::{
     AddArgs, MatMulArgs, ScaleArgs, add_backward, lora_backward, matmul_backward, scale_backward,
@@ -53,9 +45,8 @@ fn get_any<'a>(
     overlay.get(&id).or_else(|| tape.get(id))
 }
 
-/// WI-X13: if any tensor this entry needs was freed by checkpointing, replay
-/// its whole segment once into `overlay`. Cheap no-op while every activation
-/// is still resident (`checkpoint_segs <= 1`, or already replayed).
+/// WI-X13: if any tensor this entry needs was freed by checkpointing, replay its whole segment once into `overlay`.
+/// Cheap no-op while every activation is still resident (`checkpoint_segs <= 1`, or already replayed).
 fn ensure_entry_resolved(
     tape: &Tape,
     entry: &TapeEntry,
@@ -81,8 +72,7 @@ fn evict_segment_overlay(tape: &Tape, seg: usize, overlay: &mut HashMap<TensorId
 }
 
 /// Execute reverse-mode autograd pass over `tape`, starting from `loss_grad` at `loss_tensor_id`.
-///
-/// Accumulates parameter gradients into `trainable_params`. Returns the complete map of intermediate tensor gradients.
+/// Accumulates parameter gradients into `trainable_params`.
 pub fn backward(
     tape: &Tape,
     loss_grad: Tensor,
@@ -248,10 +238,8 @@ pub fn backward(
     Ok(ctx.grads)
 }
 
-/// Execute reverse-mode autograd pass over `tape`, directly fusing backward gradient calculation
-/// with optimizer parameter update stepping (LOMO style).
-///
-/// This eliminates the need to retain parameter gradient tensors in memory across the entire backward pass.
+/// Execute reverse-mode autograd pass over `tape`, directly fusing backward gradient calculation with optimizer parameter update stepping (LOMO style).
+/// This eliminates the need to retain parameter gradient tensors in memory across the entire backward.
 pub fn backward_step(
     tape: &Tape,
     loss_grad: Tensor,
@@ -263,11 +251,8 @@ pub fn backward_step(
     // Checkpoint-replay overlay (WI-X13): recomputed activations live here.
     let mut overlay: HashMap<TensorId, Tensor> = HashMap::new();
     let mut active_segment: Option<usize> = None;
-    // Audit fix (grim-models-adjacent pass): a parameter contributing through
-    // MULTIPLE tape entries gets an optimizer step PER ENTRY here — partial
-    // gradient stepped, zeroed, next partial stepped again. That silently
-    // mis-trains tied/shared params (Adam moments update once per fragment,
-    // not once per summed gradient). Fail loudly instead.
+    // Audit fix (grim-models-adjacent pass): a parameter contributing through MULTIPLE tape entries gets an optimizer step PER ENTRY here - partial gradient stepped, zeroed, next partial stepped again.
+    // That silently mis-trains tied/shared params (Adam moments update once per fragment, not once per summed.
     let mut stepped_params: std::collections::HashSet<crate::param::ParamId> =
         std::collections::HashSet::new();
 
@@ -603,9 +588,8 @@ mod tests {
         assert_ne!(initial_a, stepped_a);
     }
 
-    /// Audit gate: a parameter contributing through MULTIPLE tape entries
-    /// must make `backward_step` fail loudly — stepping each fragment
-    /// separately mis-trains tied/shared params.
+    /// Audit gate: a parameter contributing through MULTIPLE tape entries must make
+    /// `backward_step` fail loudly - stepping each fragment separately mis-trains tied/shared params.
     #[test]
     fn backward_step_refuses_multi_entry_param() {
         let mut tape = Tape::new();
@@ -614,9 +598,8 @@ mod tests {
         let x = tape.register(cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])));
         let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
         let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
-        // SAME A matrix used by two CHAINED LoRA applications (weight tying):
-        // out1 = f(x; A, B1), out2 = f(out1; A, B2), loss = out2 — so A
-        // contributes through two entries that BOTH lie on the loss path.
+        // SAME A matrix used by two CHAINED LoRA applications (weight tying): out1 = f(x; A, B1), out2 = f(out1;
+        // A, B2), loss = out2 - so A contributes through two entries that BOTH lie on the loss path.
         let a_data = cpu_tensor(vec![0.5, 0.5], Shape::new(vec![1, 2]));
         let b1_data = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2, 1]));
         let b2_data = cpu_tensor(vec![2.0, 2.0], Shape::new(vec![2, 1]));

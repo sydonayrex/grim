@@ -1,7 +1,5 @@
-//! Minimal MCP client over stdio: one child process per server, JSON-RPC
-//! lines on stdin/stdout, reader thread feeding a timeout-guarded channel.
-//! Everything a server writes is untrusted input: non-JSON lines are dropped,
-//! results are parsed defensively.
+//! Minimal MCP client over stdio: one child process per server, JSON-RPC lines on stdin/stdout, reader thread feeding a timeout-guarded channel.
+//! Everything a server writes is untrusted input: non-JSON lines are dropped, results are parsed defensively.
 
 use crate::tui::mcp::types;
 use std::io::{BufRead, Write};
@@ -62,15 +60,14 @@ impl McpClient {
     ) -> Result<serde_json::Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let req = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let req =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
         line.push('\n');
         self.stdin
             .write_all(line.as_bytes())
             .map_err(|e| format!("mcp write: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("mcp flush: {e}"))?;
+        self.stdin.flush().map_err(|e| format!("mcp flush: {e}"))?;
         loop {
             let v = self
                 .responses

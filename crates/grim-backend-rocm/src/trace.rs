@@ -1,28 +1,5 @@
-//! WRECK-1 — trace table + measurement log.
-//!
-//! Persistence layer for validated-tuned kernels, complementary to the existing
-//! `Autotuner` in-memory/disk cache in `autotune.rs`.
-//!
-//! Two pieces:
-//!
-//! 1. **KernelTrace table** — JSON file (`{gpu_arch}.trace.json`) storing validated
-//!    winner configs keyed by `(kernel, m_class, format, arch)`. Loaded at startup
-//!    alongside the existing `Autotuner` cache; dispatch path calls `lookup` before
-//!    `get_or_tune`. Hit = zero-compile launch; miss = autotune + write winner to table
-//!    (apply()).
-//!
-//! 2. **Sample log** — JSONL file (`{gpu_arch}_samples.jsonl`) recording every measured
-//!    candidate (not just winner) from dispatch-site `BenchFn` closures. Feeds
-//!    WRECK-2/3 (subspace pruning / predictor). Written per-candidate inside the
-//!    closure — NOT inside `Autotuner::get_or_tune` (thin read-through cache, no bench
-//!    loop there). The `SampleLogger` type is the shared sink.
-//!
-//! Correctness gate: only validated configs (parity_ok=true in Eval) are writeable to
-//! the trace table; compile failures never produce entries (cf. FlashInfer-Bench:
-//! 30/32 correctness errors are compile failures — gate must include compile success).
-//!
-//! Reference: rockit-holon.md H.4 (FlashInfer-Bench-style apply() dynamic substitution),
-//! H.3 step 1 (persist reduced-space measured samples); WRECK-1 in wreck-it.md.
+//! WRECK-1 - trace table + measurement log.
+//! Persistence layer for validated-tuned kernels, complementary to the existing `Autotuner` in-memory/disk cache in `autotune.rs`.
 
 use std::fs;
 use std::io::Write;
@@ -33,9 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::autotune::{AutotuneConfig, ShapeClass};
 use grim_tensor::error::{Error, Result};
 
-// ---------------------------------------------------------------------------
-// Domain types: coarse shape bucket + quant format bucket + the trace row.
-// ---------------------------------------------------------------------------
+// Domain types: coarse shape bucket +
+// quant format bucket + the trace row.
 
 /// Coarse model-shape bucket used for trace lookup. Mirrors `ShapeClass` semantics
 /// (Decode vs Prefill) plus the edge-case TLOLog path from `autotune.rs` ShapeClass.
@@ -130,8 +106,7 @@ pub struct TraceEval {
 
 impl KernelTrace {
     /// Only entries with `parity_ok == true` are eligible for dispatch substitution.
-    /// Compile-failure / unvalidated rows must never be served — the autotune loop
-    /// already prevents them from reaching this point.
+    /// Compile-failure / unvalidated rows must never be served - the autotune loop already prevents them.
     pub fn eligible_for_dispatch(&self) -> bool {
         self.evaluation.parity_ok
     }
@@ -166,9 +141,7 @@ impl KernelTrace {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Trace table: JSON file of KernelTrace rows, keyed by (kernel, m_class, format).
-// ---------------------------------------------------------------------------
 
 /// In-memory index of the trace table. Loaded from disk at startup; mutated on apply().
 #[derive(Debug, Default)]
@@ -178,9 +151,8 @@ pub struct TraceTable {
 }
 
 impl TraceTable {
-    /// Lookup a validated winner for (kernel, m_class, format). Returns the `AutotuneConfig`
-    /// iff the matching entry is eligible (parity_ok). Returns `None` if nothing matching,
-    /// or if the matching entry failed parity (so dispatch must fall back to autotune).
+    /// Lookup a validated winner for (kernel, m_class, format).
+    /// Returns the `AutotuneConfig` iff the matching entry is eligible (parity_ok).
     pub fn lookup(
         &self,
         kernel: &str,
@@ -245,9 +217,8 @@ impl TraceTable {
     }
 }
 
-/// Load a trace table from disk. File may be missing (first run) — that's not an error.
-/// Corrupt JSON is warned and treated as empty (no crash; validation still falls back to
-/// autotune).
+/// Load a trace table from disk. File may
+/// be missing (first run) - that's not an error.
 pub fn load_trace_table(cache_dir: &Path, gpu_arch: &str) -> TraceTable {
     let path = cache_dir.join(format!("{gpu_arch}.trace.json"));
     match fs::read_to_string(&path) {
@@ -287,14 +258,10 @@ pub fn save_trace_table(cache_dir: &Path, gpu_arch: &str, table: &TraceTable) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Sample log: per-candidate JSONL writer for dispatch-site BenchFn closures.
-// ---------------------------------------------------------------------------
 
 /// One measured candidate sample, written to `{gpu_arch}_samples.jsonl`.
-///
-/// This is the unit that feeds WRECK-2/3 (subspace pruning + predictor). It records
-/// every candidate the dispatch-site closure measured, not just the winner.
+/// This is the unit that feeds WRECK-2/3 (subspace pruning + predictor).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleRecord {
     /// Kernel identity.
@@ -320,17 +287,8 @@ pub struct SampleRecord {
     pub ts: u64,
 }
 
-/// Shared sink for per-candidate sample logging. Dispatch-site `BenchFn` closures receive
-/// one of these and call `log_candidate` for every measured candidate.
-///
-/// Construct once per autotune session at the dispatch site (i.e. where the
-/// `Autotuner::for_device` and `BenchFn` pair is assembled), and pass the same `SampleLogger`
-/// into every closure so all candidates across all shapes funnel into the same
-/// `{gpu_arch}_samples.jsonl`.
-///
-/// File is opened/closed per write (append mode) so a crash never loses the in-memory records
-/// already flushed; a streaming buffered writer would be a later optimization if the volume
-/// warrants it. Failure to log = warn + continue; never fail tuning on log IO.
+/// Shared sink for per-candidate sample logging.
+/// Dispatch-site `BenchFn` closures receive one of these and call `log_candidate` for every measured candidate.
 #[derive(Debug)]
 pub struct SampleLogger {
     file: PathBuf,
@@ -339,8 +297,7 @@ pub struct SampleLogger {
 
 impl SampleLogger {
     /// Path that this logger writes to: `{cache_dir}/{gpu_arch}_samples.jsonl`.
-    // Returns the derived log path on purpose, not `Self` — callers need the path
-    // before a logger bound to it can be constructed.
+    /// Returns the derived log path on purpose, not `Self` - callers need the path before.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(cache_dir: &Path, gpu_arch: &str) -> PathBuf {
         let p = cache_dir.join(format!("{gpu_arch}_samples.jsonl"));
@@ -424,23 +381,12 @@ fn _self_file_preview_used_in_warnings_only(p: &Path) -> String {
     self_file_preview(p)
 }
 
-// ---------------------------------------------------------------------------
 // Convenience: wrap an existing BenchFn so it logs every candidate it measures.
-// ---------------------------------------------------------------------------
-// A dispatch site that already has a `BenchFn` closure can wrap it with
-// `SampleLogger::wrap` to get per-candidate logging without restructuring the closure.
-// This is the portable path for sites that aren't ready to refactor the inner loop yet;
-// the tighter path (log inside the loop) is preferred once the closure is rewritten.
+// A dispatch site that already has a `BenchFn` closure can wrap it with `SampleLogger::wrap` to.
 
 impl SampleLogger {
     /// Wrap a `BenchFn`-style closure so that each call logs the candidate it measures.
-    ///
-    /// The closure must return `Ok(AutotuneConfig)` for the winner it picked; `latency_us`
-    /// is the measured time of that winner. In a more complete form the closure would also
-    /// call `log_candidate` for each *intermediate* candidate it rejected — that's the
-    /// richer dataset WRECK-2/3 wants. This wrapper logs the winner only, which is the
-    /// minimum viable sample. Sites that want the full per-candidate log should call
-    /// `log_candidate` directly inside their loop.
+    /// The closure must return `Ok(AutotuneConfig)` for the winner it picked; `latency_us` is the measured time.
     pub fn wrap<K, F>(
         self,
         kernel: K,
@@ -524,28 +470,15 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Latency predictor (WRECK-3): uses a loaded TraceTable to pre-filter the
-// CharTuner candidate search before scheduling benches. The predictor models
-// per-config latency as a simple linear function of (block_m, block_n, block_k,
-// split_k) calibrated from historical trace rows.
-// ---------------------------------------------------------------------------
+// Latency predictor (WRECK-3): uses a loaded TraceTable to pre-filter the CharTuner candidate search before scheduling benches.
+// The predictor models per-config latency as a simple linear function of (block_m, block_n, block_k, split_k).
 
-/// Lightweight latency predictor backed by a loaded TraceTable. When bench
-/// closures exist (WRECK-1 sample log has been populated), the predictor
-/// estimates per-candidate latency from historical traces and returns a
-/// pre-filtered shortlist — the autotuner benches only candidates whose
-/// predicted latency is within a configurable factor of the best predicted
-/// config.
-///
-/// WRECK-3: this cuts bench count on large decode shapes from ~144 candidates
-/// to ~20-40 shortlisted ones. If the trace table is empty or has no rows for
-/// the target kernel/arch/shape, the predictor returns the full candidate list.
+/// Lightweight latency predictor backed by a loaded TraceTable.
+/// When bench closures exist (WRECK-1 sample log has been populated), the predictor estimates per-candidate latency.
 pub struct LatencyPredictor {
     table: TraceTable,
-    /// Maximum ratio of predicted latency to the best predicted latency for a
-    /// candidate to survive pre-filtering. 2.0 = candidates up to 2x the best
-    /// predicted latency are kept (conservative shortlist).
+    /// Maximum ratio of predicted latency to the best predicted latency for a candidate to survive pre-filtering.
+    /// 2.0 = candidates up to 2x the best predicted latency are kept (conservative shortlist).
     pub shortlist_factor: f32,
 }
 
@@ -557,11 +490,8 @@ impl LatencyPredictor {
         }
     }
 
-    /// Predict per-config latency for a single candidate using a simple model:
-    /// latency ≈ base_latency * (block_dim / mean_block_dim). Calibrated from a
-    /// single historical trace row for the (kernel, arch, shape_class, fp16) key.
-    ///
-    /// Returns None when no historical trace exists (fall through to full bench).
+    /// Predict per-config latency for a single candidate using a simple model: latency ≈ base_latency * (block_dim / mean_block_dim).
+    /// Calibrated from a single historical trace row for the (kernel, arch, shape_class, fp16) key.
     pub fn predict_latency(
         &self,
         kernel: &str,
@@ -586,10 +516,8 @@ impl LatencyPredictor {
         Some(base_latency * norm)
     }
 
-    /// Pre-filter a candidate list using predicted latencies. Candidates whose
-    /// predicted latency is more than `shortlist_factor` times the best predicted
-    /// latency are dropped. If prediction fails (no trace data), returns all
-    /// candidates unchanged.
+    /// Pre-filter a candidate list using predicted latencies.
+    /// Candidates whose predicted latency is more than `shortlist_factor` times the best predicted latency are dropped.
     pub fn shortlist(
         &self,
         kernel: &str,
@@ -643,13 +571,12 @@ mod tests {
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// Manual temp dir that doesn't need the `tempfile` crate. Uses a unique
-    /// subdirectory under `/tmp` so concurrent test runs don't collide.
-    /// Returns a `TempDirHandle` that removes the dir on drop, so leftover dirs
-    /// from earlier tests in the same run don't pollute later test assertions.
+    /// Manual temp dir that doesn't need the `tempfile` crate.
+    /// Uses a unique subdirectory under `/tmp` so concurrent test runs don't collide.
     fn make_temp_dir() -> TempDirHandle {
         let n = TEST_SEQ.fetch_add(1, Ordering::SeqCst);
-        let p = PathBuf::from(format!("/tmp/grim-trace-test-{n}"));
+        let pid = std::process::id();
+        let p = PathBuf::from(format!("/tmp/grim-trace-test-{pid}-{n}"));
         let _ = std::fs::create_dir_all(&p);
         TempDirHandle { path: p }
     }
@@ -686,9 +613,7 @@ mod tests {
         path
     }
 
-    // =========================================================================
-    // RED — KernelTrace::eligible_for_dispatch: only parity_ok=true rows are eligible.
-    // =========================================================================
+    // RED - KernelTrace::eligible_for_dispatch: only parity_ok=true rows are eligible.
 
     #[test]
     fn trace_eligible_only_when_parity_ok() {
@@ -714,9 +639,7 @@ mod tests {
         assert!(!bad.eligible_for_dispatch());
     }
 
-    // =========================================================================
-    // RED — TraceTable::insert rejects parity_ok=false entries.
-    // =========================================================================
+    // RED - TraceTable::insert rejects parity_ok=false entries.
 
     #[test]
     fn trace_table_rejects_unvalidated_entries() {
@@ -735,9 +658,7 @@ mod tests {
         assert_eq!(t.len(), 0);
     }
 
-    // =========================================================================
-    // RED — TraceTable::insert accepts parity_ok=true entries.
-    // =========================================================================
+    // RED - TraceTable::insert accepts parity_ok=true entries.
 
     #[test]
     fn trace_table_accepts_validated_entries() {
@@ -756,10 +677,8 @@ mod tests {
         assert_eq!(t.eligible_count(), 1);
     }
 
-    // =========================================================================
-    // RED — TraceTable::lookup returns winner for exact (kernel, arch, m_class, format)
-    // match that is eligible.
-    // =========================================================================
+    // RED - TraceTable::lookup returns winner for exact
+    // (kernel, arch, m_class, format) match that is eligible.
 
     #[test]
     fn trace_table_lookup_hits_eligible() {
@@ -792,9 +711,7 @@ mod tests {
         assert_eq!(got.map(|c| c.block_dim), Some(256));
     }
 
-    // =========================================================================
-    // RED — TraceTable::lookup returns None for non-matching keys.
-    // =========================================================================
+    // RED - TraceTable::lookup returns None for non-matching keys.
 
     #[test]
     fn trace_table_lookup_miss_wrong_kernel() {
@@ -896,13 +813,8 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // RED — TraceTable::lookup returns None when matching row is not eligible
-    // (parity_ok=false was refused by insert, but exercise the guard via a row we
-    // construct directly into the table through a private path is not needed; the
-    // rejection test above covers the guard. Instead, verify that a multi-row table
-    // picks the eligible one among ineligible siblings.
-    // =========================================================================
+    // RED - TraceTable::lookup returns None when matching row is not eligible (parity_ok=false was refused by insert, but exercise the guard via a row we construct directly into the table through a private path is not needed; the rejection test above covers the guard.
+    // Instead, verify that a multi-row table picks the eligible one among ineligible siblings.
 
     #[test]
     fn trace_table_lookup_prefers_eligible_over_ineligible() {
@@ -948,9 +860,7 @@ mod tests {
         assert_eq!(got.block_dim, 256);
     }
 
-    // =========================================================================
-    // RED — TraceTable::insert replaces prior entry for the same key tuple.
-    // =========================================================================
+    // RED - TraceTable::insert replaces prior entry for the same key tuple.
 
     #[test]
     fn trace_table_insert_replaces_same_key() {
@@ -994,9 +904,7 @@ mod tests {
         assert_eq!(t.len(), 1);
     }
 
-    // =========================================================================
-    // RED — load_trace_table from a valid JSON file round-trips.
-    // =========================================================================
+    // RED - load_trace_table from a valid JSON file round-trips.
 
     #[test]
     fn load_trace_table_roundtrip() {
@@ -1033,9 +941,7 @@ mod tests {
         assert_eq!(loaded.eligible_count(), 1);
     }
 
-    // =========================================================================
-    // RED — load_trace_table treats missing file as empty table.
-    // =========================================================================
+    // RED - load_trace_table treats missing file as empty table.
 
     #[test]
     fn load_trace_table_missing_file_is_empty() {
@@ -1054,9 +960,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // RED — load_trace_table treats corrupt JSON as empty table (warn, not crash).
-    // =========================================================================
+    // RED - load_trace_table treats corrupt JSON as empty table (warn, not crash).
 
     #[test]
     fn load_trace_table_corrupt_json_is_empty() {
@@ -1067,9 +971,7 @@ mod tests {
         assert_eq!(loaded.len(), 0);
     }
 
-    // =========================================================================
-    // RED — save_trace_table writes a valid JSON file that load_trace_table can read.
-    // =========================================================================
+    // RED - save_trace_table writes a valid JSON file that load_trace_table can read.
 
     #[test]
     fn save_and_load_trace_table_roundtrip() {
@@ -1101,9 +1003,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // RED — SampleLogger::log_candidate appends a valid JSONL line.
-    // =========================================================================
+    // RED - SampleLogger::log_candidate appends a valid JSONL line.
 
     #[test]
     fn sample_logger_appends_jsonl_line() {
@@ -1154,9 +1054,7 @@ mod tests {
         std::fs::remove_dir(&dir).ok();
     }
 
-    // =========================================================================
-    // RED — SampleLogger::wrap runs the bench and logs the winner.
-    // =========================================================================
+    // RED - SampleLogger::wrap runs the bench and logs the winner.
 
     #[test]
     fn sample_logger_wrap_runs_and_logs_winner() {
@@ -1208,9 +1106,7 @@ mod tests {
         std::fs::remove_dir(&dir).ok();
     }
 
-    // =========================================================================
-    // RED — SampleLogger graceful degradation when the log path is unwritable.
-    // =========================================================================
+    // RED - SampleLogger graceful degradation when the log path is unwritable.
 
     #[test]
     fn sample_logger_warns_on_unwritable_but_doesnt_panic() {
@@ -1230,16 +1126,13 @@ mod tests {
             8,
             100,
         );
-        // Must not panic. We can't easily assert the warn (no log capture here),
-        // but the function must return.
-        // Teardown: remove the blocked subdir so the parent dir can be removed.
+        // Must not panic. We can't easily assert the warn
+        // (no log capture here), but the function must return.
         std::fs::remove_dir_all(&subdir).ok();
         std::fs::remove_dir(&dir).ok();
     }
 
-    // =========================================================================
-    // RED — TraceShapeClass::from(ShapeClass) round-trips.
-    // =========================================================================
+    // RED - TraceShapeClass::from(ShapeClass) round-trips.
 
     #[test]
     fn shape_class_convert_roundtrip() {
@@ -1258,9 +1151,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // RED — TraceQuantFormat::key returns unique short strings.
-    // =========================================================================
+    // RED - TraceQuantFormat::key returns unique short strings.
 
     #[test]
     fn trace_quant_format_keys_are_unique() {
@@ -1290,9 +1181,7 @@ mod tests {
         assert_eq!(seen.len(), all.len());
     }
 
-    // =========================================================================
-    // WRECK-3: latency predictor — structure tests, no GPU required.
-    // =========================================================================
+    // WRECK-3: latency predictor - structure tests, no GPU required.
 
     #[test]
     fn latency_predictor_empty_table_shortlists_everything() {
@@ -1377,9 +1266,8 @@ mod tests {
             .unwrap();
 
         let predictor = LatencyPredictor::new(table, 1.5);
-        // When both candidates have the same predicted latency (same mean trace),
-        // both should survive with factor 1.5 (since norm ≈ 128/128 = 1.0 for cfg_good,
-        // and 64/128 = 0.5 for cfg_poor — so cfg_poor predicts lower latency).
+        // When both candidates have the same predicted latency (same mean trace), both should survive with factor 1.5 (since
+        // norm ≈ 128/128 = 1.0 for cfg_good, and 64/128 = 0.5 for cfg_poor - so cfg_poor predicts lower latency).
         let cfgs = vec![cfg_good, cfg_poor];
         let shortlist = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, cfgs);
         // With a 1.5x factor, both survive since they're close.

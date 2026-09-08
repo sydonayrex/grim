@@ -1,24 +1,10 @@
 //! Distillation / training for DSpark draft bundles.
-//!
-//! WI 4.4.3 — TIDE-style adaptive draft refresh interface.
-//!
-//! See `NOTES.md` in this crate's root for the full Gate 4.6.1 gap analysis.
-//! Summary: TIDE proposes reusing the target model's already-computed hidden
-//! states as a zero-overhead adaptation signal, gated by a runtime
-//! "adapt only when beneficial" check. This module defines the *interface*
-//! for a signal-triggered draft refresh — what triggers it, what data it
-//! consumes — without implementing a full gradient-based training loop (per
-//! the plan's §4.4.3 right-limit: "define the interface ... leave the actual
-//! weight-update mechanism as an explicitly flagged follow-up").
+//! WI 4.4.3 - TIDE-style adaptive draft refresh interface.
 
 use grim_core::error::Result;
 
-/// WI 4.4.3 — The signal that triggers a draft-model refresh.
-///
-/// Produced by `ConfidenceScheduler::should_adapt_draft()` (§4.4.2) and
-/// consumed by `refresh_draft`. This is TIDE's "activate only when beneficial"
-/// control: the refresh fires on a measured signal (acceptance-rate drift),
-/// not a fixed schedule.
+/// WI 4.4.3 - The signal that triggers a draft-model refresh.
+/// Produced by `ConfidenceScheduler::should_adapt_draft()` (§4.4.2) and consumed by `refresh_draft`.
 #[derive(Debug, Clone)]
 pub struct AdaptationSignal {
     /// The acceptance-rate EMA at the moment the trigger fired.
@@ -29,30 +15,12 @@ pub struct AdaptationSignal {
     pub min_accept_rate: f64,
 }
 
-/// WI 4.4.3 — The data a draft refresh consumes.
-///
-/// TIDE's core premise: reuse the target model's already-computed hidden
-/// states as a free training signal — no separate forward pass, no labeled
-/// dataset. This struct bundles what a refresh *would* need:
-///
-/// - `target_hidden_states` — the penultimate hidden state from the target
-///   model's forward pass (already computed for verification; captured from
-///   the existing call, not a new one — Gate 4.6.2 zero-overhead).
-/// - `draft_tokens` — the draft tokens proposed this step.
-/// - `accepted_mask` — which draft tokens the target accepted (the
-///   alignment signal).
-///
-/// **Note:** `target_hidden_states` is `Option` today because the
-/// hidden-state capture surface (gap 1 in `NOTES.md`) does not exist yet —
-/// `CausalLm::forward` returns logits only. Once the upstream `grim-core`
-/// trait is extended to expose hidden states, this field becomes `Some` and
-/// the refresh can consume them. Until then, the interface is defined and
-/// compiles, ready for that upstream change.
+/// WI 4.4.3 - The data a draft refresh consumes.
+/// TIDE's core premise: reuse the target model's already-computed hidden states as a free training signal.
 #[derive(Debug, Clone)]
 pub struct DraftRefreshInput {
-    /// Target model's penultimate hidden states from the already-running
-    /// forward pass. `None` until the hidden-state capture surface (gap 1)
-    /// lands upstream in `grim-core`/`grim-models`.
+    /// Target model's penultimate hidden states from the already-running forward pass.
+    /// `None` until the hidden-state capture surface (gap 1) lands upstream in `grim-core`/`grim-models`.
     pub target_hidden_states: Option<Vec<f32>>,
     /// Draft tokens proposed this decode step.
     pub draft_tokens: Vec<u32>,
@@ -66,30 +34,13 @@ pub struct DraftRefreshInput {
 pub enum DraftRefreshOutcome {
     /// The refresh was applied successfully.
     Applied,
-    /// The refresh was skipped because the hidden-state capture surface
-    /// is not yet available (gap 1 in `NOTES.md`). The draft continues
-    /// with its existing weights; correctness is unaffected.
+    /// The refresh was skipped because the hidden-state capture surface is not yet available (gap 1 in `NOTES.md`).
+    /// The draft continues with its existing weights; correctness is unaffected.
     SkippedNoHiddenStates,
 }
 
-/// WI 4.4.3 — Signal-triggered draft refresh (TIDE-style).
-///
-/// This is the *interface* for the adaptation step TIDE describes: when the
-/// `ConfidenceScheduler`'s `should_adapt_draft()` fires, this function is
-/// called with the target's hidden states and the acceptance signal. It would
-/// update the draft model's weights to better align with the target.
-///
-/// **Current implementation: interface only.** Per the plan's §4.4.3
-/// right-limit, the actual weight-update mechanism (gradient computation,
-/// optimizer step, LoRA delta application) is an explicitly flagged follow-up.
-/// Today this function validates the input and returns
-/// `SkippedNoHiddenStates` when hidden states are unavailable — it does not
-/// modify any weights and adds zero overhead when no refresh is triggered.
-///
-/// Gate 4.6.2 (zero-overhead): this function does NOT call
-/// `target.forward` — it only consumes data the caller already computed.
-/// Gate 4.6.3 (determinism): the decision to skip is input-determined,
-/// no wall-clock or RNG.
+/// WI 4.4.3 - Signal-triggered draft refresh (TIDE-style).
+/// This is the *interface* for the adaptation step TIDE describes: when the `ConfidenceScheduler`'s `should_adapt_draft()` fires,.
 use crate::draft_backbone::DraftBackbone;
 
 pub fn refresh_draft(
@@ -98,9 +49,7 @@ pub fn refresh_draft(
     draft: &dyn DraftBackbone,
 ) -> Result<DraftRefreshOutcome> {
     // The signal must indicate actual degradation, not just the initial ramp.
-    // This is a redundant check (the caller gates on should_adapt_draft), but
-    // documents the contract: refresh_draft is only called when adaptation is
-    // beneficial, never unconditionally.
+    // This is a redundant check (the caller gates on should_adapt_draft), but documents the contract: refresh_draft.
     debug_assert!(
         signal.accept_rate_ema < signal.min_accept_rate,
         "refresh_draft called with healthy accept_rate_ema ({:.3} >= {:.3}) — caller should gate on should_adapt_draft",
@@ -126,19 +75,8 @@ pub fn refresh_draft(
     Ok(DraftRefreshOutcome::Applied)
 }
 
-/// Runs QAT-aware distillation of a target model to produce a draft bundle
-/// (DraftBackbone + MarkovHead + ConfidenceHead).
-/// WI-E4 (FIND-5a): CompressDistill job metrics — teacher→student KL
-/// distillation over a corpus with pre/post perplexity bookkeeping.
-///
-/// The garage's `TrainingMode::CompressDistill` routes through the standard
-/// training worker; this function is the standalone reporting path: it runs
-/// K epochs of KL(student‖teacher) over synthetic-batched target probs from
-/// `train_speculative_draft`'s backbone and reports ppl before/after.
-///
-/// Returns `(teacher_ppl, student_ppl_pre, student_ppl_post)`. Teacher ppl is
-/// computed from the same target distribution (entropy bound); student ppl
-/// from the cross-entropy of the draft distribution against it.
+/// Runs QAT-aware distillation of a target model to produce a draft bundle (DraftBackbone + MarkovHead + ConfidenceHead).
+/// WI-E4 (FIND-5a): CompressDistill job metrics - teacher→student KL distillation over a corpus with pre/post perplexity.
 pub fn compress_distill_report(epochs: usize, vocab_size: usize) -> Result<(f32, f32, f32)> {
     if epochs == 0 || vocab_size == 0 {
         return Err(grim_core::error::Error::Config(
@@ -159,18 +97,16 @@ pub fn compress_distill_report(epochs: usize, vocab_size: usize) -> Result<(f32,
         .sum::<f32>();
     let teacher_ppl = teacher_nll.exp();
 
-    // Student distribution: uniform init, trained by gradient descent on
-    // KL(target ‖ student). The draft head in this path is a probability
-    // vector; the garage's full-model distillation wraps this same loss.
+    // Student distribution: uniform init, trained by gradient descent on KL(target ‖ student).
+    // The draft head in this path is a probability vector; the garage's full-model distillation wraps.
     let uniform = 1.0 / vocab_size as f32;
     let mut student: Vec<f32> = vec![uniform; vocab_size];
     let student_pre = cross_entropy_ppl(&student, &target_probs);
 
     let lr = 5e-4f32;
     for _ in 0..epochs {
-        // d/dq KL(p‖q) = -p/q: high-probability targets get pushed up
-        // proportionally harder. Multiplicative (exponential-gradient)
-        // update keeps the simplex and moves mass toward large-p bins.
+        // d/dq KL(p‖q) = -p/q: high-probability targets get pushed up proportionally harder.
+        // Multiplicative (exponential-gradient) update keeps the simplex and moves mass toward large-p bins.
         for (q, &p) in student.iter_mut().zip(&target_probs) {
             let grad = -p / q.max(1e-10);
             let step = (-lr * grad).exp();
@@ -350,12 +286,8 @@ mod tests {
 
     #[test]
     fn refresh_with_hidden_states_does_not_call_forward() {
-        // Gate 4.6.2 (zero-overhead): verify by code structure that
-        // refresh_draft does not invoke a model forward pass. This is a
-        // structural assertion — the function signature takes pre-computed
-        // data only, no model reference.
-        // The test itself just confirms the function completes without
-        // any model object in scope (there is none in this module).
+        // Gate 4.6.2 (zero-overhead): verify by code structure that refresh_draft does not invoke a model forward pass.
+        // This is a structural assertion - the function signature takes pre-computed data only, no model.
         let signal = make_signal(0.1, 0.3);
         let input = DraftRefreshInput {
             target_hidden_states: Some(vec![0.5; 16]), // 1 token * 16 hidden
@@ -364,9 +296,8 @@ mod tests {
         };
         let draft = TinyDraftBackbone::new(100, 16, 5, 42);
         let _ = refresh_draft(&signal, &input, &draft).unwrap();
-        // If refresh_draft tried to call a model forward, it would need a
-        // model reference — which neither AdaptationSignal nor
-        // DraftRefreshInput provides. The API shape enforces zero-overhead.
+        // If refresh_draft tried to call a model forward, it would need a model reference - which neither AdaptationSignal nor DraftRefreshInput provides.
+        // The API shape enforces zero-overhead.
     }
 }
 

@@ -2,9 +2,7 @@
 
 use grim_backend_vulkan::{VulkanDevice, VulkanKernel, spirv_for};
 use grim_tensor::dtype::{ArithType, DType, KQuantScheme, Storage};
-use grim_tensor::{
-    BackendStorage, CollectiveOps, CoreTensorOps, MemoryOps, QuantOps, Shape,
-};
+use grim_tensor::{BackendStorage, CollectiveOps, CoreTensorOps, MemoryOps, QuantOps, Shape};
 use grim_tensor::{ScytheLink, ScythePlacement};
 
 #[test]

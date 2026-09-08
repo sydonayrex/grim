@@ -1,11 +1,5 @@
-//! Concrete `ConfidenceHead` impl: per-position confidence derived from
-//! a softmax-entropy heuristic over the base logits.
-//!
-//! §5.3.2: the verifier uses these per-position scores to decide how
-//! many draft tokens to verify. Real implementations train a learned
-//! predictor against the target's accept/reject history. This structural
-//! impl uses a deterministic entropy-based estimate: sharper peaks (low
-//! entropy) → high confidence; flat distributions → low confidence.
+//! Concrete `ConfidenceHead` impl: per-position confidence derived from a softmax-entropy heuristic over the base logits.
+//! §5.3.2: the verifier uses these per-position scores to decide how many draft tokens to verify.
 
 use std::sync::Arc;
 

@@ -1,7 +1,5 @@
 //! High-performance bitmap-backed chunk presence index for multi-tier cache lookups.
-//!
-//! Tracks cache block presence across L1 (VRAM/GPU), L2 (Host RAM), and L3 (NVMe / Remote Storage)
-//! using compact bitmasks and hash tables for O(1) admission checks.
+//! Tracks cache block presence across L1 (VRAM/GPU), L2 (Host RAM), and L3 (NVMe / Remote.
 
 use crate::CacheTier;
 use std::collections::HashMap;
@@ -108,14 +106,7 @@ impl BitmaskChunkIndex {
     }
 
     /// Record a chunk's presence in a specific cache tier.
-    ///
-    /// Tier bits model *presence*, not exclusivity: `record_chunk` sets the
-    /// given tier's bit and leaves all other bits untouched, so a chunk that
-    /// is copied into a second tier shows both. A chunk that *migrates*
-    /// between tiers must transition explicitly — prefer
-    /// [`Self::update_chunk_tier`], or pair `record_chunk` with
-    /// [`Self::remove_tier`] — otherwise the stale bit keeps `highest_tier`
-    /// reporting the old placement.
+    /// Tier bits model *presence*, not exclusivity: `record_chunk` sets the given tier's bit and leaves all.
     pub fn record_chunk(
         &mut self,
         chunk_hash: u64,
@@ -139,12 +130,7 @@ impl BitmaskChunkIndex {
     }
 
     /// Migrate a chunk from one tier to another atomically.
-    pub fn update_chunk_tier(
-        &mut self,
-        chunk_hash: u64,
-        old_tier: CacheTier,
-        new_tier: CacheTier,
-    ) {
+    pub fn update_chunk_tier(&mut self, chunk_hash: u64, old_tier: CacheTier, new_tier: CacheTier) {
         if let Some(entry) = self.entries.get_mut(&chunk_hash) {
             entry.tier_mask.clear_tier(old_tier);
             entry.tier_mask.set_tier(new_tier);

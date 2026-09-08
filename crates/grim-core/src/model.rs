@@ -1,13 +1,5 @@
 //! `Model` trait family + capability traits.
-//!
-//! See architecture §4.4. The hard design problem — transformers, Mamba,
-//! vision, audio, diffusion have genuinely different call shapes — is
-//! solved by a small `Model` base trait plus capability traits (`CausalLm`,
-//! `Encoder`, `EncoderDecoderLm`, `StatefulSequence`, `DiffusionModel`)
-//! that models implement as applicable. A hybrid Mamba+attention model
-//! just implements `CausalLm` and mixes SSM state internally inside
-//! `forward`; the trait boundary is at the request level, not forced
-//! down into every layer.
+//! See architecture §4.4.
 
 use grim_tensor::{ArithType, Device, Tensor};
 
@@ -15,8 +7,7 @@ use crate::error::Result;
 use crate::hyperparams::ArchHyperparameters;
 
 /// Handle to a loaded adapter (LoRA weights + A/B rank + scaling factor).
-/// Zero or more adapters may be active per request; the engine fuses their
-/// low-rank updates into the base forward pass (Punica-style batched LoRA).
+/// Zero or more adapters may be active per request; the engine fuses their low-rank updates.
 #[derive(Clone)]
 pub struct AdapterHandle {
     pub id: u32,
@@ -32,18 +23,15 @@ pub trait ModelConfig: Send + Sync {
     /// Capability traits stay the source of truth — this is just a hint.
     fn modality(&self) -> ModalityHint;
     /// Return the model's context window in tokens, or `0` if unknown.
-    /// The server uses this to reject requests whose total token count
-    /// (prompt + max_tokens) exceeds the model's context window.
-    /// Default returns `0` (no enforcement for models that don't report it).
+    /// The server uses this to reject requests whose total token count (prompt + max_tokens) exceeds.
     fn context_length(&self) -> u64 {
         0
     }
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-/// Coarse modality hint for serving-side heuristics. Capability traits
-/// (`CausalLm`, `Encoder`, etc.) remain authoritative — this enum only
-/// powers request-routing shortcuts, not legality checks.
+/// Coarse modality hint for serving-side heuristics.
+/// Capability traits (`CausalLm`, `Encoder`, etc.) remain authoritative - this enum only powers request-routing shortcuts, not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModalityHint {
     TextInTextOut,
@@ -70,9 +58,8 @@ pub struct MultimodalInputs {
 pub trait Model: Send + Sync {
     fn config(&self) -> &dyn ModelConfig;
     fn device(&self) -> &Device;
-    /// Arithmetic type used for inner-product / softmax computation. Most
-    /// backends compute in F32 or F16 regardless of how the weights are
-    /// stored — this is the compute-time type, not the storage type.
+    /// Arithmetic type used for inner-product / softmax computation.
+    /// Most backends compute in F32 or F16 regardless of how the weights are stored -.
     fn param_arith(&self) -> ArithType;
     /// Downcast to concrete type for debugging/inspection.
     fn as_any(&self) -> &dyn std::any::Any;
@@ -82,25 +69,18 @@ pub trait Model: Send + Sync {
 pub trait CausalLm: Model {
     fn new_session(&self) -> Box<dyn crate::session::SessionT>;
 
-    /// Architecture hyperparameters, when the model can report them. Used by the
-    /// engine's memory-sovereign admission gate (R4) to certify a request's
-    /// footprint against currently-free device memory. `None` (the default)
-    /// means "unknown" — the admission gate is then skipped (fail-open).
+    /// Architecture hyperparameters, when the model can report them.
+    /// Used by the engine's memory-sovereign admission gate (R4) to certify a request's footprint against currently-free.
     fn arch_hyperparams(&self) -> Option<ArchHyperparameters> {
         None
     }
-    /// Transformer depth of this model, when it is layer-structured. Used by
-    /// the engine to size per-model subsystems (e.g. the SCYTHE-2 placement
-    /// controller) at registration time. `None` (the default) means "not
-    /// layer-structured or unknown" — callers must fall back to a config
-    /// default rather than guessing.
+    /// Transformer depth of this model, when it is layer-structured.
+    /// Used by the engine to size per-model subsystems (e.g.
     fn num_layers_hint(&self) -> Option<usize> {
         None
     }
-    /// Residual-stream width of this model, when known. Used by the engine's
-    /// WI-SB2 admission guard for the activation working-set floor.
-    /// `None` (the default) means unknown — the guard then falls back to the
-    /// KV dimension rather than inventing a width.
+    /// Residual-stream width of this model, when known.
+    /// Used by the engine's WI-SB2 admission guard for the activation working-set floor.
     fn hidden_size_hint(&self) -> Option<usize> {
         None
     }
@@ -124,21 +104,15 @@ pub trait MultimodalCausalLm: CausalLm {
     ) -> Result<Tensor>;
 }
 
-/// Sequence-state models — Mamba/SSM/hybrid. These need an explicit state
-/// cache instead of KV blocks. `init_state` allocates a fresh per-sequence
-/// state; `step` advances it by one token (or a small chunk in chunked-step
-/// variants).
+/// Sequence-state models - Mamba/SSM/hybrid.
+/// These need an explicit state cache instead of KV blocks.
 pub trait StatefulSequence: Model {
     fn init_state(&self, batch: usize) -> Box<dyn SsmState>;
     fn step(&self, state: &mut dyn SsmState, input: &Tensor) -> Result<Tensor>;
 }
 
-/// Per-sequence SSM state. Cheap to init/drop because Mamba-style state is
-/// O(model dimension) per sequence, not O(sequence-length) like KV.
-///
-/// `as_any` is essential for downcasting to concrete state types — the
-/// `StatefulSequence::step` impl needs to mutate state fields, which
-/// requires a concrete reference.
+/// Per-sequence SSM state. Cheap to init/drop because Mamba-style state
+/// is O(model dimension) per sequence, not O(sequence-length) like KV.
 pub trait SsmState: Send {
     fn clone_snapshot(&self) -> Result<Box<dyn SsmState>>;
     fn restore_snapshot(&mut self, snap: &dyn SsmState) -> Result<()>;
@@ -151,9 +125,8 @@ pub trait Encoder: Model {
     fn encode(&self, input: &Tensor) -> Result<Tensor>;
 }
 
-/// Encoder-decoder, cross-attention-conditioned generation — Whisper-style
-/// ASR. The encoder runs once; the decoder consumes encoder output via
-/// cross-attention.
+/// Encoder-decoder, cross-attention-conditioned generation - Whisper-style ASR.
+/// The encoder runs once; the decoder consumes encoder output via cross-attention.
 pub trait EncoderDecoderLm: Model {
     fn encode(&self, input: &Tensor) -> Result<Tensor>;
     fn decode_step(

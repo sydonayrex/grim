@@ -106,15 +106,15 @@ fn every_gemm_call_site_uses_select_gemm_algo() {
 
     // Both FFI shapes that take an `algo` argument.
     let call_openers: &[&[u8]] = &[b"rocblas_gemm_ex(", b"rocblas_gemm_strided_batched_ex("];
-    // Pre-flight: at least 3 call sites in matmul + matmul_batched +
-    // matmul_with_solution. Catches the case where someone rewrites
-    // the GEMM surface to a different FFI symbol entirely.
+    // Pre-flight: at least 1 call site. The dispatch surface was consolidated
+    // so matmul/matmul_batched/matmul_with_solution now share one strided-batched
+    // call site. Catches the case where someone rewrites the GEMM surface to a
+    // different FFI symbol entirely.
     let openers_total: usize = call_openers.iter().map(|n| count_subslice(bytes, n)).sum();
     assert!(
-        openers_total >= 3,
-        "expected at least 3 rocBLAS GEMM FFI call sites in device/roc_device.rs \
-         (matmul + matmul_batched + matmul_with_solution) -- found {openers_total}. \
-         Update this test if the dispatch surface changed."
+        openers_total >= 1,
+        "expected at least 1 rocBLAS GEMM FFI call site in device/roc_device.rs \
+         -- found {openers_total}. Update this test if the dispatch surface changed."
     );
 
     let mut cursor = 0usize;

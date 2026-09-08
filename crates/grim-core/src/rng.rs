@@ -1,6 +1,5 @@
 //! Deterministic tiny RNG for module-construction randomness in tests / demos.
-//! Uses xorshift64 — no external deps; output reproducibility across compilers
-//! is "stable enough for a default-init smoke test".
+//! Uses xorshift64 - no external deps; output reproducibility across compilers is "stable enough for a.
 
 #[derive(Clone, Copy)]
 pub struct SimpleRng {

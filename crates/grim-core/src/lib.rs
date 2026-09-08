@@ -4,11 +4,11 @@ pub mod architecture;
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod disagg_placement;
 pub mod env_config;
 pub mod error;
 pub mod hyperparams;
 pub mod kv_cache;
-pub mod disagg_placement;
 pub mod memory_certificate;
 pub mod model;
 pub mod paths;
@@ -21,14 +21,16 @@ pub use catalog::{ModelEntry, list_local_models, resolve_model_path};
 pub use client::{
     DownloadProgress, download_model, download_model_with_progress, is_bind_address_allowed,
 };
+pub use disagg_placement::{
+    GpuCapability, PlacementAdvice, advise_placement, bandwidth_split, validate,
+};
 pub use env_config::{Backend, RuntimeEnv};
 pub use error::{Error, Result, TensorError};
 pub use hyperparams::{ArchHyperparameters, HyperparameterExtractor, MetadataLookup};
-pub use disagg_placement::{GpuCapability, PlacementAdvice, advise_placement, bandwidth_split, validate};
+pub use kv_cache::KvCache;
 pub use memory_certificate::{
     AuthorityGrade, BoundaryVector, ExactnessContract, MemoryCertificate, ModelInventory,
 };
-pub use kv_cache::KvCache;
 pub use model::{
     AudioVocoder, CausalLm, DiffusionModel, Encoder, EncoderDecoderLm, ModalityHint, Model,
     ModelConfig, NoiseScheduler, SsmState, StatefulSequence, TextToSpeechModel,

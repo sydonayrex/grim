@@ -44,7 +44,25 @@ extern "C" {
         out[idx] = fp8_val * exp_scale;
     }
 
+    /// Dequantize NVFP4 codes + shared exponents to F32.
+    /// Interleaved layout: 9 bytes per 16 weights (1 E8M0 scale byte + 8 packed code bytes).
+    __global__ void grim_dequant_nvfp4(
+        const unsigned char* __restrict__ packed,
+        float* __restrict__ out,
+        int n_weights)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= n_weights) return;
 
+        int sub_block_idx = idx / 16;
+        int in_sub_block = idx % 16;
+        int blk_offset = sub_block_idx * 9;
+        unsigned char shared_exp = packed[blk_offset];
+        unsigned char code_byte = packed[blk_offset + 1 + (in_sub_block / 2)];
+        unsigned char code = (in_sub_block % 2 == 0) ? (code_byte & 0x0F) : ((code_byte >> 4) & 0x0F);
+
+        out[idx] = mxfp4_to_float_hip(code, shared_exp);
+    }
 
 }
 "#;
@@ -57,6 +75,7 @@ mod tests {
     fn mxfp_standalone_source_contains_entries() {
         assert!(KERNEL_SOURCE.contains("grim_dequant_mxfp4"));
         assert!(KERNEL_SOURCE.contains("grim_dequant_mxfp8"));
+        assert!(KERNEL_SOURCE.contains("grim_dequant_nvfp4"));
         assert!(KERNEL_SOURCE.contains("mxfp4_to_float_hip"));
     }
 }

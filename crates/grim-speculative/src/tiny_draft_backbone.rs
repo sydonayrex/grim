@@ -1,10 +1,5 @@
-//! Concrete `DraftBackbone` impl: a tiny single-layer transformer
-//! designed for unit testability of the speculative-decoding pipeline.
-//!
-//! On the CPU side this is a structural forward pass — small enough
-//! that learning the weight by autograd is out of scope, but large
-//! enough to produce non-trivial base logits for the verifier and
-//! Markov-corrected confidence head to operate on.
+//! Concrete `DraftBackbone` impl: a tiny single-layer transformer designed for unit testability of the speculative-decoding pipeline.
+//! On the CPU side this is a structural forward pass - small enough that learning.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,13 +18,8 @@ pub struct DraftWeights {
     pub(crate) w_head: Vec<f32>,
 }
 
-/// Tiny draft transformer.
-///
-/// Holds a single linear projection (`emb → hidden`), positional
-/// embeddings, an attention-style score against the query, and a
-/// decoder head that maps to vocab logits.
-///
-/// Constructed from a seed for determinism in tests.
+/// Tiny draft transformer. Holds a single linear projection (`emb → hidden`), positional embeddings, an
+/// attention-style score against the query, and a decoder head that maps to vocab logits.
 pub struct TinyDraftBackbone {
     pub vocab_size: usize,
     pub hidden: usize,
@@ -73,9 +63,8 @@ impl DraftBackbone for TinyDraftBackbone {
         // Lock weights for the forward pass
         let weights = self.weights.lock().unwrap();
 
-        // 1. Pull the context representation (a 1-D F32 tensor of size `hidden`
-        //    proxying the embedding of the last prompt token; real impl would
-        //    embed the actual token and project to hidden).
+        // 1. Pull the context representation (a 1-D F32 tensor of size `hidden` proxying the embedding
+        // of the last prompt token; real impl would embed the actual token and project to hidden).
         let ctx_data = context.to_vec_f32()?;
         let ctx_vec = if ctx_data.len() >= hidden {
             ctx_data[..hidden].to_vec()
@@ -95,10 +84,8 @@ impl DraftBackbone for TinyDraftBackbone {
             }
         }
 
-        // 3. Compute scores q · k (self-attention, treating every position
-        //    as both q and k, simplified to position-conditioned vectors).
-        //    For v1 we drop the k/v attention and just project the queries
-        //    straight to vocab logits.
+        // 3. Compute scores q · k (self-attention, treating every
+        // position as both q and k, simplified to position-conditioned vectors).
         let attn_out = matmul(&queries, &weights.w_q, block_len, hidden, hidden);
 
         // 4. Decode to vocab.
@@ -171,9 +158,8 @@ impl DraftBackbone for TinyDraftBackbone {
         let mut weights = self.weights.lock().unwrap();
 
         let lr = 0.01f32;
-        // Penultimate layer target hidden state mapping update:
-        // Adjust the linear classification head (w_head) columns for accepted draft tokens
-        // to associate stronger with the target's computed hidden states.
+        // Penultimate layer target hidden state mapping update: Adjust the linear classification head (w_head)
+        // columns for accepted draft tokens to associate stronger with the target's computed hidden states.
         for pos in 0..verify_len {
             if pos < accepted_mask.len() && accepted_mask[pos] {
                 let t = draft_tokens[pos] as usize;

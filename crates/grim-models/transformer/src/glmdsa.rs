@@ -8,9 +8,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::model::{Llama, LlamaConfig};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct GlmDsaConfig {
@@ -24,11 +22,8 @@ pub struct GlmDsaConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
-    /// WI-P1 — sparse-attention (lightning-indexer) fields. Names match the
-    /// DeepSeek-V3.2-Exp checkpoint header keys (`index_head_dim`,
-    /// `index_n_heads`, `index_topk`), verified 2026-08-19 from the real
-    /// header. All zero = dense (the historic default); any non-zero enables
-    /// the selection core at load time.
+    /// WI-P1 - sparse-attention (lightning-indexer) fields.
+    /// Names match the DeepSeek-V3.2-Exp checkpoint header keys (`index_head_dim`, `index_n_heads`, `index_topk`), verified 2026-08-19 from the real.
     pub index_head_dim: usize,
     pub index_n_heads: usize,
     pub index_topk: usize,
@@ -66,9 +61,7 @@ impl ModelConfig for GlmDsaConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama
 
 pub struct GlmDsa {
     pub cfg: GlmDsaConfig,
@@ -107,9 +100,8 @@ impl GlmDsa {
         };
         let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
 
-        // WI-P1: construct the sparse-attention selection core when the config
-        // carries indexer fields; otherwise serve dense (the historic
-        // behavior) with a warning so the fallback is not silent.
+        // WI-P1: construct the sparse-attention selection core when the config carries indexer fields; otherwise
+        // serve dense (the historic behavior) with a warning so the fallback is not silent.
         let selector = if cfg.index_head_dim > 0 || cfg.index_n_heads > 0 || cfg.index_topk > 0 {
             let sel = grim_nn::sparse_attention::SparseAttentionSelector::new(
                 grim_nn::sparse_attention::SparseAttentionConfig {

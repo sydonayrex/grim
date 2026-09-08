@@ -1,13 +1,10 @@
 //! Frame throttle: gate `term.draw` to at most 60 FPS (16ms interval).
-//!
-//! Input handling stays latency-sensitive via `request_immediate`, which
-//! bypasses the throttle on the next `should_render` check.
+//! Input handling stays latency-sensitive via `request_immediate`, which bypasses the throttle on the next `should_render` check.
 
 use std::time::{Duration, Instant};
 
-/// Minimum interval between rendered frames. 8ms gives ~120 FPS for
-/// snappy picker navigation and typing response while still avoiding
-/// excessive CPU use during idle streaming.
+/// Minimum interval between rendered frames.
+/// 8ms gives ~120 FPS for snappy picker navigation and typing response while still avoiding excessive.
 pub const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Synchronous render scheduler. Lives on the UI thread, no background task.
@@ -44,7 +41,6 @@ impl RenderScheduler {
     }
 
     /// Mark a frame as needed and bypass the throttle on the next check.
-    ///
     /// Use for input events where latency matters more than frame budget.
     pub fn request_immediate(&mut self) {
         self.pending = true;
@@ -71,7 +67,6 @@ impl RenderScheduler {
     }
 
     /// Force the next pending frame to render regardless of interval.
-    ///
     /// Call on terminal resize or explicit full redraw.
     pub fn reset(&mut self) {
         self.last_render = Instant::now() - MIN_FRAME_INTERVAL - Duration::from_millis(1);

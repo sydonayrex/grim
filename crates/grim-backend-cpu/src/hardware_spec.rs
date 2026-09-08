@@ -40,11 +40,8 @@ impl CpuIsa {
     }
 }
 
-/// Process-wide CPU capability epoch. Bumped whenever [`CpuHardwareSpec::probe`]
-/// observes a host fingerprint different from the one last cached. Callers cache
-/// ISA- or topology-dependent selections (e.g. which SIMD GEMM kernel to use)
-/// and re-validate against [`CpuHardwareSpec::current_epoch`] so they invalidate
-/// when the running CPU changes (hotplug, container migration, affinity change).
+/// Process-wide CPU capability epoch. Bumped whenever [`CpuHardwareSpec::probe`] observes
+/// a host fingerprint different from the one last cached.
 static CAP_EPOCH: AtomicU64 = AtomicU64::new(0);
 static CACHED_FINGERPRINT: Mutex<Option<String>> = Mutex::new(None);
 
@@ -149,9 +146,7 @@ impl CpuHardwareSpec {
     }
 
     /// Whether the given ISA extension is present on the probed host.
-    ///
-    /// CPU-native analog of ROCm's `QuantCapability::supports(mode)`: capability
-    /// gating keyed on detected host features rather than a GCN arch string.
+    /// CPU-native analog of ROCm's `QuantCapability::supports(mode)`: capability gating keyed on detected host features rather than a.
     pub fn supports(&self, isa: CpuIsa) -> bool {
         self.isa_features.iter().any(|f| f == isa.as_str())
     }

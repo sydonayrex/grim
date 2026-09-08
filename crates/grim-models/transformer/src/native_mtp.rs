@@ -1,9 +1,5 @@
 //! Native Multi-Token Prediction (MTP) implementation for transformer models.
-//!
-//! Real MTP employs dedicated autoregressive prediction heads $k \in [1..D]$:
-//! each head $k$ takes the previous hidden state $h_{k-1}$ and candidate token embedding $E(t_{k-1})$,
-//! projects them through a fusion layer ($2 \cdot d_{\text{model}} \to d_{\text{model}}$),
-//! applies RMSNorm, and computes next-token logits via an LM head.
+//! Real MTP employs dedicated autoregressive prediction heads $k \in [1..D]$: each head $k$ takes the.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -31,10 +27,7 @@ pub trait MtpDepthProvider: Send + Sync {
 }
 
 /// A single Multi-Token Prediction (MTP) stage.
-///
-/// Fuses previous hidden state $h \in \mathbb{R}^D$ and previous token embedding $e \in \mathbb{R}^D$
-/// via linear projection $W_{\text{proj}} \in \mathbb{R}^{D \times 2D}$, normalizes, and projects
-/// to vocabulary logits $W_{\text{head}} \in \mathbb{R}^{V \times D}$.
+/// Fuses previous hidden state $h \in \mathbb{R}^D$ and previous token embedding $e \in \mathbb{R}^D$ via.
 pub struct MtpLayer {
     /// Projection from concatenated $[h, e]$ ($2D \to D$).
     pub proj: Linear,
@@ -50,10 +43,13 @@ pub struct MtpLayer {
 
 impl MtpLayer {
     /// Load an MTP stage from checkpoint weight source.
-    ///
-    /// # Contract
-    /// Fails loudly if MTP projection layers or LM head are not found in the checkpoint.
-    pub fn load(ws: &WeightSource<'_>, hidden_size: usize, vocab_size: usize, eps: f32) -> Result<Self> {
+    /// # Contract Fails loudly if MTP projection layers or LM head are not found in.
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden_size: usize,
+        vocab_size: usize,
+        eps: f32,
+    ) -> Result<Self> {
         let proj = Linear::load_shape(&ws.scoped("fc_hidden"), [hidden_size, hidden_size])
             .or_else(|_| Linear::load_shape(&ws.scoped("proj"), [hidden_size * 2, hidden_size]))?;
         let norm = RmsNorm::load(&ws.scoped("pre_fc_norm_hidden"), hidden_size, eps)
@@ -96,14 +92,16 @@ impl MtpLayer {
         }
     }
 
-    /// Forward pass through the MTP stage:
-    /// computes $h_{\text{next}} = \text{Norm}(W_{\text{proj}} \cdot [h, e])$
-    /// and $\text{logits} = W_{\text{head}} \cdot h_{\text{next}}$.
+    /// Forward pass through the MTP stage: computes $h_{\text{next}} =
+    /// \text{Norm}(W_{\text{proj}} \cdot [h, e])$ and $\text{logits} = W_{\text{head}} \cdot h_{\text{next}}$.
     pub fn forward(&self, h: &[f32], e: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
         if h.len() != self.hidden_size || e.len() != self.hidden_size {
             return Err(Error::Session(format!(
                 "MtpLayer::forward dimension mismatch: expected h={}, e={}, got h={}, e={}",
-                self.hidden_size, self.hidden_size, h.len(), e.len()
+                self.hidden_size,
+                self.hidden_size,
+                h.len(),
+                e.len()
             )));
         }
 
@@ -124,9 +122,8 @@ impl MtpLayer {
         Ok((h_next, logits_vec))
     }
 
-    /// Device-native forward pass through the MTP stage:
-    /// computes $h_{\text{next}} = \text{Norm}(W_{\text{proj}} \cdot [h, e])$
-    /// and $\text{logits} = W_{\text{head}} \cdot h_{\text{next}}$.
+    /// Device-native forward pass through the MTP stage: computes $h_{\text{next}} =
+    /// \text{Norm}(W_{\text{proj}} \cdot [h, e])$ and $\text{logits} = W_{\text{head}} \cdot h_{\text{next}}$.
     pub fn forward_tensor(&self, h: &[f32], e: &[f32]) -> Result<(Tensor, Tensor)> {
         let (h_next_vec, logits_vec) = self.forward(h, e)?;
         let target_dev = self.proj.weight.device();
@@ -142,11 +139,7 @@ impl MtpLayer {
     }
 
     /// One autoregressive MTP step: returns `(h_next, argmax(logits))`.
-    ///
-    /// GPU-first: the vocabulary logits never cross to host — the argmax
-    /// runs on the device over the final logits tensor; only the
-    /// hidden-size `h_next` row is pulled (needed as the next step's host
-    /// input). Host fallbacks cover backends without the `argmax` kernel.
+    /// GPU-first: the vocabulary logits never cross to host - the argmax runs on the device.
     pub fn forward_step(&self, h: &[f32], e: &[f32]) -> Result<(Vec<f32>, u32)> {
         if h.len() != self.hidden_size || e.len() != self.hidden_size {
             return Err(Error::Session(format!(
@@ -390,9 +383,7 @@ impl MtpDepthProvider for Qwen38FlashNextMtp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn argmax(slice: &[f32]) -> usize {
     let mut best_idx = 0;
@@ -407,9 +398,7 @@ fn argmax(slice: &[f32]) -> usize {
 }
 
 /// Argmax of the LAST `[*, vocab]` row of `logits`, on the tensor's device.
-/// Stages only that row D2D (`copy_slice_range`) and runs the `argmax`
-/// kernel; falls back to a single-row host pull when the backend lacks the
-/// primitives. Never pulls the whole `[seq, vocab]` tensor.
+/// Stages only that row D2D (`copy_slice_range`) and runs the `argmax` kernel; falls back to a.
 fn argmax_last_row_device(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     if vocab_size == 0 {
         return Err(Error::Session("argmax over empty vocabulary".into()));
@@ -422,10 +411,9 @@ fn argmax_last_row_device(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     }
     let rows = total / vocab_size;
     let dev = grim_nn::modules::pick_device_for_storage_device(logits.device());
-    if let Ok(scratch) = dev.alloc_storage(
-        &Shape::new(vec![1, vocab_size]),
-        grim_tensor::DType::F32,
-    ) {
+    if let Ok(scratch) =
+        dev.alloc_storage(&Shape::new(vec![1, vocab_size]), grim_tensor::DType::F32)
+    {
         if dev
             .copy_slice_range(
                 scratch.as_ref(),
@@ -447,9 +435,8 @@ fn argmax_last_row_device(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     Ok(argmax(&all[offset..]) as u32)
 }
 
-/// Single-row embedding gather: pulls exactly one hidden-size row from the
-/// table (via the device gather kernel), never the whole vocab×hidden
-/// table. OOV tokens clamp to row 0 (matches the legacy host helper).
+/// Single-row embedding gather: pulls exactly one hidden-size row from the table (via the device gather kernel), never the whole vocab×hidden table.
+/// OOV tokens clamp to row 0 (matches the legacy host helper).
 fn embedding_row_device(
     weight: &Tensor,
     tok: u32,
@@ -457,18 +444,11 @@ fn embedding_row_device(
     vocab_size: usize,
 ) -> Result<Vec<f32>> {
     let tok = if (tok as usize) < vocab_size { tok } else { 0 };
-    let row = grim_nn::embedding_gather_on_device(
-        weight,
-        &[tok],
-        1,
-        hidden_size,
-    )?;
+    let row = grim_nn::embedding_gather_on_device(weight, &[tok], 1, hidden_size)?;
     Ok(row.to_vec_f32()?)
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -500,7 +480,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![3.0, 7.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let tokens = mtp.predict_mtp_tokens(session.as_mut(), &input_ids, &positions).unwrap();
+        let tokens = mtp
+            .predict_mtp_tokens(session.as_mut(), &input_ids, &positions)
+            .unwrap();
         assert_eq!(tokens.len(), 2);
         for &tok in &tokens {
             assert!(tok < 64);
@@ -525,7 +507,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![5.0, 12.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let tokens = mtp.predict_mtp_tokens(session.as_mut(), &input_ids, &positions).unwrap();
+        let tokens = mtp
+            .predict_mtp_tokens(session.as_mut(), &input_ids, &positions)
+            .unwrap();
         assert_eq!(tokens.len(), 3);
         for &tok in &tokens {
             assert!(tok < 128);
@@ -533,7 +517,10 @@ mod tests {
 
         // Verify that the trunk forward pass populated the real contextual hidden state in session
         let trunk_last_h = session.get_last_hidden_state();
-        assert!(trunk_last_h.is_some(), "trunk forward must populate session.last_hidden_state");
+        assert!(
+            trunk_last_h.is_some(),
+            "trunk forward must populate session.last_hidden_state"
+        );
         let h_dims = trunk_last_h.unwrap().shape().dims().to_vec();
         assert_eq!(h_dims, vec![2, 64]);
     }

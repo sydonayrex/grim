@@ -278,7 +278,9 @@ fn test_paged_cache_transfer_roundtrip() {
         (0..128).map(|i| (l * 1000 + b * 100 + i) as f32).collect()
     };
     let v = |l: usize, b: usize| -> Vec<f32> {
-        (0..128).map(|i| -((l * 1000 + b * 100 + i) as f32)).collect()
+        (0..128)
+            .map(|i| -((l * 1000 + b * 100 + i) as f32))
+            .collect()
     };
     for layer in 0..2usize {
         for b in 0..2usize {
@@ -303,8 +305,16 @@ fn test_paged_cache_transfer_roundtrip() {
         for b in 0..2usize {
             let got_k = dest.read_layer_keys(b, layer).expect("keys written");
             let got_v = dest.read_layer_values(b, layer).expect("values written");
-            assert_eq!(&got_k[..128], &k(layer, b)[..], "layer {layer} block {b} keys");
-            assert_eq!(&got_v[..128], &v(layer, b)[..], "layer {layer} block {b} values");
+            assert_eq!(
+                &got_k[..128],
+                &k(layer, b)[..],
+                "layer {layer} block {b} keys"
+            );
+            assert_eq!(
+                &got_v[..128],
+                &v(layer, b)[..],
+                "layer {layer} block {b} values"
+            );
         }
     }
     // Valid token counts must survive the wire — the tail block stays a
@@ -370,8 +380,12 @@ fn test_disagg_shared_mem_transport_loopback_integrity() {
 
     let k0: Vec<f32> = (0..elem_per_token * 4).map(|i| (i as f32) * 0.25).collect();
     let v0: Vec<f32> = (0..elem_per_token * 4).map(|i| -(i as f32) * 0.5).collect();
-    let k1: Vec<f32> = (0..elem_per_token * 4).map(|i| (i as f32) + 100.0).collect();
-    let v1: Vec<f32> = (0..elem_per_token * 4).map(|i| (i as f32) - 100.0).collect();
+    let k1: Vec<f32> = (0..elem_per_token * 4)
+        .map(|i| (i as f32) + 100.0)
+        .collect();
+    let v1: Vec<f32> = (0..elem_per_token * 4)
+        .map(|i| (i as f32) - 100.0)
+        .collect();
 
     let port = find_free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -440,8 +454,7 @@ fn test_disagg_rdma_protocol_is_explicitly_unsupported() {
     let addr = format!("127.0.0.1:{port}");
     let _receiver = KvReceiverServer::new(&addr, dst_pool).unwrap();
 
-    let streamer =
-        LayerPipelinedKvStreamer::new(addr).with_protocol(TransportProtocol::RdmaRoce);
+    let streamer = LayerPipelinedKvStreamer::new(addr).with_protocol(TransportProtocol::RdmaRoce);
     let err = streamer
         .stream_layer_block(0, 0, &[1.0; 128], &[1.0; 128], 4)
         .expect_err("RdmaRoce must be an explicit error without a hardware backend");

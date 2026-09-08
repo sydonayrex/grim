@@ -1,12 +1,5 @@
-//! Google Gemma-2 architecture with dual pre/post layer norms,
-//! GeLU-Tanh gated activations, and attention / logit softcapping.
-//!
-//! # Architecture Details
-//! - **Normalization**: 4 RMSNorm layers per block (`input_layernorm`, `post_attention_layernorm`,
-//!   `pre_feedforward_layernorm`, `post_feedforward_layernorm`).
-//! - **Softcapping**: Attention logits softcapped at $50.0$, final LM head logits softcapped at $30.0$:
-//!   $\text{logits} = \text{cap} \cdot \tanh(\text{logits} / \text{cap})$.
-//! - **Activation**: GeLU with Tanh approximation and multiplication gating ($\text{GeLU}_{\text{tanh}}(x \cdot W_{\text{gate}}) \odot (x \cdot W_{\text{up}})$).
+//! Google Gemma-2 architecture with dual pre/post layer norms, GeLU-Tanh gated activations, and attention / logit softcapping.
+//! # Architecture Details - **Normalization**: 4 RMSNorm layers per block (`input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm`, `post_feedforward_layernorm`).
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -15,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Google Gemma-2 models.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,9 +62,7 @@ impl ModelConfig for Gemma2Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Feed Forward / GeLU-Tanh Gated MLP
-// ---------------------------------------------------------------------------
 
 pub struct Gemma2Mlp {
     pub gate_proj: Linear,
@@ -93,11 +82,8 @@ impl Gemma2Mlp {
         })
     }
 
-    /// Forward pass executing GeLU-Tanh gated multiplication:
-    /// $\text{out} = (\text{GeLU}_{\text{tanh}}(x \cdot W_{\text{gate}}) \odot (x \cdot W_{\text{up}})) \cdot W_{\text{down}}$.
-    ///
-    /// GeLU-tanh has no device kernel — the gated activation stays host-side
-    /// (kernel gap) and is re-uploaded onto the input's device once.
+    /// Forward pass executing GeLU-Tanh gated multiplication: $\text{out} = (\text{GeLU}_{\text{tanh}}(x \cdot W_{\text{gate}}) \odot (x \cdot W_{\text{up}})) \cdot W_{\text{down}}$.
+    /// GeLU-tanh has no device kernel - the gated activation stays host-side (kernel gap) and is.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
@@ -112,14 +98,13 @@ impl Gemma2Mlp {
             let gelu = 0.5 * x_val * (1.0 + tanh_in.tanh());
             act[i] = gelu * u_vec[i];
         }
-        let act_tensor = grim_nn::modules::move_to_device(&cpu_tensor(act, g.shape().clone()), x.device())?;
+        let act_tensor =
+            grim_nn::modules::move_to_device(&cpu_tensor(act, g.shape().clone()), x.device())?;
         Ok(self.down_proj.forward(&act_tensor)?)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct Gemma2Block {
     pub wq: Linear,
@@ -139,7 +124,11 @@ pub struct Gemma2Block {
 }
 
 impl Gemma2Block {
-    pub fn load(ws: &WeightSource<'_>, cfg: &Gemma2Config, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &Gemma2Config,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -191,11 +180,8 @@ impl Gemma2Block {
         })
     }
 
-    /// GPU-first forward: RoPE and attention run on the tensor's device;
-    /// host paths are only reached through the fused-kernel fallback guards.
-    /// Capped blocks take the host attention reference (the fused kernels
-    /// cannot apply cap*tanh(s/cap) before softmax); uncapped blocks take
-    /// the fully device-resident path.
+    /// GPU-first forward: RoPE and attention run on the tensor's device; host paths are only reached through the fused-kernel fallback guards.
+    /// Capped blocks take the host attention reference (the fused kernels cannot apply cap*tanh(s/cap) before softmax);.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -204,12 +190,8 @@ impl Gemma2Block {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -217,11 +199,8 @@ impl Gemma2Block {
             positions,
         )?;
 
-        // Attention-logit softcapping sits between the QK product and the
-        // softmax — the fused GPU kernels have no stage for it, so capped
-        // blocks MUST take the host reference (an uncapped fused run would
-        // silently produce wrong logits). Uncapped blocks keep the fully
-        // device-resident path.
+        // Attention-logit softcapping sits between the QK product and the softmax - the fused GPU kernels have no stage for it, so capped blocks MUST take the host reference (an uncapped fused run would silently produce wrong logits).
+        // Uncapped blocks keep the fully device-resident path.
         let attn_tensor = if let Some(cap) = self.attn_logit_softcapping {
             let q_vec = q.to_vec_f32()?;
             let k_vec = k.to_vec_f32()?;
@@ -286,9 +265,7 @@ impl Gemma2Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Gemma2 {
     pub cfg: Gemma2Config,
@@ -342,7 +319,10 @@ impl Gemma2 {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -413,9 +393,8 @@ impl CausalLm for Gemma2 {
         session.set_last_hidden_state(normed.clone());
         let logits = self.output.forward(&normed)?;
 
-        // Apply final logit softcapping if configured. Kernel gap: tanh has
-        // no device kernel, so the softcap stays a host pass on the terminal
-        // logits (pulled once per decode).
+        // Apply final logit softcapping if configured.
+        // Kernel gap: tanh has no device kernel, so the softcap stays a host pass on.
         if let Some(cap) = self.cfg.final_logit_softcapping {
             let mut l_vec = logits.to_vec_f32()?;
             for val in &mut l_vec {
@@ -428,9 +407,7 @@ impl CausalLm for Gemma2 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -455,29 +432,36 @@ mod tests {
         assert!((softcapped - cap).abs() < 1e-4);
     }
 
-    /// The attention-logit softcap (cap*tanh(s/cap) before softmax) must
-    /// change block outputs. Regression guard for the gap where the cap was
-    /// stored in the config but never applied on any path.
-    /// The attention-logit softcap (cap*tanh(s/cap) before softmax) must
-    /// change block outputs. Regression guard for the gap where the cap was
-    /// stored in the config but never applied on any path.
-    // temp debug
-#[test]
-fn dbg_shapes() {
-    use crate::gemma2::*;
-    let hidden=16; let q_dim=16; let head_dim=8;
-    let lin = |rows: usize, cols: usize, scale: f32| {
-        Linear::from_tensor(cpu_tensor((0..rows*cols).map(|i| ((i%13) as f32-6.0)*scale).collect(), Shape::new(vec![rows, cols])), None)
-    };
-    let wq = lin(hidden, q_dim, 0.1);
-    let q_in = crate::kv_attention::f32_tensor(vec![0.1f32; 2*hidden], Shape::new(vec![2, hidden]));
-    let q = wq.forward(&q_in).unwrap();
-    eprintln!("q {:?}", q.shape().dims());
-    let rope = grim_nn::modules::Rope::new(head_dim, 10000.0);
-    let qr = crate::shared_attention::rope_2d_on_device(&rope, &q, 2, &[0u32,1]).unwrap();
-    eprintln!("q roped {:?}", qr.shape().dims());
-}
+    /// The attention-logit softcap (cap*tanh(s/cap) before softmax) must change block outputs.
+    /// Regression guard for the gap where the cap was stored in the config but never.
+    #[test]
+    fn dbg_shapes() {
+        use crate::gemma2::*;
+        let hidden = 16;
+        let q_dim = 16;
+        let head_dim = 8;
+        let lin = |rows: usize, cols: usize, scale: f32| {
+            Linear::from_tensor(
+                cpu_tensor(
+                    (0..rows * cols)
+                        .map(|i| ((i % 13) as f32 - 6.0) * scale)
+                        .collect(),
+                    Shape::new(vec![rows, cols]),
+                ),
+                None,
+            )
+        };
+        let wq = lin(hidden, q_dim, 0.1);
+        let q_in =
+            crate::kv_attention::f32_tensor(vec![0.1f32; 2 * hidden], Shape::new(vec![2, hidden]));
+        let q = wq.forward(&q_in).unwrap();
+        eprintln!("q {:?}", q.shape().dims());
+        let rope = grim_nn::modules::Rope::new(head_dim, 10000.0);
+        let qr = crate::shared_attention::rope_2d_on_device(&rope, &q, 2, &[0u32, 1]).unwrap();
+        eprintln!("q roped {:?}", qr.shape().dims());
+    }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_attention_logit_softcapping_changes_logits() {
         let mut cfg = Gemma2Config::default();
@@ -490,7 +474,8 @@ fn dbg_shapes() {
         cfg.head_dim = 8;
         assert_eq!(cfg.attn_logit_softcapping, Some(50.0));
 
-        let (hidden, q_heads, kv_heads, head_dim, mlp_dim) = (16usize, 2usize, 1usize, 8usize, 32usize);
+        let (hidden, q_heads, kv_heads, head_dim, mlp_dim) =
+            (16usize, 2usize, 1usize, 8usize, 32usize);
         let q_dim = q_heads * head_dim;
         let kv_dim = kv_heads * head_dim;
         // Linear::from_tensor takes [out, in] (it pre-transposes for forward).
@@ -531,7 +516,9 @@ fn dbg_shapes() {
         };
 
         let x = cpu_tensor(
-            (0..2 * hidden).map(|i| (i as f32 * 0.125 - 1.0).sin()).collect(),
+            (0..2 * hidden)
+                .map(|i| (i as f32 * 0.125 - 1.0).sin())
+                .collect(),
             Shape::new(vec![2, hidden]),
         );
         let positions = vec![0u32, 1];
@@ -553,6 +540,7 @@ fn dbg_shapes() {
         );
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_gemma2_forward_and_session_state() {
         let mut cfg = Gemma2Config::default();
@@ -567,7 +555,9 @@ fn dbg_shapes() {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

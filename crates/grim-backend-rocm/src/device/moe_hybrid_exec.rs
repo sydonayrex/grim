@@ -1,22 +1,12 @@
 //! ROCm/HIP hybrid MoE decode executor with bandwidth-adaptive CPU-GPU co-execution.
-//!
-//! When serving frontier MoE models (DeepSeek-V4, Qwen3.6-MoE, GLM-5.2) on consumer/workstation
-//! AMD GPUs, the full expert pool exceeds VRAM. This module coordinates concurrent execution
-//! between the GPU and the CPU worker pool during decode:
-//!
-//! 1. Cache hits ($\mathcal{H}$) and bandwidth-allocated fills ($\mathcal{F}$, size $q^*$) execute on the GPU.
-//! 2. Residual misses ($\mathcal{C}$, size $m - q^*$) execute concurrently on the CPU host RAM.
-//! 3. Pinned flag handshake coordinates CPU worker execution inside captured HIP Graphs without host stalls.
-//! 4. Partial sums are reduced exactly: $y = y_{\text{GPU}} + y_{\text{CPU}}$.
+//! When serving frontier MoE models (DeepSeek-V4, Qwen3.6-MoE, GLM-5.2) on consumer/workstation AMD GPUs, the full expert.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use grim_tensor::error::{Error, Result};
 
 /// Mapped pinned memory flag for HIP-graph-compatible CPU/GPU handshake without CUDA/HIP host synchronization stalls.
-///
-/// # Layout Contract
-/// Annotated `#[repr(C, align(64))]` to fit a standard cache line and prevent false sharing.
+/// # Layout Contract Annotated `#[repr(C, align(64))]` to fit a standard cache line and prevent false.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct MoeGraphSyncFlag {
@@ -118,9 +108,7 @@ pub struct MoeHybridExecutor {
 
 impl MoeHybridExecutor {
     /// Create a new hybrid executor with empirical bandwidth measurements.
-    ///
-    /// # Contract
-    /// `pcie_bandwidth_mbps` and `host_bandwidth_mbps` must be positive.
+    /// # Contract `pcie_bandwidth_mbps` and `host_bandwidth_mbps` must be positive.
     pub fn new(pcie_bandwidth_mbps: f64, host_bandwidth_mbps: f64) -> Self {
         assert!(pcie_bandwidth_mbps > 0.0, "pcie_bandwidth_mbps must be > 0");
         assert!(host_bandwidth_mbps > 0.0, "host_bandwidth_mbps must be > 0");
@@ -131,10 +119,7 @@ impl MoeHybridExecutor {
     }
 
     /// Plan the hybrid execution partition for a token's routed top-k experts.
-    ///
-    /// # Contract
-    /// `resident_check` returns `true` if expert `e` is currently resident in GPU cache.
-    /// Returns a balanced `MoeHybridExecutionPlan`.
+    /// # Contract `resident_check` returns `true` if expert `e` is currently resident in GPU cache.
     pub fn plan_step<F>(
         &self,
         layer_idx: usize,
@@ -183,12 +168,8 @@ impl MoeHybridExecutor {
         }
     }
 
-    /// Concurrent execution of hybrid MoE step: CPU workers process Set $\mathcal{C}$
-    /// while GPU processes Set $\mathcal{H} \cup \mathcal{F}$, synchronized via atomic flags.
-    ///
-    /// # Contract
-    /// Launches CPU worker execution, executes GPU closure in parallel, waits for CPU completion
-    /// via `flag`, and merges partial results into `gpu_out`.
+    /// Concurrent execution of hybrid MoE step: CPU workers process Set $\mathcal{C}$ while GPU processes Set $\mathcal{H} \cup \mathcal{F}$, synchronized via atomic flags.
+    /// # Contract Launches CPU worker execution, executes GPU closure in parallel, waits for CPU completion.
     pub fn execute_hybrid_step<G>(
         &self,
         plan: &MoeHybridExecutionPlan,
@@ -261,9 +242,7 @@ impl MoeHybridExecutor {
     }
 
     /// Exact additive merge of GPU partial sums and CPU partial sums ($y = y_{\text{GPU}} + y_{\text{CPU}}$).
-    ///
-    /// # Contract
-    /// `gpu_out` and `cpu_out` must have identical lengths.
+    /// # Contract `gpu_out` and `cpu_out` must have identical lengths.
     pub fn merge_outputs(gpu_out: &mut [f32], cpu_out: &[f32]) -> Result<()> {
         if gpu_out.len() != cpu_out.len() {
             return Err(Error::ShapeMismatch {

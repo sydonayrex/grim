@@ -1,39 +1,9 @@
-//! Online-softmax partial-merge helpers (WI 3.4.4 shared math).
-//!
-//! FlashAttention-style online softmax maintains a running `(max, sum, acc)`
-//! triple per output dimension. When the KV loop is split across wavefronts
-//! (GPU, WI 1) or across devices (CPU/GPU hybrid, WI 3), each side produces
-//! an independent partial triple that must be merged into one. The merge
-//! formula is numerically stable — the *result* is independent of merge order,
-//! only intermediate values differ.
-//!
-//! This module hosts the merge in one place so the GPU intra-kernel wavefront
-//! merge (`grim_qkv_attention`), the CPU partial kernel
-//! (`strict_attention_partial_online`), and the cross-device CPU/GPU merge
-//! (WI 3.4.4) all reference the same math. Per the plan (`grim_rocm_consumer_perf_planv2.md`
-//! §3.4.4): "this is the same math in a third place now — put it in one place
-//! both sides can reference."
-//!
-//! The formula (mirrors the GPU kernel's wave-0 merge loop at
-//! `kernels/qkv_attention.rs` lines 224–236):
-//! ```text
-//! new_max = max(a.max, b.max)
-//! scale_a = exp(a.max - new_max)
-//! scale_b = exp(b.max - new_max)
-//! new_sum = a.sum * scale_a + b.sum * scale_b
-//! new_acc[d] = a.acc[d] * scale_a + b.acc[d] * scale_b
-//! ```
+//! Online-softmax partial-merge helpers for split-KV attention.
+//! Shared math ensuring numerical stability and device-agnostic parity.
 
 /// A partial online-softmax result for one (head, query) pair.
-///
-/// - `max` — running maximum score seen so far (`-inf` if no keys processed).
-/// - `sum` — running denominator sum (0 if no keys processed).
-/// - `acc` — running weighted value accumulator, one element per head dim.
-///
-/// Two partials computed over disjoint KV ranges can be merged via
-/// [`merge_partials`] to produce the partial that would have resulted from
-/// processing both ranges in sequence.
-#[derive(Debug, Clone)]
+/// Contains running max, denominator sum, and per-head weighted accumulator.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SoftmaxPartial {
     pub max: f32,
     pub sum: f32,
@@ -41,9 +11,7 @@ pub struct SoftmaxPartial {
 }
 
 impl SoftmaxPartial {
-    /// Identity element for merging: merging `empty(d)` with any partial `p`
-    /// returns `p` (cloned). `max = -inf` makes the `exp(-inf - new_max) = 0`
-    /// scale factor annihilate the empty side's contribution.
+    /// Constructs an empty partial acting as the identity element for merging.
     pub fn empty(head_dim: usize) -> Self {
         Self {
             max: f32::NEG_INFINITY,
@@ -52,30 +20,15 @@ impl SoftmaxPartial {
         }
     }
 
-    /// Finalize: divide the accumulator by the sum to produce the attention
-    /// output. The zero-guard (sum ≤ 0) returns 0 for empty KV ranges — this
-    /// is the "F5 guard" against NaN on sequences with no valid keys (matches
-    /// the GPU kernel's `inv_sum` ternary at `qkv_attention.rs` line 238).
+    /// Normalizes the accumulator by sum, guarding against division by zero.
     pub fn finalize(&self) -> Vec<f32> {
-        if self.sum <= 0.0 {
-            vec![0.0; self.acc.len()]
-        } else {
-            let inv = 1.0 / self.sum;
-            self.acc.iter().map(|&a| a * inv).collect()
-        }
+        let inv_sum = if self.sum > 0.0 { 1.0 / self.sum } else { 0.0 };
+        self.acc.iter().map(|&v| v * inv_sum).collect()
     }
 }
 
-/// Merge two partial online-softmax results into one.
-///
-/// Numerically stable: the result is invariant to the order of `a`/`b` and
-/// to the grouping of a sequence of merges (associative + commutative). This
-/// is the same property the GPU kernel relies on when merging 4 wavefront
-/// partials in any pairwise order.
-///
-/// If either side is empty (`sum == 0`, `max == -inf`), the other side is
-/// returned unchanged (modulo cloning) — the `exp(-inf - new_max)` scale
-/// factors zero out the empty side's contributions.
+/// Numerically stable merge of two partial online-softmax accumulators.
+/// Associative and commutative across split KV ranges.
 pub fn merge_partials(a: &SoftmaxPartial, b: &SoftmaxPartial) -> SoftmaxPartial {
     // Not debug_assert: a release-build mismatch would zip-truncate to the
     // shorter accumulator and silently return a wrong-shaped partial.
@@ -220,11 +173,8 @@ mod tests {
         assert!((out[1] - 4.0).abs() < 1e-4);
     }
 
-    // -----------------------------------------------------------------------
-    // Mutation-resistant golden merge values (hand-derived from the formula).
-    // The commutativity/associativity tests above would pass even if the
-    // merge were globally scaled by a constant; these assert exact triples.
-    // -----------------------------------------------------------------------
+    // Mutation-resistant golden merge values hand-derived from formula.
+    // Asserts exact triples beyond general commutativity/associativity.
 
     fn close(got: f32, want: f32, ctx: &str) {
         let abs = (got - want).abs();
@@ -284,9 +234,8 @@ mod tests {
         close(out[2], -2.0, "finalize acc[2]=-16/8");
     }
 
-    /// End-to-end: merge two disjoint-KV partials and finalize must equal the
-    /// attention weight from recomputing softmax over the union. This is the
-    /// property FlashAttention relies on for split-KV correctness.
+    /// End-to-end: merging disjoint partials and finalizing matches direct softmax.
+    /// FlashAttention relies on this invariant for split-KV correctness.
     #[test]
     fn merge_then_finalize_matches_direct_softmax_weights() {
         let union_max = 2.0f32;

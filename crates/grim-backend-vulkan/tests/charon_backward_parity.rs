@@ -2,8 +2,8 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test charon_backward_parity`.
 
-use grim_tensor::{CoreTensorOps, DType, Shape};
 use grim_backend_vulkan::VulkanDevice;
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 #[test]
 fn charon_backward_produces_finite_gradients() {
@@ -34,6 +34,19 @@ fn charon_backward_produces_finite_gradients() {
     let x_s = dev.from_cpu(&x, &x_shape, DType::F32).unwrap();
     let g_s = dev.from_cpu(&grad, &g_shape, DType::F32).unwrap();
 
-    let result = dev.charon_backward(&*x_s, &*gw_s, &*uw_s, &*dw_s, &*g_s, num_experts, hidden, inter);
-    assert!(result.is_ok(), "charon_backward dispatch: {:?}", result.err());
+    let result = dev.charon_backward(
+        &*x_s,
+        &*gw_s,
+        &*uw_s,
+        &*dw_s,
+        &*g_s,
+        num_experts,
+        hidden,
+        inter,
+    );
+    assert!(
+        result.is_ok(),
+        "charon_backward dispatch: {:?}",
+        result.err()
+    );
 }

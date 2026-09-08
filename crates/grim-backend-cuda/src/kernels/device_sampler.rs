@@ -1,11 +1,5 @@
 //! GPU-native stochastic sampling kernel for CUDA (WI-X3 parity).
-//!
-//! Ports `grim_sample_logits_stochastic` from grim-backend-rocm `device_sampler.rs`
-//! verbatim — same splitmix32 RNG, top-k bisection (24 iterations), top-p
-//! mass-bisection (24 iterations), and Gumbel-max sampling.
-//!
-//! Rust dispatch mirrors ROCm: `sample_logits_on_device` / `sample_logits_on_device_at`
-//! return `Ok(None)` on unsupported inputs for CPU fallback.
+//! Ports `grim_sample_logits_stochastic` from grim-backend-rocm `device_sampler.rs` verbatim - same splitmix32 RNG, top-k bisection (24 iterations), top-p.
 
 pub const DEVICE_SAMPLER_SOURCE: &str = r#"
 #define GRIM_SAMPLER_BLOCK 256

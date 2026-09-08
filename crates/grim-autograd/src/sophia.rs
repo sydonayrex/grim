@@ -1,7 +1,5 @@
 //! Sophia (Second-order Clipped Stochastic Optimization).
-//!
-//! Uses a diagonal Hessian estimate with elementwise clipping:
-//! theta_{t+1} = theta_t - eta * clip(m_t / max(h_t, gamma), rho) - eta * lambda * theta_t.
+//! Uses a diagonal Hessian estimate with elementwise clipping: theta_{t+1} = theta_t - eta * clip(m_t.
 
 use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_format::train::TrainState;

@@ -2,8 +2,8 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test log_softmax_vjp_parity`.
 
-use grim_tensor::{CoreTensorOps, DType, Shape};
 use grim_backend_vulkan::VulkanDevice;
+use grim_tensor::{CoreTensorOps, DType, Shape};
 
 #[test]
 fn log_softmax_vjp_matches_cpu_reference() {
@@ -18,8 +18,7 @@ fn log_softmax_vjp_matches_cpu_reference() {
         -1.4, -0.4,
     ];
     let grad = vec![
-        0.1f32, -0.2, 0.3, -0.1, 0.05, 0.15, -0.25, 0.0, 0.0, 0.0, 0.5, -0.5, 0.2, -0.2, 0.3,
-        -0.3,
+        0.1f32, -0.2, 0.3, -0.1, 0.05, 0.15, -0.25, 0.0, 0.0, 0.0, 0.5, -0.5, 0.2, -0.2, 0.3, -0.3,
     ];
     let shape = Shape::new(vec![2, 8]);
     let lp_s = dev.from_cpu(&log_probs, &shape, DType::F32).unwrap();
@@ -28,7 +27,7 @@ fn log_softmax_vjp_matches_cpu_reference() {
     let (dx, _handle) = dev.log_softmax_vjp(&*g_s, &*lp_s, &shape).unwrap();
     let dx_v = dx.to_cpu_vec_f32().unwrap();
 
-    let mut expected = vec![0.0f32; 16];
+    let mut expected = [0.0f32; 16];
     for row in 0..2 {
         let mut g_sum = 0.0f32;
         for k in 0..8 {

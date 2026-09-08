@@ -1,4 +1,4 @@
-use grim_disagg::coherence::{InvalidationMsg, CacheCoherenceManager};
+use grim_disagg::coherence::{CacheCoherenceManager, InvalidationMsg};
 
 #[test]
 fn test_invalidation_msg_roundtrip() {

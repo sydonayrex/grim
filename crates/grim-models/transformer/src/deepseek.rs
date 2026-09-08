@@ -70,11 +70,8 @@ impl DeepSeekBlock {
         let kv_b_proj = Linear::load(
             &ws.pp("kv_b_proj"),
             cfg.kv_lora_rank,
-            // kv_b_proj produces K **and** V concatenated per position, so its
-            // output width is 2 * num_heads * head_dim. The old value
-            // (num_heads * 128) was half of what `forward`'s split indexes,
-            // making `kv_data[pos * 2 * hidden + ...]` read out of bounds for
-            // any pos > 0. [Group B fix.]
+            // kv_b_proj produces K **and** V concatenated per position, so its output width is 2 * num_heads * head_dim.
+            // The old value (num_heads * 128) was half of what `forward`'s split indexes, making `kv_data[pos.
             2 * cfg.num_heads * 128,
             false,
         )?;
@@ -122,17 +119,8 @@ impl DeepSeekBlock {
     }
 }
 
-/// Per-layer MLA KV cache: post-RoPE keys and raw values for every token
-/// seen so far, flat `(past_len, num_heads * head_dim)`.
-///
-/// DeepSeek's MLA attention is a CPU reference loop, so it needs the *full*
-/// K/V history in one contiguous buffer. `KvCache::current_k`/`current_v` are
-/// scoped to the most recently appended slot(s) and the paged variant is
-/// block-addressed for the paged kernel, so neither fits this loop. This
-/// mirrors the pattern `lfm2.rs` already uses: per-layer caches parked in
-/// `session.model_state`, one `Vec<Option<_>>` entry per layer, so concurrent
-/// requests against the same model get independent state.
-/// [Group B fix: decode was stateless — every prior token was invisible.]
+/// Per-layer MLA KV cache: post-RoPE keys and raw values for every token seen so far, flat `(past_len, num_heads * head_dim)`.
+/// DeepSeek's MLA attention is a CPU reference loop, so it needs the *full* K/V history.
 #[derive(Clone, Default)]
 pub struct MlaLayerCache {
     /// Post-RoPE keys, `(past_len, num_heads * head_dim)`.
@@ -157,9 +145,8 @@ impl DeepSeekBlock {
         self.forward_cached(x, positions, &mut cache)
     }
 
-    /// Cache-aware forward. `cache` accumulates post-RoPE K and raw V across
-    /// calls, so a single-token decode step attends over the full context
-    /// rather than only itself.
+    /// Cache-aware forward. `cache` accumulates post-RoPE K and raw V across calls, so
+    /// a single-token decode step attends over the full context rather than only itself.
     pub fn forward_cached(
         &self,
         x: &Tensor,
@@ -208,9 +195,8 @@ impl DeepSeekBlock {
             }
         }
 
-        // RoPE expects 3-D (B, S, D). Reshape each call's Q/K to (1, S, D);
-        // the data is already contiguously (S, D) so this is a zero-copy
-        // relabel. After rotation, relabel back to 2-D for the attention loop.
+        // RoPE expects 3-D (B, S, D). Reshape each call's Q/K to (1, S,
+        // D); the data is already contiguously (S, D) so this is a zero-copy relabel.
         let q_3d = Tensor::new(
             q.storage().clone(),
             grim_tensor::Shape::new(vec![1, new_tokens, hidden]),
@@ -335,13 +321,8 @@ impl DeepSeek {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for DeepSeek (MLA). The MLA attention uses
-    /// projected (not headed) KV via `kv_b_proj` of shape
-    /// `[2*num_heads*128, hidden]`; sharding it on the head axis requires
-    /// bespoke handling that `Linear::load_column_parallel` cannot express, and
-    /// `forward` calls plain `Linear::forward` (no all-reduce hook). Refuses
-    /// `world_size > 1` until both the sharding math and the `forward` rework
-    /// land. `world_size == 1` delegates to the plain path.
+    /// Tensor-parallel load entry for DeepSeek (MLA).
+    /// The MLA attention uses projected (not headed) KV via `kv_b_proj` of shape `[2*num_heads*128, hidden]`; sharding.
     pub fn load_tp(
         device: Device,
         ws: &grim_nn::WeightSource<'_>,
@@ -514,13 +495,7 @@ mod tests {
     }
 
     // §4.2 Decode sees prior context. The original bug: `forward` attended only
-    // over the single decode token (seq_len=1), so the prior prompt was
-    // invisible. Proof the cache-aware path is fixed: decoding token `d` after a
-    // 2-token prefill must produce a DIFFERENT output than running `d` alone
-    // through the (now-prefill-only) `forward` — the cached prefix changes the
-    // attention result. Under uniform near-zero weights the cross-token
-    // influence is faint, so we assert directly that the cached decode output
-    // is not equal to a stateless single-token forward of the same token.
+    // over the single decode token (seq_len=1), so the prior prompt was invisible.
     #[test]
     fn test_decode_sees_prior_context() {
         let blk = tiny_block();
@@ -588,9 +563,8 @@ mod tests {
         assert_eq!(cache.past_len, p + n, "after decode steps");
     }
 
-    // §4.4 kv_b_proj indexing stays in bounds. The split reads 2*hidden floats
-    // per position; with new_tokens=1 (decode) and new_tokens>1 (prefill) the
-    // index pos*2*hidden + hidden + (head_dim-1) must be < kv_data.len().
+    // §4.4 kv_b_proj indexing stays in bounds.
+    // The split reads 2*hidden floats per position; with new_tokens=1 (decode) and new_tokens>1 (prefill) the index.
     #[test]
     fn test_kv_split_in_bounds() {
         let blk = tiny_block();

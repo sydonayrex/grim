@@ -1,26 +1,5 @@
 //! RoPE scaling methods for long-context fine-tuning (WI-T10 / Phase 6.2).
-//!
-//! RoPE frequency scaling extends the effective context window without
-//! retraining by modifying the rotational frequency base. The supported
-//! methods mirror Unsloth's `RopeScalingMethod`:
-//!
-//! - `None`: no scaling — use the model's native `rope_theta`.
-//! - `Linear(factor)`: linear interpolation — `θ_i' = θ_i / factor^{1/head_dim}`,
-//!   equivalently `effective_base = base * factor^{1/head_dim}`.
-//! - `Llama3(factor)`: Llama 3 style piecewise interpolation with the
-//!   default `low_freq_factor`/`high_freq_factor` folding into a single
-//!   effective base: `effective_base = base * factor` (corrected from the
-//!   earlier `(8/head_dim)^2/2` approximation, which produced ~1.6% rather
-//!   than the intended ~8x shift for `head_dim=128, factor=8`).
-//! - `LongRoPE(factor)`: NTK-aware frequency mixing (Kim et al.) where
-//!   frequencies below a critical threshold are interpolated and those above
-//!   are extrapolated. Reduced to a scalar effective base for backends whose
-//!   `rope` API takes a single base value: `base * factor^{head_dim/(head_dim-2)}`.
-//! - `YaRN(factor, ...)`: NTK-by-parts with magnitude correction; the scalar
-//!   base uses the same NTK-aware exponent. `mscale`/`mscale_all` are retained
-//!   in the enum for backends that support magnitude correction.
-//! - `Dynamic`: theta-shift placeholder — delegates to `base` (future NTK-alpha
-//!   dynamic routing).
+//! RoPE frequency scaling extends the effective context window without retraining by modifying the rotational frequency.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,10 +28,7 @@ pub enum RopeScalingMethod {
 }
 
 /// Compute the effective rotational frequency base for `method`.
-///
-/// `base` is the model's native `rope_theta`; `head_dim` is the per-head
-/// embedding dimension. Backends whose `rope` implementation accepts a single
-/// base value should use the returned scalar.
+/// `base` is the model's native `rope_theta`; `head_dim` is the per-head embedding dimension.
 pub fn scaling_base(method: &RopeScalingMethod, base: f32, head_dim: usize) -> f32 {
     let dim = head_dim.max(1) as f32;
     match method {
@@ -60,10 +36,6 @@ pub fn scaling_base(method: &RopeScalingMethod, base: f32, head_dim: usize) -> f
         RopeScalingMethod::Linear { factor } => base * factor.powf(1.0 / dim),
         // Llama 3 style: linear interpolation between original and scaled rope.
         // effective_base = base * factor for the full scaling factor.
-        // The (8/head_dim)^2/2 term was a rough approximation that produced ~1.6%
-        // shift for factor=8 instead of the intended ~8x. Corrected to match the
-        // Llama 3 reference: scale the base by the factor directly.
-        // [P2-22 fix: corrected Llama3 rope scaling formula.]
         RopeScalingMethod::Llama3 { factor } => base * factor,
         RopeScalingMethod::LongRoPE { factor } | RopeScalingMethod::YaRN { factor, .. } => {
             // NTK-aware effective base (interpolation for low freq, extrapolation for high).

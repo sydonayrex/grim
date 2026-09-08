@@ -1,14 +1,5 @@
 //! Fused KV-dequantized attention CUDA kernel.
-//!
 //! Ported from grim-backend-rocm `kernels/kv_dequant_attention.rs` (WRECK-5).
-//!
-//! Supports three quantization formats for KV cache:
-//!   0 = FP16 (row-major half, row_bytes = head_dim * 2)
-//!   1 = Q8_0 (block: 2-byte fp16 delta + 32 int8 codes = 34 bytes per 32 elements)
-//!   2 = Q4_K (super-block: 144 bytes per 256 elements — d/dmin/scales/nibbles)
-//!
-//! Legacy quant_bits paths (4=nibble, 8=int8) preserved for ABI stability.
-//! warpSize → 32 for CUDA (no wavefront assumption).
 
 pub const KV_DEQUANT_ATTENTION_SOURCE: &str = r#"
 #include <math.h>

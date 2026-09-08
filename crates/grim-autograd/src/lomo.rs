@@ -1,8 +1,5 @@
 //! LOMO (Low-Memory Optimization) and AdaLomo optimizers.
-//!
-//! LOMO fuses backward computation with parameter updates to achieve zero
-//! gradient memory overhead during LLM pretraining and full-parameter finetuning.
-//! AdaLomo adds adaptive learning rate scaling with minimal second-moment state.
+//! LOMO fuses backward computation with parameter updates to achieve zero gradient memory overhead during LLM.
 
 use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_format::train::TrainState;

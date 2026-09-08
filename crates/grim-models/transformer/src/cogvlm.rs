@@ -1,9 +1,5 @@
 //! CogVLM vision-language model with dual visual-expert attention and FFN pathways.
-//!
-//! # Architecture Details
-//! - **Visual Expert Routing**: Token sequence is tagged with text/vision mask; visual tokens activate specialized visual linear projections and visual MLPs.
-//! - **EVA2-CLIP Visual Backbone**: Extracts spatial patch representations projected into the language model's hidden dimension.
-//! - **Language Transformer**: GQA self-attention with SwiGLU text and visual expert feed-forward networks.
+//! # Architecture Details - **Visual Expert Routing**: Token sequence is tagged with text/vision mask; visual.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -11,9 +7,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Tensor};
 
-// ---------------------------------------------------------------------------
 // Vision Config & Encoder
-// ---------------------------------------------------------------------------
 
 /// Configuration for CogVLM visual encoder.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -77,9 +71,7 @@ impl CogVlmVisionEncoder {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for CogVLM transformer.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -127,9 +119,7 @@ impl ModelConfig for CogVlmConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block with Visual Expert
-// ---------------------------------------------------------------------------
 
 /// Transformer block with text and visual expert pathways.
 pub struct CogVlmBlock {
@@ -248,8 +238,7 @@ impl CogVlmBlock {
         })
     }
 
-    /// GPU-first forward: Q/K/V (text or visual expert), RoPE, KV-cache
-    /// concat, attention and the SwiGLU MLP all run on the tensor's device.
+    /// GPU-first forward: Q/K/V (text or visual expert), RoPE, KV-cache concat, attention and the SwiGLU MLP all run on the tensor's device.
     /// Host paths are only reached through the fused-kernel fallback guards.
     pub fn forward(
         &self,
@@ -271,12 +260,8 @@ impl CogVlmBlock {
         let k = cur_wk.forward(&normed_attn)?;
         let v = cur_wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -331,9 +316,7 @@ impl CogVlmBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct CogVlm {
     pub cfg: CogVlmConfig,

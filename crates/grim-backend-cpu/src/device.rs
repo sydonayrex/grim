@@ -1,20 +1,14 @@
-//! CPU `BackendDevice`.
-//!
-//! ## GEMM dispatch (§4.1 — OxiBLAS)
-//!
-//! Matrix multiplication routes through [`gemm_dispatch`]:
-//!
-//! 1. `M=1` GEMV fast path — single-token decode, avoids GEMM overhead.
-//! 2. `oxiblas` feature: `matrixmultiply::sgemm` — pure-Rust SIMD BLAS.
-//! 3. Scalar fallback triple-loop — for no-SIMD / fuzzing / `--no-default-features`.
+//! CPU `BackendDevice`. ## GEMM dispatch (§4.1 - OxiBLAS) Matrix multiplication routes through [`gemm_dispatch`]: 1.
 
 use std::sync::Arc;
 
-use grim_tensor::backend::{block_table_block_id, ComputeHandle, ReadyHandle};
+use grim_tensor::backend::{ComputeHandle, ReadyHandle, block_table_block_id};
 use grim_tensor::dtype::{DType, Device, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendStorage, Shape, Tensor,
-    CoreTensorOps, ElementwiseOps, SamplingOps, AttentionOps, FusionOps, AutogradOps, OptimizerOps, QuantOps, RecurrentOps, CollectiveOps, MemoryOps, GraphCaptureOps,
+use grim_tensor::{
+    AttentionOps, AutogradOps, BackendStorage, CollectiveOps, CoreTensorOps, ElementwiseOps,
+    FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
+    Shape, Tensor,
 };
 
 use crate::storage::CpuStorage;
@@ -77,9 +71,8 @@ impl CpuDevice {
     }
 }
 
-/// Dequantize a packed K/V cache tensor of layout `[kv_seq_len, num_kv_heads, head_dim]`
-/// (8-bit: 1 elem/byte; 4-bit: 2 elems/byte) using per-row f32 scales into a
-/// row-major f32 buffer the reference attention can consume.
+/// Dequantize a packed K/V cache tensor of layout `[kv_seq_len, num_kv_heads, head_dim]` (8-bit: 1 elem/byte; 4-bit:
+/// 2 elems/byte) using per-row f32 scales into a row-major f32 buffer the reference attention can consume.
 fn dequant_packed_kv(
     packed: &CpuStorage,
     scales: &CpuStorage,
@@ -127,9 +120,8 @@ fn dequant_packed_kv(
 }
 
 impl CpuDevice {
-    /// Shared scalar GQA attention core with optional ALiBi bias. Used by
-    /// both the plain and ALiBi trait methods so the reference math stays
-    /// in one place.
+    /// Shared scalar GQA attention core with optional ALiBi bias.
+    /// Used by both the plain and ALiBi trait methods so the reference math stays in.
     #[allow(clippy::too_many_arguments)]
     fn qkv_attention_inner(
         &self,
@@ -223,9 +215,8 @@ impl CpuDevice {
                 }
             }
         }
-        // WI-E3/E6 fix: the data is written flat [seq_len, num_head_dims];
-        // returning it with the 3-D out_shape made downstream Linear::forward
-        // see a non-2-D operand and fail with "matmul expects 2-D inputs".
+        // WI-E3/E6 fix: the data is written flat [seq_len, num_head_dims]; returning it with the 3-D
+        // out_shape made downstream Linear::forward see a non-2-D operand and fail with "matmul expects 2-D inputs".
         let flat_shape = Shape::new(vec![seq_len, num_head_dims]);
         Ok((
             Box::new(CpuStorage::new(out, flat_shape, DType::F32)),
@@ -235,7 +226,6 @@ impl CpuDevice {
 }
 
 impl CoreTensorOps for CpuDevice {
-
     /// Device-side 2-D transpose: pure re-indexing on the host-resident CPU
     /// buffer — no data conversion, no second upload (B5).
     fn transpose_2d(
@@ -274,7 +264,6 @@ impl CoreTensorOps for CpuDevice {
             dtype,
         )))
     }
-
 
     fn matmul(
         &self,
@@ -318,7 +307,6 @@ impl CoreTensorOps for CpuDevice {
         ))
     }
 
-
     fn add(
         &self,
         a: &dyn BackendStorage,
@@ -346,7 +334,6 @@ impl CoreTensorOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn mul(
         &self,
@@ -376,7 +363,6 @@ impl CoreTensorOps for CpuDevice {
         ))
     }
 
-
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -401,7 +387,6 @@ impl CoreTensorOps for CpuDevice {
         ))
     }
 
-
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -411,11 +396,8 @@ impl CoreTensorOps for CpuDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let x = a_storage(x)?;
         let w = a_storage(weight)?;
-        // The storage may carry a different shape than the tensor view (e.g. a
-        // zero-copy relabel like QK-norm's (B,S,num_heads*head_dim)->(B*S*num_heads,
-        // head_dim)). Only the total element count and the 2-D output rank matter
-        // for the row-wise norm computation; the storage's own dim layout is not
-        // used for indexing (rows are indexed by out_shape.dims().last()).
+        // The storage may carry a different shape than the tensor view (e.g.
+        // a zero-copy relabel like QK-norm's (B,S,num_heads*head_dim)->(B*S*num_heads, head_dim)).
         if x.shape().elem_count() != out_shape.elem_count() || out_shape.rank() != 2 {
             return Err(Error::Shape("rms_norm: shape mismatch".into()));
         }
@@ -443,7 +425,6 @@ impl CoreTensorOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn softmax(
         &self,
@@ -478,7 +459,6 @@ impl CoreTensorOps for CpuDevice {
         ))
     }
 
-
     fn embedding(
         &self,
         weight: &dyn BackendStorage,
@@ -511,7 +491,6 @@ impl CoreTensorOps for CpuDevice {
         ))
     }
 
-
     fn from_cpu(
         &self,
         data: &[f32],
@@ -532,7 +511,6 @@ impl CoreTensorOps for CpuDevice {
         )))
     }
 
-
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -543,8 +521,6 @@ impl CoreTensorOps for CpuDevice {
 }
 
 impl ElementwiseOps for CpuDevice {
-
-
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -566,7 +542,6 @@ impl ElementwiseOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn add_scalar(
         &self,
@@ -590,7 +565,6 @@ impl ElementwiseOps for CpuDevice {
         ))
     }
 
-
     fn sub_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -612,7 +586,6 @@ impl ElementwiseOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn div_scalar(
         &self,
@@ -637,7 +610,6 @@ impl ElementwiseOps for CpuDevice {
         ))
     }
 
-
     fn sqrt(
         &self,
         x: &dyn BackendStorage,
@@ -658,7 +630,6 @@ impl ElementwiseOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn recip(
         &self,
@@ -682,12 +653,9 @@ impl ElementwiseOps for CpuDevice {
     }
 }
 
-impl SamplingOps for CpuDevice {
-}
+impl SamplingOps for CpuDevice {}
 
 impl AttentionOps for CpuDevice {
-
-
     fn sage_attention(
         &self,
         q: &dyn BackendStorage,
@@ -710,7 +678,6 @@ impl AttentionOps for CpuDevice {
             None,
         )
     }
-
 
     fn rope(
         &self,
@@ -780,7 +747,6 @@ impl AttentionOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn rerope(
         &self,
@@ -868,7 +834,6 @@ impl AttentionOps for CpuDevice {
         ))
     }
 
-
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -894,7 +859,6 @@ impl AttentionOps for CpuDevice {
             out_shape,
         )
     }
-
 
     fn qkv_attention_alibi(
         &self,
@@ -928,16 +892,8 @@ impl AttentionOps for CpuDevice {
         )
     }
 
-
     /// CPU **reference** implementation of fused dequantized KV-attention.
-    ///
-    /// The trait default is `Unimplemented` (only ROCm wires the real HIP kernel),
-    /// but the CPU backend serves as the deterministic reference for GPU parity
-    /// testing (see cpu-catch-up.md T-ref-1). This dequantizes the packed K/V
-    /// caches on the fly (4/8-bit packed per the `grim_kv_dequant_attention`
-    /// layout) and runs a straightforward reference attention that mirrors the
-    /// math in `qkv_attention` (scale `1/sqrt(head_dim)`, causal mask relative
-    /// to `cache_offset`, GQA via `kvh = h*num_kv_heads/num_heads`).
+    /// The trait default is `Unimplemented` (only ROCm wires the real HIP kernel), but the CPU.
     fn kv_dequant_attention(
         &self,
         q: &dyn BackendStorage,
@@ -1040,7 +996,6 @@ impl AttentionOps for CpuDevice {
         ))
     }
 
-
     fn mla_q_kv_norm_split(
         &self,
         q_raw: &dyn BackendStorage,
@@ -1116,7 +1071,6 @@ impl AttentionOps for CpuDevice {
         ))
     }
 
-
     fn qkv_attention_paged(
         &self,
         q: &dyn BackendStorage,
@@ -1174,7 +1128,7 @@ impl AttentionOps for CpuDevice {
                     } else {
                         let block_idx_in_seq = t2 / page_size;
                         let offset_in_block = t2 % page_size;
-                        let block_id = block_table_block_id(&btd, block_idx_in_seq, max_blocks);
+                        let block_id = block_table_block_id(btd, block_idx_in_seq, max_blocks);
 
                         let k_offset =
                             (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
@@ -1215,7 +1169,7 @@ impl AttentionOps for CpuDevice {
                     for (t2, &score) in scores.iter().enumerate() {
                         let block_idx_in_seq = t2 / page_size;
                         let offset_in_block = t2 % page_size;
-                        let block_id = block_table_block_id(&btd, block_idx_in_seq, max_blocks);
+                        let block_id = block_table_block_id(btd, block_idx_in_seq, max_blocks);
                         let v_offset =
                             (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
                         acc += score * vd[v_offset + d];
@@ -1233,8 +1187,6 @@ impl AttentionOps for CpuDevice {
 }
 
 impl FusionOps for CpuDevice {
-
-
     fn silu_mul_quantize(
         &self,
         gate: &dyn BackendStorage,
@@ -1296,7 +1248,6 @@ impl FusionOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn fused_add_rms_norm(
         &self,
@@ -1361,8 +1312,6 @@ impl FusionOps for CpuDevice {
 }
 
 impl AutogradOps for CpuDevice {
-
-
     fn silu_mul_backward(
         &self,
         e: &dyn BackendStorage,
@@ -1405,12 +1354,9 @@ impl AutogradOps for CpuDevice {
     }
 }
 
-impl OptimizerOps for CpuDevice {
-}
+impl OptimizerOps for CpuDevice {}
 
 impl QuantOps for CpuDevice {
-
-
     fn quantized_matmul(
         &self,
         a: &dyn BackendStorage,
@@ -1442,9 +1388,8 @@ impl QuantOps for CpuDevice {
             &b_bytes_owned
         };
 
-        // WI-E7 fast path: Q8_0 GEMM directly on the packed bytes. Skips both
-        // the [N,K] f32 dequant materialization (~240 MB for an output head)
-        // and the transpose copy. Requires k % 32 == 0 (whole blocks).
+        // WI-E7 fast path: Q8_0 GEMM directly on the packed bytes.
+        // Skips both the [N,K] f32 dequant materialization (~240 MB for an output head) and the.
         if matches!(format, grim_tensor::QuantFormat::Q8_0) && k % 32 == 0 {
             let c = grim_quant::gemm_q8_0_packed(a_data, b_bytes, m, n, k)?;
             return Ok((
@@ -1453,9 +1398,8 @@ impl QuantOps for CpuDevice {
             ));
         }
 
-        // WI-E7 fast path: Q4_K GEMM directly on the packed bytes, same shape
-        // guard pattern as Q8_0 above. A q4_K super-block covers 256 weights,
-        // so whole-block GEMM requires k % 256 == 0.
+        // WI-E7 fast path: Q4_K GEMM directly on the packed bytes, same shape guard pattern as Q8_0 above.
+        // A q4_K super-block covers 256 weights, so whole-block GEMM requires k % 256 == 0.
         if matches!(format, grim_tensor::QuantFormat::Q4K) && k % 256 == 0 {
             let c = grim_quant::gemm_q4k_packed(a_data, b_bytes, m, n, k)?;
             return Ok((
@@ -1494,13 +1438,8 @@ impl QuantOps for CpuDevice {
                     out
                 }
                 _ => match format {
-                    // GGUF Q8_0 weights are resident as the native 34-byte block
-                    // stream (2-byte f16 scale + 32 int8 quants per block), and
-                    // `Linear::forward` passes an empty `b_scales` (scales live in
-                    // the block headers). Decoding with the canonical
-                    // `dequant_q80` — the hand-rolled loop below read stride-32
-                    // with a 1.0 scale fallback, treating the f16 headers as
-                    // quants and corrupting every attention projection.
+                    // GGUF Q8_0 weights are resident as the native 34-byte block stream (2-byte f16 scale + 32 int8 quants per block), and `Linear::forward` passes an empty `b_scales` (scales live in the block headers).
+                    // Decoding with the canonical `dequant_q80` - the hand-rolled loop below read stride-32 with a 1.0.
                     grim_tensor::QuantFormat::Q8_0 => grim_quant::dequant_q80(b_bytes, k * n)
                         .map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul Q8_0 dequant: {e}"))
@@ -1587,7 +1526,6 @@ impl QuantOps for CpuDevice {
         ))
     }
 
-
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
@@ -1627,10 +1565,8 @@ impl QuantOps for CpuDevice {
             _ => Vec::new(),
         };
 
-        // GGUF-native Q8_0 resident bytes (34-byte blocks, scales in headers):
-        // decode with the canonical dequant_q80, matching the forward path.
-        // Other storage dtypes keep the legacy dequant_row path (ResidualPacked
-        // training / synthetic buffers with external scales).
+        // GGUF-native Q8_0 resident bytes (34-byte blocks, scales in headers): decode with the canonical dequant_q80, matching the forward path.
+        // Other storage dtypes keep the legacy dequant_row path (ResidualPacked training / synthetic buffers with external.
         let mut dx_vec = vec![0.0f32; m * k];
         if matches!(
             b_packed.dtype().storage,
@@ -1678,8 +1614,6 @@ impl QuantOps for CpuDevice {
 }
 
 impl RecurrentOps for CpuDevice {
-
-
     fn short_conv1d_causal_step(
         &self,
         x: &dyn BackendStorage,
@@ -1722,7 +1656,6 @@ impl RecurrentOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn kda_gated_delta_rule_step(
         &self,
@@ -1777,14 +1710,185 @@ impl RecurrentOps for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
+    fn rwkv_wkv_recurrence(
+        &self,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        time_first: &dyn BackendStorage,
+        time_decay: &dyn BackendStorage,
+        state_aa: &dyn BackendStorage,
+        state_bb: &dyn BackendStorage,
+        state_pp: &dyn BackendStorage,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let k_s = a_storage(k)?;
+        let v_s = a_storage(v)?;
+        let r_s = a_storage(r)?;
+        let tf_s = a_storage(time_first)?;
+        let td_s = a_storage(time_decay)?;
+        let aa_s = a_storage(state_aa)?;
+        let bb_s = a_storage(state_bb)?;
+        let pp_s = a_storage(state_pp)?;
+
+        let k_d = k_s.data();
+        let v_d = v_s.data();
+        let r_d = r_s.data();
+        let tf_d = tf_s.data();
+        let td_d = td_s.data();
+
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+
+        unsafe {
+            let aa_ptr = aa_s.data.as_ptr() as *mut f32;
+            let bb_ptr = bb_s.data.as_ptr() as *mut f32;
+            let pp_ptr = pp_s.data.as_ptr() as *mut f32;
+
+            for i in 0..dim {
+                let k_ch = k_d[i];
+                let v_ch = v_d[i];
+                let r_ch = r_d[i];
+                let tf_ch = tf_d[i];
+                let td_ch = td_d[i];
+
+                let aa_val = *aa_ptr.add(i);
+                let bb_val = *bb_ptr.add(i);
+                let pp_val = *pp_ptr.add(i);
+
+                let ww = tf_ch + k_ch;
+                let p = pp_val.max(k_ch);
+                let e1 = (pp_val - p).exp();
+                let e2 = (ww - p).exp();
+                let num = e1 * aa_val + e2 * v_ch;
+                let den = e1 * bb_val + e2;
+
+                let sig_r = 1.0f32 / (1.0f32 + (-r_ch).exp());
+                out[i] = sig_r * if den != 0.0f32 { num / den } else { 0.0f32 };
+
+                *aa_ptr.add(i) = num;
+                *bb_ptr.add(i) = den;
+                *pp_ptr.add(i) = p + td_ch;
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn rwkv_channel_mix_full(
+        &self,
+        x: &dyn BackendStorage,
+        mix_k: &dyn BackendStorage,
+        mix_r: &dyn BackendStorage,
+        ffn_xx: &dyn BackendStorage,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = a_storage(x)?;
+        let mk_s = a_storage(mix_k)?;
+        let mr_s = a_storage(mix_r)?;
+        let xx_s = a_storage(ffn_xx)?;
+
+        let x_d = x_s.data();
+        let mk_d = mk_s.data();
+        let mr_d = mr_s.data();
+
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+
+        unsafe {
+            let xx_ptr = xx_s.data.as_ptr() as *mut f32;
+
+            for i in 0..dim {
+                let x_val = x_d[i];
+                let mk = mk_d[i];
+                let mr = mr_d[i];
+                let xx_val = *xx_ptr.add(i);
+
+                let k_mix = mk * x_val + (1.0f32 - mk) * xx_val;
+                let r_mix = mr * x_val + (1.0f32 - mr) * xx_val;
+
+                let sig_r = 1.0f32 / (1.0f32 + (-r_mix).exp());
+                out[i] = sig_r * k_mix.max(0.0f32);
+
+                *xx_ptr.add(i) = x_val;
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn delta_rule_decode(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: f32,
+        state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        num_heads: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = a_storage(q)?;
+        let k_s = a_storage(k)?;
+        let v_s = a_storage(v)?;
+        let state_s = a_storage(state)?;
+
+        let q_d = q_s.data();
+        let k_d = k_s.data();
+        let v_d = v_s.data();
+
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+
+        unsafe {
+            let state_ptr = state_s.data.as_ptr() as *mut f32;
+
+            for head in 0..num_heads {
+                let state_base = head * d_k * d_v;
+                let q_base = head * d_k;
+                let k_base = head * d_k;
+                let v_base = head * d_v;
+                let out_base = head * d_v;
+
+                for i in 0..d_v {
+                    let mut sk = 0.0f32;
+                    for j in 0..d_k {
+                        sk += *state_ptr.add(state_base + i * d_k + j) * k_d[k_base + j];
+                    }
+
+                    let delta_v = beta * (v_d[v_base + i] - sk);
+
+                    for j in 0..d_k {
+                        *state_ptr.add(state_base + i * d_k + j) += delta_v * k_d[k_base + j];
+                    }
+
+                    let mut acc = 0.0f32;
+                    for j in 0..d_k {
+                        acc += q_d[q_base + j] * *state_ptr.add(state_base + i * d_k + j);
+                    }
+
+                    out[out_base + i] = acc;
+                }
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
 }
 
-impl CollectiveOps for CpuDevice {
-}
+impl CollectiveOps for CpuDevice {}
 
 impl MemoryOps for CpuDevice {
-
-
     fn from_cpu_bytes(
         &self,
         data: &[u8],
@@ -1814,7 +1918,6 @@ impl MemoryOps for CpuDevice {
         }
     }
 
-
     fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
         let n = shape.elem_count();
@@ -1824,7 +1927,6 @@ impl MemoryOps for CpuDevice {
             dtype,
         )))
     }
-
 
     fn copy_slice_into(
         &self,
@@ -1870,26 +1972,19 @@ impl MemoryOps for CpuDevice {
 }
 
 impl GraphCaptureOps for CpuDevice {
-
-
-    // Bridge the inherent CPU graph-capture implementation into the
-    // `BackendDevice` trait contract so generic `&dyn BackendDevice` callers
-    // (model runners, the same path GPU backends use) see the real CPU capture
-    // instead of the trait default `Err(Unimplemented)`.
+    // Bridge the inherent CPU graph-capture implementation into the `BackendDevice` trait contract so generic `&dyn BackendDevice` callers (model
+    // runners, the same path GPU backends use) see the real CPU capture instead of the trait default `Err(Unimplemented)`.
     fn begin_graph_capture(&self, key: &str) -> Result<()> {
         CpuDevice::begin_graph_capture(self, key)
     }
-
 
     fn end_graph_capture(&self, key: &str) -> Result<()> {
         CpuDevice::end_graph_capture(self, key)
     }
 
-
     fn replay_graph(&self, key: &str) -> Result<bool> {
         CpuDevice::replay_graph(self, key)
     }
-
 
     fn has_captured_graph(&self, key: &str) -> bool {
         self.graphs.has_captured(key)
@@ -1897,7 +1992,6 @@ impl GraphCaptureOps for CpuDevice {
 }
 
 impl grim_tensor::BackendDevice for CpuDevice {}
-
 
 impl BackendStorage for CpuStorage {
     fn dtype(&self) -> DType {
@@ -1912,10 +2006,8 @@ impl BackendStorage for CpuStorage {
     fn quant_scales(&self) -> Option<&[f32]> {
         self.quant_scales.as_deref()
     }
-    /// CPU canonical layout is `Vec<f32>` (integers stored as f32 values),
-    /// so the u32 view is a straight cast — correct for F32, U32 and I64
-    /// dtypes alike. Mirrors the `to_cpu_vec_f32` dequant fallback for
-    /// quantized storage.
+    /// CPU canonical layout is `Vec<f32>` (integers stored as f32 values), so the u32 view is a straight cast - correct for F32, U32 and I64 dtypes alike.
+    /// Mirrors the `to_cpu_vec_f32` dequant fallback for quantized storage.
     fn to_cpu_vec_u32(&self) -> Result<Vec<u32>> {
         Ok(self
             .to_cpu_vec_f32()?
@@ -1930,9 +2022,8 @@ impl BackendStorage for CpuStorage {
         let raw = self.raw_bytes.as_deref().ok_or_else(|| {
             Error::Backend("to_cpu_vec_f32: quantized storage with no raw_bytes".into())
         })?;
-        // Quantized storage with raw_bytes: dequantize to f32 (mirrors the ROCm
-        // `to_cpu_vec_f32` host-dequant fallback) rather than casting bytes to f32,
-        // which would produce one f32 per byte and blow past the element count.
+        // Quantized storage with raw_bytes: dequantize to f32 (mirrors the ROCm `to_cpu_vec_f32` host-dequant fallback) rather than casting
+        // bytes to f32, which would produce one f32 per byte and blow past the element count.
         let n = self.shape.elem_count();
         match &self.dtype.storage {
             Storage::Native => Ok((*self.data).clone()),
@@ -2091,14 +2182,7 @@ fn oxiblas_sgemm(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: u
 }
 
 /// Scalar triple-loop GEMM with cache-friendly loop order and blocking.
-///
-/// The original O(m·n·k) triple loop accessed `b` with stride-`n`, causing
-/// cache-line misses for every inner iteration. By reordering to `i, p, j`
-/// and adding an inner block over `j`, we walk `b` sequentially within each
-/// row and keep the output row in cache across the `p` reduction.
-// Dead under default features (oxiblas SIMD is the shipping path); live only
-// when built with `--no-default-features`. Allowed so the scalar fallback
-// compiles warning-free in that configuration.
+/// The original O(m·n·k) triple loop accessed `b` with stride-`n`, causing cache-line misses for every inner.
 #[allow(dead_code)]
 fn gemm_scalar(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
     // Zero the output buffer first.
@@ -2216,11 +2300,8 @@ mod tests {
         a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tol)
     }
 
-    // SPIKE (grim-sglang-portability): prove the paged-attention kernel
-    // produces the SAME causal attention as the dense (non-paged) kernel
-    // when the block table is the identity. This de-risks the page-indexing
-    // path that the rest of the prefix-cache / tiering wiring rides on, before
-    // any model-level refactor.
+    // SPIKE (grim-sglang-portability): prove the paged-attention kernel produces the SAME causal attention as the dense (non-paged) kernel when the block table is the identity.
+    // This de-risks the page-indexing path that the rest of the prefix-cache / tiering wiring rides.
     #[test]
     fn paged_attention_matches_dense_attention() {
         use grim_tensor::{DType, Device, Shape};
@@ -2280,11 +2361,8 @@ mod tests {
         .to_vec_f32()
         .unwrap();
 
-        // Paged: lay K/V out in blocks [num_blocks, page_size, kvh, hd]
-        // through a REVERSED block table (logical block b lives on physical
-        // block num_blocks-1-b). An identity mapping decodes correctly even
-        // with a broken table reader, so only a permuted table actually
-        // guards the packed `BlockTableEntry` ABI.
+        // Paged: lay K/V out in blocks [num_blocks, page_size, kvh, hd] through a REVERSED block table (logical block b lives on physical block num_blocks-1-b).
+        // An identity mapping decodes correctly even with a broken table reader, so only a permuted.
         let num_blocks = kv_seq.div_ceil(page_size);
         let physical_of = |logical: usize| num_blocks - 1 - logical;
         let page_elems = page_size * num_kv_heads * head_dim;
@@ -2370,9 +2448,8 @@ mod tests {
         let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b = vec![1.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
         let out = scalar(&a, &b, 3, 4, 2);
-        // Row 0: [1+0, 0+2, 1+0, 0+2] = [1,2,1,2]
-        // Row 1: [3+0, 0+4, 3+0, 0+4] = [3,4,3,4]
-        // Row 2: [5+0, 0+6, 5+0, 0+6] = [5,6,5,6]
+        // Row 0: [1+0, 0+2, 1+0, 0+2] = [1,2,1,2] Row 1: [3+0, 0+4,
+        // 3+0, 0+4] = [3,4,3,4] Row 2: [5+0, 0+6, 5+0, 0+6] = [5,6,5,6]
         let expected = vec![
             1.0f32, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0, 6.0, 5.0, 6.0,
         ];
@@ -2499,16 +2576,13 @@ mod tests {
         let (out_s, handle) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &out_shape).unwrap();
         assert!(handle.is_ready());
         let result = out_s.to_cpu_vec_f32().unwrap();
-        // Hand-computed: C[i][j] = sum_k A[i][k] * B[k][j]
-        // Row 0: 1*1 + 2*3 + 3*5 = 22, 1*2 + 2*4 + 3*6 = 28
-        // Row 1: 4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64
+        // Hand-computed: C[i][j] = sum_k A[i][k] * B[k][j] Row 0: 1*1 + 2*3 + 3*5 = 22, 1*2 + 2*4
+        // + 3*6 = 28 Row 1: 4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64
         assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
     }
 
-    // ── 7. Sliding-window attention masks out-of-window keys ─────────
-    // Laguna-S-2.1 hybrid attention: SWA layers attend only the last `window`
-    // positions. Verify the CPU `qkv_attention` honors `window` by placing a
-    // dominant value far outside the window and confirming it is excluded.
+    // ── 7. Sliding-window attention masks out-of-window keys ───────── Laguna-S-2.1
+    // hybrid attention: SWA layers attend only the last `window` positions.
     #[test]
     fn qkv_attention_sliding_window_masks_remote_keys() {
         let dev = CpuDevice::new();
@@ -2679,11 +2753,8 @@ mod tests {
         );
     }
 
-    // ── 9. kv_dequant_attention CPU reference matches independent dequant+attn ──
-    // The CPU backend is the deterministic reference against which the ROCm
-    // `kv_dequant_attention` HIP kernel is validated (cpu-catch-up.md T-ref-1/§6).
-    // This guards the reference itself: packed 4-bit K/V decoded on the fly must
-    // equal a qkv_attention over the explicitly-dequantized tensors.
+    // ── 9. kv_dequant_attention CPU reference matches independent dequant+attn ── The CPU backend is
+    // the deterministic reference against which the ROCm `kv_dequant_attention` HIP kernel is validated (cpu-catch-up.md T-ref-1/§6).
     #[test]
     fn kv_dequant_attention_matches_reference() {
         let dev = CpuDevice::new();
@@ -2828,14 +2899,12 @@ mod tests {
         );
     }
 
-    // Graph capture must be reachable through the `BackendDevice` trait
-    // (`&dyn BackendDevice`), not just the inherent methods — generic model
-    // runners call it that way. Regresses the wiring gap where the trait path
-    // fell through to the default `Err(Unimplemented)`.
+    // Graph capture must be reachable through the `BackendDevice` trait (`&dyn BackendDevice`), not just the inherent methods - generic model runners call it that way.
+    // Regresses the wiring gap where the trait path fell through to the default `Err(Unimplemented)`.
     #[test]
     fn graph_capture_wired_into_trait() {
         use grim_tensor::backend::BackendDevice;
-    // umbrella `BackendDevice` still exposes every sub-trait method to `&dyn` callers
+        // umbrella `BackendDevice` still exposes every sub-trait method to `&dyn` callers
         let dev = CpuDevice::new();
         let dyn_dev: &dyn BackendDevice = &dev;
 
@@ -2861,9 +2930,8 @@ mod tests {
 mod transpose_2d_tests {
     use super::*;
 
-    /// B5 gate: CoreTensorOps::transpose_2d must produce the exact
-    /// column/row swap — this is the operation the LoRA accumulator now
-    /// relies on instead of host round-trips.
+    /// B5 gate: CoreTensorOps::transpose_2d must produce the exact column/row swap - this is
+    /// the operation the LoRA accumulator now relies on instead of host round-trips.
     #[test]
     fn transpose_2d_swaps_rows_and_columns() {
         let dev = CpuDevice::new();
@@ -2877,15 +2945,13 @@ mod transpose_2d_tests {
                 .unwrap();
         handle.synchronize().unwrap();
         assert_eq!(out.shape().dims(), vec![3, 2]);
-        assert_eq!(out.as_ref().to_cpu_vec_f32().unwrap(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-        // Element-count mismatch is an error, not a silent partial copy.
-        let wrong = CoreTensorOps::transpose_2d(
-            &dev,
-            &x,
-            3,
-            3,
-            &grim_tensor::Shape::new(vec![3, 3]),
+        assert_eq!(
+            out.as_ref().to_cpu_vec_f32().unwrap(),
+            vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
         );
+        // Element-count mismatch is an error, not a silent partial copy.
+        let wrong =
+            CoreTensorOps::transpose_2d(&dev, &x, 3, 3, &grim_tensor::Shape::new(vec![3, 3]));
         assert!(wrong.is_err());
     }
 }

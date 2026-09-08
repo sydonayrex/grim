@@ -25,7 +25,10 @@ fn test_bloom_filter_false_positive_rate_under_target() {
     }
 
     let empirical_fp_rate = (false_positives as f64) / (test_queries as f64);
-    println!("Empirical FP rate: {:.4} (target: {})", empirical_fp_rate, target_fp_rate);
+    println!(
+        "Empirical FP rate: {:.4} (target: {})",
+        empirical_fp_rate, target_fp_rate
+    );
     assert!(
         empirical_fp_rate <= 0.015,
         "empirical FP rate {} exceeded bound",

@@ -1,19 +1,11 @@
 //! Marlin-style Interleaved W4A16 GEMM for ROCm.
-//!
-//! Implements fast 4-bit weight / 16-bit activation matrix multiplication
-//! with 16x16 tile interleaving for high compute occupancy during prefill
-//! and batched decoding.
+//! Implements fast 4-bit weight / 16-bit activation matrix multiplication with 16x16 tile interleaving for high.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// Marlin-Style Interleaved W4A16 GEMM Kernel
-// ---------------------------------------------------------------------------
-//
-// Grid: ((N + 15) / 16, (M + 15) / 16)
-// Block: (16, 16)
-// ---------------------------------------------------------------------------
+// Marlin-Style Interleaved W4A16 GEMM Kernel Grid: ((N + 15)
+// / 16, (M + 15) / 16) Block: (16, 16)
 __global__ void grim_marlin_gemm_w4a16(
     const _Float16* __restrict__ A,         // [M, K]
     const unsigned int* __restrict__ B_w4,   // [N, K/8] packed 4-bit weights
@@ -54,9 +46,7 @@ __global__ void grim_marlin_gemm_w4a16(
     C[row * N + col] = (_Float16)acc;
 }
 
-// ---------------------------------------------------------------------------
 // Float32 Precision Variant for Mixed Accumulate
-// ---------------------------------------------------------------------------
 __global__ void grim_marlin_gemm_w4a16_f32(
     const float* __restrict__ A,            // [M, K]
     const unsigned int* __restrict__ B_w4,   // [N, K/8]

@@ -142,9 +142,8 @@ impl Gpt2Block {
         self.forward_cached(x, &mut cache)
     }
 
-    /// Cache-aware forward. Appends this call's K/V to `cache` before
-    /// attending, so a single-token decode step sees the full prior context
-    /// rather than only itself. [Group B fix: decode was stateless.]
+    /// Cache-aware forward. Appends this call's K/V to `cache` before attending, so a
+    /// single-token decode step sees the full prior context rather than only itself.
     pub fn forward_cached(
         &self,
         x: &Tensor,
@@ -206,19 +205,14 @@ impl Gpt2Block {
         let norm_x2 = self.ln_2.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
         // CRIT-2: GPT-2 MLP is Linear(c_fc) → GELU → Linear(c_proj).
-        // Without the activation the two linear layers compose to a single
-        // linear transformation, destroying model capacity.
+        // Without the activation the two linear layers compose to a single linear transformation, destroying model.
         let gate = gelu(&gate)?;
         let ffn_out = self.ffn_down.forward(&gate)?;
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 
-    /// Device-first cache-aware forward used by `CausalLm::forward`: the KV
-    /// history stays resident on-device (`concat_rows_on_device`) and the
-    /// attention runs via `fused_attention_tensors` — no per-step full-cache
-    /// re-download. The fused-QKV per-head interleave split and the GELU
-    /// activation stay host-side (no device kernels); each pulls once per
-    /// call and re-uploads only the split pieces / activation output.
+    /// Device-first cache-aware forward used by `CausalLm::forward`: the KV history stays resident on-device (`concat_rows_on_device`) and the attention runs via `fused_attention_tensors` - no per-step full-cache re-download.
+    /// The fused-QKV per-head interleave split and the GELU activation stay host-side (no device kernels); each.
     pub fn forward_kv(
         &self,
         x: &Tensor,
@@ -331,24 +325,8 @@ impl Gpt2 {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for GPT-2.
-    ///
-    /// GPT-2 stores attention as a single **fused `wqkv` projection** of shape
-    /// `[hidden, 3*hidden]` whose output dim interleaves Q, K, V per head
-    /// (`forward` reshapes by `num_heads`). Cleanly column-sharding it on
-    /// `world_size` requires reshaping the weight into `[3, num_heads,
-    /// head_dim, hidden]`, splitting along the head axis, and re-flattening —
-    /// a non-trivial transformation that `Linear::load_column_parallel`
-    /// (which shards dim 0 uniformly) cannot express. Doing the naive dim-0
-    /// split would cut across the (Q, K, V) interleaving and silently
-    /// corrupt attention — the exact bug class called out in the TP sanity
-    /// check.
-    ///
-    /// Rather than ship a wrong split, this entry honours `world_size == 1`
-    /// (delegates to the plain `load`) and **refuses `world_size > 1`** with a
-    /// typed `Unsupported` error. A full GPT-2 `load_tp` (head-axis reshape +
-    /// `ColumnParallelLinear`/`RowParallelLinear` + rewritten `forward`) is
-    /// tracked as a follow-up.
+    /// Tensor-parallel load entry for GPT-2. GPT-2 stores attention as a single **fused `wqkv` projection** of
+    /// shape `[hidden, 3*hidden]` whose output dim interleaves Q, K, V per head (`forward` reshapes by `num_heads`).
     pub fn load_tp(
         device: Device,
         ws: &grim_nn::WeightSource<'_>,
@@ -435,14 +413,10 @@ impl CausalLm for Gpt2 {
         let mut h = grim_nn::modules::add_on_device(&tok_emb, &pos_emb)
             .map_err(grim_core::Error::Tensor)?;
 
-        // Per-layer device-resident KV caches live on the session so decode
-        // steps see the full prior context (Group B fix); only the new K/V
-        // rows are appended each step.
+        // Per-layer device-resident KV caches live on the session so decode steps see the full
+        // prior context (Group B fix); only the new K/V rows are appended each step.
         if session.model_state().is_none() {
-            session.set_model_state(Box::new(vec![
-                None::<(Tensor, Tensor)>;
-                self.layers.len()
-            ]));
+            session.set_model_state(Box::new(vec![None::<(Tensor, Tensor)>; self.layers.len()]));
         }
         let caches = session
             .model_state_mut()

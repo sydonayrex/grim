@@ -114,12 +114,8 @@ extern "C" {
 
     // ─── Standalone global kernels ──────────────────────────────────
 
-    /// Dequantize IQ2_XXS packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ2_XXS packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq2xxs(
         const unsigned char* __restrict__ packed,
@@ -139,12 +135,8 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
-    /// Dequantize IQ2_XS packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ2_XS packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq2xs(
         const unsigned char* __restrict__ packed,
@@ -164,12 +156,8 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
-    /// Dequantize IQ2_S packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ2_S packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq2s(
         const unsigned char* __restrict__ packed,
@@ -189,12 +177,8 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
-    /// Dequantize IQ3_XXS packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ3_XXS packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq3xxs(
         const unsigned char* __restrict__ packed,
@@ -214,12 +198,8 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
-    /// Dequantize IQ3_S packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ3_S packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq3s(
         const unsigned char* __restrict__ packed,
@@ -239,12 +219,8 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
-    /// Dequantize IQ4_NL packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ4_NL packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq4nl(
         const unsigned char* __restrict__ packed,
@@ -264,12 +240,8 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
-    /// Dequantize IQ4_XS packed bytes to F32.
-    ///
-    /// One 64-thread block per 256-element quant block; each thread decodes
-    /// four consecutive elements with vectorized float4 stores (the previous
-    /// one-thread-per-block form serialized 256 dependent dequants and wrote
-    /// scalars).
+    /// Dequantize IQ4_XS packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
+    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)
     grim_dequant_iq4xs(
         const unsigned char* __restrict__ packed,

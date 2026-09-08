@@ -1,15 +1,5 @@
 //! SOUL EATER Adapter & Optimizer module for `grim-autograd`.
-//!
-//! Provides the `SoulEaterAdapter` structural parameterization:
-//! ΔW = U * Σ * V^T, with forward pass Y = X * W0^T + (α/r) * (X * V) * Σ * U^T.
-//! Also provides `SoulEaterOptimizer` using 1-bit Sign-SGD for Σ and
-//! momentum-accelerated pre-normalized cubic Newton-Schulz for U and V.
-//!
-//! SCYTHE1 extends the optimizer with Natural GaLore-style inverse-FIM
-//! preconditioning in the r-dimensional adapter subspace: the r×r Fisher
-//! information matrix is estimated from projected gradients (EMA-smoothed
-//! with diagonal damping ε), inverted, and applied to precondition the
-//! projected update before Newton-Schulz orthogonalization and Σ descent.
+//! Provides the `SoulEaterAdapter` structural parameterization: ΔW = U * Σ * V^T, with forward pass.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_quant::soul_eater::subspace_newton_schulz_step;
@@ -237,17 +227,8 @@ impl SoulEaterAdapter {
     }
 }
 
-/// SOUL EATER Optimizer (SCYTHE1 variant): Momentum + Newton-Schulz for U, V;
-/// inverse-FIM-preconditioned descent for Σ.
-///
-/// SCYTHE1 adds Natural GaLore-style inverse-FIM preconditioning: the r×r
-/// Fisher information matrix is estimated from the subspace-projected gradients,
-/// EMA-smoothed, diagonal-damped, inverted, and applied to precondition the
-/// projected U/V updates before Newton-Schulz orthogonalization. Σ is updated
-/// with the preconditioned direction instead of 1-bit Sign-SGD.
-///
-/// Per-adapter state: O(d·r) for U, V, and their momenta, plus O(r²) for the
-/// FIM EMA per basis (U, V) and O(r) for the Σ FIM EMA.
+/// SOUL EATER Optimizer (SCYTHE1 variant): Momentum + Newton-Schulz for U, V; inverse-FIM-preconditioned descent for Σ.
+/// SCYTHE1 adds Natural GaLore-style inverse-FIM preconditioning: the r×r Fisher information matrix is estimated from the.
 pub struct SoulEaterOptimizer {
     pub lr_basis: f32,
     pub lr_sigma: f32,
@@ -308,14 +289,7 @@ impl SoulEaterOptimizer {
     }
 
     /// Perform SCYTHE1 optimizer update step on adapter parameter tensors U, V, Σ.
-    ///
-    /// Steps (matching new_methods.md SCYTHE1 formulation):
-    /// 1. Compute gradients g_U, g_V, g_Σ (provided as input).
-    /// 2. Project g_U, g_V into the r-dim subspace via U^T, V^T.
-    /// 3. Estimate r×r FIM from projected gradients (EMA-smoothed + damped).
-    /// 4. Apply inverse-FIM preconditioning (with diagonal damping).
-    /// 5. Update U, V with momentum + Newton-Schulz orthogonalization.
-    /// 6. Update Σ with preconditioned direction (not 1-bit Sign-SGD).
+    /// Steps (matching new_methods.md SCYTHE1 formulation): 1.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
@@ -405,9 +379,8 @@ impl SoulEaterOptimizer {
             *v = cpu_tensor(v_vec, Shape::new(vec![d_in, r]));
         }
 
-        // --- Step 6: Update Σ with preconditioned direction ---
-        // Diagonal FIM for Σ: F_σ = EMA(g_σ²) + ε
-        // Precond direction: g_σ / F_σ
+        // --- Step 6: Update Σ with preconditioned direction --- Diagonal FIM
+        // for Σ: F_σ = EMA(g_σ²) + ε Precond direction: g_σ / F_σ
         let key_sig = format!("{name}_sigma");
         let fim_sig = self
             .fim_sigma

@@ -3,10 +3,7 @@
 use grim_tensor::error::{Error, Result};
 
 /// Container for salient weights extracted during SpQR quantization.
-///
 /// Salient weights are the ~1% of weights with the highest Hessian curvature sensitivity.
-/// They are stored as sparse (index, value) pairs in FP16 to preserve precision while
-/// allowing the remaining 99% of weights to be aggressively quantized (e.g. Crow Q4K / Jay MXFP4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpqrSalientResidual {
     /// 0-indexed flat element indices of salient weights in the tensor.
@@ -16,7 +13,6 @@ pub struct SpqrSalientResidual {
 }
 
 /// Identify salient weights whose Hessian curvature exceeds `threshold_multiplier * mean_curvature`.
-///
 /// Returns an `SpqrSalientResidual` containing the indices and values of the salient entries.
 pub fn spqr_identify_salient(
     weights: &[f32],

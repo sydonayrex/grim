@@ -1,11 +1,5 @@
-//! LongCat Flash architecture with Multi-head Latent Attention (MLA),
-//! compressed low-rank key-value projections, and SwiGLU feed-forward layers.
-//!
-//! # Architecture Details
-//! - **Attention**: Multi-head Latent Attention (MLA) compressing KV cache into latent rank $d_c$.
-//! - **Rotary**: Decoupled RoPE applied to dedicated positional query/key heads ($d_R$).
-//! - **Feed Forward**: SwiGLU gated linear projections.
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm.
+//! LongCat Flash architecture with Multi-head Latent Attention (MLA), compressed low-rank key-value projections, and SwiGLU feed-forward layers.
+//! # Architecture Details - **Attention**: Multi-head Latent Attention (MLA) compressing KV cache into latent rank.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -14,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for LongCat Flash architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -72,9 +64,7 @@ impl ModelConfig for LongCatFlashConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MLP
-// ---------------------------------------------------------------------------
 
 pub struct LongCatFlashMlp {
     pub gate_proj: Linear,
@@ -97,15 +87,13 @@ impl LongCatFlashMlp {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let act = grim_nn::modules::silu_mul_on_device(&g, &u)
-            .map_err(grim_core::error::Error::from)?;
+        let act =
+            grim_nn::modules::silu_mul_on_device(&g, &u).map_err(grim_core::error::Error::from)?;
         Ok(self.down_proj.forward(&act)?)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct LongCatFlashBlock {
     pub wq: Linear,
@@ -122,7 +110,11 @@ pub struct LongCatFlashBlock {
 }
 
 impl LongCatFlashBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &LongCatFlashConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &LongCatFlashConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim);
         let kv_dim = cfg.num_key_value_heads * cfg.v_head_dim;
 
@@ -162,14 +154,7 @@ impl LongCatFlashBlock {
     }
 
     /// GPU-first forward for attention plumbing and residuals.
-    ///
-    /// Kernel gap: the legacy RoPE here rotates Q/K with `head_dim`
-    /// (`v_head_dim`) over rows of width `heads × (nope + rope)`, i.e. only a
-    /// prefix of each row rotates under a geometry `rope_2d_on_device` cannot
-    /// express (it requires `width == heads × rope.dim` and rotates the whole
-    /// row). Q/K (and V, which feeds the same host-side attention staging)
-    /// therefore stay on the host RoPE path; the causal attention itself goes
-    /// through the fused tensor entry.
+    /// Kernel gap: the legacy RoPE here rotates Q/K with `head_dim` (`v_head_dim`) over rows of width.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -196,7 +181,10 @@ impl LongCatFlashBlock {
             10000.0,
         );
 
-        let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, self.num_heads * self.head_dim]));
+        let q_rot = cpu_tensor(
+            q_vec,
+            Shape::new(vec![seq_len, self.num_heads * self.head_dim]),
+        );
         let k_rot = cpu_tensor(
             k_vec,
             Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]),
@@ -228,9 +216,7 @@ impl LongCatFlashBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct LongCatFlash {
     pub cfg: LongCatFlashConfig,
@@ -284,7 +270,10 @@ impl LongCatFlash {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -358,9 +347,7 @@ impl CausalLm for LongCatFlash {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -376,6 +363,7 @@ mod tests {
         assert_eq!(cfg.kv_lora_rank, 512);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_longcat_flash_forward_and_session_state() {
         let mut cfg = LongCatFlashConfig::default();
@@ -390,7 +378,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 3.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

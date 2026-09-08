@@ -1,16 +1,5 @@
 //! Packed-step training driver (salamander.md P2 wire-in).
-//!
-//! The varlen collator primitives (`grim_autograd::collate`) exist but were
-//! never wired into a training loop. This module is the driver: it groups
-//! variable-length samples under a token budget and runs one optimizer step
-//! per **packed group** instead of per sample.
-//!
-//! Leakage-free by construction: each segment gets a fresh single-sequence
-//! causal forward (the existing streaming path), so no block-diagonal
-//! attention mask tensor and no `qkv_attention` trait change are needed.
-//! Gradients accumulate across segments of a group exactly as gradient
-//! accumulation already does; the only change is *when* the optimizer steps
-//! and how the reported loss is weighted (by token count, not by sample).
+//! The varlen collator primitives (`grim_autograd::collate`) exist but were never wired into a training loop.
 
 use grim_autograd::collate::TokenSequence;
 use grim_tensor::error::{Error, Result};
@@ -47,13 +36,7 @@ pub struct PackedStepStats {
 }
 
 /// Greedy first-fit grouping of sequences under a token budget.
-///
-/// Unlike `VarLenCollator::collate_1d_packed` (which stops at the first
-/// sequence that overflows the budget), this packs the full input: sequences
-/// that do not fit the current group start a new one. Sequences longer than
-/// `max_tokens_per_group` still get their own group so nothing is dropped.
-///
-/// Returns groups of indices into `sequences`.
+/// Unlike `VarLenCollator::collate_1d_packed` (which stops at the first sequence that overflows the budget), this packs the.
 pub fn group_sequences(sequences: &[TokenSequence], cfg: &PackedStepConfig) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::with_capacity(cfg.max_seqs_per_group);
@@ -78,14 +61,8 @@ pub fn group_sequences(sequences: &[TokenSequence], cfg: &PackedStepConfig) -> V
     groups
 }
 
-/// Run one packed step over `sequences`.
-///
-/// `forward_backward` is invoked once per **segment** (single sequence) and
-/// must run the caller's forward + backward (gradients accumulate in the
-/// caller's `TrainableParams`) and return `(loss, tokens)` for that segment.
-/// The caller performs the optimizer step once per returned group — use
-/// [`PackedStepStats::num_groups`] — so N short samples cost one step instead
-/// of N.
+/// Run one packed step over `sequences`. `forward_backward` is invoked once per **segment** (single sequence) and must run
+/// the caller's forward + backward (gradients accumulate in the caller's `TrainableParams`) and return `(loss, tokens)` for that segment.
 pub fn packed_step<F>(
     sequences: &[TokenSequence],
     cfg: &PackedStepConfig,

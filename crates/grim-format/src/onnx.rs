@@ -1,10 +1,5 @@
-//! ONNX format reader for Grim.
-//!
-//! Provides a read-only import path for models exported from
-//! PyTorch, TensorFlow, or other ONNX-producing frameworks.
-//! §7.2.5 - ONNX import path.
-//!
-//! Uses `ort` crate for ONNX runtime integration and tensor extraction.
+//! ONNX format reader for Grim. Provides a read-only import path
+//! for models exported from PyTorch, TensorFlow, or other ONNX-producing frameworks.
 
 use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};

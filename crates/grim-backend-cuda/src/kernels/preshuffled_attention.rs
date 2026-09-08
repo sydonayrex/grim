@@ -1,21 +1,11 @@
 //! Preshuffled vector-tiled paged KV-cache attention for CUDA.
-//!
 //! Ported from grim-backend-rocm `kernels/preshuffled_attention.rs`.
-//! Organizes KV cache into 128-bit vector-tiled memory segments:
-//!   K_cache: [num_blocks, num_heads, head_dim/4, block_size, 4]
-//!   V_cache: [num_blocks, num_heads, block_size/4, head_dim, 4]
-//! Enables aligned 128-bit (float4) loads on any SM >= 7.0 (Volta+).
 
 pub const PRESHUFFLED_ATTENTION_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// grim_reshape_and_cache_preshuffled — ingest K/V into vector-tiled layout.
-//
-// Grid: (num_tokens, num_heads)  Block: (head_dim, 1)
-// One thread per (token, head, dim_element). Writes K into the D/4 stride,
-// V into the block_offset/4 stride.
-// ---------------------------------------------------------------------------
+// grim_reshape_and_cache_preshuffled - ingest K/V into vector-tiled layout.
+// Grid: (num_tokens, num_heads) Block: (head_dim, 1) One thread per (token, head, dim_element).
 __global__ void grim_reshape_and_cache_preshuffled(
     const float* __restrict__ key,        // [num_tokens, num_heads, head_dim]
     const float* __restrict__ value,      // [num_tokens, num_heads, head_dim]
@@ -46,14 +36,8 @@ __global__ void grim_reshape_and_cache_preshuffled(
     v_cache[(((block_idx * num_heads + h) * (block_size / 4) + bo4) * head_dim + d) * 4 + bom4] = value[token_base + d];
 }
 
-// ---------------------------------------------------------------------------
-// grim_preshuffled_paged_attention — decode-time paged attention.
-//
-// Grid: (num_seqs, num_heads)  Block: (head_dim, 1)
-// Shared: (head_dim + blockDim.x) * 4 bytes.
-// Reads K/V from preshuffled cache via stride-aligned accesses.
-// Online softmax with running max/sum; no second pass needed.
-// ---------------------------------------------------------------------------
+// grim_preshuffled_paged_attention - decode-time paged attention.
+// Grid: (num_seqs, num_heads) Block: (head_dim, 1) Shared: (head_dim + blockDim.x) * 4 bytes.
 __global__ void grim_preshuffled_paged_attention(
     const float* __restrict__ q,            // [num_seqs, num_heads, head_dim]
     const float* __restrict__ k_cache,      // [num_blocks, num_heads, head_dim/4, block_size, 4]

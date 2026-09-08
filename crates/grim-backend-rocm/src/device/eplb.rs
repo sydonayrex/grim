@@ -1,7 +1,5 @@
 //! Expert Parallel Load Balancing (EPLB) for ROCm MoE Inference.
-//!
-//! Implements greedy Longest Processing Time (LPT) bin packing and dynamic
-//! expert replication across multi-GPU ranks to balance skewed routing workloads.
+//! Implements greedy Longest Processing Time (LPT) bin packing and dynamic expert replication across multi-GPU ranks.
 
 #[derive(Debug, Clone)]
 pub struct EplbPackingPlan {

@@ -1,26 +1,5 @@
 //! Tiered embedding lookup with optional NVMe spill.
-//!
-//! Provides [`SpillableEmbedding`], a drop-in wrapper around [`crate::modules::Embedding`]
-//! that adds an optional NVMe spill path for large embedding tables.
-//!
-//! # When the spill path activates
-//! The spill path is **inert by default**. It only activates when the caller
-//! explicitly enables it via [`SpillableEmbedding::new_spilled`] or when the
-//! embedding table's byte size exceeds `spill_threshold_bytes` in
-//! [`SpillableEmbedding::maybe_spilled`]. When the flag is off:
-//! - Zero behavior change relative to a plain `Embedding`.
-//! - Zero performance cost — the spill branch is a single `bool` check.
-//!
-//! # Output numerical identity
-//! When the spill path is active, `lookup` reads rows from disk via
-//! `EmbeddingSpillManager`. Since this is purely a storage-location change
-//! (no quantization, no approximation), the output is **bit-identical** to
-//! the fully-resident path for the same token ID and the same weight data.
-//!
-//! # Wire to grim-scheduler
-//! `get_unit_tier_for_token` exposes the `CacheTier` of an embedding row's
-//! containing unit, letting the scheduler reason about embedding placement
-//! alongside KV-block placement using the same `CacheTier` enum.
+//! Provides [`SpillableEmbedding`], a drop-in wrapper around [`crate::modules::Embedding`] that adds an optional NVMe spill path for.
 
 use std::path::PathBuf;
 
@@ -32,10 +11,7 @@ use crate::modules::Embedding;
 pub use grim_tensor::Result;
 
 /// Embedding table with optional NVMe spill path.
-///
-/// When `spill` is `None`, `lookup` delegates directly to the resident
-/// `Embedding::forward` path (zero extra overhead). When `spill` is `Some`,
-/// token rows are streamed from the `EmbeddingSpillManager` instead.
+/// When `spill` is `None`, `lookup` delegates directly to the resident `Embedding::forward` path (zero extra overhead).
 pub struct SpillableEmbedding {
     /// Fully-resident embedding table. Always present; used when spill is off
     /// and may be `None`-weighted when the table is too large to hold in RAM.
@@ -48,8 +24,7 @@ pub struct SpillableEmbedding {
 
 impl SpillableEmbedding {
     /// Create a `SpillableEmbedding` backed only by the fully-resident table.
-    ///
-    /// Equivalent to plain `Embedding` — zero spill overhead.
+    /// Equivalent to plain `Embedding` - zero spill overhead.
     pub fn new_resident(embedding: Embedding, hidden_dim: usize) -> Self {
         Self {
             resident: Some(embedding),
@@ -59,19 +34,7 @@ impl SpillableEmbedding {
     }
 
     /// Create a `SpillableEmbedding` using the NVMe spill path.
-    ///
-    /// The resident `Embedding` can be `None` when the table is too large to
-    /// keep fully resident (in which case `lookup` is routed entirely through
-    /// the spill manager). Providing `Some(embedding)` allows fallback on spill
-    /// errors — the caller chooses the policy.
-    ///
-    /// # Parameters
-    /// - `resident`: Optional fully-resident embedding table (kept when the
-    ///   table fits in RAM, `None` otherwise).
-    /// - `spill_path`: Flat row-major f32 file on NVMe containing `[vocab, hidden_dim]`.
-    /// - `lru_capacity_units`: Units to keep cached in host RAM simultaneously.
-    /// - `rows_per_unit`: Vocab rows per streaming unit (e.g. 4096).
-    /// - `hidden_dim`: Floats per vocab row.
+    /// The resident `Embedding` can be `None` when the table is too large to keep fully.
     pub fn new_spilled(
         resident: Option<Embedding>,
         spill_path: PathBuf,
@@ -91,22 +54,8 @@ impl SpillableEmbedding {
         }
     }
 
-    /// Optionally construct a spilled embedding depending on table size vs. threshold.
-    ///
-    /// If `embedding_bytes > spill_threshold_bytes` AND `spill_path` is `Some`,
-    /// creates a `SpillableEmbedding` with the spill path active.  Otherwise
-    /// creates a resident-only wrapper (inert, zero overhead).
-    ///
-    /// # Parameters
-    /// - `embedding`: The fully-resident table (required; used as fallback even
-    ///   when spill is active, and as sole source when spill is inactive).
-    /// - `embedding_bytes`: Total byte size of the embedding table. Compared
-    ///   against the threshold to decide whether spill activates.
-    /// - `spill_threshold_bytes`: If `embedding_bytes` exceeds this and
-    ///   `spill_path` is `Some`, spill activates. Default sensible value: 1 GiB.
-    /// - `spill_path`: Path for NVMe-backed streaming. `None` disables spill
-    ///   regardless of the threshold.
-    /// - `lru_capacity_units`, `rows_per_unit`, `hidden_dim`: Spill parameters.
+    /// Optionally construct a spilled embedding depending on table size vs.
+    /// threshold.
     pub fn maybe_spilled(
         embedding: Embedding,
         embedding_bytes: usize,
@@ -137,12 +86,7 @@ impl SpillableEmbedding {
     }
 
     /// Look up the embedding row for a single `token_id`.
-    ///
-    /// Routes through the spill manager when active; falls back to the
-    /// resident table otherwise. Both paths produce bit-identical output
-    /// for the same token and the same weight file.
-    ///
-    /// Contract: the returned `Vec<f32>` has exactly `self.hidden_dim` elements.
+    /// Routes through the spill manager when active; falls back to the resident table otherwise.
     pub fn lookup(&self, token_id: u32) -> Result<Vec<f32>> {
         if let Some(ref mgr) = self.spill {
             // Spill path: route through EmbeddingSpillManager.
@@ -163,9 +107,7 @@ impl SpillableEmbedding {
     }
 
     /// Query the current `CacheTier` for the unit containing `token_id`.
-    ///
-    /// Returns `None` when the spill path is inactive (token is fully resident,
-    /// tier concept does not apply) or when the unit has not yet been prefetched.
+    /// Returns `None` when the spill path is inactive (token is fully resident, tier concept does.
     pub fn get_unit_tier_for_token(&self, token_id: u32) -> Option<CacheTier> {
         self.spill
             .as_ref()
@@ -207,13 +149,14 @@ mod tests {
         assert_eq!(row, expected, "token 0 row must be exact");
 
         // Lookup token 3.
-        let row3 = spillable.lookup(3).expect("resident lookup of token 3 must succeed");
+        let row3 = spillable
+            .lookup(3)
+            .expect("resident lookup of token 3 must succeed");
         let expected3: Vec<f32> = (0..hidden).map(|j| (3 * hidden + j) as f32).collect();
         assert_eq!(row3, expected3, "token 3 row must be exact");
     }
 
     /// Verify the spill path produces bit-identical output to the resident path.
-    ///
     /// Plan Issue 3 criterion: "bit-identical, since this is just a storage-location change."
     #[test]
     fn test_spillable_embedding_spill_output_bit_identical_to_resident() {
@@ -235,20 +178,16 @@ mod tests {
         let resident = SpillableEmbedding::new_resident(embedding, hidden);
 
         // Spilled version (same data on disk).
-        let spilled = SpillableEmbedding::new_spilled(
-            None,
-            spill_path,
-            4,
-            rows_per_unit,
-            hidden,
-        );
+        let spilled = SpillableEmbedding::new_spilled(None, spill_path, 4, rows_per_unit, hidden);
         assert!(spilled.is_spilled(), "spilled path must be active");
 
         // For every token: spill output must be bit-identical to resident output.
         for token in 0u32..vocab as u32 {
-            let row_resident = resident.lookup(token)
+            let row_resident = resident
+                .lookup(token)
                 .unwrap_or_else(|e| panic!("resident lookup({token}): {e}"));
-            let row_spilled = spilled.lookup(token)
+            let row_spilled = spilled
+                .lookup(token)
                 .unwrap_or_else(|e| panic!("spill lookup({token}): {e}"));
             assert_eq!(
                 row_resident, row_spilled,
@@ -258,9 +197,7 @@ mod tests {
     }
 
     /// Verify maybe_spilled is inert when flag is off (table below threshold).
-    ///
-    /// Plan Issue 3 criterion: "Confirm the spill path is inert (zero behavior change,
-    /// zero performance cost) when the config/feature flag is off."
+    /// Plan Issue 3 criterion: "Confirm the spill path is inert (zero behavior change, zero performance.
     #[test]
     fn test_spillable_embedding_maybe_spilled_inert_below_threshold() {
         let vocab = 8usize;
@@ -276,7 +213,7 @@ mod tests {
             embedding,
             table_bytes,
             1024 * 1024 * 1024, // 1 GiB
-            None,                // no spill path → even if threshold exceeded, stays off
+            None,               // no spill path → even if threshold exceeded, stays off
             4,
             4,
             hidden,
@@ -287,7 +224,9 @@ mod tests {
             "below-threshold table must not activate spill path"
         );
         // Behavior: row lookup still works identically.
-        let row = spillable.lookup(0).expect("lookup must work on resident path");
+        let row = spillable
+            .lookup(0)
+            .expect("lookup must work on resident path");
         let expected: Vec<f32> = (0..hidden).map(|i| i as f32).collect();
         assert_eq!(row, expected, "token 0 row unchanged when spill is inert");
     }
@@ -327,7 +266,9 @@ mod tests {
             "above-threshold table must activate spill path"
         );
         // Output correctness: token 2 row.
-        let row = spillable.lookup(2).expect("spill lookup of token 2 must succeed");
+        let row = spillable
+            .lookup(2)
+            .expect("spill lookup of token 2 must succeed");
         let expected: Vec<f32> = (0..hidden).map(|j| (2 * hidden + j) as f32).collect();
         assert_eq!(row, expected, "token 2 spill row must be exact");
     }

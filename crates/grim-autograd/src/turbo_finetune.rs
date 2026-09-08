@@ -1,6 +1,5 @@
-//! TURBO-FINETUNE: stage-gated precision switching for parameter-efficient
-//! fine-tuning. This module lives in `grim-autograd` because it owns the
-//! precision abstraction used during scheduler-driven stage transitions.
+//! TURBO-FINETUNE: stage-gated precision switching for parameter-efficient fine-tuning.
+//! This module lives in `grim-autograd` because it owns the precision abstraction used during scheduler-driven stage.
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -107,9 +106,8 @@ impl TurboFinetuneScheduler {
         Some(precision)
     }
 
-    /// LISA layer selection stub: round-robin activation of two layers per
-    /// update interval. The two selected indices are derived from
-    /// `current_step` and `lisa_k` so they move as training progresses.
+    /// LISA layer selection stub: round-robin activation of two layers per update interval.
+    /// The two selected indices are derived from `current_step` and `lisa_k` so they move as training.
     pub fn update_lisa(&mut self, current_step: usize, total_layers: usize) -> Vec<usize> {
         if total_layers == 0 {
             return Vec::new();
@@ -147,9 +145,7 @@ impl TurboFinetuneScheduler {
 }
 
 /// Abstraction over the job fields mutated by a stage-transition hook.
-///
-/// Implemented by `grim-garage::jobs::TrainingJob` so `grim-autograd`
-/// stays independent of the garage crate.
+/// Implemented by `grim-garage::jobs::TrainingJob` so `grim-autograd` stays independent of the garage crate.
 pub trait StageTransitionTarget {
     fn training_mode(&self) -> TrainingMode;
     fn set_training_mode(&mut self, mode: TrainingMode);

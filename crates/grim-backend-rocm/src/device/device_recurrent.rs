@@ -8,13 +8,9 @@ use grim_tensor::{BackendStorage, RecurrentOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{
-    arg, as_rocm, dev_ptr, dtype_f32, linear_launch, HipDim3, RocmHandle,
-};
+use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
 
 impl RecurrentOps for RocmDevice {
-
-
     fn short_conv1d_causal_step(
         &self,
         x: &dyn BackendStorage,
@@ -70,7 +66,6 @@ impl RecurrentOps for RocmDevice {
         ))
     }
 
-
     fn kda_gated_delta_rule_step(
         &self,
         q: &dyn BackendStorage,
@@ -124,7 +119,6 @@ impl RecurrentOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn selective_scan(
         &self,
@@ -211,7 +205,6 @@ impl RecurrentOps for RocmDevice {
         ))
     }
 
-
     fn rwkv_time_mix(
         &self,
         x: &dyn BackendStorage,
@@ -238,7 +231,6 @@ impl RecurrentOps for RocmDevice {
         ))
     }
 
-
     fn rwkv_channel_mix(
         &self,
         x: &dyn BackendStorage,
@@ -262,9 +254,6 @@ impl RecurrentOps for RocmDevice {
         ))
     }
 }
-
-
-
 
 impl RocmDevice {
     // ─── Phase 2: Selective Scan ──────────────────────────────────
@@ -386,9 +375,9 @@ impl RocmDevice {
         let mut d_ptr = d_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("selective_scan_headed: d has no device ptr".into()))?;
-        let mut h_ptr = state_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("selective_scan_headed: state has no device ptr".into()))?;
+        let mut h_ptr = state_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("selective_scan_headed: state has no device ptr".into())
+        })?;
         let mut y_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("selective_scan_headed: out has no device ptr".into()))?;
@@ -633,5 +622,4 @@ impl RocmDevice {
             ],
         )
     }
-
 }

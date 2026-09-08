@@ -1,20 +1,5 @@
-//! Phase-3 §3.5 — Speculative decoding primitives.
-//!
-//! Three CPU-only primitives land in this module, leaving the GPU
-//! kernel plumbing (the target
-//! verifier forward) to the next PR. Per the spec: this PR establishes
-//! the algorithm; the kernel primitives ride the existing
-//! `RocmDevice::qkv_attention` + graph-capture wires.
-//!
-//! Skill attribution:
-//! - `rust-ai-ml-inference-guide` Action 5 — Jeet Kunde Do: one-pass
-//!   token generation: draft-and-verify amortizes per-token latency
-//!   across `gamma` candidates per target-model forward pass.
-//! - `rust-gpu-discipline` §1 — every algorithm here is deterministic
-//!   when the RNG is seeded; no fabricated acceptance values.
-//! - `rust-ml-llm-architecture` — orchestration primitives live in a
-//!   backend-agnostic module; the GPU kernel pickup is the next PR's
-//!   surface.
+//! Phase-3 §3.5 - Speculative decoding primitives.
+//! Three CPU-only primitives land in this module, leaving the GPU kernel plumbing (the target verifier.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -23,15 +8,13 @@ use std::ptr::null_mut;
 use grim_tensor::error::{Error, Result};
 
 use crate::device::handles::{
-    hipEventCreate, hipEventDestroy, hipEventRecord,
-    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamSynchronize, hipStreamWaitEvent,
-    hipSuccess,
+    hipEventCreate, hipEventDestroy, hipEventRecord, hipStreamCreateWithFlags, hipStreamDestroy,
+    hipStreamSynchronize, hipStreamWaitEvent, hipSuccess,
 };
 use crate::device::helpers::check_hip;
 
-// =========================================================================
-// Token acceptance (Leviathan / Chen et al. 2023)
-// =========================================================================
+// Token acceptance (Leviathan / Chen et al.
+// 2023)
 
 /// Per-token acceptance result for one speculative step.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,10 +43,8 @@ pub enum AcceptanceResult {
 /// tests can pin determinism via seeded RNG.
 #[derive(Debug, Clone)]
 pub struct TokenAcceptor {
-    /// Numeric floor for the acceptance threshold: `min(1, p_target / p_draft)`
-    /// is compared against a uniform `[0, 1)` draw; with `threshold = 0`,
-    /// the rule devolves to "accept iff the draft distribution is at
-    /// least as likely as the target distribution under the target".
+    /// Numeric floor for the acceptance threshold: `min(1, p_target / p_draft)` is compared against a uniform `[0, 1)` draw; with `threshold =
+    /// 0`, the rule devolves to "accept iff the draft distribution is at least as likely as the target distribution under the target".
     pub threshold: f32,
 }
 
@@ -72,25 +53,8 @@ impl TokenAcceptor {
         Self { threshold }
     }
 
-    /// Decide per-draft rejection given parallel `(p_draft, p_target)`
-    /// vectors of length `gamma` (or fewer / zero).
-    ///
-    /// Rule (Leviathan-style):
-    ///
-    ///   * For step i, compute `r = min(1, p_target[i] / max(p_draft[i],
-    ///     eps))`. Accept when `r >= 1` (target gives the draft a
-    ///     higher-or-equal probability mass). With `threshold > 0` we
-    ///     also accept when `r >= threshold` (numerical safety on
-    ///     floating-point jitter; the spec's intent is "accept when
-    ///     target says draft is at least as likely").
-    ///   * On the first failure, return `Partial` with that index.
-    ///   * If every step passes but `gamma` is shorter than
-    ///     `probs.len()`, truncate to `gamma` (the canonical "+1
-    ///     target tail" is implicit on the GPU side; here we just
-    ///     cap accepted at gamma).
-    ///   * If every step passes, return `AcceptAll` with the indices
-    ///     and an extra target tail probability (we don't sample from
-    ///     the tail distribution here — the kernel does that).
+    /// Decide per-draft rejection given parallel `(p_draft, p_target)` vectors of length `gamma` (or fewer / zero).
+    /// Rule (Leviathan-style): * For step i, compute `r = min(1, p_target[i] / max(p_draft[i], eps))`.
     pub fn decide(&self, probs: &[(f32, f32)], gamma: usize) -> AcceptanceResult {
         if probs.is_empty() {
             return AcceptanceResult::Partial {
@@ -107,9 +71,7 @@ impl TokenAcceptor {
                 break;
             }
             // Threshold rule: accept iff pt >= max(threshold * pd, eps).
-            // With threshold == 0 and pd > 0 the rule is "accept iff
-            // pt >= pd" (Leviathan-style "target cannot say draft is
-            // less likely").
+            // With threshold == 0 and pd > 0 the rule is "accept iff pt >=.
             let pd_safe = pd.max(f32::EPSILON);
             let gate_pt = if self.threshold > 0.0 {
                 self.threshold * pd_safe
@@ -132,21 +94,15 @@ impl TokenAcceptor {
     }
 }
 
-// =========================================================================
 // Tree-of-drafts ancestor mask
-// =========================================================================
 
-/// Per-row bitmask of ancestor positions in a tree of speculative
-/// draft tokens. The mask stores one `u32` per row (32-bit precision
-/// is sufficient for typical `gamma ≤ 16` trees). Higher bitmasks would
-/// be a follow-up; the kernel side can chunk across `u32`s later.
+/// Per-row bitmask of ancestor positions in a tree of speculative draft tokens.
+/// The mask stores one `u32` per row (32-bit precision is sufficient for typical `gamma ≤.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeMask {
     pub rows: usize,
-    /// `rows` u32 bitmasks; row `i` has bit `j` set when row `j` is an
-    /// ancestor of row `i` (or `j == i`, the self-bit, which the kernel
-    /// also consumes; some kernels prefer self-bit to be off — that is
-    /// handled by the kernel).
+    /// `rows` u32 bitmasks; row `i` has bit `j` set when row `j` is an ancestor of row `i` (or `j ==
+    /// i`, the self-bit, which the kernel also consumes; some kernels prefer self-bit to be off - that is handled by the kernel).
     pub bits: Vec<u32>,
 }
 
@@ -157,10 +113,7 @@ impl TreeMask {
     }
 }
 
-/// Tree-of-drafts ancestor-mask builder. Construct, set parents (root
-/// has `-1`), then `build()`. The default `gamma` rows form a simple
-/// left-recursive chain (`for i in 1..rows: parent(i) = i-1`); call
-/// `set_parent` for branching.
+/// Tree-of-drafts ancestor-mask builder. Construct, set parents (root has `-1`), then `build()`.
 #[derive(Debug, Clone)]
 pub struct TreeMaskBuilder {
     rows: usize,
@@ -240,20 +193,16 @@ impl TreeMaskBuilder {
     }
 }
 
-// =========================================================================
 // Speculative decoder step orchestration
-// =========================================================================
 
-/// Summary of one speculative-decoding step. Concrete types for
-/// emitted_tails and rejection_index are chosen so the GPU kernel
-/// pick-up can consume them directly.
+/// Summary of one speculative-decoding step.
+/// Concrete types for emitted_tails and rejection_index are chosen so the GPU kernel pick-up can consume.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepSummary {
     /// Indices of accepted draft tokens (within the draft slot).
     pub accepted: Vec<usize>,
-    /// Probability for the corrective target-tail token. The host
-    /// chooses the discrete token via target-side argmax sampling,
-    /// which is the next PR.
+    /// Probability for the corrective target-tail token.
+    /// The host chooses the discrete token via target-side argmax sampling, which is the next PR.
     pub tail_prob: f32,
     /// Number of tokens emitted this step (`accepted_count` + 1 tail,
     /// or shorter when partially rejected).
@@ -281,12 +230,8 @@ impl fmt::Display for StepSummary {
     }
 }
 
-/// Orchestrator for the speculative-decoding step. The draft and
-/// target model both expose closures; the decoder glues them
-/// together with `TokenAcceptor`.
-///
-/// Type-parameterized on closure types so callers use `&dyn Fn` or
-/// boxed `Fn` as convenience dictates.
+/// Orchestrator for the speculative-decoding step.
+/// The draft and target model both expose closures; the decoder glues them together with `TokenAcceptor`.
 pub struct SpeculativeDecoder<'a, D, T, P>
 where
     D: Fn(&[u32]) -> Vec<u32> + 'a,
@@ -318,29 +263,17 @@ where
     }
 
     /// Run one step. `input_ids` is the prompt / context slice.
-    ///
-    /// Order of operations:
-    ///   1. Draft model produces `gamma` candidate tokens
-    ///      (concatenated to `input_ids`).
-    ///   2. Target model scores every draft position against the
-    ///      target distribution; returns N parallel `(p_draft,
-    ///      p_target)` tuples.
-    ///   3. `TokenAcceptor::decide` decides accept/reject.
     pub fn step(&mut self, input_ids: &[u32]) -> std::result::Result<StepSummary, String> {
         let n = self.gamma;
         // 1. Draft.
         let draft_tokens = (self.draft)(input_ids);
         let draft_tokens: Vec<u32> = draft_tokens.into_iter().take(n).collect();
 
-        // 2. Target scoring. The target closure returns a parallel
-        //    `(p_draft, p_target)` vector; if our gamma is shorter
-        //    than what the target returns we truncate, and vice
-        //    versa.
+        // 2. Target scoring.
         let probs = (self.target)(input_ids, &draft_tokens);
         let probs: Vec<(f32, f32)> = probs.into_iter().take(n).collect();
-        // The pickup closure is reserved for the GPU kernel pickup
-        // step; in the CPU-only primitive it isn't consumed but is
-        // asserted to be non-trivial so the wiring is real.
+        // The pickup closure is reserved for the GPU kernel pickup step; in the CPU-only
+        // primitive it isn't consumed but is asserted to be non-trivial so the wiring is real.
 
         // 3. Accept / reject.
         let decision = self.acceptor.decide(&probs, n);
@@ -448,28 +381,7 @@ mod self_tests {
     }
 }
 
-// =========================================================================
-// Deterministic alpha-gain simulator.
-// -------------------------------------------------------------------------
-// Run `trials` speculative-decoding steps with gamma=γ and probabilistic
-// acceptance rate α. Each trial draws `gamma` proposal pairs
-// (`p_draft`, `p_target`) such that `p_target` covers the draft under
-// the supplied alpha (Leviathan Proposition 1):
-//
-//   * sample `p_draft` from a Dirichlet-flavored Normal-like prior,
-//   * draw `r ∈ [0, 1)` uniformly from a splitmix64-derived LCG,
-//   * `p_target = min(1, p_draft / r)` would be the formula for
-//     *emulated* Leviathan; we instead use the spec's `α` model:
-//     each token is accepted with probability `α` (independent) — this
-//     is what the spec tests against (`gamma / (1 + (1-α)(γ-1))`).
-//
-// The helper is the GPU-off spec-alpha verifier; its output is the
-// empirical mean accepted per trial. Tests use it to validate the
-// Leviathan prediction at the limits.
-///
-/// `seed` is a `u64` used to seed the deterministic RNG. Two calls with
-/// the same `(gamma, alpha, trials, seed)` must produce identical
-/// results (regression guard).
+// Deterministic alpha-gain simulator. Run `trials` speculative-decoding steps with gamma=γ and probabilistic acceptance rate α.
 pub fn deterministic_accept_with_seed(gamma: usize, alpha: f32, trials: usize, seed: u64) -> f32 {
     let mut rng = SplitMix64::new(seed);
     let mut total_accepted: u64 = 0;
@@ -477,11 +389,8 @@ pub fn deterministic_accept_with_seed(gamma: usize, alpha: f32, trials: usize, s
     for _ in 0..trials_u64 {
         let mut accepted: u64 = 0;
         for i in 0..gamma as u64 {
-            // Bernoulli(α) trial using splitmix64 output mapped to
-            // uniform [0, 1). To match the spec's notion of
-            // `alpha = p_target/p_draft` overlap, we sample
-            // independently; this isolates the test from any
-            // floating-point abundance-of-probability artifacts.
+            // Bernoulli(α) trial using splitmix64 output mapped to uniform [0, 1).
+            // To match the spec's notion of `alpha = p_target/p_draft` overlap, we sample independently; this isolates.
             let r = rng.next_f32();
             if r < alpha || i == 0 {
                 // i==0 ensures the root token is always accepted
@@ -521,9 +430,7 @@ impl SplitMix64 {
     }
 }
 
-// =========================================================================
 // Dual-Stream Speculative Engine (T3.9 / Phase-6)
-// =========================================================================
 
 /// Configuration for the dual-stream speculative decoding engine.
 #[derive(Debug, Clone)]
@@ -573,13 +480,7 @@ impl DualStreamStats {
 }
 
 /// Dual-stream speculative decoding engine for ROCm.
-///
-/// Implements real pipelined draft/verify overlap across two independent HIP compute streams:
-/// - `stream_verify` (Stream A): Target model forward evaluation and candidate verification.
-/// - `stream_draft` (Stream B): Draft model candidate proposal generation for step N+1.
-///
-/// Stream dependencies and step boundaries are coordinated via `event_draft_ready` and
-/// `event_verify_ready` without stalling unrelated control/device streams.
+/// Implements real pipelined draft/verify overlap across two independent HIP compute streams: - `stream_verify` (Stream A):.
 pub struct DualStreamSpeculativeEngine {
     config: DualStreamConfig,
     stream_verify: *mut c_void,
@@ -596,7 +497,11 @@ unsafe impl Send for DualStreamSpeculativeEngine {}
 impl DualStreamSpeculativeEngine {
     /// Create a new dual-stream speculative engine with real HIP streams and events.
     pub fn try_new(config: DualStreamConfig) -> Result<Self> {
-        let flags = if config.non_blocking_streams { 0x1 } else { 0x0 };
+        let flags = if config.non_blocking_streams {
+            0x1
+        } else {
+            0x0
+        };
         let mut stream_v: *mut c_void = null_mut();
         let mut stream_d: *mut c_void = null_mut();
         let mut ev_d: *mut c_void = null_mut();
@@ -652,9 +557,8 @@ impl DualStreamSpeculativeEngine {
         })
     }
 
-    /// Create a simulated dual-stream engine that executes the same pipelined scheduling
-    /// without initializing raw GPU HIP handles. Useful for CPU tests and environments
-    /// without physical AMD ROCm hardware.
+    /// Create a simulated dual-stream engine that executes the same pipelined scheduling without initializing raw GPU HIP handles.
+    /// Useful for CPU tests and environments without physical AMD ROCm hardware.
     pub fn new_simulated(config: DualStreamConfig) -> Self {
         let threshold = config.acceptance_threshold;
         Self {
@@ -730,10 +634,9 @@ impl DualStreamSpeculativeEngine {
             && !self.stream_verify.is_null()
             && !self.event_draft_ready.is_null()
         {
-            check_hip(
-                "hipStreamWaitEvent (verify waits draft)",
-                unsafe { hipStreamWaitEvent(self.stream_verify, self.event_draft_ready, 0) },
-            )?;
+            check_hip("hipStreamWaitEvent (verify waits draft)", unsafe {
+                hipStreamWaitEvent(self.stream_verify, self.event_draft_ready, 0)
+            })?;
         }
         Ok(())
     }
@@ -744,10 +647,9 @@ impl DualStreamSpeculativeEngine {
             && !self.stream_draft.is_null()
             && !self.event_draft_ready.is_null()
         {
-            check_hip(
-                "hipEventRecord (draft_ready)",
-                unsafe { hipEventRecord(self.event_draft_ready, self.stream_draft) },
-            )?;
+            check_hip("hipEventRecord (draft_ready)", unsafe {
+                hipEventRecord(self.event_draft_ready, self.stream_draft)
+            })?;
         }
         Ok(())
     }
@@ -758,10 +660,9 @@ impl DualStreamSpeculativeEngine {
             && !self.stream_verify.is_null()
             && !self.event_verify_ready.is_null()
         {
-            check_hip(
-                "hipEventRecord (verify_ready)",
-                unsafe { hipEventRecord(self.event_verify_ready, self.stream_verify) },
-            )?;
+            check_hip("hipEventRecord (verify_ready)", unsafe {
+                hipEventRecord(self.event_verify_ready, self.stream_verify)
+            })?;
         }
         Ok(())
     }
@@ -769,10 +670,9 @@ impl DualStreamSpeculativeEngine {
     /// Synchronize host with the verifier stream.
     pub fn sync_verify(&self) -> Result<()> {
         if self.owns_hip_resources && !self.stream_verify.is_null() {
-            check_hip(
-                "hipStreamSynchronize (verify)",
-                unsafe { hipStreamSynchronize(self.stream_verify) },
-            )?;
+            check_hip("hipStreamSynchronize (verify)", unsafe {
+                hipStreamSynchronize(self.stream_verify)
+            })?;
         }
         Ok(())
     }
@@ -780,10 +680,9 @@ impl DualStreamSpeculativeEngine {
     /// Synchronize host with the drafter stream.
     pub fn sync_draft(&self) -> Result<()> {
         if self.owns_hip_resources && !self.stream_draft.is_null() {
-            check_hip(
-                "hipStreamSynchronize (draft)",
-                unsafe { hipStreamSynchronize(self.stream_draft) },
-            )?;
+            check_hip("hipStreamSynchronize (draft)", unsafe {
+                hipStreamSynchronize(self.stream_draft)
+            })?;
         }
         Ok(())
     }
@@ -796,13 +695,7 @@ impl DualStreamSpeculativeEngine {
     }
 
     /// Execute a pipelined speculative decoding step with overlapping draft/verify execution.
-    ///
-    /// The step coordinates:
-    /// 1. Verifying step N candidate tokens `active_draft_tokens` on `stream_verify`.
-    /// 2. Concurrently launching draft generation for step N+1 candidate tokens on `stream_draft`.
-    /// 3. Synchronizing at the step N boundary to accept tokens and determine next state.
-    ///
-    /// Returns `(summary, next_staged_draft)`.
+    /// The step coordinates: 1.
     pub fn step_pipelined<D, T>(
         &mut self,
         current_tokens: &mut Vec<u32>,
@@ -822,8 +715,11 @@ impl DualStreamSpeculativeEngine {
         self.sync_draft_to_verify()?;
 
         // Step 2: Launch verification of active_draft_tokens on stream_verify
-        let probs =
-            (verify_fn)(current_tokens, &active_draft_tokens[..n_draft], self.stream_verify);
+        let probs = (verify_fn)(
+            current_tokens,
+            &active_draft_tokens[..n_draft],
+            self.stream_verify,
+        );
         self.record_verify_ready()?;
 
         // Step 3: Concurrently launch optimistic Draft(N+1) on stream_draft assuming full acceptance

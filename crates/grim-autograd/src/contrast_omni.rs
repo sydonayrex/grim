@@ -1,11 +1,5 @@
 //! CONTRAST-OMNI: Fréchet regularizer for hierarchical cross-modal contrastive learning.
-//!
-//! This module provides `ContrastOmniLoss`, which combines:
-//! - Cross-modal Fréchet distance between Gaussian embeddings of each modality.
-//! - Within-modality InfoNCE-style contrastive loss.
-//! - Utility-weighted adjustment over the contrastive term.
-//!
-//! All math is expressed over flat `f32` slices to keep the crate backend-agnostic.
+//! This module provides `ContrastOmniLoss`, which combines: - Cross-modal Fréchet distance between Gaussian embeddings of each.
 
 use std::collections::HashMap;
 
@@ -43,9 +37,7 @@ impl ContrastOmniLoss {
     }
 
     /// Squared Fréchet distance between two diagonal Gaussians.
-    ///
-    /// Uses the closed-form diagonal approximation:
-    /// `sum((mu1 - mu2)^2) + sum((sqrt(cov1) - sqrt(cov2))^2)`.
+    /// Uses the closed-form diagonal approximation: `sum((mu1 - mu2)^2) + sum((sqrt(cov1) - sqrt(cov2))^2)`.
     pub fn compute_frechet_distance(
         mean1: &[f32],
         mean2: &[f32],
@@ -70,13 +62,7 @@ impl ContrastOmniLoss {
     }
 
     /// Hierarchical cross-modal contrastive loss.
-    ///
     /// * `features` is a flat buffer of `[sample, dim]` row-major data.
-    /// * `modality_ids` assigns each sample to a modality bucket.
-    /// * `modality_names` maps modality id to a human-readable tag used for weighting.
-    /// * `labels` class ids for within-modality positives.
-    ///
-    /// Returns the scalar total loss as `f32`.
     pub fn hierarchical_contrastive(
         &self,
         features: &[f32],
@@ -222,10 +208,7 @@ impl ContrastOmniLoss {
     }
 
     /// Weight an existing contrastive loss by modality-tagged utility.
-    ///
     /// * `scores` is a flat list of per-sample contrastive scores.
-    /// * `modality_tags` are the modality names (one per sample).
-    /// * `utility` global utility scalar applied to every score.
     pub fn utility_weighted_contrastive(
         &self,
         scores: &[f32],

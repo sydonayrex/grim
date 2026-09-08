@@ -9,9 +9,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::configs::QwenConfig;
 use crate::model::{Llama, LlamaConfig};
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama
 
 pub struct Qwen {
     pub cfg: QwenConfig,

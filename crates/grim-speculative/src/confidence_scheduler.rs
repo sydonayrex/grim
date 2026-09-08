@@ -1,25 +1,10 @@
-//! `ConfidenceScheduler` — chooses how many drafted positions to verify
-//! against the target each iteration, given current load.
-//!
-//! §5.3.2. The second half of DSpark's contribution, and a serving-system
-//! concern rather than purely a modeling one: verifying every drafted
-//! position indiscriminately wastes target-model batch capacity on tail
-//! tokens unlikely to be accepted anyway, and that waste gets worse
-//! exactly when the engine is already under load.
-//!
-//! Mostly the function is deterministic. §5.8 requires "per-request-
-//! seeded speculative-decoding RNG" for any sampling step inside the
-//! speculative path; we keep the verifier length deterministic
-//! (input-driven) but use a [`DeterministicRng`] for the optional
-//! random reversal of the verification order, which is exposed via
-//! `DeterminismMode::Strict`-aware sampling. The rng helper lives
-//! in `grim-backend-cpu`.
+//! `ConfidenceScheduler` - chooses how many drafted positions to verify against the target each iteration, given current load.
+//! §5.3.2.
 
 use crate::draft_backbone::DraftBlock;
 
 /// Profile of how many accepted tokens per second the verifier produces.
-/// Engine-internal; measured at runtime from real per-position accept
-/// statistics (today: stubbed defaults).
+/// Engine-internal; measured at runtime from real per-position accept statistics (today: stubbed defaults).
 #[derive(Debug, Clone)]
 pub struct ThroughputProfile {
     /// Approximate verification cost per drafted position (ms).
@@ -60,21 +45,15 @@ impl Default for SpeculationConfig {
 pub struct ConfidenceScheduler {
     pub throughput_profile: ThroughputProfile,
     pub config: SpeculationConfig,
-    /// WI 4.4.2 — TIDE-style adaptation tracking. EMA of the per-step
-    /// acceptance rate (`accepted / drafted`). When this drifts below
-    /// `adaptation_config.min_accept_rate`, the draft model is considered
-    /// misaligned and `should_adapt_draft` returns `true`.
+    /// WI 4.4.2 - TIDE-style adaptation tracking.
+    /// EMA of the per-step acceptance rate (`accepted / drafted`).
     pub adaptation_state: AdaptationState,
     /// Configuration for the adaptation-trigger decision.
     pub adaptation_config: AdaptationConfig,
 }
 
-/// WI 4.4.2 — runtime state for the "should we adapt the draft" decision.
-///
-/// Tracks the exponential moving average of the acceptance rate across decode
-/// steps. The EMA is deterministic (input-driven, no wall-clock) — Gate 4.6.3.
-/// When the EMA drops below the configured floor, `should_adapt_draft` fires,
-/// signaling TIDE's "activate only when beneficial" control.
+/// WI 4.4.2 - runtime state for the "should we adapt the draft" decision.
+/// Tracks the exponential moving average of the acceptance rate across decode steps.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdaptationState {
     /// EMA of the acceptance rate (`accepted / drafted`). Starts at 1.0
@@ -103,9 +82,8 @@ impl Default for AdaptationState {
 /// WI 4.4.2 — configuration for the adaptation-trigger decision.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct AdaptationConfig {
-    /// EMA smoothing factor (α). `0.15` matches `SelfTuningController`'s
-    /// existing EMA alpha for consistency with the codebase's other runtime
-    /// adaptive signals.
+    /// EMA smoothing factor (α). `0.15` matches `SelfTuningController`'s existing EMA
+    /// alpha for consistency with the codebase's other runtime adaptive signals.
     pub ema_alpha: f64,
     /// Minimum acceptance rate before adaptation fires. Below this, the draft
     /// is considered misaligned with the target (TIDE's "beneficial" threshold).
@@ -169,19 +147,8 @@ impl ConfidenceScheduler {
         self.adaptation_config.min_accept_rate
     }
 
-    /// WI 4.4.2 — Record the acceptance result from a decode step and update
-    /// the adaptation EMA.
-    ///
-    /// `accepted` is the number of draft tokens the target accepted this step;
-    /// `drafted` is the total number of draft tokens proposed. Calling this
-    /// with `drafted == 0` is a no-op (no draft was proposed, nothing to
-    /// measure). The EMA update is:
-    /// ```text
-    /// ema = (1 - α) * ema + α * (accepted / drafted)
-    /// ```
-    ///
-    /// Deterministic: given the same sequence of `(accepted, drafted)` pairs,
-    /// the EMA is identical across runs (Gate 4.6.3 — no wall-clock or RNG).
+    /// WI 4.4.2 - Record the acceptance result from a decode step and update the adaptation EMA.
+    /// `accepted` is the number of draft tokens the target accepted this step; `drafted` is the.
     pub fn record_acceptance(&mut self, accepted: usize, drafted: usize) {
         if drafted == 0 {
             return;
@@ -195,18 +162,8 @@ impl ConfidenceScheduler {
         self.adaptation_state.steps_observed += 1;
     }
 
-    /// WI 4.4.2 — TIDE-style "adapt only when beneficial" trigger.
-    ///
-    /// Returns `true` when the measured acceptance-rate EMA has drifted below
-    /// `adaptation_config.min_accept_rate`, signaling that the draft model has
-    /// diverged from the target enough to warrant a refresh step. Returns
-    /// `false` during the initial ramp (before `min_steps_before_trigger`) to
-    /// avoid spurious triggers while the EMA stabilizes.
-    ///
-    /// This is the runtime control TIDE describes: the adaptation is gated by
-    /// a *measured signal* (acceptance rate), not a fixed schedule. The actual
-    /// weight update is deferred to the draft-update interface in `distill.rs`
-    /// (§4.4.3) — this function only answers "should we adapt now?"
+    /// WI 4.4.2 - TIDE-style "adapt only when beneficial" trigger.
+    /// Returns `true` when the measured acceptance-rate EMA has drifted below `adaptation_config.min_accept_rate`, signaling that the draft.
     pub fn should_adapt_draft(&self) -> bool {
         if self.adaptation_state.steps_observed < self.adaptation_config.min_steps_before_trigger {
             return false;
@@ -214,15 +171,8 @@ impl ConfidenceScheduler {
         self.adaptation_state.accept_rate_ema < self.adaptation_config.min_accept_rate
     }
 
-    /// Choose how many drafted positions to actually verify against the
-    /// target. The decision walks the confidence-ranked prefix; the
-    /// scheduler extends verification while marginal survival probability
-    /// still clears the throughput headroom implied by
-    /// `throughput_profile` at current GPU utilization. Never drops
-    /// below `min_verify_len`.
-    ///
-    /// `live_gpu_utilization`            ∈ [0, 1]
-    /// `batch_pressure`                  ongoing iteration backlog in tokens
+    /// Choose how many drafted positions to actually verify against the target.
+    /// The decision walks the confidence-ranked prefix; the scheduler extends verification while marginal survival probability still.
     pub fn choose_verify_len(
         &self,
         draft: &DraftBlock,
@@ -233,13 +183,10 @@ impl ConfidenceScheduler {
             return 0;
         }
         // 1. Determine hierarchy of available slots via descending confidence.
-        // (v1 confidence is per-position; in real DSpark this is pre-sorted
-        // by confidence head. We treat `draft.confidence` as already aligned.)
         let max_len = self.config.block_len.min(draft.len());
 
-        // 2. Reduce verify length under load: target
-        //     headroom = 1.0 - live_gpu_utilization
-        //     squeeze = batch_pressure based factor
+        // 2. Reduce verify length under load: target headroom
+        // = 1.0 - live_gpu_utilization squeeze = batch_pressure based factor
         let headroom = (1.0 - live_gpu_utilization).max(0.0);
         let squeeze = 1.0 / (1.0 + (batch_pressure as f64) / 16.0);
         let load_factor = (headroom as f64) * squeeze;
@@ -262,9 +209,8 @@ impl ConfidenceScheduler {
             return reduced;
         }
 
-        // 4. Walk confidence-ranked prefix, keep extending while
-        //    marginal survival probability × block-cost stays under
-        //    the throughput headroom. Below `confidence_floor` we drop.
+        // 4. Walk confidence-ranked prefix, keep extending while marginal
+        // survival probability × block-cost stays under the throughput headroom.
         let mut len = self.config.min_verify_len.min(max_len);
         let mut cumulative_survival = 1.0f64;
         let mut cumulative_lifetime_ms = 0.0f64;
@@ -380,9 +326,8 @@ mod tests {
 
     #[test]
     fn deterministic_seeded_rng_is_reproducible_under_strict() {
-        // Architecture §5.8: a per-request seeded RNG, used by the
-        // speculative path, must produce identical noise under
-        // strict mode given identical seeds.
+        // Architecture §5.8: a per-request seeded RNG, used by the speculative
+        // path, must produce identical noise under strict mode given identical seeds.
         let mut a = DeterministicRng::from_seed(0xDEAD_BEEF);
         let mut b = DeterministicRng::from_seed(0xDEAD_BEEF);
         for _ in 0..256 {
@@ -400,9 +345,7 @@ mod tests {
         assert!(differ, "distinct seeds must produce distinct streams");
     }
 
-    // ====================================================================
-    // WI 4.4.2 — TIDE-style adaptation trigger tests.
-    // ====================================================================
+    // WI 4.4.2 - TIDE-style adaptation trigger tests.
 
     #[test]
     fn should_adapt_does_not_fire_during_initial_ramp() {

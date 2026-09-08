@@ -1,17 +1,8 @@
 //! ROCm HIP kernel sources for the compressed tensor types.
-//!
-//! - W8A8MXFP8 weights: reuse the existing `mxfp_standalone` MxFp8 kernel
-//!   (`grim_dequant_mxfp8`) — codes/E8M0 exps framing is identical.
-//! - WNA16 weights: 256-weight blocks, per-block f16 scale, per-tensor f32
-//!   scale; N-bit codes packed MSB-first across bytes.
-//! - EmbeddingWNA16Int: same N-bit decode but per-tensor f32 scale only
-//!   (no per-block scales), row-major packed codes.
+//! - W8A8MXFP8 weights: reuse the existing `mxfp_standalone` MxFp8 kernel (`grim_dequant_mxfp8`) - codes/E8M0 exps framing is.
 
-/// MSB-first N-bit decoder: from a byte stream, extract the N-bit code for
-/// element `lane_in_block` (0-based) within its block. Codes are packed MSB
-/// first, crossing byte boundaries as needed. `bytes_total` = ceil(256*n_bit/8)
-/// for the WNA16 path or ceil(embedding_dim*n_bit/8) per row for the embedding
-/// path.
+/// MSB-first N-bit decoder: from a byte stream, extract the N-bit code for element `lane_in_block` (0-based) within its block.
+/// Codes are packed MSB first, crossing byte boundaries as needed.
 #[inline]
 #[allow(dead_code)]
 fn decode_msb_nbit(
@@ -52,10 +43,8 @@ fn decode_msb_nbit_row(code_bytes: &[u8], row_byte_offset: usize, col: usize, n_
 }
 
 pub const WEIGHT_NA16_KERNEL: &str = r#"
-// Device helpers must precede first use in a single TU (audit fix: the
-// previous revision defined them AFTER grim_dequant_wna16 and used Rust
-// f32::from_bits syntax, which HIP C cannot parse — every kernel in the
-// aggregate JIT unit failed with "undeclared identifier").
+// Device helpers must precede first use in a single TU (audit fix: the previous revision defined them AFTER grim_dequant_wna16 and
+// used Rust f32::from_bits syntax, which HIP C cannot parse - every kernel in the aggregate JIT unit failed with "undeclared identifier").
 static inline __device__ float grim_f16_to_f32_hip(unsigned short h)
 {
     unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
@@ -71,18 +60,13 @@ static inline __device__ float grim_f16_to_f32_hip(unsigned short h)
         float v = (float)m * (1.0f / 16777216.0f);
         return (h & 0x8000u) ? -v : v;
     }
-    // e = exponent field already shifted into f32 position (E<<23); the
-    // f16→f32 bias adjustment adds (127-15)=112 to the exponent field,
-    // i.e. OR with 112<<23 = 0x38000000. The previous 0x38800000 constant
-    // (113<<23) doubled every normal-range scale — caught by the WNA16
-    // fused-GEMM golden gate (its host reference decodes correctly).
+    // e = exponent field already shifted into f32 position (E<<23); the f16→f32 bias adjustment adds (127-15)=112 to the exponent field, i.e.
+    // OR with 112<<23 = 0x38000000.
     return __uint_as_float(s | e | m | 0x38000000u);
 }
 
-// Audit rewrite: the previous loop computed a NEGATIVE shift on the first
-// byte (8 - 8 - take), which is UB in C/CUDA and silently extracted the
-// wrong bits. MSB-first means: stream bit p lives at byte p/8, bit 7-(p%8);
-// the code assembles MSB→LSB across those stream bits.
+// Audit rewrite: the previous loop computed a NEGATIVE shift on the first byte (8 - 8 - take), which is UB in C/CUDA and silently extracted the wrong bits.
+// MSB-first means: stream bit p lives at byte p/8, bit 7-(p%8); the code assembles MSB→LSB.
 static inline __device__ unsigned int grim_decode_msb_nbit(
     const unsigned char* code_bytes,
     int block_offset_bytes,
@@ -160,20 +144,14 @@ extern "C" __global__ void grim_dequant_embedding_wna16_int(
 }
 "#;
 
-// ── Quant workstream: fused dequant-GEMMs for the compressed-tensors
-// W8A8 formats and WNA16. Family contract (matches grim_gptq_dequant_gemm /
-// marlin): C[M, N] = A[M, K] @ deq(B)\u1d40, one 256-thread block per 256
-// outputs, B stored in each format's documented blob layout.
+// ── Quant workstream: fused dequant-GEMMs for the compressed-tensors W8A8 formats and WNA16.
+// Family contract (matches grim_gptq_dequant_gemm / marlin): C[M, N] = A[M, K] @ deq(B)\u1d40, one 256-thread.
 
-/// CompressedTensors W8A8 INT8 (SmoothQuant): blob =
-/// [u64 scales_len][int8 codes (N*K, row-major over output channels)]
-/// [f32 per-output-channel scales (N)]. Activations arrive F32 (the int8
-/// activation quantization is applied upstream per-token and is out of
-/// scope for the weight-side dequant GEMM).
+/// CompressedTensors W8A8 INT8 (SmoothQuant): blob = [u64 scales_len][int8 codes (N*K, row-major over output channels)] [f32 per-output-channel scales (N)].
+/// Activations arrive F32 (the int8 activation quantization is applied upstream per-token and is out of.
 pub const W8A8_GEMM_KERNEL: &str = r#"
-// ── Forward: C[M, N] = A[M, K] @ deq(B)
-// ── Backward: dX[M, K] = dY[M, N] @ deq(B)[N, K]
-// Both use the same blob layouts; backward swaps the accumulation axis.
+// ── Forward: C[M, N] = A[M, K] @ deq(B) ── Backward: dX[M, K] = dY[M,
+// N] @ deq(B)[N, K] Both use the same blob layouts; backward swaps the accumulation axis.
 
 extern "C" __global__ void grim_w8a8_int8_dequant_gemm(
     const float* __restrict__ A,

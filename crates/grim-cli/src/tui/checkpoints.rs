@@ -1,6 +1,5 @@
-//! File-store checkpoints: before a mutating tool touches a file, snapshot
-//! its prior bytes under `$XDG_DATA_HOME/grim/checkpoints/<hash-of-project>/`.
-//! Works in non-git directories. One manifest per checkpoint, id = unix nanos.
+//! File-store checkpoints: before a mutating tool touches a file, snapshot its prior bytes under `$XDG_DATA_HOME/grim/checkpoints/<hash-of-project>/`.
+//! Works in non-git directories.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -197,7 +196,11 @@ mod tests {
         let sandbox = Sandbox::new(proj.path().to_path_buf());
         let store = CheckpointStore::open(proj.path());
         let cp = store
-            .persist(store.capture(&write_tool("src.txt", "replaced"), &sandbox).unwrap())
+            .persist(
+                store
+                    .capture(&write_tool("src.txt", "replaced"), &sandbox)
+                    .unwrap(),
+            )
             .unwrap();
 
         std::fs::write(proj.path().join("src.txt"), "replaced").unwrap();

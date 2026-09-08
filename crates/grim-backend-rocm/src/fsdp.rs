@@ -1,13 +1,10 @@
 //! Consumer Parallel GPU Multi-GPU FSDP (Fully Sharded Data Parallel) module.
-//!
-//! Provides ZeRO-3 / FSDP distributed training primitives across multiple ROCm GPUs,
-//! backed by real cross-rank collective communication via [`ParallelCommunicator`]
-//! (RCCL device collectives or high-speed `HostStagingRing` synchronization).
+//! Provides ZeRO-3 / FSDP distributed training primitives across multiple ROCm GPUs, backed by real cross-rank.
 
-use std::sync::Arc;
+use crate::device::parallel_comm::ParallelCommunicator;
 use grim_tensor::Shape;
 use grim_tensor::error::{Error, Result};
-use crate::device::parallel_comm::ParallelCommunicator;
+use std::sync::Arc;
 
 /// Configuration for Consumer Parallel GPU FSDP sharding.
 #[derive(Debug, Clone)]
@@ -45,7 +42,10 @@ pub type ConsumerZeroPlanner = ConsumerFsdpGroup;
 
 impl ConsumerFsdpGroup {
     /// Constructs a new `ConsumerFsdpGroup` with optional parallel communicator.
-    pub fn new(config: ConsumerFsdpConfig, comm: Option<Arc<ParallelCommunicator>>) -> Result<Self> {
+    pub fn new(
+        config: ConsumerFsdpConfig,
+        comm: Option<Arc<ParallelCommunicator>>,
+    ) -> Result<Self> {
         if config.world_size == 0 {
             return Err(Error::Backend("world_size must be >= 1".into()));
         }
@@ -215,7 +215,8 @@ impl ConsumerFsdpGroup {
             comm.reduce_scatter_storage(local_full_grad, sharded_dst, stream)?;
         } else {
             // Single rank: copy rank shard into destination
-            if let (Some(s_ptr), Some(d_ptr)) = (local_full_grad.device_ptr, sharded_dst.device_ptr) {
+            if let (Some(s_ptr), Some(d_ptr)) = (local_full_grad.device_ptr, sharded_dst.device_ptr)
+            {
                 let offset_bytes = self.config.rank * sharded_dst.bytes();
                 unsafe {
                     crate::hipMemcpy(
@@ -239,8 +240,8 @@ impl ConsumerFsdpGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::device::parallel_comm::HostStagingRing;
+    use std::sync::Arc;
 
     #[test]
     fn test_consumer_fsdp_multi_rank_all_gather_real_cross_rank() -> Result<()> {
@@ -248,10 +249,16 @@ mod tests {
         let ring = Arc::new(HostStagingRing::new(world_size));
 
         let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
-            0, world_size, vec![0, 1], ring.clone(),
+            0,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
         let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
-            1, world_size, vec![0, 1], ring.clone(),
+            1,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
 
         let cfg0 = ConsumerFsdpConfig {
@@ -279,8 +286,14 @@ mod tests {
 
         // Both ranks must see the FULL gathered sequence across rank 0 and rank 1!
         let expected = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
-        assert_eq!(gathered0, expected, "Rank 0 must receive full cross-rank gathered buffer");
-        assert_eq!(gathered1, expected, "Rank 1 must receive full cross-rank gathered buffer");
+        assert_eq!(
+            gathered0, expected,
+            "Rank 0 must receive full cross-rank gathered buffer"
+        );
+        assert_eq!(
+            gathered1, expected,
+            "Rank 1 must receive full cross-rank gathered buffer"
+        );
 
         Ok(())
     }
@@ -291,10 +304,16 @@ mod tests {
         let ring = Arc::new(HostStagingRing::new(world_size));
 
         let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
-            0, world_size, vec![0, 1], ring.clone(),
+            0,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
         let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
-            1, world_size, vec![0, 1], ring.clone(),
+            1,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
 
         let cfg0 = ConsumerFsdpConfig {
@@ -338,10 +357,16 @@ mod tests {
         let ring = Arc::new(HostStagingRing::new(world_size));
 
         let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
-            0, world_size, vec![0, 1], ring.clone(),
+            0,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
         let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
-            1, world_size, vec![0, 1], ring.clone(),
+            1,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
 
         let cfg0 = ConsumerFsdpConfig {
@@ -364,7 +389,12 @@ mod tests {
         let full_shape = Shape::new(vec![8]);
 
         // If no physical GPU or running under test sandbox, we can check contract shapes
-        if let (Ok(shard0_storage), Ok(shard1_storage), Ok(mut full0_storage), Ok(mut full1_storage)) = (
+        if let (
+            Ok(shard0_storage),
+            Ok(shard1_storage),
+            Ok(mut full0_storage),
+            Ok(mut full1_storage),
+        ) = (
             crate::RocmStorage::alloc_gpu(&shard_shape, grim_tensor::DType::F32, &alloc, 0),
             crate::RocmStorage::alloc_gpu(&shard_shape, grim_tensor::DType::F32, &alloc, 0),
             crate::RocmStorage::alloc_gpu(&full_shape, grim_tensor::DType::F32, &alloc, 0),

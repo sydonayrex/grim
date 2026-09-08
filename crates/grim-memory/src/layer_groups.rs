@@ -1,8 +1,5 @@
 //! Heterogeneous KV Layer Grouping for non-uniform transformer topologies.
-//!
-//! Maps model layers into distinct physical layout groups (e.g. standard dense attention,
-//! sliding-window attention, hybrid linear attention such as Qwen3.8 GDN, or low-rank MLA)
-//! so each layer group can be allocated, transferred, and spilled under independent policies.
+//! Maps model layers into distinct physical layout groups (e.g.
 
 use grim_tensor::DType;
 use std::collections::HashMap;

@@ -1,9 +1,5 @@
 //! Agent task / todo list panel for the grim TUI sidebar.
-//!
 //! The model can emit structured task updates via a `tool` call (e.g.
-//! `update_tasks`) and the UI renders them in the sidebar between the
-//! diagnostics panel and the tok/s sparkline. Tasks are ephemeral — they
-//! live only for the current TUI session and are cleared on `/clear`.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -49,11 +45,11 @@ impl TaskStatus {
     /// Color for the status indicator.
     pub fn color(&self) -> Color {
         match self {
-            TaskStatus::Pending => Color::Rgb(136, 136, 136),    // muted
-            TaskStatus::InProgress => Color::Rgb(245, 158, 11),  // amber
-            TaskStatus::Completed => Color::Rgb(16, 185, 129),    // green
-            TaskStatus::Failed => Color::Rgb(239, 68, 68),       // red
-            TaskStatus::Cancelled => Color::Rgb(112, 50, 180),   // dim purple
+            TaskStatus::Pending => Color::Rgb(136, 136, 136), // muted
+            TaskStatus::InProgress => Color::Rgb(245, 158, 11), // amber
+            TaskStatus::Completed => Color::Rgb(16, 185, 129), // green
+            TaskStatus::Failed => Color::Rgb(239, 68, 68),    // red
+            TaskStatus::Cancelled => Color::Rgb(112, 50, 180), // dim purple
         }
     }
 
@@ -233,9 +229,7 @@ impl TaskList {
     }
 
     /// Render the task list as styled Lines for the sidebar.
-    ///
-    /// `max_rows` caps how many task rows are rendered; when the list
-    /// exceeds this, a "(+N more)" footer is appended.
+    /// `max_rows` caps how many task rows are rendered; when the list exceeds this, a "(+N.
     pub fn render(&self, max_rows: usize) -> Vec<Line<'static>> {
         let c_purple_soft = Color::Rgb(192, 132, 252);
         let c_muted = Color::Rgb(136, 136, 136);
@@ -259,10 +253,7 @@ impl TaskList {
         let total = self.tasks.len();
         let done = self.count_by_status(TaskStatus::Completed);
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("╭─ tasks "),
-                Style::default().fg(c_muted),
-            ),
+            Span::styled(format!("╭─ tasks "), Style::default().fg(c_muted)),
             Span::styled(
                 format!("{done}/{total}"),
                 Style::default().fg(if done == total {
@@ -297,21 +288,17 @@ impl TaskList {
                 Span::styled(format!("{indicator} "), Style::default().fg(status_color)),
                 Span::styled(
                     truncate(&task.title, 22),
-                    Style::default().fg(title_color).add_modifier(
-                        if is_selected {
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(if is_selected {
                             Modifier::BOLD
                         } else {
                             Modifier::empty()
-                        },
-                    ),
+                        }),
                 ),
                 Span::styled(
                     format!(" [{}]", task.status.label()),
-                    Style::default().fg(if is_selected {
-                        status_color
-                    } else {
-                        c_muted
-                    }),
+                    Style::default().fg(if is_selected { status_color } else { c_muted }),
                 ),
             ]));
 
@@ -321,10 +308,7 @@ impl TaskList {
                     for desc_line in desc.lines().take(2) {
                         lines.push(Line::from(vec![
                             Span::styled("    ╎ ".to_string(), Style::default().fg(c_muted)),
-                            Span::styled(
-                                truncate(desc_line, 22),
-                                Style::default().fg(c_muted),
-                            ),
+                            Span::styled(truncate(desc_line, 22), Style::default().fg(c_muted)),
                         ]));
                     }
                 }
@@ -368,11 +352,20 @@ mod tests {
 
     #[test]
     fn task_status_parse() {
-        assert_eq!("pending".parse::<TaskStatus>().unwrap(), TaskStatus::Pending);
-        assert_eq!("in-progress".parse::<TaskStatus>().unwrap(), TaskStatus::InProgress);
+        assert_eq!(
+            "pending".parse::<TaskStatus>().unwrap(),
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            "in-progress".parse::<TaskStatus>().unwrap(),
+            TaskStatus::InProgress
+        );
         assert_eq!("done".parse::<TaskStatus>().unwrap(), TaskStatus::Completed);
         assert_eq!("failed".parse::<TaskStatus>().unwrap(), TaskStatus::Failed);
-        assert_eq!("cancelled".parse::<TaskStatus>().unwrap(), TaskStatus::Cancelled);
+        assert_eq!(
+            "cancelled".parse::<TaskStatus>().unwrap(),
+            TaskStatus::Cancelled
+        );
         assert!("unknown".parse::<TaskStatus>().is_err());
     }
 
@@ -487,7 +480,10 @@ mod tests {
     #[test]
     fn task_list_render_truncation() {
         let mut list = TaskList::new();
-        list.upsert(Task::new("1", "This is a very long task title that should be truncated"));
+        list.upsert(Task::new(
+            "1",
+            "This is a very long task title that should be truncated",
+        ));
         let lines = list.render(6);
         let text: String = lines
             .iter()

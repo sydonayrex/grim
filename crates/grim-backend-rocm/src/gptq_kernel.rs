@@ -1,26 +1,11 @@
 //! ROCm HIP kernels for GPTQ quantization-aware re-quantization.
-//!
-//! Provides wavefront-level parallelism for the GPTQ error-correcting update:
-//! ```text
-//! W_corrected = W_approx + α * H_diag^{-1} ⊙ (W_original - W_approx)
-//! ```
-//!
-//! where `H_diag` is the Fisher/GGN diagonal, `α` is the correction rate, and
-//! `⊙` is element-wise multiplication. This is the Pass 4 ROCm-accelerated
-//! path: the CPU fallback in `grim-quant` runs scalar row-by-row; this module
-//! runs the same algorithm with wavefront-parallel HIP kernels via `hiprtc`.
-//!
-//! Design follows the FFI pattern from `lib.rs` — safe wrappers over unsafe
-//! HIP FFI, using `jit_compile_hsaco` for on-demand kernel compilation.
+//! Provides wavefront-level parallelism for the GPTQ error-correcting update: ```text W_corrected = W_approx + α *.
 
 use crate::device::helpers::check_hip;
 use crate::{HiprtcProgram, hipSuccess};
 
 /// HIP source for the GPTQ wavefront correction kernel.
-///
-/// Each HIP thread corrects one element of the weight matrix using the
-/// diagonal Fisher preconditioner. Threads within a wavefront cooperate
-/// via shuffle to reduce LDS bank pressure during the correction pass.
+/// Each HIP thread corrects one element of the weight matrix using the diagonal Fisher preconditioner.
 pub const GPTQ_CORRECTION_KERNEL: &str = r#"
 extern "C" __global__
 void gptq_wavefront_correction_kernel(
@@ -59,10 +44,7 @@ void gptq_wavefront_correction_kernel(
 "#;
 
 /// HIP source for GPU-accelerated per-block scale search.
-///
-/// One HIP thread per quantization block. Each thread evaluates all 7
-/// scale multipliers and picks the one with lowest weighted quantization error.
-/// This replaces `fit_block_quantization` on CPU.
+/// One HIP thread per quantization block.
 pub const GPTQ_SCALE_FIT_KERNEL: &str = r#"
 extern "C" __global__
 void gptq_scale_fit_kernel(
@@ -151,10 +133,7 @@ pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
 }
 
 /// Compile a GPTQ HIP kernel and return the compiled HSACO bytes.
-///
-/// Uses `hiprtc` (HIP runtime compilation) for JIT compilation targeting
-/// the specified GCN architecture. Consults `HsacoKernelCache` first to
-/// bypass compilation on cache hit.
+/// Uses `hiprtc` (HIP runtime compilation) for JIT compilation targeting the specified GCN architecture.
 pub fn compile_gptq_kernel(
     kernel_name: &str,
     source: &str,

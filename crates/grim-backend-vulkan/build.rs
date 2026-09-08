@@ -160,15 +160,30 @@ fn kernels() -> Vec<(&'static str, String)> {
         ),
         ("charon_backward", load_kernel("charon_backward")),
         ("moe_mega_kernel", load_kernel("moe_mega_kernel")),
-        ("short_conv1d_causal_step", load_kernel("short_conv1d_causal_step")),
-        ("gated_delta_net_decode", load_kernel("gated_delta_net_decode")),
+        (
+            "short_conv1d_causal_step",
+            load_kernel("short_conv1d_causal_step"),
+        ),
+        (
+            "gated_delta_net_decode",
+            load_kernel("gated_delta_net_decode"),
+        ),
         ("mla_qkv_norm_split", load_kernel("mla_qkv_norm_split")),
-        ("selective_scan_headed", load_kernel("selective_scan_headed")),
+        (
+            "selective_scan_headed",
+            load_kernel("selective_scan_headed"),
+        ),
         ("fused_mxfp4_qkv", load_kernel("fused_mxfp4_qkv")),
-        ("block_diffusion_attention", load_kernel("block_diffusion_attention")),
+        (
+            "block_diffusion_attention",
+            load_kernel("block_diffusion_attention"),
+        ),
         ("delta_rule_decode", load_kernel("delta_rule_decode")),
         ("rwkv_wkv_recurrence", load_kernel("rwkv_wkv_recurrence")),
-        ("rwkv_channel_mix_full", load_kernel("rwkv_channel_mix_full")),
+        (
+            "rwkv_channel_mix_full",
+            load_kernel("rwkv_channel_mix_full"),
+        ),
     ]
 }
 

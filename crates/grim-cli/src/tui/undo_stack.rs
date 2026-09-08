@@ -1,7 +1,4 @@
-//! Generic bounded undo stack.
-//!
-//! Stores clones of state snapshots. Oldest entries are dropped when the
-//! capacity is exceeded. No redo stack: one undo direction is enough for chat.
+//! Generic bounded undo stack. Stores clones of state snapshots.
 
 // Allow dead_code for len/clear which are used by callers and tests.
 #![allow(unused)]

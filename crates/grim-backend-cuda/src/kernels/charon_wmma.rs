@@ -1,9 +1,5 @@
-//! Charon WMMA — Tensor Core warp matrix multiply-accumulate kernels for CUDA MoE.
-//!
-//! Implements `nvcuda::wmma::` 16×16×16 WMMA tiles for fused gate+up+down
-//! MoE expert GEMMs. Maps 1:1 to `charon_wmma.rs` in grim-backend-rocm which
-//! uses `rocwmma::` 16×16 tiles. CUDA targets Turing+ (`sm_75`) which first
-//! exposed `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
+//! Charon WMMA - Tensor Core warp matrix multiply-accumulate kernels for CUDA MoE.
+//! Implements `nvcuda::wmma::` 16×16×16 WMMA tiles for fused gate+up+down MoE expert GEMMs.
 
 pub const CHARON_WMMA_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -14,17 +10,8 @@ using namespace nvcuda::wmma;
 
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// grim_moe_wmma_gate_up — WMMA-accelerated gate+up fused SiLU projection.
-//
-// Computes per-expert gate_out[b, j] = silu(A[b,:] @ gate_w[e, j, :]) * (A[b,:] @ up_w[e, j, :])
-// using 16×16×16 WMMA tiles. Each warp owns one (expert_tile, inter_tile) pair.
-//
-// Contract:
-//   - A is float16, gate_w and up_w are float16.
-//   - hidden and inter must be multiples of 16.
-//   - Grid: (num_experts * inter / 16, batch / 16), Block: (32, 1).
-// ---------------------------------------------------------------------------
+// grim_moe_wmma_gate_up - WMMA-accelerated gate+up fused SiLU projection.
+// Computes per-expert gate_out[b, j] = silu(A[b,:] @ gate_w[e, j, :]) * (A[b,:] @ up_w[e, j,.
 __global__ void grim_moe_wmma_gate_up(
     const half* __restrict__ A,          // [batch, hidden]
     const half* __restrict__ gate_w,     // [num_experts, inter, hidden]
@@ -85,16 +72,8 @@ __global__ void grim_moe_wmma_gate_up(
     }
 }
 
-// ---------------------------------------------------------------------------
-// grim_moe_wmma_down — WMMA-accelerated down projection.
-//
-// Computes out[b, h] += gate_up_out[b, e, :] @ down_w[e, h, :] * routing_weight
-// using 16×16×16 WMMA tiles.
-//
-// Contract:
-//   - gate_up_out and down_w are float32 accumulated from gate_up kernel.
-//   - hidden and inter must be multiples of 16.
-// ---------------------------------------------------------------------------
+// grim_moe_wmma_down - WMMA-accelerated down projection.
+// Computes out[b, h] += gate_up_out[b, e, :] @ down_w[e, h, :] * routing_weight using 16×16×16.
 __global__ void grim_moe_wmma_down(
     const float* __restrict__ gate_up_out,   // [batch, num_experts, inter]
     const half*  __restrict__ down_w,         // [num_experts, hidden, inter]

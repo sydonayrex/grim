@@ -22,8 +22,8 @@ fn test_vulkan_rerope_parity_vs_cpu_oracle() {
     let shape = Shape::new(vec![b, s, d]);
 
     let mut k_init = vec![0.0f32; b * s * d];
-    for i in 0..k_init.len() {
-        k_init[i] = ((i as f32 + 1.0) * 0.05).sin();
+    for (i, val) in k_init.iter_mut().enumerate() {
+        *val = ((i as f32 + 1.0) * 0.05).sin();
     }
 
     let old_pos = vec![0u32, 1, 2, 3];
@@ -32,7 +32,9 @@ fn test_vulkan_rerope_parity_vs_cpu_oracle() {
 
     // 1. Initial RoPE on CPU
     let k_cpu_init = cpu_dev.from_cpu(&k_init, &shape, DType::F32).unwrap();
-    let (k_cpu_old, _) = cpu_dev.rope(k_cpu_init.as_ref(), &old_pos, &cfg, &shape).unwrap();
+    let (k_cpu_old, _) = cpu_dev
+        .rope(k_cpu_init.as_ref(), &old_pos, &cfg, &shape)
+        .unwrap();
 
     // 2. CPU Re-RoPE Oracle
     let (k_cpu_retargeted, _) = cpu_dev

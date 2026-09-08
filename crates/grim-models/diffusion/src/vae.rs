@@ -1,7 +1,5 @@
 //! Flux 2 AutoencoderKL (VAE) Latent Codec.
-//!
-//! Handles 32-channel latent representations, 2x2 spatial patch packing (`128` channels),
-//! and convolutional encoder/decoder transforms for high-fidelity pixel reconstruction.
+//! Handles 32-channel latent representations, 2x2 spatial patch packing (`128` channels), and convolutional encoder/decoder transforms for.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};

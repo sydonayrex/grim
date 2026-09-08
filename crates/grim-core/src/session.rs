@@ -1,8 +1,5 @@
-//! `Session` — per-request mutable execution state.
-//!
-//! A trait object so libraries can box user-supplied sessions, and a
-//! concrete `Inner` impl that holds a KV cache (when present) plus a
-//! monotonically-increasing `current_pos` cursor.
+//! `Session` - per-request mutable execution state.
+//! A trait object so libraries can box user-supplied sessions, and a concrete `Inner` impl that.
 
 use grim_tensor::{Device, Tensor};
 
@@ -16,9 +13,8 @@ pub enum DeterminismMode {
     Strict,
 }
 
-/// Object-safe session interface used by `Model` traits (`CausalLm`,
-/// `EncoderDecoderLm`). The simplest implementation is the `Inner`
-/// concrete value returned from `Session::new_storage`.
+/// Object-safe session interface used by `Model` traits (`CausalLm`, `EncoderDecoderLm`).
+/// The simplest implementation is the `Inner` concrete value returned from `Session::new_storage`.
 pub trait SessionT: Send {
     fn device(&self) -> &Device;
     fn current_pos(&self) -> usize;
@@ -49,11 +45,8 @@ pub trait SessionT: Send {
     fn paged_kv_handles(&self, _layer: usize) -> Option<(Tensor, Tensor, usize)> {
         None
     }
-    /// Device-resident block table in the `grim_qkv_attention_paged` kernel's
-    /// `BlockTableEntry { block_id, page_size }` ABI, cached across decode
-    /// steps. Perf (WI-kv): uploading the table per layer per token was a
-    /// redundant H2D per forward; caching keyed on (len, first, last) makes it
-    /// a no-op until the table actually grows. `None` → caller uploads fresh.
+    /// Device-resident block table in the `grim_qkv_attention_paged` kernel's `BlockTableEntry { block_id, page_size }` ABI, cached across decode steps.
+    /// Perf (WI-kv): uploading the table per layer per token was a redundant H2D per forward;.
     fn block_table_gpu_handle(
         &self,
     ) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
@@ -126,9 +119,6 @@ pub struct Inner {
     pub hip_graph_handle: Option<u64>,
     pub last_hidden_state: Option<Tensor>,
     /// Model-specific per-request state (e.g. LFM2 layer caches).
-    /// Typed slot — each model downcasts to its own cache type.  Lives on
-    /// the session so different requests against the same model get
-    /// independent caches, matching bebelm-main's ownership model.
     pub model_state: Option<Box<dyn std::any::Any + Send>>,
     /// Per-request RNG for deterministic sampling (e.g., speculative rejection).
     pub request_rng: Option<SimpleRng>,
@@ -290,12 +280,7 @@ impl Graph {
     }
 
     /// Replays the captured computation graph using bound session inputs.
-    ///
-    /// NOTE: Graph replay is not yet implemented (sims.md issue #10). The
-    /// previous implementation printed the node count and returned `Ok(())`,
-    /// silently making every shape-specialized computation path a no-op. We now
-    /// surface an explicit `Unimplemented` error so callers cannot mistake a
-    /// successful return for a successful replay.
+    /// NOTE: Graph replay is not yet implemented (sims.md issue #10).
     pub fn replay(&self, _session: &mut dyn SessionT) -> Result<()> {
         Err(Error::Unimplemented(format!(
             "Graph::replay: graph replay is not yet implemented ({} nodes captured).              No computation graph nodes were executed.",
@@ -349,9 +334,7 @@ impl Inner {
 }
 
 /// Public alias used everywhere `Session` is named as a concrete type.
-///
-// The `Session::new` name is kept stable for call sites even though the
-// runtime handle lives in `Inner`; returning `Inner` there is intentional.
+/// The `Session::new` name is kept stable for call sites even though the runtime handle lives.
 pub struct Session;
 
 impl Session {

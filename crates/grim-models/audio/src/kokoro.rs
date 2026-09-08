@@ -1,9 +1,5 @@
 //! Kokoro-82M StyleTTS2 / iSTFTNet Text-to-Speech Model Architecture.
-//!
-//! Models speech synthesis as a 3-stage pipeline:
-//! 1. Phoneme Text Representation via PLBERT text encoder (768-dim, 12 layers).
-//! 2. Acoustic & Duration Predictor conditioned on 128-dim voice style vectors (AdaIN).
-//! 3. iSTFTNet Neural Vocoder converting mel-spectrogram representations into high-fidelity PCM audio.
+//! Models speech synthesis as a 3-stage pipeline: 1.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};

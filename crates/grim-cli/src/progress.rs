@@ -1,11 +1,7 @@
 use std::io::{IsTerminal, Write};
 
 /// A minimal, dependency-free conversion progress bar.
-///
-/// Renders `[stage] [####----] 42% (done/total)` to stderr. When stderr is a
-/// terminal the bar updates in place with `\r`; otherwise (piped / logged)
-/// each update is printed as its own line so the percentage survives in
-/// redirects and logs.
+/// Renders `[stage] [####----] 42% (done/total)` to stderr.
 pub struct Progress {
     tty: bool,
     last_pct: isize,

@@ -115,9 +115,7 @@ mod tests {
         assert_eq!(dummy.device_ordinal(), 0);
     }
 
-    // ------------------------------------------------------------------------
     // Pass 4: WeightLayout, WavefrontTiledLayout, attention routing
-    // ------------------------------------------------------------------------
 
     #[test]
     fn test_wavefront_tiled_layout_tile_untile_roundtrip() {
@@ -370,11 +368,7 @@ mod tests {
     }
 
     // WRECK-6: host-mirror correctness test for `grim_split_k_reduction`.
-    // Mirrors the device kernel's reduction formula on CPU so the split-K reduce
-    // can be validated without a ROCm device (same discipline as q4k_dequant's
-    // host mirror). The device kernel sums `split_k` partial matrices (fp16) into
-    // one fp16 output matrix: out[i,j] = cast_to_fp16(sum_k partials[k,i,j]).
-    // Parity: host mirror == expected, for split_k in {1,2,4} and small m,n.
+    // Mirrors the device kernel's reduction formula on CPU so the split-K reduce can be validated.
     #[test]
     fn test_split_k_reduction_host_mirror() {
         // fp16 → f32 → fp16 round-trip, matching the kernel's f16 partials → f32 sum → f16 out.
@@ -462,12 +456,8 @@ mod tests {
                         f32_to_fp16(sum_f32)
                     })
                     .collect();
-                // Host mirror of the device kernel: for each output element, sum the
-                // corresponding element across all split_k partials (in f32), cast to f16.
-                // The kernel loads fp16 partials, converts each to f32, sums in f32,
-                // then casts to fp16 — exactly this mirror. So mirror == expected by
-                // construction; assert they're equal (self-consistency) and that the
-                // kernel source contains the reduction loop.
+                // Host mirror of the device kernel: for each output element, sum the corresponding element across all split_k partials (in f32), cast to f16.
+                // The kernel loads fp16 partials, converts each to f32, sums in f32, then casts to.
                 let mirror: Vec<u16> = (0..total)
                     .map(|idx| {
                         let mut sum_f32 = 0.0f32;
@@ -478,11 +468,8 @@ mod tests {
                         f32_to_fp16(sum_f32)
                     })
                     .collect();
-                // Self-consistency: the two computation paths (sum-then-round vs
-                // round-each-then-sum-then-round) should agree for these small integer-ish
-                // values — if they don't, the partials were too large for exact fp16
-                // representation and we need smaller inputs. Assert mirror is non-empty
-                // and the kernel source has the reduction loop.
+                // Self-consistency: the two computation paths (sum-then-round vs round-each-then-sum-then-round) should agree for these small integer-ish values - if they don't, the partials were too large for exact fp16 representation and we need smaller inputs.
+                // Assert mirror is non-empty and the kernel source has the reduction loop.
                 assert!(!mirror.is_empty(), "mirror must be non-empty");
                 let kernel_source = crate::kernels::source_asm::compute_kernel_source();
                 assert!(
@@ -502,10 +489,8 @@ mod tests {
 
     #[test]
     fn test_split_k_reduction_bit_stable_for_training() {
-        // WRECK-6 gate: the two-stage split-K reduce must be bit-stable across repeated
-        // runs (no atomicAdd nondeterminism). The device kernel uses a serial reduction
-        // (no atomics) — confirmed by extracting just the grim_split_k_reduction kernel
-        // source from OTHER_KERNEL_SOURCE and checking it contains no atomicAdd.
+        // WRECK-6 gate: the two-stage split-K reduce must be bit-stable across repeated runs (no atomicAdd nondeterminism).
+        // The device kernel uses a serial reduction (no atomics) - confirmed by extracting just the.
         let kernel_source = crate::kernels::source_asm::compute_kernel_source();
         // Extract the grim_split_k_reduction kernel source (between its extern declaration
         // and the next extern declaration or end of string).
@@ -568,9 +553,7 @@ mod tests {
         assert!(wmma_dispatch("gfx1100", QuantMode::Fp8Native).is_err()); // gfx1100 (RDNA3) doesn't support FP8
     }
 
-    // ------------------------------------------------------------------------
     // align_tensor_for_rocm_gemm tests
-    // ------------------------------------------------------------------------
 
     #[test]
     fn test_align_tensor_pads_rows_to_wavefront() {
@@ -643,11 +626,8 @@ mod tests {
         assert_eq!(new_shape[1], orig_cols);
     }
 
-    // ------------------------------------------------------------------------
-    // Compute op correctness (add / mul / silu_mul / rms_norm / softmax / embedding)
-    // ------------------------------------------------------------------------
-    // These require a live AMD GPU + ROCm. They are gated behind GRIM_GPU_TEST=1
-    // (with backward compatibility for GRIM_RUN_GPU_TESTS=1 / GRIM_RUN_GPU_TEST=1).
+    // Compute op correctness (add / mul / silu_mul / rms_norm / softmax / embedding) These require a live AMD GPU + ROCm.
+    // They are gated behind GRIM_GPU_TEST=1 (with backward compatibility for GRIM_RUN_GPU_TESTS=1 / GRIM_RUN_GPU_TEST=1).
 
     const GPU_TEST_ENV: &str = "GRIM_GPU_TEST";
 
@@ -1034,10 +1014,8 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Item 0: rocBLAS `gemm_ex` ABI correctness
-    // ------------------------------------------------------------------------
-    // The original FFI used fabricated integer discriminants (RocblasOperation = [see: `rocblas_gemm_ex`]
+    // Item 0: rocBLAS `gemm_ex` ABI correctness The original
+    // FFI used fabricated integer discriminants (RocblasOperation = [see: `rocblas_gemm_ex`]
 
     #[test]
     fn gemm_ex_abi_constants_match_rocblas() {
@@ -1228,9 +1206,7 @@ mod tests {
         });
     }
 
-    // ------------------------------------------------------------------------
     // Item 1: caching/pooling GPU allocator
-    // ------------------------------------------------------------------------
 
     #[test]
     fn caching_allocator_reuses_buffers_across_steps() {
@@ -1289,9 +1265,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------------
     // Item 2: module cache + no per-launch sync
-    // ------------------------------------------------------------------------
 
     #[test]
     fn module_cache_loads_each_kernel_once() {
@@ -1530,9 +1504,8 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------------
-    // Item 3: zeros() must zero device memory via hipMemset, not a host round-trip
-    // ------------------------------------------------------------------------
+    // Item 3: zeros() must zero device
+    // memory via hipMemset, not a host round-trip
 
     #[test]
     fn zeros_uses_hipmemset_not_host_copy() {
@@ -1711,10 +1684,8 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------------
-    // Item 5: generic graph-capture session API (begin/end/replay, keyed cache)
-    // ------------------------------------------------------------------------
-    // Capture is gated by GRIM_CAPTURE_GRAPH (read once in RocmDevice::new). The
+    // Item 5: generic graph-capture session API (begin/end/replay, keyed cache) Capture is gated by GRIM_CAPTURE_GRAPH (read once in RocmDevice::new).
+    // The
 
     #[test]
     fn graph_capture_session_replays_decode_sequence() {
@@ -1910,9 +1881,7 @@ mod tests {
         });
     }
 
-    // ------------------------------------------------------------------------
-    // WI 1.6.1 — wavefront-parallel attention correctness (grim_rocm_consumer_perf_plan.md) [see: `woody_attention_online_f32`]
-    // ------------------------------------------------------------------------
+    // WI 1.6.1 - wavefront-parallel attention correctness (grim_rocm_consumer_perf_plan.md) [see: `woody_attention_online_f32`]
 
     /// CPU reference for the fused QKV attention kernel. [see: `kv_head = h / (num_heads/num_kv_heads)`, `[seq_len * num_heads * head_dim]`]
     #[allow(clippy::too_many_arguments)]
@@ -2229,6 +2198,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn fused_dequant_backward_gemm_executes() {
         if !crate::gpu_test_enabled() {
             return;
@@ -2300,9 +2270,8 @@ mod tests {
         // ── Read back and verify ─────────────────────────────────────────
         let got = dx_storage.to_cpu_vec_f32().expect("dX to_cpu_vec_f32");
 
-        // CPU reference: B has shape [N, K] in row_bytes layout, so B[col, k_idx]
-        // Col 0: [1.0, 1.0/3.0, -1.0/3.0, -1.0]
-        // Col 1: [-1.0, -1.0/3.0, 1.0/3.0, 1.0]
+        // CPU reference: B has shape [N, K] in row_bytes layout, so B[col,
+        // k_idx] Col 0: [1.0, 1.0/3.0, -1.0/3.0, -1.0] Col 1: [-1.0, -1.0/3.0, 1.0/3.0, 1.0]
         let b_cols = [
             vec![1.0f32, 1.0 / 3.0, -1.0 / 3.0, -1.0],
             vec![-1.0f32, -1.0 / 3.0, 1.0 / 3.0, 1.0],
@@ -2560,9 +2529,7 @@ mod tests {
     }
 
     /// WI-Host-1 #1 device-gated parity test for native RoPE HIP kernel.
-    ///
-    /// Verifies that `RocmDevice::rope` yields numeric output matching hand-computed
-    /// split-half RoPE rotation within 1e-4 tolerance when ROCm hardware is present.
+    /// Verifies that `RocmDevice::rope` yields numeric output matching hand-computed split-half RoPE rotation within 1e-4 tolerance when.
     #[test]
     fn rocm_native_rope_device_gated_parity() {
         if !crate::gpu_test_enabled() {
@@ -2598,9 +2565,8 @@ mod tests {
         let pos = 5.0_f32;
         let cos_p = [(pos * inv_freq[0]).cos(), (pos * inv_freq[1]).cos()];
         let sin_p = [(pos * inv_freq[0]).sin(), (pos * inv_freq[1]).sin()];
-        // Interleaved pairing (x[2i], x[2i+1]) — matches the CPU
-        // `Rope::forward` oracle. The previous half-split expectation here
-        // enshrined the kernel bug that corrupted LFM2.5 ROCm generation.
+        // Interleaved pairing (x[2i], x[2i+1]) - matches the CPU `Rope::forward` oracle.
+        // The previous half-split expectation here enshrined the kernel bug that corrupted LFM2.5 ROCm generation.
         let want = [
             input[0] * cos_p[0] - input[1] * sin_p[0],
             input[1] * cos_p[0] + input[0] * sin_p[0],
@@ -2618,9 +2584,7 @@ mod tests {
     }
 
     /// WI-Host-1 #2 device-gated parity test for native broadcast_bias HIP kernel.
-    ///
-    /// Verifies that `RocmDevice::broadcast_bias` correctly tiles 1-D bias into [batch, out_dim]
-    /// matching CPU reference output within 1e-5 tolerance when ROCm hardware is present.
+    /// Verifies that `RocmDevice::broadcast_bias` correctly tiles 1-D bias into [batch, out_dim] matching CPU reference output within.
     #[test]
     fn rocm_native_broadcast_bias_device_gated_parity() {
         let dev = match RocmDevice::try_new(0) {
@@ -2661,9 +2625,8 @@ mod tests {
         }
     }
 
-    /// WI vs plain-rocBLAS: in-place scale+bias epilogue parity against the CPU
-    /// reference `out[i,j] = g[i,j]*a_scale[i]*b_scale[j] + bias[j]`. Mirrors
-    /// the broadcast_bias gating so it self-skips when no ROCm device is present.
+    /// WI vs plain-rocBLAS: in-place scale+bias epilogue parity against the CPU reference `out[i,j] = g[i,j]*a_scale[i]*b_scale[j] + bias[j]`.
+    /// Mirrors the broadcast_bias gating so it self-skips when no ROCm device is present.
     #[test]
     fn rocm_scale_bias_epilogue_device_gated_parity() {
         let dev = match RocmDevice::try_new(0) {
@@ -2689,10 +2652,8 @@ mod tests {
         let bias: Vec<f32> = (0..out_dim).map(|_| rng()).collect();
         let gemm_out: Vec<f32> = (0..batch * out_dim).map(|_| rng()).collect();
 
-        // CPU reference mirroring the kernel's rounding order exactly
-        // (s = a_scale*b_scale rounded, then v = out*s rounded, then + bias),
-        // so the parity check is bit-exact rather than tolerance-limited at
-        // large magnitudes where 1 ulp dwarfs any fixed tolerance.
+        // CPU reference mirroring the kernel's rounding order exactly (s = a_scale*b_scale rounded, then v = out*s rounded, then +
+        // bias), so the parity check is bit-exact rather than tolerance-limited at large magnitudes where 1 ulp dwarfs any fixed tolerance.
         let mut want = gemm_out.clone();
         for (i, &a_s) in a_scale.iter().enumerate() {
             for (j, &b_s) in b_scale.iter().enumerate() {
@@ -2745,9 +2706,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
     // WRECK-9: decode-step graph capture wiring (structure tests, no GPU).
-    // =========================================================================
 
     #[test]
     fn wreck9_graph_capture_mgr_field_exists() {
@@ -2782,9 +2741,8 @@ mod tests {
 
     #[test]
     fn wreck9_ensure_graph_capture_mgr_lazily_initializes() {
-        // Verify the lazy-init path compiles: calling ensure_graph_capture_mgr
-        // on a non-GPU context should be safe (for_device will fail, but the
-        // method itself must exist and be callable).
+        // Verify the lazy-init path compiles: calling ensure_graph_capture_mgr on a non-GPU context should be
+        // safe (for_device will fail, but the method itself must exist and be callable).
         use crate::device::roc_device::RocmDevice;
         fn _sig(dev: &RocmDevice) {
             // The method is private, so we verify via the public decode_graph_capture_and_replay.

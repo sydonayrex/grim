@@ -1,7 +1,5 @@
 //! Speculative decoding loop tailored for Mamba sequence/SSM architectures.
-//!
-//! Handles saving, restoring, and rolling back internal Mamba/SSM state vectors
-//! (SSM states and convolution state FIFOs) upon draft token rejection.
+//! Handles saving, restoring, and rolling back internal Mamba/SSM state vectors (SSM states and convolution state.
 
 use grim_core::error::Result;
 

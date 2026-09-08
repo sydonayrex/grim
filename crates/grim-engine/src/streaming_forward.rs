@@ -1,8 +1,5 @@
 //! Streaming block-wise forward execution with gradient checkpointing (WI-T2).
-//!
-//! Provides `StreamingBlockForward` that reads quantized transformer weights
-//! lazily block-by-block from a `TensorProvider`, runs fused forward operations,
-//! and manages activation recomputation buffers (`GradientCheckpointBuffer`).
+//! Provides `StreamingBlockForward` that reads quantized transformer weights lazily block-by-block from a `TensorProvider`, runs fused forward.
 
 use crate::rope_scaling::{RopeScalingMethod, scaling_base};
 use grim_autograd::AutogradScope;
@@ -11,11 +8,11 @@ use grim_core::error::{Error, Result};
 use grim_models_transformer::{LlamaBlock, LlamaConfig};
 use grim_nn::WeightSource;
 use grim_nn::modules::{pick_device_for_storage_device, pick_device_for_tensor};
+use grim_tensor::MemoryOps;
 use grim_tensor::{DType, Device, Shape, Tensor, TensorProvider};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
-use grim_tensor::{MemoryOps};
 
 /// Saved activation checkpoint for a transformer block.
 #[derive(Debug, Clone)]
@@ -81,15 +78,7 @@ impl GradientCheckpointBuffer {
 }
 
 /// Transfer `x` to `target_device`, returning a tensor owned by that device.
-///
-/// ROCm→ROCm moves use a true device-to-device copy (peer-routed through
-/// `RocmDevice::copy_via_route`), so activations never detour through host
-/// memory. CUDA↔CUDA moves within the same PCI domain would also support
-/// peer memcpy via `cuMemcpyPeer` but is not yet wired. Any other cross-backend
-/// move (different backends, or different PCI domains) stages through host memory
-/// since cross-device P2P transfer requires backend-specific peer support that
-/// is not universally available (e.g. ROCm↔CUDA GPUDirect requires both drivers
-/// and hardware support).
+/// ROCm→ROCm moves use a true device-to-device copy (peer-routed through `RocmDevice::copy_via_route`), so activations never detour through.
 fn transfer_to_device(x: &Tensor, target_device: &Device) -> Result<Tensor> {
     if x.device() == target_device {
         return Ok(x.clone());
@@ -128,9 +117,20 @@ fn transfer_to_device(x: &Tensor, target_device: &Device) -> Result<Tensor> {
         if src_ord != dst_ord {
             if let Ok(dev) = grim_backend_cuda::CudaDevice::new(*dst_ord) {
                 if let Ok(dst_storage) = dev.alloc_storage(x.shape(), DType::F32) {
-                    if let (Some(src_ptr), Some(dst_ptr)) = (x.storage().device_ptr(), dst_storage.device_ptr()) {
+                    if let (Some(src_ptr), Some(dst_ptr)) =
+                        (x.storage().device_ptr(), dst_storage.device_ptr())
+                    {
                         let bytes = x.shape().elem_count() * std::mem::size_of::<f32>();
-                        if dev.copy_via_route(*src_ord as i32, *dst_ord as i32, src_ptr as *const c_void, dst_ptr as *mut c_void, bytes).is_ok() {
+                        if dev
+                            .copy_via_route(
+                                *src_ord as i32,
+                                *dst_ord as i32,
+                                src_ptr as *const c_void,
+                                dst_ptr as *mut c_void,
+                                bytes,
+                            )
+                            .is_ok()
+                        {
                             return Ok(Tensor::new(
                                 Arc::from(dst_storage),
                                 x.shape().clone(),
@@ -158,20 +158,12 @@ fn transfer_to_device(x: &Tensor, target_device: &Device) -> Result<Tensor> {
 }
 
 /// SCYTHE-2 placement routing attached to a [`StreamingBlockForward`] (WI-INF3).
-///
-/// When present, every `forward_block` consults the controller with the real
-/// per-call `layer_idx` and activation shape — the direct analog of the fix
-/// landed in `grim-garage::run_rank_sft_forward` (no synthetic keys) — and
-/// executes the block on the controller-chosen device. Placement changes which
-/// device runs the block, never the math: every rank runs identical weights and
-/// kernels, so numerics are invariant under re-placement (pinned by the parity
-/// gate test).
+/// When present, every `forward_block` consults the controller with the real per-call `layer_idx` and activation shape.
 pub struct ScytheRoute {
     /// The online placement router. Shared ownership so the engine can keep
     /// warming/observing the same controller it handed off.
     pub ctrl: std::sync::Arc<std::sync::Mutex<crate::scythe2::C2plrController>>,
-    /// Live capability source; refreshed only when the capability epoch moves,
-    /// so the ~50 ns decode hit path never pays for a topology probe.
+    /// Live capability source; refreshed only when the capability epoch moves, so the ~50 ns decode hit path never pays for a topology probe.
     /// `None` in CPU-only harnesses, which seed `caps`/`links` directly.
     pub profiler: Option<Arc<grim_backend_rocm::CapabilityProfiler>>,
     /// Capability snapshot used when `profiler` is `None` (and the seed value
@@ -181,17 +173,14 @@ pub struct ScytheRoute {
     pub links: Vec<grim_tensor::backend::ScytheLink>,
     /// Epoch the `caps`/`links` snapshot was taken at (`CAPABILITY_EPOCH`).
     pub caps_epoch: u32,
-    /// Rank → execution device. The engine maps rank → `Device::Rocm(rank)`;
-    /// CPU-only harnesses map every rank to `Device::Cpu`, which is what lets
-    /// the parity gate prove numerics-invariance without GPUs.
+    /// Rank → execution device. The engine maps rank → `Device::Rocm(rank)`; CPU-only harnesses map every
+    /// rank to `Device::Cpu`, which is what lets the parity gate prove numerics-invariance without GPUs.
     pub device_for_rank: Arc<dyn Fn(usize) -> Device + Send + Sync>,
 }
 
 impl ScytheRoute {
-    /// Refresh `caps`/`links` iff the capability epoch moved since the snapshot
-    /// was taken. Topology probes (`link_matrix`) cost host µs-to-ms per pair,
-    /// so they must never run per layer call — only on epoch bumps (~100 ms
-    /// cadence or GPU-leave), where they amortize against a full cache miss.
+    /// Refresh `caps`/`links` iff the capability epoch moved since the snapshot was taken.
+    /// Topology probes (`link_matrix`) cost host µs-to-ms per pair, so they must never run per layer.
     fn refresh_if_stale(&mut self) {
         let epoch = grim_backend_rocm::current_epoch();
         if !self.caps.is_empty() && self.caps_epoch == epoch {
@@ -218,10 +207,8 @@ pub struct StreamingBlockForward {
     pub hidden_size: usize,
     pub checkpoint_buffer: GradientCheckpointBuffer,
     pub rope_scaling: Option<RopeScalingMethod>,
-    /// Session-lifetime cache of materialized `LlamaBlock`s, keyed by
-    /// `(layer_idx, device)` so block weights are loaded/uploaded once and
-    /// reused across forward and recompute passes. Cleared explicitly via
-    /// [`Self::clear_block_cache`] when the model or configuration changes.
+    /// Session-lifetime cache of materialized `LlamaBlock`s, keyed by `(layer_idx, device)` so block weights are loaded/uploaded once and reused across forward and recompute passes.
+    /// Cleared explicitly via [`Self::clear_block_cache`] when the model or configuration changes.
     block_cache: std::sync::Mutex<HashMap<(usize, Device), LlamaBlock>>,
     /// Optional SCYTHE-2 routing (WI-INF3). `None` keeps blocks on the
     /// incoming tensor's device — unchanged behavior and the default.
@@ -252,11 +239,8 @@ impl StreamingBlockForward {
         self.scythe_route = None;
     }
 
-    /// WI-INF3 decision step: consult the controller with the real layer index
-    /// and activation shape, then move `x` to the chosen rank's device.
-    ///
-    /// Cache-hit path ~50 ns/layer; miss path ~2 µs/layer (verified host-side
-    /// bounding via WI-INF4 benchmark — see `benches/scythe2_decide_miss.rs`).
+    /// WI-INF3 decision step: consult the controller with the real layer index and activation shape, then move `x` to the chosen rank's device.
+    /// Cache-hit path ~50 ns/layer; miss path ~2 µs/layer (verified host-side bounding via WI-INF4 benchmark -.
     fn route_for_execution(&mut self, layer_idx: usize, x: &Tensor) -> Result<Tensor> {
         let Some(route) = self.scythe_route.as_mut() else {
             return Ok(x.clone());
@@ -268,9 +252,8 @@ impl StreamingBlockForward {
             let mut ctrl = route.ctrl.lock().unwrap_or_else(|e| e.into_inner());
             ctrl.decide(layer_idx as u32, shape, &route.caps, &route.links, epoch)
         };
-        // Primary owner = the rank holding the largest partition share; the
-        // whole block executes there. Any rank yields identical numerics —
-        // only load balance differs.
+        // Primary owner = the rank holding the largest partition share; the whole block executes there.
+        // Any rank yields identical numerics - only load balance differs.
         let target_rank = placement
             .partition
             .iter()
@@ -292,11 +275,8 @@ impl StreamingBlockForward {
             .clear();
     }
 
-    /// F2 (full-parameter write-back): copy stepped base weights from the
-    /// autograd registry into the cached blocks, so every subsequent forward
-    /// pass (which clones from this cache) trains on the updated weights.
-    /// CPU-resident blocks only — device-resident weight mirrors land with
-    /// the dirty-block upload work.
+    /// F2 (full-parameter write-back): copy stepped base weights from the autograd registry into the cached blocks, so every subsequent forward pass (which clones from this cache) trains on the updated weights.
+    /// CPU-resident blocks only - device-resident weight mirrors land with the dirty-block upload work.
     pub fn overwrite_base_weights(&self, reg: &grim_autograd::AutogradRegistry) -> Result<()> {
         use grim_autograd::{LoRAInjectionPoint, ParamId};
         let mut cache = self.block_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -365,20 +345,7 @@ impl StreamingBlockForward {
     }
 
     /// Run streaming block-wise forward pass for `layer_idx`.
-    ///
-    /// Reads layer input `x`, records activation checkpoint in `checkpoint_buffer`,
-    /// then loads block weights lazily from `provider` and runs real
-    /// transformer block math (RMSNorm → GQA attention → residual →
-    /// RMSNorm → SwiGLU FFN → residual) via `LlamaBlock`.
-    ///
-    /// `positions` carries RoPE position ids for this block (required for correct
-    /// positional encoding in loss-eval / reference-model paths). When `None`,
-    /// an empty slice is passed (RoPE not applied), matching prior behavior.
-    /// Run streaming forward block for `layer_idx` targeting a SCYTHE-2 assigned GPU device.
-    ///
-    /// If `target_device` differs from `x.device()`, transfers activation `x` to
-    /// `target_device` before running block forward. ROCm→ROCm moves use a true
-    /// device-to-device copy (no host round-trip); other pairs stage through host.
+    /// Reads layer input `x`, records activation checkpoint in `checkpoint_buffer`, then loads block weights lazily from.
     pub fn forward_block_on_device(
         &mut self,
         provider: &dyn TensorProvider,
@@ -440,10 +407,7 @@ impl StreamingBlockForward {
     }
 
     /// Run streaming block-wise forward pass for `layer_idx` with autograd tape recording.
-    ///
-    /// Loads block weights lazily from `provider`, executes pre-norm attention and SwiGLU FFN,
-    /// applies enabled LoRA adapters via `apply_and_record_lora`, and records `LoRAApply` and `Add`
-    /// entries on `tape`. Returns `(output_tensor_id, output_tensor)`.
+    /// Loads block weights lazily from `provider`, executes pre-norm attention and SwiGLU FFN, applies enabled LoRA.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_block_with_autograd(
         &mut self,
@@ -574,12 +538,7 @@ impl StreamingBlockForward {
         )?;
 
         // Apply RoPE + qkv_attention via placement-aware BackendDevice.
-        // Q/K arrive as [total_tokens, num_head_dims] (flat layout
-        // (i*num_heads + h)*head_dim, which is exactly what the attention
-        // kernel's q_offset/k_offset expect). RoPE operates on (B, S, D=head_dim),
-        // so we view the same storage as [1, total_tokens*num_heads, head_dim]
-        // with the token position repeated per head — a pure shape change, no
-        // data movement. V is never rotated.
+        // Q/K arrive as [total_tokens, num_head_dims] (flat layout (i*num_heads + h)*head_dim, which is exactly what the.
         let num_head_dims = cfg.num_heads * cfg.head_dim;
         let total_tokens = q.shape().elem_count() / num_head_dims;
 
@@ -606,14 +565,8 @@ impl StreamingBlockForward {
         let k_shape = Shape::new(vec![1, total_tokens * cfg.num_kv_heads, cfg.head_dim]);
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
 
-        // Reshape Q/K to 3D [1, total_tokens*num_heads, head_dim] for the
-        // `rope` call below. The data is already laid out as
-        // (i*num_heads + h)*head_dim, and rope() only reads the storage's
-        // device pointer plus the explicitly-passed shape — so for
-        // device-resident Q/K we pass the original storage straight through
-        // with the 3-D shape (zero copies). The previous form did
-        // to_vec_f32 + from_cpu: a full D2H+H2D round trip per tensor per
-        // layer per token. CPU tensors still take the upload path.
+        // Reshape Q/K to 3D [1, total_tokens*num_heads, head_dim] for the `rope` call below.
+        // The data is already laid out as (i*num_heads + h)*head_dim, and rope() only reads the.
         let q_up: Option<Box<dyn grim_tensor::BackendStorage>> = if q.device().is_cpu() {
             Some(dev.from_cpu(&q.to_vec_f32()?, &q_shape, DType::F32)?)
         } else {
@@ -1013,13 +966,7 @@ mod tests {
     }
 
     /// WI-INF3 Gate: placement changes device routing, never numerics.
-    ///
-    /// The route is attached over an asymmetric 2-GPU topology with every
-    /// rank mapped back to `Device::Cpu`, so the routed block must produce
-    /// byte-identical output to the plain forward no matter which rank the
-    /// controller picks — the property "placement moves work, never math".
-    /// Also pins the WI-INF5 first-cut fallback: the untrained (all-zero) MLP
-    /// must steer the block to the faster card (rank 1), not sticky rank 0.
+    /// The route is attached over an asymmetric 2-GPU topology with every rank mapped back to.
     #[test]
     fn scythe_route_parity_and_untrained_fallback_gate() {
         use grim_tensor::backend::{GpuCapability, ScytheLink};

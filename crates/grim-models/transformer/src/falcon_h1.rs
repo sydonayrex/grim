@@ -1,18 +1,5 @@
 //! Falcon-H1: hybrid Mamba-2 + GQA attention + SwiGLU FFN.
-//!
-//! Self-contained CPU implementation. Follows `llama.cpp` reference:
-//! - `src/models/mamba-base.cpp` (build_mamba2_layer, lines 193–295)
-//! - `src/models/falcon-h1.cpp` (FalconH1 model, lines 593–700)
-//!
-//! Differences from a plain transformer:
-//! - `token_embd` is reused as the LM head (tied output).
-//! - `ffn_norm.weight` has no `.weight` suffix in the GGUF — loaded as a bare
-//!   tensor and wrapped in `RmsNorm` directly.
-//! - RoPE pairing is NEOX (rotates `(i, i+half)` pairs), per `Rope::forward`
-//!   in `grim-nn`.
-//!
-//! Pattern mirrors `lfm2.rs`: `FalconH1Config: ModelConfig`, `FalconH1Model:
-//! Model + CausalLm`. The loader constructs the type via `FalconH1Model::load`.
+//! Self-contained CPU implementation.
 use grim_backend_cpu::cpu_tensor;
 use grim_core::Result;
 use grim_core::model::{CausalLm, ModalityHint, Model, ModelConfig};
@@ -23,8 +10,7 @@ use grim_nn::modules::{
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-/// Falcon-H1 model config — what the loader passes in.
-///
+/// Falcon-H1 model config - what the loader passes in.
 /// Derived from the GGUF metadata of `NeVe-Cascade-S-90M-Q8_0.gguf`.
 #[derive(Clone, Debug)]
 pub struct FalconH1Config {
@@ -78,10 +64,8 @@ pub struct FalconH1LayerCache {
     pub ssm_state: Vec<f32>,  // d_state * ssm_d_inner
     pub k_cache: Vec<f32>,    // past_tokens * (num_kv_heads * head_dim)
     pub v_cache: Vec<f32>,    // past_tokens * (num_kv_heads * head_dim)
-    /// Device-resident key arena (shape `[cap, num_kv_heads * head_dim]`),
-    /// valid rows `0..current_pos`. Grown geometrically by
-    /// `block.rs::cache_append_kv`; host mirrors below only advance on the
-    /// host fallback path.
+    /// Device-resident key arena (shape `[cap, num_kv_heads * head_dim]`), valid rows `0..current_pos`.
+    /// Grown geometrically by `block.rs::cache_append_kv`; host mirrors below only advance on the host fallback path.
     pub k_device: Option<Box<dyn grim_tensor::BackendStorage>>,
     /// Device-resident value arena, same layout as `k_device`.
     pub v_device: Option<Box<dyn grim_tensor::BackendStorage>>,
@@ -166,10 +150,8 @@ impl FalconH1Model {
     }
 }
 
-/// Load one block. GGUF tensor names inside `blk.{i}.` are:
-/// `attn_norm.weight`, `ffn_norm` (bare weight, no `.weight` suffix),
-/// `attn_q/wk/wv/wo`, `ffn_gate/up/down`, `ssm_in/out.weight`,
-/// `ssm_conv1d.{weight,bias}`, `ssm_a`, `ssm_d`, `ssm_dt.bias`.
+/// Load one block. GGUF tensor names inside `blk.{i}.` are: `attn_norm.weight`, `ffn_norm`
+/// (bare weight, no `.weight` suffix), `attn_q/wk/wv/wo`, `ffn_gate/up/down`, `ssm_in/out.weight`, `ssm_conv1d.{weight,bias}`, `ssm_a`, `ssm_d`, `ssm_dt.bias`.
 fn load_block(ws: &WeightSource<'_>, cfg: &FalconH1Config) -> Result<FalconH1Block> {
     let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
     let wq = Linear::load(
@@ -288,10 +270,8 @@ impl CausalLm for FalconH1Model {
         positions: &Tensor,
         _adapters: &[grim_core::model::AdapterHandle],
     ) -> Result<Tensor> {
-        // Native integer readback: U32 passes through, I64 truncates, F32
-        // casts. Avoids forcing integer tensors through an f32 round-trip
-        // (which would be garbage on backends with genuinely-integer
-        // storage layouts, e.g. Vulkan U32 buffers).
+        // Native integer readback: U32 passes through, I64 truncates, F32 casts.
+        // Avoids forcing integer tensors through an f32 round-trip (which would be garbage on backends with.
         let ids: Vec<u32> = input_ids.to_vec_u32()?;
         let positions_vec: Vec<u32> = positions.to_vec_u32()?;
         let caches: &mut Vec<FalconH1LayerCache> = match session
@@ -311,9 +291,8 @@ impl CausalLm for FalconH1Model {
             }
         };
         let logits = self.forward_cpu(caches, &ids, &positions_vec)?;
-        // Audit fix (grim-models): FalconH1 never advanced the session
-        // position — the engine's decode start_pos stayed at 0, so every
-        // decode token ran at RoPE position 0 while its KV cache grew.
+        // Audit fix (grim-models): FalconH1 never advanced the session position - the engine's decode start_pos stayed
+        // at 0, so every decode token ran at RoPE position 0 while its KV cache grew.
         session.advance_pos(ids.len());
         Ok(logits)
     }
@@ -373,8 +352,7 @@ fn forward_block_cpu(
     let v_t =
         b.wv.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?;
 
-    let attn_tensor =
-        gqa_attn_with_cache(b, cfg, &q_t, &k_t, &v_t, positions, seq_len, cache)?;
+    let attn_tensor = gqa_attn_with_cache(b, cfg, &q_t, &k_t, &v_t, positions, seq_len, cache)?;
     let attn_out = attn_tensor.to_vec_f32()?;
     let ssm_out = mamba2_layer_cpu(b, cfg, &normed, cache)?;
 
@@ -413,12 +391,9 @@ fn forward_block_cpu(
     Ok(out)
 }
 
-/// GQA attention with RoPE and a growing KV cache. Q/K/V arrive as device
-/// tensors from `wq`/`wk`/`wv` and never round-trip through the host on the
-/// primary path: RoPE stays on-device, new K/V rows are appended to the
-/// device arena D2D (`block.rs::cache_append_kv`), and the fused attention
-/// kernel reads the arena. Host mirrors + host attention remain the
-/// `Unimplemented` fallback for backends without the device primitives.
+/// GQA attention with RoPE and a growing KV cache.
+/// Q/K/V arrive as device tensors from `wq`/`wk`/`wv` and never round-trip through the host on the.
+#[allow(clippy::too_many_arguments)]
 fn gqa_attn_with_cache(
     b: &FalconH1Block,
     cfg: &FalconH1Config,
@@ -435,14 +410,8 @@ fn gqa_attn_with_cache(
     let device = b.attn_norm.weight.device();
 
     // RoPE via the Rope module (NEOX pairing, reshaped to (1, S*heads, head_dim)).
-    let q_3d = crate::block::reshaped_view(
-        q_t,
-        &Shape::new(vec![1, seq_len * n_heads, h_dim]),
-    )?;
-    let k_3d = crate::block::reshaped_view(
-        k_t,
-        &Shape::new(vec![1, seq_len * n_kv, h_dim]),
-    )?;
+    let q_3d = crate::block::reshaped_view(q_t, &Shape::new(vec![1, seq_len * n_heads, h_dim]))?;
+    let k_3d = crate::block::reshaped_view(k_t, &Shape::new(vec![1, seq_len * n_kv, h_dim]))?;
     let q_roped = b
         .rope
         .forward(&q_3d, &expand_positions(positions, n_heads))?;
@@ -483,11 +452,8 @@ fn gqa_attn_with_cache(
                     grim_tensor::QuantProvenance::default(),
                     device.clone(),
                 )),
-                // Arena already holds this step's rows — fetch them to host
-                // once for the scalar kernel instead of re-extending mirrors.
-                // The arena buffer is capacity-sized; only `total` rows are
-                // valid, and the scalar kernel derives kv_len from the vec
-                // length — truncate.
+                // Arena already holds this step's rows - fetch them to host once for the scalar kernel instead of re-extending mirrors.
+                // The arena buffer is capacity-sized; only `total` rows are valid, and the scalar kernel derives.
                 Err(_) => {
                     let mut hk = k_st.to_cpu_vec_f32()?;
                     hk.truncate(total * row_elems);
@@ -536,9 +502,7 @@ fn gqa_attn_with_cache(
 }
 
 /// Faithful Mamba-2 selective scan forward.
-///
-/// h_normed: `[seq_len, hidden_size]` (768-wide ssm_d_inner, but input here is
-/// `hidden_size=512` from attn_norm) → `ssm_in.forward` projects 512 → 1688.
+/// h_normed: `[seq_len, hidden_size]` (768-wide ssm_d_inner, but input here is `hidden_size=512` from attn_norm) → `ssm_in.forward` projects.
 fn mamba2_layer_cpu(
     b: &FalconH1Block,
     cfg: &FalconH1Config,
@@ -549,7 +513,9 @@ fn mamba2_layer_cpu(
     let device = b.attn_norm.weight.device();
 
     let in_dim = cfg.ssm_in_dim();
-    let ssm_t = b.ssm_in.forward(&wrap(h_normed, seq_len, cfg.hidden_size, device)?)?;
+    let ssm_t = b
+        .ssm_in
+        .forward(&wrap(h_normed, seq_len, cfg.hidden_size, device)?)?;
     let ssm = ssm_t.to_vec_f32()?;
 
     let conv_dim = cfg.ssm_conv_dim();
@@ -558,9 +524,8 @@ fn mamba2_layer_cpu(
     let n_ssm_head = cfg.ssm_dt_rank;
     let head_dim_ssm = cfg.ssm_d_inner / n_ssm_head;
 
-    // xBC rows (post-conv + silu), width conv_dim. Decode (seq == 1) runs the
-    // `short_conv1d_causal_step` kernel on device; prefill keeps the host
-    // loop (per-token kernel launches lose at prefill lengths).
+    // xBC rows (post-conv + silu), width conv_dim.
+    // Decode (seq == 1) runs the `short_conv1d_causal_step` kernel on device; prefill keeps the host loop.
     let mut xbc = vec![0.0f32; seq_len * conv_dim];
     let mut conv_done = false;
     if seq_len == 1 {
@@ -607,14 +572,11 @@ fn mamba2_layer_cpu(
     let dt_src = cfg.ssm_d_inner + conv_dim;
     let mut y = vec![0.0f32; seq_len * cfg.ssm_d_inner];
 
-    // WI-D dispatch: decode-step scan via `selective_scan_headed` when the
-    // backend wires it. Until then every backend hits Unimplemented and the
-    // host loop below runs — the always-correct fallback.
+    // WI-D dispatch: decode-step scan via `selective_scan_headed` when the backend wires it.
+    // Until then every backend hits Unimplemented and the host loop below runs - the always-correct.
     let mut scan_done = false;
     if seq_len == 1 {
-        match ssm_scan_step_device(
-            cfg, &xbc, &ssm, &a_vec, &d_vec, &dt_b, cache, device,
-        ) {
+        match ssm_scan_step_device(cfg, &xbc, &ssm, &a_vec, &d_vec, &dt_b, cache, device) {
             Ok(Some(y_row)) => {
                 y[..cfg.ssm_d_inner].copy_from_slice(&y_row);
                 scan_done = true;
@@ -667,12 +629,7 @@ fn mamba2_layer_cpu(
 }
 
 /// WI-D dispatch: one decode-step scan via `BackendDevice::selective_scan_headed`.
-///
-/// Builds the kernel inputs from the host row slices (x / B / C from the
-/// post-conv xBC row, dt post-softplus), uploads state, and syncs the updated
-/// state back into the host mirror. Returns `Ok(None)` when the backend does
-/// not implement the kernel yet — every backend today — so the host loop
-/// stays the single source of truth until real kernel impls land.
+/// Builds the kernel inputs from the host row slices (x / B / C from.
 #[allow(clippy::too_many_arguments)]
 fn ssm_scan_step_device(
     cfg: &FalconH1Config,
@@ -752,15 +709,7 @@ fn ssm_scan_step_device(
 }
 
 /// Decode-step conv via the `short_conv1d_causal_step` kernel.
-///
-/// Slices the current xBC row off the `ssm_in` output on device (columns
-/// `[d_inner, d_inner+conv_dim)` are one contiguous flat range), convolves
-/// against the device weight/bias, and returns the post-silu row. The scan
-/// itself stays host-side at this stage, so the result crosses D2H once.
-///
-/// Layout note: `cache.conv_state` is time-major (`[t][d]`); the kernel wants
-/// channel-major (`[d][t]`) — rearranged per call (host data, no round-trip).
-/// The host mirror still slides here; the device arena lands in WI-C.
+/// Slices the current xBC row off the `ssm_in` output on device (columns `[d_inner, d_inner+conv_dim)` are.
 enum ConvStepError {
     Unimplemented,
     Fatal(grim_core::Error),
@@ -781,13 +730,7 @@ fn ssm_conv_step_device(
     let mut inner = || -> Result<Vec<f32>> {
         let ssm_st = ssm_t.storage().as_ref();
         let xbc_st = dev.alloc_storage(&Shape::new(vec![conv_dim]), DType::F32)?;
-        dev.copy_slice_range(
-            xbc_st.as_ref(),
-            0,
-            ssm_st,
-            cfg.ssm_d_inner,
-            conv_dim,
-        )?;
+        dev.copy_slice_range(xbc_st.as_ref(), 0, ssm_st, cfg.ssm_d_inner, conv_dim)?;
 
         let mut state_cm = vec![0.0f32; kc * conv_dim];
         for t in 0..kc {
@@ -795,8 +738,7 @@ fn ssm_conv_step_device(
                 state_cm[d * kc + t] = cache.conv_state[t * conv_dim + d];
             }
         }
-        let state_st =
-            dev.from_cpu(&state_cm, &Shape::new(vec![kc * conv_dim]), DType::F32)?;
+        let state_st = dev.from_cpu(&state_cm, &Shape::new(vec![kc * conv_dim]), DType::F32)?;
 
         let (out_st, _h) = dev.short_conv1d_causal_step(
             xbc_st.as_ref(),
@@ -885,16 +827,19 @@ mod tests {
             ((self.0 >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
         }
         fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
-            (0..n).map(|i| self.next_f32() * scale + i as f32 * 1e-3).collect()
+            (0..n)
+                .map(|i| self.next_f32() * scale + i as f32 * 1e-3)
+                .collect()
         }
     }
 
     struct MemProvider(HashMap<String, (Vec<u8>, Vec<usize>)>);
     impl grim_tensor::TensorProvider for MemProvider {
         fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
-            let (bytes, shape) = self.0.get(name).cloned().ok_or_else(|| {
-                grim_tensor::error::Error::Backend(format!("missing: {name}"))
-            })?;
+            let (bytes, shape) =
+                self.0.get(name).cloned().ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!("missing: {name}"))
+                })?;
             Ok(RawTensor {
                 bytes,
                 shape,
@@ -903,9 +848,10 @@ mod tests {
             })
         }
         fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
-            let (_, shape) = self.0.get(name).cloned().ok_or_else(|| {
-                grim_tensor::error::Error::Backend(format!("missing: {name}"))
-            })?;
+            let (_, shape) =
+                self.0.get(name).cloned().ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!("missing: {name}"))
+                })?;
             Ok(TensorMeta {
                 dtype: DType::F32,
                 provenance: grim_tensor::QuantProvenance::GrimNative,
@@ -951,17 +897,52 @@ mod tests {
         };
         put(&mut m, "attn_norm.weight", vec![hs], rng);
         put(&mut m, "ffn_norm", vec![hs], rng);
-        put(&mut m, "attn_q.weight", vec![cfg.num_heads * cfg.head_dim, hs], rng);
-        put(&mut m, "attn_k.weight", vec![cfg.num_kv_heads * cfg.head_dim, hs], rng);
-        put(&mut m, "attn_v.weight", vec![cfg.num_kv_heads * cfg.head_dim, hs], rng);
+        put(
+            &mut m,
+            "attn_q.weight",
+            vec![cfg.num_heads * cfg.head_dim, hs],
+            rng,
+        );
+        put(
+            &mut m,
+            "attn_k.weight",
+            vec![cfg.num_kv_heads * cfg.head_dim, hs],
+            rng,
+        );
+        put(
+            &mut m,
+            "attn_v.weight",
+            vec![cfg.num_kv_heads * cfg.head_dim, hs],
+            rng,
+        );
         put(&mut m, "attn_output.weight", vec![hs, hs], rng);
-        put(&mut m, "ffn_gate.weight", vec![cfg.intermediate_size, hs], rng);
-        put(&mut m, "ffn_up.weight", vec![cfg.intermediate_size, hs], rng);
-        put(&mut m, "ffn_down.weight", vec![hs, cfg.intermediate_size], rng);
+        put(
+            &mut m,
+            "ffn_gate.weight",
+            vec![cfg.intermediate_size, hs],
+            rng,
+        );
+        put(
+            &mut m,
+            "ffn_up.weight",
+            vec![cfg.intermediate_size, hs],
+            rng,
+        );
+        put(
+            &mut m,
+            "ffn_down.weight",
+            vec![hs, cfg.intermediate_size],
+            rng,
+        );
         put(&mut m, "ssm_in.weight", vec![cfg.ssm_in_dim(), hs], rng);
         put(&mut m, "ssm_out.weight", vec![hs, cfg.ssm_d_inner], rng);
         let conv_dim = cfg.ssm_conv_dim();
-        put(&mut m, "ssm_conv1d.weight", vec![conv_dim, cfg.ssm_d_conv], rng);
+        put(
+            &mut m,
+            "ssm_conv1d.weight",
+            vec![conv_dim, cfg.ssm_d_conv],
+            rng,
+        );
         put(&mut m, "ssm_conv1d.bias", vec![conv_dim], rng);
         put(&mut m, "ssm_a", vec![cfg.ssm_dt_rank, 1], rng);
         put(&mut m, "ssm_d", vec![cfg.ssm_dt_rank, 1], rng);
@@ -979,6 +960,7 @@ mod tests {
 
     /// Host-reference attention: rope on device, then pull Q/K to host, grow
     /// host caches, run the scalar kernel. Mirrors the pre-WI-A algorithm.
+    #[allow(clippy::too_many_arguments)]
     fn ref_attn_step(
         b: &FalconH1Block,
         cfg: &FalconH1Config,
@@ -1030,9 +1012,8 @@ mod tests {
         .unwrap()
     }
 
-    /// WI-A gate: 8-step decode through the device-arena path must match the
-    /// host-reference algorithm (rope + host cache + scalar attention) to
-    /// atol 1e-5, and the arena must actually be populated.
+    /// WI-A gate: 8-step decode through the device-arena path must match the host-reference algorithm (rope +
+    /// host cache + scalar attention) to atol 1e-5, and the arena must actually be populated.
     #[test]
     fn test_gqa_arena_matches_host_reference() {
         let (block, cfg) = small_block();
@@ -1053,14 +1034,21 @@ mod tests {
             let k_t = block.wk.forward(&normed).unwrap();
             let v_t = block.wv.forward(&normed).unwrap();
 
-            let device_out = gqa_attn_with_cache(
-                &block, &cfg, &q_t, &k_t, &v_t, &[step], 1, &mut arena_cache,
-            )
-            .unwrap()
-            .to_vec_f32()
-            .unwrap();
+            let device_out =
+                gqa_attn_with_cache(&block, &cfg, &q_t, &k_t, &v_t, &[step], 1, &mut arena_cache)
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap();
             let ref_out = ref_attn_step(
-                &block, &cfg, &q_t, &k_t, &v_t, &[step], 1, &mut ref_k, &mut ref_v,
+                &block,
+                &cfg,
+                &q_t,
+                &k_t,
+                &v_t,
+                &[step],
+                1,
+                &mut ref_k,
+                &mut ref_v,
             );
 
             assert_eq!(device_out.len(), ref_out.len());
@@ -1079,9 +1067,8 @@ mod tests {
         assert_eq!(ref_k.len(), 8 * cfg.num_kv_heads * cfg.head_dim);
     }
 
-    /// WI-B gate: single-token decode (device `short_conv1d_causal_step`)
-    /// must match multi-token prefill (host conv loop) — causal equivalence
-    /// of the conv + scan stack, including state evolution.
+    /// WI-B gate: single-token decode (device `short_conv1d_causal_step`) must match multi-token prefill (host conv
+    /// loop) - causal equivalence of the conv + scan stack, including state evolution.
     #[test]
     fn test_ssm_decode_matches_prefill() {
         let (block, cfg) = small_block();
@@ -1099,22 +1086,22 @@ mod tests {
         let mut out_b = Vec::new();
         for t in 0..seq {
             out_b.extend(
-                mamba2_layer_cpu(&block, &cfg, &h[t * hs..(t + 1) * hs], &mut cache_b)
-                    .unwrap(),
+                mamba2_layer_cpu(&block, &cfg, &h[t * hs..(t + 1) * hs], &mut cache_b).unwrap(),
             );
         }
 
         assert_eq!(out_a.len(), out_b.len());
-        // 1e-4 (not tighter): prefill matmuls run [3,in] batches vs [1,in]
-        // per decode step — fp32 accumulation order differs by ~1 ulp and
-        // propagates through conv + scan.
+        // 1e-4 (not tighter): prefill matmuls run [3,in] batches vs [1,in] per decode step
+        // - fp32 accumulation order differs by ~1 ulp and propagates through conv + scan.
         for (i, (a, b)) in out_a.iter().zip(&out_b).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-4,
-                "token {i}: prefill {a} vs decode {b}"
-            );
+            assert!((a - b).abs() < 1e-4, "token {i}: prefill {a} vs decode {b}");
         }
-        for (i, (a, b)) in cache_a.conv_state.iter().zip(&cache_b.conv_state).enumerate() {
+        for (i, (a, b)) in cache_a
+            .conv_state
+            .iter()
+            .zip(&cache_b.conv_state)
+            .enumerate()
+        {
             assert!((a - b).abs() < 1e-4, "conv_state[{i}]: {a} vs {b}");
         }
         for (i, (a, b)) in cache_a.ssm_state.iter().zip(&cache_b.ssm_state).enumerate() {
@@ -1122,9 +1109,8 @@ mod tests {
         }
     }
 
-    /// WI-A guard: on the device path the host mirrors must stay empty —
-    /// if the fallback branch ever runs silently on a kernel-capable backend,
-    /// mirrors would grow while the arena also grows.
+    /// WI-A guard: on the device path the host mirrors must stay empty - if the fallback
+    /// branch ever runs silently on a kernel-capable backend, mirrors would grow while the arena also grows.
     #[test]
     fn test_gqa_device_path_leaves_mirrors_empty() {
         let (block, cfg) = small_block();
@@ -1141,8 +1127,7 @@ mod tests {
             let q_t = block.wq.forward(&normed).unwrap();
             let k_t = block.wk.forward(&normed).unwrap();
             let v_t = block.wv.forward(&normed).unwrap();
-            gqa_attn_with_cache(&block, &cfg, &q_t, &k_t, &v_t, &[step], 1, &mut cache)
-                .unwrap();
+            gqa_attn_with_cache(&block, &cfg, &q_t, &k_t, &v_t, &[step], 1, &mut cache).unwrap();
         }
         assert!(cache.k_device.is_some(), "arena must be allocated");
         assert!(

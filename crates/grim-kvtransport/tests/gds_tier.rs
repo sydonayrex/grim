@@ -16,10 +16,12 @@ fn test_gds_tier_lifecycle_and_roundtrip() {
     let block_id = 42;
     let block_data: Vec<f32> = (0..1024).map(|i| (i as f32) * 0.25).collect();
 
-    tier.demote_block(block_id, &block_data).expect("demote_block should succeed");
+    tier.demote_block(block_id, &block_data)
+        .expect("demote_block should succeed");
 
     let mut restored = vec![0.0f32; 1024];
-    tier.promote_block(block_id, &mut restored).expect("promote_block should succeed");
+    tier.promote_block(block_id, &mut restored)
+        .expect("promote_block should succeed");
 
     assert_eq!(restored, block_data);
 }

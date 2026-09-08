@@ -9,16 +9,11 @@ use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::TensorProvider;
 
-/// Hook for offloading tensor dequantization to an accelerator during
-/// `.grim` conversion.
-///
-/// Implemented by GPU backends (e.g. `grim-backend-rocm`). When an
-/// implementation returns `Ok(None)` the caller falls back to the CPU
-/// dequant path for that tensor's storage scheme.
+/// Hook for offloading tensor dequantization to an accelerator during `.grim` conversion.
+/// Implemented by GPU backends (e.g.
 pub trait GpuDequant: Send + Sync {
-    /// Dequantize `bytes` (a raw storage payload for `storage`) into
-    /// `elem_count` f32 values. Returning `Ok(None)` means this storage
-    /// scheme is not supported and the caller should use the CPU path.
+    /// Dequantize `bytes` (a raw storage payload for `storage`) into `elem_count` f32 values.
+    /// Returning `Ok(None)` means this storage scheme is not supported and the caller should use the.
     fn dequantize(
         &self,
         storage: &grim_tensor::dtype::Storage,
@@ -28,7 +23,6 @@ pub trait GpuDequant: Send + Sync {
 }
 
 /// Retrieve the type tag representing a GgufValue.
-///
 /// SAFETY: Pure lookup function mapping enum variants.
 fn gguf_value_tag(val: &GgufValue) -> u32 {
     match val {
@@ -49,8 +43,7 @@ fn gguf_value_tag(val: &GgufValue) -> u32 {
 }
 
 /// Serialize a GgufValue to the target stream.
-///
-/// SAFETY: Standard binary writing. Handles recursive array serialization.
+/// SAFETY: Standard binary writing.
 fn write_gguf_value<W: Write>(w: &mut W, val: &GgufValue) -> std::io::Result<()> {
     let tag = gguf_value_tag(val);
     w.write_all(&tag.to_le_bytes())?;
@@ -58,8 +51,7 @@ fn write_gguf_value<W: Write>(w: &mut W, val: &GgufValue) -> std::io::Result<()>
 }
 
 /// Serialize only the raw data bytes of a GgufValue (without type tag).
-///
-/// SAFETY: Opaque byte copy. Recursive arrays write a single element type tag.
+/// SAFETY: Opaque byte copy.
 fn write_gguf_value_raw<W: Write>(w: &mut W, val: &GgufValue) -> std::io::Result<()> {
     match val {
         GgufValue::Uint8(v) => w.write_all(&[*v]),
@@ -95,24 +87,15 @@ fn write_gguf_value_raw<W: Write>(w: &mut W, val: &GgufValue) -> std::io::Result
     }
 }
 
-/// Serialize a GGUF format string.
-///
-/// SAFETY: Standard length-prefixed bytes serialization.
+/// Serialize a GGUF format string. SAFETY: Standard length-prefixed bytes serialization.
 fn write_gguf_string<W: Write>(w: &mut W, s: &str) -> std::io::Result<()> {
     let bytes = s.as_bytes();
     w.write_all(&(bytes.len() as u64).to_le_bytes())?;
     w.write_all(bytes)
 }
 
-/// Primary GGUF-to-GRIM conversion logic.
-///
-/// Reads model weights from `input_path`, optimizes layout representation specifically
-/// for the target ROCm GPU architecture (`resolved_gcn`), attaches `.grim` extension
-/// metadata, and writes the resulting `.grim` file.
-///
-/// RDNA 2 (starts with `gfx10`) is explicitly rejected by the caller or this validator.
-///
-/// SAFETY: Performs heavy file I/O operations.
+/// Primary GGUF-to-GRIM conversion logic. Reads model weights from `input_path`, optimizes layout representation specifically for the
+/// target ROCm GPU architecture (`resolved_gcn`), attaches `.grim` extension metadata, and writes the resulting `.grim` file.
 pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &str) -> Result<()> {
     println!("[Grim Convert] Opening source GGUF file: {}", input_path);
     let mut infile = File::open(input_path)
@@ -271,17 +254,7 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
 pub const GRIM_QUANT_VERSION: u32 = 1;
 
 /// Convert any supported model format to the native `.grim` format.
-///
-/// Routes by file extension (spec §5): `.gguf` → GGUF reader, `.safetensors`
-/// / `.bin` → safetensors reader. Each source tensor is repacked at
-/// `target_bpw` bits-per-weight into the normals stream (Wave64-aligned),
-/// with an empty outliers stream. The output is a valid native `.grim` file
-/// readable by [`crate::tprov::GrimProvider`].
-///
-/// The EvoPress/GPTQ calibration engine (spec §2) is a separate concern;
-/// this function performs format-correct repacking. When calibration is
-/// available it will slot in between the read and write phases without
-/// changing this function's signature.
+/// Routes by file extension (spec §5): `.gguf` → GGUF reader, `.safetensors` / `.bin` → safetensors.
 fn dequant_group_int_bytes(
     bytes: &[u8],
     shape: &[usize],
@@ -433,20 +406,17 @@ pub fn convert_to_grim(
     train_state: Option<&crate::train::TrainState>,
     // Per-tensor bitwidths from EvoPress evolutionary search.
     // If provided, these override the uniform `target_bpw` for each tensor.
-    // Must match the number of tensors in the source model.
     evopress_bitwidths: Option<Vec<u32>>,
-    // Pre-populated metadata (caller may have set quant_overrides /
-    // ext_entries from EvoPress / calibration). When `None`, a fresh
-    // default metadata is constructed.
+    // Pre-populated metadata (caller may have set quant_overrides / ext_entries from EvoPress / calibration).
+    // When `None`, a fresh default metadata is constructed.
     caller_metadata: Option<crate::gguf::GrimMetadata>,
     // Target WeightFormat codec. When `None`, uses Bf16 (default).
     target_format: Option<String>,
     // Build wavefront size. When `None`, resolves from `target_gcn`
     // (RDNA → W32 default, CDNA `gfx90x` → W64).
     wave: Option<crate::format::WaveSize>,
-    // Progress callback invoked with `(stage, done, total)` so the CLI
-    // can render a conversion percentage bar. Stages: "evopress",
-    // "pack", "write". When `None`, no progress is reported.
+    // Progress callback invoked with `(stage, done, total)` so the CLI can render a conversion percentage bar.
+    // Stages: "evopress", "pack", "write".
     progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<()> {
     convert_to_grim_inner(
@@ -466,8 +436,7 @@ pub fn convert_to_grim(
     )
 }
 
-/// Same as [`convert_to_grim`], but dequantizes tensors through the
-/// supplied [`GpuDequant`] hook when the storage scheme is supported.
+/// Same as [`convert_to_grim`], but dequantizes tensors through the supplied [`GpuDequant`] hook when the storage scheme is supported.
 /// Schemes the hook does not handle fall back to the CPU path.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
@@ -636,9 +605,8 @@ fn convert_to_grim_inner(
         });
     }
 
-    // Preserve source GGUF metadata (tokenizer, architecture, etc.) so
-    // GrimProvider can reconstruct the tokenizer directly from the .grim
-    // file without a sibling .gguf fallback.
+    // Preserve source GGUF metadata (tokenizer, architecture, etc.) so GrimProvider can reconstruct
+    // the tokenizer directly from the .grim file without a sibling .gguf fallback.
     if metadata.gguf_metadata.is_none() {
         let lower = input_path.to_ascii_lowercase();
         if lower.ends_with(".gguf") {
@@ -699,7 +667,6 @@ fn convert_to_grim_inner(
 
     // WI-R6: optionally emit the training sidecar next to the .grim file.
     // The sidecar path is `output_path` with a `.train` suffix (e.g.
-    // `model.grim` → `model.grim.train`).
     if let Some(train) = train_state {
         let sidecar_path = format!("{}.train", output_path);
         train.write(&sidecar_path)?;
@@ -758,9 +725,7 @@ fn build_entries_from_source(
 }
 
 /// Pack tensors from a provider into registry entries + normals payloads.
-///
-/// Also returns per-tensor `GrimTensorExt` entries containing SpQR
-/// salient indices/values so the caller can populate `metadata.ext_entries`.
+/// Also returns per-tensor `GrimTensorExt` entries containing SpQR salient indices/values so the caller can populate `metadata.ext_entries`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 fn pack_tensors(
@@ -843,9 +808,8 @@ fn pack_tensors(
                 {
                     grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
                 }
-                // else: attention projection but not a rotatable square block —
-                // fall through without rotating; do not error (non-square attention
-                // projections are legitimate, e.g. GQA with differing Q/KV dims).
+                // else: attention projection but not a rotatable square block - fall through without rotating; do not error (non-square attention projections are legitimate, e.g.
+                // GQA with differing Q/KV dims).
             }
 
             let payload_size =
@@ -925,10 +889,7 @@ fn gcn_to_profile(gcn: &str) -> crate::gguf::GrimRocmlProfile {
 }
 
 /// Build the `.grim` metadata for the output file.
-///
-/// Note: caller-supplied metadata (e.g. with `quant_overrides` pre-populated
-/// from EvoPress) should be passed to `convert_to_grim` directly via
-/// `caller_metadata`. This helper is for the uniform-quantization path only.
+/// Note: caller-supplied metadata (e.g.
 fn build_grim_metadata(
     target_gcn: &str,
     profile: crate::gguf::GrimRocmlProfile,
@@ -952,24 +913,15 @@ fn build_grim_metadata(
         quant_method: Some(quant_method),
         rocm_fusion_ops: vec![crate::gguf::GrimFusionOp::QkvAttention],
         kv_layout_optimized: Some(true),
-        // P1 §8 convert-time tag: record the GEMM backend the target's
-        // rocBLAS layer resolves to (RDNA/CDNA both route through rocBLAS
-        // gemm_ex on the current backend).
+        // P1 §8 convert-time tag: record the GEMM backend the target's rocBLAS layer
+        // resolves to (RDNA/CDNA both route through rocBLAS gemm_ex on the current backend).
         gemm_backend: Some("rocblas".into()),
         ..Default::default()
     }
 }
 
-/// Encode an outlier list for the on-disk stream, picking the encoding
-/// based on the spec's recommendation: delta-varint for ≥16 outliers
-/// (Phase 5 compressed path), flat u32 + f16 below that threshold
-/// (legacy path). Returns the encoded bytes plus the encoding chosen
-/// so the caller can store it on the tensor's capability extension.
-///
-/// This is the writer-side counterpart of
-/// [`crate::format::read_outliers_with_encoding`]. The converter calls
-/// it when outliers are present; the encoding flag is recorded on the
-/// tensor's `GrimTensorExt` so the reader knows which decoder to use.
+/// Encode an outlier list for the on-disk stream, picking the encoding based on the spec's recommendation: delta-varint for ≥16 outliers (Phase 5 compressed path), flat u32 + f16 below that threshold (legacy path).
+/// Returns the encoded bytes plus the encoding chosen so the caller can store it on.
 pub fn encode_outliers_with_encoding(
     outliers: &[(u32, f32)],
 ) -> (Vec<u8>, crate::spec::OutlierIndexEncoding) {
@@ -1060,8 +1012,7 @@ mod tests {
         assert!(!buf.is_empty());
     }
 
-    /// WI-SPINQUANT-AttentionGate: SpinQuant Cayley rotation must run ONLY on
-    /// attention projections with square, power-of-two dimensions (>= 16).
+    /// WI-SPINQUANT-AttentionGate: SpinQuant Cayley rotation must run ONLY on attention projections with square, power-of-two dimensions (>= 16).
     /// Non-attention square tensors and non-square attention tensors must be skipped.
     #[test]
     fn test_spinquant_gated_on_attention_role_and_square_shape() {
@@ -1194,9 +1145,8 @@ mod tests {
         assert_eq!(entry_ffn_sq.name, "blk.0.ffn_gate.weight");
         assert_eq!(entry_attn_rect.name, "blk.0.attn_k.weight");
 
-        // The square attention tensor and square non-attention tensor started with
-        // identical input bytes. Because SpinQuant rotation was applied ONLY to the
-        // attention tensor, their packed payloads must differ.
+        // The square attention tensor and square non-attention tensor started with identical input bytes.
+        // Because SpinQuant rotation was applied ONLY to the attention tensor, their packed payloads must differ.
         assert_ne!(
             payload_attn_sq, payload_ffn_sq,
             "Attention square tensor and non-attention square tensor must have different payloads because only attention was SpinQuant-rotated"
@@ -1244,23 +1194,11 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
 // External quantization toolkit format detection and layout adapters.
-//
-// TorchAO, Quark, ModelOpt, and FBGEMM-FP8 each pack FP8/INT4/INT8 weights
-// with their own scale conventions. Rather than add a new `Storage` variant
-// per toolkit, we detect the producer from safetensors metadata (or GGUF
-// quantize_config.json) and adapt their layout onto the existing
-// `Storage` variants in grim-tensor. This keeps the dequant kernel surface
-// bounded while supporting models from all four toolkits.
-// ---------------------------------------------------------------------------
+// TorchAO, Quark, ModelOpt, and FBGEMM-FP8 each pack FP8/INT4/INT8 weights with their own scale conventions.
 
 /// Identifies which external quantization toolkit produced a model checkpoint.
-///
-/// Detection reads safetensors `__metadata__` and the companion
-/// `quantize_config.json` (if present). The producer tag drives the layout
-/// adapter that maps the checkpoint's scale/codebook convention onto grim's
-/// `Storage` variants.
+/// Detection reads safetensors `__metadata__` and the companion `quantize_config.json` (if present).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolkitProducer {
     /// TorchAO (PyTorch): int4_weight_only, float8_weight_only,
@@ -1275,16 +1213,7 @@ pub enum ToolkitProducer {
 }
 
 /// Detect the toolkit producer from safetensors metadata.
-///
-/// Checks `__metadata__` keys in priority order:
-///   - `"quant_method"` / `"quantization"` / `"producer"`
-///   - `"torchao"` → TorchAO
-///   - `"quark"` → Quark
-///   - `"modelopt"` / `"tensorrt_model_optimizer"` / `"nvfp4"` → ModelOpt
-///   - `"fbgemm"` / `"fbgemm_fp8"` → FBGEMM-FP8
-///
-/// Returns `None` when no toolkit signature is recognized — the caller
-/// falls back to the default `Storage` interpretation.
+/// Checks `__metadata__` keys in priority order: - `"quant_method"` / `"quantization"` / `"producer"` - `"torchao"` →.
 pub fn detect_toolkit_producer(
     metadata: &std::collections::HashMap<String, String>,
 ) -> Option<ToolkitProducer> {
@@ -1336,12 +1265,7 @@ pub fn detect_toolkit_producer(
 }
 
 /// Detect the toolkit producer from GGUF metadata.
-///
-/// GGUF checkpoints produced by these toolkits carry a `quantize_config.json`
-/// alongside the file, or stamp the producer in metadata keys like
-/// `general.quantization_config`. This function scans string-valued GGUF
-/// metadata for toolkit signatures. It is the GGUF-container counterpart to
-/// [`detect_toolkit_producer`] (which reads safetensors `__metadata__`).
+/// GGUF checkpoints produced by these toolkits carry a `quantize_config.json` alongside the file, or stamp the.
 pub fn detect_toolkit_producer_from_gguf(
     metadata: &std::collections::HashMap<String, crate::gguf::GgufValue>,
 ) -> Option<ToolkitProducer> {
@@ -1377,9 +1301,7 @@ pub fn detect_toolkit_producer_from_gguf(
 }
 
 /// Toolkit-specific tensor packing descriptor.
-///
-/// Returned by [`classify_toolkit_tensor`] and consumed by the layout
-/// adapters to select the correct reframe function.
+/// Returned by [`classify_toolkit_tensor`] and consumed by the layout adapters to select the correct reframe function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolkitQuantFormat {
     /// TorchAO INT4 weight-only: `[qweight (int4 packed)][scales (f32)]`.
@@ -1400,11 +1322,8 @@ pub enum ToolkitQuantFormat {
     FbgemmFP8,
 }
 
-/// Classify a quantized tensor's toolkit-specific format from its name and
-/// the detected producer.
-///
-/// Uses naming conventions (e.g. `.qweight` suffix for GPTQ, `.scale` for
-/// FP8) to disambiguate formats within a single toolkit.
+/// Classify a quantized tensor's toolkit-specific format from its name and the detected producer.
+/// Uses naming conventions (e.g.
 pub fn classify_toolkit_tensor(
     producer: ToolkitProducer,
     tensor_name: &str,
@@ -1446,25 +1365,15 @@ pub fn classify_toolkit_tensor(
 }
 
 /// Map a toolkit's packed weight bytes onto the appropriate `Storage` variant.
-///
-/// This is the central dispatch: given a producer + tensor format, it selects
-/// the existing `Storage` variant that can carry the tensor without precision
-/// loss. The raw bytes are passed through unchanged where the toolkit layout
-/// already matches a `Storage` variant, or reframed where conventions differ.
-///
-/// # Returns
-/// `Some(storage)` when the toolkit format maps cleanly onto an existing
-/// `Storage` variant; `None` when a dedicated adapter is needed (caller
-/// should use `reframe_toolkit_bytes`).
-pub fn toolkit_to_storage(
-    _producer: ToolkitProducer,
-    qfmt: ToolkitQuantFormat,
-) -> Option<Storage> {
-    use grim_tensor::dtype::{FloatPackScheme, GroupQuantScheme, GpuIntConfig};
+/// This is the central dispatch: given a producer + tensor format, it selects the existing.
+pub fn toolkit_to_storage(_producer: ToolkitProducer, qfmt: ToolkitQuantFormat) -> Option<Storage> {
+    use grim_tensor::dtype::{FloatPackScheme, GpuIntConfig, GroupQuantScheme};
     match qfmt {
         ToolkitQuantFormat::TorchAOInt4 => {
             // TorchAO INT4 packs int4 codes + f32 scales, structurally W4A16.
-            Some(Storage::W4A16(grim_tensor::dtype::W4A16Config { group_size: 128 }))
+            Some(Storage::W4A16(grim_tensor::dtype::W4A16Config {
+                group_size: 128,
+            }))
         }
         ToolkitQuantFormat::TorchAOFP8 | ToolkitQuantFormat::FbgemmFP8 => {
             // FP8 weights with per-channel scales → CompressedTensorsW8A8Fp8.
@@ -1486,16 +1395,8 @@ pub fn toolkit_to_storage(
     }
 }
 
-/// Layout adapter: reframe toolkit-specific packed bytes into the canonical
-/// layout expected by the target `Storage` variant.
-///
-/// Some toolkit formats pack scales/codes in an order that differs from
-/// grim's `Storage` byte convention. This function reorders them so the
-/// existing dequant kernels can consume them without modification.
-///
-/// # Returns
-/// Reframed bytes ready for the target `Storage` variant, or `Err` when
-/// the layout is unsupported.
+/// Layout adapter: reframe toolkit-specific packed bytes into the canonical layout expected by the target `Storage` variant.
+/// Some toolkit formats pack scales/codes in an order that differs from grim's `Storage` byte convention.
 pub fn reframe_toolkit_bytes(
     qfmt: ToolkitQuantFormat,
     bytes: &[u8],
@@ -1505,13 +1406,11 @@ pub fn reframe_toolkit_bytes(
         ToolkitQuantFormat::TorchAOInt4 => {
             // TorchAO INT4 packs as: [qweight int4 codes][scales f32].
             // Grim's W4A16 expects: [codes (N*K/8 u32)][scales (N*K/group_size f32)].
-            // Both are codes-then-scales with identical packing, so pass through.
             Ok(bytes.to_vec())
         }
         ToolkitQuantFormat::TorchAOFP8 | ToolkitQuantFormat::QuarkFP8 => {
             // FP8 with per-channel f32 scales: [fp8 codes][f32 scales].
             // CompressedTensorsW8A8Fp8 expects: [u64 scale_len][codes][scale bytes].
-            // Prefix the scale length to match the convention.
             let num_channels = elem_count; // per-channel: one scale per column
             let codes_len = elem_count;
             let scale_bytes = num_channels * 4;
@@ -1581,11 +1480,7 @@ pub fn reframe_toolkit_bytes(
 }
 
 /// Build a `QuantProvenance` tag for a toolkit-produced tensor.
-///
-/// External toolkit tensors must never be re-quantized by grim-quant (that
-/// would compound quantization error). This tag marks them as foreign so
-/// the conversion pipeline preserves them verbatim or routes them to the
-/// correct dequant path.
+/// External toolkit tensors must never be re-quantized by grim-quant (that would compound quantization error).
 pub fn toolkit_to_provenance(
     _producer: ToolkitProducer,
     qfmt: ToolkitQuantFormat,
@@ -1598,13 +1493,11 @@ pub fn toolkit_to_provenance(
             scheme: GroupQuantScheme::Asymmetric,
             desc_act: true,
         },
-        // All other toolkit formats are weight-only PTQ (not QAT) — mark as
-        // external so the pipeline skips re-quantization but uses the correct
-        // storage-specific dequant path.
+        // All other toolkit formats are weight-only PTQ (not QAT) - mark as
+        // external so the pipeline skips re-quantization but uses the correct storage-specific dequant path.
         _ => QuantProvenance::ExternalQat {
             bits: match qfmt {
-                ToolkitQuantFormat::TorchAOInt4
-                | ToolkitQuantFormat::ModelOptNVFP4 => 4,
+                ToolkitQuantFormat::TorchAOInt4 | ToolkitQuantFormat::ModelOptNVFP4 => 4,
                 ToolkitQuantFormat::TorchAOFP8
                 | ToolkitQuantFormat::TorchAOFP8W8A8
                 | ToolkitQuantFormat::QuarkFP8
@@ -1628,7 +1521,10 @@ mod toolkit_tests {
         use std::collections::HashMap;
         let mut meta = HashMap::new();
         meta.insert("quant_method".into(), "torchao".into());
-        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::TorchAO));
+        assert_eq!(
+            detect_toolkit_producer(&meta),
+            Some(ToolkitProducer::TorchAO)
+        );
     }
 
     #[test]
@@ -1644,7 +1540,10 @@ mod toolkit_tests {
         use std::collections::HashMap;
         let mut meta = HashMap::new();
         meta.insert("quant_method".into(), "modelopt".into());
-        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::ModelOpt));
+        assert_eq!(
+            detect_toolkit_producer(&meta),
+            Some(ToolkitProducer::ModelOpt)
+        );
     }
 
     #[test]
@@ -1652,7 +1551,10 @@ mod toolkit_tests {
         use std::collections::HashMap;
         let mut meta = HashMap::new();
         meta.insert("producer".into(), "fbgemm_fp8".into());
-        assert_eq!(detect_toolkit_producer(&meta), Some(ToolkitProducer::FbgemmFp8));
+        assert_eq!(
+            detect_toolkit_producer(&meta),
+            Some(ToolkitProducer::FbgemmFp8)
+        );
     }
 
     #[test]
@@ -1682,10 +1584,7 @@ mod toolkit_tests {
         use crate::gguf::GgufValue;
         use std::collections::HashMap;
         let mut meta: HashMap<String, GgufValue> = HashMap::new();
-        meta.insert(
-            "quant_format".into(),
-            GgufValue::String("nvfp4".into()),
-        );
+        meta.insert("quant_format".into(), GgufValue::String("nvfp4".into()));
         assert_eq!(
             detect_toolkit_producer_from_gguf(&meta),
             Some(ToolkitProducer::ModelOpt),
@@ -1723,11 +1622,9 @@ mod toolkit_tests {
     #[test]
     fn test_toolkit_to_storage_nvfp4() {
         use grim_tensor::dtype::{FloatPackScheme, Storage};
-        let storage = toolkit_to_storage(
-            ToolkitProducer::ModelOpt,
-            ToolkitQuantFormat::ModelOptNVFP4,
-        )
-        .unwrap();
+        let storage =
+            toolkit_to_storage(ToolkitProducer::ModelOpt, ToolkitQuantFormat::ModelOptNVFP4)
+                .unwrap();
         assert_eq!(storage, Storage::FloatPack(FloatPackScheme::NvFp4));
     }
 
@@ -1738,24 +1635,14 @@ mod toolkit_tests {
         for i in 0..4u32 {
             bytes.extend_from_slice(&(i as f32).to_le_bytes()); // f32 scales
         }
-        let reframe = reframe_toolkit_bytes(
-            ToolkitQuantFormat::TorchAOFP8,
-            &bytes,
-            4,
-        )
-        .unwrap();
+        let reframe = reframe_toolkit_bytes(ToolkitQuantFormat::TorchAOFP8, &bytes, 4).unwrap();
         // Output: [u64 scale_len (=16)][f32 scales (16 bytes)][fp8 codes (4 bytes)]
         assert_eq!(reframe.len(), 8 + 16 + 4);
-        assert_eq!(
-            u64::from_le_bytes(reframe[0..8].try_into().unwrap()),
-            16
-        );
+        assert_eq!(u64::from_le_bytes(reframe[0..8].try_into().unwrap()), 16);
     }
 
-    /// Independent OCP E2M1 codebook oracle — transcribed from spec, NOT
-    /// calling grim's own `mxfp4_e2m1_to_f32`. Used to verify that the
-    /// toolkit-to-storage pipeline produces bytes that `dequant_nvfp4`
-    /// decodes to the correct values.
+    /// Independent OCP E2M1 codebook oracle - transcribed from spec, NOT calling grim's own `mxfp4_e2m1_to_f32`.
+    /// Used to verify that the toolkit-to-storage pipeline produces bytes that `dequant_nvfp4` decodes to the correct.
     fn oracle_e2m1(code: u8) -> f32 {
         let sign = (code >> 3) & 1 != 0;
         let exp = (code >> 1) & 3;
@@ -1769,10 +1656,10 @@ mod toolkit_tests {
     }
 
     #[test]
+    #[allow(clippy::same_item_push)]
     fn test_nvfp4_toolkit_storage_produces_correct_dequant() {
         // Build a 32-weight NVFP4 buffer by hand: 2 sub-blocks of 16.
-        // Sub-block 0: exp=127 (scale 1.0), code=2 (codebook 1.0) → 1.0
-        // Sub-block 1: exp=128 (scale 2.0), code=4 (codebook 2.0) → 4.0
+        // Sub-block 0: exp=127 (scale 1.0), code=2 (codebook 1.0) → 1.0 Sub-block 1: exp=128 (scale 2.0),.
         let mut nvfp4 = Vec::with_capacity(18);
         // Sub-block 0: scale byte + 8 packed code bytes
         nvfp4.push(127); // E8M0 scale
@@ -1786,22 +1673,17 @@ mod toolkit_tests {
         }
 
         // Route through the toolkit adapter (as SafetensorsProvider would).
-        let storage = toolkit_to_storage(
-            ToolkitProducer::ModelOpt,
-            ToolkitQuantFormat::ModelOptNVFP4,
-        )
-        .unwrap();
-        let reframe_bytes = reframe_toolkit_bytes(
-            ToolkitQuantFormat::ModelOptNVFP4,
-            &nvfp4,
-            32,
-        )
-        .unwrap();
+        let storage =
+            toolkit_to_storage(ToolkitProducer::ModelOpt, ToolkitQuantFormat::ModelOptNVFP4)
+                .unwrap();
+        let reframe_bytes =
+            reframe_toolkit_bytes(ToolkitQuantFormat::ModelOptNVFP4, &nvfp4, 32).unwrap();
 
         // Verify the storage variant is NvFp4.
-        assert_eq!(storage, grim_tensor::dtype::Storage::FloatPack(
-            grim_tensor::dtype::FloatPackScheme::NvFp4
-        ));
+        assert_eq!(
+            storage,
+            grim_tensor::dtype::Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::NvFp4)
+        );
 
         // Dequantize and verify against the independent oracle.
         let f32_out = grim_quant::dequant_nvfp4(&reframe_bytes, 32).unwrap();

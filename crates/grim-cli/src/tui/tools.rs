@@ -1,8 +1,5 @@
 //! Coding tool definitions and sandboxed execution.
-//!
-//! Tools are exposed to the model via grim's OpenAI-compatible `ToolDef`
-//! format so the chat template receives them through the `tools` Jinja
-//! variable. Execution is sandboxed to a single allow-listed directory.
+//! Tools are exposed to the model via grim's OpenAI-compatible `ToolDef` format so the chat template.
 
 use std::fs;
 use std::path::PathBuf;
@@ -41,8 +38,7 @@ fn default_task_status() -> String {
 }
 
 /// Parse and validate the arguments of an `update_tasks` tool call.
-/// Returns the task list on success; the error string lists invalid
-/// statuses so the model can correct and retry.
+/// Returns the task list on success; the error string lists invalid statuses so the model.
 pub fn parse_update_tasks(arguments: &str) -> Result<Vec<TaskItem>, String> {
     let args: serde_json::Value =
         serde_json::from_str(arguments).map_err(|e| format!("invalid arguments: {e}"))?;
@@ -57,7 +53,11 @@ pub fn parse_update_tasks(arguments: &str) -> Result<Vec<TaskItem>, String> {
         if item.id.trim().is_empty() || item.title.trim().is_empty() {
             bad.push(format!("task with empty id or title ({:?})", item.id));
         }
-        if item.status.parse::<crate::tui::tasks::TaskStatus>().is_err() {
+        if item
+            .status
+            .parse::<crate::tui::tasks::TaskStatus>()
+            .is_err()
+        {
             bad.push(format!(
                 "invalid status {:?} for task {} (use pending, in-progress, completed, failed, cancelled)",
                 item.status, item.id
@@ -90,11 +90,8 @@ pub fn summarize_tasks(items: &[TaskItem]) -> String {
     )
 }
 
-/// Remove tool-call markup from generated text so the cleaned remainder can
-/// be stored as an assistant message alongside structured `tool_calls`
-/// without double-encoding the calls on the next template render. Handles
-/// the two conventions grim's parser recognizes: Hermes `<tool_call>…`
-/// and LFM2.5 `<|tool_call_start|>…<|tool_call_end|>`.
+/// Remove tool-call markup from generated text so the cleaned remainder can be stored as an assistant message alongside structured `tool_calls` without double-encoding the calls on the next template render.
+/// Handles the two conventions grim's parser recognizes: Hermes `<tool_call>…` and LFM2.5 `<|tool_call_start|>…<|tool_call_end|>`.
 pub fn strip_tool_markup(text: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
     let mut rest = text;
@@ -103,7 +100,11 @@ pub fn strip_tool_markup(text: &str) -> String {
         let lfm = rest.find("<|tool_call_start|>");
         let (start, close) = match (hermes, lfm) {
             (Some(h), Some(l)) => {
-                if h <= l { (h, "</tool_call>") } else { (l, "<|tool_call_end|>") }
+                if h <= l {
+                    (h, "</tool_call>")
+                } else {
+                    (l, "<|tool_call_end|>")
+                }
             }
             (Some(h), None) => (h, "</tool_call>"),
             (None, Some(l)) => (l, "<|tool_call_end|>"),
@@ -135,167 +136,168 @@ fn segments_join(segments: &[&str]) -> String {
 /// OpenAI-compatible `ToolDef` format.
 pub fn coding_tools() -> Vec<ToolDef> {
     vec![
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "read_file".to_string(),
-            description: Some(
-                "Read a file and return its lines prefixed with line numbers. \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "read_file".to_string(),
+                description: Some(
+                    "Read a file and return its lines prefixed with line numbers. \
                  Long files are truncated to the first 400 lines / 32 KiB; use \
                  `offset` and `limit` to page through larger files."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the file, relative to the sandbox root" },
-                    "offset": { "type": "integer", "description": "1-based line number to start reading from (default: 1)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 400)" }
-                },
-                "required": ["path"]
-            })),
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path to the file, relative to the sandbox root" },
+                        "offset": { "type": "integer", "description": "1-based line number to start reading from (default: 1)" },
+                        "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 400)" }
+                    },
+                    "required": ["path"]
+                })),
+            },
         },
-    },
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "write_file".to_string(),
-            description: Some(
-                "Write content to a file at the given path. Creates the file if it \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "write_file".to_string(),
+                description: Some(
+                    "Write content to a file at the given path. Creates the file if it \
                  does not exist, overwrites if it does. Creates parent directories \
                  as needed."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the file, relative to the sandbox root" },
-                    "content": { "type": "string", "description": "The text content to write" }
-                },
-                "required": ["path", "content"]
-            })),
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path to the file, relative to the sandbox root" },
+                        "content": { "type": "string", "description": "The text content to write" }
+                    },
+                    "required": ["path", "content"]
+                })),
+            },
         },
-    },
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "edit_file".to_string(),
-            description: Some(
-                "Edit a file by replacing an exact string occurrence. `old_string` \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "edit_file".to_string(),
+                description: Some(
+                    "Edit a file by replacing an exact string occurrence. `old_string` \
                  must match exactly including whitespace and indentation. Use this \
                  for precise, surgical edits."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "old_string": { "type": "string" },
-                    "new_string": { "type": "string" }
-                },
-                "required": ["path", "old_string", "new_string"]
-            })),
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "old_string": { "type": "string" },
+                        "new_string": { "type": "string" }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                })),
+            },
         },
-    },
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "run_command".to_string(),
-            description: Some(
-                "Execute a shell command in the sandbox directory. Returns stdout, \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "run_command".to_string(),
+                description: Some(
+                    "Execute a shell command in the sandbox directory. Returns stdout, \
                  stderr, and exit status. Use this to run tests, builds, git, and \
                  other development commands. The command is killed after \
                  `timeout_ms` (default 120s, max 600s). Combined output is \
                  truncated past 30 KiB."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "workdir": { "type": "string", "description": "Working directory relative to sandbox (default: \".\")" },
-                    "timeout_ms": { "type": "integer", "description": "Kill the command after this many milliseconds (default 120000, max 600000)" }
-                },
-                "required": ["command"]
-            })),
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "workdir": { "type": "string", "description": "Working directory relative to sandbox (default: \".\")" },
+                        "timeout_ms": { "type": "integer", "description": "Kill the command after this many milliseconds (default 120000, max 600000)" }
+                    },
+                    "required": ["command"]
+                })),
+            },
         },
-    },
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "list_files".to_string(),
-            description: Some(
-                "List files and directories in a given path. Directories are \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "list_files".to_string(),
+                description: Some(
+                    "List files and directories in a given path. Directories are \
                  suffixed with \"/\". Returns one entry per line."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Directory path relative to sandbox (default: \".\")" }
-                },
-                "required": []
-            })),
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory path relative to sandbox (default: \".\")" }
+                    },
+                    "required": []
+                })),
+            },
         },
-    },
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "search_files".to_string(),
-            description: Some(
-                "Search for a regex pattern in files under a directory. Returns \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "search_files".to_string(),
+                description: Some(
+                    "Search for a regex pattern in files under a directory. Returns \
                  matching lines as path:line:content, skipping build artifacts \
                  (target/, node_modules/, .git/). Capped at 200 matches."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "pattern": { "type": "string" }
-                },
-                "required": ["path", "pattern"]
-            })),
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "pattern": { "type": "string" }
+                    },
+                    "required": ["path", "pattern"]
+                })),
+            },
         },
-    },
-    ToolDef {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: "update_tasks".to_string(),
-            description: Some(
-                "Update the session task list shown to the user. Send the FULL \
+        ToolDef {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "update_tasks".to_string(),
+                description: Some(
+                    "Update the session task list shown to the user. Send the FULL \
                  list each call — it replaces the current one. Use this at the \
                  start of multi-step work to lay out the plan, and after each \
                  step to report progress. Mark exactly one task in-progress at \
                  a time."
-                    .to_string(),
-            ),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "description": "The complete task list; replaces the current list.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": { "type": "string", "description": "Stable id, e.g. \"1\", \"2\"" },
-                                "title": { "type": "string", "description": "Short imperative summary" },
-                                "description": { "type": "string", "description": "Optional longer detail" },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in-progress", "completed", "failed", "cancelled"],
-                                    "description": "Default: pending"
-                                }
-                            },
-                            "required": ["id", "title"]
+                        .to_string(),
+                ),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tasks": {
+                            "type": "array",
+                            "description": "The complete task list; replaces the current list.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Stable id, e.g. \"1\", \"2\"" },
+                                    "title": { "type": "string", "description": "Short imperative summary" },
+                                    "description": { "type": "string", "description": "Optional longer detail" },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in-progress", "completed", "failed", "cancelled"],
+                                        "description": "Default: pending"
+                                    }
+                                },
+                                "required": ["id", "title"]
+                            }
                         }
-                    }
-                },
-                "required": ["tasks"]
-            })),
+                    },
+                    "required": ["tasks"]
+                })),
+            },
         },
-    }]
+    ]
 }
 
 /// Sandbox policy: all file operations are restricted to this directory.
@@ -311,9 +313,8 @@ impl Sandbox {
         Self { root }
     }
 
-    /// Resolve a user-provided path against the sandbox root, verifying it
-    /// does not escape the sandbox. Works for paths that don't exist yet
-    /// (write operations) by canonicalizing the existing prefix.
+    /// Resolve a user-provided path against the sandbox root, verifying it does not escape the sandbox.
+    /// Works for paths that don't exist yet (write operations) by canonicalizing the existing prefix.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let joined = self.root.join(path);
         // Canonicalize the longest existing prefix, then re-append the rest.
@@ -324,11 +325,11 @@ impl Sandbox {
                 let mut components = joined.components();
                 let mut existing = PathBuf::new();
                 for component in &mut components {
-                    let candidate = existing.join(&component);
+                    let candidate = existing.join(component);
                     if candidate.exists() {
-                        existing = candidate.canonicalize().map_err(|e| {
-                            format!("path error: {e}")
-                        })?;
+                        existing = candidate
+                            .canonicalize()
+                            .map_err(|e| format!("path error: {e}"))?;
                     } else {
                         existing = existing.join(component);
                         // Remaining components are appended as-is (no canonicalize).
@@ -342,9 +343,10 @@ impl Sandbox {
             }
         };
         // Strip trailing symlinks/dots and compare against canonical root.
-        let root_canonical = self.root.canonicalize().map_err(|e| {
-            format!("sandbox root error: {e}")
-        })?;
+        let root_canonical = self
+            .root
+            .canonicalize()
+            .map_err(|e| format!("sandbox root error: {e}"))?;
         // For escape detection, compare using the canonical prefix.
         if !canonical.starts_with(&root_canonical) {
             return Err("path escapes sandbox".to_string());
@@ -353,14 +355,11 @@ impl Sandbox {
     }
 }
 
-/// Execute a tool call within the sandbox. Returns the result as a string
-/// suitable for injection as a `tool`-role message.
-///
-/// `update_tasks` is handled by the worker's agentic loop (it targets the UI,
-/// not the filesystem) and falls through to the unknown-tool error here.
+/// Execute a tool call within the sandbox. Returns the result
+/// as a string suitable for injection as a `tool`-role message.
 pub fn execute_tool(call: &ToolCallMsg, sandbox: &Sandbox) -> Result<String, String> {
-    let args: serde_json::Value = serde_json::from_str(&call.arguments)
-        .map_err(|e| format!("invalid arguments: {e}"))?;
+    let args: serde_json::Value =
+        serde_json::from_str(&call.arguments).map_err(|e| format!("invalid arguments: {e}"))?;
     match call.name.as_str() {
         "read_file" => {
             let path = args["path"].as_str().ok_or("missing path")?;
@@ -406,8 +405,7 @@ pub fn execute_tool(call: &ToolCallMsg, sandbox: &Sandbox) -> Result<String, Str
             let old = args["old_string"].as_str().ok_or("missing old_string")?;
             let new = args["new_string"].as_str().ok_or("missing new_string")?;
             let full = sandbox.resolve(path)?;
-            let existing =
-                fs::read_to_string(&full).map_err(|e| format!("read error: {e}"))?;
+            let existing = fs::read_to_string(&full).map_err(|e| format!("read error: {e}"))?;
             if !existing.contains(old) {
                 return Err("old_string not found in file".to_string());
             }
@@ -493,12 +491,8 @@ pub fn execute_tool(call: &ToolCallMsg, sandbox: &Sandbox) -> Result<String, Str
     }
 }
 
-/// Execute a tool call with a pre-execution checkpoint of every file the call
-/// will modify. The snapshot persists only when the tool succeeds, so a
-/// failed call never pollutes the checkpoint list. `mcp_*` tool names are
-/// routed to the MCP manager instead of the sandbox. This is the single choke
-/// point for tool execution from both the worker (auto-exec) and the UI
-/// (approval) paths.
+/// Execute a tool call with a pre-execution checkpoint of every file the call will modify.
+/// The snapshot persists only when the tool succeeds, so a failed call never pollutes the.
 pub fn execute_tool_checked(
     call: &ToolCallMsg,
     sandbox: &Sandbox,
@@ -523,9 +517,8 @@ pub fn execute_tool_checked(
     result
 }
 
-/// Run `sh -c <command>` with a wall-clock timeout. Stdout/stderr are drained
-/// on reader threads so a chatty child can't deadlock on a full pipe, and the
-/// combined result is truncated past MAX_CMD_BYTES keeping head and tail.
+/// Run `sh -c <command>` with a wall-clock timeout.
+/// Stdout/stderr are drained on reader threads so a chatty child can't deadlock on a full.
 fn run_shell_command(
     command: &str,
     cwd: &std::path::Path,
@@ -545,18 +538,16 @@ fn run_shell_command(
 
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
-    let out_reader =
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out_pipe.read_to_end(&mut buf);
-            buf
-        });
-    let err_reader =
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = err_pipe.read_to_end(&mut buf);
-            buf
-        });
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
 
     let start = std::time::Instant::now();
     let (status, timed_out) = loop {
@@ -589,7 +580,9 @@ fn run_shell_command(
         ),
         (false, Some(s)) => format!(
             "exit {}\n{}\n{}",
-            s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            s.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
             stdout,
             stderr
         ),
@@ -600,14 +593,30 @@ fn run_shell_command(
 
 /// Truncate `s` to at most `max_bytes`, keeping the head and tail with a
 /// marker in the middle so both the start and end of the output survive.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 fn cap_head_tail(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
     let head = max_bytes * 3 / 4;
     let tail = max_bytes / 4;
-    let head = s.floor_char_boundary(head);
-    let tail = s.ceil_char_boundary(s.len() - tail);
+    let head = floor_char_boundary(s, head);
+    let tail = ceil_char_boundary(s, s.len() - tail);
     format!(
         "{}\n[… {} bytes omitted …]\n{}",
         &s[..head],
@@ -702,7 +711,10 @@ mod tests {
             arguments: serde_json::json!({"path": "test.txt"}).to_string(),
         };
         // read_file returns cat -n style line-numbered output.
-        assert_eq!(execute_tool(&read_call, &sb).unwrap(), "     1\thello world\n");
+        assert_eq!(
+            execute_tool(&read_call, &sb).unwrap(),
+            "     1\thello world\n"
+        );
     }
 
     #[test]
@@ -712,15 +724,15 @@ mod tests {
         let write_call = ToolCallMsg {
             id: "1".into(),
             name: "write_file".into(),
-            arguments: serde_json::json!({"path": "a.txt", "content": "hello world"})
-                .to_string(),
+            arguments: serde_json::json!({"path": "a.txt", "content": "hello world"}).to_string(),
         };
         execute_tool(&write_call, &sb).unwrap();
         let edit_call = ToolCallMsg {
             id: "2".into(),
             name: "edit_file".into(),
-            arguments: serde_json::json!({"path": "a.txt", "old_string": "world", "new_string": "rust"})
-                .to_string(),
+            arguments:
+                serde_json::json!({"path": "a.txt", "old_string": "world", "new_string": "rust"})
+                    .to_string(),
         };
         assert_eq!(execute_tool(&edit_call, &sb).unwrap(), "edited");
         let read_call = ToolCallMsg {
@@ -728,7 +740,10 @@ mod tests {
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "a.txt"}).to_string(),
         };
-        assert_eq!(execute_tool(&read_call, &sb).unwrap(), "     1\thello rust\n");
+        assert_eq!(
+            execute_tool(&read_call, &sb).unwrap(),
+            "     1\thello rust\n"
+        );
     }
 
     #[test]
@@ -740,8 +755,7 @@ mod tests {
         let call = ToolCallMsg {
             id: "1".into(),
             name: "read_file".into(),
-            arguments: serde_json::json!({"path": "big.txt", "offset": 4, "limit": 2})
-                .to_string(),
+            arguments: serde_json::json!({"path": "big.txt", "offset": 4, "limit": 2}).to_string(),
         };
         let out = execute_tool(&call, &sb).unwrap();
         assert!(out.contains("     4\tline4\n"));
@@ -773,8 +787,7 @@ mod tests {
         let call = ToolCallMsg {
             id: "1".into(),
             name: "run_command".into(),
-            arguments: serde_json::json!({"command": "sleep 30", "timeout_ms": 200})
-                .to_string(),
+            arguments: serde_json::json!({"command": "sleep 30", "timeout_ms": 200}).to_string(),
         };
         let start = std::time::Instant::now();
         let out = execute_tool(&call, &sb).unwrap();
@@ -844,7 +857,8 @@ mod tests {
 
     #[test]
     fn strip_tool_markup_removes_known_tags() {
-        let hermes = r#"Let me check. <tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>"#;
+        let hermes =
+            r#"Let me check. <tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>"#;
         assert_eq!(strip_tool_markup(hermes), "Let me check.");
         let lfm = "ok<|tool_call_start|>[read_file(path=\"a\")]<|tool_call_end|>done";
         assert_eq!(strip_tool_markup(lfm), "ok\ndone");
@@ -876,8 +890,9 @@ mod tests {
         let edit_call = ToolCallMsg {
             id: "2".into(),
             name: "edit_file".into(),
-            arguments: serde_json::json!({"path": "a.txt", "old_string": "missing", "new_string": "x"})
-                .to_string(),
+            arguments:
+                serde_json::json!({"path": "a.txt", "old_string": "missing", "new_string": "x"})
+                    .to_string(),
         };
         assert!(execute_tool(&edit_call, &sb).is_err());
     }

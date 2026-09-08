@@ -1,10 +1,10 @@
 //! Backend tests verifying tensor storage creation, quant conversions, and
 //! backend device parity between CPU and GPU backends.
 
-use std::sync::Arc;
+use grim_backend_cpu::CpuStorage;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::{Device, QuantProvenance, Shape, Tensor};
-use grim_backend_cpu::CpuStorage;
+use std::sync::Arc;
 
 #[test]
 fn test_tensor_storage_and_shape_properties() {
@@ -20,7 +20,13 @@ fn test_tensor_storage_and_shape_properties() {
 
     let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
     let storage = Arc::new(CpuStorage::new(data, shape.clone(), dtype.clone()));
-    let t = Tensor::new(storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+    let t = Tensor::new(
+        storage,
+        shape,
+        dtype,
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
     assert_eq!(t.shape().dims(), &[2, 4]);
 }
 

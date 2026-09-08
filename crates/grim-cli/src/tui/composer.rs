@@ -1,7 +1,5 @@
 //! Input composer managing text editing, cursor navigation, and input history.
-//!
 //! Owns character buffer, cursor position, and history ring.
-//! Ensures cursor remains within unicode scalar boundaries and survives terminal resize.
 
 use crate::tui::kill_ring::{KillPushOpts, KillRing};
 use crate::tui::undo_stack::UndoStack;
@@ -165,9 +163,7 @@ impl Composer {
     }
 
     /// Kill from cursor to end of the current logical line (Ctrl+K).
-    ///
     /// Returns the killed text, if any, and pushes it to the kill-ring.
-    /// Consecutive kills accumulate into one ring entry.
     pub fn kill_to_end(&mut self) -> Option<String> {
         let (row_start, row_end) = self.current_logical_line_bounds();
         let _ = row_start;
@@ -226,10 +222,8 @@ impl Composer {
         // Replace the previously yanked span. No undo push: yank and yank-pop
         // are one undo unit, so the push was already done at yank time.
         self.chars.drain(start..end);
-        let mut insert_at = start;
-        for ch in text.chars() {
+        for (insert_at, ch) in (start..).zip(text.chars()) {
             self.chars.insert(insert_at, ch);
-            insert_at += 1;
         }
         // Adjust cursor and span for the new length.
         let new_end = start + text.chars().count();
@@ -256,7 +250,12 @@ impl Composer {
     pub fn jump_backward(&mut self, target: char) -> bool {
         let target_lower = target.to_lowercase().next().unwrap_or(target);
         for idx in (0..self.cursor).rev() {
-            if self.chars[idx].to_lowercase().next().unwrap_or(self.chars[idx]) == target_lower {
+            if self.chars[idx]
+                .to_lowercase()
+                .next()
+                .unwrap_or(self.chars[idx])
+                == target_lower
+            {
                 self.cursor = idx;
                 self.last_yank_span = None;
                 self.last_kill_was_cut = false;
@@ -429,12 +428,10 @@ impl Composer {
     pub fn submit(&mut self) -> String {
         let text = self.text();
         let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            if self.history.last().map(|s| s.as_str()) != Some(trimmed) {
-                self.history.push(trimmed.to_string());
-                if self.history.len() > self.max_history {
-                    self.history.remove(0);
-                }
+        if !trimmed.is_empty() && self.history.last().map(|s| s.as_str()) != Some(trimmed) {
+            self.history.push(trimmed.to_string());
+            if self.history.len() > self.max_history {
+                self.history.remove(0);
             }
         }
         self.clear();

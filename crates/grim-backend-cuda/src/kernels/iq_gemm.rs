@@ -1,9 +1,5 @@
 //! IQ2/IQ3/IQ4 family fused dequantization GEMM CUDA kernels.
-//!
-//! Implements native CUDA fwd+bwd kernels for all IQ quant formats:
-//! IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS.
-//!
-//! Block layouts match grim-quant's CPU reference exactly so parity tests pass.
+//! Implements native CUDA fwd+bwd kernels for all IQ quant formats: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,.
 
 pub const IQ_GEMM_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -11,9 +7,7 @@ pub const IQ_GEMM_SOURCE: &str = r#"
 
 extern "C" {
 
-// ---------------------------------------------------------------------------
 // FP16 → float helper (no __half2float in all runtimes)
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float fp16_to_float_device(unsigned short h) {
     unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
     unsigned int e = ((unsigned int)(h & 0x7C00u)) << 13;
@@ -27,9 +21,7 @@ __device__ __forceinline__ float fp16_to_float_device(unsigned short h) {
     return __uint_as_float(s | e | m | 0x38000000u);
 }
 
-// ---------------------------------------------------------------------------
 // Per-format dequant device functions
-// ---------------------------------------------------------------------------
 
 __device__ __forceinline__ float dequant_iq2xxs(const unsigned char* blk, int in_sb) {
     float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
@@ -134,9 +126,7 @@ __device__ __forceinline__ float dequant_iq4xs(const unsigned char* blk, int in_
     return d * (float)sc_val * (float)q_code;
 }
 
-// ---------------------------------------------------------------------------
 // Macro to emit forward + backward GEMM for each IQ format
-// ---------------------------------------------------------------------------
 
 #define GRIM_IQ_FWD_KERNEL(NAME, FMT, BLOCK_BYTES) \
 __global__ void grim_fused_dequant_gemm_##NAME( \

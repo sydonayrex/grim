@@ -1,7 +1,6 @@
 //! On-device fused linear cross-entropy kernels.
 
-/// Design B: Threadblock-parallel vocabulary scan with warp-level shuffle reduction
-/// and online logsumexp combination across threads.
+/// Design B: Threadblock-parallel vocabulary scan with warp-level shuffle reduction and online logsumexp combination across threads.
 /// Eliminates single-thread bottleneck on large vocabulary models (128k+).
 pub const FUSED_LINEAR_CE_KERNEL_SOURCE: &str = r#"
 __device__ __forceinline__ float warp_reduce_max(float val) {

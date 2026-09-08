@@ -1,8 +1,5 @@
 //! Qwen3.5 / Qwen3.8 hybrid SSM (Mamba) + GQA Attention + SwiGLU FFN.
-//!
-//! Supports `Qwen3.8-27B` and related hybrid GGUF checkpoints with fused `attn_qkv`,
-//! `attn_gate`, 1D short-convolution SSM layers, full attention intervals, and SwiGLU feed-forward networks.
-//! Supports automatic multi-GPU layer pipelining across available discrete GPUs to fit strictly within VRAM.
+//! Supports `Qwen3.8-27B` and related hybrid GGUF checkpoints with fused `attn_qkv`, `attn_gate`, 1D short-convolution SSM layers,.
 
 use std::sync::Arc;
 
@@ -14,9 +11,7 @@ use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_devic
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
@@ -79,9 +74,7 @@ impl ModelConfig for Qwen35Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Layer Cache
-// ---------------------------------------------------------------------------
 
 pub struct Qwen35LayerCache {
     pub k_cache: Vec<f32>,
@@ -90,10 +83,7 @@ pub struct Qwen35LayerCache {
     pub ssm_state: Vec<f32>,
     pub current_pos: usize,
     /// WI-kv (qwen35): device-resident K/V arenas for full-attention layers.
-    /// History stays on the GPU so decode uploads only the current step's
-    /// rows instead of re-uploading the full context per layer per token.
-    /// `Box<dyn BackendStorage>` is not `Clone`; cloned caches (session
-    /// fork/rollback) fall back to the host vectors and re-grow lazily.
+    /// History stays on the GPU so decode uploads only the current step's rows instead of.
     #[doc(hidden)]
     pub k_device: Option<Box<dyn grim_tensor::BackendStorage>>,
     #[doc(hidden)]
@@ -151,9 +141,7 @@ impl Qwen35LayerCache {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct Qwen35Block {
     pub device: Device,
@@ -400,26 +388,17 @@ impl Qwen35Block {
 
         if self.is_full_attention {
             // Attention path with separated wq, wk, wv.
-            // GPU-first: projections stay on-device; RoPE runs through the
-            // device kernel; K/V are appended into the device arenas D2D.
-            // Only the (small) per-step Q rows cross to host for the
-            // arena-attention entry point.
+            // GPU-first: projections stay on-device; RoPE runs through the device kernel; K/V are appended into the.
             let dev = pick_device_for_storage_device(&device);
             // Some TP-sharded projections emit padded rows — cut to the
             // exact [seq, width] extent via a D2D staging copy when needed.
             let exact = |t: Tensor, rows: usize, width: usize| -> Result<Tensor> {
                 let want = Shape::new(vec![rows, width]);
                 if t.shape().elem_count() == rows * width {
-                    return Ok(crate::block::reshaped_view(&t, &want)?);
+                    return crate::block::reshaped_view(&t, &want);
                 }
                 let scratch = dev.alloc_storage(&want, DType::F32)?;
-                dev.copy_slice_range(
-                    scratch.as_ref(),
-                    0,
-                    t.storage().as_ref(),
-                    0,
-                    rows * width,
-                )?;
+                dev.copy_slice_range(scratch.as_ref(), 0, t.storage().as_ref(), 0, rows * width)?;
                 Ok(Tensor::new(
                     scratch.into(),
                     want,
@@ -430,41 +409,37 @@ impl Qwen35Block {
             };
 
             let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
-            let rope_ext =
-                |t: &Tensor, heads: usize| -> Result<Tensor> {
-                    let mut pos_ext = Vec::with_capacity(seq_len * heads);
-                    for &pos in positions {
-                        for _ in 0..heads {
-                            pos_ext.push(pos);
-                        }
+            let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
+                let mut pos_ext = Vec::with_capacity(seq_len * heads);
+                for &pos in positions {
+                    for _ in 0..heads {
+                        pos_ext.push(pos);
                     }
-                    let t3 = crate::block::reshaped_view(
-                        t,
-                        &Shape::new(vec![1, seq_len * heads, self.head_dim]),
-                    )?;
-                    let (rope_s, _) = dev.rope(
-                        t3.storage().as_ref(),
-                        &pos_ext,
-                        &rope_cfg,
-                        t3.shape(),
-                    )?;
-                    let roped = Tensor::new(
-                        rope_s.into(),
-                        t3.shape().clone(),
-                        DType::F32,
-                        t.provenance().clone(),
-                        t.device().clone(),
-                    );
-                    crate::block::reshaped_view(
-                        &roped,
-                        &Shape::new(vec![seq_len, heads * self.head_dim]),
-                    )
-                };
+                }
+                let t3 = crate::block::reshaped_view(
+                    t,
+                    &Shape::new(vec![1, seq_len * heads, self.head_dim]),
+                )?;
+                let (rope_s, _) =
+                    dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape())?;
+                let roped = Tensor::new(
+                    rope_s.into(),
+                    t3.shape().clone(),
+                    DType::F32,
+                    t.provenance().clone(),
+                    t.device().clone(),
+                );
+                crate::block::reshaped_view(
+                    &roped,
+                    &Shape::new(vec![seq_len, heads * self.head_dim]),
+                )
+            };
 
             let q_dev = match self.wq.as_ref() {
                 Some(wq) => exact(wq.forward(&x_normed)?, seq_len, q_dim)?,
                 None => Tensor::new(
-                    dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?.into(),
+                    dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                        .into(),
                     Shape::new(vec![seq_len, q_dim]),
                     DType::F32,
                     x_normed.provenance().clone(),
@@ -474,7 +449,8 @@ impl Qwen35Block {
             let k_dev_t = match self.wk.as_ref() {
                 Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
                 None => Tensor::new(
-                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?.into(),
+                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
+                        .into(),
                     Shape::new(vec![seq_len, kv_dim]),
                     DType::F32,
                     x_normed.provenance().clone(),
@@ -484,7 +460,8 @@ impl Qwen35Block {
             let v_dev_t = match self.wv.as_ref() {
                 Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
                 None => Tensor::new(
-                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?.into(),
+                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
+                        .into(),
                     Shape::new(vec![seq_len, kv_dim]),
                     DType::F32,
                     x_normed.provenance().clone(),
@@ -570,8 +547,8 @@ impl Qwen35Block {
                     0,
                     kv_elems,
                 )?;
-                cache.k_device = Some(k_grown.into());
-                cache.v_device = Some(v_grown.into());
+                cache.k_device = Some(k_grown);
+                cache.v_device = Some(v_grown);
             }
 
             let total_kv = cache.current_pos + seq_len;
@@ -590,8 +567,7 @@ impl Qwen35Block {
             out_branch = attn_tensor.to_vec_f32()?;
         } else {
             // SSM short-conv path with fused attn_qkv.
-            // GPU-first: conv runs on device via short_conv1d wrapper; state
-            // is uploaded/downloaded around the device call.
+            // GPU-first: conv runs on device via short_conv1d wrapper; state is uploaded/downloaded around the device call.
             if let Some(ref qkv_lin) = self.attn_qkv {
                 let qkv = qkv_lin.forward(&x_normed)?;
                 let qkv_vec = qkv.to_vec_f32()?;
@@ -609,7 +585,8 @@ impl Qwen35Block {
 
                         // Build per-token input [1, 1, num_feats] for device conv
                         let tok_data = &qkv_vec[base..base + num_feats];
-                        let x_storage = dev.from_cpu(tok_data, &Shape::new(vec![1, 1, num_feats]), DType::F32)?;
+                        let x_storage =
+                            dev.from_cpu(tok_data, &Shape::new(vec![1, 1, num_feats]), DType::F32)?;
                         let x_tok = Tensor::new(
                             Arc::from(x_storage),
                             Shape::new(vec![1, 1, num_feats]),
@@ -619,7 +596,11 @@ impl Qwen35Block {
                         );
 
                         // Build conv weight [num_feats, l_conv] (depthwise)
-                        let w_storage = dev.from_cpu(&w[..num_feats * l_conv], &Shape::new(vec![num_feats, l_conv]), DType::F32)?;
+                        let w_storage = dev.from_cpu(
+                            &w[..num_feats * l_conv],
+                            &Shape::new(vec![num_feats, l_conv]),
+                            DType::F32,
+                        )?;
                         let w_tensor = Tensor::new(
                             Arc::from(w_storage),
                             Shape::new(vec![num_feats, l_conv]),
@@ -629,12 +610,18 @@ impl Qwen35Block {
                         );
 
                         // Upload conv state to device
-                        let state_data = if state_len_per_feat > 0 && cache.conv_state.len() >= num_feats * state_len_per_feat {
+                        let state_data = if state_len_per_feat > 0
+                            && cache.conv_state.len() >= num_feats * state_len_per_feat
+                        {
                             cache.conv_state[..num_feats * state_len_per_feat].to_vec()
                         } else {
                             vec![0.0f32; num_feats * state_len_per_feat.max(1)]
                         };
-                        let state_storage = dev.from_cpu(&state_data, &Shape::new(vec![1, state_len_per_feat.max(1), num_feats]), DType::F32)?;
+                        let state_storage = dev.from_cpu(
+                            &state_data,
+                            &Shape::new(vec![1, state_len_per_feat.max(1), num_feats]),
+                            DType::F32,
+                        )?;
                         let mut state_tensor = Tensor::new(
                             Arc::from(state_storage),
                             Shape::new(vec![1, state_len_per_feat.max(1), num_feats]),
@@ -654,8 +641,11 @@ impl Qwen35Block {
                         // Download result and updated state
                         let conv_vec = conv_result.to_vec_f32()?;
                         let state_new = state_tensor.to_vec_f32()?;
-                        if state_len_per_feat > 0 && cache.conv_state.len() >= num_feats * state_len_per_feat {
-                            cache.conv_state[..num_feats * state_len_per_feat].copy_from_slice(&state_new[..num_feats * state_len_per_feat]);
+                        if state_len_per_feat > 0
+                            && cache.conv_state.len() >= num_feats * state_len_per_feat
+                        {
+                            cache.conv_state[..num_feats * state_len_per_feat]
+                                .copy_from_slice(&state_new[..num_feats * state_len_per_feat]);
                         }
 
                         // Apply silu (elementwise on CPU — data already downloaded)
@@ -715,9 +705,7 @@ impl Qwen35Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Full Model
-// ---------------------------------------------------------------------------
 
 pub struct Qwen35 {
     pub cfg: Qwen35Config,
@@ -908,11 +896,7 @@ impl CausalLm for Qwen35 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
-
-
 
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {
     if device == &Device::Cpu {
@@ -929,7 +913,6 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
         ))
     }
 }
-
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
@@ -968,6 +951,7 @@ pub(crate) fn apply_rope_neox(
 mod tests {
     use super::*;
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_qwen35_shortconv_recurrent_state_advances() {
         let mut cfg = Qwen35Config::default();
@@ -991,16 +975,43 @@ mod tests {
 
         let block = Qwen35Block {
             device: Device::Cpu,
-            attn_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
+            attn_norm: RmsNorm::new(
+                cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
+                1e-6,
+            ),
             wq: None,
             wk: None,
             wv: None,
             wo: None,
             attn_q_norm: None,
             attn_k_norm: None,
-            attn_qkv: Some(Linear::from_tensor(cpu_tensor(vec![0.1; (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size], Shape::new(vec![q_dim + 2 * cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size])), None)),
-            attn_gate: Some(Linear::from_tensor(cpu_tensor(vec![0.1; q_dim * cfg.hidden_size], Shape::new(vec![q_dim, cfg.hidden_size])), None)),
-            ssm_out: Some(Linear::from_tensor(cpu_tensor(vec![0.1; cfg.hidden_size * q_dim], Shape::new(vec![cfg.hidden_size, q_dim])), None)),
+            attn_qkv: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size],
+                    Shape::new(vec![
+                        q_dim + 2 * cfg.num_kv_heads * cfg.head_dim,
+                        cfg.hidden_size,
+                    ]),
+                ),
+                None,
+            )),
+            attn_gate: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; q_dim * cfg.hidden_size],
+                    Shape::new(vec![q_dim, cfg.hidden_size]),
+                ),
+                None,
+            )),
+            ssm_out: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; cfg.hidden_size * q_dim],
+                    Shape::new(vec![cfg.hidden_size, q_dim]),
+                ),
+                None,
+            )),
             ssm_conv1d: None,
             ssm_conv_vec: Some(conv_w),
             ssm_a: None,
@@ -1008,10 +1019,34 @@ mod tests {
             ssm_beta: None,
             ssm_dt_bias: None,
             ssm_norm: None,
-            post_attention_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
-            ffn_gate: Linear::from_tensor(cpu_tensor(vec![0.1; cfg.intermediate_size * cfg.hidden_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
-            ffn_up: Linear::from_tensor(cpu_tensor(vec![0.1; cfg.intermediate_size * cfg.hidden_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
-            ffn_down: Linear::from_tensor(cpu_tensor(vec![0.1; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.hidden_size, cfg.intermediate_size])), None),
+            post_attention_norm: RmsNorm::new(
+                cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
+                1e-6,
+            ),
+            ffn_gate: Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; cfg.intermediate_size * cfg.hidden_size],
+                    Shape::new(vec![cfg.intermediate_size, cfg.hidden_size]),
+                ),
+                None,
+            ),
+            ffn_up: Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; cfg.intermediate_size * cfg.hidden_size],
+                    Shape::new(vec![cfg.intermediate_size, cfg.hidden_size]),
+                ),
+                None,
+            ),
+            ffn_down: Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; cfg.hidden_size * cfg.intermediate_size],
+                    Shape::new(vec![cfg.hidden_size, cfg.intermediate_size]),
+                ),
+                None,
+            ),
             is_full_attention: false,
             layer_idx: 0,
             num_heads: cfg.num_heads,
@@ -1022,11 +1057,19 @@ mod tests {
             intermediate_size: cfg.intermediate_size,
         };
 
-        let x = cpu_tensor(vec![1.0; 2 * cfg.hidden_size], Shape::new(vec![2, cfg.hidden_size]));
-        let out = block.forward(&x, &[0, 1], &mut cache).expect("forward recurrent layer");
+        let x = cpu_tensor(
+            vec![1.0; 2 * cfg.hidden_size],
+            Shape::new(vec![2, cfg.hidden_size]),
+        );
+        let out = block
+            .forward(&x, &[0, 1], &mut cache)
+            .expect("forward recurrent layer");
         assert_eq!(out.shape().dims(), &[2, cfg.hidden_size]);
 
         // State must not be all zeroes after forward pass with non-zero inputs
-        assert_ne!(cache.conv_state, conv_initial, "conv_state must be updated across steps");
+        assert_ne!(
+            cache.conv_state, conv_initial,
+            "conv_state must be updated across steps"
+        );
     }
 }

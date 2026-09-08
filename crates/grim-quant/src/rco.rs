@@ -1,9 +1,5 @@
 //! Riemannian Constrained Optimization (RCO) for bitwidth allocation.
-//!
-//! Formulates the per-tensor mixed-precision allocation under a hard total size budget
-//! as optimization over a Riemannian manifold in logit space. Replaces heuristic
-//! genetic search (EvoPress) with direct projected gradient descent that strictly
-//! satisfies the parameter budget down to the exact byte limit.
+//! Formulates the per-tensor mixed-precision allocation under a hard total size budget as optimization over a.
 
 /// Configuration for Riemannian Constrained Optimization bitwidth search.
 #[derive(Debug, Clone)]
@@ -33,10 +29,7 @@ impl Default for RcoConfig {
 }
 
 /// Run RCO (Riemannian Constrained Optimization) to find optimal per-tensor bitwidths.
-///
-/// Optimizes logit allocation vectors theta_i such that the expected
-/// bitwidth satisfies the target parameter budget exactly via tangent space projection,
-/// then projects to discrete bitwidths via greedy knapsack.
+/// Optimizes logit allocation vectors theta_i such that the expected bitwidth satisfies the target parameter budget.
 pub fn rco_search(
     config: &RcoConfig,
     importance_scores: &[f32],
@@ -73,7 +66,11 @@ pub fn rco_search(
     let imp_sum: f32 = importance_scores.iter().sum::<f32>().max(1e-9);
     let mut theta = vec![vec![0.0f64; k_candidates]; n_tensors];
 
-    for (i, (&imp, _)) in importance_scores.iter().zip(tensor_sizes.iter()).enumerate() {
+    for (i, (&imp, _)) in importance_scores
+        .iter()
+        .zip(tensor_sizes.iter())
+        .enumerate()
+    {
         let norm_imp = (imp / imp_sum) * n_tensors as f32;
         for (k, &bpw) in bpws_f64.iter().enumerate() {
             let dist = (bpw - (config.target_bpw as f64 * norm_imp as f64)).abs();
@@ -172,8 +169,15 @@ pub fn rco_search(
         });
 
         for &i in &indices {
-            while final_genes[i] > config.available_bpws[0] && total_allocated_bits > target_bits_usize {
-                if let Some(&lower) = config.available_bpws.iter().rev().find(|&&b| b < final_genes[i]) {
+            while final_genes[i] > config.available_bpws[0]
+                && total_allocated_bits > target_bits_usize
+            {
+                if let Some(&lower) = config
+                    .available_bpws
+                    .iter()
+                    .rev()
+                    .find(|&&b| b < final_genes[i])
+                {
                     let diff = (final_genes[i] - lower) as usize * tensor_sizes[i];
                     total_allocated_bits -= diff;
                     final_genes[i] = lower;
@@ -231,7 +235,11 @@ mod tests {
         let bitwidths = rco_search(&config, &importance, &sizes, None);
         assert_eq!(bitwidths.len(), sizes.len());
 
-        let total_bits: usize = bitwidths.iter().zip(sizes.iter()).map(|(&b, &s)| b as usize * s).sum();
+        let total_bits: usize = bitwidths
+            .iter()
+            .zip(sizes.iter())
+            .map(|(&b, &s)| b as usize * s)
+            .sum();
         let actual_bpw = total_bits as f32 / total_params as f32;
 
         assert!(

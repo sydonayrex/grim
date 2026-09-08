@@ -1,7 +1,5 @@
 //! Distributed Bloom filter for remote prefix lookup pre-filtering.
-//!
-//! Provides fast sub-millisecond local membership testing to eliminate wasted
-//! network round-trips when querying multi-node disaggregated KV cache tiers.
+//! Provides fast sub-millisecond local membership testing to eliminate wasted network round-trips when querying multi-node disaggregated.
 
 /// Optimal mathematical Bloom filter with Murmur/FNV double-hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,9 +11,7 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     /// Constructs a new bloom filter sized for `expected_items` with target false-positive rate `fp_rate`.
-    ///
-    /// # Sizing Formulas
-    /// $$m = -\frac{n \ln p}{(\ln 2)^2}, \quad k = \frac{m}{n} \ln 2$$
+    /// # Sizing Formulas $$m = -\frac{n \ln p}{(\ln 2)^2}, \quad k = \frac{m}{n} \ln 2$$
     pub fn new(expected_items: usize, fp_rate: f64) -> Self {
         let n = expected_items.max(1) as f64;
         let p = fp_rate.clamp(0.00001, 0.5);
@@ -27,7 +23,7 @@ impl BloomFilter {
         let k = ((num_bits as f64 / n) * ln2).round() as usize;
         let num_hashes = k.clamp(1, 30);
 
-        let words = (num_bits + 63) / 64;
+        let words = num_bits.div_ceil(64);
         Self {
             bits: vec![0u64; words],
             num_bits,

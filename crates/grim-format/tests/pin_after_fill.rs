@@ -1,6 +1,6 @@
+use grim_format::bank::{FillFlags, HostBank};
 use std::io::Write;
 use tempfile::NamedTempFile;
-use grim_format::bank::{HostBank, FillFlags};
 
 #[test]
 fn test_pin_after_fill_lifecycle() {
@@ -17,7 +17,9 @@ fn test_pin_after_fill_lifecycle() {
     file.flush().unwrap();
 
     let mut read_file = std::fs::File::open(file.path()).unwrap();
-    let read_bytes = bank.fill_from_disk(&mut read_file, FillFlags::Standard).expect("fill_from_disk should succeed");
+    let read_bytes = bank
+        .fill_from_disk(&mut read_file, FillFlags::Standard)
+        .expect("fill_from_disk should succeed");
     assert_eq!(read_bytes, size);
 
     assert_eq!(bank.as_slice(), pattern.as_slice());

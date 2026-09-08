@@ -19,16 +19,12 @@ use grim_engine::{
 };
 use grim_format::GgufTokenizer;
 use grim_models_transformer::{Lfm2Config, LlamaConfig};
+use grim_tensor::CoreTensorOps;
 use grim_tensor::Device;
 use std::sync::Arc;
-use grim_tensor::{CoreTensorOps};
 
-/// Resolve the GPU ordinal for this TP rank's process. Only returns `Some`
-/// when multi-process TP is active (`GRIM_TP_SIZE > 1`). Mirrors the ordinal
-/// resolution in `model_loader::resolve_tp_ordinal` and
-/// `RocmDevice::auto_init_rccl` — they all read the same env vars to stay in
-/// sync. Returns `None` for single-device or when the configured ordinal isn't
-/// among the probed devices.
+/// Resolve the GPU ordinal for this TP rank's process.
+/// Only returns `Some` when multi-process TP is active (`GRIM_TP_SIZE > 1`).
 fn tp_ordinal(devices: &[grim_backend_rocm::RocmDevice]) -> Option<usize> {
     let world_size = std::env::var("GRIM_TP_SIZE")
         .ok()
@@ -59,8 +55,6 @@ fn tp_ordinal(devices: &[grim_backend_rocm::RocmDevice]) -> Option<usize> {
 }
 
 /// Auto-detect best available device. Probed once, reused by interactive REPL.
-/// An explicitly requested backend must be available — never silently
-/// degrade to CPU (WS-E1).
 fn probe_device() -> Result<(Device, String)> {
     // `GRIM_BACKEND` is canonical (set by the install script); `GRIM_FORCE_DEVICE`
     // is accepted as a legacy alias for backward compatibility.
@@ -77,12 +71,8 @@ fn backend_unavailable(name: &str, why: &str) -> grim_core::error::Error {
     ))
 }
 
-/// Resolve the device for an explicit selection string (`"rocm"`, `"cuda:1"`,
-/// `"auto"`, ...); `None` means auto-detect. Split from [`probe_device`] so
-/// the unavailable-backend error path is unit-testable without mutating the
-/// process environment. `auto`/unset keep the probe-chain-with-fallback
-/// behavior; any other explicitly named backend that is not compiled in or
-/// has no device is a hard error.
+/// Resolve the device for an explicit selection string (`"rocm"`, `"cuda:1"`, `"auto"`, ...); `None` means auto-detect.
+/// Split from [`probe_device`] so the unavailable-backend error path is unit-testable without mutating the process environment.
 fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
     if let Some(s) = requested
         .map(|s| s.trim().to_ascii_lowercase())
@@ -451,15 +441,11 @@ pub async fn cmd_run(
     let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
         let mut ids = Vec::new();
 
-        // If the tokenizer carries a Jinja chat template, render the
-        // single-turn prompt through it for instruction-tuned models.
+        // If the tokenizer carries a Jinja chat template, render the single-turn prompt through it for instruction-tuned models.
         // Otherwise fall back to raw prompt + best-effort BOS.
         let prompt_text = if tok.chat_template.is_some() {
-            // The chat template itself is responsible for inserting BOS via
-            // `{{ bos_token }}` (grim-format resolves it to the tokenizer's
-            // `<s>` string). We must NOT prepend BOS here — that would
-            // double-inject it for models like MiniCPM5 whose template opens
-            // with `{{- bos_token }}`.
+            // The chat template itself is responsible for inserting BOS via `{{ bos_token }}` (grim-format resolves it to the tokenizer's `<s>` string).
+            // We must NOT prepend BOS here - that would double-inject it for models like MiniCPM5.
             let messages = vec![grim_format::ChatMessage {
                 role: "user".to_string(),
                 content: prompt.clone(),
@@ -1036,10 +1022,8 @@ mod tests {
 
     #[test]
     fn requested_unavailable_backend_errors_loudly() {
-        // On the default (no-cuda) build this exercises the "not compiled in"
-        // path; on a cuda build without a GPU it exercises "no device". In
-        // both cases it must hard-error naming the backend and the env var —
-        // never silently fall back to CPU (WS-E1).
+        // On the default (no-cuda) build this exercises the "not compiled in" path; on a cuda build without a GPU it exercises "no device".
+        // In both cases it must hard-error naming the backend and the env var - never.
         match probe_device_with(Some("cuda")) {
             Err(e) => {
                 let msg = e.to_string();

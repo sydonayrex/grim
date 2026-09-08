@@ -1,8 +1,5 @@
 //! Noise schedulers for diffusion: DDIM and Euler (deterministic).
-//!
-//! A noise scheduler owns a step loop. Sampling is a sequence of:
-//!   predicted_noise = model.denoise_step(latents, timestep, cond)
-//!   next_latents    = scheduler.step(predicted_noise, latents, timestep)
+//! A noise scheduler owns a step loop.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -71,10 +68,8 @@ impl NoiseScheduler for DdimScheduler {
                 lshape, mshape
             )));
         }
-        // DDIM (eta = 0) deterministic update from epsilon-prediction:
-        //   x0_pred = (x_t - sqrt(1 - alpha_t) * eps) / sqrt(alpha_t)
-        //   x_{t-1}  = sqrt(alpha_prev) * x0_pred + sqrt(1 - alpha_prev) * eps
-        // The final step lands on alpha_prev = 1 (clean image).
+        // DDIM (eta = 0) deterministic update from epsilon-prediction: x0_pred = (x_t - sqrt(1 - alpha_t) * eps) / sqrt(alpha_t) x_{t-1}
+        // = sqrt(alpha_prev) * x0_pred + sqrt(1 - alpha_prev) * eps The final step lands on alpha_prev = 1 (clean image).
         let t = timestep as usize;
         let alpha_t = self.alphas_cumprod[t];
         let alpha_prev = if t == 0 {
@@ -99,9 +94,7 @@ impl NoiseScheduler for DdimScheduler {
 }
 
 /// Euler (deterministic) scheduler on the probability-flow ODE.
-///
-/// Follows the same linear beta schedule as DDIM, expressed as the
-/// per-step noise level `sigma = sqrt(1 - alpha_cumprod)`.
+/// Follows the same linear beta schedule as DDIM, expressed as the per-step noise level `sigma.
 #[derive(Debug, Clone)]
 pub struct EulerScheduler {
     /// Descending sigma schedule, length = num_steps.
@@ -121,8 +114,7 @@ impl EulerScheduler {
         }
         let mut sigmas: Vec<f32> = cumprod.iter().map(|a| (1.0 - a).max(0.0).sqrt()).collect();
         alphas.clear();
-        // timesteps descend (N-1..0); sigmas must be in the same order so that
-        // the first denoising step (largest timestep) uses the largest sigma.
+        // timesteps descend (N-1..0); sigmas must be in the same order so that the first denoising step (largest timestep) uses the largest sigma.
         // [P1-35 fix: reverse sigmas to match descending timesteps.]
         sigmas.reverse();
         let timesteps: Vec<u32> = (0..cumprod.len() as u32).rev().collect();

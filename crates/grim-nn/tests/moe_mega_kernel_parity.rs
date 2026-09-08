@@ -78,12 +78,20 @@ fn test_moe_mega_kernel_gpu_parity() {
     let cpu_input = cpu_tensor(input_vec.clone(), Shape::new(vec![batch, hidden]));
 
     // 1. CPU reference output
-    let cpu_out = moe.forward_deterministic(&cpu_input).unwrap().to_vec_f32().unwrap();
+    let cpu_out = moe
+        .forward_deterministic(&cpu_input)
+        .unwrap()
+        .to_vec_f32()
+        .unwrap();
 
     // 2. Upload input to GPU and run mega-kernel
     let rocm_dev = grim_backend_rocm::RocmDevice::try_new(0);
     if let Ok(dev) = rocm_dev {
-        let rocm_storage = dev.from_cpu(&input_vec, &Shape::new(vec![batch, hidden]), grim_tensor::DType::F32);
+        let rocm_storage = dev.from_cpu(
+            &input_vec,
+            &Shape::new(vec![batch, hidden]),
+            grim_tensor::DType::F32,
+        );
         if let Ok(storage) = rocm_storage {
             let gpu_input = Tensor::new(
                 std::sync::Arc::from(storage),
