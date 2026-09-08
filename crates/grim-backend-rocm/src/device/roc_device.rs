@@ -195,7 +195,8 @@ pub struct RocmDevice {
     pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
     /// Resolved-function fast path for `launch_compute_kernel_with_solution`: (entry, grid_x, grid_y) -> hipFunction.
     /// Skips the per-launch kernel source regeneration + seahash + CString work for repeat launches (the.
-    pub(crate) resolved_kernel_cache: Mutex<HashMap<(String, u32, u32, Option<i32>), *mut c_void>>,
+    // SPEED-ROC-12: key entries are interned (&'static str) — the old String key heap-allocated on EVERY launch fast-path lookup.
+    pub(crate) resolved_kernel_cache: Mutex<HashMap<(&'static str, u32, u32, Option<i32>), *mut c_void>>,
     /// Interner for `&'static str` autotune keys (entry / arch).
     /// Each unique string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` / `store_tune_cache` calls reuse it instead.
     pub(crate) str_interner: Mutex<std::collections::HashSet<&'static str>>,
@@ -1546,19 +1547,75 @@ impl RocmDevice {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
         let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
-        let stream = self.active_stream();
-        check_hip("hipMemcpyAsync(H2D)", unsafe {
+        // SPEED-ROC-12: same seam as `upload_from_host_stream_ordered` —
+        // async H2D on the transfer stream + reused completion event, so the
+        // host never blocks on the copy and the next compute dispatch fences
+        // on it via `active_stream()`. The caller-owned pin cannot be kept
+        // alive by the caller past this call, so retain a pinned COPY of the
+        // staging bytes (drained on the next device-wide synchronize, like
+        // every other retained pin) — never free a page-locked source while a
+        // stream-ordered copy may still read it.
+        let xfer = self
+            .get_stream_from_pool(1)
+            .or_else(|| self.get_stream_from_pool(0))
+            .unwrap_or(std::ptr::null_mut());
+        let status = unsafe {
             hipMemcpyAsync(
                 dev_ptr_void,
                 src.as_ptr() as *const c_void,
                 storage.bytes,
                 HipMemcpyKind::HostToDevice,
-                stream,
+                xfer,
             )
-        })?;
-        check_hip("hipStreamSynchronize(H2D)", unsafe {
-            hipStreamSynchronize(stream)
-        })?;
+        };
+        if status != hipSuccess {
+            self.allocator.free(dev_ptr_void, storage.bytes);
+            return Err(Error::Backend(format!(
+                "hipMemcpyAsync(H2D, pinned, stream-ordered) failed with error code {status}"
+            )));
+        }
+        let event = {
+            let mut guard = self
+                .upload_event
+                .lock()
+                .map_err(|_| Error::Backend("upload_event mutex poisoned".into()))?;
+            match *guard {
+                Some(e) => e,
+                None => {
+                    let mut ev: *mut c_void = std::ptr::null_mut();
+                    let r = unsafe { crate::hipEventCreate(&mut ev) };
+                    if r != hipSuccess {
+                        self.allocator.free(dev_ptr_void, storage.bytes);
+                        return Err(Error::Backend(format!(
+                            "hipEventCreate failed with code {r}"
+                        )));
+                    }
+                    *guard = Some(ev);
+                    ev
+                }
+            }
+        };
+        let r = unsafe { crate::hipEventRecord(event, xfer) };
+        if r != hipSuccess {
+            self.allocator.free(dev_ptr_void, storage.bytes);
+            return Err(Error::Backend(format!(
+                "hipEventRecord failed with code {r}"
+            )));
+        }
+        // If we cannot retain a private copy of the staging bytes (alloc
+        // failure or poisoned pin list), fall back to a blocking sync of the
+        // transfer stream — always correct, just slower.
+        let retained = RocmPinnedBuffer::<f32>::from_slice(src.as_slice()).ok();
+        match (retained, self.retained_pins.lock()) {
+            (Some(pin), Ok(mut pins)) => {
+                pins.push(pin);
+            }
+            _ => {
+                check_hip("hipStreamSynchronize(H2D, pinned fallback)", unsafe {
+                    hipStreamSynchronize(xfer)
+                })?;
+            }
+        }
         Ok(Box::new(storage))
     }
 
