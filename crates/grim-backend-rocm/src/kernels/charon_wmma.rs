@@ -57,25 +57,38 @@ extern "C" __global__ void grim_moe_fused_grouped_wmma(
                 fragment<matrix_b, 16, 16, 16, float, col_major> frag_x;
                 fragment<accumulator, 16, 16, 16, float> frag_acc;
 
-                fill_fragment(frag_acc, 0.0f);
-                for (int i = 0; i < hidden; i += 16) {
-                    const float* w_tile = gw + (unsigned long long)j * hidden + i;
-                    const float* a_tile = a + i;
-                    load_matrix_sync(frag_w, w_tile, hidden);
-                    load_matrix_sync(frag_x, a_tile, 1);
-                    mma_sync(frag_acc, frag_w, frag_x, frag_acc);
-                }
-                float h_gate = frag_acc.x[0];
+                // SPEED-ROC-13: rocWMMA tiles are 16x16x16. For hidden >= 16
+                // (all real models) the tiled path is correct and fast; for
+                // hidden < 16 the 16-wide fragment loads would read out of
+                // bounds, so fall back to a scalar dot product.
+                float h_gate = 0.0f;
+                float h_up = 0.0f;
+                if (hidden >= 16) {
+                    fill_fragment(frag_acc, 0.0f);
+                    for (int i = 0; i < hidden; i += 16) {
+                        const float* w_tile = gw + (unsigned long long)j * hidden + i;
+                        const float* a_tile = a + i;
+                        load_matrix_sync(frag_w, w_tile, hidden);
+                        load_matrix_sync(frag_x, a_tile, 1);
+                        mma_sync(frag_acc, frag_w, frag_x, frag_acc);
+                    }
+                    h_gate = frag_acc.x[0];
 
-                fill_fragment(frag_acc, 0.0f);
-                for (int i = 0; i < hidden; i += 16) {
-                    const float* w_tile = uw + (unsigned long long)j * hidden + i;
-                    const float* a_tile = a + i;
-                    load_matrix_sync(frag_w, w_tile, hidden);
-                    load_matrix_sync(frag_x, a_tile, 1);
-                    mma_sync(frag_acc, frag_w, frag_x, frag_acc);
+                    fill_fragment(frag_acc, 0.0f);
+                    for (int i = 0; i < hidden; i += 16) {
+                        const float* w_tile = uw + (unsigned long long)j * hidden + i;
+                        const float* a_tile = a + i;
+                        load_matrix_sync(frag_w, w_tile, hidden);
+                        load_matrix_sync(frag_x, a_tile, 1);
+                        mma_sync(frag_acc, frag_w, frag_x, frag_acc);
+                    }
+                    h_up = frag_acc.x[0];
+                } else {
+                    for (int i = 0; i < hidden; ++i) {
+                        h_gate += gw[(unsigned long long)j * hidden + i] * a[i];
+                        h_up   += uw[(unsigned long long)j * hidden + i] * a[i];
+                    }
                 }
-                float h_up = frag_acc.x[0];
 
                 float silu_g = h_gate / (1.0f + expf(-h_gate));
                 float act = silu_g * h_up;
