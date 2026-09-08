@@ -104,6 +104,10 @@ fn kernels() -> Vec<(&'static str, String)> {
             "fused_dequant_gemm_mxfp4",
             load_kernel("fused_dequant_gemm_mxfp4"),
         ),
+        (
+            "fused_dequant_gemm_nvfp4",
+            load_kernel("fused_dequant_gemm_nvfp4"),
+        ),
         ("kv_dequant_attention", load_kernel("kv_dequant_attention")),
         ("log_softmax_vjp", load_kernel("log_softmax_vjp")),
         ("selective_scan", load_kernel("selective_scan")),
@@ -258,6 +262,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq2s.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_fp8_e4m3.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_mxfp4.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_nvfp4.comp");
     println!("cargo:rerun-if-changed=kernels/kv_dequant_attention.comp");
     println!("cargo:rerun-if-changed=kernels/log_softmax_vjp.comp");
     println!("cargo:rerun-if-changed=kernels/selective_scan.comp");

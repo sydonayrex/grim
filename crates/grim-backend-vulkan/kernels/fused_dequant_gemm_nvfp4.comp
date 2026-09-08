@@ -1,0 +1,117 @@
+// fused_dequant_gemm_nvfp4.comp
+//
+// Fused dequantize-GEMM for NVFP4 (NVIDIA Blackwell 4-bit float with
+// interleaved 1-byte E8M0 scale per 16-element sub-block) weights.
+//
+// Layout:
+//   Weight B is stored as [N, K] in column-major packed form.
+//   Each 16-element sub-block consists of:
+//     1 byte: shared E8M0 exponent
+//     8 bytes: packed E2M1 codes (2 per byte: low nibble = even index, high nibble = odd index)
+//   Total: 9 bytes per 16 weights.
+//
+// Sub-blocks per column: K / 16.
+// Column stride in bytes: (K / 16) * 9.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB { uint B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+// OCP E2M1 4-bit code to f32 base value.
+// Format: bit3=sign, bits[2:1]=exponent, bit0=mantissa
+float mxfp4_e2m1_to_f32(uint code) {
+    bool sign = (code & 0x08u) != 0u;
+    uint exp = (code >> 1u) & 0x03u;
+    uint mant = code & 0x01u;
+
+    float base_val;
+    if (exp == 0u) {
+        base_val = float(mant) * 0.5;
+    } else {
+        base_val = (1.0 + float(mant) * 0.5) * exp2(float(exp) - 1.0);
+    }
+
+    return sign ? -base_val : base_val;
+}
+
+float dequant_nvfp4_element(uint col_bytes_stride, uint col, uint k_idx) {
+    uint sb_idx = k_idx / 16u;
+    uint in_sb = k_idx % 16u;
+    uint blk_offset = col * col_bytes_stride + sb_idx * 9u;
+
+    uint shared_exp = get_byte(blk_offset);
+    float exp_scale = exp2(float(int(shared_exp) - 127));
+
+    uint code_byte = get_byte(blk_offset + 1u + (in_sb / 2u));
+    uint code = (in_sb % 2u == 0u) ? (code_byte & 0x0Fu) : ((code_byte >> 4u) & 0x0Fu);
+
+    return mxfp4_e2m1_to_f32(code) * exp_scale;
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    uint blocks_per_col = K / 16u;
+    uint col_bytes_stride = blocks_per_col * 9u;
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            s_b[ty][tx] = dequant_nvfp4_element(col_bytes_stride, col, k_idx);
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
