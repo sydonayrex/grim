@@ -69,6 +69,25 @@ impl VulkanStorage {
             device,
             physical_device,
             GpuMemoryTier::HostVisible,
+            None,
+        )
+    }
+
+    /// Allocates memory and a buffer on the Vulkan device with explicit byte size (host-visible).
+    pub fn alloc_gpu_with_bytes(
+        shape: &Shape,
+        dtype: DType,
+        device: *mut c_void,
+        physical_device: *mut c_void,
+        explicit_bytes: usize,
+    ) -> Result<Self> {
+        Self::alloc_gpu_inner(
+            shape,
+            dtype,
+            device,
+            physical_device,
+            GpuMemoryTier::HostVisible,
+            Some(explicit_bytes),
         )
     }
 
@@ -86,6 +105,7 @@ impl VulkanStorage {
             device,
             physical_device,
             GpuMemoryTier::DeviceLocal,
+            None,
         )
     }
 
@@ -95,16 +115,21 @@ impl VulkanStorage {
         device: *mut c_void,
         physical_device: *mut c_void,
         tier: GpuMemoryTier,
+        explicit_bytes: Option<usize>,
     ) -> Result<Self> {
-        let bytes = shape
-            .elem_count()
-            .checked_mul(dtype_byte_size(&dtype))
-            .ok_or_else(|| {
-                Error::Backend(format!(
-                    "alloc_gpu: byte count overflow for shape {:?} dtype {:?}",
-                    shape, dtype
-                ))
-            })?;
+        let bytes = if let Some(eb) = explicit_bytes {
+            eb
+        } else {
+            shape
+                .elem_count()
+                .checked_mul(dtype_byte_size(&dtype))
+                .ok_or_else(|| {
+                    Error::Backend(format!(
+                        "alloc_gpu: byte count overflow for shape {:?} dtype {:?}",
+                        shape, dtype
+                    ))
+                })?
+        };
 
         let alloc_bytes = bytes.max(16);
         let buffer_ci = VkBufferCreateInfo {

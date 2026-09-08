@@ -1,0 +1,117 @@
+// fused_dequant_gemm_w8a8_fp8.comp
+//
+// Fused dequantize-GEMM for CompressedTensors W8A8 FP8 (OCP E4M3) weights
+// with per-channel or per-tensor F32 scale.
+//
+// Layout:
+//   BufA: float A[M, K]
+//   BufB: uint B_bytes[]:
+//     [u64 scale_len (8 bytes)]
+//     [float scales (scale_len bytes)]
+//     [uint8 E4M3 codes (K * N bytes)]
+//   BufC: float C[M, N]
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB { uint B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float get_float(uint byte_idx) {
+    uint b0 = get_byte(byte_idx);
+    uint b1 = get_byte(byte_idx + 1u);
+    uint b2 = get_byte(byte_idx + 2u);
+    uint b3 = get_byte(byte_idx + 3u);
+    uint bits = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    return uintBitsToFloat(bits);
+}
+
+// OCP FP8 E4M3 to float
+float fp8_e4m3_to_f32(uint byte_val) {
+    bool sign = (byte_val & 0x80u) != 0u;
+    uint exp = (byte_val >> 3u) & 0x0Fu;
+    uint mant = byte_val & 0x07u;
+
+    if (exp == 15u && mant == 7u) {
+        return 0.0;
+    }
+    float val;
+    if (exp == 0u) {
+        val = float(mant) / 512.0;
+    } else {
+        val = (1.0 + float(mant) / 8.0) * exp2(float(int(exp) - 7));
+    }
+    return sign ? -val : val;
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    // Read scale_len prefix (u64 at offset 0, taking lower 32 bits)
+    uint scale_len = get_byte(0u) | (get_byte(1u) << 8u) | (get_byte(2u) << 16u) | (get_byte(3u) << 24u);
+    uint scales_start = 8u;
+    uint codes_start = 8u + scale_len;
+
+    // Read per-channel scale if available, else per-tensor scale
+    float scale = (scale_len >= N * 4u) ? get_float(scales_start + col * 4u) : get_float(scales_start);
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            uint code = get_byte(codes_start + col * K + k_idx);
+            s_b[ty][tx] = fp8_e4m3_to_f32(code) * scale;
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

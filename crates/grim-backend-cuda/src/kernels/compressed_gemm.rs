@@ -82,5 +82,81 @@ __global__ void grim_awq_dequant_gemm(
     C[row * N + col] = acc;
 }
 
+// OCP FP8 E4M3 dequantization to float
+__device__ __forceinline__ float fp8_e4m3_to_f32_dev(unsigned char byte) {
+    bool sign = (byte & 0x80) != 0;
+    int exp = (byte >> 3) & 0x0F;
+    int mant = byte & 0x07;
+
+    if (exp == 15 && mant == 7) {
+        return 0.0f; // NaN
+    }
+    float val;
+    if (exp == 0) {
+        val = (float)mant / 512.0f;
+    } else {
+        val = (1.0f + (float)mant / 8.0f) * exp2f((float)(exp - 7));
+    }
+    return sign ? -val : val;
+}
+
+// CompressedTensors W8A8 FP8 GEMM:
+// Layout in B_bytes: [u64 scale_len (8 bytes)][scales F32 (scale_len bytes)][FP8 codes (K*N bytes)]
+// Or unpadded scales: scale_len = N * 4 for per-channel scales.
+__global__ void grim_w8a8_fp8_dequant_gemm(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_bytes,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    // Read scale_len prefix
+    unsigned long long scale_len = *((const unsigned long long*)B_bytes);
+    const float* scales = (const float*)(B_bytes + 8);
+    const unsigned char* codes = B_bytes + 8 + scale_len;
+
+    float scale = (scale_len >= (unsigned long long)(N * 4)) ? scales[col] : scales[0];
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        unsigned char code = codes[col * K + k];
+        float w_val = fp8_e4m3_to_f32_dev(code) * scale;
+        acc += A[row * K + k] * w_val;
+    }
+
+    C[row * N + col] = acc;
+}
+
+// CompressedTensors W8A8 INT8 GEMM:
+// Layout in B_bytes: [u64 scale_len (8 bytes)][scales F32 (scale_len bytes)][INT8 codes (K*N bytes)]
+__global__ void grim_w8a8_int8_dequant_gemm(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_bytes,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    unsigned long long scale_len = *((const unsigned long long*)B_bytes);
+    const float* scales = (const float*)(B_bytes + 8);
+    const signed char* codes = (const signed char*)(B_bytes + 8 + scale_len);
+
+    float scale = (scale_len >= (unsigned long long)(N * 4)) ? scales[col] : scales[0];
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        signed char code = codes[col * K + k];
+        float w_val = (float)code * scale;
+        acc += A[row * K + k] * w_val;
+    }
+
+    C[row * N + col] = acc;
+}
+
 }
 "#;

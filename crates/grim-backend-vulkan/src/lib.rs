@@ -2290,7 +2290,18 @@ impl MemoryOps for VulkanDevice {
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
+        let min_bytes = shape
+            .elem_count()
+            .checked_mul(dtype_byte_size(&dtype))
+            .unwrap_or(0)
+            .max(data.len());
+        let storage = VulkanStorage::alloc_gpu_with_bytes(
+            shape,
+            dtype,
+            ctx.device,
+            ctx.physical_device,
+            min_bytes,
+        )?;
 
         let mut mapped: *mut c_void = std::ptr::null_mut();
         let res = unsafe {

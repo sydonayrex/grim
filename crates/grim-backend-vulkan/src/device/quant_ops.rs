@@ -71,6 +71,9 @@ impl QuantOps for VulkanDevice {
                 Storage::FloatPack(FloatPackScheme::NvFp4) => {
                     Some(VulkanKernel::FusedDequantGemmNvFp4)
                 }
+                Storage::CompressedTensorsW8A8Fp8 => Some(VulkanKernel::FusedDequantGemmW8A8Fp8),
+                Storage::CompressedTensorsW8A8Int8 => Some(VulkanKernel::FusedDequantGemmW8A8Int8),
+                Storage::GroupInt(_) | Storage::W4A16(_) => Some(VulkanKernel::MarlinGemm),
                 other => {
                     tracing::warn!(
                         "Vulkan quantized_matmul: no GPU kernel for dtype storage {:?}; \
@@ -172,7 +175,58 @@ impl QuantOps for VulkanDevice {
                     BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
                 })
             }
-            _ => None, // GroupInt, ResidualPacked, Native — handled below.
+            Storage::CompressedTensorsW8A8Fp8 => {
+                let b_bytes_cpu: Vec<u8> = extract_raw_bytes(b_packed)?;
+                // [u64 scale_len][scales F32][FP8 codes]
+                let scale_len = u64::from_le_bytes(b_bytes_cpu[..8].try_into().unwrap()) as usize;
+                let scales = &b_bytes_cpu[8..8 + scale_len];
+                let codes = &b_bytes_cpu[8 + scale_len..];
+                let mut out = Vec::with_capacity(k * n);
+                for col in 0..n {
+                    let scale = if scale_len >= n * 4 {
+                        f32::from_le_bytes(scales[col * 4..col * 4 + 4].try_into().unwrap())
+                    } else {
+                        f32::from_le_bytes(scales[..4].try_into().unwrap())
+                    };
+                    for r in 0..k {
+                        let code = codes[col * k + r];
+                        out.push(grim_quant::fp8_e4m3_to_f32(code) * scale);
+                    }
+                }
+                Some(out)
+            }
+            Storage::CompressedTensorsW8A8Int8 => {
+                let b_bytes_cpu: Vec<u8> = extract_raw_bytes(b_packed)?;
+                let scale_len = u64::from_le_bytes(b_bytes_cpu[..8].try_into().unwrap()) as usize;
+                let scales = &b_bytes_cpu[8..8 + scale_len];
+                let codes = &b_bytes_cpu[8 + scale_len..];
+                let mut out = Vec::with_capacity(k * n);
+                for col in 0..n {
+                    let scale = if scale_len >= n * 4 {
+                        f32::from_le_bytes(scales[col * 4..col * 4 + 4].try_into().unwrap())
+                    } else {
+                        f32::from_le_bytes(scales[..4].try_into().unwrap())
+                    };
+                    for r in 0..k {
+                        let code = codes[col * k + r] as i8;
+                        out.push((code as f32) * scale);
+                    }
+                }
+                Some(out)
+            }
+            Storage::GroupInt(cfg) => {
+                let b_bytes_cpu: Vec<u8> = extract_raw_bytes(b_packed)?;
+                Some(grim_quant::dequant_gptq_group_int(
+                    &b_bytes_cpu,
+                    &[],
+                    &[],
+                    None,
+                    &[k, n],
+                    cfg.bits as u32,
+                    cfg.group_size,
+                )?)
+            }
+            _ => None, // ResidualPacked, Native — handled below.
         };
 
         if let Some(dequantized) = grim_dequant {
