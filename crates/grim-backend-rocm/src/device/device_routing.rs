@@ -1907,13 +1907,17 @@ impl RocmDevice {
             routed_scaling_factor,
             num_experts,
         )?;
+        // SPEED-ROC-9: device-wide sync preserves the "gradients are settled
+        // when this returns" contract without the D2H — the buffers stay in
+        // VRAM for the optimizer / gradient-reduction stage. Host consumers
+        // call CharonBackwardResult::to_cpu().
         self.synchronize();
 
         Ok(CharonBackwardResult {
-            d_gate_w: dgw_storage.to_cpu_vec_f32()?,
-            d_up_w: duw_storage.to_cpu_vec_f32()?,
-            d_down_w: ddw_storage.to_cpu_vec_f32()?,
-            d_x: dx_storage.to_cpu_vec_f32()?,
+            d_gate_w: dgw_storage,
+            d_up_w: duw_storage,
+            d_down_w: ddw_storage,
+            d_x: dx_storage,
         })
     }
 

@@ -63,6 +63,66 @@ pub mod q4k_test_shim {
         dev.launch_fused_dequant_gemm_q4k_tiled(a, b, out, m, n, k)
     }
 
+    /// SPEED-ROC-8: launch a tiled quant fused dequant-GEMM (forward) by
+    /// kernel entry name — see kernels::quant_tiled_gemm.
+    pub fn launch_quant_tiled(
+        dev: &RocmDevice,
+        kernel: &str,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_deq_gemm_tiled(kernel, a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC-8: launch a scalar quant fused dequant-GEMM (forward) by
+    /// kernel entry name — the parity baseline for `launch_quant_tiled`.
+    pub fn launch_quant_scalar(
+        dev: &RocmDevice,
+        kernel: &str,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_deq_gemm_simple(kernel, a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC-8: launch a tiled quant fused dequant-GEMM (backward) by
+    /// kernel entry name.
+    pub fn launch_quant_tiled_backward(
+        dev: &RocmDevice,
+        kernel: &str,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_deq_gemm_tiled_backward(kernel, dy, b, dx, m, n, k)
+    }
+
+    /// SPEED-ROC-8: launch a scalar quant fused dequant-GEMM (backward) by
+    /// kernel entry name.
+    pub fn launch_quant_scalar_backward(
+        dev: &RocmDevice,
+        kernel: &str,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_deq_backward_gemm_simple(kernel, dy, b, dx, m, n, k)
+    }
+
     /// Launch the tiled Q4_K fused dequant-GEMM (backward, dX).
     pub fn launch_backward_tiled(
         dev: &RocmDevice,
