@@ -344,8 +344,6 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_q4k"));
         // SPEED-ROC-6: the LDS-tiled prefill variant rides the same aggregate.
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q4k_tiled"));
-        assert!(KERNEL_SOURCE.contains(
-            "grim_fused_dequant_gemm_q4k_backward_tiled"
-        ));
+        assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q4k_backward_tiled"));
     }
 }

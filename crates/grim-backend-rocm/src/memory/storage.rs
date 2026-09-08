@@ -508,7 +508,7 @@ impl BackendStorage for RocmStorage {
         }
 
         // F16/BF16 storage: the device buffer holds 2-byte elements, but the
-        let result_f32 = match self.dtype.arith {
+        match self.dtype.arith {
             grim_tensor::ArithType::F16 => {
                 let mut raw = vec![0u8; elem_count * 2];
                 check_hip("hipMemcpyDtoH (f16)", unsafe {
@@ -565,8 +565,7 @@ impl BackendStorage for RocmStorage {
                 })?;
                 Ok(host_data)
             }
-        };
-        result_f32
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

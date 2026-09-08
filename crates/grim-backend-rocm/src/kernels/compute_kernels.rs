@@ -362,6 +362,57 @@ extern "C" __global__ void grim_all_reduce_accum_bf16(
     out[i] = hip_bfloat16(acc);
 }
 
+// SPEED-ROC-10: multi-tensor (foreach) fused AdamW step. One launch updates
+// every parameter tensor in the step: p/g/m/v are device arrays of per-tensor
+// pointers, `offsets` is a device [n_tensors+1] prefix-sum of element counts
+// over the concatenated virtual buffer, and each thread binary-searches its
+// flat index to a tensor. Same update math as grim_fused_adamw_step.
+extern "C" __global__ void grim_fused_adamw_step_foreach(
+    float* const* __restrict__ p_list,
+    float* const* __restrict__ g_list,
+    float* const* __restrict__ m_list,
+    float* const* __restrict__ v_list,
+    const int* __restrict__ offsets,
+    int n_tensors,
+    long long total,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bc1,
+    float bc2
+) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride) {
+        int lo = 0, hi = n_tensors - 1, t = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            if (i >= (long long)offsets[mid + 1]) lo = mid + 1;
+            else if (i < (long long)offsets[mid]) hi = mid - 1;
+            else { t = mid; break; }
+        }
+        if (t < 0) continue;
+
+        const long long local = i - (long long)offsets[t];
+        float* p = p_list[t];
+        const float* g = g_list[t];
+        float* m = m_list[t];
+        float* v = v_list[t];
+
+        const float grad = g[local];
+        const float m_val = beta1 * m[local] + (1.0f - beta1) * grad;
+        const float v_val = beta2 * v[local] + (1.0f - beta2) * grad * grad;
+        m[local] = m_val;
+        v[local] = v_val;
+
+        const float m_hat = m_val / bc1;
+        const float v_hat = v_val / bc2;
+        const float param_val = p[local];
+        p[local] = param_val - lr * ((m_hat / (sqrtf(v_hat) + eps)) + weight_decay * param_val);
+    }
+}
+
 // Warp-per-row RMS norm: one warp owns a row; the sum of squares reduces with 5 __shfl_xor butterflies (no barriers).
 // The previous one-thread-per- element form made EVERY thread walk the whole row - O(row_len^2) loads.
 extern "C" __global__ void __launch_bounds__(256)

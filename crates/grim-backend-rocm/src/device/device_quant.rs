@@ -1226,12 +1226,15 @@ impl RocmDevice {
                 Ok("1" | "true" | "on")
             )
         });
-        if tiled_enabled
-            && m >= 16
-            && n >= 64
-            && k % 256 == 0
-        {
-            return self.launch_fused_dequant_gemm_q4k_tiled(a_storage, b_q4k_storage, out_storage, m, n, k);
+        if tiled_enabled && m >= 16 && n >= 64 && k % 256 == 0 {
+            return self.launch_fused_dequant_gemm_q4k_tiled(
+                a_storage,
+                b_q4k_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
         }
 
         const BLOCK_SIZE: usize = 256;
@@ -1280,12 +1283,12 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = a_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k_tiled: a has no device ptr".into()))?;
-        let b_ptr = b_q4k_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k_tiled: b has no device ptr".into()))?;
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q4k_tiled: a has no device ptr".into())
+        })?;
+        let b_ptr = b_q4k_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q4k_tiled: b has no device ptr".into())
+        })?;
         let out_ptr = out_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_dequant_gemm_q4k_tiled: out has no device ptr".into())
         })?;
@@ -1349,7 +1352,12 @@ impl RocmDevice {
         });
         if tiled_enabled && n >= 64 && k % 256 == 0 {
             return self.launch_fused_dequant_gemm_q4k_backward_tiled(
-                dy_storage, b_q4k_storage, dx_storage, m, n, k,
+                dy_storage,
+                b_q4k_storage,
+                dx_storage,
+                m,
+                n,
+                k,
             );
         }
 
@@ -1597,7 +1605,13 @@ impl RocmDevice {
             {
                 let tiled_kernel = format!("grim_fused_dequant_gemm_{}_tiled", tag);
                 return self.launch_fused_deq_gemm_tiled(
-                    &tiled_kernel, a_storage, b_storage, out_storage, m, n, k,
+                    &tiled_kernel,
+                    a_storage,
+                    b_storage,
+                    out_storage,
+                    m,
+                    n,
+                    k,
                 );
             }
         }
@@ -1658,13 +1672,16 @@ impl RocmDevice {
             .and_then(|fmt| Self::tiled_quant_lookup(fmt))
         {
             let (tag, blk) = tag;
-            if Self::tiled_quant_enabled(tag)
-                && n >= 64
-                && k % Self::tiled_k_multiple(blk) == 0
-            {
+            if Self::tiled_quant_enabled(tag) && n >= 64 && k % Self::tiled_k_multiple(blk) == 0 {
                 let tiled_kernel = format!("grim_fused_dequant_gemm_{}_backward_tiled", tag);
                 return self.launch_fused_deq_gemm_tiled_backward(
-                    &tiled_kernel, dy_storage, b_storage, dx_storage, m, n, k,
+                    &tiled_kernel,
+                    dy_storage,
+                    b_storage,
+                    dx_storage,
+                    m,
+                    n,
+                    k,
                 );
             }
         }

@@ -8,7 +8,7 @@
 
 use grim_backend_rocm::device::q4k_test_shim;
 use grim_backend_rocm::{RocmCachingAllocator, RocmDevice, RocmStorage};
-use grim_tensor::dtype::{Storage as DTypeStorage, DType};
+use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::{BackendStorage, Shape};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,14 +36,7 @@ fn fixture() -> Fixture {
 }
 
 fn upload_f32(fx: &Fixture, data: &[f32], dims: &[usize]) -> RocmStorage {
-    RocmStorage::copy_from_host(
-        data,
-        &Shape::new(dims.to_vec()),
-        DType::F32,
-        &fx.alloc,
-        0,
-    )
-    .unwrap()
+    RocmStorage::copy_from_host(data, &Shape::new(dims.to_vec()), DType::F32, &fx.alloc, 0).unwrap()
 }
 
 fn upload_q4k_blob(fx: &Fixture, bytes: &[u8]) -> RocmStorage {
@@ -92,7 +85,9 @@ fn run_kernel(
 /// tiled: 64-wide tiles), so allow a small relative tolerance.
 fn parity_case(m: usize, n: usize, k: usize, atol: f32) {
     let fx = fixture();
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.125 - 0.75).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.125 - 0.75)
+        .collect();
     let blob = make_q4k_blob(n, k);
     let a = upload_f32(&fx, &a_data, &[m, k]);
     let b = upload_q4k_blob(&fx, &blob);
@@ -143,8 +138,7 @@ fn run_kernel_backward(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    let out =
-        RocmStorage::alloc_gpu(&Shape::new(vec![m, k]), DType::F32, &fx.alloc, 0).unwrap();
+    let out = RocmStorage::alloc_gpu(&Shape::new(vec![m, k]), DType::F32, &fx.alloc, 0).unwrap();
     let stream = if tiled {
         q4k_test_shim::launch_backward_tiled(&fx.dev, dy, b, &out, m, n, k)
     } else {
@@ -197,7 +191,9 @@ fn tiled_q4k_prefill_throughput() {
     }
     let fx = fixture();
     let (m, n, k) = (512usize, 4096usize, 4096usize);
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.125 - 0.75).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.125 - 0.75)
+        .collect();
     let blob = make_q4k_blob(n, k);
     let a = upload_f32(&fx, &a_data, &[m, k]);
     let b = upload_q4k_blob(&fx, &blob);
@@ -238,8 +234,8 @@ fn bf16_grad_allreduce_single_gpu_noop() {
     if !gpu_enabled() {
         return;
     }
-    let rccl = grim_backend_rocm::rccl::RcclAllReduce::try_new(&[0])
-        .expect("single-GPU RcclAllReduce");
+    let rccl =
+        grim_backend_rocm::rccl::RcclAllReduce::try_new(&[0]).expect("single-GPU RcclAllReduce");
     for (name, dtype) in [
         ("f32", grim_backend_rocm::rccl::NCCL_FLOAT32),
         ("f16", grim_backend_rocm::rccl::NCCL_FLOAT16),

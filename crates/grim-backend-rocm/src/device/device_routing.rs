@@ -10,8 +10,8 @@ use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 use crate::device::roc_device::{CharonBackwardResult, RocmDevice};
 use crate::memory::storage::RocmStorage;
 use crate::{
-    HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFreeAsync,
-    hipMemsetAsync, upload_device_buffer,
+    HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFreeAsync, hipMemsetAsync,
+    upload_device_buffer,
 };
 
 impl RocmDevice {
@@ -55,7 +55,12 @@ impl RocmDevice {
         // Zero the output buffer before launch: the kernel accumulates per- expert contributions via `atomicAdd`, so any stale bytes in the output storage would be added into the result.
         // This mirrors the `BackendDevice::zeros` path (hipMemset, roc_device.rs:1363).
         check_hip("charon hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         // Plan the launch (wave-aligned block, grid over pairs). Pass the
@@ -241,7 +246,12 @@ impl RocmDevice {
         )?;
 
         check_hip("moe_mega hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         let mut dest_slots_ptr = upload_device_buffer(self.ordinal, destination_slots)?;
@@ -578,7 +588,12 @@ impl RocmDevice {
 
         // Output is accumulated via atomicAdd in-kernel; zero first.
         check_hip("charon_grouped hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -683,7 +698,12 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_fp8 hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -793,7 +813,12 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_mxfp4 hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -903,7 +928,12 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_mxfp8 hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1010,7 +1040,12 @@ impl RocmDevice {
         )?;
 
         check_hip("charon_grouped_q80 hipMemset(output, 0)", unsafe {
-            hipMemsetAsync(out_ptr as *mut c_void, 0, out_storage.bytes(), self.active_stream())
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1103,10 +1138,10 @@ impl RocmDevice {
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_iqk: out has no device ptr".into())
                 })? as *mut c_void,
-                 0,
+                0,
                 out_storage.bytes(),
-                 self.active_stream(),
-    )
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1202,10 +1237,10 @@ impl RocmDevice {
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_w8a8_int8: out has no device ptr".into())
                 })? as *mut c_void,
-                 0,
+                0,
                 out_storage.bytes(),
-                 self.active_stream(),
-    )
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1298,10 +1333,10 @@ impl RocmDevice {
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_w8a8_fp8: out has no device ptr".into())
                 })? as *mut c_void,
-                 0,
+                0,
                 out_storage.bytes(),
-                 self.active_stream(),
-    )
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1404,10 +1439,10 @@ impl RocmDevice {
                 out_storage.device_ptr.ok_or_else(|| {
                     Error::Backend("charon_grouped_awq: out has no device ptr".into())
                 })? as *mut c_void,
-                 0,
+                0,
                 out_storage.bytes(),
-                 self.active_stream(),
-    )
+                self.active_stream(),
+            )
         })?;
 
         let wave = self.wavefront_size() as u32;
@@ -1743,13 +1778,28 @@ impl RocmDevice {
 
         // All four output buffers are accumulated via atomicAdd; zero first.
         check_hip("charon_backward hipMemset(d_gate_w, 0)", unsafe {
-            hipMemsetAsync(dgw_ptr as *mut c_void, 0, d_gate_w.bytes(), self.active_stream())
+            hipMemsetAsync(
+                dgw_ptr as *mut c_void,
+                0,
+                d_gate_w.bytes(),
+                self.active_stream(),
+            )
         })?;
         check_hip("charon_backward hipMemset(d_up_w, 0)", unsafe {
-            hipMemsetAsync(duw_ptr as *mut c_void, 0, d_up_w.bytes(), self.active_stream())
+            hipMemsetAsync(
+                duw_ptr as *mut c_void,
+                0,
+                d_up_w.bytes(),
+                self.active_stream(),
+            )
         })?;
         check_hip("charon_backward hipMemset(d_down_w, 0)", unsafe {
-            hipMemsetAsync(ddw_ptr as *mut c_void, 0, d_down_w.bytes(), self.active_stream())
+            hipMemsetAsync(
+                ddw_ptr as *mut c_void,
+                0,
+                d_down_w.bytes(),
+                self.active_stream(),
+            )
         })?;
         check_hip("charon_backward hipMemset(d_x, 0)", unsafe {
             hipMemsetAsync(dx_ptr as *mut c_void, 0, d_x.bytes(), self.active_stream())
