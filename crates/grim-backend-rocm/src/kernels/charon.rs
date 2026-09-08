@@ -92,7 +92,9 @@ extern "C" {
         const float* __restrict__ sorted_weights,         // [num_tokens_post_padded]
         float* __restrict__ out,                     // [batch, hidden]
         int hidden, int inter, int num_tokens, int block_size,
-        float routed_scaling_factor)
+        float routed_scaling_factor,
+        float* __restrict__ stash_hg,  // [num_tokens*inter] or null (SPEED-ROC-14)
+        float* __restrict__ stash_hu)  // [num_tokens*inter] or null
     {
         // `blockDim.x` is the effective worker width supplied by the persistent dispatcher.
         // It need not equal block_size: the stride below handles smaller and larger routed blocks without.
@@ -127,6 +129,14 @@ extern "C" {
                     }
                     float silu_g = g / (1.0f + expf(-g));
                     float act = silu_g * u;
+                    // SPEED-ROC-14: stash the gate/up pre-activations for this
+                    // (slot, j) so the backward kernel reads them instead of
+                    // recomputing the full projections. Indexed by sorted slot
+                    // to match the backward's cur_shg = stash_hg + s*inter.
+                    if (stash_hg != nullptr) {
+                        stash_hg[s * inter + j] = g;
+                        stash_hu[s * inter + j] = u;
+                    }
                     acc += dw[h * inter + j] * act;
                 }
                 if (odd_hidden) {
@@ -148,10 +158,11 @@ extern "C" {
         const float* activations, const float* expert_gate_w, const float* expert_up_w,
         const float* expert_down_w, const unsigned int* sorted_token_ids,
         const unsigned int* sorted_expert_ids, const float* sorted_weights, float* out,
-        int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor) {
+        int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor,
+        float* stash_hg, float* stash_hu) {
         grim_moe_fused_grouped_device(activations, expert_gate_w, expert_up_w, expert_down_w,
             sorted_token_ids, sorted_expert_ids, sorted_weights, out, hidden, inter,
-            num_tokens, block_size, routed_scaling_factor);
+            num_tokens, block_size, routed_scaling_factor, stash_hg, stash_hu);
     }
 }
 

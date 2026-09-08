@@ -382,3 +382,74 @@ pub mod gptq_test_shim {
         )
     }
 }
+
+#[cfg(feature = "gpu-test-shims")]
+pub mod decode_test_shim {
+    use crate::memory::storage::RocmStorage;
+    use crate::{Result, RocmDevice};
+
+    /// Direct test shims for benchmarking decode GEMM candidates.
+    pub fn launch_decode_gemm_f16(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_decode_gemm_f16(a, b, out, m, n, k)
+    }
+
+    pub fn launch_wmma_gemm(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_wmma_gemm(a, b, out, m, n, k)
+    }
+
+    pub fn launch_wmma_gemm_b_transposed(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b_col: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_wmma_gemm_b_transposed(a, b_col, out, m, n, k)
+    }
+
+    pub fn launch_wmma_gemm_b_transposed_rdna4(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b_col: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_wmma_gemm_b_transposed_rdna4(a, b_col, out, m, n, k)
+    }
+
+    pub fn launch_rocblas_gemm_f16(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_rocblas_gemm_f16(a, b, out, m, n, k)
+    }
+}
+
+
+
+
