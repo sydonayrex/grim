@@ -358,6 +358,9 @@ fn p2_charon_backward_device_verifier() {
     );
     assert!(dx_max > 1e-6, "host d_x is all-zero — reference degenerate");
 
+    // SPEED-ROC-9: gradients now come back device-resident; read back for the host-side oracle comparison.
+    let device_grads = result.to_cpu().expect("device gradient readback");
+
     // Compare device vs host per grad buffer.
     // The device layout is [num_experts, inter*hidden] (gate_w, up_w),
     // [num_experts, hidden*inter] (down_w), [batch, hidden] (d_x).
@@ -367,28 +370,28 @@ fn p2_charon_backward_device_verifier() {
 
     let tol = 0.01f32; // generous for f32 atomicAdd + recompute; bugs surface at >> 0.1
 
-    let dgw_err = rms_rel_err(&result.d_gate_w, &host_dgw_flat);
+    let dgw_err = rms_rel_err(&device_grads.d_gate_w, &host_dgw_flat);
     eprintln!("d_gate_w: rms_rel_err = {dgw_err:.6} (tol={tol})");
     assert!(
         dgw_err <= tol,
         "P2 d_gate_w: RMS rel err {dgw_err} exceeds {tol}"
     );
 
-    let duw_err = rms_rel_err(&result.d_up_w, &host_duw_flat);
+    let duw_err = rms_rel_err(&device_grads.d_up_w, &host_duw_flat);
     eprintln!("d_up_w: rms_rel_err = {duw_err:.6} (tol={tol})");
     assert!(
         duw_err <= tol,
         "P2 d_up_w: RMS rel err {duw_err} exceeds {tol}"
     );
 
-    let ddw_err = rms_rel_err(&result.d_down_w, &host_ddw_flat);
+    let ddw_err = rms_rel_err(&device_grads.d_down_w, &host_ddw_flat);
     eprintln!("d_down_w: rms_rel_err = {ddw_err:.6} (tol={tol})");
     assert!(
         ddw_err <= tol,
         "P2 d_down_w: RMS rel err {ddw_err} exceeds {tol}"
     );
 
-    let dx_err = rms_rel_err(&result.d_x, &host.d_x);
+    let dx_err = rms_rel_err(&device_grads.d_x, &host.d_x);
     eprintln!("d_x: rms_rel_err = {dx_err:.6} (tol={tol})");
     assert!(dx_err <= tol, "P2 d_x: RMS rel err {dx_err} exceeds {tol}");
 }

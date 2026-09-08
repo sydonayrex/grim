@@ -110,13 +110,48 @@ use crate::{
 };
 
 /// Return type for [`RocmDevice::charon_grouped_backward_roundtrip`].
-/// Holds the four named gradient buffers from the Charon MoE backward kernel, each as a.
-#[derive(Debug, Clone)]
+/// SPEED-ROC-9: holds the four Charon MoE backward gradient buffers as
+/// DEVICE-RESIDENT storages — the old `Vec<f32>` fields forced a full D2H
+/// round-trip of every gradient per step even when the optimizer/communicator
+/// downstream works on device memory. Consumers that need host data call
+/// [`CharonBackwardResult::to_cpu`].
 pub struct CharonBackwardResult {
+    pub d_gate_w: Box<dyn BackendStorage>,
+    pub d_up_w: Box<dyn BackendStorage>,
+    pub d_down_w: Box<dyn BackendStorage>,
+    pub d_x: Box<dyn BackendStorage>,
+}
+
+impl std::fmt::Debug for CharonBackwardResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CharonBackwardResult")
+            .field("d_gate_w", &self.d_gate_w.shape().dims())
+            .field("d_up_w", &self.d_up_w.shape().dims())
+            .field("d_down_w", &self.d_down_w.shape().dims())
+            .field("d_x", &self.d_x.shape().dims())
+            .finish()
+    }
+}
+
+/// Host-side mirror of [`CharonBackwardResult`] for consumers that read back.
+#[derive(Debug, Clone)]
+pub struct CharonBackwardHost {
     pub d_gate_w: Vec<f32>,
     pub d_up_w: Vec<f32>,
     pub d_down_w: Vec<f32>,
     pub d_x: Vec<f32>,
+}
+
+impl CharonBackwardResult {
+    /// D2H readback of all four gradient buffers.
+    pub fn to_cpu(&self) -> Result<CharonBackwardHost> {
+        Ok(CharonBackwardHost {
+            d_gate_w: self.d_gate_w.to_cpu_vec_f32()?,
+            d_up_w: self.d_up_w.to_cpu_vec_f32()?,
+            d_down_w: self.d_down_w.to_cpu_vec_f32()?,
+            d_x: self.d_x.to_cpu_vec_f32()?,
+        })
+    }
 }
 
 #[derive(Debug)]

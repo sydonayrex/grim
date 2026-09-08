@@ -34,6 +34,10 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::q5k_gemm::KERNEL_SOURCE);
     #[cfg(feature = "q6k")]
     s.push_str(crate::kernels::q6k_gemm::KERNEL_SOURCE);
+    // SPEED-ROC-8: LDS-tiled quant GEMMs (macro-stamped from the q4k tiling
+    // skeleton). Must come after iq_gemm/q5k_gemm/q6k_gemm — the tiled
+    // kernels call those files' dequant_* device helpers.
+    s.push_str(&crate::kernels::quant_tiled_gemm::tiled_quant_kernel_source());
     #[cfg(feature = "q2k")]
     s.push_str(crate::kernels::q2k_gemm::KERNEL_SOURCE);
     #[cfg(feature = "q3k")]
