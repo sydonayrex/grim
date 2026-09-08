@@ -64,6 +64,141 @@ extern "C" {
         dX[row * K + k_idx] = acc;
     }
 
+    // SPEED-ROC-6: LDS-tiled Q4_K forward GEMM (prefill path).
+    // TILE_N=64, TILE_K=64, TILE_M=4; 256 threads arranged (64 cols, 4 rows).
+    // Each weight element is dequantized ONCE per M-tile (vs once per output
+    // row in the scalar kernel) and staged through LDS; the A fragment is
+    // broadcast from LDS rather than re-read from global per thread.
+    // Requires K % 256 == 0 (standard Q4_K row layout); callers guard.
+    __global__ void grim_fused_dequant_gemm_q4k_tiled(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_q4k,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        __shared__ float sW[64][64];  // [k_local][col] — 16 KB
+        __shared__ float sA[4][64];   // [row][k_local] — 1 KB
+
+        const int col0 = blockIdx.x * 64;
+        const int row0 = blockIdx.y * 4;
+        const int tx = threadIdx.x;   // 0..63 -> column within tile
+        const int ty = threadIdx.y;   // 0..3  -> row within tile
+
+        const int row = row0 + ty;
+        const int col = col0 + tx;
+        const bool tile_ok = (row < M) && (col < N);
+
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 144;
+
+        float acc = 0.0f;
+
+        for (int k0 = 0; k0 < K; k0 += 64) {
+            // Cooperative weight dequant: 256 threads cover the 64x64 tile
+            // (16 elements each), reading raw bytes straight from global and
+            // writing dequantized f32 into LDS.
+            for (int t = ty * 64 + tx; t < 64 * 64; t += 256) {
+                int kk = t >> 6;          // 0..63 local k
+                int cc = t & 63;          // column
+                int gk = k0 + kk;
+                int gcc = col0 + cc;
+                float w = 0.0f;
+                if (gcc < N && gk < K) {
+                    int sb_idx = gk / 256;
+                    int in_sb = gk % 256;
+                    w = dequant_q4k_element(
+                        B_q4k + (long long)gcc * row_bytes + (long long)sb_idx * 144,
+                        in_sb);
+                }
+                sW[kk][cc] = w;
+            }
+            // A fragment: rows 0..3 x k 0..63 = exactly 256 elements.
+            {
+                int gk = k0 + tx;
+                int rr = row0 + ty;
+                sA[ty][tx] = (rr < M && gk < K) ? A[(long long)rr * K + gk] : 0.0f;
+            }
+            __syncthreads();
+
+            if (tile_ok) {
+                #pragma unroll 8
+                for (int kk = 0; kk < 64; ++kk) {
+                    acc += sA[ty][kk] * sW[kk][tx];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tile_ok) {
+            C[(long long)row * N + col] = acc;
+        }
+    }
+
+    // SPEED-ROC-6b: LDS-tiled Q4_K backward GEMM — dX[M,K] = dY[M,N] * W[N,K].
+    // Same tiling discipline as the forward variant: block computes a
+    // 4-row x 64-k tile of dX, staging the W super-block elements through LDS
+    // once per N-chunk instead of re-dequantizing per output element.
+    __global__ void grim_fused_dequant_gemm_q4k_backward_tiled(
+        const float* __restrict__ dY,      // [M, N]
+        const unsigned char* __restrict__ B_q4k,
+        float* __restrict__ dX,            // [M, K]
+        int M, int N, int K)
+    {
+        __shared__ float sW[64][64];  // [n_local][k_local] — 16 KB
+        __shared__ float sY[4][64];   // [row][n_local] — 1 KB
+
+        const int k0 = blockIdx.x * 64;
+        const int row0 = blockIdx.y * 4;
+        const int tx = threadIdx.x;   // 0..63 -> k within tile
+        const int ty = threadIdx.y;   // 0..3  -> row within tile
+
+        const int row = row0 + ty;
+        const int kcol = k0 + tx;
+        const bool tile_ok = (row < M) && (kcol < K);
+
+        const int blocks_per_row = K / 256;
+        const int row_bytes = blocks_per_row * 144;
+
+        float acc = 0.0f;
+
+        for (int n0 = 0; n0 < N; n0 += 64) {
+            // Cooperative weight dequant: 256 threads cover the 64x64 tile.
+            // sW[cc][kk] = W[n0+cc][k0+kk].
+            for (int t = ty * 64 + tx; t < 64 * 64; t += 256) {
+                int kk = t >> 6;
+                int cc = t & 63;
+                int gk = k0 + kk;
+                int gn = n0 + cc;
+                float w = 0.0f;
+                if (gn < N && gk < K) {
+                    w = dequant_q4k_element(
+                        B_q4k + (long long)gn * row_bytes + (long long)(gk / 256) * 144,
+                        gk % 256);
+                }
+                sW[cc][kk] = w;
+            }
+            // dY fragment: 4 rows x 64 n-cols = exactly 256 elements.
+            {
+                int gn = n0 + tx;
+                int rr = row0 + ty;
+                sY[ty][tx] = (rr < M && gn < N) ? dY[(long long)rr * N + gn] : 0.0f;
+            }
+            __syncthreads();
+
+            if (tile_ok) {
+                #pragma unroll 8
+                for (int cc = 0; cc < 64; ++cc) {
+                    acc += sY[ty][cc] * sW[cc][tx];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tile_ok) {
+            dX[(long long)row * K + kcol] = acc;
+        }
+    }
+
 }
 "#;
 
@@ -207,5 +342,10 @@ mod tests {
     fn test_q4k_kernel_source_non_empty() {
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q4k"));
         assert!(KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_q4k"));
+        // SPEED-ROC-6: the LDS-tiled prefill variant rides the same aggregate.
+        assert!(KERNEL_SOURCE.contains("grim_fused_dequant_gemm_q4k_tiled"));
+        assert!(KERNEL_SOURCE.contains(
+            "grim_fused_dequant_gemm_q4k_backward_tiled"
+        ));
     }
 }

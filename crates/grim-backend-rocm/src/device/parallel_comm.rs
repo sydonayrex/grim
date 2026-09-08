@@ -220,7 +220,21 @@ impl ParallelCommunicator {
                 .device_ptr
                 .ok_or_else(|| Error::Backend("No valid device pointer on storage".into()))?;
             let count = storage.shape.elem_count();
-            rccl.sum_gradients_device(ptr, ptr, count, stream_u64, self.topology.rank)?;
+            // SPEED-ROC-7: reduce in the gradient's native dtype — BF16/F16
+            // gradients halve collective wire bytes vs the legacy F32 path.
+            let nccl_dtype = match storage.dtype.arith {
+                grim_tensor::ArithType::BF16 => crate::rccl::NCCL_BFLOAT16,
+                grim_tensor::ArithType::F16 => crate::rccl::NCCL_FLOAT16,
+                _ => crate::rccl::NCCL_FLOAT32,
+            };
+            rccl.sum_gradients_device_typed(
+                ptr,
+                ptr,
+                count,
+                nccl_dtype,
+                stream_u64,
+                self.topology.rank,
+            )?;
             Ok(())
         } else if let Some(_ring) = &self.staging_ring {
             if let Ok(mut host_vec) = storage.to_cpu_vec_f32() {
