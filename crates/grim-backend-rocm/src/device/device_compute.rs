@@ -2834,7 +2834,9 @@ impl RocmDevice {
         if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
             eprintln!("[launch-done] {}", entry);
         }
-        let fast_key = (entry.to_string(), grid.x, grid.y, solution_index);
+        // SPEED-ROC-12: intern once per unique entry (one leaked &str) — the
+        // old `entry.to_string()` heap-allocated on every launch lookup.
+        let fast_key = (self.intern_str(entry), grid.x, grid.y, solution_index);
         let cached_func: Option<*mut c_void> = self
             .resolved_kernel_cache
             .lock()
