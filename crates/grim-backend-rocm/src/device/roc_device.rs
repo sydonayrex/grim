@@ -878,6 +878,13 @@ impl RocmDevice {
         Ok(buf)
     }
 
+    /// SPEED-ROC-4: whether HIP graph capture is enabled for this device
+    /// (`GRIM_CAPTURE_GRAPH`). Read by hot-path dispatchers to opt into
+    /// capture/replay without poking private fields across modules.
+    pub(crate) fn graph_capture_enabled(&self) -> bool {
+        self.capture_enabled
+    }
+
     /// If a graph-capture session is active, returns the dedicated capture stream. [see: `None`]
     pub(crate) fn active_capture_stream(&self) -> Option<*mut c_void> {
         if self.capture_active.load(Ordering::SeqCst) {
@@ -1130,6 +1137,14 @@ impl RocmDevice {
                 "decode_graph_capture_and_replay: graph capture manager not initialized".into(),
             )
         })?;
+        // SPEED-ROC-4: bind the cached graph to the exact buffers captured —
+        // see the pointer fields on `DecodeGraphKey`.
+        let key = crate::graph_capture::DecodeGraphKey {
+            a_ptr: a.device_ptr.unwrap_or(0) as usize,
+            b_ptr: b.device_ptr.unwrap_or(0) as usize,
+            out_ptr: out.device_ptr.unwrap_or(0) as usize,
+            ..key
+        };
         mgr.get_or_capture(key, |stream| {
             if let Ok(h) = self.get_rocblas_handle() {
                 unsafe {
@@ -1546,11 +1561,9 @@ impl RocmDevice {
                 arg(&mut b_i),
             ],
         )?;
-        if self.active_capture_stream().is_none() {
-            check_hip("hipStreamSynchronize(transpose_2d_f32)", unsafe {
-                hipStreamSynchronize(stream)
-            })?;
-        }
+        // SPEED-ROC-2: no trailing sync — src/dst are both allocator-owned
+        // device buffers ordered on the same stream as every consumer.
+        let _ = stream;
         Ok(Box::new(storage))
     }
 
@@ -1835,14 +1848,25 @@ impl RocmDevice {
         }
     }
 
-    /// Device-side element-wise sum of multiple F32 storages via the `grim_all_reduce_accum` kernel.
-    /// Each input must have the same shape.
-    pub(crate) fn device_accumulate_f32(
+    /// Device-side element-wise sum of multiple storages via the appropriate `grim_all_reduce_accum*` kernel.
+    /// Supports F32, F16, and BF16. Each input must have the same shape.
+    pub(crate) fn device_accumulate(
         &self,
         inputs: &[&dyn BackendStorage],
         out_ptr: u64,
+        dtype: &DType,
     ) -> Result<()> {
         let total = inputs[0].shape().elem_count();
+        let kernel_name = match dtype.arith {
+            ArithType::F32 => "grim_all_reduce_accum",
+            ArithType::F16 => "grim_all_reduce_accum_f16",
+            ArithType::BF16 => "grim_all_reduce_accum_bf16",
+            other => {
+                return Err(Error::Backend(format!(
+                    "device_accumulate: unsupported dtype arith {other:?}"
+                )));
+            }
+        };
 
         // Collect host-side device pointers, upload them as a device array.
         let host_ptrs: Vec<u64> = inputs
@@ -1868,7 +1892,7 @@ impl RocmDevice {
         let mut n_inputs = inputs.len() as i32;
         let mut n_elements = total as i32;
         self.launch_compute_kernel(
-            "grim_all_reduce_accum",
+            kernel_name,
             grid,
             block,
             &mut [
@@ -1879,6 +1903,16 @@ impl RocmDevice {
             ],
         )?;
         Ok(())
+    }
+
+    /// Device-side element-wise sum of multiple F32 storages via the `grim_all_reduce_accum` kernel.
+    /// Each input must have the same shape.
+    pub(crate) fn device_accumulate_f32(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        out_ptr: u64,
+    ) -> Result<()> {
+        self.device_accumulate(inputs, out_ptr, &dtype_f32())
     }
 }
 

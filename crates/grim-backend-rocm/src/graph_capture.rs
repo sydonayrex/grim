@@ -24,6 +24,14 @@ pub struct DecodeGraphKey {
     pub num_heads: u32,
     pub num_kv_heads: u32,
     pub fused_dequant: bool,
+    /// SPEED-ROC-4: a captured HIP graph bakes in the device pointers of the
+    /// buffers it was recorded against. Keying replay on those pointers keeps
+    /// it correct under the caching allocator: if any buffer is recycled to a
+    /// different address the key misses and the graph is re-captured instead
+    /// of replaying against stale memory.
+    pub a_ptr: usize,
+    pub b_ptr: usize,
+    pub out_ptr: usize,
 }
 
 /// A captured HIP graph plus its instantiated executable.

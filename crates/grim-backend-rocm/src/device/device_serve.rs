@@ -58,46 +58,48 @@ impl CollectiveOps for RocmDevice {
         // ── Cross-GPU all-reduce via RCCL (device-side) ─────────────────── When an RCCL handle is attached
         // and we have multiple GPUs, perform the collective directly on device memory via ncclAllReduce.
         if let Some(rccl_handle) = &rccl {
-            if rccl_handle.num_gpus > 1 && is_f32 {
-                let out_storage =
-                    RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
-                let out_ptr = dev_ptr(&out_storage)?;
-
-                if inputs.len() == 1 {
-                    // Single tensor: direct cross-GPU all-reduce.
-                    let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
-                    rccl_handle.sum_gradients_device(
-                        send_ptr,
-                        out_ptr,
-                        total,
-                        stream_u64,
-                        self.ordinal,
-                    )?;
-                } else {
-                    // Multiple shards: accumulate on-device first, then all-reduce.
-                    let temp_storage =
+            if rccl_handle.num_gpus > 1 {
+                if is_f32 {
+                    let out_storage =
                         RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
-                    let temp_ptr = dev_ptr(&temp_storage)?;
-                    self.device_accumulate_f32(inputs, temp_ptr)?;
-                    rccl_handle.sum_gradients_device(
-                        temp_ptr,
-                        out_ptr,
-                        total,
-                        stream_u64,
-                        self.ordinal,
-                    )?;
-                }
+                    let out_ptr = dev_ptr(&out_storage)?;
 
-                return Ok((
-                    Box::new(out_storage),
-                    Box::new(RocmHandle::new(Some(stream))),
-                ));
-            }
+                    if inputs.len() == 1 {
+                        // Single tensor: direct cross-GPU all-reduce.
+                        let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
+                        rccl_handle.sum_gradients_device(
+                            send_ptr,
+                            out_ptr,
+                            total,
+                            stream_u64,
+                            self.ordinal,
+                        )?;
+                    } else {
+                        // Multiple shards: accumulate on-device first, then all-reduce.
+                        let temp_storage = RocmStorage::alloc_gpu(
+                            &shape,
+                            dtype_f32(),
+                            &self.allocator,
+                            self.ordinal,
+                        )?;
+                        let temp_ptr = dev_ptr(&temp_storage)?;
+                        self.device_accumulate_f32(inputs, temp_ptr)?;
+                        rccl_handle.sum_gradients_device(
+                            temp_ptr,
+                            out_ptr,
+                            total,
+                            stream_u64,
+                            self.ordinal,
+                        )?;
+                    }
 
-            // F16/BF16 single-shard TP activations: all-reduce in the native dtype - previously this
-            // fell through to a full D2H→CPU-sum→H2D round trip per RowParallel layer per token.
-            if rccl_handle.num_gpus > 1 && !is_f32 && inputs.len() == 1 {
-                if let Some(nccl_dt) = rccl_dtype {
+                    return Ok((
+                        Box::new(out_storage),
+                        Box::new(RocmHandle::new(Some(stream))),
+                    ));
+                } else if let Some(nccl_dt) = rccl_dtype {
+                    // F16/BF16 TP activations: all-reduce in the native dtype - previously this
+                    // fell through to a full D2H→CPU-sum→H2D round trip per RowParallel layer per token.
                     let out_storage = RocmStorage::alloc_gpu(
                         &shape,
                         dtype.clone(),
@@ -105,15 +107,57 @@ impl CollectiveOps for RocmDevice {
                         self.ordinal,
                     )?;
                     let out_ptr = dev_ptr(&out_storage)?;
-                    let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
-                    rccl_handle.all_reduce_device(
-                        send_ptr,
-                        out_ptr,
-                        total,
-                        nccl_dt,
-                        stream_u64,
-                        self.ordinal,
-                    )?;
+
+                    if inputs.len() == 1 {
+                        let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
+                        rccl_handle.all_reduce_device(
+                            send_ptr,
+                            out_ptr,
+                            total,
+                            nccl_dt,
+                            stream_u64,
+                            self.ordinal,
+                        )?;
+                    } else {
+                        let all_same = inputs.iter().all(|s| s.shape() == inputs[0].shape());
+                        if all_same {
+                            let temp_storage = RocmStorage::alloc_gpu(
+                                &shape,
+                                dtype.clone(),
+                                &self.allocator,
+                                self.ordinal,
+                            )?;
+                            let temp_ptr = dev_ptr(&temp_storage)?;
+                            self.device_accumulate(inputs, temp_ptr, &dtype)?;
+                            rccl_handle.all_reduce_device(
+                                temp_ptr,
+                                out_ptr,
+                                total,
+                                nccl_dt,
+                                stream_u64,
+                                self.ordinal,
+                            )?;
+                        } else {
+                            // Mismatched shapes: execute CPU fallback
+                            let mut acc = inputs[0].to_cpu_vec_f32()?;
+                            for other in &inputs[1..] {
+                                let v = other.to_cpu_vec_f32()?;
+                                if v.len() != acc.len() {
+                                    return Err(Error::Backend(format!(
+                                        "all_reduce: input shape mismatch (first {} != other {})",
+                                        acc.len(),
+                                        v.len()
+                                    )));
+                                }
+                                for (a, b) in acc.iter_mut().zip(v.iter()) {
+                                    *a += b;
+                                }
+                            }
+                            let storage = self.from_cpu(&acc, &shape, dtype)?;
+                            return Ok((storage, Box::new(ReadyHandle)));
+                        }
+                    }
+
                     return Ok((
                         Box::new(out_storage),
                         Box::new(RocmHandle::new(Some(stream))),
@@ -124,7 +168,11 @@ impl CollectiveOps for RocmDevice {
 
         // ── Intra-process device-side fan-in (no RCCL) ────────────────────
         // Avoid the CPU round-trip: sum partials directly on the GPU.
-        if is_f32 && total > 0 {
+        let is_supported_device_dtype = matches!(
+            dtype.arith,
+            ArithType::F32 | ArithType::F16 | ArithType::BF16
+        );
+        if is_supported_device_dtype && total > 0 {
             if inputs.len() == 1 {
                 // Identity: device-to-device copy (no D2H + H2D round-trip).
                 let bytes = total * crate::dtype_byte_size(&dtype);
@@ -147,13 +195,13 @@ impl CollectiveOps for RocmDevice {
                 ));
             }
 
-            // Multi-input: device-side element-wise sum via grim_all_reduce_accum.
+            // Multi-input: device-side element-wise sum via grim_all_reduce_accum*.
             let all_same = inputs.iter().all(|s| s.shape() == inputs[0].shape());
             if all_same {
                 let out_storage =
-                    RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
+                    RocmStorage::alloc_gpu(&shape, dtype.clone(), &self.allocator, self.ordinal)?;
                 let out_ptr = dev_ptr(&out_storage)?;
-                self.device_accumulate_f32(inputs, out_ptr)?;
+                self.device_accumulate(inputs, out_ptr, &dtype)?;
                 return Ok((
                     Box::new(out_storage),
                     Box::new(RocmHandle::new(Some(stream))),
@@ -161,7 +209,7 @@ impl CollectiveOps for RocmDevice {
             }
         }
 
-        // ── CPU fallback ─────────────────────────────────────────────────── Used for non-F32 dtypes or
+        // ── CPU fallback ─────────────────────────────────────────────────── Used for non-supported dtypes or
         // mismatched shard shapes where the device accum kernel cannot apply.
         let mut acc = inputs[0].to_cpu_vec_f32()?;
         for other in &inputs[1..] {
@@ -233,20 +281,23 @@ impl CollectiveOps for RocmDevice {
             .map(|(s, _)| s.shape().dims().get(1).copied().unwrap_or(0))
             .sum();
         let dtype = partials[0].0.dtype();
-        let is_f32 = dtype.arith == ArithType::F32;
+        let is_supported_device_dtype = matches!(
+            dtype.arith,
+            ArithType::F32 | ArithType::F16 | ArithType::BF16
+        );
         let stream = self.active_stream();
         let stream_u64 = stream as u64;
         let rccl = self.rccl.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let elem_bytes = crate::dtype_byte_size(&dtype);
 
         // ── Device-side assembly + optional RCCL all-reduce ────────────────
-        if is_f32 {
+        if is_supported_device_dtype {
             // WI-M1 context discipline: the synchronous D2D memcpys below execute in the calling thread's current device
             // context; pin THIS device or a drifted thread assembles the fan-in buffer against foreign mappings.
             let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             let out_shape = Shape::from_slice(&[m, n_total]);
             let out_storage =
-                RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+                RocmStorage::alloc_gpu(&out_shape, dtype.clone(), &self.allocator, self.ordinal)?;
             let out_ptr_val = dev_ptr(&out_storage)?;
             let out_ptr_usize = out_ptr_val as usize;
 
@@ -276,13 +327,22 @@ impl CollectiveOps for RocmDevice {
             let total_elems = m * n_total;
             if let Some(rccl_handle) = &rccl {
                 if rccl_handle.num_gpus > 1 {
-                    rccl_handle.sum_gradients_device(
-                        out_ptr_val,
-                        out_ptr_val,
-                        total_elems,
-                        stream_u64,
-                        self.ordinal,
-                    )?;
+                    let rccl_dtype = match dtype.arith {
+                        ArithType::F32 => Some(crate::rccl::NCCL_FLOAT32),
+                        ArithType::F16 => Some(crate::rccl::NCCL_FLOAT16),
+                        ArithType::BF16 => Some(crate::rccl::NCCL_BFLOAT16),
+                        _ => None,
+                    };
+                    if let Some(nccl_dt) = rccl_dtype {
+                        rccl_handle.all_reduce_device(
+                            out_ptr_val,
+                            out_ptr_val,
+                            total_elems,
+                            nccl_dt,
+                            stream_u64,
+                            self.ordinal,
+                        )?;
+                    }
                 }
             }
 

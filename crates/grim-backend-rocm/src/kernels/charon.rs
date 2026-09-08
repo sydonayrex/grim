@@ -1732,6 +1732,7 @@ pub fn charon_autotune_launch_config(
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: 0,
         }
     })
 }
@@ -2309,6 +2310,7 @@ mod tests {
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: 0,
         };
         tuner.record_moe(key.clone(), cfg).expect("record_moe");
 
@@ -2351,6 +2353,7 @@ mod tests {
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: 0,
         };
         tuner.record_moe(key, expected_cfg).unwrap();
 

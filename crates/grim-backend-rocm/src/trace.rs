@@ -691,6 +691,7 @@ mod tests {
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: 0,
         };
         let row = KernelTrace::new(
             "qkv",
@@ -917,6 +918,7 @@ mod tests {
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: 0,
         };
         let rows = vec![KernelTrace::new(
             "qkv",
@@ -1077,6 +1079,7 @@ mod tests {
                     spec_gamma: 4,
                     spec_acceptance_threshold: 0.6,
                     spec_alpha: 0.0,
+                    split_k: 0,
                 },
                 77,
             ))

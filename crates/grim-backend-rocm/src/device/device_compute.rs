@@ -2003,8 +2003,35 @@ impl RocmDevice {
             spec_gamma: 4,
             spec_acceptance_threshold: 0.6,
             spec_alpha: 0.0,
+            split_k: winner.split_k,
         };
         let _ = autotuner.record(key, config);
+    }
+
+    /// SPEED-ROC-3: read-only lookup of the persisted GEMM autotune table for
+    /// the canonical workload entries (`grim_decode_gemm`, `grim_prefill_gemm`,
+    /// `grim_lm_head`). Unlike `get_or_tune_tiles`, this NEVER triggers the
+    /// FCP search — on a miss the caller falls back to the static heuristic
+    /// table. Only fields the rocBLAS dispatch consumes (split_k) are honored;
+    /// older tables without a recorded `split_k` (0) are ignored.
+    pub(crate) fn lookup_tuned_gemm_split_k(
+        &self,
+        entry: &'static str,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Option<u32> {
+        let autotuner = self.autotuner.lock().ok()?;
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let key = crate::autotune::KernelKey {
+            kernel: entry,
+            gpu_arch: arch_leak,
+            m,
+            n,
+            k,
+        };
+        let split_k = autotuner.lookup(key)?.split_k;
+        (split_k > 1).then_some(split_k)
     }
 
     /// Persist the in-memory autotune cache to a JSON file at `path`.
@@ -2158,8 +2185,24 @@ impl RocmDevice {
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution).
         // Op-identity classifier: LmHead -> TLOLog tile arm; everything else bins by m.
         let shape_class = crate::autotune::ShapeClass::from_op(op, m);
-        let tile_config =
-            lookup_gemm_config_for_shape(m, n, k, self.props.wavefront_size, shape_class);
+        // SPEED-ROC-3: prefer the offline-tuned split_k when the exact
+        // (entry, arch, M, N, K) was tuned via examples/tune_gemm.rs; the
+        // static heuristic table remains the fallback.
+        let entry: &'static str = match shape_class {
+            crate::autotune::ShapeClass::TLOLog => "grim_lm_head",
+            crate::autotune::ShapeClass::Prefill => "grim_prefill_gemm",
+            crate::autotune::ShapeClass::Decode => "grim_decode_gemm",
+        };
+        let tuned_split_k = self.lookup_tuned_gemm_split_k(entry, m, n, k);
+        let tile_config = match tuned_split_k {
+            Some(split_k) => {
+                let mut cfg =
+                    lookup_gemm_config_for_shape(m, n, k, self.props.wavefront_size, shape_class);
+                cfg.split_k = split_k;
+                cfg
+            }
+            None => lookup_gemm_config_for_shape(m, n, k, self.props.wavefront_size, shape_class),
+        };
         // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for [see: `examples/tune_gemm.rs`]
         let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
         // WI 2.4.3 — split_k clamp gate.
@@ -2274,6 +2317,44 @@ impl RocmDevice {
                 && dtype_out.arith == ArithType::F16
                 && m <= 8
             {
+                // SPEED-ROC-4: opt-in (GRIM_CAPTURE_GRAPH) capture/replay of the
+                // decode GEMM. Replay is pointer-bound via DecodeGraphKey, so a
+                // recycled buffer re-captures instead of replaying stale memory;
+                // any capture failure falls back to the direct launch.
+                if self.graph_capture_enabled() {
+                    let key = crate::graph_capture::DecodeGraphKey {
+                        batch: m as u32,
+                        seq_len: 1,
+                        kv_seq_len: 1,
+                        head_dim: k as u32,
+                        num_heads: 1,
+                        num_kv_heads: 1,
+                        fused_dequant: false,
+                        a_ptr: 0,
+                        b_ptr: 0,
+                        out_ptr: 0,
+                    };
+                    match self.decode_graph_capture_and_replay(
+                        key,
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    ) {
+                        Ok(_) => {
+                            self.launch_counter.fetch_add(1, Ordering::SeqCst);
+                            let compute_handle = Box::new(RocmHandle::new(Some(
+                                self.active_stream(),
+                            )));
+                            return Ok((Box::new(out_storage), compute_handle));
+                        }
+                        Err(_) => {
+                            // fall through to the direct launch below
+                        }
+                    }
+                }
                 // WI 2.4.4-2(a) — thread the *real* enqueued stream into the [see: `launch_compute_kernel`, `hipModuleLaunchKernel`]
                 let stream =
                     self.launch_decode_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;

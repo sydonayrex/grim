@@ -2734,6 +2734,9 @@ mod tests {
                 num_heads: 1,
                 num_kv_heads: 1,
                 fused_dequant: false,
+                a_ptr: 0,
+                b_ptr: 0,
+                out_ptr: 0,
             };
             let _ = std::hint::black_box(_key);
         }
@@ -2747,6 +2750,27 @@ mod tests {
         fn _sig(dev: &RocmDevice) {
             // The method is private, so we verify via the public decode_graph_capture_and_replay.
             let _ = std::hint::black_box(dev);
+        }
+    }
+
+    #[test]
+    fn test_all_reduce_f16_bf16_device_routing() {
+        use crate::device::roc_device::RocmDevice;
+        use grim_tensor::CollectiveOps;
+        use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
+
+        fn _check_signatures(dev: &RocmDevice, storage: &dyn BackendStorage) {
+            let _ = dev.all_reduce(&[storage, storage], "sum");
+            let f16_dt = DType {
+                arith: ArithType::F16,
+                storage: DTypeStorage::Native,
+            };
+            let bf16_dt = DType {
+                arith: ArithType::BF16,
+                storage: DTypeStorage::Native,
+            };
+            let _ = dev.device_accumulate(&[storage], 0, &f16_dt);
+            let _ = dev.device_accumulate(&[storage], 0, &bf16_dt);
         }
     }
 }

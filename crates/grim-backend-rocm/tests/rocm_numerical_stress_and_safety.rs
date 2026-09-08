@@ -126,6 +126,7 @@ fn test_autotune_serialization_nan_and_inf_handling() {
         spec_gamma: 4,
         spec_acceptance_threshold: f32::NAN,
         spec_alpha: f32::INFINITY,
+        split_k: 0,
     };
 
     // Serializing NaN/Inf to JSON and reading it back
