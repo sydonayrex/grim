@@ -29,6 +29,68 @@ pub mod util;
 
 /// Integration-test shims for the GPTQ fused dequant-GEMM path.
 /// These are thin public forwardings to `pub(crate)` launchers so `tests/` binaries can exercise real device.
+/// SPEED-ROC-6: test shims exposing the Q4_K scalar/tiled launchers so the
+/// integration parity test (`tests/q4k_tiled_gemm.rs`) can compare them
+/// directly without going through the env-gated dispatch.
+#[cfg(feature = "gpu-test-shims")]
+pub mod q4k_test_shim {
+    use crate::memory::storage::RocmStorage;
+    use crate::{Result, RocmDevice};
+
+    /// Launch the scalar Q4_K fused dequant-GEMM (forward).
+    pub fn launch_scalar(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_dequant_gemm_q4k(a, b, out, m, n, k)
+    }
+
+    /// Launch the LDS-tiled Q4_K fused dequant-GEMM (forward).
+    pub fn launch_tiled(
+        dev: &RocmDevice,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_dequant_gemm_q4k_tiled(a, b, out, m, n, k)
+    }
+
+    /// Launch the tiled Q4_K fused dequant-GEMM (backward, dX).
+    pub fn launch_backward_tiled(
+        dev: &RocmDevice,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_dequant_gemm_q4k_backward_tiled(dy, b, dx, m, n, k)
+    }
+
+    /// Launch the scalar Q4_K fused dequant-GEMM (backward, dX).
+    pub fn launch_backward_scalar(
+        dev: &RocmDevice,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        b_scales_ptr: *const std::ffi::c_void,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        dev.launch_fused_dequant_backward_gemm_q4k(dy, b, b_scales_ptr, dx, m, n, k)
+    }
+}
+
 #[cfg(feature = "gpu-test-shims")]
 pub mod gptq_test_shim {
     use crate::memory::storage::RocmStorage;

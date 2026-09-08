@@ -567,6 +567,29 @@ impl RcclAllReduce {
         stream: u64,
         rank: usize,
     ) -> Result<()> {
+        self.sum_gradients_device_typed(
+            send_dev_ptr,
+            recv_dev_ptr,
+            count,
+            NCCL_FLOAT32,
+            stream,
+            rank,
+        )
+    }
+
+    /// SPEED-ROC-7: dtype-aware gradient all-reduce. BF16/F16 gradients reduce
+    /// natively at half (BF16) or half (F16) the wire bytes of the F32 path —
+    /// the caller must guarantee the device buffers hold `count` elements of
+    /// exactly `nccl_dtype`.
+    pub fn sum_gradients_device_typed(
+        &self,
+        send_dev_ptr: u64,
+        recv_dev_ptr: u64,
+        count: usize,
+        nccl_dtype: NcclDataType,
+        stream: u64,
+        rank: usize,
+    ) -> Result<()> {
         if self.num_gpus <= 1 || count == 0 {
             return Ok(());
         }
@@ -582,14 +605,16 @@ impl RcclAllReduce {
                     "RCCL communicator is unavailable for a multi-GPU reduction".into(),
                 ));
             }
-            // SAFETY: send/recv must be valid device pointers for `count` f32 elements; comm must be a valid NCCL communicator; stream must be a valid HIP stream (0 = default).
-            // These invariants are upheld by the caller (the training gradient sync path).
+            // SAFETY: send/recv must be valid device pointers for `count` elements of
+            // `nccl_dtype`; comm must be a valid NCCL communicator; stream must be a valid
+            // HIP stream (0 = default). These invariants are upheld by the caller (the
+            // training gradient sync path).
             let status = unsafe {
                 ncclAllReduce(
                     send_dev_ptr as *const c_void,
                     recv_dev_ptr as *mut c_void,
                     count,
-                    NCCL_FLOAT32,
+                    nccl_dtype,
                     NCCL_SUM,
                     comm,
                     stream as *mut c_void,
@@ -605,7 +630,7 @@ impl RcclAllReduce {
         }
         #[cfg(not(feature = "rccl"))]
         {
-            let _ = (send_dev_ptr, recv_dev_ptr, count, stream, rank);
+            let _ = (send_dev_ptr, recv_dev_ptr, count, nccl_dtype, stream, rank);
             Err(Error::Backend(
                 "RcclAllReduce::sum_gradients_device: multi-GPU RCCL \
                  all-reduce requires the `rccl` feature flag"
