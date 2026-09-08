@@ -24,6 +24,7 @@ fn test_all_vulkan_spirv_blobs_compiled_and_non_empty() {
         VulkanKernel::Rope,
         VulkanKernel::FusedDequantGemmQ4K,
         VulkanKernel::FusedDequantGemmQ80,
+        VulkanKernel::FusedDequantGemmNvFp4,
         VulkanKernel::KvDequantAttention,
         VulkanKernel::SelectiveScan,
         VulkanKernel::QkvAttentionPaged,
@@ -191,5 +192,93 @@ fn test_vulkan_comm_fuse_reduce_parity() {
     assert_eq!(result.len(), expected.len());
     for (r, e) in result.iter().zip(expected.iter()) {
         assert!((r - e).abs() < 1e-5, "comm_fuse mismatch: {} != {}", r, e);
+    }
+}
+
+#[test]
+fn test_vulkan_fused_dequant_gemm_nvfp4_parity() {
+    let dev = VulkanDevice::new();
+
+    let m = 2usize;
+    let k = 32usize;
+    let n = 2usize;
+
+    // A is [M, K] = [2, 32]
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.1).sin()).collect();
+
+    // B is [K, N] in column-major packed NVFP4 format.
+    // Blocks per column: K / 16 = 2 sub-blocks.
+    // Bytes per sub-block: 9 (1 byte shared exponent + 8 bytes packed codes).
+    // Total bytes for B = N * 2 * 9 = 2 * 18 = 36 bytes.
+    let mut b_bytes = Vec::with_capacity(n * 2 * 9);
+    for col in 0..n {
+        for sb in 0..2 {
+            let shared_exp = 127u8; // scale = 2^0 = 1.0
+            b_bytes.push(shared_exp);
+            for b in 0..8 {
+                // Low nibble = even element, high nibble = odd element
+                // e.g. code 2 (val 1.0) and code 3 (val 1.5)
+                let low = ((col + sb + b) % 7) as u8;
+                let high = ((col + sb + b + 1) % 7) as u8;
+                b_bytes.push(low | (high << 4));
+            }
+        }
+    }
+
+    let shape_a = Shape::new(vec![m, k]);
+    let shape_b = Shape::new(vec![k, n]);
+    let shape_out = Shape::new(vec![m, n]);
+
+    use grim_tensor::dtype::FloatPackScheme;
+    let nvfp4_dtype = DType {
+        arith: ArithType::U8,
+        storage: Storage::FloatPack(FloatPackScheme::NvFp4),
+    };
+
+    let a_storage = dev.from_cpu(&a_data, &shape_a, DType::F32).unwrap();
+    let b_storage = dev.from_cpu_bytes(&b_bytes, &shape_b, nvfp4_dtype).unwrap();
+
+    let (out_storage, _) = dev
+        .quantized_matmul(
+            &*a_storage,
+            &*b_storage,
+            &[],
+            grim_tensor::QuantFormat::Fp4,
+            &shape_out,
+        )
+        .unwrap();
+
+    let gpu_result = out_storage.to_cpu_vec_f32().unwrap();
+    assert_eq!(gpu_result.len(), m * n);
+
+    // Compute expected result using CPU dequant_nvfp4
+    // Note: each column has 32 weights, packed in 18 bytes.
+    let mut b_dequant = vec![0.0f32; k * n];
+    let col_bytes = (k / 16) * 9;
+    for col in 0..n {
+        let col_slice = &b_bytes[col * col_bytes..(col + 1) * col_bytes];
+        let deq_col = grim_quant::dequant_nvfp4(col_slice, k).unwrap();
+        for r in 0..k {
+            b_dequant[r * n + col] = deq_col[r];
+        }
+    }
+
+    let mut cpu_expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += a_data[row * k + p] * b_dequant[p * n + col];
+            }
+            cpu_expected[row * n + col] = sum;
+        }
+    }
+
+    for (i, (gpu, cpu)) in gpu_result.iter().zip(cpu_expected.iter()).enumerate() {
+        let diff = (gpu - cpu).abs();
+        assert!(
+            diff < 1e-4,
+            "NVFP4 GEMM mismatch at {i}: gpu={gpu}, cpu={cpu}, diff={diff}"
+        );
     }
 }

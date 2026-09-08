@@ -68,6 +68,9 @@ impl QuantOps for VulkanDevice {
                 Storage::FloatPack(FloatPackScheme::MxFp4) => {
                     Some(VulkanKernel::FusedDequantGemmMxFp4)
                 }
+                Storage::FloatPack(FloatPackScheme::NvFp4) => {
+                    Some(VulkanKernel::FusedDequantGemmNvFp4)
+                }
                 other => {
                     tracing::warn!(
                         "Vulkan quantized_matmul: no GPU kernel for dtype storage {:?}; \
