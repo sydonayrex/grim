@@ -26,6 +26,7 @@ void grim_qkv_attention(
     float inv_sqrt_d,
     int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
                         // Pass 0 for full causal attention (no window).
+    float softcap,      // logit softcapping cap (e.g. 50.0f for Gemma-2). Pass <=0.0f to disable.
                         // WI-F2 - fused O-projection epilogue.
     const float* __restrict__ o_proj_w,
     int o_dim,
@@ -132,6 +133,9 @@ void grim_qkv_attention(
             partial += __shfl_xor_sync(shfl_mask, partial, off);
         }
         float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
         if (has_alibi) {
             score += alibi_slopes[h] * (float)(j - abs_i);
         }

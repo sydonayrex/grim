@@ -41,6 +41,7 @@ pub fn fused_or_scalar_attention(
             cache_offset,
             window,
             1.0 / (head_dim as f32).sqrt(),
+            None,
             &pick_device_for_storage_device(device),
             device,
         );
@@ -92,6 +93,7 @@ pub fn fused_or_scalar_attention(
             cache_offset,
             window,
             1.0 / (head_dim as f32).sqrt(),
+            None,
             &dev,
             device,
         ),
@@ -227,6 +229,7 @@ pub fn fused_or_scalar_attention_paged(
                 cache_offset as usize,
                 window,
                 1.0 / (head_dim as f32).sqrt(),
+                None,
                 &dev,
                 device,
             )
@@ -302,6 +305,7 @@ pub fn fused_or_scalar_attention_scaled(
         cache_offset,
         window,
         scale,
+        None,
         &dev,
         device,
     )
@@ -321,7 +325,36 @@ pub fn fused_attention_tensors(
     kv_len: usize,
     window: Option<usize>,
 ) -> Result<Tensor> {
+    fused_attention_tensors_softcapped(
+        q,
+        k,
+        v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        kv_len,
+        window,
+        None,
+    )
+}
+
+/// Fused attention with optional logit softcapping (e.g. Gemma-2).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attention_tensors_softcapped(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    kv_len: usize,
+    window: Option<usize>,
+    softcap: Option<f32>,
+) -> Result<Tensor> {
     let device = q.device().clone();
+    grim_nn::modules::set_device_attn_logit_softcap(&device, softcap);
     let dev = pick_device_for_storage_device(&device);
     let cache_offset = kv_len.saturating_sub(steps);
     let q3 = crate::block::reshaped_view(q, &Shape::new(vec![steps, num_heads, head_dim]))?;
@@ -375,6 +408,7 @@ pub fn fused_attention_tensors(
                     cache_offset,
                     window,
                     scale,
+                    softcap,
                     &dev,
                     &device,
                 );
@@ -477,6 +511,7 @@ fn scalar_attention(
     cache_offset: usize,
     window: Option<usize>,
     scale: f32,
+    softcap: Option<f32>,
     dev: &std::sync::Arc<dyn grim_tensor::backend::BackendDevice>,
     device: &Device,
 ) -> Result<Tensor> {
@@ -499,7 +534,13 @@ fn scalar_attention(
                     dot += q[t * num_head_dims + h * head_dim + d]
                         * k_history[t2 * kv_stride + kvh * head_dim + d];
                 }
-                scores[t2] = dot * scale;
+                let mut s = dot * scale;
+                if let Some(cap) = softcap {
+                    if cap > 0.0 {
+                        s = cap * (s / cap).tanh();
+                    }
+                }
+                scores[t2] = s;
             }
             for (t2, s) in scores.iter_mut().enumerate() {
                 if t2 > causal_limit || t2 < window_start {
@@ -621,6 +662,7 @@ mod tests {
             kv_len - steps,
             window,
             1.0 / (head_dim as f32).sqrt(),
+            None,
             &dev,
             &Device::Cpu,
         )

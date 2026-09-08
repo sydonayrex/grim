@@ -2760,6 +2760,7 @@ impl RocmDevice {
         let mut co = cache_offset as i32;
         let mut isd: f32 = 1.0 / (head_dim as f32).sqrt();
         let mut wlo: i32 = 0;
+        let mut softcap: f32 = self.attn_logit_softcap();
         let mut oproj_ptr = o_proj_ptr;
         let mut odim = o_dim as i32;
         let mut fuseo: i32 = 1;
@@ -2785,6 +2786,7 @@ impl RocmDevice {
                 arg(&mut co),
                 arg(&mut isd),
                 arg(&mut wlo),
+                arg(&mut softcap),
                 arg(&mut oproj_ptr),
                 arg(&mut odim),
                 arg(&mut fuseo),
@@ -2793,7 +2795,7 @@ impl RocmDevice {
             ],
         )?;
         let _ = (
-            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo,
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo, softcap,
             oproj_ptr, odim, fuseo, alibi_ptr, has_alibi,
         );
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))

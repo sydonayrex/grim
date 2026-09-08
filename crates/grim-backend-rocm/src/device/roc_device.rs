@@ -196,7 +196,8 @@ pub struct RocmDevice {
     /// Resolved-function fast path for `launch_compute_kernel_with_solution`: (entry, grid_x, grid_y) -> hipFunction.
     /// Skips the per-launch kernel source regeneration + seahash + CString work for repeat launches (the.
     // SPEED-ROC-12: key entries are interned (&'static str) — the old String key heap-allocated on EVERY launch fast-path lookup.
-    pub(crate) resolved_kernel_cache: Mutex<HashMap<(&'static str, u32, u32, Option<i32>), *mut c_void>>,
+    pub(crate) resolved_kernel_cache:
+        Mutex<HashMap<(&'static str, u32, u32, Option<i32>), *mut c_void>>,
     /// Interner for `&'static str` autotune keys (entry / arch).
     /// Each unique string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` / `store_tune_cache` calls reuse it instead.
     pub(crate) str_interner: Mutex<std::collections::HashSet<&'static str>>,
@@ -223,6 +224,9 @@ pub struct RocmDevice {
     pub(crate) rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
     /// Upload completion event for async H2D pipeline.
     pub(crate) upload_event: Mutex<Option<*mut c_void>>,
+    /// Attention logit softcapping cap (e.g. 50.0 for Gemma-2) stored as f32 bits.
+    /// <= 0.0 disables.
+    pub(crate) attn_logit_softcap: std::sync::atomic::AtomicU32,
 }
 
 // SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
@@ -733,6 +737,7 @@ impl RocmDevice {
             rccl: Mutex::new(None),
             upload_event: Mutex::new(None),
             graph_capture_mgr: Mutex::new(None),
+            attn_logit_softcap: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -804,6 +809,18 @@ impl RocmDevice {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cfg.enabled = enabled;
+    }
+
+    /// Set attention logit softcapping cap (e.g. `Some(50.0)` for Gemma-2, or `None` to disable).
+    pub fn set_attn_logit_softcap(&self, cap: Option<f32>) {
+        let val = cap.unwrap_or(0.0);
+        self.attn_logit_softcap
+            .store(val.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Get current attention logit softcapping cap (or 0.0 if disabled).
+    pub fn attn_logit_softcap(&self) -> f32 {
+        f32::from_bits(self.attn_logit_softcap.load(Ordering::Relaxed))
     }
 
     /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver

@@ -230,21 +230,10 @@ impl Eagle3DecoderLayer {
         let norm_h = self.hidden_norm.forward(hidden_states)?;
         let norm_e = self.input_layernorm.forward(input_emb)?;
 
-        let h_vec = norm_h.to_vec_f32()?;
-        let e_vec = norm_e.to_vec_f32()?;
         let seq_len = positions.len().max(1);
-        let hidden_dim = self.hidden_size;
 
-        // Concatenate along hidden dimension: [E_t, H_{t-1}] -> [seq_len, 2 * hidden_dim]
-        let mut concat_vec = Vec::with_capacity(seq_len * hidden_dim * 2);
-        for t in 0..seq_len {
-            let e_slice = &e_vec[t * hidden_dim..(t + 1) * hidden_dim];
-            let h_slice = &h_vec[t * hidden_dim..(t + 1) * hidden_dim];
-            concat_vec.extend_from_slice(e_slice);
-            concat_vec.extend_from_slice(h_slice);
-        }
-
-        let concat_t = cpu_tensor(concat_vec, Shape::new(vec![seq_len, hidden_dim * 2]));
+        // Concatenate along hidden dimension: [E_t, H_{t-1}] -> [seq_len, 2 * hidden_dim] on device
+        let concat_t = grim_nn::modules::concat_2d_horizontal_on_device(&norm_e, &norm_h)?;
 
         // Q, K, V projections from concatenated input
         let q = self.wq.forward(&concat_t)?;
@@ -444,41 +433,18 @@ impl Eagle3 {
             ));
         }
 
-        let seq_len = target_layer_hiddens[0]
-            .shape()
-            .dims()
-            .first()
-            .copied()
-            .unwrap_or(1);
         let num_fusion = self.cfg.num_target_fusion_layers.max(1);
-
-        // Pull each target hidden ONCE — the old loop re-downloaded every
-        // layer tensor `seq_len` times from inside the per-token loop.
-        let layer_rows: Vec<Vec<f32>> = (0..num_fusion)
+        let selected: Vec<&Tensor> = (0..num_fusion)
             .map(|layer_idx| {
-                let layer_tensor = if layer_idx < target_layer_hiddens.len() {
+                if layer_idx < target_layer_hiddens.len() {
                     target_layer_hiddens[layer_idx]
                 } else {
                     target_layer_hiddens[target_layer_hiddens.len() - 1]
-                };
-                layer_tensor
-                    .to_vec_f32()
-                    .map_err(grim_core::error::Error::from)
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect();
 
-        let mut flattened_fusion =
-            Vec::with_capacity(seq_len * self.cfg.target_hidden_size * num_fusion);
-        for t in 0..seq_len {
-            for vec in &layer_rows {
-                let start = t * self.cfg.target_hidden_size;
-                let end = (start + self.cfg.target_hidden_size).min(vec.len());
-                flattened_fusion.extend_from_slice(&vec[start..end]);
-            }
-        }
-
-        let fusion_shape = Shape::new(vec![seq_len, self.cfg.target_hidden_size * num_fusion]);
-        let fusion_t = cpu_tensor(flattened_fusion, fusion_shape);
+        let fusion_t = grim_nn::modules::concat_2d_slices_horizontal_on_device(&selected)?;
         Ok(self.fc.forward(&fusion_t)?)
     }
 

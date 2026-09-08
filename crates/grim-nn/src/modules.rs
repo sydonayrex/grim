@@ -87,6 +87,101 @@ pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Concatenates two 2D tensors [S, Da] and [S, Db] along dimension 1 into [S, Da + Db] on device without host round-trips.
+pub fn concat_2d_horizontal_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    concat_2d_slices_horizontal_on_device(&[a, b])
+}
+
+/// Concatenates a slice of 2D tensors [S, D_i] along dimension 1 into [S, sum(D_i)] directly on device.
+pub fn concat_2d_slices_horizontal_on_device(tensors: &[&Tensor]) -> Result<Tensor> {
+    if tensors.is_empty() {
+        return Err(Error::Shape(
+            "concat_2d_slices_horizontal_on_device: tensors cannot be empty".into(),
+        ));
+    }
+    let first = tensors[0];
+    let first_dims = first.shape().dims();
+    if first_dims.len() != 2 {
+        return Err(Error::Shape(format!(
+            "concat_2d_slices_horizontal_on_device expects 2D tensors, got {:?}",
+            first.shape()
+        )));
+    }
+    let seq_len = first_dims[0];
+    let mut total_d = 0;
+    let mut dims = Vec::with_capacity(tensors.len());
+    for t in tensors {
+        let d = t.shape().dims();
+        if d.len() != 2 || d[0] != seq_len {
+            return Err(Error::Shape(format!(
+                "concat_2d_slices_horizontal_on_device shape mismatch: expected [{}, *], got {:?}",
+                seq_len,
+                t.shape()
+            )));
+        }
+        dims.push(d[1]);
+        total_d += d[1];
+    }
+
+    let out_shape = Shape::new(vec![seq_len, total_d]);
+    let dev = pick_device_for_tensor(first);
+    let out_storage = dev.alloc_storage(&out_shape, DType::F32)?;
+
+    for t_idx in 0..seq_len {
+        let mut curr_offset = t_idx * total_d;
+        for (i, t) in tensors.iter().enumerate() {
+            let d_i = dims[i];
+            dev.copy_slice_range(
+                out_storage.as_ref(),
+                curr_offset,
+                t.storage().as_ref(),
+                t_idx * d_i,
+                d_i,
+            )?;
+            curr_offset += d_i;
+        }
+    }
+
+    Ok(Tensor::new(
+        Arc::from(out_storage),
+        out_shape,
+        DType::F32,
+        first.provenance().clone(),
+        first.device().clone(),
+    ))
+}
+
+/// Slices the last row [1, D] of a 2D tensor [S, D] directly on device.
+pub fn slice_last_row_2d_on_device(t: &Tensor) -> Result<Tensor> {
+    let dims = t.shape().dims();
+    if dims.len() < 2 {
+        return Err(Error::Shape(format!(
+            "slice_last_row_2d_on_device expects at least 2D tensor, got {:?}",
+            t.shape()
+        )));
+    }
+    let d = dims[dims.len() - 1];
+    let total_elements = t.shape().elem_count();
+    if total_elements < d {
+        return Err(Error::Shape(format!(
+            "slice_last_row_2d_on_device: total elements ({total_elements}) < row dim ({d})"
+        )));
+    }
+    let src_offset = total_elements - d;
+    let out_shape = Shape::new(vec![1, d]);
+    let dev = pick_device_for_tensor(t);
+    let out_storage = dev.alloc_storage(&out_shape, DType::F32)?;
+    dev.copy_slice_range(out_storage.as_ref(), 0, t.storage().as_ref(), src_offset, d)?;
+
+    Ok(Tensor::new(
+        Arc::from(out_storage),
+        out_shape,
+        DType::F32,
+        t.provenance().clone(),
+        t.device().clone(),
+    ))
+}
+
 /// Row gather `weight[indices, :]` dispatched on-device without copying the embedding table to the host.
 /// The `embedding` kernel is a required `BackendStorage` trait method, so every backend implements it; the.
 pub fn embedding_gather_on_device(
@@ -159,6 +254,20 @@ pub fn move_to_device(x: &Tensor, target: &Device) -> Result<Tensor> {
     ))
 }
 
+/// Configures attention logit softcapping on the underlying device (e.g. CPU or ROCm) if supported.
+pub fn set_device_attn_logit_softcap(d: &Device, cap: Option<f32>) {
+    match d {
+        Device::Cpu => {
+            grim_backend_cpu::set_attn_logit_softcap(cap);
+        }
+        #[cfg(feature = "rocm-mem")]
+        Device::Rocm(ord) => {
+            let rdev = grim_backend_rocm::RocmDevice::shared(*ord);
+            rdev.set_attn_logit_softcap(cap);
+        }
+        _ => {}
+    }
+}
 /// Pick a `BackendDevice` for a storage `Device` directly (without an owning `Tensor`), used when reconstructing a tensor from CPU-side bytes but needing to land it back on the original device.
 /// Falls back to CPU if the requested backend is unavailable in this build.
 pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
