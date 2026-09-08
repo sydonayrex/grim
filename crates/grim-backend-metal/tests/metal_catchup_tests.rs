@@ -13,7 +13,10 @@ fn test_metal_caps_probing_and_hashing() {
     assert!(caps.supports_fp8);
     assert!(caps.supports_quant_format(QuantFormat::Q8_0));
     assert!(caps.supports_quant_format(QuantFormat::Fp8));
-    assert!(!caps.is_stale());
+    assert!(caps.epoch > 0);
+    assert!(caps.epoch <= MetalCaps::current_epoch());
+    let stale_caps = MetalCaps { epoch: 0, ..caps };
+    assert!(stale_caps.is_stale());
 }
 
 #[test]
