@@ -1,9 +1,5 @@
 //! Gemma 3n transformer architecture with GeGLU activations and 3-norm layer normalization sandwich.
-//!
-//! # Architecture Details
-//! - **GeGLU Activation**: Feed-forward network uses GELU-gated linear units: $\text{MLP}(x) = (W_{\text{gate}} x \cdot \text{GELU}(W_{\text{gate}} x)) \odot (W_{\text{up}} x) \cdot W_{\text{down}}$.
-//! - **Triple LayerNorm Sandwich**: Input RMSNorm, Post-Attention RMSNorm, and Post-FeedForward RMSNorm.
-//! - **Embedding Scaling**: Token embeddings are scaled by $\sqrt{d_{\text{model}}}$.
+//! # Architecture Details - **GeGLU Activation**: Feed-forward network uses GELU-gated linear units: $\text{MLP}(x) = (W_{\text{gate}}.
 
 use std::sync::Arc;
 
@@ -11,15 +7,12 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, DType, ElementwiseOps, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, ElementwiseOps, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Device helpers
-// ---------------------------------------------------------------------------
 
-/// Upload host f32 rows onto `device` (GPU-first). Used to hand results of
-/// documented kernel-gap host loops back to the device residency of their
-/// inputs instead of leaving the residual stream on CPU.
+/// Upload host f32 rows onto `device` (GPU-first).
+/// Used to hand results of documented kernel-gap host loops back to the device residency of.
 fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -> Result<Tensor> {
     let shape = Shape::new(vec![rows, cols]);
     let dev = grim_nn::modules::pick_device_for_storage_device(device);
@@ -33,9 +26,8 @@ fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -
     ))
 }
 
-/// Device-side `x * scalar` (Gemma sqrt(d_model) embedding scale). Uses the
-/// backend `mul_scalar` kernel when available; the host round-trip fallback
-/// only runs on backends without the kernel.
+/// Device-side `x * scalar` (Gemma sqrt(d_model) embedding scale).
+/// Uses the backend `mul_scalar` kernel when available; the host round-trip fallback only runs on backends.
 fn mul_scalar_on_device(x: &Tensor, scalar: f32) -> Result<Tensor> {
     let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
     if let Ok((storage, _handle)) =
@@ -63,9 +55,7 @@ fn mul_scalar_on_device(x: &Tensor, scalar: f32) -> Result<Tensor> {
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Gemma 3n architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -115,9 +105,7 @@ impl ModelConfig for Gemma3nConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 /// Gemma 3n transformer block with 3 RMSNorms and GeGLU MLP.
 pub struct Gemma3nBlock {
@@ -214,10 +202,8 @@ impl Gemma3nBlock {
         })
     }
 
-    /// GPU-first forward: Q/K/V, RoPE, KV-cache concat and (sliding-window)
-    /// attention run on the tensor's device. The GeGLU activation stays
-    /// host-side — no device gelu-tanh kernel exists yet (documented kernel
-    /// gap); everything around it is device-resident.
+    /// GPU-first forward: Q/K/V, RoPE, KV-cache concat and (sliding-window) attention run on the tensor's device.
+    /// The GeGLU activation stays host-side - no device gelu-tanh kernel exists yet (documented kernel gap);.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -231,12 +217,8 @@ impl Gemma3nBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -303,9 +285,7 @@ impl Gemma3nBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct Gemma3n {
     pub cfg: Gemma3nConfig,
@@ -399,9 +379,8 @@ impl CausalLm for Gemma3n {
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
-        // GPU-first embedding gather + Gemma sqrt(d_model) embedding scale:
-        // rows land on the weight's device; the vocab×hidden table never
-        // crosses to host.
+        // GPU-first embedding gather + Gemma sqrt(d_model) embedding scale: rows land
+        // on the weight's device; the vocab×hidden table never crosses to host.
         let embedded = grim_nn::embedding_gather_on_device(
             &self.tok_embeddings.weight,
             &ids,

@@ -1,9 +1,5 @@
 //! MeanVC2 Voice Conversion & Diffusion Transformer (DiT) Architecture.
-//!
-//! Based on MeanVC2 / FastU2++ / DiT:
-//! - Chunked causal cross-attention layers with RMSNorm QK-norm.
-//! - Timestep and target voice style conditioning.
-//! - Bottleneck conv-layers for acoustic compression and latent alignment.
+//! Based on MeanVC2 / FastU2++ / DiT: - Chunked causal cross-attention layers with RMSNorm QK-norm.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;

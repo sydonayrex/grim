@@ -1,15 +1,5 @@
-//! Runtime poller — pulls models / datasets / devices / jobs from the
-//! local grim-garage backend and writes them into a shared `DisplayState`.
-//!
-//! The application owns one `Poller` per session; the mutator side of
-//! the display state lives behind an `Arc<Mutex<DisplayState>>` that
-//! the UI reads. Polling is fire-and-await — if the backend is down,
-//! the call surfaces an error and the loop swallows it (no UI death).
-//!
-//! Live SSE for per-job metrics is opt-in via `subscribe_sse(...)` and
-//! uses the existing `JobRegistry::subscribe_metrics` broadcast
-//! channel — exactly the same one the axum `sse_metrics` handler
-//! drains. The view layer does not need a separate broadcast.
+//! Runtime poller - pulls models / datasets / devices / jobs from the local grim-garage backend and writes them into a shared `DisplayState`.
+//! The application owns one `Poller` per session; the mutator side of the display state lives.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,15 +15,12 @@ use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::ui_state::UiJob;
 use tracing::warn;
 
-/// Number of endpoints polled by [`poll_fetch`]. Kept as a named
-/// constant (rather than the magic literal it replaces) so the
-/// fetcher, the AllFailed classifier, and any future callers stay in
-/// lockstep when an endpoint is added or removed.
+/// Number of endpoints polled by [`poll_fetch`].
+/// Kept as a named constant (rather than the magic literal it replaces) so the fetcher,.
 pub const POLL_ENDPOINT_COUNT: usize = 4;
 
-/// Best-effort fetch results for a single poll round. Each field is
-/// `Ok`/`Err` independently — a partial failure (e.g. backend up but
-/// `/api/rocm/devices` 500s) should not mask the others.
+/// Best-effort fetch results for a single poll round.
+/// Each field is `Ok`/`Err` independently - a partial failure (e.g.
 pub struct PollFetch {
     pub models: Result<Vec<ModelEntry>, String>,
     pub datasets: Result<Vec<DatasetEntry>, String>,
@@ -78,14 +65,11 @@ impl PollFetch {
     }
 }
 
-/// Fetch all four endpoints — **no shared-state lock required**. The spawn
-/// loop calls this unlocked so a stalled TCP connect (which has no
-/// client-side timeout today) cannot block the UI's reactive read path.
-/// Each `await` runs ahead of any `DisplayState` mutation.
+/// Fetch all four endpoints - **no shared-state lock required**.
+/// The spawn loop calls this unlocked so a stalled TCP connect (which has no client-side.
 pub async fn poll_fetch(client: &GarageClient) -> PollFetch {
-    // Fetch sequentially — a hung backend path is now bounded by the
-    // caller's outer `tokio::time::timeout` rather than an unbounded lock
-    // held across awaits. Order matches the panel-importance ranking.
+    // Fetch sequentially - a hung backend path is now bounded by the caller's outer `tokio::time::timeout` rather than an unbounded lock held across awaits.
+    // Order matches the panel-importance ranking.
     PollFetch {
         models: client.get_models().await,
         datasets: client.get_datasets().await,
@@ -94,12 +78,8 @@ pub async fn poll_fetch(client: &GarageClient) -> PollFetch {
     }
 }
 
-/// Merge a fetched poll round into `state`. This is the synchronous
-/// (no-`await`) side of the poll loop — the only section that needs the
-/// `DisplayState` write lock. Returns
-/// `Err(PollError::AllFailed(labels))` when every endpoint returned an
-/// error; `Err(PollError::Partial(labels))` when 1..=POLL_ENDPOINT_COUNT-1
-/// endpoints failed. `Ok(())` when all succeeded.
+/// Merge a fetched poll round into `state`.
+/// This is the synchronous (no-`await`) side of the poll loop - the only section that.
 pub fn merge_fetch(state: &mut DisplayState, fetched: PollFetch) -> Result<(), PollError> {
     // Snapshot failed labels BEFORE we start moving the result fields
     // out of `fetched` (each `if let Ok(x) = ...` is a partial move).
@@ -117,9 +97,7 @@ pub fn merge_fetch(state: &mut DisplayState, fetched: PollFetch) -> Result<(), P
     }
     if let Ok(jobs) = fetched.jobs {
         // Wholesale replace: ids that vanished from the backend (e.g.
-        // completed jobs pruned server-side) must not linger in the UI's
-        // history list. Earlier per-entry `upsert_job` calls leaked
-        // these forever.
+        // completed jobs pruned server-side) must not linger in the UI's history list.
         let map: HashMap<String, UiJob> = jobs
             .into_iter()
             .map(|j| {
@@ -149,18 +127,8 @@ pub fn merge_fetch(state: &mut DisplayState, fetched: PollFetch) -> Result<(), P
     }
 }
 
-/// Single refresh round: hits GET /api/models, /api/datasets, /api/rocm/devices,
-/// /api/train/jobs and overwrites the corresponding fields on `state`.
-///
-/// Each step is best-effort: an unreachable backend, a partial failure,
-/// or even a partial JSON parse doesn't poison the whole call. The
-/// `Result` returned is `Err` only when **every** endpoint failed, and
-/// even then the state may have been partially populated.
-///
-/// This convenience form holds the caller's lock for the duration of
-/// four sequential network awaits; the background `Poller` loop instead
-/// uses [`poll_fetch`] + [`merge_fetch`] so the UI read path is not
-/// blocked on a stalled backend.
+/// Single refresh round: hits GET /api/models, /api/datasets, /api/rocm/devices, /api/train/jobs and overwrites the corresponding fields on `state`.
+/// Each step is best-effort: an unreachable backend, a partial failure, or even a partial JSON.
 pub async fn poll_once(client: &GarageClient, state: &mut DisplayState) -> Result<(), PollError> {
     let fetched = poll_fetch(client).await;
     merge_fetch(state, fetched)
@@ -169,33 +137,24 @@ pub async fn poll_once(client: &GarageClient, state: &mut DisplayState) -> Resul
 /// Reasons a refresh round can fail.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PollError {
-    /// All polled endpoints returned errors. Carries the static labels of
-    /// every endpoint that failed so the UI can render an actionable
-    /// diagnostic instead of an opaque "backend offline" banner.
+    /// All polled endpoints returned errors. Carries the static labels of every endpoint that failed
+    /// so the UI can render an actionable diagnostic instead of an opaque "backend offline" banner.
     #[error("all poll endpoints failed: {0:?}")]
     AllFailed(Vec<&'static str>),
-    /// A subset of endpoints failed; the rest succeeded, so the round
-    /// is not "all-failed" — but the caller still benefits from the
-    /// list of what broke.
+    /// A subset of endpoints failed; the rest succeeded, so the round is not
+    /// "all-failed" - but the caller still benefits from the list of what broke.
     #[error("partial poll failure: {0:?}")]
     Partial(Vec<&'static str>),
 }
 
-/// Single normalization point for incoming wire status strings. The
-/// server today emits lowercase (`status_label`), but a future refactor
-/// that emits `"Failed"` or `"CANCELLED"` from a different code path
-/// would silently slip past `JobCardV1::badge_label`'s exhaustive match
-/// and render as "? Failed". Normalize at the seam so the UI depends on
-/// a stable `lowercase` invariant.
-///
-/// Exposed `pub` so tests can pin the contract.
+/// Single normalization point for incoming wire status strings.
+/// The server today emits lowercase (`status_label`), but a future refactor that emits `"Failed"` or `"CANCELLED"`.
 pub fn normalize_wire_status(raw: &str) -> String {
     raw.to_ascii_lowercase()
 }
 
-/// Convert a wire `JobSummaryDto` into the UI's `UiJob`. Static function
-/// so the poller is the single seam where wire-side `TrainingMode`
-/// gets normalized back to UI string labels.
+/// Convert a wire `JobSummaryDto` into the UI's `UiJob`.
+/// Static function so the poller is the single seam where wire-side `TrainingMode` gets normalized back.
 fn job_summary_to_ui_job(s: JobSummaryDto) -> UiJob {
     UiJob {
         job_id: s.job_id,
@@ -228,17 +187,14 @@ fn job_summary_to_ui_job(s: JobSummaryDto) -> UiJob {
     }
 }
 
-/// Poller handle — owns a background tokio task that calls `poll_once`
-/// on a fixed interval plus a one-shot initial refresh.
-///
+/// Poller handle - owns a background tokio task that calls `poll_once` on a fixed interval plus a one-shot initial refresh.
 /// `abort()` stops the task and is idempotent.
 pub struct Poller {
     client: GarageClient,
     state: Arc<Mutex<DisplayState>>,
     interval: Duration,
-    /// Per-round wall-clock budget for `poll_fetch`. Bounds a stalled
-    /// connect so the UI read path can never be blocked indefinitely by
-    /// a hung backend.
+    /// Per-round wall-clock budget for `poll_fetch`.
+    /// Bounds a stalled connect so the UI read path can never be blocked indefinitely by.
     fetch_timeout: Duration,
     handle: Option<JoinHandle<()>>,
 }
@@ -259,24 +215,15 @@ impl Poller {
         self
     }
 
-    /// Override the per-round fetch timeout. Tests use very short values to
-    /// assert the loop does not stall on an unreachable host; production
-    /// keeps the 800 ms default so a hung connect doesn't block UI reads.
+    /// Override the per-round fetch timeout. Tests use very short values to assert the loop does not stall
+    /// on an unreachable host; production keeps the 800 ms default so a hung connect doesn't block UI reads.
     pub fn with_fetch_timeout(&mut self, d: Duration) -> &mut Self {
         self.fetch_timeout = d;
         self
     }
 
-    /// Spawn the background loop. Returns `&mut self` so callers can
-    /// keep a handle and abort later via `abort()`.
-    ///
-    /// Lock discipline: the `DisplayState` mutex is held *only* during the
-    /// synchronous merge phase, never across a network `await`. A stalled
-    /// TCP connect (the underlying HTTP client has no connect timeout)
-    /// therefore blocks the poll task, not the UI's reactive read path —
-    /// `DisplayState::snapshot()` and friends remain lockable while the
-    /// backend is unreachable. A `tokio::time::timeout` bounds each round
-    /// so a hung half-open connection cannot stall the loop indefinitely.
+    /// Spawn the background loop. Returns `&mut self` so callers
+    /// can keep a handle and abort later via `abort()`.
     pub fn spawn(&mut self) -> &mut Self {
         let client = self.client.clone();
         let state = Arc::clone(&self.state);
@@ -343,11 +290,8 @@ mod tests {
 
     #[test]
     fn merge_fetch_reports_all_failed_with_labels_when_every_endpoint_failed() {
-        // M5: `merge_fetch` returns `AllFailed(label_vec)` rather than the
-        // pre-fix magic `()` constant — the UI can now surface which
-        // endpoints were unreachable. Pin a *specific* expected set rather
-        // than asserting the count so a mutant that drops/deviates stays
-        // caught.
+        // M5: `merge_fetch` returns `AllFailed(label_vec)` rather than the pre-fix magic `()` constant - the UI can now surface which endpoints were unreachable.
+        // Pin a *specific* expected set rather than asserting the count so a mutant that drops/deviates.
         let mut s = DisplayState::new();
         let fetched = PollFetch::new_failures();
         let result = merge_fetch(&mut s, fetched);
@@ -365,10 +309,8 @@ mod tests {
 
     #[test]
     fn merge_fetch_reports_partial_with_only_failed_labels() {
-        // M5: 1..N-1 endpoint failures must produce `Partial(failed)`,
-        // not `AllFailed`. The successful endpoint's label must be
-        // absent — guards against an impl that confuses "all failed"
-        // with "not all succeeded".
+        // M5: 1..N-1 endpoint failures must produce `Partial(failed)`, not `AllFailed`.
+        // The successful endpoint's label must be absent - guards against an impl that confuses "all.
         let mut s = DisplayState::new();
         let mut fetched = PollFetch::new_failures();
         // One endpoint OK — let it through with a synthetic, well-typed
@@ -398,9 +340,8 @@ mod tests {
 
     #[test]
     fn merge_fetch_reports_ok_when_nothing_failed() {
-        // Confirm the enum discriminator picks the poller's happy path
-        // rather than the empty `Vec` partial case (which a careless
-        // `if !failed_labels.is_empty()` could misroute).
+        // Confirm the enum discriminator picks the poller's happy path rather than
+        // the empty `Vec` partial case (which a careless `if !failed_labels.is_empty()` could misroute).
         let mut s = DisplayState::new();
         let fetched = PollFetch {
             models: Ok(vec![]),
@@ -413,10 +354,8 @@ mod tests {
 
     #[test]
     fn normalize_wire_status_lowercases_in_place_at_poller_seam() {
-        // M6: the poller is the single normalization point for incoming
-        // JobSummaryDto.status. Servers may emit `"Failed"` (capitalized),
-        // `"CANCELLED"`, or other casings; the UI side depends on a stable
-        // lowercase invariant. Pin the exact contract.
+        // M6: the poller is the single normalization point for incoming JobSummaryDto.status.
+        // Servers may emit `"Failed"` (capitalized), `"CANCELLED"`, or other casings; the UI side depends on a.
         assert_eq!(normalize_wire_status("running"), "running");
         assert_eq!(normalize_wire_status("Pending"), "pending");
         assert_eq!(normalize_wire_status("FAILED"), "failed");
@@ -429,9 +368,8 @@ mod tests {
 
     #[test]
     fn job_summary_to_ui_job_applies_status_lowercase_seam() {
-        // End-to-end: a wire summary arriving with mixed-case status is
-        // normalized before entering the UiJob. Construct the DTO with
-        // a randomized case and assert the resulting UiJob variant.
+        // End-to-end: a wire summary arriving with mixed-case status is normalized before entering the UiJob.
+        // Construct the DTO with a randomized case and assert the resulting UiJob variant.
         let dto = JobSummaryDto {
             job_id: "j-1".into(),
             status: "Running".into(),

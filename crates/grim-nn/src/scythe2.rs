@@ -1,29 +1,5 @@
 //! SCYTHE-2 capacity-calibrated sharded linears (WI-3).
-//!
-//! Implements the concrete leaf layer that the C²PLR controller drives:
-//! `Scythe2Linear::forward_placed` slices the weight matrix per the controller-
-//! chosen `ScythePlacement`, dispatches each shard to its GPU, then assembles
-//! the output via CommFuse decomposed P2P fan-in (for row-parallel) or simple
-//! concatenation (for column-parallel).
-//!
-//! ## Why forward_placed, not a static partition?
-//! v1's `ScytheColumnParallelLinear` fixed the shard ratio at load time.
-//! SCYTHE-2 fixes it at *forward time*: the controller may choose a 70/30 split
-//! for a compute-bound GEMM and 100/100 (replicated) for a memory-bound norm,
-//! using the same weight tensor for both. The partition is a runtime parameter,
-//! not a construction parameter.
-//!
-//! ## Staleness contract
-//! A stale `placement.partition` (failure mode A, scythe2.md §3.5) means
-//! GPU 0 gets 70% of columns when it should get 60% — the result is still
-//! *correct* (concatenation is shape-valid for any partition that sums to ≤ 1
-//! per GPU), just slightly load-imbalanced. `forward_placed` never panics on
-//! a stale placement; it produces the right tensor at potentially suboptimal
-//! latency.
-//!
-//! Skill attribution:
-//! - `rust-ffi-grim` §1 — ABI-safe repr for all structs passed over FFI.
-//! - `rust-ffi-grim` §3 — compile-time gate via `cargo check`.
+//! Implements the concrete leaf layer that the C²PLR controller drives: `Scythe2Linear::forward_placed` slices the weight matrix.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -38,16 +14,8 @@ use grim_backend_rocm::RocmStorage;
 
 use crate::modules::{add_tensors, pick_device_for_storage_device};
 
-// ── WI-SB5: per-shard transposed-weight residency ─────────────────────────────
-//
-// Controller-chosen partitions are stable across decode steps, but the naive
-// path re-transposed and re-uploaded every weight shard on EVERY forward
-// (O(k·count) host copies against an O(m·k·count) GEMM, plus a redundant H2D
-// of data that was already resident). This process-wide cache pins each
-// shard's transposed operand to its rank device once; the cache key carries
-// the layer id, the owning ordinal and the slice bounds, so a partition
-// change simply allocates new entries (old ones age out with the process —
-// shard operands for active layers are bounded by the partition set).
+// ── WI-SB5: per-shard transposed-weight residency ───────────────────────────── Controller-chosen partitions are stable across decode steps, but the naive path re-transposed and re-uploaded every weight shard on EVERY forward (O(k·count) host copies against an O(m·k·count) GEMM, plus a redundant H2D of data that was already resident).
+// This process-wide cache pins each shard's transposed operand to its rank device once; the cache.
 
 type ShardKey = (u32, usize, usize, usize);
 
@@ -56,9 +24,8 @@ fn shard_wt_cache() -> &'static Mutex<HashMap<ShardKey, Arc<Tensor>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// WI-SB5: floor-rounded partition ratios lose up to `n_ranks - 1` units of
-/// the split dimension; distribute the remainder to the last non-empty rank
-/// so sharded output always covers the full dimension.
+/// WI-SB5: floor-rounded partition ratios lose up to `n_ranks - 1` units of the split dimension;
+/// distribute the remainder to the last non-empty rank so sharded output always covers the full dimension.
 fn split_counts(partition: &[f32], n_ranks: usize, total: usize) -> Vec<usize> {
     let mut counts = vec![0usize; n_ranks];
     let mut assigned = 0usize;
@@ -223,15 +190,7 @@ fn x_operand_for<'a>(
 // ── WeightSource helpers ──────────────────────────────────────────────────────
 
 /// Slice the output-dimension of a weight tensor `[out_features, in_features]`.
-///
-/// Column-parallel sharding: GPU k gets columns `[start, start+count)` of
-/// the output dimension. Returns a new tensor with shape `[count, in_features]`.
-///
-/// This is the `slice_output_dim` called for in scythe2.md §5.2.
-///
-/// # Contract
-/// - `start + count <= weight.shape().dims()[0]` must hold; returns `Err` otherwise.
-/// - The returned tensor lives on the same device as `weight`.
+/// Column-parallel sharding: GPU k gets columns `[start, start+count)` of the output dimension.
 pub fn slice_output_dim(weight: &Tensor, start: usize, count: usize) -> Result<Tensor> {
     let dims = weight.shape().dims();
     if dims.len() < 2 {
@@ -247,8 +206,7 @@ pub fn slice_output_dim(weight: &Tensor, start: usize, count: usize) -> Result<T
         )));
     }
     // Extract the sub-matrix via host round-trip.
-    // For a production path this would be a device-side slice kernel;
-    // the host round-trip is correct and exercisable in tests (WI-3 gate).
+    // For a production path this would be a device-side slice kernel; the host round-trip is.
     let full = weight.storage().to_cpu_vec_f32()?;
     let slice: Vec<f32> = full
         .chunks(in_dim)
@@ -273,12 +231,7 @@ pub fn slice_output_dim(weight: &Tensor, start: usize, count: usize) -> Result<T
 }
 
 /// Slice the input-dimension of a weight tensor `[out_features, in_features]`.
-///
-/// Row-parallel sharding: GPU k gets rows `[start, start+count)` of the
-/// input dimension (i.e. the first `in_features` axis). Returns a tensor
-/// with shape `[out_features, count]`.
-///
-/// This is the `slice_input_dim` called for in scythe2.md §5.2.
+/// Row-parallel sharding: GPU k gets rows `[start, start+count)` of the input dimension (i.e.
 pub fn slice_input_dim(weight: &Tensor, start: usize, count: usize) -> Result<Tensor> {
     let dims = weight.shape().dims();
     if dims.len() < 2 {
@@ -313,15 +266,8 @@ pub fn slice_input_dim(weight: &Tensor, start: usize, count: usize) -> Result<Te
 
 // ── Scythe2Linear ─────────────────────────────────────────────────────────────
 
-/// A linear layer whose shard boundaries are chosen per-forward by the
-/// C²PLR controller, not fixed at load time.
-///
+/// A linear layer whose shard boundaries are chosen per-forward by the C²PLR controller, not fixed at load time.
 /// The full (unsharded) weight is replicated on every participating GPU.
-/// For >30B models where that is too large, the caller pre-shards at load
-/// via `slice_output_dim` and sets `full_weight` to the local shard; the
-/// controller then decides the *active* partition per forward.
-///
-/// The `layer_id` is the fingerprint index used by `PlacementCache`.
 pub struct Scythe2Linear {
     /// Full unsharded weight tensor `[out_features, in_features]`.
     pub full_weight: Tensor,
@@ -335,22 +281,7 @@ pub struct Scythe2Linear {
 
 impl Scythe2Linear {
     /// Forward pass under a controller-chosen `ScythePlacement`.
-    ///
-    /// Behaviour depends on the placement type:
-    /// - **Column-parallel** (`partition` does not sum to K across ranks):
-    ///   each rank computes a column shard of the output; shards are
-    ///   concatenated on the primary rank (rank 0). No collective needed.
-    /// - **Row-parallel** (caller sets `is_row_parallel = true`):
-    ///   each rank computes a partial row sum; CommFuse P2P fan-in is used to
-    ///   collect partials. Default: column-parallel.
-    /// - **Replicated** (`partition` all 1.0): every rank runs the full GEMM
-    ///   and the outputs are identical — only rank 0's output is used.
-    ///
-    /// ## Staleness safety (scythe2.md §3.5, mode A)
-    /// A stale `partition` produces a shape-valid result — the slice
-    /// boundaries are always within `[0, out_features]` because `partition[k]`
-    /// is clamped to `[0, 1]` and multiplied by `out_features` before
-    /// `floor()`. No panic is possible from partition staleness.
+    /// Behaviour depends on the placement type: - **Column-parallel** (`partition` does not sum to K across.
     pub fn forward_placed(
         &self,
         x: &Tensor,
@@ -373,15 +304,8 @@ impl Scythe2Linear {
         }
     }
 
-    /// Column-parallel forward: each rank computes a column shard,
-    /// outputs are concatenated. No collective required.
-    ///
-    /// WI-SB5 step 1: shards execute as real backend `matmul` calls on their
-    /// placed rank's device (rocBLAS-bound when the layer lives on ROCm),
-    /// replacing the host triple-loop emulation. Cross-rank fan-in is still
-    /// host-staged — ring descriptors carrying shard pointers (opcode 1/2)
-    /// remain the open second step, as does binding one rocBLAS handle per
-    /// rank stream.
+    /// Column-parallel forward: each rank computes a column shard, outputs are concatenated.
+    /// No collective required.
     fn forward_col_parallel(
         &self,
         x: &Tensor,
@@ -399,9 +323,8 @@ impl Scythe2Linear {
         let k = *x_dims.last().unwrap_or(&1);
         let x_vec = x.storage().to_cpu_vec_f32()?;
 
-        // Floor-rounded ratios drop up to n_ranks-1 trailing output columns;
-        // hand the remainder to the last non-empty rank so the concatenated
-        // width always equals `out_features`.
+        // Floor-rounded ratios drop up to n_ranks-1 trailing output columns; hand the remainder
+        // to the last non-empty rank so the concatenated width always equals `out_features`.
         let counts = split_counts(&placement.partition, n_ranks, out_features);
 
         for (rank_idx, gpu_ord) in placement.ranks.iter().enumerate() {
@@ -409,18 +332,16 @@ impl Scythe2Linear {
             if count == 0 {
                 continue;
             }
-            // The shard executes on its placed rank's device when the layer
-            // itself lives on ROCm; otherwise the layer's own backend runs it
-            // so off-box tests stay hermetic.
+            // The shard executes on its placed rank's device when the layer itself lives
+            // on ROCm; otherwise the layer's own backend runs it so off-box tests stay hermetic.
             let rank_device = match (&self.device, gpu_ord) {
                 (Device::Rocm(_), ord) => Device::Rocm(*ord),
                 (other, _) => other.clone(),
             };
             let rank_dev = pick_device_for_storage_device(&rank_device);
 
-            // WI-SB5: the transposed shard operand is cached resident on the
-            // rank device (built once per slice); `x` is zero-copy when it is
-            // already resident there.
+            // WI-SB5: the transposed shard operand is cached resident on the rank device
+            // (built once per slice); `x` is zero-copy when it is already resident there.
             let b_tensor;
             let b_uploaded;
 
@@ -466,10 +387,8 @@ impl Scythe2Linear {
             ));
         }
 
-        // WI-SB5: device-side gather — route every shard row into the output
-        // matrix on the FIRST shard's device via copy_via_route. Decode batches
-        // are tiny (m ≤ 64), so per-row routed copies are cheap; larger
-        // prefills keep the legacy host-staged gather.
+        // WI-SB5: device-side gather - route every shard row into the output matrix on the FIRST shard's device via copy_via_route.
+        // Decode batches are tiny (m ≤ 64), so per-row routed copies are cheap; larger prefills.
         let all_rocm = shards.iter().all(|(t, _)| rocm_residency(t).is_some());
         let no_bias = self.bias.is_none();
         if all_rocm && no_bias && m <= 64 {
@@ -542,11 +461,8 @@ impl Scythe2Linear {
         ))
     }
 
-    /// Row-parallel forward: each rank computes a partial row sum;
-    /// CommFuse decomposed P2P fan-in collects the partials.
-    ///
-    /// Falls back to naive CPU-side sum when CommFuse is unavailable
-    /// (non-ROCm builds), which is always correct and exercisable in tests.
+    /// Row-parallel forward: each rank computes a partial row sum; CommFuse decomposed P2P fan-in collects the partials.
+    /// Falls back to naive CPU-side sum when CommFuse is unavailable (non-ROCm builds), which is always.
     fn forward_row_parallel(
         &self,
         x: &Tensor,
@@ -559,10 +475,8 @@ impl Scythe2Linear {
         let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
         let x_vec = x.storage().to_cpu_vec_f32()?;
         let n_ranks = placement.ranks.len();
-        // WI-SB5 fan-in mode: with every rank on ROCm and NO bias, partials
-        // stay device-resident — routed cross-ordinal and accumulated
-        // pairwise via device adds on the accumulator's ordinal. Any CPU
-        // rank or bias falls back to the legacy host sum.
+        // WI-SB5 fan-in mode: with every rank on ROCm and NO bias, partials stay device-resident - routed cross-ordinal and accumulated pairwise via device adds on the accumulator's ordinal.
+        // Any CPU rank or bias falls back to the legacy host sum.
         let counts = split_counts(&placement.partition, n_ranks, in_features);
         let device_fan_in = matches!(self.device, Device::Rocm(_))
             && self.bias.is_none()
@@ -774,10 +688,8 @@ mod tests {
         let y = layer.forward_placed(&x, &p, false).unwrap();
         let y_vec = y.storage().to_cpu_vec_f32().unwrap();
 
-        // Reference: x @ W^T manually.
-        // W^T = [[1,0,0,1],[0,1,0,1],[0,0,1,1]]
-        // x[0]=[1,2,3] → [1, 2, 3, 6]
-        // x[1]=[4,5,6] → [4, 5, 6, 15]
+        // Reference: x @ W^T manually. W^T = [[1,0,0,1],[0,1,0,1],[0,0,1,1]] x[0]=[1,2,3] →
+        // [1, 2, 3, 6] x[1]=[4,5,6] → [4, 5, 6, 15]
         let expected = [1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0];
         let max_diff = y_vec
             .iter()

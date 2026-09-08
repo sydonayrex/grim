@@ -14,7 +14,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::RocmDevice;
 use grim_nn::Linear;
 use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
-use grim_tensor::backend::{CoreTensorOps};
+use grim_tensor::backend::CoreTensorOps;
 use grim_tensor::dtype::{DType, Device, QuantProvenance};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
@@ -51,7 +51,8 @@ fn deterministic_expert_weights() -> ExpertWeights {
         for i in 0..INTER {
             for j in 0..HIDDEN {
                 g[i * HIDDEN + j] = ((i as f32 + 1.0) * 0.1 + (j as f32 + 1.0) * 0.05 + seed).sin();
-                u[i * HIDDEN + j] = ((i as f32 + 1.0) * 0.07 + (j as f32 + 1.0) * 0.03 + seed * 2.0).cos();
+                u[i * HIDDEN + j] =
+                    ((i as f32 + 1.0) * 0.07 + (j as f32 + 1.0) * 0.03 + seed * 2.0).cos();
             }
         }
         for h in 0..HIDDEN {
@@ -129,8 +130,9 @@ fn test_moe_ffn_forward_gpu_cpu_parity_and_device_residency() {
     let cpu_v = cpu_out.to_vec_f32().expect("CPU out to vec");
 
     // 2. GPU Device-Resident Forward
-    let dev_storage = CoreTensorOps::from_cpu(&dev, &x_data, &Shape::new(vec![BATCH, HIDDEN]), DType::F32)
-        .expect("upload activation to GPU");
+    let dev_storage =
+        CoreTensorOps::from_cpu(&dev, &x_data, &Shape::new(vec![BATCH, HIDDEN]), DType::F32)
+            .expect("upload activation to GPU");
     let x_gpu = Tensor::new(
         Arc::from(dev_storage),
         Shape::new(vec![BATCH, HIDDEN]),

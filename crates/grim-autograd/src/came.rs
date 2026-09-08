@@ -1,7 +1,5 @@
 //! CAME (Confidence-guided Adaptive Memory Efficient Optimization).
-//!
-//! Factored second-moment matrix tracking (row & column sums) with an
-//! instability/confidence matrix for stable and memory-efficient LLM training.
+//! Factored second-moment matrix tracking (row & column sums) with an instability/confidence matrix for stable and.
 
 use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_format::train::TrainState;

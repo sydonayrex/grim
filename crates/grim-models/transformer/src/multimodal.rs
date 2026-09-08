@@ -1,8 +1,5 @@
 //! Multimodal patch/frame projection and embedding merger module.
-//!
-//! Provides `VisionPatchProjection` and `AudioMelProjection` layers and
-//! `merge_multimodal_embeddings` helper to interleave image/audio patch
-//! representations into text token sequence embeddings.
+//! Provides `VisionPatchProjection` and `AudioMelProjection` layers and `merge_multimodal_embeddings` helper to interleave image/audio patch representations into text.
 
 use grim_core::error::{Error, Result};
 use grim_nn::Linear;

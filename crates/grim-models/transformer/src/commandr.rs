@@ -1,11 +1,5 @@
-//! Cohere Command-R / Command-R+ architecture with per-head QK-Normalization,
-//! parallel Attention + MLP residual connections, and LayerNorm / RMSNorm.
-//!
-//! # Architecture Details
-//! - **Parallel Residual**: Attention and MLP compute in parallel from normalized input:
-//!   $\text{out} = x + \text{Attn}(\text{Norm}(x)) + \text{MLP}(\text{Norm}(x))$.
-//! - **QK Normalization**: Per-head `q_norm` and `k_norm` applied to query and key heads before RoPE.
-//! - **RoPE**: 8192 / 128k context with `rope_theta: 500000.0`.
+//! Cohere Command-R / Command-R+ architecture with per-head QK-Normalization, parallel Attention + MLP residual connections, and LayerNorm / RMSNorm.
+//! # Architecture Details - **Parallel Residual**: Attention and MLP compute in parallel from normalized input:.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -14,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Cohere Command-R / Command-R+.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -66,9 +58,7 @@ impl ModelConfig for CommandRConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MLP
-// ---------------------------------------------------------------------------
 
 pub struct CommandRMlp {
     pub gate_proj: Linear,
@@ -98,9 +88,7 @@ impl CommandRMlp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block (Parallel Attention + MLP)
-// ---------------------------------------------------------------------------
 
 pub struct CommandRBlock {
     pub wq: Linear,
@@ -118,7 +106,11 @@ pub struct CommandRBlock {
 }
 
 impl CommandRBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &CommandRConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &CommandRConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -162,12 +154,8 @@ impl CommandRBlock {
         })
     }
 
-    /// Forward pass executing parallel Attention + MLP branches:
-    /// $\text{out} = x + \text{Attn}(\text{Norm}(x)) + \text{MLP}(\text{Norm}(x))$.
-    ///
-    /// GPU-first: Q/K/V, RoPE, attention and both residual adds run on the
-    /// tensor's device; host paths are only reached through the fused-kernel
-    /// fallback guards.
+    /// Forward pass executing parallel Attention + MLP branches: $\text{out} = x + \text{Attn}(\text{Norm}(x)) + \text{MLP}(\text{Norm}(x))$.
+    /// GPU-first: Q/K/V, RoPE, attention and both residual adds run on the tensor's device; host paths.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed = self.input_layernorm.forward(x)?;
@@ -176,12 +164,8 @@ impl CommandRBlock {
         let k = self.wk.forward(&normed)?;
         let v = self.wv.forward(&normed)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -189,9 +173,8 @@ impl CommandRBlock {
             positions,
         )?;
 
-        // GPU-first: fused tensor-level attention; on backends that reject the
-        // kernel call (e.g. no fused kernel) fall back to the host-history
-        // entry, which degrades to the scalar reference on CPU.
+        // GPU-first: fused tensor-level attention; on backends that reject the kernel call (e.g.
+        // no fused kernel) fall back to the host-history entry, which degrades to the scalar reference.
         let attn_tensor = match crate::shared_attention::fused_attention_tensors(
             &q,
             &k,
@@ -225,9 +208,7 @@ impl CommandRBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct CommandR {
     pub cfg: CommandRConfig,
@@ -281,7 +262,10 @@ impl CommandR {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -355,9 +339,7 @@ impl CausalLm for CommandR {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -377,9 +359,9 @@ mod tests {
     #[test]
     fn test_commandr_parallel_residual_numerics() {
         // Test parallel residual formula: x + attn(x) + mlp(x)
-        let x = vec![1.0f32, 2.0];
-        let attn = vec![0.5f32, 0.25];
-        let mlp = vec![1.5f32, 0.75];
+        let x = [1.0f32, 2.0];
+        let attn = [0.5f32, 0.25];
+        let mlp = [1.5f32, 0.75];
         let mut out = vec![0.0f32; 2];
         for i in 0..2 {
             out[i] = x[i] + attn[i] + mlp[i];
@@ -388,6 +370,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_commandr_forward_and_session_state() {
         let mut cfg = CommandRConfig::default();
         cfg.vocab_size = 32;
@@ -401,7 +384,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

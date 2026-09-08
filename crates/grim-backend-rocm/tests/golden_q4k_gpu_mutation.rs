@@ -8,12 +8,12 @@
 use grim_backend_rocm::RocmDevice;
 use grim_format::convert::GpuDequant;
 use grim_quant::{dequant_q4k, quant_q4k};
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 use grim_tensor::{
     Shape,
     dtype::{ArithType, DType, KQuantScheme, Storage},
 };
 use std::panic;
-use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 

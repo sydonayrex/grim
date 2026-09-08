@@ -1,16 +1,5 @@
-//! Muse-Glimmer dense transformer — `CausalLm` implementation.
-//!
-//! Text backbone: Llama-style pre-norm + GQA attention with **hybrid**
-//! sliding-window / full attention (layers in `attention_sliding_window_layer_ids`
-//! attend only within `attention_sliding_window_size`; the rest attend to the
-//! full causal prefix), **per-layer RoPE base** (`per_layer_rope_theta`), an
-//! attention **`qk_scale_factor`** (multiplies `1/sqrt(head_dim)`), a per-layer
-//! **`output_multiplier`** on the residual stream, and **`final_logit_softcapping`**
-//! on the output logits (`softcap * tanh(logits/softcap)`).
-//!
-//! Vision: optional Muse-Glimmer temporal-patch ViT (`grim_models_vision::GlimmerVision`)
-//! feeding a `GlimmerProjector` (Linear `vision_hidden → text_hidden`) whose
-//! token embeddings may be merged into the text sequence.
+//! Muse-Glimmer dense transformer - `CausalLm` implementation.
+//! Text backbone: Llama-style pre-norm + GQA attention with **hybrid** sliding-window / full attention (layers in.
 
 /// Decode outputs: `(hidden_after_blocks, logits, per-layer (key, value) KV pairs)`.
 type DecodeOutputs = (Tensor, Tensor, Vec<(Tensor, Tensor)>);
@@ -35,9 +24,7 @@ use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 use crate::block::{LlamaLayerCache, plan_kv_head_sharding};
 use crate::multimodal::merge_multimodal_embeddings;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct MuseGlimmerConfig {
@@ -167,10 +154,8 @@ impl MuseGlimmerConfig {
         let hidden_size = u("hidden_size");
         let num_heads = u("num_attention_heads");
         let raw_head_dim = u("head_dim");
-        // MOD-2 fix: `hidden_size / num_heads` can evaluate to 0 (e.g. when
-        // `hidden_size == 0` or is smaller than `num_heads`), and a 0
-        // `head_dim` becomes a divisor later in the model and panics. Clamp
-        // to a minimum of 1 so the value is always a valid, non-zero stride.
+        // MOD-2 fix: `hidden_size / num_heads` can evaluate to 0 (e.g.
+        // when `hidden_size == 0` or is smaller than `num_heads`), and a 0 `head_dim` becomes a.
         let head_dim = if raw_head_dim > 0 {
             raw_head_dim
         } else {
@@ -260,9 +245,7 @@ impl ModelConfig for MuseGlimmerConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GlimmerBlock — hybrid sliding-window/full attention
-// ---------------------------------------------------------------------------
+// GlimmerBlock - hybrid sliding-window/full attention
 
 #[derive(Clone, Copy)]
 pub(crate) struct GlimmerConfigRefs {
@@ -383,9 +366,7 @@ impl GlimmerBlock {
     }
 
     /// Decode one layer. Appends K/V to the (host-mirror) cache, runs hybrid
-    /// causal (+ optional window) attention with `qk_scale_factor`, then the
-    /// dense SwiGLU FFN. Returns `(out, k, v)` post-RoPE for the caller's
-    /// KV population.
+    /// causal (+ optional window) attention with `qk_scale_factor`, then the dense SwiGLU FFN.
     pub fn forward_with_kv(
         &self,
         x_2d: &Tensor,
@@ -405,12 +386,8 @@ impl GlimmerBlock {
         let row_elems = cfg.local_num_kv_heads * cfg.head_dim;
         let dev = grim_nn::modules::pick_device_for_storage_device(x_2d.device());
 
-        // Device-first: append the step's K/V rows to the device arena (D2D)
-        // and run the fused attention kernel over the arena. Only valid when
-        // `qk_scale_factor` is unity — the device kernel contract carries no
-        // custom scale (see `shared_attention::fused_or_scalar_attention_scaled`).
-        // `Ok(None)` means the backend lacks the device kernels; the caller
-        // then runs the host-mirror path via `host_mirror_attention`.
+        // Device-first: append the step's K/V rows to the device arena (D2D) and run the fused attention kernel over the arena.
+        // Only valid when `qk_scale_factor` is unity - the device kernel contract carries no custom scale.
         let device_attempt: Result<Option<Tensor>> = if cfg.qk_scale_factor == 1.0 {
             match cache.as_deref_mut() {
                 Some(c) => match crate::block::cache_append_kv(
@@ -425,8 +402,7 @@ impl GlimmerBlock {
                 ) {
                     Ok((k_st, v_st, total)) => {
                         c.past_len = total;
-                        let out_shape =
-                            Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]);
+                        let out_shape = Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]);
                         match dev.qkv_attention(
                             q_rot.storage().as_ref(),
                             k_st,
@@ -446,18 +422,20 @@ impl GlimmerBlock {
                                 grim_tensor::QuantProvenance::default(),
                                 x_2d.device().clone(),
                             ))),
-                            // Arena already holds this step's K/V — fetch it
-                            // to host once instead of re-extending the mirror.
-                            // The arena buffer is capacity-sized; only
-                            // `total` rows are valid — truncate or the scalar
-                            // kernel reads garbage rows.
+                            // Arena already holds this step's K/V - fetch it to host once instead of re-extending the mirror.
+                            // The arena buffer is capacity-sized; only `total` rows are valid - truncate or the scalar.
                             Err(_) => {
                                 let mut hk = k_st.to_cpu_vec_f32()?;
                                 hk.truncate(total * row_elems);
                                 let mut hv = v_st.to_cpu_vec_f32()?;
                                 hv.truncate(total * row_elems);
                                 Ok(Some(self.hybrid_attention(
-                                    &q_rot, &hk, &hv, total - s, s, total,
+                                    &q_rot,
+                                    &hk,
+                                    &hv,
+                                    total - s,
+                                    s,
+                                    total,
                                 )?))
                             }
                         }
@@ -470,8 +448,7 @@ impl GlimmerBlock {
                 },
                 None => {
                     // No cache: attend over the current step's K/V directly.
-                    let out_shape =
-                        Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]);
+                    let out_shape = Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]);
                     match dev.qkv_attention(
                         q_rot.storage().as_ref(),
                         k_rot.storage().as_ref(),
@@ -503,9 +480,7 @@ impl GlimmerBlock {
 
         let attn_out = match device_attempt {
             Ok(Some(t)) => t,
-            Ok(None) => {
-                self.host_mirror_attention(&q_rot, &k_rot, &v, cache.as_deref_mut(), s)?
-            }
+            Ok(None) => self.host_mirror_attention(&q_rot, &k_rot, &v, cache, s)?,
             Err(e) => return Err(e),
         };
         let attn_out = reshaped_view(
@@ -526,9 +501,8 @@ impl GlimmerBlock {
         Ok((out, k_rot, v))
     }
 
-    /// Legacy host path: extend the host-mirror KV cache and run the scalar
-    /// attention loop. Only reached when the backend lacks the device cache /
-    /// attention kernels or the layer carries a non-unit `qk_scale_factor`.
+    /// Legacy host path: extend the host-mirror KV cache and run the scalar attention loop.
+    /// Only reached when the backend lacks the device cache / attention kernels or the layer.
     fn host_mirror_attention(
         &self,
         q_rot: &Tensor,
@@ -631,10 +605,8 @@ impl GlimmerBlock {
         }
     }
 
-    /// Hybrid attention on host mirrors. Causal always; when `sliding_window`
-    /// is set for this layer, each query attends to at most the previous
-    /// `window` keys. Scores are `scale = qk_scale_factor / sqrt(head_dim)`,
-    /// no softcap at the attention stage (Muse-Glimmer only softcaps logits).
+    /// Hybrid attention on host mirrors. Causal always; when `sliding_window` is set for
+    /// this layer, each query attends to at most the previous `window` keys.
     #[allow(clippy::too_many_arguments)]
     fn hybrid_attention(
         &self,
@@ -696,9 +668,7 @@ fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Projector
-// ---------------------------------------------------------------------------
 
 /// Projection of `GlimmerVision` patch embeddings into the text hidden space.
 #[derive(Clone)]
@@ -723,9 +693,7 @@ impl GlimmerProjector {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct MuseGlimmer {
     pub cfg: MuseGlimmerConfig,
@@ -924,8 +892,7 @@ impl MuseGlimmer {
         Ok((logits, h, kv_pairs))
     }
 
-    /// Encode an image with the optional vision tower + projector, returning
-    /// per-token projected embeddings of shape `(num_tokens, hidden_size)`.
+    /// Encode an image with the optional vision tower + projector, returning per-token projected embeddings of shape `(num_tokens, hidden_size)`.
     /// Errors when the model has no vision stack configured.
     pub fn encode_image_tokens(&self, image: &Tensor) -> Result<Tensor> {
         let vision = self

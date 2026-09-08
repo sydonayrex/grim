@@ -1,14 +1,5 @@
-//! Model catalog — per-model JSON sidecar written alongside every downloaded
-//! model file. Allows `grim run <name>` and `GET /v1/models` to resolve a
-//! friendly name to a file path without scanning for extensions.
-//!
-//! Sidecar path: `<models_dir>/<stem>.json`
-//!
-//! Contract:
-//! - Written atomically (temp-file + rename) so a crash during download
-//!   cannot leave a half-written catalog entry.
-//! - Read-tolerant: missing fields deserialize to their Default values so
-//!   older sidecars remain readable after format additions.
+//! Model catalog - per-model JSON sidecar written alongside every downloaded model file.
+//! Allows `grim run <name>` and `GET /v1/models` to resolve a friendly name to a file.
 
 use std::path::{Path, PathBuf};
 
@@ -56,14 +47,12 @@ pub struct ModelEntry {
 
 impl ModelEntry {
     /// Derive the sidecar path for a given model file path.
-    ///
-    /// `<dir>/<stem>.json` — always lives next to the model file.
+    /// `<dir>/<stem>.json` - always lives next to the model file.
     pub fn sidecar_path_for(model_path: &Path) -> PathBuf {
         model_path.with_extension("json")
     }
 
     /// Write this entry to the canonical sidecar location atomically.
-    ///
     /// Uses a `.tmp` suffix + rename to avoid partial writes.
     pub fn save(&self, model_path: &Path) -> Result<()> {
         let sidecar = Self::sidecar_path_for(model_path);
@@ -87,18 +76,8 @@ impl ModelEntry {
 }
 
 impl ModelEntry {
-    /// Best-effort GGUF header enrichment.
-    ///
-    /// Parses only the GGUF header (magic, version, metadata KV map) — never
-    /// the multi-GB tensor data section — so it is cheap enough to run on the
-    /// per-model pull path and during `GET /v1/models`. Returns the fields the
-    /// catalog displays: architecture (`general.architecture`), a human-readable
-    /// parameter count (`general.parameter_count`, e.g. `"7B"`), and the context
-    /// window (`llama.context_length` / `<arch>.context_length`).
-    ///
-    /// A corrupted or non-GGUF file yields `None` and the caller keeps whatever
-    /// it already had (filename-derived hint, empty strings); this never fails
-    /// the surrounding download/catalog operation.
+    /// Best-effort GGUF header enrichment. Parses only the GGUF header (magic, version, metadata KV map) - never the multi-GB tensor
+    /// data section - so it is cheap enough to run on the per-model pull path and during `GET /v1/models`.
     pub fn enrich_from_gguf(model_path: &Path) -> Option<GgufEnrichment> {
         let mut file = std::fs::File::open(model_path).ok()?;
         let gguf: GgufFile = read_gguf(&mut file).ok()?;
@@ -143,10 +122,8 @@ impl ModelEntry {
     }
 }
 
-/// Fill a `ModelEntry`'s `arch` / `params` / `context_length` from a GGUF
-/// header when those fields are still empty. Header-only read, so it is safe to
-/// call on the per-model pull path and the filesystem-scan fallback. Never
-/// overwrites data already present (e.g. a sidecar's richer value).
+/// Fill a `ModelEntry`'s `arch` / `params` / `context_length` from a GGUF header when those fields are still empty.
+/// Header-only read, so it is safe to call on the per-model pull path and the.
 pub fn apply_gguf_enrichment(entry: &mut ModelEntry, model_path: &Path) {
     if !entry.arch.is_empty() && !entry.params.is_empty() && entry.context_length != 0 {
         return;
@@ -164,13 +141,8 @@ pub fn apply_gguf_enrichment(entry: &mut ModelEntry, model_path: &Path) {
     }
 }
 
-/// WI-3 serve-time self-heal: if `model_path`'s catalog sidecar still has
-/// an empty `arch` or zero `context_length` (an older pull, or a manually-
-/// placed file whose sidecar predates WI-3), reload it, fill only the empty
-/// fields from the GGUF header, and re-save. Header-only read — never the
-/// multi-GB tensor section. Failure is non-fatal (returns `()`); callers in
-/// the serve path invoke this after the model is already loaded, so a
-/// missing sidecar or unreadable header must never break serving.
+/// WI-3 serve-time self-heal: if `model_path`'s catalog sidecar still has an empty `arch` or zero `context_length` (an older pull, or a manually- placed file whose sidecar predates WI-3), reload it, fill only the empty fields from the GGUF header, and re-save.
+/// Header-only read - never the multi-GB tensor section.
 pub fn self_heal_sidecar(model_path: &Path) {
     if let Some(mut entry) = ModelEntry::load_for(model_path) {
         if entry.arch.is_empty() || entry.context_length == 0 {
@@ -180,10 +152,8 @@ pub fn self_heal_sidecar(model_path: &Path) {
     }
 }
 
-/// Fill a `ModelEntry`'s `preferred_dtype` from a native `.grim` file's JSON
-/// metadata layer (P1 §8 tag written at train time). Header + metadata read
-/// only — payload bytes are never touched — so it is cheap on the catalog
-/// scan path. Non-`.grim` files or missing tags leave the entry untouched.
+/// Fill a `ModelEntry`'s `preferred_dtype` from a native `.grim` file's JSON metadata layer (P1 §8 tag written at train time).
+/// Header + metadata read only - payload bytes are never touched - so it is.
 pub fn apply_grim_tags(entry: &mut ModelEntry, model_path: &Path) {
     if !entry.preferred_dtype.is_empty()
         || model_path.extension().map(|e| e != "grim").unwrap_or(true)
@@ -247,16 +217,7 @@ fn is_safe_model_path(path: &Path, models_dir: &Path) -> bool {
 }
 
 /// Resolve a model name or alias to a file path on disk.
-///
-/// Resolution order:
-/// 1. Exact file path (absolute or relative) that exists as-is.
-/// 2. Sidecar lookup in `grim_models_dir()` — walks all `.json` files and
-///    matches `entry.name` exactly, then by stem prefix.
-/// 3. File scan in `grim_models_dir()` — matches `<name>.gguf`, `<name>.grim`,
-///    `<name_with_underscores>.gguf`, etc.
-///
-/// Returns `None` when no match is found. The caller should print a helpful
-/// message directing the user to run `grim pull <name>`.
+/// Resolution order: 1.
 pub fn resolve_model_path(name: &str) -> Option<PathBuf> {
     let models_dir = grim_models_dir();
 
@@ -317,27 +278,13 @@ pub fn resolve_model_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a model name or alias to a file path, preferring an existing
-/// ROCm-optimized `.grim` conversion over a sibling `.gguf` when both are
-/// present.
-///
-/// This is used by `grim run` so that once a model has been converted with
-/// `grim oxidize convert --rocml-profile <target>`, the tuned artifact is
-/// picked up automatically — the conversion step is opt-in, but once it
-/// exists it should be used without the user having to remember to point at
-/// the `.grim` file explicitly.
-///
-/// Resolution strategy mirrors [`resolve_model_path`]: direct path, then
-/// sidecar lookup, then a filesystem scan — but at the filesystem-scan step
-/// a `.grim` candidate takes precedence over a `.gguf` candidate for the
-/// same stem.
+/// Resolve a model name or alias to a file path, preferring an existing ROCm-optimized `.grim` conversion over a sibling `.gguf` when both are present.
+/// This is used by `grim run` so that once a model has been converted with.
 pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
     let models_dir = grim_models_dir();
 
-    // 0. Strip explicit format suffixes (`:grim`, `:gguf`) so that
-    //    `resolve_model_preferring_grim("sleipnir:grim")` and
-    //    `resolve_model_preferring_grim("sleipnir:gguf")` resolve the bare
-    //    stem and then prefer/select the requested format.
+    // 0. Strip explicit format suffixes (`:grim`, `:gguf`) so that `resolve_model_preferring_grim("sleipnir:grim")` and
+    // `resolve_model_preferring_grim("sleipnir:gguf")` resolve the bare stem and then prefer/select the requested format.
     let (stem, force_ext) = strip_format_suffix(name);
 
     // 1. Direct path (guarded against traversal).
@@ -390,10 +337,7 @@ pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
         }
     }
 
-    // 3. File scan — extension-based fallback, `.grim` wins over `.gguf`.
-    //    `stem`/`force_ext` have already had any `:grim`/`:gguf` suffix stripped
-    //    in step 0, so a bare lookup like `sleipnir:grim` resolves to
-    //    `sleipnir.grim` rather than the mangled `sleipnir_grim.grim`.
+    // 3. File scan - extension-based fallback, `.grim` wins over `.gguf`.
     let file_stem = stem.replace(['/', ':'], "_");
     let gguf_candidate = models_dir.join(format!("{file_stem}.gguf"));
     let grim_candidate = models_dir.join(format!("{file_stem}.grim"));
@@ -416,10 +360,7 @@ pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
 }
 
 /// Strip a `:grim` or `:gguf` format suffix from a model name.
-///
-/// Returns `(stem, force_ext)` where `stem` is the name without the suffix and
-/// `force_ext` is `Some("grim")` or `Some("gguf")` when a suffix was present,
-/// or `None` when the caller left the format implicit.
+/// Returns `(stem, force_ext)` where `stem` is the name without the suffix and `force_ext` is `Some("grim")`.
 fn strip_format_suffix(name: &str) -> (&str, Option<&str>) {
     if let Some(rest) = name.strip_suffix(":grim") {
         (rest, Some("grim"))
@@ -430,9 +371,8 @@ fn strip_format_suffix(name: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// When `force_ext` is `Some`, override the candidate's extension if a file
-/// with the *other* extension happens to be the one on disk. This lets
-/// `sleipnir:gguf` resolve the GGUF even when `.grim` also exists.
+/// When `force_ext` is `Some`, override the candidate's extension if a file with the *other* extension happens to be the one on disk.
+/// This lets `sleipnir:gguf` resolve the GGUF even when `.grim` also exists.
 fn resolve_with_ext(candidate: &Path, force_ext: Option<&str>) -> Option<PathBuf> {
     let desired = match force_ext {
         Some("grim") => "grim",
@@ -466,9 +406,7 @@ fn grim_sibling_if_gguf(path: &Path) -> Option<PathBuf> {
 }
 
 /// List all model entries in the models directory.
-///
-/// Combines sidecar metadata (when present) with a plain filesystem scan
-/// for files that have no sidecar.
+/// Combines sidecar metadata (when present) with a plain filesystem scan for files that have no.
 pub fn list_local_models() -> Vec<ModelEntry> {
     let models_dir = grim_models_dir();
     let mut out: Vec<ModelEntry> = Vec::new();
@@ -534,9 +472,8 @@ pub fn list_local_models() -> Vec<ModelEntry> {
 mod tests {
     use super::*;
 
-    /// WI-S6: when both a `.gguf` and a `.grim` sibling exist for a model,
-    /// `resolve_model_preferring_grim` must return the `.grim` path so the
-    /// ROCm-tuned conversion is used automatically once it exists.
+    /// WI-S6: when both a `.gguf` and a `.grim` sibling exist for a model, `resolve_model_preferring_grim`
+    /// must return the `.grim` path so the ROCm-tuned conversion is used automatically once it exists.
     #[test]
     fn resolve_preferring_grim_chooses_grim_over_gguf() {
         let _guard = crate::paths::ENV_LOCK

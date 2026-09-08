@@ -1,25 +1,5 @@
 //! AWQ (Activation-aware Weight Quantization) ingestion.
-//!
-//! AWQ checkpoints are safetensors files whose quantized layers store
-//! `*.qweight` / `*.qzeros` / `*.scales` tensors plus a sibling
-//! `quantize_config.json` with `"quant_method": "awq"`. Layout differences
-//! from GPTQ:
-//!
-//! - **Column-major packing**: AWQ packs along the OUTPUT dimension
-//!   (`qweight` is [in_features/8, out_features] u32 words for 4-bit), the
-//!   transpose of GPTQ's row-packing.
-//! - **Shifted zeros**: the stored zero-point is pre-offset by 1 relative to
-//!   GPTQ's `(zero + 1)` decode — AWQ decodes as `(code - zero)` directly,
-//!   where `zero` is the raw stored value.
-//! - **Scale dtype**: f16 (not f32) per-(group, output-column) scales.
-//! - **g_idx**: never present; AWQ always uses sequential groups.
-//!
-//! The tensor data itself is consumed through the existing GroupInt storage
-//! path: this module re-frames each AWQ tensor into grim's length-prefixed
-//! four-segment packed blob ([see: `grim_tensor::dtype::GpuIntConfig`]) with
-//! the zero-points re-encoded to the GPTQ convention (`stored + 1`) and the
-//! scales widened to f32, so ONE dequant implementation (CPU in `grim-quant`,
-//! GPU fused kernel in `grim-backend-rocm`) serves both formats.
+//! AWQ checkpoints are safetensors files whose quantized layers store `*.qweight` / `*.qzeros` / `*.scales` tensors.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -48,9 +28,8 @@ impl AwqConfig {
         let val: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| Error::Backend(format!("AWQ: invalid quantize_config.json: {e}")))?;
 
-        // Accept either an explicit "quant_method": "awq" or absence of the
-        // key on older exports; reject other methods so a GPTQ checkpoint
-        // misrouted here fails loudly instead of silently misdecoding.
+        // Accept either an explicit "quant_method": "awq" or absence of the key on older exports;
+        // reject other methods so a GPTQ checkpoint misrouted here fails loudly instead of silently misdecoding.
         if let Some(method) = val.get("quant_method").and_then(|v| v.as_str()) {
             if !method.eq_ignore_ascii_case("awq") {
                 return Err(Error::Backend(format!(
@@ -97,10 +76,8 @@ pub struct AwqTensorInfo {
     pub scales_size: u64,
 }
 
-/// Reader for AWQ safetensors checkpoints. Implements `TensorProvider`; every
-/// `get_packed` returns a GroupInt-stamped RawTensor holding grim's canonical
-/// four-segment packed blob, so the existing CPU dequant and ROCm fused-GEMM
-/// paths consume it unchanged.
+/// Reader for AWQ safetensors checkpoints. Implements `TensorProvider`; every `get_packed` returns a GroupInt-stamped RawTensor holding grim's
+/// canonical four-segment packed blob, so the existing CPU dequant and ROCm fused-GEMM paths consume it unchanged.
 pub struct AwqProvider {
     pub tensors: HashMap<String, AwqTensorInfo>,
     reader: std::sync::Mutex<BufReader<File>>,
@@ -204,14 +181,7 @@ impl AwqProvider {
 }
 
 /// Re-frame one AWQ layer into grim's canonical GroupInt packed blob.
-///
-/// Transformations applied so the shared GPTQ-convention consumers work:
-/// 1. Zero-points: AWQ stores `zero_gptq - 1`; add 1 back per element.
-/// 2. Scales: widen f16 → f32 (one per (group, output column)).
-/// 3. g_idx: absent in AWQ — emit an empty-length segment.
-///
-/// Packing order is left byte-identical to the checkpoint (both formats use
-/// little-endian u32 words with the same intra-word bit order for 4/8-bit).
+/// Transformations applied so the shared GPTQ-convention consumers work: 1.
 pub fn pack_awq_group_int(
     info: &AwqTensorInfo,
     qweight: &[u8],
@@ -424,10 +394,8 @@ impl TensorProvider for AwqProvider {
 mod tests {
     use super::*;
 
-    /// 4-bit, group_size 2, [in=4, out=2] AWQ tensor. Verify the re-framed
-    /// blob decodes through the shared GPTQ kernel to the values the AWQ
-    /// layout encodes: w = (code - zero_awq) * scale, where zero_awq is the
-    /// RAW stored zero (no +1) and scales are f16.
+    /// 4-bit, group_size 2, [in=4, out=2] AWQ tensor.
+    /// Verify the re-framed blob decodes through the shared GPTQ kernel to the values the AWQ.
     #[test]
     fn pack_awq_roundtrips_through_gptq_decoder() {
         let (k, n, gs) = (4usize, 2usize, 2usize);

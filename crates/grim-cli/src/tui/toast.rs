@@ -1,9 +1,4 @@
-//! Toast notification system for the TUI.
-//!
-//! Transient info/success/warning/error notifications that auto-dismiss after
-//! a timeout. Borrowed from the opencode-dev pattern: a single toast slot in
-//! `App` with a deadline; the `ui()` loop renders it as an overlay in the
-//! top-right corner and clears it when the deadline passes.
+//! Toast notification system for the TUI. Transient info/success/warning/error notifications that auto-dismiss after a timeout.
 
 use std::time::{Duration, Instant};
 
@@ -63,7 +58,11 @@ impl Toast {
     }
 
     /// Create a toast with a title.
-    pub fn with_title(variant: ToastVariant, title: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn with_title(
+        variant: ToastVariant,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             title: Some(title.into()),
             message: message.into(),
@@ -88,7 +87,8 @@ impl Toast {
 
     /// True if the toast has expired.
     pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.deadline }
+        Instant::now() >= self.deadline
+    }
 }
 
 /// Convenience constructors.
@@ -135,7 +135,10 @@ fn truncate(s: &str, max_cols: usize) -> String {
     if s.len() <= max_cols {
         s.to_string()
     } else {
-        let mut result = s.chars().take(max_cols.saturating_sub(1)).collect::<String>();
+        let mut result = s
+            .chars()
+            .take(max_cols.saturating_sub(1))
+            .collect::<String>();
         result.push('…');
         result
     }

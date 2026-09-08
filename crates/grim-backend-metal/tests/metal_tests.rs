@@ -170,8 +170,12 @@ fn test_metal_moe_fused_dispatch_parity() {
             DType::F32,
         )
         .unwrap();
-    let tok = dev.from_cpu(&rtok, &Shape::new(vec![2]), DType::F32).unwrap();
-    let exp = dev.from_cpu(&rexp, &Shape::new(vec![2]), DType::F32).unwrap();
+    let tok = dev
+        .from_cpu(&rtok, &Shape::new(vec![2]), DType::F32)
+        .unwrap();
+    let exp = dev
+        .from_cpu(&rexp, &Shape::new(vec![2]), DType::F32)
+        .unwrap();
     let rw_s = dev.from_cpu(&rw, &Shape::new(vec![2]), DType::F32).unwrap();
 
     let out_shape = Shape::new(vec![batch as usize, hidden as usize]);

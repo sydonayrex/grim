@@ -1,31 +1,13 @@
 //! Shared attention entry point for transformer loaders.
-//!
-//! One canonical function replaces the ~25 per-model scalar CPU attention
-//! loops (lfm2.rs-style). It first tries the fused device kernel
-//! (`BackendDevice::qkv_attention`, which handles GQA, causal masking and
-//! sliding windows on ROCm/CUDA/Metal/Vulkan/CPU), and falls back to the
-//! reference scalar loop (ported from `block.rs::cpu_attention_fallback`)
-//! when the backend returns `Unimplemented` or the tensors live on CPU.
-//!
-//! See docs/adr/0001-attention-own-vs-delegate.md.
+//! One canonical function replaces the ~25 per-model scalar CPU attention loops (lfm2.rs-style).
 
 use grim_core::error::Result;
 use grim_nn::modules::pick_device_for_storage_device;
 use grim_tensor::{DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
-/// Inputs are flat host buffers with the layouts the scalar loops already use:
-/// - `q`: `[steps, num_heads, head_dim]` (post-RoPE)
-/// - `k_history` / `v_history`: `[kv_len, num_kv_heads, head_dim]`, already
-///   extended with the current step's keys/values (so `kv_len >= steps` and
-///   `cache_offset = kv_len - steps`).
-///
+/// Inputs are flat host buffers with the layouts the scalar loops already use: - `q`: `[steps, num_heads, head_dim]` (post-RoPE) - `k_history` / `v_history`: `[kv_len, num_kv_heads, head_dim]`, already extended with the current step's keys/values (so `kv_len >= steps` and `cache_offset = kv_len - steps`).
 /// Returns a `[steps, num_heads * head_dim]` tensor on `device`.
-///
-/// Causal/window contract (matches `BackendDevice::qkv_attention`): query at
-/// absolute position `cache_offset + i` attends to keys `j` with
-/// `j <= cache_offset + i` and, when `window` is set,
-/// `j >= cache_offset + i - window + 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_or_scalar_attention(
     q: &[f32],
@@ -45,9 +27,7 @@ pub fn fused_or_scalar_attention(
     let cache_offset = kv_len.saturating_sub(steps);
 
     // GRIM_QKV_FUSED=0 forces the scalar reference path on GPU backends.
-    // Correctness escape hatch while the fused-route generation corruption
-    // (bisected to d95f21f, kernel itself verified correct standalone) is
-    // being root-caused.
+    // Correctness escape hatch while the fused-route generation corruption (bisected to d95f21f, kernel itself verified correct.
     if std::env::var("GRIM_QKV_FUSED").as_deref() == Ok("0") {
         return scalar_attention(
             q,
@@ -67,10 +47,8 @@ pub fn fused_or_scalar_attention(
     }
 
     let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
-    // Allocate the kernel output directly with the FLAT [steps, heads*dim]
-    // shape consumers expect. Relabeling a [steps, heads, dim] storage under a
-    // flat shape corrupts downstream matmuls that consult the storage dims
-    // (bisected: LFM2 `wo` projections on ROCm).
+    // Allocate the kernel output directly with the FLAT [steps, heads*dim] shape consumers expect.
+    // Relabeling a [steps, heads, dim] storage under a flat shape corrupts downstream matmuls that consult.
     let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
     let dev = pick_device_for_storage_device(device);
 
@@ -120,11 +98,8 @@ pub fn fused_or_scalar_attention(
     }
 }
 
-/// WI-X2: attention over a caller-maintained device KV arena (see
-/// `block.rs::cache_append_kv`). Only the per-step K/V rows cross H2D; the
-/// history stays resident, so decode cost is O(new tokens), not O(context).
-/// Falls back to the host-history path when the device kernel rejects the
-/// call or the backend lacks the fused kernel.
+/// WI-X2: attention over a caller-maintained device KV arena (see `block.rs::cache_append_kv`).
+/// Only the per-step K/V rows cross H2D; the history stays resident, so decode cost is.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_or_scalar_attention_arena(
     q: &[f32],
@@ -165,9 +140,8 @@ pub fn fused_or_scalar_attention_arena(
             device.clone(),
         ));
     }
-    // Fallback: materialize exactly `kv_len` rows (the arena may be larger
-    // than the live history — capacity grows geometrically) and take the
-    // host-history path.
+    // Fallback: materialize exactly `kv_len` rows (the arena may be larger than
+    // the live history - capacity grows geometrically) and take the host-history path.
     let kv_stride = num_kv_heads * head_dim;
     let k_hist = k_arena.to_cpu_vec_f32()?;
     let v_hist = v_arena.to_cpu_vec_f32()?;
@@ -230,13 +204,8 @@ pub fn fused_or_scalar_attention_paged(
             ))
         }
         Err(_) => {
-            // Fallback to scalar attention when the paged device kernel is
-            // unavailable. Audit fix (grim-models): the pre-fix fallback
-            // IGNORED the block table (treating the page arena as a linear
-            // history — wrong whenever blocks are non-contiguous) and
-            // `unwrap_or_default()`-ed failed D2H reads into EMPTY K/V
-            // (fabricated zeros). It now gathers rows through the block
-            // table and propagates read errors.
+            // Fallback to scalar attention when the paged device kernel is unavailable.
+            // Audit fix (grim-models): the pre-fix fallback IGNORED the block table (treating the page arena as.
             let bt_host = block_tables.to_cpu_vec_f32()?;
             let block_table: Vec<usize> = bt_host.iter().map(|&b| b as usize).collect();
             let kv_stride = num_kv_heads * head_dim;
@@ -265,9 +234,8 @@ pub fn fused_or_scalar_attention_paged(
     }
 }
 
-/// Gather `kv_seq_len` logical history rows out of a paged KV arena using
-/// the per-sequence block table: logical position `p` lives at physical row
-/// `block_table[p / page_size] * page_size + (p % page_size)`.
+/// Gather `kv_seq_len` logical history rows out of a paged KV arena using the per-sequence block table:
+/// logical position `p` lives at physical row `block_table[p / page_size] * page_size + (p % page_size)`.
 pub fn gather_paged_history(
     pages: &[f32],
     block_table: &[usize],
@@ -303,11 +271,8 @@ pub fn gather_paged_history(
     Ok(hist)
 }
 
-/// Like [`fused_or_scalar_attention`] but with an explicit softmax scale
-/// override (e.g. `qk_scale_factor / sqrt(head_dim)`). Used by models whose
-/// config carries a non-unit `qk_scale_factor` (muse_glimmer-class); the
-/// device kernel contract has no scale parameter, so those models always
-/// take the scalar path when `scale` differs from `1/sqrt(head_dim)`.
+/// Like [`fused_or_scalar_attention`] but with an explicit softmax scale override (e.g.
+/// `qk_scale_factor / sqrt(head_dim)`).
 #[allow(clippy::too_many_arguments)]
 pub fn fused_or_scalar_attention_scaled(
     q: &[f32],
@@ -342,17 +307,8 @@ pub fn fused_or_scalar_attention_scaled(
     )
 }
 
-/// Tensor-level fused attention (GPU-first): q/k/v stay on their device and
-/// only the fused `qkv_attention` kernel runs — no host roundtrip on GPU
-/// backends. `k`/`v` carry the full history (`kv_len` rows, layout
-/// `[kv_len, num_kv_heads * head_dim]`); the kernel applies the causal mask
-/// at `cache_offset + i` (`cache_offset = kv_len - steps`), with an optional
-/// sliding `window`. Falls back to the scalar host path only when the
-/// backend lacks the kernel, matching the `fused_or_scalar_attention`
-/// contract without forcing per-call H2D uploads of Q/K/V.
-///
-/// `q` is `[steps, num_heads * head_dim]` (post-RoPE); storage layouts are
-/// relabeled zero-copy where possible (D2D otherwise).
+/// Tensor-level fused attention (GPU-first): q/k/v stay on their device and only the fused `qkv_attention` kernel runs - no host roundtrip on GPU backends.
+/// `k`/`v` carry the full history (`kv_len` rows, layout `[kv_len, num_kv_heads * head_dim]`); the kernel applies.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention_tensors(
     q: &Tensor,
@@ -375,10 +331,8 @@ pub fn fused_attention_tensors(
     let q3s = q3.storage().as_ref();
     let k3s = k3.storage().as_ref();
     let v3s = v3.storage().as_ref();
-    // Kernel contracts differ per backend: ROCm/CUDA allocate the flat
-    // `[steps, heads*dim]` output directly; the CPU kernel requires a 3-D
-    // `[steps, heads, dim]` out_shape. Try flat, retry 3-D, relabel the
-    // storage to the flat consumer shape (zero-copy) when needed.
+    // Kernel contracts differ per backend: ROCm/CUDA allocate the flat `[steps, heads*dim]` output directly; the CPU kernel requires a 3-D `[steps, heads, dim]` out_shape.
+    // Try flat, retry 3-D, relabel the storage to the flat consumer shape (zero-copy) when needed.
     let fused = |out: &Shape| {
         dev.qkv_attention(
             q3s,
@@ -437,10 +391,8 @@ pub fn fused_attention_tensors(
     ))
 }
 
-/// Concatenate two `[rows_a, width]` / `[rows_b, width]` tensors along rows
-/// (GPU-first). Device path: fresh arena + two D2D copies (the
-/// `block.rs::cache_append_kv` primitive pair); host fallback only when the
-/// backend lacks `alloc_storage`/`copy_slice_into`.
+/// Concatenate two `[rows_a, width]` / `[rows_b, width]` tensors along rows (GPU-first).
+/// Device path: fresh arena + two D2D copies (the `block.rs::cache_append_kv` primitive pair); host fallback only.
 pub fn concat_rows_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let rows = a.shape().dims()[0] + b.shape().dims()[0];
     let width = *a.shape().dims().last().expect("non-empty tensor");
@@ -485,11 +437,7 @@ pub fn concat_rows_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 /// NeoX RoPE for `[steps, num_heads * head_dim]` tensors (GPU-first).
-/// Relabels to one head_dim-wide row per head (`(1, steps * num_heads, D)`,
-/// positions repeated per head — the `block.rs`/`muse_glimmer` kernel
-/// contract), runs the grim-nn `Rope` module (device kernel on GPU, host
-/// loop on the CPU fallback backend), relabels back to `[steps, width]`.
-/// `x.width() == num_heads * rope.config.dim` must hold.
+/// Relabels to one head_dim-wide row per head (`(1, steps * num_heads, D)`, positions repeated per.
 pub fn rope_2d_on_device(
     rope: &grim_nn::Rope,
     x: &Tensor,
@@ -515,8 +463,7 @@ pub fn rope_2d_on_device(
 }
 
 /// Reference scalar attention with causal + sliding-window masking.
-/// Direct port of `block.rs::cpu_attention_fallback`, taking explicit dims
-/// so loaders without a `BlockConfig` can use it.
+/// Direct port of `block.rs::cpu_attention_fallback`, taking explicit dims so loaders without a `BlockConfig` can use it.
 #[allow(clippy::too_many_arguments)]
 fn scalar_attention(
     q: &[f32],
@@ -594,10 +541,8 @@ fn scalar_attention(
 mod tests {
     use super::*;
 
-    /// Audit gate: the paged fallback's gather must follow the BLOCK TABLE,
-    /// not assume the arena is linear history. Pages are filled with
-    /// position-encoded values in permuted physical order; the gather must
-    /// reconstruct linear order exactly.
+    /// Audit gate: the paged fallback's gather must follow the BLOCK TABLE, not assume the arena is linear history.
+    /// Pages are filled with position-encoded values in permuted physical order; the gather must reconstruct linear.
     #[test]
     fn gather_paged_history_follows_block_table() {
         let page_size = 4usize;
@@ -721,9 +666,8 @@ mod tests {
         }
     }
 
-    /// WI-X2: the arena entry must produce byte-identical results to the
-    /// host-history entry when the device has no fused kernel (CPU) — the
-    /// arena path degrades to a materialize-and-fallback, never to wrong math.
+    /// WI-X2: the arena entry must produce byte-identical results to the host-history entry when the device has
+    /// no fused kernel (CPU) - the arena path degrades to a materialize-and-fallback, never to wrong math.
     #[test]
     fn arena_attention_matches_host_history_path() {
         let num_heads = 4;

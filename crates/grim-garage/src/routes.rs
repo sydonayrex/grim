@@ -1,20 +1,5 @@
 //! HTTP routes for Grim's Garage web app & API (WI-T9 & WI-T10).
-//!
 //! Mounted under `/api/...`, `/sse/...`, and static web UI routes under `/`.
-//!
-//! Endpoints:
-//! - `GET  /`                                — static web dashboard
-//! - `GET  /api/models`                      — list local models
-//! - `GET  /api/datasets`                    — list local datasets
-//! - `GET  /api/rocm/devices`                — GPU probe
-//! - `POST /api/train/start`                 — create + start a job
-//! - `GET  /api/train/jobs`                  — list jobs + statuses
-//! - `GET  /api/train/status/{id}`          — single-job snapshot
-//! - `POST /api/train/cancel/{id}`          — request cancellation
-//! - `GET  /api/models/{id}/bolt-ons`       — list bolt-on adapter status
-//! - `POST /api/models/{id}/bolt-ons`      — attach bolt-on adapter
-//! - `DELETE /api/models/{id}/bolt-ons/{slot}` — detach bolt-on adapter
-//! - `SSE  /sse/metrics/{id}`               — live loss/vram events
 
 use std::path::Path;
 use std::sync::Arc;
@@ -43,7 +28,7 @@ use grim_engine::{Engine, model_loader};
 use grim_format::GgufTokenizer;
 use grim_models_audio::{KokoroConfig, VocosConfig};
 use grim_models_diffusion::{Flux2Config, Flux2VaeConfig};
-use grim_tensor::{CoreTensorOps};
+use grim_tensor::CoreTensorOps;
 
 /// Shared state passed to every handler.
 #[derive(Clone)]
@@ -72,10 +57,8 @@ pub struct StartTrainingRequest {
     pub training_mode: TrainingMode,
     #[serde(default = "default_rank")]
     pub lora_rank: u32,
-    /// LoRA alpha (scaling) for adapter init and bake-merge
-    /// (`ΔW = (alpha / rank) · B·A`). `None` = documented rule-of-thumb
-    /// default `2 * lora_rank`. The UI always sends this; previously it was
-    /// silently dropped by serde.
+    /// LoRA alpha (scaling) for adapter init and bake-merge (`ΔW = (alpha / rank) · B·A`).
+    /// `None` = documented rule-of-thumb default `2 * lora_rank`.
     #[serde(default)]
     pub lora_alpha: Option<f32>,
     #[serde(default = "default_lr")]
@@ -119,9 +102,8 @@ pub struct StartTrainingRequest {
     /// SPECTRAL-QLORA: orthogonal adapter init + Muon optimizer.
     #[serde(default)]
     pub use_spectral_qlora: bool,
-    /// Optionally resume training from a checkpoint sidecar produced by a
-    /// prior run. The sidecar must exist at this path on the server and
-    /// is validated via `validate_job_path` in the route handler.
+    /// Optionally resume training from a checkpoint sidecar produced by a prior run.
+    /// The sidecar must exist at this path on the server and is validated via `validate_job_path`.
     #[serde(default)]
     pub resume_from_checkpoint: Option<String>,
     /// Permanently bake the trained adapter into the target .grim file upon job completion.
@@ -207,8 +189,7 @@ pub struct ConvertModelRequest {
     #[serde(default = "default_generations")]
     pub evopress_generations: usize,
     /// Target codec format: "crow", "raven", "rook", "jay", "jackdaw", "magpie".
-    /// Passes through to `grim_format::convert_to_grim()` as the `target_bpw`
-    /// equivalent after resolving each name to its bpw via `WeightFormat`.
+    /// Passes through to `grim_format::convert_to_grim()` as the `target_bpw` equivalent after resolving each name to its bpw.
     #[serde(default)]
     pub target_format: Option<String>,
 }
@@ -244,11 +225,8 @@ async fn embedded_asset_handler(AxumPath(path): AxumPath<String>) -> impl IntoRe
     } else {
         &path
     };
-    // P2-13d: axum matches registered `/api/*` routes before this catch-all,
-    // so any path reaching here that starts with `api/` is an unknown API
-    // endpoint. It must 404 rather than silently serving the SPA shell —
-    // returning index.html would mask API typos as HTTP 200 and confuse
-    // clients.
+    // P2-13d: axum matches registered `/api/*` routes before this catch-all, so any path reaching here that starts with `api/` is an unknown API endpoint.
+    // It must 404 rather than silently serving the SPA shell - returning index.html would mask.
     if path_str == "api" || path_str.starts_with("api/") {
         return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
     }
@@ -260,6 +238,14 @@ async fn embedded_asset_handler(AxumPath(path): AxumPath<String>) -> impl IntoRe
                 "text/css"
             } else if path_str.ends_with(".js") {
                 "application/javascript"
+            } else if path_str.ends_with(".png") {
+                "image/png"
+            } else if path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") {
+                "image/jpeg"
+            } else if path_str.ends_with(".svg") {
+                "image/svg+xml"
+            } else if path_str.ends_with(".webp") {
+                "image/webp"
             } else {
                 "application/octet-stream"
             };
@@ -365,8 +351,7 @@ async fn get_rocm_devices() -> Json<BackendProbeResponse> {
     })
 }
 
-/// Probe every compute backend in the selection chain (ROCm → CUDA →
-/// Vulkan → Metal → CPU) and report which are actually live on this host.
+/// Probe every compute backend in the selection chain (ROCm → CUDA → Vulkan → Metal → CPU) and report which are actually live on this host.
 /// Drives the "select GPU" panel in the UI.
 async fn list_backends() -> Json<BackendProbeResponse> {
     Json(BackendProbeResponse {
@@ -378,14 +363,8 @@ async fn list_backends() -> Json<BackendProbeResponse> {
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Json<JobsListResponse> {
-    // L5 / H5: take a single read-lock snapshot so we cannot snag a job
-    // id from `list()` and then miss it on the follow-up `get()` (which
-    // surfaced as "ghost" JobSummary rows with empty paths and the
-    // placeholder TrainingMode::Lora). Filter rows whose `model_path` is
-    // empty — defensive guard against any future code path that stores a
-    // job with empty fields (post-M1 path validation rejects `/`, `..`,
-    // etc. on input, but we ignore such rows defensively rather than
-    // shipping blank cards).
+    // L5 / H5: take a single read-lock snapshot so we cannot snag a job id from `list()` and then miss it on the follow-up `get()` (which surfaced as "ghost" JobSummary rows with empty paths and the placeholder TrainingMode::Lora).
+    // Filter rows whose `model_path` is empty - defensive guard against any future code path that.
     let snap = state.registry.snapshot().await;
     let summaries: Vec<JobSummary> = snap
         .into_iter()
@@ -413,11 +392,8 @@ async fn start_training(
     State(state): State<AppState>,
     Json(req): Json<StartTrainingRequest>,
 ) -> Result<Json<StartTrainingResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // M1: reject path-traversal-style strings in model_path and
-    // dataset_path. Pre-fix the worker wrote sidecars under attacker-
-    // chosen directories because `create_dir_all(parent)` had no
-    // allowlist check. Mirrors the sibling `convert_model_route` and
-    // `get_bolt_ons` rejection strategy.
+    // M1: reject path-traversal-style strings in model_path and dataset_path.
+    // Pre-fix the worker wrote sidecars under attacker- chosen directories because `create_dir_all(parent)` had no allowlist check.
     if let Err(e) = validate_job_path("model_path", &req.model_path) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
     }
@@ -434,11 +410,8 @@ async fn start_training(
             ),
         ));
     }
-    // M7: refuse `lora_rank == 0` (autograd divides by rank) and
-    // enforce the QLoRA×rank ceiling before the worker spawns. Without
-    // this gate a non-form code path that targeted `lora_rank = 0`
-    // would reach `apply_and_record_lora` and crash; a QLoRA job with
-    // rank > QLORA_MAX_RANK would OOM the consumer GPU.
+    // M7: refuse `lora_rank == 0` (autograd divides by rank) and enforce the QLoRA×rank ceiling before the worker spawns.
+    // Without this gate a non-form code path that targeted `lora_rank = 0` would reach `apply_and_record_lora`.
     use crate::view_model::hyperparam::{LoraRank, LoraRankError};
     let rank = match LoraRank::new(req.lora_rank) {
         Ok(r) => r,
@@ -461,22 +434,16 @@ async fn start_training(
             Json(json!({ "error": format!("lora_rank / training_mode: {e}") })),
         ));
     }
-    // OLoRA: refuse a job that enables the orthogonality penalty with a
-    // non-positive weight — the worker only applies the penalty when
-    // `olora_lambda > 0.0`, so accepting `0.0` or negative here would
-    // silently no-op a feature the user asked for.
+    // OLoRA: refuse a job that enables the orthogonality penalty with a non-positive weight - the worker only applies the
+    // penalty when `olora_lambda > 0.0`, so accepting `0.0` or negative here would silently no-op a feature the user asked for.
     if req.use_olora && req.olora_lambda <= 0.0 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "use_olora requires olora_lambda > 0.0" })),
         ));
     }
-    // Soul Eater is a fixed RECIPE, not a swappable part: spectral-orthogonal
-    // adapter initialization trained by its own Muon-family optimizer
-    // (Newton–Schulz orthogonalized momentum + Sign-SGD). The CLI enforces
-    // exactly this pairing (`is_soul_eater` forces use_spectral_qlora and the
-    // recipe assumes the Muon-style update); mirror it server-side so an API
-    // caller picking Soul Eater + AdamW can't silently train something else.
+    // Soul Eater is a fixed RECIPE, not a swappable part: spectral-orthogonal adapter initialization trained by its own Muon-family optimizer (Newton-Schulz orthogonalized momentum + Sign-SGD).
+    // The CLI enforces exactly this pairing (`is_soul_eater` forces use_spectral_qlora and the recipe assumes the Muon-style.
     let mut optimizer = req.optimizer;
     let mut use_spectral_qlora = req.use_spectral_qlora;
     if req.training_mode == crate::jobs::TrainingMode::SoulEater {
@@ -569,10 +536,8 @@ async fn cancel_job(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let jid = JobId(id);
-    // Atomic: signal the worker's CancellationToken AND transition the
-    // status to `Cancelled` only if the job is still Pending/Running. A
-    // cancel that arrives after the worker already finished preserves the
-    // real terminal status (Completed/Failed) rather than lying.
+    // Atomic: signal the worker's CancellationToken AND transition the status to `Cancelled` only if the job is still Pending/Running.
+    // A cancel that arrives after the worker already finished preserves the real terminal status (Completed/Failed).
     match state.registry.request_cancel(&jid).await {
         Ok(crate::jobs::JobStatus::Cancelled) => {
             Ok(Json(json!({ "job_id": jid.0, "status": "cancelled" })))
@@ -589,13 +554,8 @@ async fn cancel_job(
     }
 }
 
-/// Validate a `model_path` or `dataset_path` value. Rejects any path
-/// containing `..`, `/`, or `\` because the worker constructs
-/// `{model_path}.train` and `create_dir_all`s the parent, which would
-/// otherwise let an HTTP POST write `.train` files into arbitrary
-/// directories. Mirrors the wire shape used by the sibling
-/// `convert_model_route` and `prevent_path_traversal` helpers (those reject
-/// the same byte set on the model_id path segment).
+/// Validate a `model_path` or `dataset_path` value.
+/// Rejects any path containing `..`, `/`, or `\` because the worker constructs `{model_path}.train` and `create_dir_all`s.
 pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result<(), String> {
     let has_traversal = value
         .split('/')
@@ -609,9 +569,8 @@ pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result
     }
 }
 
-/// Prevent path traversal in model_id. Only blocks `..`, `/`, and `\`;
-/// does NOT validate existence or non-emptiness. Callers must check those
-/// separately after this guard.
+/// Prevent path traversal in model_id. Only blocks `..`,
+/// `/`, and `\`; does NOT validate existence or non-emptiness.
 fn prevent_path_traversal(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if id.contains("..") || id.contains('/') || id.contains('\\') {
         Err((
@@ -685,10 +644,8 @@ async fn attach_bolt_on_route(
     Json(req): Json<AttachBoltOnRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     prevent_path_traversal(&model_id)?;
-    // M1-class gate: `adapter_path` becomes `{adapter_path}.train` and is read
-    // for the LoRA sidecar. Without this check a POST could point at an
-    // arbitrary file via `..`/absolute segments — the same traversal class the
-    // sibling `validate_job_path` already blocks on model/dataset paths.
+    // M1-class gate: `adapter_path` becomes `{adapter_path}.train` and is read for the LoRA sidecar.
+    // Without this check a POST could point at an arbitrary file via `..`/absolute segments -.
     if let Err(e) = validate_job_path("adapter_path", &req.adapter_path) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
     }
@@ -969,10 +926,8 @@ async fn sse_metrics(
     (StatusCode, Json<serde_json::Value>),
 > {
     let jid = JobId(id);
-    // Snapshot the job's existing metrics BEFORE subscribing so we can
-    // replay them (the broadcast channel only delivers future events;
-    // without a replay, late subscribers permanently miss step 0 and any
-    // metrics emitted between job start and subscription).
+    // Snapshot the job's existing metrics BEFORE subscribing so we can replay them (the broadcast channel only delivers future
+    // events; without a replay, late subscribers permanently miss step 0 and any metrics emitted between job start and subscription).
     let (existing_metrics, existing_status) = match state.registry.get(&jid).await {
         Some(job) => (job.metrics, job.status),
         None => {
@@ -982,18 +937,12 @@ async fn sse_metrics(
             ));
         }
     };
-    // Subscribe AFTER the snapshot but before yielding the replay block,
-    // so any metrics appended between snapshot and subscription are still
-    // delivered via the live recv loop (worst case: a duplicate at the
-    // boundary, which the UI tolerates by (step, loss) keying).
+    // Subscribe AFTER the snapshot but before yielding the replay block, so any metrics appended between snapshot and subscription are still
+    // delivered via the live recv loop (worst case: a duplicate at the boundary, which the UI tolerates by (step, loss) keying).
     let mut rx = state.registry.subscribe_metrics();
     let stream = async_stream::stream! {
         // Initial replay: re-emit any history this subscriber missed.
-        // Replay carries the job's *current* status (snapshot taken above),
-        // not a hardcoded `Running`: a completed/failed/cancelled job that a
-        // subscriber joins late must not be mislabeled as still-running on
-        // the first frame. Late-arriving live events then carry their own
-        // authoritative status.
+        // Replay carries the job's *current* status (snapshot taken above), not a hardcoded `Running`: a completed/failed/cancelled.
         for m in &existing_metrics {
             let event = crate::jobs::MetricStreamEvent {
                 job_id: jid.0.clone(),
@@ -1012,10 +961,8 @@ async fn sse_metrics(
                     yield std::result::Result::<Event, axum::Error>::Ok(
                         Event::default().event("metric").data(payload)
                     );
-                    // A terminal status ends the stream after the event so
-                    // the client learns the run is done without waiting
-                    // for a Closed that never arrives (the broadcast
-                    // sender lives in the registry for the process life).
+                    // A terminal status ends the stream after the event so the client learns the run is done without
+                    // waiting for a Closed that never arrives (the broadcast sender lives in the registry for the process life).
                     if matches!(
                         event.status,
                         crate::jobs::JobStatus::Completed
@@ -1030,8 +977,7 @@ async fn sse_metrics(
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Subscriber fell behind the 1024-deep buffer; some
-                    // events were dropped but the worker is still running.
+                    // Subscriber fell behind the 1024-deep buffer; some events were dropped but the worker is still running.
                     // Keep streaming rather than emitting a spurious end.
                     continue;
                 }
@@ -1098,9 +1044,8 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         }
         source_input.to_string()
     } else {
-        // Relative path: reject `..`/`.` components before joining — Path::join
-        // does not sanitize traversal, so a source_input like "../secret" would
-        // escape the models directory.
+        // Relative path: reject `..`/`.` components before joining - Path::join does not
+        // sanitize traversal, so a source_input like "../secret" would escape the models directory.
         if source_input.contains("..")
             || source_input.split('/').any(|c| c == ".")
             || source_input.split('\\').any(|c| c == ".")
@@ -1117,11 +1062,8 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         output_dir.join(source_input).to_string_lossy().to_string()
     };
 
-    // P2-13e: the oxidizer conversion is CPU/file-bound — it reads the source
-    // model, may run the EvoPress evolutionary search, packs tensors, and
-    // writes the .grim file. Run it on the blocking pool so a single slow
-    // conversion can never occupy an async worker thread. Response semantics
-    // are unchanged.
+    // P2-13e: the oxidizer conversion is CPU/file-bound - it reads the source model, may run the EvoPress evolutionary search, packs tensors, and writes the .grim file.
+    // Run it on the blocking pool so a single slow conversion can never occupy an.
     let target_gcn = req.target_gcn;
     let target_bpw = req.target_bpw;
     let evopress_generations = req.evopress_generations;
@@ -1336,11 +1278,8 @@ async fn chat_handler(
         ));
     }
 
-    // GAR-1 fix: `model_id` is later used directly as a filesystem path by
-    // `load_tokenizer_from_path` / `model_loader::load_from_path`. Reject any
-    // traversal / separator characters up front so a caller cannot escape the
-    // model directory (e.g. `../../etc/passwd`). Other routes already call this
-    // helper; the chat handler was the one gap.
+    // GAR-1 fix: `model_id` is later used directly as a filesystem path by `load_tokenizer_from_path` / `model_loader::load_from_path`.
+    // Reject any traversal / separator characters up front so a caller cannot escape the model.
     prevent_path_traversal(&req.model_id)?;
 
     let model_name = std::path::Path::new(&req.model_id)
@@ -1405,14 +1344,8 @@ async fn chat_handler(
         ))
     };
 
-    // P2-13a: acquire the engine mutex per engine call instead of holding a
-    // single guard across the entire generation loop. The engine is a
-    // multi-request scheduler — `tick()` advances every scheduled request and
-    // outcomes are keyed per request id — so concurrent chats interleave
-    // correctly as long as each handler only reads its own request's outcome.
-    // No `.await` happens while the guard is held (the loop body is
-    // synchronous), so `std::sync::Mutex` remains correct; we only shrink the
-    // hold time from the whole sequence to a single step.
+    // P2-13a: acquire the engine mutex per engine call instead of holding a single guard across the entire generation loop.
+    // The engine is a multi-request scheduler - `tick()` advances every scheduled request and outcomes are.
     {
         // Enqueue prefill under a short-lived lock.
         let mut engine = state.engine.lock().unwrap();
@@ -1434,10 +1367,8 @@ async fn chat_handler(
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
 
     for _step in 0..max_tokens {
-        // Step the engine and pull this request's logits under one short
-        // lock, then sample outside it. The lock is released between steps,
-        // so competing chats can make progress instead of waiting for the
-        // whole sequence to finish.
+        // Step the engine and pull this request's logits under one short lock, then sample outside it.
+        // The lock is released between steps, so competing chats can make progress instead of waiting.
         let token = {
             let logits = {
                 let mut engine = state.engine.lock().unwrap();
@@ -1461,10 +1392,8 @@ async fn chat_handler(
             }
         };
 
-        // EOS detection: use tokenizer's EOS token ID if available, otherwise
-        // fall back to token == 0 (common but not universal). Never hardcode
-        // token == 2 which is wrong for Llama-3-family tokenizers.
-        // [P2-13 fix: tokenizer-aware EOS detection; propagate sampler errors.]
+        // EOS detection: use tokenizer's EOS token ID if available, otherwise fall back to token == 0 (common but not universal).
+        // Never hardcode token == 2 which is wrong for Llama-3-family tokenizers.
         let eos_id = state
             .tokenizer
             .lock()
@@ -2027,20 +1956,14 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
 
-    /// The dashboard's Training Mode dropdown must offer every mode the
-    /// worker backend fully supports. SoulEater (adapter + Muon-style
-    /// Newton-Schulz optimizer) was backend-complete and CLI-available but
-    /// absent from the embedded UI, so the only route to it was the CLI.
-    /// The value must equal the serde variant name: `training_mode` in
-    /// StartTrainingRequest deserializes straight into `TrainingMode`.
+    /// The dashboard's Training Mode dropdown must offer every mode the worker backend fully supports.
+    /// SoulEater (adapter + Muon-style Newton-Schulz optimizer) was backend-complete and CLI-available but absent from the embedded.
     #[test]
     fn dashboard_offers_soul_eater_training_mode() {
         let html = WebAssets::get("index.html").expect("index.html embedded");
         let html = std::str::from_utf8(&html.data).expect("index.html is utf-8");
-        // Assert the exact `value="SoulEater"` attribute — this fails if
-        // SoulEater disappears from the Training Mode dropdown. (The option
-        // now also carries a `title` attribute after `value`, so we cannot
-        // assert the tag tail.)
+        // Assert the exact `value="SoulEater"` attribute - this fails if SoulEater disappears from the Training Mode dropdown.
+        // (The option now also carries a `title` attribute after `value`, so we cannot assert the.
         assert!(
             html.contains(r#"value="SoulEater""#),
             "embedded dashboard is missing the SoulEater training-mode option"

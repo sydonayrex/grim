@@ -1,8 +1,5 @@
 //! External editor ($EDITOR / $VISUAL) integration.
-//!
-//! Borrowed from the opencode-dev pattern: suspend the TUI, spawn the user's
-//! preferred editor on a temp file, and resume with the edited content.
-//! Activated via `/edit` in the chat input.
+//! Borrowed from the opencode-dev pattern: suspend the TUI, spawn the user's preferred editor on a.
 
 use std::env;
 use std::ffi::OsString;
@@ -12,9 +9,7 @@ use std::process::Command;
 use grim_core::error::{Error, Result};
 
 /// Open the user's external editor with the given initial content.
-///
-/// Returns the edited content on success, or `None` if the user has no
-/// editor configured. The TUI should call this only when stdout is a terminal.
+/// Returns the edited content on success, or `None` if the user has no editor configured.
 pub fn open_editor(content: &str) -> Result<Option<String>> {
     let editor = env::var_os("VISUAL")
         .or_else(|| env::var_os("EDITOR"))
@@ -68,7 +63,10 @@ pub fn open_editor(content: &str) -> Result<Option<String>> {
     let _ = std::fs::remove_file(&path);
 
     // Trim trailing newline that many editors add.
-    let edited = edited.trim_end_matches('\n').trim_end_matches('\r').to_string();
+    let edited = edited
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string();
     if edited.is_empty() {
         Ok(None)
     } else {

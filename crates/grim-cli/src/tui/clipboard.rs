@@ -1,12 +1,10 @@
-//! Text clipboard helpers: arboard first (requires display server), then an
-//! OSC52 escape-sequence fallback so the terminal emulator can set the
-//! clipboard itself.
+//! Text clipboard helpers: arboard first (requires display server), then an OSC52
+//! escape-sequence fallback so the terminal emulator can set the clipboard itself.
 
 use std::io::Write;
 
-/// Copy text to the system clipboard. When arboard is unavailable (headless
-/// or missing display server) falls back to writing an OSC52 sequence to stdout
-/// so the terminal emulator can place the text in the system clipboard.
+/// Copy text to the system clipboard. When arboard is unavailable (headless or missing display server) falls back to
+/// writing an OSC52 sequence to stdout so the terminal emulator can place the text in the system clipboard.
 pub fn copy_to_clipboard(text: &str) {
     // Try arboard first (requires display server).
     if let Ok(mut cb) = arboard::Clipboard::new() {

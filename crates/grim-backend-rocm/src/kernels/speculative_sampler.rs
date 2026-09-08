@@ -1,18 +1,11 @@
 //! GPU-Accelerated Speculative Decoding Rejection Sampler for ROCm.
-//!
-//! Performs device-side modified rejection sampling and residual distribution
-//! recovery sampling without host-device synchronization round-trips.
+//! Performs device-side modified rejection sampling and residual distribution recovery sampling without host-device synchronization round-trips.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// GPU Speculative Rejection Sampling Kernel
-// ---------------------------------------------------------------------------
-//
-// Grid: (batch_size, 1)
-// Block: (256, 1) — thread index mapped across vocab reduction
-// ---------------------------------------------------------------------------
+// GPU Speculative Rejection Sampling Kernel Grid: (batch_size, 1) Block:
+// (256, 1) - thread index mapped across vocab reduction
 __global__ void grim_speculative_rejection_sample(
     const float* __restrict__ target_probs,   // [batch_size, num_draft_tokens + 1, vocab_size]
     const float* __restrict__ draft_probs,    // [batch_size, num_draft_tokens, vocab_size]
@@ -101,12 +94,8 @@ __global__ void grim_speculative_rejection_sample(
     }
 }
 
-// ---------------------------------------------------------------------------
-// GPU Direct Logits Argmax Sampler (Zero-CPU Greedy Token Selection)
-// ---------------------------------------------------------------------------
-// Grid: (batch_size, 1)
-// Block: (256, 1)
-// ---------------------------------------------------------------------------
+// GPU Direct Logits Argmax Sampler (Zero-CPU Greedy
+// Token Selection) Grid: (batch_size, 1) Block: (256, 1)
 __global__ void grim_sample_logits_argmax(
     const float* __restrict__ logits,  // [batch_size, vocab_size]
     int* __restrict__ out_tokens,       // [batch_size]
@@ -152,14 +141,8 @@ __global__ void grim_sample_logits_argmax(
     }
 }
 
-// ---------------------------------------------------------------------------
-// GPU Stochastic Sampler (WI-X3): temperature + top-k filter + Gumbel-max
-// sampled argmax, all on device. D2H transfers only the chosen token id.
-// Grid: (batch_size, 1)  Block: (256, 1)
-// Determinism: `seed` drives a per-thread Philox-style LCG so the same
-// (logits, seed) pair yields the same token — testable against the CPU
-// reference without statistical tolerance.
-// ---------------------------------------------------------------------------
+// GPU Stochastic Sampler (WI-X3): temperature + top-k filter + Gumbel-max sampled argmax, all on device.
+// D2H transfers only the chosen token id.
 __global__ void grim_sample_stochastic(
     const float* __restrict__ logits,   // [batch_size, vocab_size]
     int* __restrict__ out_tokens,       // [batch_size]
@@ -182,12 +165,8 @@ __global__ void grim_sample_stochastic(
     unsigned long long rng = seed * 6364136223846793005ULL
         + (unsigned long long)(b * blockDim.x + tid) * 1442695040888963407ULL;
 
-    // Pass 1: top-k via threshold refinement. For top_k==0 (disabled) the
-    // threshold is -inf and every logit passes. We compute the k-th largest
-    // value with a two-pass histogram-free approach: first find the max, then
-    // binary-search a threshold whose pass-count is >= top_k. For simplicity
-    // and single-wave friendliness we do: collect max; if top_k>0, find the
-    // k-th largest via iterative threshold narrowing on the block.
+    // Pass 1: top-k via threshold refinement. For top_k==0
+    // (disabled) the threshold is -inf and every logit passes.
     float t_lo = -1e30f, t_hi = 1e30f;
     float threshold = -1e30f;
     if (top_k > 0 && top_k < vocab_size) {
@@ -212,8 +191,7 @@ __global__ void grim_sample_stochastic(
     }
 
     // Pass 2: Gumbel-max over surviving candidates.
-    //   score(v) = logit(v)/temperature + gumbel_noise(v)
-    // The max of Gumbel-perturbed scores is a sample from softmax(logits/T).
+    // score(v) = logit(v)/temperature + gumbel_noise(v) The max of Gumbel-perturbed scores is a sample from softmax(logits/T).
     float local_best = -1e30f;
     int local_tok = 0;
     for (int v = tid; v < vocab_size; v += blockDim.x) {
@@ -250,14 +228,8 @@ __global__ void grim_sample_stochastic(
     }
 }
 
-// ---------------------------------------------------------------------------
-// GPU Fused Tree Speculation Verifier (Medusa / Eagle Tree Verification)
-// ---------------------------------------------------------------------------
-//
-// Evaluates tree candidates in parallel on-chip. Each warp/block evaluates
-// one candidate tree path against target logits, extracting the longest
-// accepted prefix without sequential host round-trips.
-// ---------------------------------------------------------------------------
+// GPU Fused Tree Speculation Verifier (Medusa / Eagle Tree Verification) Evaluates tree candidates in parallel on-chip.
+// Each warp/block evaluates one candidate tree path against target logits, extracting the longest accepted prefix.
 __global__ void grim_speculative_tree_verify(
     const int* __restrict__ candidate_paths,      // [num_paths, max_path_len]
     const float* __restrict__ target_logits,       // [max_path_len, vocab_size]

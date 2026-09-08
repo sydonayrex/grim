@@ -1,10 +1,5 @@
 //! Bandwidth-adaptive CPU-GPU hybrid MoE execution ($q^\star$).
-//!
-//! When active MoE experts exceed device VRAM, work is partitioned by the
-//! bandwidth ratio $q^\star = \text{BW}_{\text{pcie}} / \text{BW}_{\text{cpu\_ram}}$.
-//! The first $q^\star$ fraction is fetched to GPU over PCIe, while the remaining
-//! overflow experts are computed concurrently on CPU host RAM and merged,
-//! perfectly overlapping PCIe transfer latency with CPU compute time.
+//! When active MoE experts exceed device VRAM, work is partitioned by the bandwidth ratio $q^\star.
 
 /// Bandwidth benchmark parameters for calculating optimal fetch fraction $q^\star$.
 #[derive(Debug, Clone, Copy)]

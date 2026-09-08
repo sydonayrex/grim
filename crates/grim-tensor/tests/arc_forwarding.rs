@@ -8,8 +8,9 @@
 //! dispatching through the boxed Arc must reach it.
 
 use grim_tensor::backend::{
-    BackendDevice, BackendStorage, ComputeHandle, MemAdvice, RopeConfig,
-    CoreTensorOps, ElementwiseOps, SamplingOps, AttentionOps, FusionOps, AutogradOps, OptimizerOps, QuantOps, RecurrentOps, CollectiveOps, MemoryOps, GraphCaptureOps,
+    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps, ComputeHandle,
+    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, MemAdvice, MemoryOps, OptimizerOps,
+    QuantOps, RecurrentOps, RopeConfig, SamplingOps,
 };
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance};
 use grim_tensor::shape::Shape;
@@ -54,7 +55,6 @@ fn probe_err(method: &str) -> grim_tensor::Result<()> {
 // The macro above is awkward for the varied return types; write the
 // overrides directly instead — explicit and grep-friendly.
 impl CoreTensorOps for ProbeDevice {
-
     fn transpose_2d(
         &self,
         _x: &dyn BackendStorage,
@@ -72,7 +72,6 @@ impl CoreTensorOps for ProbeDevice {
         }))
     }
 
-
     fn matmul(
         &self,
         _a: &dyn BackendStorage,
@@ -88,7 +87,6 @@ impl CoreTensorOps for ProbeDevice {
             )
         })
     }
-
 
     fn add(
         &self,
@@ -106,7 +104,6 @@ impl CoreTensorOps for ProbeDevice {
         })
     }
 
-
     fn mul(
         &self,
         _a: &dyn BackendStorage,
@@ -123,7 +120,6 @@ impl CoreTensorOps for ProbeDevice {
         })
     }
 
-
     fn silu_mul(
         &self,
         _gate: &dyn BackendStorage,
@@ -139,7 +135,6 @@ impl CoreTensorOps for ProbeDevice {
             )
         })
     }
-
 
     fn rms_norm(
         &self,
@@ -158,7 +153,6 @@ impl CoreTensorOps for ProbeDevice {
         })
     }
 
-
     fn softmax(
         &self,
         _x: &dyn BackendStorage,
@@ -173,7 +167,6 @@ impl CoreTensorOps for ProbeDevice {
             )
         })
     }
-
 
     fn embedding(
         &self,
@@ -191,7 +184,6 @@ impl CoreTensorOps for ProbeDevice {
         })
     }
 
-
     fn from_cpu(
         &self,
         data: &[f32],
@@ -204,15 +196,12 @@ impl CoreTensorOps for ProbeDevice {
         }))
     }
 
-
     fn advise(&self, _storage: &dyn BackendStorage, _advice: MemAdvice) -> grim_tensor::Result<()> {
         probe_err("advise")
     }
 }
 
 impl ElementwiseOps for ProbeDevice {
-
-
     #[allow(clippy::too_many_arguments)]
     fn sub(
         &self,
@@ -224,18 +213,15 @@ impl ElementwiseOps for ProbeDevice {
         unreachable!()
     }
 
-
     fn reduce_sum(&self, _x: &dyn BackendStorage) -> grim_tensor::Result<f32> {
         probe_err("reduce_sum")?;
         unreachable!()
     }
 
-
     fn reduce_max(&self, _x: &dyn BackendStorage) -> grim_tensor::Result<f32> {
         probe_err("reduce_max")?;
         unreachable!()
     }
-
 
     fn argmax(&self, _x: &dyn BackendStorage) -> grim_tensor::Result<u32> {
         probe_err("argmax")?;
@@ -244,8 +230,6 @@ impl ElementwiseOps for ProbeDevice {
 }
 
 impl SamplingOps for ProbeDevice {
-
-
     // ── Overrides under test: previously NOT forwarded by the Arc impl ──
 
     fn sample_on_device(
@@ -262,8 +246,6 @@ impl SamplingOps for ProbeDevice {
 }
 
 impl AttentionOps for ProbeDevice {
-
-
     fn qkv_attention_alibi(
         &self,
         _q: &dyn BackendStorage,
@@ -280,7 +262,6 @@ impl AttentionOps for ProbeDevice {
         unreachable!()
     }
 
-
     fn rerope(
         &self,
         _k: &dyn BackendStorage,
@@ -292,7 +273,6 @@ impl AttentionOps for ProbeDevice {
         probe_err("rerope")?;
         unreachable!()
     }
-
 
     #[allow(clippy::too_many_arguments)]
     fn mla_q_kv_norm_split(
@@ -316,7 +296,6 @@ impl AttentionOps for ProbeDevice {
         unreachable!()
     }
 
-
     fn mla_absorbed_decode(
         &self,
         _q_absorbed: &dyn BackendStorage,
@@ -338,8 +317,6 @@ impl AttentionOps for ProbeDevice {
 }
 
 impl FusionOps for ProbeDevice {
-
-
     fn fused_add_rms_norm(
         &self,
         _x: &dyn BackendStorage,
@@ -355,7 +332,6 @@ impl FusionOps for ProbeDevice {
         probe_err("fused_add_rms_norm")?;
         unreachable!()
     }
-
 
     #[allow(clippy::too_many_arguments)]
     fn fused_mxfp4_gemm_qk_norm_rope_kv(
@@ -386,7 +362,6 @@ impl FusionOps for ProbeDevice {
         unreachable!()
     }
 
-
     fn broadcast_bias(
         &self,
         _bias: &dyn BackendStorage,
@@ -397,7 +372,6 @@ impl FusionOps for ProbeDevice {
         probe_err("broadcast_bias")?;
         unreachable!()
     }
-
 
     fn scale_bias_epilogue(
         &self,
@@ -413,8 +387,7 @@ impl FusionOps for ProbeDevice {
     }
 }
 
-impl AutogradOps for ProbeDevice {
-}
+impl AutogradOps for ProbeDevice {}
 
 impl OptimizerOps for ProbeDevice {
     fn fused_adamw_step(
@@ -472,12 +445,9 @@ impl OptimizerOps for ProbeDevice {
     }
 }
 
-impl QuantOps for ProbeDevice {
-}
+impl QuantOps for ProbeDevice {}
 
 impl RecurrentOps for ProbeDevice {
-
-
     fn short_conv1d_causal_step(
         &self,
         _x: &dyn BackendStorage,
@@ -489,7 +459,6 @@ impl RecurrentOps for ProbeDevice {
         probe_err("short_conv1d_causal_step")?;
         unreachable!()
     }
-
 
     #[allow(clippy::too_many_arguments)]
     fn kda_gated_delta_rule_step(
@@ -509,17 +478,13 @@ impl RecurrentOps for ProbeDevice {
     }
 }
 
-impl CollectiveOps for ProbeDevice {
-}
+impl CollectiveOps for ProbeDevice {}
 
-impl MemoryOps for ProbeDevice {
-}
+impl MemoryOps for ProbeDevice {}
 
-impl GraphCaptureOps for ProbeDevice {
-}
+impl GraphCaptureOps for ProbeDevice {}
 
 impl BackendDevice for ProbeDevice {}
-
 
 /// Dispatch each previously-unforwarded method through `Box<dyn
 /// BackendDevice>` built from `Arc<ProbeDevice>` and require the probe's
@@ -553,10 +518,7 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
     assert_probe!(dev.reduce_max(s.as_ref()), "reduce_max");
     assert_probe!(dev.argmax(s.as_ref()), "argmax");
     // B5: transpose_2d must forward through the Arc blanket impls too.
-    assert_probe!(
-        dev.transpose_2d(s.as_ref(), 2, 2, &shape),
-        "transpose_2d"
-    );
+    assert_probe!(dev.transpose_2d(s.as_ref(), 2, 2, &shape), "transpose_2d");
     assert_probe!(
         dev.qkv_attention_alibi(
             s.as_ref(),
@@ -605,7 +567,10 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
         ),
         "fused_mxfp4_gemm_qk_norm_rope_kv"
     );
-    assert_probe!(dev.broadcast_bias(s.as_ref(), 1, 4, &shape), "broadcast_bias");
+    assert_probe!(
+        dev.broadcast_bias(s.as_ref(), 1, 4, &shape),
+        "broadcast_bias"
+    );
     assert_probe!(
         dev.scale_bias_epilogue(s2.as_ref(), None, None, None, 1, 4),
         "scale_bias_epilogue"
@@ -629,18 +594,53 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
         "kda_gated_delta_rule_step"
     );
     assert_probe!(
-        dev.mla_q_kv_norm_split(s.as_ref(), s.as_ref(), s.as_ref(), s.as_ref(), 1, 1, 1, 1e-6),
+        dev.mla_q_kv_norm_split(
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            1,
+            1,
+            1,
+            1e-6
+        ),
         "mla_q_kv_norm_split"
     );
     assert_probe!(
-        dev.mla_absorbed_decode(s.as_ref(), s.as_ref(), s.as_ref(), None, s2.as_ref(), 1, 1, 1, 1, 1),
+        dev.mla_absorbed_decode(
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            None,
+            s2.as_ref(),
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+        ),
         "mla_absorbed_decode"
     );
     // Optimizer steps: these were the methods whose forwards went missing
     // a second time after the B1 fix (they postdate the original probe) —
     // they must stay forwarded through the Arc blanket impls.
     assert_probe!(
-        dev.fused_adamw_step(s.as_ref(), s.as_ref(), s.as_ref(), s.as_ref(), 1e-3, 0.9, 0.999, 1e-8, 0.0, 1.0, 1.0, 4),
+        dev.fused_adamw_step(
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            1e-3,
+            0.9,
+            0.999,
+            1e-8,
+            0.0,
+            1.0,
+            1.0,
+            4
+        ),
         "fused_adamw_step"
     );
     assert_probe!(
@@ -648,7 +648,21 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
         "fused_lion_step"
     );
     assert_probe!(
-        dev.fused_madam_step(s.as_ref(), s.as_ref(), s.as_ref(), s.as_ref(), 1e-3, 0.9, 0.999, 1e-8, 1.0, 0.0, 1.0, 1.0, 4),
+        dev.fused_madam_step(
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            1e-3,
+            0.9,
+            0.999,
+            1e-8,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            4
+        ),
         "fused_madam_step"
     );
 }

@@ -1,12 +1,5 @@
-//! Fusion-pattern detection over checkpoint tensor names (folded in from
-//! the former grim-tensor-graph crate).
-//!
-//! Detects which [`GrimFusionOp`] fusion groups a checkpoint's tensor
-//! naming suggests, so the oxidizer can recommend fusion ops for the
-//! `.grim` `fusion_mask`. Detection is intentionally name-substring based
-//! (`ponytail:` heuristic — upgrade to dataflow-matched detection only if
-//! a consumer needs per-layer tensor-level pairing; today's consumer,
-//! `recommended_fusion_ops`, is op-level only).
+//! Fusion-pattern detection over checkpoint tensor names (folded in from the former grim-tensor-graph crate).
+//! Detects which [`GrimFusionOp`] fusion groups a checkpoint's tensor naming suggests, so the oxidizer can recommend.
 
 use super::gguf::GrimFusionOp;
 
@@ -138,7 +131,10 @@ mod tests {
             "blk.0.attention.wk.weight",
             // No wv → no QkvAttention group.
         ]);
-        assert!(!ir.recommended_fusion_ops().contains(&GrimFusionOp::QkvAttention));
+        assert!(
+            !ir.recommended_fusion_ops()
+                .contains(&GrimFusionOp::QkvAttention)
+        );
     }
 
     #[test]

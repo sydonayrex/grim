@@ -1,7 +1,5 @@
 //! Subspace Orthogonal Newton-Schulz Kernel for SOUL EATER.
-//!
-//! Provides exact 16x16 Jacobi symmetric eigendecomposition, rank conditioning checks,
-//! and adaptive cubic Newton-Schulz matrix orthogonalization for tall/thin matrices [d x r].
+//! Provides exact 16x16 Jacobi symmetric eigendecomposition, rank conditioning checks, and adaptive cubic Newton-Schulz matrix orthogonalization.
 
 /// Custom error type for ill-conditioned or rank-deficient subspace matrices.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,7 +129,6 @@ pub fn check_rank_conditioning(s: &[f32], r: usize) -> Result<(f32, f32), Condit
 
 /// Execute adaptive spectral-normalized Cubic Newton-Schulz iteration steps on matrix `X` [d x r].
 /// Recomputes S_k = X_k^T * X_k at EVERY step k inside the loop body.
-/// Returns the number of iterations required to achieve ||S_k - I_r||_F < 1e-4.
 pub fn subspace_newton_schulz_step(
     x: &mut [f32],
     d: usize,

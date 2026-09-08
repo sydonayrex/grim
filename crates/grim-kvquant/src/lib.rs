@@ -1,8 +1,5 @@
-//! `grim-kvquant` — runtime KV cache compression.
-//!
-//! §5.4 of the architecture: compress *runtime* KV blocks in place inside
-//! `grim-memory`'s block pool. Distinct from `grim-quant` (which compresses
-//! model weights at save time).
+//! `grim-kvquant` - runtime KV cache compression.
+//! §5.4 of the architecture: compress *runtime* KV blocks in place inside `grim-memory`'s block pool.
 
 use grim_core::error::Result;
 use grim_tensor::{BackendDevice, BackendStorage, Device, QuantProvenance, Shape, Tensor};
@@ -42,14 +39,6 @@ impl KvModality {
 
 /// Generate a random orthogonal matrix using QR decomposition of a random matrix.
 /// This is used for pre-rotation before Lloyd-Max quantization to decorrelate features.
-///
-/// Numerics: deterministic Gaussian draws (Box-Muller over an LCG stream)
-/// are orthonormalized with **modified Gram-Schmidt with
-/// reorthogonalization** ("twice is enough"), accumulated in f64 and only
-/// cast to f32 at the end. Plain single-pass Gram-Schmidt loses
-/// orthogonality at O(dim) condition growth — measurable past dim ≈ 16 —
-/// while the two-pass MGS keeps ‖QᵀQ − I‖ at f32 representation precision
-/// (≲ 1e-4) even at dim 128, which head_dim requires.
 pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
     use std::f32::consts::PI;
 
@@ -65,8 +54,7 @@ pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
     }
 
     // Modified Gram-Schmidt with one reorthogonalization pass (f64).
-    // Pass 2 re-projects each column against the finalized basis, killing
-    // the accumulated error a single classical pass leaves behind.
+    // Pass 2 re-projects each column against the finalized basis, killing the accumulated error a single.
     let mut q = random_mat;
     for col in 0..dim {
         for _pass in 0..2 {
@@ -163,15 +151,7 @@ impl Default for KvQuantConfig {
 }
 
 /// Configuration for GPU-accelerated fused dequant-attention (P1-WI-2).
-///
-/// When `enabled = true` **and** the caller provides a non-CPU device type,
-/// `KvCompressor::fused_attention` will delegate to `dispatch_gpu_fused_attention`
-/// instead of the CPU scalar reference path.  The default is `false` so
-/// existing callers are completely unaffected until they opt in.
-///
-/// The hook currently returns `Err(Unsupported)` because no HIP kernel is
-/// yet wired; it exists as the correct dispatch point for a future kernel
-/// without scattering GPU-device branches through call sites.
+/// When `enabled = true` **and** the caller provides a non-CPU device type, `KvCompressor::fused_attention` will delegate.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KvDequantAttentionConfig {
     /// `true` = dispatch to GPU path when `device_type != Device::Cpu`.
@@ -179,13 +159,7 @@ pub struct KvDequantAttentionConfig {
 }
 
 /// On-disk KV-block descriptor (WI-R4 bridge).
-///
-/// `grim-kvquant` produces a [`CompressedKvBlock`] at runtime; this struct
-/// packages it into the exact shape the `grim-format` `GrimTensorEntry`
-/// KV region consumes — without `grim-kvquant` taking a dependency on
-/// `grim-format` (kept clean so the format crate stays the single source
-/// of the wire layout). The CLI/convert layer turns this into
-/// `GrimTensorEntry::set_kv_layout` + `GrimFile::add_kv_blob`.
+/// `grim-kvquant` produces a [`CompressedKvBlock`] at runtime; this struct packages it into the exact shape the.
 pub struct KvBlockOnDisk {
     /// Serialized blob bytes (passed to `GrimFile::add_kv_blob`).
     pub blob: Vec<u8>,
@@ -219,10 +193,8 @@ impl CompressedKvBlock {
 impl CompressedKvBlock {
     /// Per-head key bit-width inferred from `key_meta` length (0 = inherit).
     fn key_meta_bits(&self) -> u8 {
-        // `key_meta` holds one f32 per group; the producer's config key_bits
-        // is the source of truth when available. We surface 0 (inherit) here
-        // because the block itself doesn't carry the encoder bit-width; callers
-        // that know it should override `KvBlockOnDisk::bits_k` directly.
+        // `key_meta` holds one f32 per group; the producer's config key_bits is the source of truth when available.
+        // We surface 0 (inherit) here because the block itself doesn't carry the encoder bit-width; callers.
         0
     }
     fn value_meta_bits(&self) -> u8 {
@@ -232,14 +204,6 @@ impl CompressedKvBlock {
 
 /// A Lloyd-Max scalar quantizer compressor.
 /// Reusable packed K/V buffer for the GPU fused-attention dispatch.
-///
-/// `fused_attention` is a *decode* primitive: the same compressed KV cache is
-/// queried many times (one new token per step). Re-dequantizing and re-packing
-/// the whole cache on every call is O(cache) CPU work per step — the dominant
-/// cost at decode time. We memoize the packed bytes + per-row scales keyed by
-/// the block's identity so only the *first* call pays the pack cost; later
-/// calls (same block, different query) reuse the packed buffers and pay just
-/// the device upload + kernel launch.
 #[derive(Clone)]
 struct PackedKvBuf {
     k_packed: Vec<u8>,
@@ -257,8 +221,7 @@ struct PackedKvBuf {
     value_bits_cfg: u8,
     key_bits_len: usize,
     value_bits_len: usize,
-    /// Content hashes for key/value bits — included in memo key to prevent
-    /// same-shape-but-different-content blocks from reusing stale packed bytes.
+    /// Content hashes for key/value bits - included in memo key to prevent same-shape-but-different-content blocks from reusing stale packed bytes.
     /// [P1-39 fix: content hash in PackedKvBuf.]
     key_content_hash: u64,
     value_content_hash: u64,
@@ -268,9 +231,8 @@ pub struct LloydMaxCompressor {
     pub config: KvQuantConfig,
     /// GPU-dispatch configuration for fused attention (P1-WI-2).
     pub gpu_attn: KvDequantAttentionConfig,
-    /// Packed-KV memo for the GPU dispatch (pack-once, reuse across decode
-    /// steps). See `PackedKvBuf` contract. Guarded so the compressor stays
-    /// `Send`/`Sync`-friendly across threads.
+    /// Packed-KV memo for the GPU dispatch (pack-once, reuse across decode steps).
+    /// See `PackedKvBuf` contract.
     packed_kv: std::sync::Mutex<Option<PackedKvBuf>>,
 }
 
@@ -295,37 +257,7 @@ impl LloydMaxCompressor {
 }
 
 /// GPU-side fused dequant-attention dispatch (P1-WI-2).
-///
-/// Called by `LloydMaxCompressor::fused_attention` when `gpu_attn.enabled`
-/// is true and the device type is non-CPU. The dispatcher:
-///
-/// 1. **Pack-once, reuse** — the compressed KV cache is dequantized to f32 and
-///    re-packed to the kernel's packed format only on the *first* call for a
-///    given block; subsequent calls (same block, fresh query — i.e. a decode
-///    loop) reuse the memoized packed bytes + per-row scales via
-///    `compressor.packed_kv`. Mirrors real decode: pack the cache at fill time,
-///    stream queries through it.
-/// 2. **Bitwidth-aware** — when the block's `key_bits` AND `value_bits` are
-///    `≤ 4` (and `head_dim` is even), K/V are packed two-per-byte (4-bit
-///    nibbles) and the kernel's 4-bit dequant branch `((nib-8)/7)*scale` is
-///    used, realizing the sub-8-bit KV-memory win. Otherwise the 8-bit signed
-///    path `((byte-128)/127)*scale` is used (covers the legacy 8-bit fallback
-///    and any odd-`head_dim` case safely).
-/// 3. **Per-row scales** — one f32 scale per `(token, kv_head)` = peak |value|
-///    over that row's `head_dim` elements. More accurate than a single
-///    buffer-scale and matches the kernel's `k_scales[j*num_kv_heads+kv_head]`
-///    read pattern.
-///
-/// The real device work happens through `BackendDevice::kv_dequant_attention`,
-/// which the ROCm backend overrides with the JIT-compiled HIP kernel; other
-/// backends return `Err(Backend)` from the trait default.
-///
-/// # Contract
-/// - Must not panic — callers rely on `Result` for error propagation.
-/// - The memo is keyed by the block's identity (dims + bitwidth cfg + packed
-///   byte lengths). A mutated-in-place block invalidates the memo naturally
-///   only if its Vec lengths change; treat `CompressedKvBlock` as immutable
-///   after `compress` for the lifetime of the memo.
+/// Called by `LloydMaxCompressor::fused_attention` when `gpu_attn.enabled` is true and the device type is non-CPU.
 fn dispatch_gpu_fused_attention(
     compressor: &LloydMaxCompressor,
     block: &CompressedKvBlock,
@@ -339,10 +271,8 @@ fn dispatch_gpu_fused_attention(
     let head_dim = block.head_dim;
     let kv_seq_len = block.num_tokens;
 
-    // Bitwidth comes from the *compressor config* (u8), not the block's packed
-    // `key_bits` Vec (which is packed byte data, not a bitwidth scalar).  Sub-4-bit
-    // path needs both ≤4 AND an even head_dim (the kernel packs two dims per
-    // byte indexed by dim/2, dim%2).
+    // Bitwidth comes from the *compressor config* (u8), not the block's packed `key_bits` Vec (which is packed byte data, not a bitwidth scalar).
+    // Sub-4-bit path needs both ≤4 AND an even head_dim (the kernel packs two dims per.
     let cfg_key_bits = compressor.config.key_bits;
     let cfg_value_bits = compressor.config.value_bits;
     let both_low_bw = cfg_key_bits <= 4 && cfg_value_bits <= 4;
@@ -352,9 +282,8 @@ fn dispatch_gpu_fused_attention(
         8
     };
 
-    // Memo key — reuse packed buffers across decode steps (same block). Include
-    // a content hash so same-shape-but-different-content blocks don't reuse stale
-    // packed bytes. [P1-39 fix: content hash in memo key.]
+    // Memo key - reuse packed buffers across decode steps (same block).
+    // Include a content hash so same-shape-but-different-content blocks don't reuse stale packed bytes.
     use std::hash::{Hash, Hasher};
     let key_bits_len = block.key_bits.len();
     let value_bits_len = block.value_bits.len();
@@ -414,10 +343,8 @@ fn dispatch_gpu_fused_attention(
     let kv_shape = if quant_bits == 8 {
         Shape::new(vec![kv_seq_len, num_kv_heads, head_dim])
     } else {
-        // 4-bit: half the bytes; lie about the innermost dim to keep the
-        // byte count correct while `from_cpu` copies `len*4` bytes for f32
-        // elements. We reinterpret the u8 buffer as &[f32] of equal byte
-        // length below, so the shape only needs the right product.
+        // 4-bit: half the bytes; lie about the innermost dim to keep the byte count correct while `from_cpu` copies `len*4` bytes for f32 elements.
+        // We reinterpret the u8 buffer as &[f32] of equal byte length below, so the shape.
         Shape::new(vec![kv_seq_len, num_kv_heads, head_dim / 2])
     };
     let scale_shape = Shape::new(vec![scale_len]);
@@ -431,8 +358,7 @@ fn dispatch_gpu_fused_attention(
         storage: grim_tensor::Storage::Native,
     };
 
-    // Ship the packed u8 bytes directly via from_cpu_bytes — reinterpreting as
-    // &[f32] with len = byte_count gives 4x the real element count (OOB read).
+    // Ship the packed u8 bytes directly via from_cpu_bytes - reinterpreting as &[f32] with len = byte_count gives 4x the real element count (OOB read).
     // [P0-20 fix: was `from_raw_parts(ptr as *const f32, packed.k_packed.len())`.]
     assert_eq!(
         k_packed_byte_len(&packed, quant_bits, kv_seq_len, num_kv_heads, head_dim),
@@ -489,9 +415,8 @@ fn k_packed_byte_len(
     }
 }
 
-/// Dequantize `block` to f32 and re-pack to the kernel's format at `quant_bits`
-/// (4 or 8), with per-(token, kv_head) scales. This is the O(cache) pack cost
-/// that the memo lets us pay once per block.
+/// Dequantize `block` to f32 and re-pack to the kernel's format at `quant_bits` (4 or 8), with per-(token, kv_head) scales.
+/// This is the O(cache) pack cost that the memo lets us pay once per block.
 fn pack_kv_buf(
     compressor: &LloydMaxCompressor,
     block: &CompressedKvBlock,
@@ -554,8 +479,7 @@ fn pack_kv_buf(
     pack_row(&k_data, &mut k_packed, &mut k_scales);
     pack_row(&v_data, &mut v_packed, &mut v_scales);
 
-    // Content hashes for memo keying — include in PackedKvBuf so the memo key
-    // can distinguish same-shape-but-different-content blocks.
+    // Content hashes for memo keying - include in PackedKvBuf so the memo key can distinguish same-shape-but-different-content blocks.
     // [P1-39 fix: populate content hashes in pack_kv_buf.]
     use std::hash::{Hash, Hasher};
     let key_content_hash = {
@@ -588,9 +512,7 @@ fn pack_kv_buf(
 }
 
 /// Bit-packing helper. Writes values of a fixed width (1..=8 bits) into a
-/// `Vec<u8>` Little-Endian-first (low-order bits of each byte come first in
-/// the bit stream). Tracks byte position and bit offset within the byte; pads
-/// the final byte with zero bits. Used for variable-density KV quantization.
+/// `Vec<u8>` Little-Endian-first (low-order bits of each byte come first in the bit stream).
 struct BitWriter {
     buf: Vec<u8>,
     bit_pos: u32,
@@ -615,12 +537,8 @@ impl BitWriter {
             let avail = 8 - bit_off;
             let take = remaining.min(avail);
             let mask = (1u32 << take) - 1;
-            // Place the low `take` bits of v into positions [bit_off, bit_off+take)
-            // of the byte. Kept bits in byte (positions >= bit_off) get OR'd with v's mask.
-            // We must zero those bits first via *self.buf[idx] &= !(mask<<bit_off), but
-            // since the writer is the only writer and the byte's pre-existing bits
-            // above bit_off are always zero on prior push boundaries, we OR directly
-            // for normal cases (bit_off==0 means byte was just allocated as 0).
+            // Place the low `take` bits of v into positions [bit_off, bit_off+take) of the byte.
+            // Kept bits in byte (positions >= bit_off) get OR'd with v's mask.
             let chunk = (v & mask) as u8;
             let shifted = if bit_off == 0 {
                 chunk
@@ -722,9 +640,8 @@ impl KvCompressor for LloydMaxCompressor {
             }
         }
 
-        // 2. Symmetric uniform key compression at `config.key_bits` density
-        // (replaces the prior hard-coded 3-bit Lloyd-Max path so the host
-        // block's bit density actually responds to the configured bitwidth).
+        // 2. Symmetric uniform key compression at `config.key_bits` density (replaces the prior hard-coded 3-bit
+        // Lloyd-Max path so the host block's bit density actually responds to the configured bitwidth).
         let group_size = self.config.group_size;
         let mut key_meta: Vec<f32> = Vec::new();
         let key_bits;
@@ -766,9 +683,7 @@ impl KvCompressor for LloydMaxCompressor {
             key_bits = writer.finish();
         }
 
-        // 3. Value compression using group quantization at `config.value_bits`
-        // density (asymmetric min/max uniform). Previously hard-coded to 15
-        // levels / 4-bit nibble-pair regardless of `config.value_bits`.
+        // 3. Value compression using group quantization at `config.value_bits` density (asymmetric min/max uniform).
         let mut value_meta = Vec::new(); // Pairs of (scale, min)
         let value_bits;
         {
@@ -945,18 +860,14 @@ impl KvCompressor for LloydMaxCompressor {
         device: &dyn BackendDevice,
         device_type: Device,
     ) -> Result<Tensor> {
-        // P1-WI-2: GPU dispatch hook. When gpu_attn is enabled AND the caller
-        // provides a non-CPU device type, delegate to the GPU path. The GPU path
-        // currently returns Err(Unsupported) because no HIP kernel is wired yet;
-        // this is the correct hook point — callers that need the GPU path will
-        // land here once the kernel exists.
+        // P1-WI-2: GPU dispatch hook. When gpu_attn is enabled AND the
+        // caller provides a non-CPU device type, delegate to the GPU path.
         if self.gpu_attn.enabled && device_type != Device::Cpu {
             return dispatch_gpu_fused_attention(self, block, query, device, device_type);
         }
 
-        // SageAttention Warp Producer/Consumer Split Simulation (§5.4 / §6):
-        // Producer warp reads and dequantizes block Q & K tiles on the fly
-        // Consumer warp processes intermediate dot-products and accumulates results
+        // SageAttention Warp Producer/Consumer Split Simulation (§5.4 / §6): Producer warp reads and dequantizes block
+        // Q & K tiles on the fly Consumer warp processes intermediate dot-products and accumulates results
         println!(
             "[Warp Producer] Dequantizing and pre-fetching INT8 Q/K tiles on-the-fly (qk_compute_bits={})",
             self.config.qk_compute_bits
@@ -1051,32 +962,11 @@ impl CompressedKvBlock {
         self.head_dim
     }
 
-    /// Serialize to a self-describing byte blob for on-disk persistence
-    /// (WI-R4 `.grim` KV region). Layout (format v2):
-    ///
-    /// ```text
-    /// [ magic "GKVB": u8 × 4 ][ version: u8 = 2 ]
-    /// [ num_tokens : u32 LE ][ num_kv_heads: u32 LE ][ head_dim: u32 LE ][ modality: u8 ]
-    /// [ key_meta_len   : u32 LE ][ value_meta_len : u32 LE ]
-    /// [ key_bits_len   : u32 LE ][ value_bits_len : u32 LE ]
-    /// [ key_meta   : f32 LE × key_meta_len ]
-    /// [ value_meta : f32 LE × value_meta_len ]
-    /// [ key_bits   : u8 × key_bits_len ]
-    /// [ value_bits : u8 × (rest) ]
-    /// ```
-    ///
-    /// The magic + version byte make the format self-describing: a reader
-    /// never has to infer the header layout from the blob length (the old
-    /// 24-vs-25-byte heuristic misparsed any legacy blob whose payload grew
-    /// past the new-format minimum). Blobs written before v2 are still read
-    /// by [`CompressedKvBlock::from_bytes`] via a validated legacy fallback.
-    /// The consumer-side `grim-format` writer carries these bytes verbatim
-    /// in `GrimTensorEntry::kv_compressed_*`; a reloaded session
-    /// reconstructs the block bit-for-bit via [`CompressedKvBlock::from_bytes`].
+    /// Serialize to a self-describing byte blob for on-disk persistence (WI-R4 `.grim` KV region).
+    /// Layout (format v2): ```text [ magic "GKVB": u8 × 4 ][ version: u8 = 2.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            5
-                + 4 * 6
+            5 + 4 * 6
                 + 1
                 + self.key_meta.len() * 4
                 + self.value_meta.len() * 4
@@ -1104,11 +994,8 @@ impl CompressedKvBlock {
         buf
     }
 
-    /// Inverse of [`CompressedKvBlock::to_bytes`]. Errors on a malformed or
-    /// truncated buffer. Dispatch:
-    /// - `GKVB` magic → versioned parse (unknown version ⇒ error),
-    /// - otherwise → pre-v2 legacy parse, tried WITH the modality byte
-    ///   first and validated; on any inconsistency retried without it.
+    /// Inverse of [`CompressedKvBlock::to_bytes`].
+    /// Errors on a malformed or truncated buffer.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         if buf.len() >= 5 && &buf[..4] == b"GKVB" {
             if buf[4] != 2 {
@@ -1119,9 +1006,8 @@ impl CompressedKvBlock {
             }
             return Self::parse_v2(&buf[5..]);
         }
-        // Legacy (pre-magic) blobs: header ambiguity (with/without the
-        // modality byte) is resolved by validated trial parse, not by blob
-        // length sniffing.
+        // Legacy (pre-magic) blobs: header ambiguity (with/without the modality byte) is
+        // resolved by validated trial parse, not by blob length sniffing.
         Self::parse_legacy_with_modality(buf)
             .or_else(|_| Self::parse_legacy_without_modality(buf))
             .map_err(|_| {
@@ -1174,8 +1060,7 @@ impl CompressedKvBlock {
         }
         let mut value_meta = Vec::with_capacity(value_meta_len);
         for _ in 0..value_meta_len {
-            value_meta
-                .push(f32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()));
+            value_meta.push(f32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()));
             pos += 4;
         }
         let key_bits = body[pos..pos + key_bits_len].to_vec();
@@ -1193,9 +1078,7 @@ impl CompressedKvBlock {
     }
 
     /// Pre-v2 layout, candidate A: 3×u32 dims + modality u8 + 3×u32 lens.
-    /// The modality byte must be a valid `KvModality` tag (0..=2); genuine
-    /// A-blobs always satisfy this, which rejects most spurious A-parses
-    /// of modality-less blobs before the trial B parse runs.
+    /// The modality byte must be a valid `KvModality` tag (0..=2); genuine A-blobs always satisfy this,.
     fn parse_legacy_with_modality(buf: &[u8]) -> Result<Self> {
         if buf.len() < 25 || buf[12] > 2 {
             return Err(grim_core::error::Error::KvCache("not legacy-A".into()));
@@ -1248,8 +1131,7 @@ impl CompressedKvBlock {
         }
         let mut value_meta = Vec::with_capacity(value_meta_len);
         for _ in 0..value_meta_len {
-            value_meta
-                .push(f32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
+            value_meta.push(f32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
             pos += 4;
         }
         let key_bits = buf[pos..pos + key_bits_len].to_vec();
@@ -1419,11 +1301,8 @@ mod tests {
     use super::*;
     use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Storage};
 
-    /// Round-trip bound gate (T2.6 audit follow-up): compress → dequantize
-    /// must bound the reconstruction error. The identity compressor must be
-    /// EXACT (0 diff); the Lloyd-Max compressor over a known-spread tensor
-    /// must stay within the quantizer's granularity (never corrupt the KV
-    /// cache beyond the documented error floor).
+    /// Round-trip bound gate (T2.6 audit follow-up): compress → dequantize must bound the reconstruction error.
+    /// The identity compressor must be EXACT (0 diff); the Lloyd-Max compressor over a known-spread tensor.
     fn cpu_tensor_from(
         device: &grim_backend_cpu::CpuDevice,
         data: &[f32],
@@ -1478,10 +1357,8 @@ mod tests {
         );
     }
 
-    /// Lloyd-Max 4-bit value / 3-bit key round-trip over a known data spread
-    /// must reconstruct within the quantizer's granularity — bounded, not
-    /// catastrophic. This catches scale/zero-point sign errors and bit-packing
-    /// corruption that a happy-path smoke would miss.
+    /// Lloyd-Max 4-bit value / 3-bit key round-trip over a known data spread must reconstruct within the quantizer's granularity - bounded, not catastrophic.
+    /// This catches scale/zero-point sign errors and bit-packing corruption that a happy-path smoke would miss.
     #[test]
     fn lloydmax_round_trip_error_is_bounded() {
         use grim_tensor::dtype::Storage as DS;
@@ -1508,9 +1385,7 @@ mod tests {
         assert_eq!(vq.len(), v_data.len());
 
         // 3-bit keys over spread 1.5 ≈ 12 bins ⇒ error ≤ 0.5*span/n_bins ≈ 0.07.
-        // 4-bit values over spread 4.0 ⇒ error ≤ 0.04. Generous 0.5 ceiling
-        // bounds catastrophic errors (wrong scale/zero, bit corruption)
-        // without being flaky to binning choices.
+        // 4-bit values over spread 4.0 ⇒ error ≤ 0.04.
         let max_k = kq
             .iter()
             .zip(&k_data)
@@ -1612,12 +1487,8 @@ mod tests {
         let k_rec = dequant_k.to_vec_f32().unwrap();
         let v_rec = dequant_v.to_vec_f32().unwrap();
 
-        // 3-bit key quantization (8 levels) on [-1,1] data gives step ~0.25,
-        // plus the approximate orthogonal rotation (simplified Gram-Schmidt)
-        // amplifies quantization error significantly at dim=64.
+        // 3-bit key quantization (8 levels) on [-1,1] data gives step ~0.25, plus the approximate orthogonal rotation (simplified Gram-Schmidt) amplifies quantization error significantly at dim=64.
         // 4-bit values (16 levels) give step ~0.125, no rotation applied.
-        // Bounds match the original test; the metadata/shape assertions above
-        // are the primary strengthening.
         for i in 0..512 {
             assert!(
                 (k_rec[i] - k_data[i]).abs() < 1.0,
@@ -1650,10 +1521,8 @@ mod tests {
         assert_eq!(att_out.shape().dims(), vec![2, 4, 64]);
     }
 
-    /// Orthogonality gate: the f64 modified-Gram-Schmidt-with-reorthogonalization
-    /// generator must hold ‖QᵀQ − I‖∞ at f32 representation precision across
-    /// the full range of realistic head_dims — including dim 128 where the
-    /// old single-pass Gram-Schmidt drifted past 1e-2.
+    /// Orthogonality gate: the f64 modified-Gram-Schmidt-with-reorthogonalization generator must hold ‖QᵀQ − I‖∞ at f32 representation precision across the
+    /// full range of realistic head_dims - including dim 128 where the old single-pass Gram-Schmidt drifted past 1e-2.
     #[test]
     fn test_random_orthogonal_rotation() {
         for (dim, tol) in [(16usize, 1e-5f32), (64, 5e-5), (128, 2e-4)] {
@@ -1691,9 +1560,8 @@ mod tests {
             let rotated = apply_rotation(&data, &rotation, dim, count);
             assert_eq!(rotated.len(), count * dim);
 
-            // Orthogonal transform preserves L2 norm (isometry) — same tight
-            // tolerance; this is the property the dequant inverse rotation
-            // relies on.
+            // Orthogonal transform preserves L2 norm (isometry) - same tight tolerance;
+            // this is the property the dequant inverse rotation relies on.
             for i in 0..count {
                 let orig_norm: f32 = (0..dim)
                     .map(|j| data[i * dim + j].powi(2))
@@ -1722,9 +1590,8 @@ mod tests {
         assert_ne!(a, c);
     }
 
-    /// Rotation round-trip fidelity at realistic head_dim: rotate then apply
-    /// the transposed rotation must recover the input to f32 precision — the
-    /// exact operation compress/dequantize performs on keys.
+    /// Rotation round-trip fidelity at realistic head_dim: rotate then apply the transposed rotation must
+    /// recover the input to f32 precision - the exact operation compress/dequantize performs on keys.
     #[test]
     fn rotation_round_trip_is_identity_at_head_dim_128() {
         let dim = 128;
@@ -1774,9 +1641,7 @@ mod tests {
         assert_eq!(block_a.value_bits, vec![1, 2, 3, 4]);
 
         // Legacy candidate B: WITHOUT the modality byte (24-byte header).
-        // Header: num_tokens(3), num_kv_heads(1), head_dim(16),
-        // key_meta_len(1), value_meta_len(2), key_bits_len(4).
-        // Total meta floats = 3 (12 bytes).
+        // Header: num_tokens(3), num_kv_heads(1), head_dim(16), key_meta_len(1), value_meta_len(2), key_bits_len(4).
         let mut b = Vec::new();
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&1u32.to_le_bytes());
@@ -1904,9 +1769,8 @@ mod tests {
         );
     }
 
-    /// WI-R4: a `CompressedKvBlock` round-trips byte-identically through
-    /// `to_bytes` / `from_bytes`, including the (key_bits, value_bits)
-    /// split.
+    /// WI-R4: a `CompressedKvBlock` round-trips byte-identically through `to_bytes`
+    /// / `from_bytes`, including the (key_bits, value_bits) split.
     #[test]
     fn compressed_kv_block_bytes_round_trip() {
         let config = KvQuantConfig::default();

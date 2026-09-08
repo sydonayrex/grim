@@ -23,12 +23,8 @@ pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
     }
 }
 
-///
 /// Memory copy that handles XNACK automatically.
-/// WI-SB6 control-plane primitive: async u32-sized copy on an EXPLICIT
-/// non-blocking stream followed by synchronizing ONLY that stream. Used by
-/// the resident ring so head/stop/tail traffic is never ordered behind the
-/// eternally-polling worker kernel.
+/// WI-SB6 control-plane primitive: async u32-sized copy on an EXPLICIT non-blocking stream followed by synchronizing ONLY.
 pub fn hip_stream_synchronize_after_copy(
     dst_dev: *mut std::ffi::c_void,
     src: *mut std::ffi::c_void,
@@ -71,9 +67,8 @@ pub fn memcpy_with_xnack_fallback(
     kind: HipMemcpyKind,
     device_ordinal: usize,
 ) -> HipErrorT {
-    // WI-M1 context discipline: both the sync and the async+sync-stream copy
-    // execute against the calling thread's current device context. Pin the
-    // owning ordinal or a drifted thread copies through foreign mappings.
+    // WI-M1 context discipline: both the sync and the async+sync-stream copy execute against the calling thread's current device context.
+    // Pin the owning ordinal or a drifted thread copies through foreign mappings.
     let _guard = crate::device::util::DeviceGuard::set(device_ordinal as i32);
     if crate::probe_xnack(device_ordinal) {
         unsafe {
@@ -92,12 +87,8 @@ pub fn memcpy_with_xnack_fallback(
     }
 }
 
-/// JIT compile HIP source to .hsaco binary, returning the compiled code and
-/// the *lowered* (possibly C++-mangled) kernel name that `hipModuleGetFunction`
-/// requires. Some `__global__` kernels (e.g. `grim_moe_fused_grouped_fp8`) are
-/// emitted mangled by hipRTC even under `extern "C"`, so callers must use the
-/// lowered name, not the plain entry name, to look the function up. [see:
-/// `hiprtcAddNameExpression`, `hiprtcGetLoweredName`, `hipModuleGetFunction`]
+/// JIT compile HIP source to .hsaco binary, returning the compiled code and the *lowered* (possibly C++-mangled) kernel name that `hipModuleGetFunction` requires.
+/// Some `__global__` kernels (e.g.
 pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(Vec<u8>, String)> {
     let mut prog: HiprtcProgram = std::ptr::null_mut();
     let source_cstr = CString::new(source)
@@ -189,11 +180,8 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(
     }
 }
 
-/// Allocate a device-side scratch buffer, copy `data` into it, and return the [see: `hipFree`, `upload_to_scratch`]
-/// Allocate a device-side scratch buffer, copy `data` into it, and return the
-/// raw pointer. `ordinal` is the device the buffer must live on: WI-M1 pins
-/// the calling thread's context to it for the malloc + H2D copy so a drifted
-/// thread cannot land the scratch on another device.
+/// Allocate a device-side scratch buffer, copy `data` into it, and return the [see: `hipFree`, `upload_to_scratch`] Allocate a device-side scratch buffer, copy `data` into it, and return the raw pointer.
+/// `ordinal` is the device the buffer must live on: WI-M1 pins the calling thread's context.
 pub fn upload_device_buffer<T: Copy>(ordinal: usize, data: &[T]) -> Result<*mut c_void> {
     let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
     let bytes = std::mem::size_of_val(data);
@@ -206,9 +194,8 @@ pub fn upload_device_buffer<T: Copy>(ordinal: usize, data: &[T]) -> Result<*mut 
         res = unsafe { hipMalloc(&mut ptr, bytes) };
     }
     if res != hipSuccess {
-        // Scratch uploads are transient activation/auxiliary buffers. If
-        // ordinary VRAM is exhausted, managed memory keeps the operation
-        // viable and lets HIP migrate the pages used by the kernel.
+        // Scratch uploads are transient activation/auxiliary buffers.
+        // If ordinary VRAM is exhausted, managed memory keeps the operation viable and lets HIP migrate.
         res = unsafe { hipMallocManaged(&mut ptr, bytes, 1) };
     }
     if res != hipSuccess {

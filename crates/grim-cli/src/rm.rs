@@ -6,12 +6,8 @@ use grim_core::grim_models_dir;
 use std::fs;
 use std::io::{self, Write};
 
-/// Remove a model from the local cache.
-///
-/// # Safety
-///
-/// This function permanently deletes files from disk. By default it prompts
-/// for confirmation unless `force` is true.
+/// Remove a model from the local cache. #
+/// Safety This function permanently deletes files from disk.
 pub async fn cmd_rm(model: &str, force: bool) -> Result<()> {
     // Resolve model
     let model_path = resolve_model_preferring_grim(model)

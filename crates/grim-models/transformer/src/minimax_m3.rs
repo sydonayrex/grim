@@ -1,9 +1,5 @@
 //! Compatibility loader and native implementation for `MiniMaxAI/MiniMax-M3`.
-//!
-//! # Architecture Details
-//! - **Block Sparse MoE**: Top-4 routing across 32 sparse experts using softmax gating.
-//! - **SwiGLU Expert Projections**: $w_1$ (gate), $w_3$ (up), and $w_2$ (down) feed-forward networks.
-//! - **GQA Attention**: Grouped Query Attention with RoPE positional encodings and RMSNorm normalization.
+//! # Architecture Details - **Block Sparse MoE**: Top-4 routing across 32 sparse experts using softmax.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -12,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for MiniMax-M3 architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -85,9 +79,7 @@ impl MiniMaxM3Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block Sparse MoE
-// ---------------------------------------------------------------------------
 
 pub struct MiniMaxM3Expert {
     pub w1: Linear,
@@ -144,9 +136,8 @@ impl MiniMaxM3BlockSparseMoe {
         })
     }
 
-    /// Host routing stays by design: gate logits (steps×n_expert) are tiny and
-    /// top-k selection is host logic. The per-token input rows are pulled once
-    /// (hoisted out of the loop — was re-downloading `x` per token).
+    /// Host routing stays by design: gate logits (steps×n_expert) are tiny and top-k selection is host logic.
+    /// The per-token input rows are pulled once (hoisted out of the loop - was re-downloading.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -189,9 +180,7 @@ impl MiniMaxM3BlockSparseMoe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct MiniMaxM3Block {
     pub wq: Linear,
@@ -247,10 +236,8 @@ impl MiniMaxM3Block {
         })
     }
 
-    /// GPU-first forward: Q/K RoPE, KV-cache concat, attention and the
-    /// residual adds run on the tensor's device. Host paths are only reached
-    /// through the fused-kernel fallback guards and the (host-side) MoE
-    /// routing pull.
+    /// GPU-first forward: Q/K RoPE, KV-cache concat, attention and the residual adds run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards and the (host-side) MoE routing.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -264,12 +251,8 @@ impl MiniMaxM3Block {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -316,9 +299,7 @@ impl MiniMaxM3Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct MiniMaxM3 {
     pub cfg: MiniMaxM3Config,

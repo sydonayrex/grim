@@ -1,9 +1,5 @@
 //! grim tui: Ratatui chat interface over the in-process engine.
-//!
-//! Two threads: the UI thread owns the terminal, input composer, and ratatui loop;
-//! the worker thread owns Engine, tokenizer, and sampler. The UI thread sends
-//! `WorkerCommand`s and drains `WorkerEvent`s over `std::sync::mpsc` channels.
-//! GPU and model code runs only on the worker.
+//! Two threads: the UI thread owns the terminal, input composer, and ratatui loop; the worker.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -11,8 +7,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyboardEnhancementFlags, KeyModifiers,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use grim_core::error::{Error, Result};
 use ratatui::Frame;
@@ -113,16 +110,20 @@ pub mod worker;
 
 pub use commands::{CommandRegistry, CommandSpec, ParsedCommand};
 pub use composer::Composer;
-pub use file_complete::{FileSuggestion, apply_file_completion, extract_at_prefix, get_file_suggestions};
-pub use fuzzy::{FuzzyMatch, fuzzy_filter, fuzzy_match};
+pub use file_complete::{
+    FileSuggestion, apply_file_completion, extract_at_prefix, get_file_suggestions,
+};
 pub use frecency::Frecency;
+pub use fuzzy::{FuzzyMatch, fuzzy_filter, fuzzy_match};
 pub use kill_ring::{KillPushOpts, KillRing};
-pub use layout::{Basis, HStack, LayoutNode, ScrollView, ScrollViewOptions, StackEntry, StackOptions, VStack};
+pub use layout::{
+    Basis, HStack, LayoutNode, ScrollView, ScrollViewOptions, StackEntry, StackOptions, VStack,
+};
 pub use select_list::{SelectAction, SelectItem, SelectList, SelectListTheme};
 pub use skills::{Skill, default_skills_dir, discover_skills, find_skill, load_skill_body};
 pub use sparkline::SpeedHistory;
+pub use throttle::{MIN_FRAME_INTERVAL, RenderScheduler};
 pub use toast::{Toast, ToastVariant, render_toast};
-pub use throttle::{RenderScheduler, MIN_FRAME_INTERVAL};
 pub use transcript::{MessageNode, Role, Transcript};
 pub use undo_stack::UndoStack;
 pub use worker::{DiagnosticsSnapshot, TurnStats, WorkerCommand, WorkerEvent, WorkerParams};
@@ -258,17 +259,30 @@ pub enum JumpMode {
 pub enum InputMode {
     Chat,
     CtxOverride,
-    ModelPicker { selected: usize },
+    ModelPicker {
+        selected: usize,
+    },
     /// Fuzzy-searchable command palette overlay (borrowed from opencode-dev).
-    CommandPalette { selected: usize },
+    CommandPalette {
+        selected: usize,
+    },
     /// Interactive session browser overlay (type-to-filter).
-    SessionBrowser { query: String, selected: usize },
+    SessionBrowser {
+        query: String,
+        selected: usize,
+    },
     /// Checkpoint restore picker (/undo).
-    CheckpointPicker { selected: usize },
+    CheckpointPicker {
+        selected: usize,
+    },
     /// Interactive skill picker overlay (Ctrl+G).
-    SkillPicker { selected: usize },
+    SkillPicker {
+        selected: usize,
+    },
     /// Interactive backend picker overlay (Ctrl+B).
-    BackendPicker { selected: usize },
+    BackendPicker {
+        selected: usize,
+    },
     /// Project directory input mode (type a path to set the sandbox root).
     ProjectDir,
     /// Find in transcript (Ctrl+F) — fuzzy/substring search over nodes.
@@ -367,8 +381,7 @@ pub struct App {
 
 impl App {
     pub fn new(cmd_tx: Sender<WorkerCommand>) -> Self {
-        let project_dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let project_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         // Discover skills from the default skills directory.
         let skills = crate::tui::skills::default_skills_dir()
             .map(|dir| crate::tui::skills::discover_skills(&dir))
@@ -456,11 +469,8 @@ impl App {
         false
     }
 
-    /// Finalize the current streaming buffer as an assistant message — in the
-    /// transcript (rendered segment) and in `messages` (model history). A
-    /// tool call arriving mid-turn splits the stream into segments; `tool`
-    /// attaches this segment's tool call to the message so the next turn's
-    /// history preserves the full exchange.
+    /// Finalize the current streaming buffer as an assistant message - in the transcript (rendered segment) and in `messages` (model history).
+    /// A tool call arriving mid-turn splits the stream into segments; `tool` attaches this segment's tool.
     fn close_stream_segment(&mut self, call_id: Option<&str>, tool: Option<(&str, &str)>) {
         let text = self.transcript.streaming_text_clean();
         self.transcript.finish_segment();
@@ -528,9 +538,8 @@ impl App {
                 }
             }
             WorkerEvent::TurnComplete { stats } => {
-                // Capture the final assistant segment into history so the
-                // next turn sees what the model said (and, across the loop,
-                // the tool exchanges).
+                // Capture the final assistant segment into history so the next turn
+                // sees what the model said (and, across the loop, the tool exchanges).
                 self.close_stream_segment(None, None);
                 if let Some(tps) = stats.decode_tps {
                     self.speed_history.record(tps as u64);
@@ -632,8 +641,12 @@ impl App {
                     &arguments,
                     &crate::tui::tools::Sandbox::new(self.sandbox_root.clone()),
                 );
-                self.transcript
-                    .push_tool_call_with_diff(&name, Some(&call_id), &arguments, preview.clone());
+                self.transcript.push_tool_call_with_diff(
+                    &name,
+                    Some(&call_id),
+                    &arguments,
+                    preview.clone(),
+                );
                 self.pending_tool_call = Some((call_id, name.clone(), arguments));
                 self.pending_tool_diff = preview;
                 self.tool_approval_mode = true;
@@ -698,9 +711,11 @@ impl App {
             InputMode::SkillPicker { .. } => self.handle_skill_picker_key(key),
             InputMode::BackendPicker { .. } => self.handle_backend_picker_key(key),
             InputMode::ProjectDir => self.handle_project_dir_key(key),
-            InputMode::Find { query, matches, selected } => {
-                self.handle_find_key(key, query, matches, selected)
-            }
+            InputMode::Find {
+                query,
+                matches,
+                selected,
+            } => self.handle_find_key(key, query, matches, selected),
             InputMode::HistorySearch { .. } => self.handle_history_search_key(key),
         }
     }
@@ -741,7 +756,11 @@ impl App {
         self.find_query = query.clone();
         self.find_matches = matches.clone();
         self.find_selected = selected;
-        self.input_mode = InputMode::Find { query, matches, selected };
+        self.input_mode = InputMode::Find {
+            query,
+            matches,
+            selected,
+        };
     }
 
     fn scroll_to_find_match(&mut self, selected: usize, matches: &[(usize, usize)]) {
@@ -751,7 +770,6 @@ impl App {
         let (node_idx, _line_idx) = matches[selected % matches.len()];
         // Approximate scroll: count rendered lines before the target node.
         // Use simple node-count heuristic scaled to line count so scroll_offset brings node into view.
-        // More accurate would need layout width; heuristic is sufficient for the spec's "just scroll" requirement.
         let total = self.transcript.nodes.len();
         // Estimate 4 lines per node average + line_idx offset.
         let lines_after = total.saturating_sub(node_idx + 1) * 4;
@@ -856,9 +874,9 @@ impl App {
             KeyCode::Enter => {
                 self.input_mode = InputMode::Chat;
                 if let Some(entry) = models.get(selected) {
-                    let _ = self
-                        .cmd_tx
-                        .send(WorkerCommand::LoadModel { name: entry.name.clone() });
+                    let _ = self.cmd_tx.send(WorkerCommand::LoadModel {
+                        name: entry.name.clone(),
+                    });
                 }
             }
             KeyCode::Esc => {
@@ -976,7 +994,9 @@ impl App {
                     // Also copy yanked text to system clipboard via arboard or OSC52 fallback.
                     if let Some(text) = self.composer.peek_yank_text() {
                         copy_to_clipboard(&text);
-                    } else if let Some(last) = self.transcript.nodes.last().map(|n| n.content.clone()) {
+                    } else if let Some(last) =
+                        self.transcript.nodes.last().map(|n| n.content.clone())
+                    {
                         if !last.is_empty() {
                             copy_to_clipboard(&last);
                         }
@@ -1001,12 +1021,15 @@ impl App {
                         .rev()
                         .find(|n| n.role == Role::Assistant && !n.content.is_empty())
                         .map(|n| n.content.clone());
-                    if let Some((_, code)) =
-                        last_assistant.as_deref().and_then(markdown::last_fenced_code_block)
+                    if let Some((_, code)) = last_assistant
+                        .as_deref()
+                        .and_then(markdown::last_fenced_code_block)
                     {
                         copy_to_clipboard(&code);
                         self.show_toast(Toast::success("Code block copied to clipboard"));
-                    } else if let Some(last) = self.transcript.nodes.last().map(|n| n.content.clone()) {
+                    } else if let Some(last) =
+                        self.transcript.nodes.last().map(|n| n.content.clone())
+                    {
                         if !last.is_empty() {
                             copy_to_clipboard(&last);
                             self.show_toast(Toast::success("Copied to clipboard"));
@@ -1015,7 +1038,6 @@ impl App {
                         self.composer.insert_char('y');
                     }
                 }
-                return;
             }
             KeyCode::Char('z') if is_ctrl => {
                 self.composer.undo();
@@ -1037,13 +1059,11 @@ impl App {
                     matches: Vec::new(),
                     selected: 0,
                 };
-                return;
             }
             KeyCode::Char('e') if !is_ctrl && !is_alt && self.composer.is_empty() => {
                 if let Some(content) = self.last_user_content() {
                     self.composer.set_text(&content);
                 }
-                return;
             }
             KeyCode::Char('r') if !is_ctrl && !is_alt && self.composer.is_empty() => {
                 if let Some(content) = self.last_user_content() {
@@ -1075,7 +1095,6 @@ impl App {
                         messages: self.messages.clone(),
                     });
                 }
-                return;
             }
             KeyCode::Char('p') if is_ctrl => {
                 // Command palette: fuzzy-searchable command list.
@@ -1145,15 +1164,15 @@ impl App {
                 if let Some((start, prefix)) =
                     crate::tui::file_complete::extract_at_prefix(&text, cursor)
                 {
-                    let base = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let base =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     let after_at = prefix.trim_start_matches('@');
-                    let suggestions =
-                        crate::tui::file_complete::get_file_suggestions_ranked(
-                            after_at,
-                            &base,
-                            50,
-                            &self.frecency,
-                        );
+                    let suggestions = crate::tui::file_complete::get_file_suggestions_ranked(
+                        after_at,
+                        &base,
+                        50,
+                        &self.frecency,
+                    );
                     if !suggestions.is_empty() {
                         // Record frecency for the selected file.
                         let selected = &suggestions[0];
@@ -1203,7 +1222,8 @@ impl App {
                 // First Esc while generating clears the queue; the next cancels.
                 if self.generating && !self.queue.is_empty() {
                     self.queue.clear();
-                    self.transcript.push_system("cleared queued messages".into());
+                    self.transcript
+                        .push_system("cleared queued messages".into());
                 } else {
                     let _ = self.cmd_tx.send(WorkerCommand::Cancel);
                     // Immediate UI feedback: show cancelling state.
@@ -1350,7 +1370,10 @@ impl App {
 
     /// Prompt history search (Ctrl+R): type to filter, Enter fills the composer.
     fn handle_history_search_key(&mut self, key: KeyEvent) {
-        if let InputMode::HistorySearch { query, selected, .. } = &mut self.input_mode {
+        if let InputMode::HistorySearch {
+            query, selected, ..
+        } = &mut self.input_mode
+        {
             match key.code {
                 KeyCode::Esc => self.input_mode = InputMode::Chat,
                 KeyCode::Enter => {
@@ -1412,9 +1435,7 @@ impl App {
                                 self.transcript.push_system(msg);
                                 self.show_toast(Toast::success("checkpoint restored"));
                             }
-                            Err(e) => {
-                                self.show_toast(Toast::error(format!("restore failed: {e}")))
-                            }
+                            Err(e) => self.show_toast(Toast::error(format!("restore failed: {e}"))),
                         }
                         close = true;
                     }
@@ -1537,13 +1558,16 @@ impl App {
                     if first.role == "system" {
                         first.content = injected;
                     } else {
-                        self.messages.insert(0, grim_format::ChatMessage {
-                            role: "system".to_string(),
-                            content: injected,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                        });
+                        self.messages.insert(
+                            0,
+                            grim_format::ChatMessage {
+                                role: "system".to_string(),
+                                content: injected,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                            },
+                        );
                     }
                 } else {
                     self.messages.push(grim_format::ChatMessage {
@@ -1555,10 +1579,8 @@ impl App {
                     });
                 }
                 self.active_skill_name = Some(skill.name.clone());
-                self.transcript.push_system(format!(
-                    "skill activated: {} ({})",
-                    skill.name, skill.id
-                ));
+                self.transcript
+                    .push_system(format!("skill activated: {} ({})", skill.name, skill.id));
                 self.show_toast(Toast::success(format!("Skill activated: {}", skill.name)));
             }
             Err(e) => {
@@ -1622,8 +1644,7 @@ impl App {
                 if path.is_empty() {
                     // Reset to current_dir.
                     self.set_project_dir(
-                        std::env::current_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                     );
                 } else {
                     let p = std::path::PathBuf::from(path);
@@ -1635,10 +1656,8 @@ impl App {
                         return;
                     }
                 }
-                self.transcript.push_system(format!(
-                    "project directory: {}",
-                    self.project_dir.display()
-                ));
+                self.transcript
+                    .push_system(format!("project directory: {}", self.project_dir.display()));
             }
             KeyCode::Backspace => {
                 self.composer.delete_prev_char();
@@ -1713,8 +1732,7 @@ impl App {
             SlashCommand::Model(None) => {
                 let list = grim_core::catalog::list_local_models();
                 if list.is_empty() {
-                    self.transcript
-                        .push_system("no local models found".into());
+                    self.transcript.push_system("no local models found".into());
                 } else {
                     self.input_mode = InputMode::ModelPicker { selected: 0 };
                 }
@@ -1762,13 +1780,16 @@ impl App {
                     if first.role == "system" {
                         first.content = prompt.clone();
                     } else {
-                        self.messages.insert(0, grim_format::ChatMessage {
-                            role: "system".to_string(),
-                            content: prompt.clone(),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                        });
+                        self.messages.insert(
+                            0,
+                            grim_format::ChatMessage {
+                                role: "system".to_string(),
+                                content: prompt.clone(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                            },
+                        );
                     }
                 } else {
                     self.messages.push(grim_format::ChatMessage {
@@ -1801,9 +1822,8 @@ impl App {
                             let count = nodes.len();
                             self.transcript.nodes = nodes;
                             self.messages = chat_msgs;
-                            self.transcript.push_system(format!(
-                                "loaded {count} message nodes from {path}"
-                            ));
+                            self.transcript
+                                .push_system(format!("loaded {count} message nodes from {path}"));
                         }
                         Err(e) => self
                             .transcript
@@ -1817,9 +1837,9 @@ impl App {
                         .push_error("specify export path: /save <filename>".into());
                 } else {
                     match export_transcript(&self.transcript, &path) {
-                        Ok(count) => self.transcript.push_system(format!(
-                            "saved {count} message nodes to {path}"
-                        )),
+                        Ok(count) => self
+                            .transcript
+                            .push_system(format!("saved {count} message nodes to {path}")),
                         Err(e) => self
                             .transcript
                             .push_error(format!("failed to save transcript: {e}")),
@@ -1859,11 +1879,7 @@ impl App {
                     // Deactivate the current skill.
                     if self.active_skill_name.take().is_some() {
                         // Remove the system message so the skill body is no longer injected.
-                        if let Some(pos) = self
-                            .messages
-                            .iter()
-                            .position(|m| m.role == "system")
-                        {
+                        if let Some(pos) = self.messages.iter().position(|m| m.role == "system") {
                             self.messages.remove(pos);
                         }
                         self.system_prompt = None;
@@ -1905,15 +1921,16 @@ impl App {
             SlashCommand::ProjectDir(path) => {
                 if path.is_empty() {
                     // No path — open the interactive project dir input.
-                    self.composer
-                        .set_text(&self.project_dir.to_string_lossy());
+                    self.composer.set_text(&self.project_dir.to_string_lossy());
                     self.input_mode = InputMode::ProjectDir;
                 } else {
                     let p = std::path::PathBuf::from(&path);
                     if p.is_dir() {
                         self.set_project_dir(p.canonicalize().unwrap_or(p));
-                        self.transcript
-                            .push_system(format!("project directory: {}", self.project_dir.display()));
+                        self.transcript.push_system(format!(
+                            "project directory: {}",
+                            self.project_dir.display()
+                        ));
                     } else {
                         self.transcript
                             .push_error(format!("not a directory: {path}"));
@@ -1974,7 +1991,8 @@ impl App {
                     .send(WorkerCommand::SetPlanMode { enabled: enable });
                 let state = if enable { "on" } else { "off" };
                 self.transcript.push_system(if enable {
-                    "plan mode on — mutations blocked; the model will research and propose a plan".into()
+                    "plan mode on — mutations blocked; the model will research and propose a plan"
+                        .into()
                 } else {
                     "plan mode off — write tools re-enabled".into()
                 });
@@ -1982,7 +2000,8 @@ impl App {
             }
             SlashCommand::Compact => {
                 if self.compacting {
-                    self.transcript.push_system("compaction already running".into());
+                    self.transcript
+                        .push_system("compaction already running".into());
                 } else {
                     self.start_compaction();
                     if !self.compacting {
@@ -1992,8 +2011,7 @@ impl App {
             }
             SlashCommand::Undo => {
                 if self.checkpoints.list().is_empty() {
-                    self.transcript
-                        .push_system("no checkpoints yet".into());
+                    self.transcript.push_system("no checkpoints yet".into());
                 } else {
                     self.input_mode = InputMode::CheckpointPicker { selected: 0 };
                 }
@@ -2152,8 +2170,7 @@ impl App {
                 // Always allow: persist a rule so future matching calls skip
                 // the prompt, then run this one.
                 if let Some((_, name, arguments)) = &self.pending_tool_call {
-                    let rule =
-                        permissions::rule_for_tool_call(name, arguments);
+                    let rule = permissions::rule_for_tool_call(name, arguments);
                     let mut rules = self.permissions.lock().unwrap();
                     rules.add(rule.clone());
                     let summary = match &rule.command_prefix {
@@ -2183,11 +2200,12 @@ impl App {
                         name: Some(name),
                         tool_calls: None,
                     });
-                    let _ = self.cmd_tx.send(WorkerCommand::ToolResult { call_id, output });
+                    let _ = self
+                        .cmd_tx
+                        .send(WorkerCommand::ToolResult { call_id, output });
                 }
                 self.tool_approval_mode = false;
-                self.transcript
-                    .push_system("tool call denied".to_string());
+                self.transcript.push_system("tool call denied".to_string());
             }
             _ => {}
         }
@@ -2210,7 +2228,8 @@ impl App {
                     unsafe {
                         std::env::remove_var("GRIM_BACKEND");
                     }
-                    self.transcript.push_system("backend: auto (default)".into());
+                    self.transcript
+                        .push_system("backend: auto (default)".into());
                 } else {
                     self.backend = Some(name.clone());
                     // SAFETY: called from the UI thread before model load.
@@ -2233,7 +2252,11 @@ impl App {
     fn selected_transcript_text(&self) -> Option<String> {
         if !self.find_matches.is_empty() {
             let (node_idx, _) = self.find_matches[self.find_selected % self.find_matches.len()];
-            return self.transcript.nodes.get(node_idx).map(|n| n.content.clone());
+            return self
+                .transcript
+                .nodes
+                .get(node_idx)
+                .map(|n| n.content.clone());
         }
         // Fallback: last assistant or user content
         self.transcript
@@ -2248,16 +2271,8 @@ impl App {
     pub fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         match m.kind {
             MouseEventKind::Down(_) => {
-                // Heuristic: clicks in the top ~80% of the terminal focus chat,
-                // clicks in the right ~32% of the top area focus side, clicks in the
-                // bottom few rows focus input (reset to bottom).
+                // Heuristic: clicks in the top ~80% of the terminal focus chat, clicks in the right ~32% of the top area focus side, clicks in the bottom few rows focus input (reset to bottom).
                 // We don't have exact layout rects here, so use row-based heuristic.
-                // For a more precise hit-test the caller can pass precomputed rects;
-                // here we handle the generic case by toggling focus via was_at_bottom.
-                // Default: focus chat (keep pinned handling).
-                // If the click is near the bottom, treat as input focus.
-                // This satisfies the spec's "focus chat vs side vs input" requirement
-                // while remaining testable without a real terminal.
                 self.was_at_bottom = true;
                 self.scroll_offset = 0;
             }
@@ -2335,9 +2350,8 @@ fn thinking_level_label(level: &grim_core::sampler::ThinkingLevel) -> String {
     }
 }
 
-/// Find the most recently modified *.jsonl session file in `dir`
-/// (--continue semantics). Ignores hidden files and errors: no sessions
-/// found returns None.
+/// Find the most recently modified *.jsonl session file in `dir` (--continue semantics).
+/// Ignores hidden files and errors: no sessions found returns None.
 fn latest_session_file(dir: &std::path::Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries
@@ -2489,9 +2503,7 @@ fn import_transcript(
                 // Rebuild the canonical OpenAI sequence: tool_call lines
                 // become assistant messages carrying structured tool_calls…
                 Role::ToolCall => {
-                    if let (Some(id), Some(name), Some(args)) =
-                        (&tool_id, &tool_name, &tool_args)
-                    {
+                    if let (Some(id), Some(name), Some(args)) = (&tool_id, &tool_name, &tool_args) {
                         messages.push(grim_format::ChatMessage {
                             role: "assistant".to_string(),
                             content: String::new(),
@@ -2535,15 +2547,15 @@ fn import_transcript(
 }
 
 /// Send a desktop notification using the system's native mechanism.
-///
-/// Best-effort: failures are silently ignored (notifications are a nice-to-have,
-/// not a correctness requirement). Uses platform-specific commands.
+/// Best-effort: failures are silently ignored (notifications are a nice-to-have, not a correctness requirement).
 fn send_desktop_notification(title: &str, body: &str) {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("osascript")
             .arg("-e")
-            .arg(format!("display notification \"{body}\" with title \"{title}\""))
+            .arg(format!(
+                "display notification \"{body}\" with title \"{title}\""
+            ))
             .spawn();
     }
     #[cfg(target_os = "linux")]
@@ -2571,43 +2583,34 @@ fn send_desktop_notification(title: &str, body: &str) {
 }
 
 /// Copy text to system clipboard via `arboard`, falling back to OSC52 escape.
-///
-/// Tries `arboard::Clipboard::new().set_text()` first; if that fails (e.g. headless
-/// or missing display server) falls back to writing an OSC52 sequence to stdout
-/// so the terminal emulator can place the text in the system clipboard.
+/// Tries `arboard::Clipboard::new().set_text()` first; if that fails (e.g.
 pub use clipboard::{copy_to_clipboard, osc52_copy};
-/// Terminal lifecycle: the alternate screen is restored by the panic hook
-/// (see `run_tui`) on crash, or by the explicit `ratatui::restore()` call
-/// on the normal exit path. Kept as a placeholder comment — if you need a
-/// guard-based restore in the future, wrap the body in a struct whose Drop
-/// calls `ratatui::restore()`.
-
-/// Render one frame via the constrained layout engine.
-///
-/// Color contract:
-/// - Primary panel borders: `#a855f7` (neon purple) when focused/active.
-/// - Inactive panel borders: dim purple `#703264`.
-/// - Input border changes to amber (#f59e0b) while generating, magenta while in tool-approval.
-/// - Body text is always white. Purple is reserved for borders, chips, and key labels.
-/// - A 1-row status-bar footer sits below the input box with model/tps/ctx info.
+/// Terminal lifecycle: the alternate screen is restored by the panic hook (see `run_tui`) on crash, or by the explicit `ratatui::restore()` call on the normal exit path.
+/// Kept as a placeholder comment - if you need a guard-based restore in the future,.
 fn ui(f: &mut Frame, app: &App) {
     use crate::tui::layout::{Basis, StackEntry, StackOptions};
 
     // Brand colors — neon purple to match grim-garage.
-    let c_purple     = Color::Rgb(168, 85, 247);   // #a855f7 primary
-    let c_purple_dim = Color::Rgb(112, 50, 180);   // inactive border
+    let c_purple = Color::Rgb(168, 85, 247); // #a855f7 primary
+    let c_purple_dim = Color::Rgb(112, 50, 180); // inactive border
     let c_purple_soft = Color::Rgb(192, 132, 252); // soft purple titles
-    let c_cyan       = Color::Rgb(34, 211, 238);   // assistant / sparkline
-    let c_amber      = Color::Rgb(245, 158, 11);   // generating
-    let c_magenta    = Color::Rgb(232, 121, 249);  // tool call
-    let c_green      = Color::Rgb(16, 185, 129);   // success
-    let c_red        = Color::Rgb(239, 68, 68);    // error, diff removals
-    let c_muted      = Color::Rgb(136, 136, 136);  // muted text
+    let c_cyan = Color::Rgb(34, 211, 238); // assistant / sparkline
+    let c_amber = Color::Rgb(245, 158, 11); // generating
+    let c_magenta = Color::Rgb(232, 121, 249); // tool call
+    let c_green = Color::Rgb(16, 185, 129); // success
+    let c_red = Color::Rgb(239, 68, 68); // error, diff removals
+    let c_muted = Color::Rgb(136, 136, 136); // muted text
 
     // 20-line gradient helper: lerp between two Rgb colors per char.
     let gradient_title = |text: &str, from: Color, to: Color| -> Line<'static> {
-        let (r1, g1, b1) = match from { Color::Rgb(r,g,b) => (r as f32,g as f32,b as f32), _ => (168.0,85.0,247.0) };
-        let (r2, g2, b2) = match to { Color::Rgb(r,g,b) => (r as f32,g as f32,b as f32), _ => (34.0,211.0,238.0) };
+        let (r1, g1, b1) = match from {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => (168.0, 85.0, 247.0),
+        };
+        let (r2, g2, b2) = match to {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => (34.0, 211.0, 238.0),
+        };
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len().max(1) as f32;
         let mut spans = Vec::with_capacity(chars.len());
@@ -2616,7 +2619,12 @@ fn ui(f: &mut Frame, app: &App) {
             let r = (r1 * (1.0 - t) + r2 * t) as u8;
             let g = (g1 * (1.0 - t) + g2 * t) as u8;
             let b = (b1 * (1.0 - t) + b2 * t) as u8;
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(r,g,b)).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(r, g, b))
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         Line::from(spans)
     };
@@ -2630,13 +2638,22 @@ fn ui(f: &mut Frame, app: &App) {
     // Layout: content_area | find_bar (if active, 3 rows) | input_bar (dynamic) | status_bar (1 row).
     let input_height = (app.composer.line_count() as u16 + 2).clamp(3, 8);
     let status_height: u16 = 1;
-    let find_bar_height: u16 = if matches!(app.input_mode, InputMode::Find { .. }) { 3 } else { 0 };
+    let find_bar_height: u16 = if matches!(app.input_mode, InputMode::Find { .. }) {
+        3
+    } else {
+        0
+    };
     let content_height = area
         .height
         .saturating_sub(input_height + status_height + find_bar_height)
         .max(3);
 
-    let content_rect = Rect { x: area.x, y: area.y, width: area.width, height: content_height };
+    let content_rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: content_height,
+    };
     let find_rect = Rect {
         x: area.x,
         y: area.y + content_height,
@@ -2660,11 +2677,24 @@ fn ui(f: &mut Frame, app: &App) {
     let (chat_area, side_area) = if app.show_sidebar {
         let total_w = content_rect.width;
         let chat_w = ((total_w as u32 * 68) / 100) as u16;
-        let side_w = total_w.saturating_sub(chat_w).max(1).min(total_w.saturating_sub(1).max(1));
+        let side_w = total_w
+            .saturating_sub(chat_w)
+            .max(1)
+            .min(total_w.saturating_sub(1).max(1));
         let chat_w = total_w.saturating_sub(side_w);
         (
-            Rect { x: content_rect.x, y: content_rect.y, width: chat_w, height: content_rect.height },
-            Some(Rect { x: content_rect.x + chat_w, y: content_rect.y, width: side_w, height: content_rect.height }),
+            Rect {
+                x: content_rect.x,
+                y: content_rect.y,
+                width: chat_w,
+                height: content_rect.height,
+            },
+            Some(Rect {
+                x: content_rect.x + chat_w,
+                y: content_rect.y,
+                width: side_w,
+                height: content_rect.height,
+            }),
         )
     } else {
         (content_rect, None)
@@ -2674,7 +2704,10 @@ fn ui(f: &mut Frame, app: &App) {
     let _engine_check = crate::tui::layout::VStack::new(
         vec![
             StackEntry {
-                node: Box::new(crate::tui::layout::VStack::new(vec![], StackOptions { gap: 0 })),
+                node: Box::new(crate::tui::layout::VStack::new(
+                    vec![],
+                    StackOptions { gap: 0 },
+                )),
                 basis: Basis::Fixed(0),
                 grow: 1,
                 shrink: 1,
@@ -2682,7 +2715,10 @@ fn ui(f: &mut Frame, app: &App) {
                 max_size: None,
             },
             StackEntry {
-                node: Box::new(crate::tui::layout::VStack::new(vec![], StackOptions { gap: 0 })),
+                node: Box::new(crate::tui::layout::VStack::new(
+                    vec![],
+                    StackOptions { gap: 0 },
+                )),
                 basis: Basis::Fixed(input_height),
                 grow: 0,
                 shrink: 0,
@@ -2693,9 +2729,8 @@ fn ui(f: &mut Frame, app: &App) {
         StackOptions { gap: 0 },
     );
 
-    // -----------------------------------------------------------------------
-    // Chat panel — active purple border, dim title. Flash green for 300ms on TurnComplete.
-    // -----------------------------------------------------------------------
+    // Chat panel - active purple border, dim title.
+    // Flash green for 300ms on TurnComplete.
     let has_model = app.snap.model_name.is_some();
     let is_flashing = app.flash_until.is_some_and(|t| Instant::now() < t);
     let chat_border_color = if is_flashing {
@@ -2722,7 +2757,11 @@ fn ui(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(chat_border_color));
     if !has_model {
         chat_block = chat_block.title_bottom(
-            Line::from(Span::styled(" no model — /model or F4 ", Style::default().fg(c_amber))).centered()
+            Line::from(Span::styled(
+                " no model — /model or F4 ",
+                Style::default().fg(c_amber),
+            ))
+            .centered(),
         );
     }
     let chat = Paragraph::new(chat_items)
@@ -2734,8 +2773,14 @@ fn ui(f: &mut Frame, app: &App) {
     // Auto-scroll pill: show when user scrolled up and new lines arrived
     if app.pending_new_lines > 0 && !app.was_at_bottom {
         let pill_text = format!(" ↑ {} new — Press End ", app.pending_new_lines);
-        let pill = Paragraph::new(Line::from(Span::styled(pill_text, Style::default().fg(Color::White).bg(c_amber).add_modifier(Modifier::BOLD))))
-            .alignment(Alignment::Center);
+        let pill = Paragraph::new(Line::from(Span::styled(
+            pill_text,
+            Style::default()
+                .fg(Color::White)
+                .bg(c_amber)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center);
         let pill_area = Rect {
             x: chat_area.x + 1,
             y: chat_area.y + chat_area.height.saturating_sub(1),
@@ -2745,28 +2790,25 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(pill, pill_area);
     }
 
-    // -----------------------------------------------------------------------
-    // Sidebar panels — dim purple border.
-    //
-    // Three zones stacked vertically:
-    //   1. Diagnostics (top, flexible)
-    //   2. Agent task list (middle, flexible — shared space for tasks/todos)
-    //   3. tok/s sparkline (bottom, fixed 4 rows)
-    // -----------------------------------------------------------------------
+    // Sidebar panels - dim purple border. Three zones stacked vertically: 1.
     if let Some(area) = side_area {
         let side_chunks = Layout::vertical([
-            Constraint::Min(8),      // diagnostics
-            Constraint::Min(4),      // task list
-            Constraint::Length(1),   // gauge
-            Constraint::Length(4),   // sparkline
+            Constraint::Min(8),    // diagnostics
+            Constraint::Min(4),    // task list
+            Constraint::Length(1), // gauge
+            Constraint::Length(4), // sparkline
         ])
         .split(area);
 
         // 1) Diagnostics panel with styled key/value lines.
         let styled_lines = diagnostics::sidebar_styled_lines(&app.snap);
         let side = Paragraph::new(styled_lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" diagnostics ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " diagnostics ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple_dim)),
         );
         f.render_widget(side, side_chunks[0]);
@@ -2775,7 +2817,8 @@ fn ui(f: &mut Frame, app: &App) {
         let task_max_rows = side_chunks[1].height.saturating_sub(2) as usize;
         let task_lines = app.task_list.render(task_max_rows.max(3));
         let task_panel = Paragraph::new(task_lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
+            Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(Span::styled(" tasks ", Style::default().fg(c_purple_soft)))
                 .border_style(Style::default().fg(c_purple_dim)),
         );
@@ -2793,9 +2836,12 @@ fn ui(f: &mut Frame, app: &App) {
             format!("ctx {} / ?", app.snap.ctx_used)
         };
         let gauge = Gauge::default()
-            .block(Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" ctx ", Style::default().fg(c_purple_soft)))
-                .border_style(Style::default().fg(c_purple_dim)))
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(" ctx ", Style::default().fg(c_purple_soft)))
+                    .border_style(Style::default().fg(c_purple_dim)),
+            )
             .gauge_style(Style::default().fg(Color::White).bg(c_purple_dim))
             .ratio(ctx_ratio.clamp(0.0, 1.0))
             .label(Span::styled(ctx_label, Style::default().fg(Color::White)));
@@ -2805,7 +2851,8 @@ fn ui(f: &mut Frame, app: &App) {
         let spark_data = app.speed_history.as_slice();
         let spark = Sparkline::default()
             .block(
-                Block::bordered().border_type(BorderType::Rounded)
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
                     .title(Span::styled(" tok/s ", Style::default().fg(c_purple_soft)))
                     .border_style(Style::default().fg(c_purple_dim)),
             )
@@ -2814,24 +2861,20 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(spark, side_chunks[3]);
     }
 
-    // -----------------------------------------------------------------------
-    // Input bar — border color and title reflect current mode.
-    // -----------------------------------------------------------------------
+    // Input bar - border color and title reflect current mode.
     let input_text = app.composer.text();
     let (input_border_color, input_title) = match &app.input_mode {
         _ if app.tool_approval_mode => (
             c_magenta,
             format!(" ⚠  approve tool call?  Enter = yes   Esc = deny "),
         ),
-        _ if app.compacting => (
-            c_amber,
-            " compacting context... ".to_string(),
-        ),
+        _ if app.compacting => (c_amber, " compacting context... ".to_string()),
         _ if app.generating && !app.queue.is_empty() => (
             c_amber,
             format!(
                 " {} generating...  {} queued — Esc clears queue ",
-                spinner_char, app.queue.len()
+                spinner_char,
+                app.queue.len()
             ),
         ),
         _ if app.generating => (
@@ -2854,10 +2897,9 @@ fn ui(f: &mut Frame, app: &App) {
             c_purple_soft,
             " sessions  Enter to load, Esc cancels ".into(),
         ),
-        InputMode::CheckpointPicker { .. } => (
-            c_green,
-            " checkpoints  Enter restores, Esc cancels ".into(),
-        ),
+        InputMode::CheckpointPicker { .. } => {
+            (c_green, " checkpoints  Enter restores, Esc cancels ".into())
+        }
         InputMode::SkillPicker { .. } => (
             c_purple_soft,
             " skills  type to filter, Enter to activate, Esc cancels ".into(),
@@ -2870,7 +2912,11 @@ fn ui(f: &mut Frame, app: &App) {
             c_green,
             " project directory  Enter to set, Esc cancels ".into(),
         ),
-        InputMode::Find { query: _, matches, selected } => {
+        InputMode::Find {
+            query: _,
+            matches,
+            selected,
+        } => {
             let total = matches.len();
             let cur = if total == 0 { 0 } else { selected + 1 };
             let q = match &app.input_mode {
@@ -2897,7 +2943,12 @@ fn ui(f: &mut Frame, app: &App) {
     };
 
     // Find bar above input when in Find mode
-    if let InputMode::Find { query, matches, selected } = &app.input_mode {
+    if let InputMode::Find {
+        query,
+        matches,
+        selected,
+    } = &app.input_mode
+    {
         let total = matches.len();
         let cur = if total == 0 { 0 } else { selected + 1 };
         let title = if total == 0 && query.is_empty() {
@@ -2906,7 +2957,10 @@ fn ui(f: &mut Frame, app: &App) {
             format!(" Find {cur}/{total} ")
         };
         let find_query_text = if query.is_empty() {
-            Span::styled("type to search…", Style::default().fg(c_muted).add_modifier(Modifier::ITALIC))
+            Span::styled(
+                "type to search…",
+                Style::default().fg(c_muted).add_modifier(Modifier::ITALIC),
+            )
         } else {
             Span::raw(query.clone())
         };
@@ -2914,22 +2968,42 @@ fn ui(f: &mut Frame, app: &App) {
         let para = Paragraph::new(Line::from(vec![find_query_text])).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(Span::styled(title, Style::default().fg(count_style).add_modifier(Modifier::BOLD)))
-                .title(Line::from(Span::styled(" Esc exit · Enter/Ctrl+F next ", Style::default().fg(c_muted))).right_aligned())
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(count_style)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title(
+                    Line::from(Span::styled(
+                        " Esc exit · Enter/Ctrl+F next ",
+                        Style::default().fg(c_muted),
+                    ))
+                    .right_aligned(),
+                )
                 .border_style(Style::default().fg(c_cyan)),
         );
         f.render_widget(para, find_rect);
     }
 
     // Chat mode: ghost text + split title via left/right alignment (Layout-like)
-    let is_chat = matches!(app.input_mode, InputMode::Chat) && !app.tool_approval_mode && !app.generating;
+    let is_chat =
+        matches!(app.input_mode, InputMode::Chat) && !app.tool_approval_mode && !app.generating;
     if is_chat {
         // Slash param ghost hint: when input is "/cmd " show CommandSpec.hint in muted after cursor.
         // Use split_once to safely handle multibyte UTF-8 characters.
-        let ghost_hint: Option<String> = if input_text.starts_with('/') {
-            if let Some((cmd_name, rest)) = input_text[1..].split_once(' ') {
-                if let Some(spec) = app.registry.all_commands().iter().find(|s| s.name == cmd_name) {
-                    if !spec.hint.is_empty() && app.composer.cursor_offset() == input_text.chars().count() && rest.is_empty() {
+        let ghost_hint: Option<String> = if let Some(stripped) = input_text.strip_prefix('/') {
+            if let Some((cmd_name, rest)) = stripped.split_once(' ') {
+                if let Some(spec) = app
+                    .registry
+                    .all_commands()
+                    .iter()
+                    .find(|s| s.name == cmd_name)
+                {
+                    if !spec.hint.is_empty()
+                        && app.composer.cursor_offset() == input_text.chars().count()
+                        && rest.is_empty()
+                    {
                         Some(spec.hint.to_string())
                     } else {
                         None
@@ -2943,21 +3017,40 @@ fn ui(f: &mut Frame, app: &App) {
         } else {
             None
         };
-        let _title_layout = Layout::horizontal([Constraint::Min(0), Constraint::Length(28)]).split(input_rect);
-        let block = Block::bordered().border_type(BorderType::Rounded)
-            .title(Line::from(Span::styled(" Type / for commands, @ for files ", Style::default().fg(c_muted))).left_aligned())
-            .title(Line::from(Span::styled(" F2 sidebar · Ctrl+P palette ", Style::default().fg(c_muted))).right_aligned())
+        let _title_layout =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(28)]).split(input_rect);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(
+                Line::from(Span::styled(
+                    " Type / for commands, @ for files ",
+                    Style::default().fg(c_muted),
+                ))
+                .left_aligned(),
+            )
+            .title(
+                Line::from(Span::styled(
+                    " F2 sidebar · Ctrl+P palette ",
+                    Style::default().fg(c_muted),
+                ))
+                .right_aligned(),
+            )
             .border_style(Style::default().fg(input_border_color));
         let para = if app.composer.is_empty() {
             Paragraph::new(Line::from(vec![
                 Span::raw(input_text.clone()),
                 Span::styled("/ for commands  @ for files", Style::default().fg(c_muted)),
-            ])).block(block)
+            ]))
+            .block(block)
         } else if let Some(hint) = ghost_hint {
             Paragraph::new(Line::from(vec![
                 Span::raw(input_text.clone()),
-                Span::styled(format!("{hint}"), Style::default().fg(c_muted).add_modifier(Modifier::ITALIC)),
-            ])).block(block)
+                Span::styled(
+                    format!("{hint}"),
+                    Style::default().fg(c_muted).add_modifier(Modifier::ITALIC),
+                ),
+            ]))
+            .block(block)
         } else {
             Paragraph::new(input_text.as_str()).block(block)
         };
@@ -2965,23 +3058,21 @@ fn ui(f: &mut Frame, app: &App) {
     } else {
         f.render_widget(
             Paragraph::new(input_text.as_str()).block(
-                Block::bordered().border_type(BorderType::Rounded)
-                    .title(Span::styled(input_title, Style::default().fg(input_border_color)))
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        input_title,
+                        Style::default().fg(input_border_color),
+                    ))
                     .border_style(Style::default().fg(input_border_color)),
             ),
             input_rect,
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Status bar — 1-row footer with model/tps/ctx info and key hints.
-    // -----------------------------------------------------------------------
+    // Status bar - 1-row footer with model/tps/ctx info and key hints.
     {
-        let model_str = app
-            .snap
-            .model_name
-            .as_deref()
-            .unwrap_or("no model");
+        let model_str = app.snap.model_name.as_deref().unwrap_or("no model");
         let tps_str = app
             .snap
             .decode_tps
@@ -3022,7 +3113,12 @@ fn ui(f: &mut Frame, app: &App) {
 
         let mut status_spans = vec![
             Span::styled(" ", Style::default()),
-            Span::styled(model_str.to_string(), Style::default().fg(c_purple_soft).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                model_str.to_string(),
+                Style::default()
+                    .fg(c_purple_soft)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("  ", Style::default()),
             Span::styled(tps_str, Style::default().fg(c_cyan)),
             Span::styled("  ", Style::default()),
@@ -3035,7 +3131,10 @@ fn ui(f: &mut Frame, app: &App) {
             .then(|| c_muted)
             .unwrap_or(c_green);
         status_spans.push(Span::styled("  ", Style::default()));
-        status_spans.push(Span::styled(thinking_str, Style::default().fg(thinking_color)));
+        status_spans.push(Span::styled(
+            thinking_str,
+            Style::default().fg(thinking_color),
+        ));
         // Backend indicator.
         status_spans.push(Span::styled("  ", Style::default()));
         status_spans.push(Span::styled(
@@ -3061,10 +3160,9 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(Line::from(status_spans)), status_rect);
     }
 
-    // -----------------------------------------------------------------------
-    // Autocomplete popups — slash commands and @file.
-    // -----------------------------------------------------------------------
-    if app.input_mode == InputMode::Chat && input_text.starts_with('/') && !input_text.contains(' ') {
+    // Autocomplete popups - slash commands and @file.
+    if app.input_mode == InputMode::Chat && input_text.starts_with('/') && !input_text.contains(' ')
+    {
         let query = input_text.trim_start_matches('/').trim_start();
         let all_items: Vec<crate::tui::select_list::SelectItem> = app
             .registry
@@ -3100,8 +3198,12 @@ fn ui(f: &mut Frame, app: &App) {
             };
             let completion_lines = menu.render(popup_area.width.saturating_sub(2));
             let popup = Paragraph::new(completion_lines).block(
-                Block::bordered().border_type(BorderType::Rounded)
-                    .title(Span::styled(" commands ", Style::default().fg(c_purple_soft)))
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        " commands ",
+                        Style::default().fg(c_purple_soft),
+                    ))
                     .border_style(Style::default().fg(c_purple_dim)),
             );
             f.render_widget(popup, popup_area);
@@ -3113,8 +3215,12 @@ fn ui(f: &mut Frame, app: &App) {
         {
             let after_at = prefix.trim_start_matches('@');
             let base = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let suggestions =
-                crate::tui::file_complete::get_file_suggestions_ranked(after_at, &base, 50, &app.frecency);
+            let suggestions = crate::tui::file_complete::get_file_suggestions_ranked(
+                after_at,
+                &base,
+                50,
+                &app.frecency,
+            );
             if !suggestions.is_empty() {
                 let items: Vec<crate::tui::select_list::SelectItem> = suggestions
                     .iter()
@@ -3140,7 +3246,8 @@ fn ui(f: &mut Frame, app: &App) {
                     };
                     let completion_lines = menu.render(popup_area.width.saturating_sub(2));
                     let popup = Paragraph::new(completion_lines).block(
-                        Block::bordered().border_type(BorderType::Rounded)
+                        Block::bordered()
+                            .border_type(BorderType::Rounded)
                             .title(Span::styled(" files ", Style::default().fg(c_purple_soft)))
                             .border_style(Style::default().fg(c_purple_dim)),
                     );
@@ -3150,93 +3257,146 @@ fn ui(f: &mut Frame, app: &App) {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Model picker modal.
-    // -----------------------------------------------------------------------
     if let InputMode::ModelPicker { selected } = app.input_mode {
         let models = grim_core::catalog::list_local_models();
         let height = (models.len() as u16 + 4).clamp(5, 16);
         let width = 64.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
         if models.is_empty() {
-            lines.push(Line::from(Span::styled("  No local models discovered in catalog.", Style::default().fg(c_muted))));
+            lines.push(Line::from(Span::styled(
+                "  No local models discovered in catalog.",
+                Style::default().fg(c_muted),
+            )));
         } else {
             for (idx, m) in models.iter().enumerate() {
                 let is_sel = idx == selected;
                 let prefix = if is_sel { "▶ " } else { "  " };
                 let _row_style = if is_sel {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
                 let name_color = if is_sel { c_purple } else { Color::White };
-                let ctx_str = if m.context_length > 0 { format!("ctx {}", m.context_length) } else { "ctx ?".into() };
+                let ctx_str = if m.context_length > 0 {
+                    format!("ctx {}", m.context_length)
+                } else {
+                    "ctx ?".into()
+                };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}{:<24}", prefix, m.name), Style::default().fg(name_color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
-                    Span::styled(format!(" {:<8} {}", m.quant, ctx_str), Style::default().fg(c_muted)),
+                    Span::styled(
+                        format!("{}{:<24}", prefix, m.name),
+                        Style::default().fg(name_color).add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
+                    Span::styled(
+                        format!(" {:<8} {}", m.quant, ctx_str),
+                        Style::default().fg(c_muted),
+                    ),
                 ]));
             }
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" model picker  Enter to load ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " model picker  Enter to load ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Command palette modal.
-    // -----------------------------------------------------------------------
     if let InputMode::CommandPalette { selected } = app.input_mode {
         let filtered = app.palette_filtered_commands();
         let height = (filtered.len() as u16 + 4).clamp(5, 20);
         let width = 72.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled("  type to filter  Enter to run  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::from(Span::styled(
+            "  type to filter  Enter to run  Esc to cancel",
+            Style::default().fg(c_muted),
+        )));
         lines.push(Line::raw(""));
         for (idx, cmd) in filtered.iter().enumerate() {
             let is_sel = idx == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let name_color = if is_sel { c_purple } else { Color::White };
-            let hint_str = if cmd.hint.is_empty() { String::new() } else { format!(" {}", cmd.hint) };
+            let hint_str = if cmd.hint.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", cmd.hint)
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}{}{}", prefix, cmd.name, hint_str),
-                    Style::default().fg(name_color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                    Style::default().fg(name_color).add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
-                Span::styled(format!("  {}", cmd.description), Style::default().fg(c_muted)),
+                Span::styled(
+                    format!("  {}", cmd.description),
+                    Style::default().fg(c_muted),
+                ),
             ]));
         }
         if filtered.is_empty() {
-            lines.push(Line::from(Span::styled("  no matching commands", Style::default().fg(c_muted))));
+            lines.push(Line::from(Span::styled(
+                "  no matching commands",
+                Style::default().fg(c_muted),
+            )));
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" command palette  Ctrl+P ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " command palette  Ctrl+P ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Session browser modal.
-    // -----------------------------------------------------------------------
     if let InputMode::SessionBrowser { selected, .. } = app.input_mode {
         let session_items = app.session_browser_items();
         let height = (session_items.len() as u16 + 5).clamp(5, 20);
         let width = 72.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let query = app.session_browser_query();
         let mut lines = Vec::new();
@@ -3245,7 +3405,10 @@ fn ui(f: &mut Frame, app: &App) {
         } else {
             format!("  filter: \"{query}\"  ·  Enter to load  ·  Esc to cancel")
         };
-        lines.push(Line::from(Span::styled(filter_note, Style::default().fg(c_muted))));
+        lines.push(Line::from(Span::styled(
+            filter_note,
+            Style::default().fg(c_muted),
+        )));
         lines.push(Line::raw(""));
         for (idx, meta) in session_items.iter().enumerate() {
             let is_sel = idx == selected;
@@ -3254,8 +3417,11 @@ fn ui(f: &mut Frame, app: &App) {
             let when = chrono::DateTime::from_timestamp(meta.modified as i64, 0)
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
-            let shown: String =
-                meta.title.chars().take(width.saturating_sub(24) as usize).collect();
+            let shown: String = meta
+                .title
+                .chars()
+                .take(width.saturating_sub(24) as usize)
+                .collect();
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{prefix}{shown}"),
@@ -3275,23 +3441,30 @@ fn ui(f: &mut Frame, app: &App) {
             )));
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" sessions  Ctrl+O ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " sessions  Ctrl+O ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Checkpoint picker modal (/undo).
-    // -----------------------------------------------------------------------
     if let InputMode::CheckpointPicker { selected } = app.input_mode {
         let cps = app.checkpoints.list();
         let height = (cps.len() as u16 + 4).clamp(5, 20);
         let width = 76.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
@@ -3326,16 +3499,18 @@ fn ui(f: &mut Frame, app: &App) {
             )));
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" checkpoints  /undo ", Style::default().fg(c_green)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " checkpoints  /undo ",
+                    Style::default().fg(c_green),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Prompt history search modal (Ctrl+R).
-    // -----------------------------------------------------------------------
     if let InputMode::HistorySearch { selected, .. } = app.input_mode {
         let matches = app.history_search_matches();
         let query = match &app.input_mode {
@@ -3346,7 +3521,12 @@ fn ui(f: &mut Frame, app: &App) {
         let width = 72.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
@@ -3358,10 +3538,17 @@ fn ui(f: &mut Frame, app: &App) {
             let is_sel = idx == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let color = if is_sel { c_purple } else { Color::White };
-            let shown: String = text.chars().take(width.saturating_sub(6) as usize).collect();
+            let shown: String = text
+                .chars()
+                .take(width.saturating_sub(6) as usize)
+                .collect();
             lines.push(Line::from(Span::styled(
                 format!("{prefix}{shown}"),
-                Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                Style::default().fg(color).add_modifier(if is_sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
             )));
         }
         if matches.is_empty() {
@@ -3371,16 +3558,18 @@ fn ui(f: &mut Frame, app: &App) {
             )));
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" history  Ctrl+R ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " history  Ctrl+R ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Skill picker modal.
-    // -----------------------------------------------------------------------
     if let InputMode::SkillPicker { selected } = app.input_mode {
         // Recompute filtered skills using the same logic as the handler.
         let query = app
@@ -3416,10 +3605,18 @@ fn ui(f: &mut Frame, app: &App) {
         let width = 72.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled("  type to filter  Enter to activate  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::from(Span::styled(
+            "  type to filter  Enter to activate  Esc to cancel",
+            Style::default().fg(c_muted),
+        )));
         lines.push(Line::raw(""));
         for (idx, skill) in filtered.iter().enumerate() {
             let is_sel = idx == selected;
@@ -3438,7 +3635,11 @@ fn ui(f: &mut Frame, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}{}{}", prefix, skill.id, desc_str),
-                    Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                    Style::default().fg(color).add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
                 Span::styled(active_marker.to_string(), Style::default().fg(c_green)),
             ]));
@@ -3453,26 +3654,36 @@ fn ui(f: &mut Frame, app: &App) {
             )));
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" skills  Ctrl+G ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " skills  Ctrl+G ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Backend picker modal.
-    // -----------------------------------------------------------------------
     if let InputMode::BackendPicker { selected } = app.input_mode {
         let backends = app.available_backends();
         let height = (backends.len() as u16 + 4).clamp(5, 12);
         let width = 48.min(f.area().width.saturating_sub(4));
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled("  Enter to select  Esc to cancel", Style::default().fg(c_muted))));
+        lines.push(Line::from(Span::styled(
+            "  Enter to select  Esc to cancel",
+            Style::default().fg(c_muted),
+        )));
         lines.push(Line::raw(""));
         for (idx, name) in backends.iter().enumerate() {
             let is_sel = idx == selected;
@@ -3497,32 +3708,36 @@ fn ui(f: &mut Frame, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}{}", prefix, name),
-                    Style::default().fg(color).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                    Style::default().fg(color).add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
                 Span::styled(format!(" — {desc}"), Style::default().fg(c_muted)),
                 Span::styled(active_marker.to_string(), Style::default().fg(c_green)),
             ]));
         }
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" backend  Ctrl+B ", Style::default().fg(c_purple_soft)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " backend  Ctrl+B ",
+                    Style::default().fg(c_purple_soft),
+                ))
                 .border_style(Style::default().fg(c_purple)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
     // Cursor position.
-    // -----------------------------------------------------------------------
     let (c_row, c_col) = app.composer.cursor_row_col();
     f.set_cursor_position(Position::new(
         input_rect.x + 1 + c_col as u16,
         input_rect.y + 1 + c_row as u16,
     ));
 
-    // -----------------------------------------------------------------------
     // Tool-call approval modal.
-    // -----------------------------------------------------------------------
     if let Some((call_id, name, arguments)) = &app.pending_tool_call {
         let width = 72.min(f.area().width.saturating_sub(4));
         // Taller modal when an edit diff is available.
@@ -3530,12 +3745,22 @@ fn ui(f: &mut Frame, app: &App) {
         let height: u16 = if diff.is_some() { 18 } else { 12 };
         let x = (f.area().width.saturating_sub(width)) / 2;
         let y = (f.area().height.saturating_sub(height)) / 2;
-        let modal_area = Rect { x, y, width, height };
+        let modal_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
 
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled("  tool: ", Style::default().fg(c_muted)),
-            Span::styled(name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("  id: {}", call_id), Style::default().fg(c_muted)),
         ]));
         lines.push(Line::raw(""));
@@ -3569,7 +3794,10 @@ fn ui(f: &mut Frame, app: &App) {
             let pretty = serde_json::from_str::<serde_json::Value>(arguments)
                 .and_then(|v| serde_json::to_string_pretty(&v))
                 .unwrap_or_else(|_| arguments.clone());
-            lines.push(Line::from(Span::styled("  arguments:", Style::default().fg(c_purple_soft))));
+            lines.push(Line::from(Span::styled(
+                "  arguments:",
+                Style::default().fg(c_purple_soft),
+            )));
             for arg_line in pretty.lines().take(5) {
                 lines.push(Line::from(vec![
                     Span::styled("    + ", Style::default().fg(c_green)),
@@ -3583,16 +3811,18 @@ fn ui(f: &mut Frame, app: &App) {
             Style::default().fg(c_amber).add_modifier(Modifier::BOLD),
         )));
         let modal = Paragraph::new(lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" tool approval ", Style::default().fg(c_magenta).add_modifier(Modifier::BOLD)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " tool approval ",
+                    Style::default().fg(c_magenta).add_modifier(Modifier::BOLD),
+                ))
                 .border_style(Style::default().fg(c_magenta)),
         );
         f.render_widget(modal, modal_area);
     }
 
-    // -----------------------------------------------------------------------
-    // Toast notification — top-right corner.
-    // -----------------------------------------------------------------------
+    // Toast notification - top-right corner.
     if let Some(toast) = &app.toast {
         let toast_width = 44.min(f.area().width.saturating_sub(4));
         let toast_lines = render_toast(toast, toast_width);
@@ -3605,21 +3835,19 @@ fn ui(f: &mut Frame, app: &App) {
         };
         let toast_border_color = toast.variant.color();
         let toast_widget = Paragraph::new(toast_lines).block(
-            Block::bordered().border_type(BorderType::Rounded)
-                .title(Span::styled(" notice ", Style::default().fg(toast_border_color)))
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " notice ",
+                    Style::default().fg(toast_border_color),
+                ))
                 .border_style(Style::default().fg(toast_border_color)),
         );
         f.render_widget(toast_widget, toast_area);
     }
 }
 
-
-
-
-/// Entry point for the `grim tui` command.
-///
-/// Runs the terminal loop until the user quits. Requires an interactive
-/// terminal; otherwise returns a config error instead of garbling a pipe.
+/// Entry point for the `grim tui` command. Runs the terminal loop until the user quits.
 pub async fn cmd_tui(
     model: Option<String>,
     temperature: f32,
@@ -3637,12 +3865,10 @@ pub async fn cmd_tui(
         ));
     }
 
-    // Redirect stderr to a log file so all debug output (eprintln! from
-    // backend code) is captured even if the process crashes. Without this,
-    // the raw-mode terminal swallows stderr and the debug lines are lost.
-    // The file is created/truncated here; the Redirect guard restores the
-    // original stderr on drop. Users can `tail -f` it in another terminal.
-    let log_path = std::env::var("GRIM_TUI_LOG").unwrap_or_else(|_| "/tmp/grim-tui.log".to_string());
+    // Redirect stderr to a log file so all debug output (eprintln!
+    // from backend code) is captured even if the process crashes.
+    let log_path =
+        std::env::var("GRIM_TUI_LOG").unwrap_or_else(|_| "/tmp/grim-tui.log".to_string());
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -3652,9 +3878,8 @@ pub async fn cmd_tui(
     let _stderr_redirect = gag::Redirect::stderr(log_file)
         .map_err(|e| Error::Config(format!("stderr redirect failed: {e}")))?;
 
-    // Enable kitty keyboard protocol for sixel-adjacent input fidelity and
-    // accurate modifier reporting. Best-effort: terminals that do not support
-    // it ignore the sequence. Restored on drop via Pop.
+    // Enable kitty keyboard protocol for sixel-adjacent input fidelity and accurate modifier reporting.
+    // Best-effort: terminals that do not support it ignore the sequence.
     let _ = crossterm::execute!(
         std::io::stdout(),
         PushKeyboardEnhancementFlags(
@@ -3663,16 +3888,14 @@ pub async fn cmd_tui(
         )
     );
     // Mouse support: enable capture only when opted in via GRIM_MOUSE=1.
-    // Capture intercepts all mouse events, which disables the terminal's
-    // native text selection/copy. Default off so users can select text.
+    // Capture intercepts all mouse events, which disables the terminal's native text selection/copy.
     let mouse_capture = std::env::var("GRIM_MOUSE").as_deref() == Ok("1");
     if mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     }
 
-    // Panic hook: restore the terminal so the panic message lands in the
-    // terminal scrollback (and the redirected log file). The stderr redirect
-    // above already captures all eprintln! output to the log file.
+    // Panic hook: restore the terminal so the panic message lands in the terminal scrollback (and the redirected log file).
+    // The stderr redirect above already captures all eprintln!
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
@@ -3686,24 +3909,34 @@ pub async fn cmd_tui(
         prev_hook(info);
     }));
 
-    // Signal handlers: GPU faults (SIGSEGV/SIGABRT/SIGBUS) kill the process
-    // without running the panic hook. Restore the terminal before re-raising
-    // so the user's shell isn't left in raw mode. The eprintln! goes to the
-    // redirected stderr (log file) automatically.
+    // Signal handlers: GPU faults (SIGSEGV/SIGABRT/SIGBUS) kill the process without running the panic hook.
+    // Restore the terminal before re-raising so the user's shell isn't left in raw mode.
     unsafe extern "C" fn fatal_signal_handler(sig: libc::c_int) {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
         let _ = ratatui::restore();
-        eprintln!("[grim-tui SIGNAL] fatal signal {} — terminal restored, re-raising", sig);
+        eprintln!(
+            "[grim-tui SIGNAL] fatal signal {} — terminal restored, re-raising",
+            sig
+        );
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
         }
     }
     unsafe {
-        libc::signal(libc::SIGSEGV, fatal_signal_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGABRT, fatal_signal_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGBUS, fatal_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGSEGV,
+            fatal_signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGABRT,
+            fatal_signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGBUS,
+            fatal_signal_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let mut term = ratatui::init();
@@ -3724,9 +3957,8 @@ pub async fn cmd_tui(
     // the App (adds rules on "always allow").
     let perms = permissions::shared(permissions::PermissionRules::load());
     // One MCP manager shared by worker (tool routing) and the App (/mcp).
-    let mcp: mcp::manager::SharedMcp = std::sync::Arc::new(std::sync::Mutex::new(
-        mcp::manager::McpManager::load(),
-    ));
+    let mcp: mcp::manager::SharedMcp =
+        std::sync::Arc::new(std::sync::Mutex::new(mcp::manager::McpManager::load()));
     let worker = worker::spawn_worker(params, cmd_rx, evt_tx, perms.clone(), mcp.clone());
     if let Some(m) = &model {
         let _ = cmd_tx.send(WorkerCommand::LoadModel { name: m.clone() });
@@ -3758,16 +3990,15 @@ pub async fn cmd_tui(
     }
     app.mcp = mcp;
 
-    // Session resume: --resume <path> uses that file; --continue picks the
-    // most recently modified *.jsonl in the current directory, falling back
-    // to the newest autosaved session in the central store.
+    // Session resume: --resume <path> uses that file; --continue picks the most recently modified *.jsonl
+    // in the current directory, falling back to the newest autosaved session in the central store.
     let resume_target = match (&resume, continue_last) {
         (Some(path), _) => Some(path.clone()),
-        (None, true) => latest_session_file(
-            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        )
-        .or_else(|| sessions::list_sessions().first().map(|s| s.path.clone()))
-        .map(|p| p.to_string_lossy().into_owned()),
+        (None, true) => {
+            latest_session_file(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                .or_else(|| sessions::list_sessions().first().map(|s| s.path.clone()))
+                .map(|p| p.to_string_lossy().into_owned())
+        }
         (None, false) => None,
     };
     if let Some(path) = resume_target {
@@ -3810,8 +4041,7 @@ pub async fn cmd_tui(
             }
         }
         // Handle terminal resize as a full redraw trigger.
-        // Short poll timeout (10ms) keeps input latency low for snappy picker
-        // navigation and typing response.
+        // Short poll timeout (10ms) keeps input latency low for snappy picker navigation and typing response.
         if crossterm::event::poll(Duration::from_millis(10))
             .map_err(|e| Error::Config(format!("terminal poll failed: {e}")))?
         {
@@ -3838,8 +4068,6 @@ pub async fn cmd_tui(
                         MouseEventKind::Down(_) => {
                             // Focus heuristic: clicks focus chat vs side vs input.
                             // We use row to decide; column could distinguish chat vs side.
-                            // For now, any click in the upper area resets to bottom focus,
-                            // scroll events are handled separately.
                             app.handle_mouse(m);
                             scheduler.request_render();
                         }
@@ -3915,7 +4143,9 @@ mod tests {
         app.generating = true;
         app.submit_chat("queued msg");
         assert_eq!(app.queue.len(), 1);
-        app.handle_event(WorkerEvent::TurnComplete { stats: zero_stats() });
+        app.handle_event(WorkerEvent::TurnComplete {
+            stats: zero_stats(),
+        });
         assert!(app.generating, "queued submit restarts generation");
         assert!(app.queue.is_empty());
         assert!(app.messages.iter().any(|m| m.content == "queued msg"));
@@ -4024,7 +4254,11 @@ mod tests {
         });
         assert!(!app.compacting);
         assert!(app.messages.len() < 7);
-        assert!(app.messages.iter().any(|m| m.content.contains("the summary")));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("the summary"))
+        );
         assert_eq!(app.messages.last().unwrap().content, "a3");
         assert!(app.pending_compaction.is_none());
     }
@@ -4045,7 +4279,10 @@ mod tests {
         app.messages = vec![cmsg("user", "only one turn")];
         app.submit_chat("/compact");
         assert!(!app.compacting);
-        assert!(matches!(parse_slash_command("/compact"), SlashCommand::Compact));
+        assert!(matches!(
+            parse_slash_command("/compact"),
+            SlashCommand::Compact
+        ));
     }
 
     #[test]
@@ -4071,12 +4308,7 @@ mod tests {
         tr.push_user("read main.rs".into());
         tr.append_token("Sure, reading it now.");
         tr.finish_segment();
-        tr.push_tool_call_with_diff(
-            "read_file",
-            Some("call_1"),
-            r#"{"path":"main.rs"}"#,
-            None,
-        );
+        tr.push_tool_call_with_diff("read_file", Some("call_1"), r#"{"path":"main.rs"}"#, None);
         tr.push_tool_result_for("fn main() {}".to_string(), Some("call_1".into()));
         tr.append_token("It defines main().");
         tr.finish_turn("done".into());
@@ -4094,7 +4326,10 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "Sure, reading it now.");
         assert_eq!(messages[2].role, "assistant");
-        let calls = messages[2].tool_calls.as_ref().expect("tool_calls preserved");
+        let calls = messages[2]
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls preserved");
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "read_file");
         assert!(calls[0].arguments.contains("main.rs"));
@@ -4120,10 +4355,7 @@ mod tests {
             .append_token("Checking. <tool_call>{\"name\":\"read_file\"}</tool_call>");
         app.close_stream_segment(Some("c9"), Some(("read_file", "{\"path\":\"x\"}")));
         assert_eq!(app.messages[1].content, "Checking.");
-        assert_eq!(
-            app.messages[1].tool_calls.as_ref().unwrap()[0].id,
-            "c9"
-        );
+        assert_eq!(app.messages[1].tool_calls.as_ref().unwrap()[0].id, "c9");
 
         // Empty segments are skipped.
         let before = app.messages.len();
@@ -4146,7 +4378,10 @@ mod tests {
 
     #[test]
     fn test_plan_mode_toggles_and_notifies_worker() {
-        assert!(matches!(parse_slash_command("/plan"), SlashCommand::Plan(None)));
+        assert!(matches!(
+            parse_slash_command("/plan"),
+            SlashCommand::Plan(None)
+        ));
         assert!(matches!(
             parse_slash_command("/plan on"),
             SlashCommand::Plan(Some(s)) if s == "on"
@@ -4252,10 +4487,7 @@ mod tests {
             parse_slash_command("/cd /tmp"),
             SlashCommand::ProjectDir(p) if p == "/tmp"
         ));
-        assert!(matches!(
-            parse_slash_command("/pwd"),
-            SlashCommand::Pwd
-        ));
+        assert!(matches!(parse_slash_command("/pwd"), SlashCommand::Pwd));
     }
 
     #[test]
@@ -4290,8 +4522,14 @@ mod tests {
         assert_eq!(loaded_nodes[0].role, Role::User);
         assert_eq!(loaded_nodes[0].content, "What is GRIM?");
         assert_eq!(loaded_nodes[1].role, Role::Assistant);
-        assert_eq!(loaded_nodes[1].thinking.as_deref(), Some("Analyzing GRIM architecture"));
-        assert_eq!(loaded_nodes[1].content, "GRIM is a high performance inference engine.");
+        assert_eq!(
+            loaded_nodes[1].thinking.as_deref(),
+            Some("Analyzing GRIM architecture")
+        );
+        assert_eq!(
+            loaded_nodes[1].content,
+            "GRIM is a high performance inference engine."
+        );
     }
 
     #[test]
@@ -4397,10 +4635,7 @@ mod tests {
 
     #[test]
     fn test_slash_command_edit() {
-        assert!(matches!(
-            parse_slash_command("/edit"),
-            SlashCommand::Edit
-        ));
+        assert!(matches!(parse_slash_command("/edit"), SlashCommand::Edit));
         assert!(matches!(
             parse_slash_command("/editor"),
             SlashCommand::ShowEditor
@@ -4455,11 +4690,12 @@ mod tests {
         assert!(app.pending_tool_call.is_some());
         assert_eq!(app.pending_tool_call.as_ref().unwrap().1, "write_file");
         // Transcript should have a ToolCall node.
-        assert!(app
-            .transcript
-            .nodes
-            .iter()
-            .any(|n| n.role == crate::tui::transcript::Role::ToolCall));
+        assert!(
+            app.transcript
+                .nodes
+                .iter()
+                .any(|n| n.role == crate::tui::transcript::Role::ToolCall)
+        );
     }
 
     #[test]
@@ -4570,11 +4806,12 @@ mod tests {
 
         assert_eq!(app.active_skill_name.as_deref(), Some("Test Skill"));
         assert!(app.system_prompt.is_some());
-        assert!(app
-            .system_prompt
-            .as_ref()
-            .unwrap()
-            .contains("You are a test assistant."));
+        assert!(
+            app.system_prompt
+                .as_ref()
+                .unwrap()
+                .contains("You are a test assistant.")
+        );
         // A system message should be injected.
         assert!(app.messages.iter().any(|m| m.role == "system"));
     }
@@ -4612,7 +4849,7 @@ mod tests {
 
         app.submit_chat(&format!("/project {path}"));
 
-        assert_eq!(app.project_dir, std::path::PathBuf::from(dir.path().canonicalize().unwrap()));
+        assert_eq!(app.project_dir, dir.path().canonicalize().unwrap());
         assert_eq!(app.sandbox_root, app.project_dir);
     }
 
@@ -4623,11 +4860,12 @@ mod tests {
 
         app.submit_chat("/pwd");
         // Transcript should have a system message containing "project directory:".
-        assert!(app
-            .transcript
-            .nodes
-            .iter()
-            .any(|n| n.content.contains("project directory:")));
+        assert!(
+            app.transcript
+                .nodes
+                .iter()
+                .any(|n| n.content.contains("project directory:"))
+        );
     }
 
     #[test]
@@ -4678,10 +4916,7 @@ mod tests {
 
         app.submit_chat("/thinking high");
 
-        assert_eq!(
-            app.thinking_level,
-            grim_core::sampler::ThinkingLevel::High
-        );
+        assert_eq!(app.thinking_level, grim_core::sampler::ThinkingLevel::High);
         // Verify the worker was notified.
         let result = rx.try_recv();
         assert!(matches!(
@@ -4699,11 +4934,12 @@ mod tests {
         app.submit_chat("/thinking");
 
         // Transcript should report the current level.
-        assert!(app
-            .transcript
-            .nodes
-            .iter()
-            .any(|n| n.content.contains("thinking level: medium")));
+        assert!(
+            app.transcript
+                .nodes
+                .iter()
+                .any(|n| n.content.contains("thinking level: medium"))
+        );
     }
 
     #[test]
@@ -4713,10 +4949,7 @@ mod tests {
 
         // Start at Default, cycle → Low.
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(
-            app.thinking_level,
-            grim_core::sampler::ThinkingLevel::Low
-        );
+        assert_eq!(app.thinking_level, grim_core::sampler::ThinkingLevel::Low);
         // Drain the command.
         let _ = rx.try_recv();
 
@@ -4730,18 +4963,12 @@ mod tests {
 
         // Cycle → High.
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(
-            app.thinking_level,
-            grim_core::sampler::ThinkingLevel::High
-        );
+        assert_eq!(app.thinking_level, grim_core::sampler::ThinkingLevel::High);
         let _ = rx.try_recv();
 
         // Cycle → Off.
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(
-            app.thinking_level,
-            grim_core::sampler::ThinkingLevel::Off
-        );
+        assert_eq!(app.thinking_level, grim_core::sampler::ThinkingLevel::Off);
         let _ = rx.try_recv();
 
         // Cycle → Default (wraps around).
@@ -4759,17 +4986,22 @@ mod tests {
 
         assert!(app.task_list.is_empty());
 
-        app.task_list.upsert(crate::tui::tasks::Task::new("1", "Read config file"));
         app.task_list
-            .upsert(crate::tui::tasks::Task::new("2", "Run tests").with_status(crate::tui::tasks::TaskStatus::Completed));
+            .upsert(crate::tui::tasks::Task::new("1", "Read config file"));
+        app.task_list.upsert(
+            crate::tui::tasks::Task::new("2", "Run tests")
+                .with_status(crate::tui::tasks::TaskStatus::Completed),
+        );
 
         assert_eq!(app.task_list.len(), 2);
         assert_eq!(
-            app.task_list.count_by_status(crate::tui::tasks::TaskStatus::Pending),
+            app.task_list
+                .count_by_status(crate::tui::tasks::TaskStatus::Pending),
             1
         );
         assert_eq!(
-            app.task_list.count_by_status(crate::tui::tasks::TaskStatus::Completed),
+            app.task_list
+                .count_by_status(crate::tui::tasks::TaskStatus::Completed),
             1
         );
     }
@@ -4888,19 +5120,22 @@ mod tests {
 
         // Pick a backend that's compiled in but has no device available.
         // In CI/test environments, CUDA is typically compiled in but no GPU is present.
-        // The availability check should reject it.
         if grim_backend_cuda::CudaDevice::probe()
             .map(|d| d.is_empty())
             .unwrap_or(true)
         {
             // CUDA compiled in but no device — should be rejected.
             app.submit_chat("/backend cuda");
-            assert!(app.backend.is_none(), "unavailable backend should not be set");
-            assert!(app
-                .transcript
-                .nodes
-                .iter()
-                .any(|n| n.content.contains("unavailable")));
+            assert!(
+                app.backend.is_none(),
+                "unavailable backend should not be set"
+            );
+            assert!(
+                app.transcript
+                    .nodes
+                    .iter()
+                    .any(|n| n.content.contains("unavailable"))
+            );
         }
         // Otherwise (CUDA has a device), skip — availability check passed correctly.
     }
@@ -4908,7 +5143,9 @@ mod tests {
     #[test]
     fn test_backend_rejects_unknown() {
         // Isolate from GRIM_BACKEND env var set by other tests.
-        unsafe { std::env::remove_var("GRIM_BACKEND"); }
+        unsafe {
+            std::env::remove_var("GRIM_BACKEND");
+        }
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx);
         // Ensure clean state regardless of prior test pollution.
@@ -4918,10 +5155,11 @@ mod tests {
         // Backend should remain unchanged (None from default).
         assert!(app.backend.is_none());
         // Error should be in transcript.
-        assert!(app
-            .transcript
-            .nodes
-            .iter()
-            .any(|n| n.content.contains("unknown backend")));
+        assert!(
+            app.transcript
+                .nodes
+                .iter()
+                .any(|n| n.content.contains("unknown backend"))
+        );
     }
 }

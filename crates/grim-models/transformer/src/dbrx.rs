@@ -1,10 +1,5 @@
-//! Databricks DBRX MoE architecture with 16 fine-grained routed experts (top-4),
-//! SwiGLU activation, and Grouped Query Attention (GQA).
-//!
-//! # Architecture Details
-//! - **Attention**: GQA with 16 query heads and 4 KV heads ($d_{\text{head}} = 128$).
-//! - **Feed Forward**: Sparse Mixture of Experts with 16 total experts, 4 active per token.
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm.
+//! Databricks DBRX MoE architecture with 16 fine-grained routed experts (top-4), SwiGLU activation, and Grouped Query Attention (GQA).
+//! # Architecture Details - **Attention**: GQA with 16 query heads and 4 KV heads ($d_{\text{head}}.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Databricks DBRX.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -67,9 +60,7 @@ impl ModelConfig for DbrxConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Block
-// ---------------------------------------------------------------------------
 
 struct DbrxExpert {
     w1: Linear,
@@ -88,8 +79,8 @@ impl DbrxExpert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.w1.forward(x)?;
         let u = self.v1.forward(x)?;
-        let act = grim_nn::modules::silu_mul_on_device(&g, &u)
-            .map_err(grim_core::error::Error::from)?;
+        let act =
+            grim_nn::modules::silu_mul_on_device(&g, &u).map_err(grim_core::error::Error::from)?;
         Ok(self.w2.forward(&act)?)
     }
 }
@@ -141,9 +132,7 @@ impl DbrxMoeBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct DbrxBlock {
     pub wq: Linear,
@@ -160,7 +149,11 @@ pub struct DbrxBlock {
 }
 
 impl DbrxBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &DbrxConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &DbrxConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.kv_n_heads * cfg.head_dim;
 
@@ -170,16 +163,9 @@ impl DbrxBlock {
         let wv = Linear::load_shape(&attn_ws.scoped("Wv"), [cfg.d_model, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("out_proj"), [q_dim, cfg.d_model])?;
 
-        let input_layernorm = RmsNorm::load(
-            &ws.scoped("norm_1"),
-            cfg.d_model,
-            cfg.rms_norm_eps,
-        )?;
-        let post_attention_layernorm = RmsNorm::load(
-            &ws.scoped("norm_2"),
-            cfg.d_model,
-            cfg.rms_norm_eps,
-        )?;
+        let input_layernorm = RmsNorm::load(&ws.scoped("norm_1"), cfg.d_model, cfg.rms_norm_eps)?;
+        let post_attention_layernorm =
+            RmsNorm::load(&ws.scoped("norm_2"), cfg.d_model, cfg.rms_norm_eps)?;
 
         let moe = DbrxMoeBlock::load(&ws.scoped("ffn"), cfg)?;
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
@@ -199,9 +185,8 @@ impl DbrxBlock {
         })
     }
 
-    /// GPU-first forward: Q/K RoPE, attention and the residual adds run on
-    /// the tensor's device. Host paths are only reached through the
-    /// fused-kernel fallback guards and the (host-side) MoE routing pull.
+    /// GPU-first forward: Q/K RoPE, attention and the residual adds run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards and the (host-side) MoE routing.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -210,12 +195,8 @@ impl DbrxBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -247,9 +228,7 @@ impl DbrxBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Dbrx {
     pub cfg: DbrxConfig,
@@ -268,10 +247,8 @@ impl Dbrx {
         tp: TensorParallelConfig,
     ) -> Result<Self> {
         let root = ws.scoped("transformer");
-        let tok_embeddings = Linear::load_shape(
-            &root.scoped("wte"),
-            [cfg.vocab_size, cfg.d_model],
-        )?;
+        let tok_embeddings =
+            Linear::load_shape(&root.scoped("wte"), [cfg.vocab_size, cfg.d_model])?;
 
         let num_layers_to_load = cfg.n_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
@@ -377,9 +354,7 @@ impl CausalLm for Dbrx {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -396,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_dbrx_forward_and_session_state() {
         let mut cfg = DbrxConfig::default();
         cfg.vocab_size = 32;
@@ -409,7 +385,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

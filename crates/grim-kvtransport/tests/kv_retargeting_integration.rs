@@ -20,7 +20,8 @@ fn test_local_spill_manager_retarget_block_positions() {
     }
 
     let block_id = 42;
-    mgr.demote_to_host(block_id, k_init.clone(), v_init.clone()).unwrap();
+    mgr.demote_to_host(block_id, k_init.clone(), v_init.clone())
+        .unwrap();
 
     // Retarget from old_pos=0 to new_pos=100
     mgr.retarget_block_positions(
@@ -35,7 +36,13 @@ fn test_local_spill_manager_retarget_block_positions() {
     .expect("retargeting should succeed");
 
     let (k_retargeted, v_retargeted) = mgr.retrieve(block_id).unwrap().unwrap();
-    assert_eq!(v_retargeted, v_init, "V vectors must remain untouched by Re-RoPE");
+    assert_eq!(
+        v_retargeted, v_init,
+        "V vectors must remain untouched by Re-RoPE"
+    );
     assert_eq!(k_retargeted.len(), block_elems);
-    assert_ne!(k_retargeted, k_init, "K vectors must be re-rotated to new positions");
+    assert_ne!(
+        k_retargeted, k_init,
+        "K vectors must be re-rotated to new positions"
+    );
 }

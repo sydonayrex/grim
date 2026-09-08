@@ -1,7 +1,5 @@
 //! Emacs kill-ring buffer for cut and yank cycling.
-//!
-//! Stores killed text entries. Consecutive kills can accumulate into a single
-//! entry. Supports peek and rotate for yank and yank-pop.
+//! Stores killed text entries.
 
 /// Options for pushing text into the ring.
 #[derive(Debug, Clone, Copy)]
@@ -24,11 +22,8 @@ impl KillRing {
         Self { ring: Vec::new() }
     }
 
-    /// Push `text` into the ring.
-    ///
-    /// When `opts.accumulate` is true and the ring is non-empty, the new text
-    /// is merged into the last entry (prepend or append based on `opts.prepend`).
-    /// Otherwise a new entry is created. Empty text is ignored.
+    /// Push `text` into the ring. When `opts.accumulate` is true and the ring is non-empty,
+    /// the new text is merged into the last entry (prepend or append based on `opts.prepend`).
     pub fn push(&mut self, text: String, opts: KillPushOpts) {
         if text.is_empty() {
             return;

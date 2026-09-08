@@ -2,10 +2,10 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test ring_allreduce_parity`.
 
+use grim_backend_vulkan::VulkanDevice;
+use grim_backend_vulkan::collective::VkCommunicator;
 use grim_tensor::backend::CollectiveOps;
 use grim_tensor::{CoreTensorOps, DType, Shape};
-use grim_backend_vulkan::collective::VkCommunicator;
-use grim_backend_vulkan::VulkanDevice;
 
 #[test]
 fn ring_allreduce_sums_across_inputs_single_gpu() {
@@ -15,18 +15,17 @@ fn ring_allreduce_sums_across_inputs_single_gpu() {
     }
     let dev = VulkanDevice::new();
     let shape = Shape::new(vec![256]);
-    let a = dev.from_cpu(&vec![1.0f32; 256], &shape, DType::F32).unwrap();
-    let b = dev.from_cpu(&vec![2.0f32; 256], &shape, DType::F32).unwrap();
+    let a = dev
+        .from_cpu(&vec![1.0f32; 256], &shape, DType::F32)
+        .unwrap();
+    let b = dev
+        .from_cpu(&vec![2.0f32; 256], &shape, DType::F32)
+        .unwrap();
 
     let (result, _handle) = CollectiveOps::all_reduce(&dev, &[&*a, &*b], "sum").unwrap();
     let v = result.to_cpu_vec_f32().unwrap();
-    for i in 0..256 {
-        assert!(
-            (v[i] - 3.0).abs() < 1e-5,
-            "idx {}: {} != 3.0",
-            i,
-            v[i]
-        );
+    for (i, val) in v.iter().enumerate() {
+        assert!((val - 3.0).abs() < 1e-5, "idx {}: {} != 3.0", i, val);
     }
 }
 
@@ -41,8 +40,12 @@ fn communicator_multi_gpu_returns_honest_error() {
     let comm = VkCommunicator::new(2, 0).unwrap();
     let dev = VulkanDevice::new().with_communicator(comm);
     let shape = Shape::new(vec![256]);
-    let a = dev.from_cpu(&vec![1.0f32; 256], &shape, DType::F32).unwrap();
-    let b = dev.from_cpu(&vec![2.0f32; 256], &shape, DType::F32).unwrap();
+    let a = dev
+        .from_cpu(&vec![1.0f32; 256], &shape, DType::F32)
+        .unwrap();
+    let b = dev
+        .from_cpu(&vec![2.0f32; 256], &shape, DType::F32)
+        .unwrap();
 
     let result = CollectiveOps::all_reduce(&dev, &[&*a, &*b], "sum");
     assert!(

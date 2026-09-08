@@ -34,8 +34,8 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::speculative::{
-    AcceptanceResult, DualStreamConfig, DualStreamSpeculativeEngine,
-    SpeculativeDecoder, StepSummary, TokenAcceptor, TreeMaskBuilder,
+    AcceptanceResult, DualStreamConfig, DualStreamSpeculativeEngine, SpeculativeDecoder,
+    StepSummary, TokenAcceptor, TreeMaskBuilder,
 };
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -367,7 +367,7 @@ fn dual_stream_engine_lifecycle_and_fallback_safety() -> TestResult {
 
     // Simulated explicit creation
     let sim_engine = DualStreamSpeculativeEngine::new_simulated(config);
-    assert_eq!(sim_engine.is_hip_backed(), false);
+    assert!(!sim_engine.is_hip_backed());
     assert_eq!(sim_engine.stream_verify(), std::ptr::null_mut());
     assert_eq!(sim_engine.stream_draft(), std::ptr::null_mut());
     Ok(())
@@ -397,12 +397,8 @@ fn dual_stream_multi_step_pipelined_generation_all_accepted() -> TestResult {
 
     // Run 3 pipelined speculative rounds
     for _ in 0..3 {
-        let (summary, next_staged) = engine.step_pipelined(
-            &mut tokens,
-            &staged_draft,
-            &draft_proposals,
-            &target_verify,
-        )?;
+        let (summary, next_staged) =
+            engine.step_pipelined(&mut tokens, &staged_draft, &draft_proposals, &target_verify)?;
         assert_eq!(summary.accepted_count(), 3);
         staged_draft = next_staged;
     }
@@ -466,8 +462,10 @@ fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm"))
-        .ok()
+    std::panic::catch_unwind(|| {
+        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
+    })
+    .ok()
 }
 
 /// Hardware verification test on live GPU.

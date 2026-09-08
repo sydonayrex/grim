@@ -1,7 +1,5 @@
 //! Fixed-capacity circular ring tracking generation speeds for sparkline widget.
-//!
-//! Stores history of tokens-per-second samples for real-time visualization
-//! in the diagnostics sidebar.
+//! Stores history of tokens-per-second samples for real-time visualization in the diagnostics sidebar.
 
 /// Fixed-capacity buffer storing recent tokens-per-second integer metrics.
 #[derive(Debug, Clone)]

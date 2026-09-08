@@ -1,10 +1,10 @@
 //! Parallel communication primitives for CUDA intra-model Tensor Parallelism and FSDP.
 
-use std::sync::{Arc, Mutex};
-use grim_tensor::backend::BackendStorage;
-use grim_tensor::error::{Error, Result};
 use crate::memory::storage::CudaStorage;
 use crate::nccl::CudaComm;
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::error::{Error, Result};
+use std::sync::{Arc, Mutex};
 
 /// Communication topology descriptor for a parallel execution group.
 #[derive(Debug, Clone)]
@@ -20,7 +20,9 @@ pub struct ParallelTopology {
 impl ParallelTopology {
     pub fn new(rank: usize, world_size: usize, device_ordinals: Vec<usize>) -> Result<Self> {
         if world_size == 0 {
-            return Err(Error::Backend("ParallelTopology: world_size must be >= 1".into()));
+            return Err(Error::Backend(
+                "ParallelTopology: world_size must be >= 1".into(),
+            ));
         }
         if rank >= world_size {
             return Err(Error::Backend(format!(
@@ -43,7 +45,10 @@ impl ParallelTopology {
     }
 
     pub fn local_device_ordinal(&self) -> usize {
-        self.device_ordinals.get(self.rank).copied().unwrap_or(self.rank)
+        self.device_ordinals
+            .get(self.rank)
+            .copied()
+            .unwrap_or(self.rank)
     }
 }
 
@@ -127,7 +132,9 @@ impl ParallelCommunicator {
             let world_size = self.topology.world_size;
 
             {
-                let mut slot = ring.buffers[my_rank].lock().unwrap_or_else(|e| e.into_inner());
+                let mut slot = ring.buffers[my_rank]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 slot.clear();
                 slot.extend_from_slice(buf);
             }
@@ -179,7 +186,9 @@ impl ParallelCommunicator {
 
         if let Some(ring) = &self.staging_ring {
             {
-                let mut slot = ring.buffers[my_rank].lock().unwrap_or_else(|e| e.into_inner());
+                let mut slot = ring.buffers[my_rank]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 slot.clear();
                 slot.extend_from_slice(src);
             }
@@ -227,7 +236,9 @@ impl ParallelCommunicator {
 
         if let Some(ring) = &self.staging_ring {
             {
-                let mut slot = ring.buffers[my_rank].lock().unwrap_or_else(|e| e.into_inner());
+                let mut slot = ring.buffers[my_rank]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 slot.clear();
                 slot.extend_from_slice(src);
             }

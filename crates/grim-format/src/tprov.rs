@@ -1,7 +1,5 @@
 //! `TensorProvider` implementations for GGUF, native `.grim`, and safetensors files.
-//!
-//! Each implements `TensorProvider` so `WeightSource` can walk checkpoints
-//! without caring whether they came from GGUF, native `.grim`, or safetensors.
+//! Each implements `TensorProvider` so `WeightSource` can walk checkpoints without caring whether they came from GGUF,.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,9 +23,8 @@ use crate::safetensors::{SafetensorInfo, read_safetensors_header};
 /// `BufReader<File>` for lazy tensor reads.
 pub struct GgufProvider {
     file: GgufFile,
-    /// Memory-mapped file. Tensor bytes are sliced directly from this (zero
-    /// copy) instead of being `read_exact`'d through a per-tensor mutex, which
-    /// both removes the serialization bottleneck and lets the OS prefetch.
+    /// Memory-mapped file. Tensor bytes are sliced directly from this (zero copy) instead of being `read_exact`'d
+    /// through a per-tensor mutex, which both removes the serialization bottleneck and lets the OS prefetch.
     mmap: memmap2::Mmap,
     /// Byte offset of the aligned tensor-data section within the file.
     data_start: u64,
@@ -35,9 +32,7 @@ pub struct GgufProvider {
     grim: GrimMetadata,
     overrides: HashMap<String, GrimQuantOverride>,
     /// Detected external-toolkit producer (TorchAO/Quark/ModelOpt/FBGEMM).
-    /// When `Some`, tensors whose GGUF dtype maps to a toolkit format are
-    /// routed through the layout adapter so the correct `Storage` variant
-    /// and `QuantProvenance` are selected.
+    /// When `Some`, tensors whose GGUF dtype maps to a toolkit format are routed through the.
     toolkit_producer: Option<crate::convert::ToolkitProducer>,
 }
 
@@ -60,11 +55,8 @@ impl GgufProvider {
             .map(|o| (o.tensor_name.clone(), o.clone()))
             .collect();
 
-        // Detect external-toolkit producer from GGUF metadata. This is the
-        // GGUF-container counterpart to the safetensors `__metadata__` path in
-        // SafetensorsProvider. Toolkit-produced GGUF files (e.g. NVFP4 models
-        // distributed via HuggingFace in GGUF wrapping) stamp the producer in
-        // string metadata keys like `general.quantization_config`.
+        // Detect external-toolkit producer from GGUF metadata.
+        // This is the GGUF-container counterpart to the safetensors `__metadata__` path in SafetensorsProvider.
         let toolkit_producer = crate::convert::detect_toolkit_producer_from_gguf(&gguf.metadata);
         if let Some(producer) = toolkit_producer {
             println!(
@@ -183,9 +175,7 @@ impl GgufProvider {
 }
 
 /// Maps a `GgufDType` to a grim `DType` using the canonical mapping.
-///
-/// Delegates to [`crate::gguf::map_gguf_dtype_to_storage`] so there is a
-/// single source of truth for GGUF→DType conversion.
+/// Delegates to [`crate::gguf::map_gguf_dtype_to_storage`] so there is a single source of truth for GGUF→DType conversion.
 fn dtype_from_gguf(gguf_dtype: GgufDType) -> DType {
     crate::gguf::map_gguf_dtype_to_storage(gguf_dtype)
 }
@@ -209,18 +199,14 @@ impl TensorProvider for GgufProvider {
         let dtype = effective_dtype(info, &self.overrides);
         let n = info.shape().iter().product::<usize>();
 
-        // External-toolkit tensor routing: when a toolkit producer was
-        // detected from GGUF metadata and this tensor's dtype maps to a
-        // toolkit-specific format (e.g. NVFP4), route through the layout
-        // adapter so the correct `Storage` variant and `QuantProvenance`
-        // are selected. This mirrors the safetensors path in
-        // SafetensorsProvider::get.
+        // External-toolkit tensor routing: when a toolkit producer was detected from GGUF metadata and this tensor's dtype maps to a toolkit-specific format (e.g.
+        // NVFP4), route through the layout adapter so the correct `Storage` variant and `QuantProvenance` are selected.
         if let Some(producer) = self.toolkit_producer {
             if let Some(qfmt) = crate::convert::classify_toolkit_tensor(producer, name) {
-                let storage = crate::convert::toolkit_to_storage(producer, qfmt)
-                    .ok_or_else(|| Error::Backend(format!(
-                        "no Storage mapping for toolkit format {qfmt:?}"
-                    )))?;
+                let storage =
+                    crate::convert::toolkit_to_storage(producer, qfmt).ok_or_else(|| {
+                        Error::Backend(format!("no Storage mapping for toolkit format {qfmt:?}"))
+                    })?;
                 let reframe_bytes = crate::convert::reframe_toolkit_bytes(qfmt, &bytes, n)?;
                 let provenance = crate::convert::toolkit_to_provenance(producer, qfmt);
                 return Ok(RawTensor {
@@ -262,11 +248,8 @@ impl TensorProvider for GgufProvider {
         self.tensors.keys().cloned().collect()
     }
 
-    /// Zero-copy byte-range read for column-parallel (dim==0) sharding of GGUF
-    /// block-quantised tensors. Computes the file offset of the rank's block
-    /// range instead of materialising the full tensor, so sharding costs O(1)
-    /// reads rather than O(N) CPU round-trips. Delegates to the default trait
-    /// impl for dim!=0 (which still falls back to `get_packed` + `shard_raw_tensor`).
+    /// Zero-copy byte-range read for column-parallel (dim==0) sharding of GGUF block-quantised tensors.
+    /// Computes the file offset of the rank's block range instead of materialising the full tensor,.
     fn get_packed_sharded(
         &self,
         name: &str,
@@ -342,8 +325,7 @@ impl TensorProvider for GgufProvider {
                 provenance: QuantProvenance::GrimNative,
             })
         } else {
-            // dim == 1 (row-parallel: slice across columns)
-            // Shard geometry must divide evenly.
+            // dim == 1 (row-parallel: slice across columns) Shard geometry must divide evenly.
             // [P1-26 fix: error on non-divisible shard geometry.]
             if in_dim % world_size != 0 {
                 return Err(Error::Backend(format!(
@@ -381,9 +363,8 @@ impl TensorProvider for GgufProvider {
 }
 
 impl GgufProvider {
-    /// Slice a full tensor's packed bytes out of the mmap (zero copy into a
-    /// fresh `Vec`). `GgufTensorInfo.offset` is relative to the tensor-data
-    /// section start, which begins at `self.data_start`.
+    /// Slice a full tensor's packed bytes out of the mmap (zero copy into a fresh `Vec`).
+    /// `GgufTensorInfo.offset` is relative to the tensor-data section start, which begins at `self.data_start`.
     fn slice_tensor(&self, info: &GgufTensorInfo) -> Result<Vec<u8>> {
         let start = self.data_start.checked_add(info.offset).ok_or_else(|| {
             Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name))
@@ -391,13 +372,8 @@ impl GgufProvider {
         self.read_region(start, info.size_bytes as usize)
     }
 
-    /// Reframe GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale
-    /// first, then nibble-packed codes) into the length-prefixed
-    /// `[codes][exps]` layout every downstream dequant path expects.
-    ///
-    /// Shared by [`get`] and [`get_packed_sharded`] so that sharded (TP)
-    /// MXFP4 tensors — which slice straight out of the mmap and therefore
-    /// skip `get`'s reframe — still come back in the correct layout.
+    /// Reframe GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale first, then nibble-packed codes) into the length-prefixed `[codes][exps]` layout every downstream dequant path expects.
+    /// Shared by [`get`] and [`get_packed_sharded`] so that sharded (TP) MXFP4 tensors - which slice straight.
     fn reframe_bytes(&self, bytes: Vec<u8>, num_values: usize, dtype: &DType) -> Result<Vec<u8>> {
         if matches!(
             dtype.storage,
@@ -438,8 +414,7 @@ pub struct SafetensorsProvider {
     /// `quantize_config.json` decides which provider decodes the file.
     awq: Option<crate::awq::AwqProvider>,
     /// Detected external-toolkit producer (TorchAO/Quark/ModelOpt/FBGEMM).
-    /// When `Some`, non-GPTQ/AWQ tensors are routed through the toolkit
-    /// layout adapter so the correct `Storage` variant is selected.
+    /// When `Some`, non-GPTQ/AWQ tensors are routed through the toolkit layout adapter so the correct `Storage`.
     toolkit_producer: Option<crate::convert::ToolkitProducer>,
 }
 
@@ -453,7 +428,7 @@ impl SafetensorsProvider {
         // Detect external-toolkit producer from safetensors `__metadata__`.
         let toolkit_producer = metadata
             .as_ref()
-            .and_then(|m| crate::convert::detect_toolkit_producer(m));
+            .and_then(crate::convert::detect_toolkit_producer);
 
         if let Some(producer) = toolkit_producer {
             println!(
@@ -474,11 +449,8 @@ impl SafetensorsProvider {
         }
 
         let has_qweight = info.keys().any(|k| k.ends_with(".qweight"));
-        // AWQ vs GPTQ: both stamp `.qweight` tensors. The sibling
-        // quantize_config.json is authoritative — `quant_method: "awq"` (or
-        // an AWQ-only config shape) routes to AwqProvider; anything else
-        // keeps the historical GPTQ path. If no quantize_config.json exists
-        // at all, GptqProvider::open errors and we surface its message.
+        // AWQ vs GPTQ: both stamp `.qweight` tensors.
+        // The sibling quantize_config.json is authoritative - `quant_method: "awq"` (or an AWQ-only config shape) routes to.
         let awq = if has_qweight {
             crate::awq::AwqProvider::open(path).ok()
         } else {
@@ -591,31 +563,24 @@ impl TensorProvider for SafetensorsProvider {
             }
         }
 
-        // External-toolkit tensor routing: when a toolkit producer was
-        // detected, classify the tensor and map it onto the correct
-        // `Storage` variant via the layout adapter.
+        // External-toolkit tensor routing: when a toolkit producer was detected, classify the tensor
+        // and map it onto the correct `Storage` variant via the layout adapter.
         if let Some(producer) = self.toolkit_producer {
             if let Some(qfmt) = crate::convert::classify_toolkit_tensor(producer, name) {
                 let info = self.info.get(name).ok_or_else(|| {
-                    Error::Backend(format!(
-                        "tensor '{name}' not found in safetensors file"
-                    ))
+                    Error::Backend(format!("tensor '{name}' not found in safetensors file"))
                 })?;
                 let start = self
                     .data_region_start
                     .checked_add(info.data_start)
-                    .ok_or_else(|| {
-                        Error::Backend("safetensors tensor offset overflow".into())
-                    })?;
+                    .ok_or_else(|| Error::Backend("safetensors tensor offset overflow".into()))?;
                 let len = (info.data_end - info.data_start) as usize;
                 let raw_bytes = self.read_region(start, len)?;
                 let elem_count: usize = info.shape().iter().product();
 
                 let storage =
                     crate::convert::toolkit_to_storage(producer, qfmt).ok_or_else(|| {
-                        Error::Backend(format!(
-                            "no Storage mapping for toolkit format {qfmt:?}"
-                        ))
+                        Error::Backend(format!("no Storage mapping for toolkit format {qfmt:?}"))
                     })?;
                 let reframe_bytes =
                     crate::convert::reframe_toolkit_bytes(qfmt, &raw_bytes, elem_count)?;
@@ -693,18 +658,12 @@ impl TensorProvider for SafetensorsProvider {
     }
 }
 
-/// Native `.grim`-backed `TensorProvider`.
-///
-/// Opens a file with the `GRIM\x01` magic header, parses the JSON metadata
-/// layer and tensor registry, and lazily reads normals + outliers streams
-/// on `get()`. The returned `RawTensor.bytes` contains the raw packed
-/// normals; callers that need outlier correction read them separately via
-/// the [`crate::format`] helpers.
+/// Native `.grim`-backed `TensorProvider`. Opens a file with the `GRIM\x01` magic header, parses the JSON
+/// metadata layer and tensor registry, and lazily reads normals + outliers streams on `get()`.
 pub struct GrimProvider {
     file: GrimFile,
-    /// Memory-mapped file. Lazy normals/outliers reads slice directly from
-    /// this (zero copy) via a per-call `Cursor`, so concurrent `get()` calls
-    /// are lock-free instead of serializing behind a `Mutex<BufReader<File>>`.
+    /// Memory-mapped file. Lazy normals/outliers reads slice directly from this (zero copy) via a
+    /// per-call `Cursor`, so concurrent `get()` calls are lock-free instead of serializing behind a `Mutex<BufReader<File>>`.
     mmap: memmap2::Mmap,
 }
 
@@ -738,10 +697,7 @@ impl GrimProvider {
     }
 
     /// Look up the per-tensor capability extension for `name`, if any.
-    ///
-    /// Returns `None` for plain version-1 tensors that carry no extension
-    /// declaration. Callers can use `GrimTensorExt::is_legacy()` to detect
-    /// the default (zeroed) extension.
+    /// Returns `None` for plain version-1 tensors that carry no extension declaration.
     pub fn ext_for(&self, name: &str) -> Option<&crate::spec::GrimTensorExt> {
         self.file
             .metadata
@@ -765,12 +721,8 @@ impl GrimProvider {
         read_outliers(&mut reader, entry)
     }
 
-    /// Construct a `GgufTokenizer` from the GGUF metadata embedded in this
-    /// `.grim` file during conversion.
-    ///
-    /// Returns an error if no GGUF metadata was embedded (e.g. legacy `.grim`
-    /// files or conversion from safetensors). Callers should fall back to the
-    /// sibling `.gguf` route in that case.
+    /// Construct a `GgufTokenizer` from the GGUF metadata embedded in this `.grim` file during conversion.
+    /// Returns an error if no GGUF metadata was embedded (e.g.
     pub fn tokenizer(&self) -> Result<crate::tokenizer::GgufTokenizer> {
         let meta = self
             .file
@@ -804,11 +756,8 @@ impl TensorProvider for GrimProvider {
                 };
                 let mut primary_scale_bytes = Vec::new();
                 if ext.scale_size != 0 {
-                    // `scale_offset` is payload-relative; add payload_offset
-                    // to get the absolute file position.
-                    // If the region is outside the file (e.g. test fixtures that
-                    // only emit metadata without real scale payloads), leave the
-                    // bytes empty — provenance metadata is still populated.
+                    // `scale_offset` is payload-relative; add payload_offset to get the absolute file position.
+                    // If the region is outside the file (e.g.
                     let start = entry.payload_offset + ext.scale_offset;
                     if let Ok(seek_pos) = reader.seek(std::io::SeekFrom::Start(start)) {
                         if seek_pos == start {
@@ -862,10 +811,8 @@ impl TensorProvider for GrimProvider {
             }
         }
 
-        // P2-WI-1: if the per-tensor extension declares Fp8 block-scale mode
-        // (row_scale_dtype = Fp8, block_size = 16), dequantize on the fly to F32
-        // instead of returning the raw packed bytes. This is the single dispatch
-        // hook; all other metadata fields are passed through unchanged.
+        // P2-WI-1: if the per-tensor extension declares Fp8 block-scale mode (row_scale_dtype = Fp8, block_size = 16), dequantize on the fly to F32 instead of returning the raw packed bytes.
+        // This is the single dispatch hook; all other metadata fields are passed through unchanged.
         if let Some(ext) = self.ext_for(name) {
             if ext.row_scale_dtype == crate::spec::RowScaleDtype::Fp8 && ext.block_size == 16 {
                 // Total element count = product of shape dimensions.
@@ -919,10 +866,7 @@ impl TensorProvider for GrimProvider {
 }
 
 /// Map a `.grim` base bitwidth to the arithmetic `DType` used for dequant.
-///
-/// The packed normals are stored at `base_bitwidth` bits per weight; the
-/// arithmetic type is always F32 (dequantized). The storage layer carries
-/// the bitwidth so dequant kernels know how to unpack.
+/// The packed normals are stored at `base_bitwidth` bits per weight; the arithmetic type is always.
 fn dtype_from_bitwidth(base_bitwidth: u8) -> DType {
     match base_bitwidth {
         16 => DType::F16,
@@ -942,10 +886,8 @@ fn dtype_from_bitwidth(base_bitwidth: u8) -> DType {
     }
 }
 
-// ---------- Remapping Tensor Provider ----------
-/// Wraps a `TensorProvider` and remaps tensor names using a provided
-/// mapping function. Useful for loading checkpoints with different naming
-/// conventions (e.g., Hugging Face → GGUF).
+// ---------- Remapping Tensor Provider ---------- Wraps a `TensorProvider` and remaps tensor names using a provided mapping function.
+// Useful for loading checkpoints with different naming conventions (e.g., Hugging Face → GGUF).
 pub struct RemappingTensorProvider<'a> {
     inner: &'a dyn TensorProvider,
     remap: Box<dyn Fn(&str) -> String + Send + Sync + 'a>,
@@ -992,9 +934,8 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
     }
 
     fn tensor_names(&self) -> Vec<String> {
-        // Enumerate under the remapped (loader-side) names so a
-        // `WeightSource` prefetch keyed by those names lines up with the
-        // `full_name` keys the loader actually requests.
+        // Enumerate under the remapped (loader-side) names so a `WeightSource` prefetch keyed by
+        // those names lines up with the `full_name` keys the loader actually requests.
         self.inner
             .tensor_names()
             .into_iter()
@@ -1013,10 +954,6 @@ mod tests {
 
     /// Build a minimal GGUF byte stream with the given metadata KV pairs and zero tensors.
     /// Used by tprov accessor tests to exercise `GgufProvider::open` against real serialized bytes.
-    ///
-    /// Values supported:
-    /// - `GgufValue::String(s)` — written as a GGUF string
-    /// - `GgufValue::Array(items)` — written as a GGUF array, each string element is `&str`
     fn write_minimal_gguf_bytes(metadata: &HashMap<&str, GgufValue>) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.write_all(&GGUF_MAGIC.to_le_bytes())
@@ -1259,11 +1196,8 @@ mod tests {
         assert!(provider.meta("nonexistent").is_err());
     }
 
-    /// P0-WI-2 (WI-F2) regression: a plain (non-quantized) safetensors file
-    /// must round-trip with `GrimNative` provenance and unchanged bytes. This
-    /// guards the plain path while GPTQ `.qweight` groups are delegated to
-    /// `GptqProvider` (which stamps `ExternalQat`). Constructing a minimal
-    /// valid safetensors (8-byte LE length prefix + JSON header + F32 data).
+    /// P0-WI-2 (WI-F2) regression: a plain (non-quantized) safetensors file must round-trip with `GrimNative` provenance and unchanged bytes.
+    /// This guards the plain path while GPTQ `.qweight` groups are delegated to `GptqProvider` (which stamps.
     #[test]
     fn plain_safetensors_keeps_grim_native_provenance() {
         // Header: one F32 tensor "w" of shape [4] (16 bytes), no metadata.

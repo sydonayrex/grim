@@ -54,9 +54,8 @@ impl JitCacheKey {
     }
 }
 
-/// Cache for compiled .hsaco kernels. The in-memory map also stores the
-/// (possibly C++-mangled) *lowered* kernel name so `hipModuleGetFunction` can
-/// resolve kernels that hipRTC emits mangled (e.g. `grim_moe_fused_grouped_fp8`).
+/// Cache for compiled .hsaco kernels. The in-memory map also stores the (possibly C++-mangled)
+/// *lowered* kernel name so `hipModuleGetFunction` can resolve kernels that hipRTC emits mangled (e.g.
 #[derive(Debug)]
 pub struct HsacoKernelCache {
     cache_dir: PathBuf,
@@ -77,11 +76,8 @@ impl HsacoKernelCache {
             let _ = fs::create_dir_all(&cache_dir);
         }
 
-        // NOTE: we deliberately do NOT pre-populate `entries` from on-disk
-        // .hsaco files. The lowered (possibly mangled) kernel name is computed
-        // at JIT-compile time and stored in-memory here; a cold start just
-        // reuses the existing on-disk .hsaco via `cache_kernel`'s exists-check.
-        // This keeps `hipModuleGetFunction` pointing at the correct symbol.
+        // NOTE: we deliberately do NOT pre-populate `entries` from on-disk .hsaco files.
+        // The lowered (possibly mangled) kernel name is computed at JIT-compile time and stored in-memory here;.
         let entries_lock = RwLock::new(HashMap::new());
 
         Self {
@@ -108,9 +104,8 @@ impl HsacoKernelCache {
         lowered_name: &str,
     ) -> Result<PathBuf> {
         let hash = seahash::hash(source.as_bytes());
-        // A code object compiled by a previous ROCm/HIPRTC build can fault in
-        // `hipModuleLoad` after a driver upgrade. Keep versions separate even
-        // when source and GPU target are unchanged.
+        // A code object compiled by a previous ROCm/HIPRTC build can fault in `hipModuleLoad` after a driver upgrade.
+        // Keep versions separate even when source and GPU target are unchanged.
         let cache_key = format!(
             "{}_{}_{:016x}.hsaco",
             key,
@@ -131,9 +126,8 @@ impl HsacoKernelCache {
                 .unwrap_or(0)
         ));
         fs::write(&tmp_path, compiled)?;
-        // `rename` atomically replaces an old entry. This matters after a
-        // failed or stale compile: a successful HIPRTC result must not be
-        // discarded merely because a same-key file already exists.
+        // `rename` atomically replaces an old entry.
+        // This matters after a failed or stale compile: a successful HIPRTC result must not be.
         fs::rename(&tmp_path, &cache_path)?;
 
         let metadata = fs::metadata(&cache_path)?;

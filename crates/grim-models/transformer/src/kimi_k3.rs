@@ -1,21 +1,15 @@
 //! Compatibility loader and native implementation for `moonshotai/Kimi-K3`.
-//!
-//! # Architecture Details
-//! - **Multi-Head Latent Attention (MLA)**: Dual Q-LoRA (`q_a_proj -> q_b_proj`) and KV-LoRA (`kv_a_proj_with_mqa -> kv_b_proj`) latent projections.
-//! - **Kimi MoE**: 64-expert Mixture of Experts with top-6 routing and scaling factor.
-//! - **SwiGLU Experts**: $w_1$ (gate), $w_3$ (up), and $w_2$ (down) feed-forward branches.
+//! # Architecture Details - **Multi-Head Latent Attention (MLA)**: Dual Q-LoRA (`q_a_proj -> q_b_proj`) and KV-LoRA.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, Device, DType, QuantProvenance, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
 // GPU fallback guard
-// ---------------------------------------------------------------------------
 
 /// `Ok(None)` marks "backend lacks the kernel — use the host fallback";
 /// other errors are real failures and propagate.
@@ -27,9 +21,7 @@ fn or_host_fallback<T>(r: std::result::Result<T, grim_tensor::Error>) -> Result<
     }
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Kimi-K3 architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -131,9 +123,7 @@ impl KimiK3Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MLA Attention Block
-// ---------------------------------------------------------------------------
 
 pub struct KimiK3Mla {
     pub q_a_proj: Linear,
@@ -308,16 +298,8 @@ impl KimiK3Mla {
         // see future in-chunk keys.
         let cache_offset = total_kv_len.saturating_sub(seq_len);
 
-        // KERNEL GAP: this loader materializes per-head K/V through kv_b_proj
-        // and attends UNCOMPRESSED (per-head `k_nope[h]` + a rope key shared
-        // across heads, `v_head_dim != qk_nope_head_dim`). None of the device
-        // kernels map onto that: `qkv_attention` has no shared-rope MQA mixing
-        // or mismatched v-dim, and `mla_absorbed_decode` needs a compressed
-        // latent cache this loader deliberately does not keep (the session
-        // cache layout `(k, v, rope)` is load-bearing). The scalar loop below
-        // is therefore the reference path on every device, reached by explicit
-        // host-materialized caches rather than an unguarded free-running
-        // device path.
+        // KERNEL GAP: this loader materializes per-head K/V through kv_b_proj and attends UNCOMPRESSED (per-head `k_nope[h]` + a rope key shared across heads, `v_head_dim != qk_nope_head_dim`).
+        // None of the device kernels map onto that: `qkv_attention` has no shared-rope MQA mixing or.
         let scale = 1.0 / ((self.qk_nope_head_dim + self.qk_rope_head_dim) as f32).sqrt();
         let mut attn_out = vec![0.0f32; seq_len * self.num_heads * self.v_head_dim];
 
@@ -378,9 +360,7 @@ impl KimiK3Mla {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Feed-Forward Layer
-// ---------------------------------------------------------------------------
 
 pub struct KimiK3Expert {
     pub gate_proj: Linear,
@@ -445,11 +425,8 @@ impl KimiK3Moe {
         })
     }
 
-    /// GPU-first MoE forward: routing stays on host (small gate-logits pull),
-    /// but on non-CPU devices the experts run on-device and the routing
-    /// weighted sum accumulates with scalar-mul/add kernels so per-expert
-    /// outputs never cross to host. Falls back to [`Self::forward_moe_host`]
-    /// on CPU devices or when the backend lacks a needed primitive.
+    /// GPU-first MoE forward: routing stays on host (small gate-logits pull), but on non-CPU devices the experts run on-device and the routing weighted sum accumulates with scalar-mul/add kernels so per-expert outputs never cross to host.
+    /// Falls back to [`Self::forward_moe_host`] on CPU devices or when the backend lacks a needed primitive.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.gate.forward(x)?;
         let logits_v = logits.to_vec_f32()?;
@@ -462,10 +439,8 @@ impl KimiK3Moe {
         self.forward_moe_host(x, &logits_v)
     }
 
-    /// Device-resident MoE: token rows are extracted D2D, experts run
-    /// on-device (Linear + `silu_mul_on_device`), and the weighted sum
-    /// accumulates on-device. `Ok(None)` = backend lacks a needed kernel
-    /// (`is_kernel_unimplemented`); caller uses the host path.
+    /// Device-resident MoE: token rows are extracted D2D, experts run on-device (Linear + `silu_mul_on_device`), and the weighted sum accumulates on-device.
+    /// `Ok(None)` = backend lacks a needed kernel (`is_kernel_unimplemented`); caller uses the host path.
     fn forward_moe_device(&self, x: &Tensor, logits_v: &[f32]) -> Result<Option<Tensor>> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -565,10 +540,8 @@ impl KimiK3Moe {
         )))
     }
 
-    /// Host routing reference path — the documented FALLBACK (CPU device, or
-    /// GPU backends missing the copy/mul primitives). Identical math to the
-    /// device path: per-token top-k routing on the gate logits, expert
-    /// forward, routed-scaling weighted sum.
+    /// Host routing reference path - the documented FALLBACK (CPU device, or GPU backends missing the copy/mul primitives).
+    /// Identical math to the device path: per-token top-k routing on the gate logits, expert forward,.
     fn forward_moe_host(&self, x: &Tensor, logits_v: &[f32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -612,9 +585,7 @@ impl KimiK3Moe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct KimiK3Block {
     pub attn_norm: RmsNorm,
@@ -660,14 +631,11 @@ impl KimiK3Block {
         let normed_ffn = self.ffn_norm.forward(&res1)?;
         let mlp_out = self.moe.forward(&normed_ffn)?;
 
-        grim_nn::modules::add_on_device(&res1, &mlp_out)
-            .map_err(grim_core::error::Error::from)
+        grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct KimiK3 {
     pub cfg: KimiK3Config,
@@ -859,10 +827,8 @@ mod tests {
         cpu_tensor(data, Shape::new(vec![rows, cols]))
     }
 
-    /// WI-X11a: decode must attend with the CACHED rope keys, not the current
-    /// call's buffer. Probe: poison every cached rope row after prefill; a
-    /// correct decode output changes. (The old bug read `k_rope_v[0..]` from
-    /// the current call and was blind to the cache.)
+    /// WI-X11a: decode must attend with the CACHED rope keys, not the current call's buffer.
+    /// Probe: poison every cached rope row after prefill; a correct decode output changes.
     #[test]
     fn decode_uses_cached_rope_keys() {
         let mla = tiny_mla();
@@ -902,10 +868,8 @@ mod tests {
         );
     }
 
-    /// WI-X11b: causal mask — the FIRST query of a multi-token call must not
-    /// see later tokens of the same call. Probe: change only the second
-    /// token's input; query 0's output must be bit-identical, query 1's must
-    /// differ (it attends to itself).
+    /// WI-X11b: causal mask - the FIRST query of a multi-token call must not see later tokens of the same call.
+    /// Probe: change only the second token's input; query 0's output must be bit-identical, query 1's.
     #[test]
     fn causal_mask_blocks_future_keys() {
         let mla = tiny_mla();

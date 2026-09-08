@@ -16,9 +16,7 @@ pub struct VulkanCaps {
     pub supports_bf16: bool,
     pub supports_fp8: bool,
     /// True when the device supports `buffer_atomic_add_f32` / `OpAtomicFAdd` on SSBOs.
-    /// Required by the MoE fused dispatch kernel. AMD RADV only assembles this
-    /// instruction on RDNA 3+ (gfx1100+, device_id >= 0x7440); earlier hardware
-    /// (including the Raphael Mendocino iGPU at 0x164e) will SIGABRT in ACO.
+    /// Required by the MoE fused dispatch kernel.
     pub supports_fp32_atomic_add: bool,
     /// True when device supports `VK_KHR_shader_subgroup_arithmetic` (subgroupAdd, subgroupMax).
     pub supports_subgroup_arithmetic: bool,
@@ -43,8 +41,7 @@ impl VulkanCaps {
         // AMD RDNA 3+ (gfx1100+, 0x1002) and NVIDIA Pascal+ (0x10de):
         // These support native FP32 atomic add on SSBOs via GL_EXT_shader_atomic_float / OpAtomicFAdd.
         let supports_fp32_atomic_add =
-            (vendor_id == 0x1002 && (0x7440..=0x75ff).contains(&device_id))
-                || vendor_id == 0x10de;
+            (vendor_id == 0x1002 && (0x7440..=0x75ff).contains(&device_id)) || vendor_id == 0x10de;
         // Intel executes EU threads at SIMD16; AMD RDNA (wave32) and
         // NVIDIA (warp32) both dispatch 32-lane subgroups.
         let subgroup_size = if vendor_id == 0x8086 { 16 } else { 32 };

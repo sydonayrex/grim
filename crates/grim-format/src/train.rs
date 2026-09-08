@@ -1,25 +1,5 @@
 //! Training-state sidecar format: `model.grim.train` (WI-R6).
-//!
-//! The V3 `.grim` wire format is weight/inference-only; it has no slot for
-//! optimizer state, LoRA/DoRA adapters, or SERQ low-rank error matrices.
-//! Research shows consumer fine-tune is viable (LoRA Edge 26× peak-mem cut
-//! on Llama-3.2-3B; DoRA ~24% train-mem reduction vs LoRA; SERQ saliency
-//! low-rank error for 4-bit GEMM). This module defines a **companion
-//! sidecar** — `model.grim.train` written next to `model.grim` — so the
-//! inference reader is never touched and legacy files ignore it.
-//!
-//! Layout (little-endian):
-//!
-//! ```text
-//! [ magic: 8 bytes "GRIMTRN\x01" ]
-//! [ header_len: u32 LE ][ header JSON ]
-//! [ per-blob: name_len:u16 | name | ndim:u8 | dims:u32×ndim | nbytes:u64 | bytes ]
-//! ```
-//!
-//! Each blob (adapter A/B, optimizer m/v, error matrix, …) is a self-describing
-//! byte region. The header JSON records the `fp_format` numeric descriptor and
-//! which named blobs belong to which logical slot, so a resumed fine-tune can
-//! reconstruct step-N state bit-for-bit.
+//! The V3 `.grim` wire format is weight/inference-only; it has no slot for optimizer state, LoRA/DoRA.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,12 +12,7 @@ use grim_tensor::error::{Error, Result};
 pub const TRAIN_MAGIC: [u8; 8] = [0x47, 0x52, 0x49, 0x4d, 0x54, 0x52, 0x4e, 0x01]; // "GRIMTRN\x01"
 
 /// FP format descriptor for training-state tensors (WI-R6).
-///
-/// The numeric set RDNA3/4 training targets (Dual-Precision MAC paper:
-/// FP8/FP4 rising in inference, FP16/FP32 still dominate training).
-///
-/// `Bf16` and `Fp16` encode the param blob bytes in that format while
-/// optimizer moments remain f32 (sidecar header `dtypes` map disambiguates).
+/// The numeric set RDNA3/4 training targets (Dual-Precision MAC paper: FP8/FP4 rising in inference, FP16/FP32 still.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrainFpFormat {
     Fp16 = 0,
@@ -175,9 +150,7 @@ fn f16_to_f32_le(bytes: &[u8]) -> f32 {
 }
 
 /// Encode a slice of f32 values into raw little-endian bytes in `fmt`.
-///
-/// Fp32 emits 4-byte words; Bf16/Fp16 emit 2-byte words. FP8/FP4 formats are
-/// not encodable here and fall back to Fp32 (callers must not request them).
+/// Fp32 emits 4-byte words; Bf16/Fp16 emit 2-byte words.
 pub fn encode_f32s_as(vals: &[f32], fmt: TrainFpFormat) -> Vec<u8> {
     match fmt {
         TrainFpFormat::Bf16 => vals.iter().flat_map(|v| f32_to_bf16_bytes(*v)).collect(),
@@ -278,9 +251,7 @@ impl TrainBlob {
 }
 
 /// A training-state sidecar: adapters, optimizer moments, error matrices.
-///
-/// Optional companion to a `.grim` inference file. The inference reader never
-/// requires it; a resumed fine-tune reproduces step-N state from it.
+/// Optional companion to a `.grim` inference file.
 #[derive(Debug, Clone)]
 pub struct TrainState {
     /// Current optimizer step number. Persisted so resumed training
@@ -308,9 +279,8 @@ impl Default for TrainState {
 }
 
 impl TrainState {
-    /// F2b: full-parameter sidecars store base weights as
-    /// `param_{layer}_0_{point}_a` with no `_b` partner. Returns
-    /// `(layer_idx, point_suffix, blob)` candidates for checkpoint merge.
+    /// F2b: full-parameter sidecars store base weights as `param_{layer}_0_{point}_a` with no `_b` partner.
+    /// Returns `(layer_idx, point_suffix, blob)` candidates for checkpoint merge.
     pub fn base_weight_blobs(&self) -> Vec<(usize, String, &TrainBlob)> {
         let mut out = Vec::new();
         for (name, blob) in &self.blobs {
@@ -339,9 +309,7 @@ impl TrainState {
     }
 
     /// Extract lora A and B raw f32 data for a given base tensor name.
-    ///
     /// Expects blobs named `{tensor_name}.lora_A.weight` and `{tensor_name}.lora_B.weight`.
-    /// Returns `(a_data, a_shape, b_data, b_shape)` or `None` if either blob is missing.
     #[allow(clippy::type_complexity)]
     pub fn lora_weights_for(
         &self,

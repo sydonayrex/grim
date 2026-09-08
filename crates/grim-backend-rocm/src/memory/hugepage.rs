@@ -1,17 +1,10 @@
 //! 2MB Linux HugePage Host-Pinned Memory Allocator.
-//!
-//! Provides `HugePagePinnedBuffer`, which allocates 2MB-aligned host memory
-//! via `mmap(MAP_HUGETLB | MAP_HUGE_2MB)` on Linux (falling back to aligned
-//! anonymous mmap on platforms/systems without hugepages configured) and
-//! registers it with the ROCm driver via `hipHostRegister`.
-//!
-//! This enables maximum DMA throughput over PCIe Gen4/Gen5 links by eliminating
-//! 4KB TLB miss penalties and scatter-gather lists.
+//! Provides `HugePagePinnedBuffer`, which allocates 2MB-aligned host memory via `mmap(MAP_HUGETLB | MAP_HUGE_2MB)` on Linux (falling back.
 
+use crate::device::handles::{hipHostRegister, hipHostUnregister};
+use grim_tensor::error::{Error, Result};
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use grim_tensor::error::{Error, Result};
-use crate::device::handles::{hipHostRegister, hipHostUnregister};
 
 const HUGEPAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
 
@@ -53,7 +46,10 @@ impl HugePagePinnedBuffer {
     #[cfg(target_os = "linux")]
     fn alloc_mmap(size: usize) -> Result<(NonNull<u8>, bool)> {
         // Try 2MB Hugepages first
-        let flags_huge = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | (21 << libc::MAP_HUGE_SHIFT);
+        let flags_huge = libc::MAP_PRIVATE
+            | libc::MAP_ANONYMOUS
+            | libc::MAP_HUGETLB
+            | (21 << libc::MAP_HUGE_SHIFT);
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

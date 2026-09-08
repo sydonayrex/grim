@@ -1,10 +1,5 @@
 //! SCYTHE: FORGE (fused tile-wise backward) + SCALE (stateless column-norm) + OASIS low-rank adapter optimizer.
-//!
-//! - FORGE: Consumes U and V gradients tile-wise in register tiles (e.g. 64 rows), avoiding
-//!   ever materializing full [d_out, r] or [d_in, r] gradient tensors in memory.
-//! - SCALE: Eliminates persistent second-moment EMA (Fisher/Adam v) for singular values Σ,
-//!   using instantaneous column-wise RMS normalization.
-//! - OASIS: Provides online low-rank subspace projection for intermediate activation tensors.
+//! - FORGE: Consumes U and V gradients tile-wise in register tiles (e.g.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_quant::soul_eater::subspace_newton_schulz_step;
@@ -270,41 +265,7 @@ impl ScytheOptimizer {
     }
 
     /// Fused backward + optimizer step with optional OASIS activation subspace projection.
-    ///
-    /// # Memory contract — FORGE tile bound vs. host round-trip gap
-    ///
-    /// **What FORGE eliminates:** The U and V gradient accumulation buffers are
-    /// bounded to `U_TILE_ROWS * r` elements (e.g. 64 × 16 = 1 024 floats, 4 KiB),
-    /// never `d_out * r` or `d_in * r` (which can reach tens of MiB on large layers).
-    /// The tile loop is genuinely bounded and tested by
-    /// `test_scythe_never_allocates_full_gradient_tensor`.
-    ///
-    /// **What FORGE does NOT eliminate — exactly 5 full-tensor host copies per call:**
-    ///
-    /// 1. `out_grad.to_vec_f32()` → `g_out_slice`  (output gradient, `batch_tokens × d_out` f32)
-    /// 2. `x.to_vec_f32()`        → `x_raw`        (input activation, `batch_tokens × d_in` f32)
-    /// 3. `adapter.u.to_vec_f32()` → `u_slice`     (U basis matrix, `d_out × r` f32)
-    /// 4. `adapter.v.to_vec_f32()` → `v_slice`     (V basis matrix, `d_in × r` f32)
-    /// 5. `adapter.sigma.to_vec_f32()` → `sig_slice` (singular values, `r` f32 — negligible)
-    ///
-    /// On **CPU-resident tensors**, each `to_vec_f32()` call is conceptually a
-    /// no-op (data already in host memory) but still incurs an extra `Vec`
-    /// allocation and copy. This is a known, documented anti-pattern flagged by
-    /// `BackendStorage::to_cpu_vec_f32`'s own doc comment ("production code paths
-    /// should keep data on-device and avoid this when possible").
-    ///
-    /// On **GPU-resident tensors**, each of the 5 copies is a real PCIe DtoH transfer
-    /// per call. Eliminating these round-trips requires a device-resident fused kernel
-    /// that computes the backward pass without staging data through host RAM.
-    /// That kernel is **out of scope for this crate** — see the ROCm/HIP follow-up plan
-    /// (`grim-backend-rocm` tile-wise backward). Until that kernel lands, callers on GPU
-    /// should treat each `fused_step_with_oasis` call as implicitly incurring 5 PCIe
-    /// round-trips regardless of the FORGE tile memory optimisation.
-    ///
-    /// The copy count is locked at exactly 5 by
-    /// `test_fused_step_no_redundant_cpu_copy_when_already_cpu_resident`; any
-    /// accidental addition of a 6th copy (e.g. a refactor re-fetching `u_slice`)
-    /// fails CI immediately.
+    /// # Memory contract - FORGE tile bound vs.
     pub fn fused_step_with_oasis(
         &mut self,
         name: &str,
@@ -332,8 +293,7 @@ impl ScytheOptimizer {
         let (x_slice, oasis_proj) = if let Some(subspace) = oasis {
             subspace.update_basis(&x_raw, batch_tokens);
             let proj = subspace.project(&x_raw, batch_tokens);
-            // In linear adapter Y = X V Σ U^T, if X is in subspace basis Q [d_in, p],
-            // then X V = (X_proj * Q^T) V = X_proj * (Q^T V) where Q^T V is [p, r].
+            // In linear adapter Y = X V Σ U^T, if X is in subspace basis Q [d_in, p], then X V = (X_proj * Q^T) V = X_proj * (Q^T V) where Q^T V is [p, r].
             // We use the exact raw activation for unbiased adapter backward:
             (x_raw, Some(proj))
         } else {
@@ -593,16 +553,8 @@ mod tests {
         );
     }
 
-    /// Phase 3 load-bearing test: Measure trajectory similarity and convergence rate between SICKLE (2nd-order FIM preconditioned)
-    /// and SCYTHE (1st-order FORGE-tiled + SCALE column RMS) on a structured multi-frequency problem.
-    ///
-    /// Note: SICKLE and SCYTHE have mathematically distinct update rules (SICKLE computes an inverse-FIM preconditioned
-    /// curvature step while SCYTHE computes a stateless column-RMS scaled momentum step to eliminate gradient buffers).
-    /// This test verifies:
-    ///   1. Both optimizers monotonically reduce loss on a multi-feature regression problem.
-    ///   2. The parameter displacement vectors ΔU and ΔV maintain positive directional alignment (cos > 0.0).
-    ///   3. The singular spectrum displacement ΔΣ maintains positive alignment (cos >= 0.40).
-    ///   4. Neither optimizer explodes, produces NaNs, or diverges from the optimization objective.
+    /// Phase 3 load-bearing test: Measure trajectory similarity and convergence rate between SICKLE (2nd-order FIM preconditioned) and SCYTHE (1st-order FORGE-tiled + SCALE column RMS) on a structured multi-frequency problem.
+    /// Note: SICKLE and SCYTHE have mathematically distinct update rules (SICKLE computes an inverse-FIM preconditioned curvature.
     #[test]
     fn test_scythe_trajectory_alignment_and_convergence_against_sickle() {
         // Verified: 2026-08-28 on ROCm target gfx1036
@@ -851,35 +803,12 @@ mod tests {
         );
     }
 
-    /// Regression test: lock the exact count of `to_vec_f32()` calls inside
-    /// `fused_step_with_oasis` at **5** — one per tensor listed in the doc
-    /// comment (`out_grad`, `x`, `u`, `v`, `sigma`).
-    ///
-    /// Currently these 5 copies are unavoidable on CPU-resident tensors (each
-    /// produces an extra `Vec` allocation even though the bytes are already in
-    /// host RAM) and are real PCIe transfers on GPU-resident tensors. This test
-    /// does not reduce the copies; it makes any future increase detectable in
-    /// CI so creep is caught before it merges.
-    ///
-    /// If a follow-on change genuinely removes one copy (e.g. in-place mutation
-    /// of `u`/`v`/`sigma`), update the constant from 5 to 4 with a one-line
-    /// comment explaining which copy was eliminated.
+    /// Regression test: lock the exact count of `to_vec_f32()` calls inside `fused_step_with_oasis` at **5** - one per tensor listed in the doc comment (`out_grad`, `x`, `u`, `v`, `sigma`).
+    /// Currently these 5 copies are unavoidable on CPU-resident tensors (each produces an extra `Vec` allocation.
     #[test]
     fn test_fused_step_no_redundant_cpu_copy_when_already_cpu_resident() {
         // Verified: 2026-08-28 on ROCm target gfx1036
         //
-        // We count `.to_vec_f32()` call-sites in the production body of
-        // `fused_step_with_oasis` via source-text inspection. This avoids
-        // instrumenting hot paths with runtime counters (which would require
-        // a cfg-gated wrapper around every call-site and pollute the normal
-        // build), while still producing a hard CI failure if the count drifts.
-        //
-        // Enumerated copies (in call order):
-        //   1. out_grad.to_vec_f32()       — g_out_slice
-        //   2. x.to_vec_f32()              — x_raw
-        //   3. adapter.u.to_vec_f32()      — u_slice
-        //   4. adapter.v.to_vec_f32()      — v_slice
-        //   5. adapter.sigma.to_vec_f32()  — sig_slice
         const EXPECTED_COPIES: usize = 5;
 
         let source_code = include_str!("scythe.rs");
@@ -905,9 +834,8 @@ mod tests {
              If you eliminated a copy: decrement EXPECTED_COPIES with a one-line explanation."
         );
 
-        // Numeric sanity: construct CPU-resident adapter, do one step, confirm
-        // forward still produces finite output (the copy-count test is structural;
-        // this confirms the update math is valid after the step).
+        // Numeric sanity: construct CPU-resident adapter, do one step, confirm forward still produces finite output
+        // (the copy-count test is structural; this confirms the update math is valid after the step).
         let mut adapter = ScytheAdapter::new(8, 8, 4, 1.0).unwrap();
         let mut opt = ScytheOptimizer::new(1e-3, 1e-3, 0.9);
         let x = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![1, 8]));

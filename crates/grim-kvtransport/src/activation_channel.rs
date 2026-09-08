@@ -1,12 +1,5 @@
 //! Point-to-point activation frames over TCP for multi-rank VPP (R3).
-//!
 //! VPP rank threads exchange f32 activation tensors at chunk fold points.
-//! Unlike the KV-block protocol (block-store semantics, pull by block id),
-//! activations are push-only, ordered per (channel, tag), and sized by the
-//! sender — a separate minimal wire format keeps the two contracts from
-//! drifting. Latency budget: prefill chunks are large, so plain TCP is
-//! acceptable (see `gpu-followup-workitems.md`, work item 2, transport
-//! options).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -30,12 +23,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Per-rank TCP transport for VPP activation exchange.
-///
-/// One [`TcpActivationTransport`] owns a listener per rank so a single-node,
-/// multi-rank job (one process, N GPUs) can run all ranks over loopback;
-/// a multi-node deployment constructs it with only the local rank's listener
-/// and `set_peer` entries for the remote ranks. The same call sequence works
-/// for both — senders dial the peer's listener, receivers accept on their own.
+/// One [`TcpActivationTransport`] owns a listener per rank so a single-node, multi-rank job (one process, N.
 pub struct TcpActivationTransport {
     listeners: Vec<TcpListener>,
     peers: HashMap<usize, SocketAddr>,
@@ -70,9 +58,8 @@ impl TcpActivationTransport {
         self.peers.insert(rank, addr);
     }
 
-    /// Sends one activation frame to `to_rank`. Fire-and-forget: the frame
-    /// lands in the peer's listener backlog and the peer's matching
-    /// [`Self::recv_activation`] consumes it.
+    /// Sends one activation frame to `to_rank`.
+    /// Fire-and-forget: the frame lands in the peer's listener backlog and the peer's matching [`Self::recv_activation`] consumes.
     pub fn send_activation(
         &self,
         to_rank: usize,
@@ -115,10 +102,8 @@ impl TcpActivationTransport {
         Ok(())
     }
 
-    /// Blocks until the next frame for `for_rank` with a matching
-    /// (channel_id, tag) arrives, and returns its payload. The frame's own
-    /// element count sizes the output; callers validate it against the
-    /// expected activation shape.
+    /// Blocks until the next frame for `for_rank` with a matching (channel_id, tag) arrives, and returns its payload.
+    /// The frame's own element count sizes the output; callers validate it against the expected activation.
     pub fn recv_activation(&self, for_rank: usize, channel_id: u32, tag: u32) -> Result<Vec<f32>> {
         let listener = self.listener(for_rank)?;
         let deadline = Instant::now() + ACCEPT_DEADLINE;

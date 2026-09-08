@@ -1,7 +1,4 @@
-//! Adapter that exposes [`grim_models_transformer::LlamaMtp`] (a Mamba/SSM
-//! model with native multi-token prediction head) through the
-//! [`NativeMtp`] speculative-decoding trait.
-//!
+//! Adapter that exposes [`grim_models_transformer::LlamaMtp`] (a Mamba/SSM model with native multi-token prediction head) through the [`NativeMtp`] speculative-decoding trait.
 //! §5.3.1: One model class registered to the speculative wrapper.
 
 use std::sync::Arc;

@@ -1,6 +1,5 @@
-//! `grim-backend-tests` — Centralized Known-Answer Tests (KAT) and backend parity verification.
-//!
-//! §WI-E9: Multi-format numerical parity tests across CPU, ROCm, and CUDA backends.
+//! Known-Answer Tests (KAT) and backend parity verification.
+//! Multi-format numerical parity tests across CPU, ROCm, and CUDA backends.
 
 use grim_quant::QuantFormat;
 

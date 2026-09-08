@@ -8,9 +8,15 @@ fn test_metal_modular_kernel_sources_non_empty() {
     assert!(!MATH_MSL.is_empty(), "MATH_MSL must not be empty");
     assert!(!GEMM_MSL.is_empty(), "GEMM_MSL must not be empty");
     assert!(!ATTENTION_MSL.is_empty(), "ATTENTION_MSL must not be empty");
-    assert!(!QUANTIZATION_MSL.is_empty(), "QUANTIZATION_MSL must not be empty");
+    assert!(
+        !QUANTIZATION_MSL.is_empty(),
+        "QUANTIZATION_MSL must not be empty"
+    );
     assert!(!OPTIMIZER_MSL.is_empty(), "OPTIMIZER_MSL must not be empty");
-    assert!(!SPECULATIVE_MSL.is_empty(), "SPECULATIVE_MSL must not be empty");
+    assert!(
+        !SPECULATIVE_MSL.is_empty(),
+        "SPECULATIVE_MSL must not be empty"
+    );
 
     assert!(MATH_MSL.contains("grim_add"));
     assert!(MATH_MSL.contains("grim_rms_norm"));

@@ -1,62 +1,12 @@
-//! Compatibility loader for `inclusionAI/Ling-3.0-tiny` (a.k.a. `BailingMoeV3`,
-//! HuggingFace `model_type = "bailing_hybrid"`).
-//!
-//! ## What this model is
-//!
-//! Ling-3.0-tiny is a **hybrid linear-attention + MLA + sparse-MoE** CausalLM:
-//!
-//! * 24 layers stacked 3:1 — three **KDA** (Kimi Delta Attention, a gated
-//!   linear-attention / short-conv hybrid) layers followed by one **MLA**
-//!   (Multi-head Latent Attention) layer per 4-layer block.
-//! * MLA uses `q_lora_rank` (256), `kv_lora_rank` (512), `qk_nope_head_dim`
-//!   (128) and `qk_rope_head_dim` (64) — i.e. a low-rank value/key compression
-//!   with partial RoPE, exactly like DeepSeek-V2/V3.
-//! * MoE FFN: 128 routed experts, `num_experts_per_tok = 8`, 1 shared expert,
-//!   sigmoid router (`scoring_func = "sigmoid"`) with expert bias and the
-//!   `noaux_tc` top-k group selection (`n_group = 8`, `topk_group = 4`).
-//! * `routed_scaling_factor = 2.5`, `norm_topk_prob = true`.
-//!
-//! ## Compatibility status
-//!
-//! All three primitives this model needs are now implemented in grim:
-//!
-//! 1. **MoE FFN** — `grim_nn::moe::MoeFfn` (sigmoid router, `noaux_tc` top-k,
-//!    `routed_scaling_factor`, optional shared expert), fused-dispatch backends.
-//! 2. **MLA** — `grim_nn::MlaAttention`: two-stage `q_a -> q_a_norm -> q_b`
-//!    low-rank Q projection, `kv_a -> kv_a_norm -> kv_b` low-rank KV projection,
-//!    split nope/rope head layout with partial RoPE on the rope slice, optional
-//!    `q_norm`/`k_norm` (`use_qk_norm`). CPU reference in `grim-nn`.
-//! 3. **KDA** — `grim_nn::KdaAttention`: gated delta-rule linear attention with
-//!    a depthwise causal `short_conv1d` (`short_conv_kernel_size = 4`) on the
-//!    value path and a per-step recurrent state (`KdaLayerCache`).
-//!
-//! `Ling3Tiny::load_tp` builds a real model (KDA/MLA chosen per layer by
-//! `i % layer_group_size`, MoE FFN on every layer). Layer blend is 3 KDA : 1 MLA
-//! (`layer_group_size = 4`). Remaining gaps (tracked, not silently fallen back):
-//! * The `short_conv1d` / delta-rule / MLA projections have a CPU reference only;
-//!   fused Metal/Vulkan/CUDA/ROCm kernels are a follow-up (mirroring the MoE
-//!   fused-dispatch work). On non-CPU backends these still run the CPU path.
-//! * Full end-to-end logits parity against HF transformers is not yet captured
-//!   in CI (needs the 15.8 GB safetensors + a reference run on a GPU box).
-//!
-//! Reference config (Ling-3.0-tiny, bf16, 15.8 GB):
-//! `hidden_size=1536, num_hidden_layers=24, num_attention_heads=16,
-//! num_key_value_heads=16, head_dim=128, q_lora_rank=256, kv_lora_rank=512,
-//! qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
-//! intermediate_size=4608, moe_intermediate_size=512,
-//! moe_shared_expert_intermediate_size=512, num_experts=128,
-//! num_experts_per_tok=8, num_shared_experts=1, first_k_dense_replace=1,
-//! routed_scaling_factor=2.5, vocab_size=157184, max_position_embeddings=131072,
-//! rope_theta=6000000, partial_rotary_factor=0.5, rope_interleave=true.`
+//! Compatibility loader for `inclusionAI/Ling-3.0-tiny` (a.k.a.
+//! `BailingMoeV3`, HuggingFace `model_type = "bailing_hybrid"`).
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_tensor::{ArithType, Device, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Native mirror of `BailingMoeV3Config` (HuggingFace `bailing_hybrid`).
 #[derive(Debug, Clone)]
@@ -122,9 +72,7 @@ impl ModelConfig for Ling3TinyConfig {
 
 impl Ling3TinyConfig {
     /// Build from the raw HuggingFace `config.json` `serde_json::Value`.
-    ///
-    /// Panics are avoided: every field is read with a `get` + `as_*` + fallback
-    /// so a slightly different tiny-variant config still parses.
+    /// Panics are avoided: every field is read with a `get` + `as_*` + fallback so.
     pub fn from_hf(value: &serde_json::Value) -> Self {
         let u = |k: &str| value.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let f = |k: &str| value.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -195,17 +143,8 @@ impl Ling3TinyConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Safetensors tensor-name map (compatibility reference)
-// ---------------------------------------------------------------------------
-//
-// These are the key paths present in `model-000XX-of-00032.safetensors` for
-// Ling-3.0-tiny. They are documented here so the eventual loader (after KDA +
-// MLA blocks land) can map HF tensors -> grim `WeightSource` keys without a
-// second reverse-engineering pass. Naming follows the standard Bailing hybrid
-// convention: `model.layers.{i}.{kda|self_attn|mla|mlp|moe}...`, where layer
-// `i` is KDA when `i % layer_group_size < layer_group_size - 1` and MLA
-// otherwise (3:1 interleave).
+// Safetensors tensor-name map (compatibility reference) These are the key paths present in `model-000XX-of-00032.safetensors` for Ling-3.0-tiny.
+// They are documented here so the eventual loader (after KDA + MLA blocks land) can.
 #[allow(dead_code)]
 pub const LING3_TINY_TENSOR_KEYS: &[&str] = &[
     // shared / embed
@@ -245,22 +184,17 @@ pub const LING3_TINY_TENSOR_KEYS: &[&str] = &[
     "model.layers.{i}.moe.shared_expert.w3.weight",
 ];
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Model Layer Types
-// ---------------------------------------------------------------------------
 
 pub enum Ling3Attn {
     Kda(Box<grim_nn::KdaAttention>),
     Mla(Box<grim_nn::MlaAttention>),
 }
 
-/// Per-layer session cache (audit fix): KDA layers carry conv + recurrent
-/// state; MLA layers carry the post-RoPE KV history. Boxed so the enum stays
-/// small.
+/// Per-layer session cache (audit fix): KDA layers carry conv + recurrent state; MLA layers carry the post-RoPE KV history.
+/// Boxed so the enum stays small.
 pub enum Ling3LayerCache {
     Kda(Box<grim_nn::KdaLayerCache>),
     Mla(Box<grim_nn::MlaKvCache>),
@@ -464,11 +398,8 @@ impl CausalLm for Ling3Tiny {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        // Audit fix (grim-models): per-layer caches now live on the SESSION
-        // and every call threads them into the attention variants — the
-        // pre-fix code passed None everywhere and ignored the session, so
-        // decode attended only to itself (fully stateless). KDA layers get
-        // real conv/recurrent state; MLA layers get the post-RoPE KV history.
+        // Audit fix (grim-models): per-layer caches now live on the SESSION and every call threads them into the attention variants - the pre-fix code passed None everywhere and ignored the session, so decode attended only to itself (fully stateless).
+        // KDA layers get real conv/recurrent state; MLA layers get the post-RoPE KV history.
         if session.model_state().is_none() {
             let caches: Vec<Ling3LayerCache> = self
                 .layers

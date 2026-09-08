@@ -1,10 +1,5 @@
-//! Dots-3 Note architecture with specialized reasoning/note token attention,
-//! RoPE positional embeddings, SwiGLU feed-forward networks, and RMSNorm.
-//!
-//! # Architecture Details
-//! - **Attention**: GQA with RoPE rotation.
-//! - **Feed Forward**: SwiGLU activation ($x \cdot \text{SiLU}(x \cdot W_{\text{gate}}) \cdot W_{\text{up}} \cdot W_{\text{down}}$).
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm.
+//! Dots-3 Note architecture with specialized reasoning/note token attention, RoPE positional embeddings, SwiGLU feed-forward networks, and RMSNorm.
+//! # Architecture Details - **Attention**: GQA with RoPE rotation.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Dots-3 Note.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,9 +56,7 @@ impl ModelConfig for Dots3NoteConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Feed Forward
-// ---------------------------------------------------------------------------
 
 pub struct Dots3NoteMlp {
     pub gate_proj: Linear,
@@ -93,9 +84,7 @@ impl Dots3NoteMlp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct Dots3NoteBlock {
     pub wq: Linear,
@@ -112,7 +101,11 @@ pub struct Dots3NoteBlock {
 }
 
 impl Dots3NoteBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &Dots3NoteConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &Dots3NoteConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -161,12 +154,8 @@ impl Dots3NoteBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -209,9 +198,7 @@ impl Dots3NoteBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Dots3Note {
     pub cfg: Dots3NoteConfig,
@@ -265,7 +252,10 @@ impl Dots3Note {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -338,9 +328,7 @@ impl CausalLm for Dots3Note {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -357,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_dots3_note_forward_and_session_state() {
         let mut cfg = Dots3NoteConfig::default();
         cfg.vocab_size = 32;
@@ -370,7 +359,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![1.0, 4.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

@@ -1,7 +1,5 @@
 //! Dynamic Speculative Speculation-Depth PID Controller.
-//!
-//! Automatically adjusts the speculative rollout depth $K \in [1, 5]$ online
-//! based on empirical token acceptance rates to maximize generation throughput.
+//! Automatically adjusts the speculative rollout depth $K \in [1, 5]$ online based on empirical token.
 
 /// Configuration for the speculative rollout depth PID controller.
 #[derive(Debug, Clone, PartialEq)]

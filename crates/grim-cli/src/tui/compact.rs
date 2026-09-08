@@ -1,9 +1,5 @@
 //! Context compaction planning: pure functions, no engine access.
-//!
-//! Strategy (locked): summarize older turns with the SAME engine on the
-//! worker thread; keep the original system preamble and the last
-//! `keep_turns` complete turns verbatim. Cuts only at user-message
-//! boundaries so tool_call/tool_result pairs are never split.
+//! Strategy (locked): summarize older turns with the SAME engine on the worker thread; keep the.
 
 use grim_format::ChatMessage;
 
@@ -17,10 +13,8 @@ fn is_turn_start(m: &ChatMessage) -> bool {
     m.role == "user" && m.tool_call_id.is_none()
 }
 
-/// Find a safe cut point: the user message that starts the
-/// `keep_turns`-th turn from the end (so exactly the last `keep_turns`
-/// turns stay verbatim). `None` when there is nothing to summarize.
-/// `keep_turns` must be >= 1.
+/// Find a safe cut point: the user message that starts the `keep_turns`-th turn from the end (so exactly the last `keep_turns` turns stay verbatim).
+/// `None` when there is nothing to summarize.
 pub fn plan(messages: &[ChatMessage], keep_turns: usize) -> Option<CompactionPlan> {
     if keep_turns == 0 {
         return None;
@@ -104,16 +98,40 @@ mod tests {
     use super::*;
 
     fn user(t: &str) -> ChatMessage {
-        ChatMessage { role: "user".into(), content: t.into(), tool_calls: None, tool_call_id: None, name: None }
+        ChatMessage {
+            role: "user".into(),
+            content: t.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     fn assistant(t: &str) -> ChatMessage {
-        ChatMessage { role: "assistant".into(), content: t.into(), tool_calls: None, tool_call_id: None, name: None }
+        ChatMessage {
+            role: "assistant".into(),
+            content: t.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     fn system(t: &str) -> ChatMessage {
-        ChatMessage { role: "system".into(), content: t.into(), tool_calls: None, tool_call_id: None, name: None }
+        ChatMessage {
+            role: "system".into(),
+            content: t.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     fn tool_msg(id: &str) -> ChatMessage {
-        ChatMessage { role: "tool".into(), content: "out".into(), tool_calls: None, tool_call_id: Some(id.into()), name: None }
+        ChatMessage {
+            role: "tool".into(),
+            content: "out".into(),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            name: None,
+        }
     }
 
     #[test]

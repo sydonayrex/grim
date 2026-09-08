@@ -1,8 +1,5 @@
 //! Markdown → ratatui rendering for assistant messages.
-//!
-//! Uses pulldown-cmark to parse CommonMark and syntect for syntax
-//! highlighting inside fenced code blocks. Produces styled Lines that
-//! the transcript widget can render directly.
+//! Uses pulldown-cmark to parse CommonMark and syntect for syntax highlighting inside fenced code blocks.
 
 use std::sync::OnceLock;
 
@@ -80,7 +77,9 @@ pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
             }
             Event::End(TagEnd::Heading(_)) => {
                 let style = match heading_level {
-                    1 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    1 => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                     2 => Style::default().fg(Color::Cyan),
                     _ => Style::default().fg(Color::White),
                 };
@@ -105,15 +104,22 @@ pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
                 in_code_block = false;
                 // Code block border: purple-soft header, purple-dim gutter footer.
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  ┌── [{}]", if code_lang.is_empty() { "code" } else { &code_lang }),
-                    Style::default().fg(Color::Rgb(192, 132, 252)),  // #c084fc purple-soft
+                    format!(
+                        "  ┌── [{}]",
+                        if code_lang.is_empty() {
+                            "code"
+                        } else {
+                            &code_lang
+                        }
+                    ),
+                    Style::default().fg(Color::Rgb(192, 132, 252)), // #c084fc purple-soft
                 )]));
                 for hl_line in highlight_code(&code_buf, &code_lang) {
                     lines.push(hl_line);
                 }
                 lines.push(Line::from(vec![Span::styled(
                     "  └────".to_string(),
-                    Style::default().fg(Color::Rgb(112, 50, 180)),  // dim purple
+                    Style::default().fg(Color::Rgb(112, 50, 180)), // dim purple
                 )]));
             }
             Event::Start(Tag::Emphasis) => italic = true,
@@ -167,13 +173,13 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
 
     let mut out = Vec::new();
     for line in code.lines() {
-        let ranges: Vec<(SynStyle, &str)> = match h.highlight_line(line, &ss) {
+        let ranges: Vec<(SynStyle, &str)> = match h.highlight_line(line, ss) {
             Ok(r) => r,
             Err(_) => vec![(SynStyle::default(), line)],
         };
         let mut spans = vec![Span::styled(
             "  │ ".to_string(),
-            Style::default().fg(Color::Rgb(112, 50, 180)),  // dim purple gutter
+            Style::default().fg(Color::Rgb(112, 50, 180)), // dim purple gutter
         )];
         for (style, text) in ranges {
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);

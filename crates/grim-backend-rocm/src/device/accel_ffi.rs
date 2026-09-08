@@ -5,9 +5,7 @@ use std::ffi::c_void;
 use grim_tensor::Error;
 use libloading::{Library, Symbol};
 
-// ---------------------------------------------------------------------------
-// F9 — MIOpen (dynamic load; no link-time .so required)
-// ---------------------------------------------------------------------------
+// F9 - MIOpen (dynamic load; no link-time .so required)
 
 /// MIOpen status code (every function returns one).
 pub type MiopenStatus = i32;

@@ -76,11 +76,8 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
     fn block_num_tokens(&self, id: BlockId) -> Option<usize> {
         KvBlockPool::block_num_tokens(self, id)
     }
-    // F8/F10: pull-mode fetch support. The inherent methods already exist;
-    // they were just never exposed through the trait the KV receiver server
-    // is generic over, so the server had no way to answer a fetch request.
-    // Call via the inherent path (`KvBlockPool::read_keys`) — the shared
-    // name would otherwise resolve to the trait method being defined here.
+    // F8/F10: pull-mode fetch support. The inherent methods already exist; they were just never exposed through the trait
+    // the KV receiver server is generic over, so the server had no way to answer a fetch request.
     fn read_keys(&self, id: BlockId) -> Option<Vec<f32>> {
         if id < self.num_blocks() {
             Some(KvBlockPool::read_keys(self, id).to_vec())
@@ -123,19 +120,16 @@ struct KvBlock {
     /// Per-layer value storage for multi-layer handoffs.
     layer_values: Vec<Vec<f32>>,
     num_tokens: usize,
-    /// Whether this block has received real KV data (via `store_kv`,
-    /// network ingestion, or explicit `write_keys`). Replaces the
-    /// fragile non-zero-content sniff in the decode fetch loop: a
-    /// genuinely all-zero KV block is valid data, not "not yet arrived."
+    /// Whether this block has received real KV data (via `store_kv`, network ingestion, or explicit `write_keys`).
+    /// Replaces the fragile non-zero-content sniff in the decode fetch loop: a genuinely all-zero KV block.
     received: bool,
     /// Current tier residency (Phase 2.3): explicit so promotion can be
     /// decided without re-querying the spill manager.
     location: CacheTier,
 }
 
-/// Outcome of a single demote-before-drop operation. Recorded so callers
-/// (engine, telemetry) can observe the tier migration without holding
-/// an internal mutator reference.
+/// Outcome of a single demote-before-drop operation.
+/// Recorded so callers (engine, telemetry) can observe the tier migration without holding an internal mutator.
 #[derive(Debug, Clone)]
 pub struct DemotionRecord {
     pub block_id: BlockId,
@@ -148,20 +142,14 @@ pub struct DemotionRecord {
 }
 
 /// Shared pool of physical blocks, pre-allocated.
-///
-/// The pool optionally carries:
-/// - a [`KvCompressor`] — any block whose allocation history would be
-///   wasted is run through the compressor before being zeroed;
-/// - a [`SharedSpillManager`] — refcount-zero blocks are demoted to
-///   Host RAM, then to NVMe, before the GPU copy is released.
+/// The pool optionally carries: - a [`KvCompressor`] - any block whose allocation history would be.
 pub struct KvBlockPool {
     blocks: Vec<KvBlock>,
     free_list: VecDeque<BlockId>,
     /// Block id → refcount; 0 means released and eligible for tiering.
     ref_counts: HashMap<BlockId, u32>,
-    /// Prefix caching: block-granular radix tree (§5.1). Keys by block
-    /// content, so partial/branching prefix sharing across requests works
-    /// instead of the old exact-whole-prefix hash map.
+    /// Prefix caching: block-granular radix tree (§5.1).
+    /// Keys by block content, so partial/branching prefix sharing across requests works instead of the old.
     prefix_tree: RadixTree,
     /// SsmStatePool containing fixed-size state tensors for Mamba/SSM architectures (§5.1)
     ssm_states: HashMap<u32, Vec<f32>>,
@@ -171,9 +159,8 @@ pub struct KvBlockPool {
     pub anchor_registry: SemanticAnchorRegistry,
     /// Layout configuration: block-major switch tied to the rocm-aiter feature flag
     block_major_layout: bool,
-    /// Block ids that recently had their refcount drop to zero — kept
-    /// here for one cycle so the next `free` knows there might be data
-    /// in the spill tier to return.
+    /// Block ids that recently had their refcount drop to zero - kept here for one
+    /// cycle so the next `free` knows there might be data in the spill tier to return.
     recently_zero: VecDeque<BlockId>,
     /// Set of block IDs whose contents have been modified on the GPU tier
     /// and have not yet been synchronized/flushed to the host device mirror.
@@ -308,11 +295,8 @@ impl KvBlockPool {
         Ok(id)
     }
 
-    /// Prefix caching (§5.1): look up how much of `tokens` can be reused
-    /// from previously computed blocks. Returns the reused physical block
-    /// ids and the number of leading tokens they cover. The caller runs
-    /// prefill only for `tokens[matched..]` and then calls
-    /// [`KvBlockPool::insert_prefix`].
+    /// Prefix caching (§5.1): look up how much of `tokens` can be reused from previously computed blocks.
+    /// Returns the reused physical block ids and the number of leading tokens they cover.
     pub fn match_prefix(&self, tokens: &[u32]) -> (Vec<BlockId>, usize) {
         self.prefix_tree.match_prefix(tokens)
     }
@@ -327,9 +311,8 @@ impl KvBlockPool {
         (matched, count, checkpoint)
     }
 
-    /// Register newly computed `blocks` for `tokens` after a prefill
-    /// completes. Shared prefix nodes are reused; diverging blocks become
-    /// new tree nodes.
+    /// Register newly computed `blocks` for `tokens` after a prefill completes.
+    /// Shared prefix nodes are reused; diverging blocks become new tree nodes.
     pub fn insert_prefix(&mut self, tokens: &[u32], blocks: &[BlockId]) {
         self.prefix_tree.insert(tokens, blocks);
         self.prefix_tree.touch(tokens);
@@ -362,9 +345,8 @@ impl KvBlockPool {
         }
     }
 
-    /// Drop one sequence's reference to `blocks`, pruning unshared tree
-    /// nodes (trie-leaf LRU walk-up). Call this when a sequence is fully
-    /// released so eviction does not reclaim a still-referenced prefix.
+    /// Drop one sequence's reference to `blocks`, pruning unshared tree nodes (trie-leaf LRU walk-up).
+    /// Call this when a sequence is fully released so eviction does not reclaim a still-referenced.
     pub fn remove_prefix(&mut self, blocks: &[BlockId]) {
         self.prefix_tree.remove(blocks);
     }
@@ -374,11 +356,8 @@ impl KvBlockPool {
         self.blocks[id].location
     }
 
-    /// Look up reusable prefix blocks for `tokens`, promoting any matched
-    /// block that was demoted to host/NVMe back to GPU before returning it
-    /// (Phase 2.2: the "cache hit but demoted" path). Returns the matched
-    /// block ids, the number of matched tokens, and whether any promotion
-    /// occurred.
+    /// Look up reusable prefix blocks for `tokens`, promoting any matched block that was demoted to host/NVMe back to GPU before returning it (Phase 2.2: the "cache hit but demoted" path).
+    /// Returns the matched block ids, the number of matched tokens, and whether any promotion occurred.
     pub fn match_prefix_promoting(&mut self, tokens: &[u32]) -> (Vec<BlockId>, usize, bool) {
         let (matched, n) = self.prefix_tree.match_prefix(tokens);
         let mut promoted = false;
@@ -392,13 +371,8 @@ impl KvBlockPool {
         (matched, n, promoted)
     }
 
-    /// Demote a cached prefix block to the spill tier under memory pressure
-    /// WITHOUT reclaiming it: the radix-tree entry is kept so a future
-    /// request can still match it and promote it back, and the block is NOT
-    /// returned to the free list (so its cached KV is never overwritten by a
-    /// new alloc). The caller (`demote_cold_prefix`) only supplies blocks
-    /// the radix tree reports as cold (tree refcount 0), so an actively
-    /// referenced block is never demoted.
+    /// Demote a cached prefix block to the spill tier under memory pressure WITHOUT reclaiming it: the radix-tree entry is kept so a future request can still match it and promote it back, and the block is NOT returned to the free list (so its cached KV is never overwritten by a new alloc).
+    /// The caller (`demote_cold_prefix`) only supplies blocks the radix tree reports as cold (tree refcount 0),.
     fn demote_prefix_block(&mut self, bid: BlockId) -> bool {
         let Some(spill) = self.spill.as_ref() else {
             return false;
@@ -415,10 +389,8 @@ impl KvBlockPool {
         true
     }
 
-    /// Pressure hook (Phase 2.1): demote the coldest unreferenced prefix
-    /// leaf to host/NVMe, keeping it cached. Returns the demoted block id,
-    /// or `None` if there is no cold prefix to demote. The engine calls this
-    /// when GPU block-pool utilization crosses a threshold.
+    /// Pressure hook (Phase 2.1): demote the coldest unreferenced prefix leaf to host/NVMe, keeping it cached.
+    /// Returns the demoted block id, or `None` if there is no cold prefix to demote.
     pub fn demote_cold_prefix(&mut self) -> Option<BlockId> {
         let bid = self.prefix_tree.coldest_leaf()?;
         if self.demote_prefix_block(bid) {
@@ -428,10 +400,8 @@ impl KvBlockPool {
         }
     }
 
-    /// Convenience single-call prefix share (§5.1): match, allocate physical
-    /// blocks for any non-matching tail, insert, and return all block ids
-    /// plus the count of tokens that were reused. Used where the caller
-    /// does not split match/prefill/insert (e.g. eager one-shot paths).
+    /// Convenience single-call prefix share (§5.1): match, allocate physical blocks for any non-matching tail, insert, and return all block ids plus the count of tokens that were reused.
+    /// Used where the caller does not split match/prefill/insert (e.g.
     pub fn find_or_share_prefix_tokens(&mut self, tokens: &[u32]) -> Result<(Vec<BlockId>, usize)> {
         let (matched, matched_tokens) = self.prefix_tree.match_prefix(tokens);
         let total_blocks = tokens.len().div_ceil(BLOCK_SIZE);
@@ -467,23 +437,14 @@ impl KvBlockPool {
         self.block_major_layout
     }
 
-    /// Free a block — refcount decrement. The pool consults the attached
-    /// spill manager before zeroing; if a tier demotion succeeds, the
-    /// block remains live in the spill tier and can be promoted back
-    /// later. Without a spill manager, the block is zeroed immediately.
+    /// Free a block - refcount decrement. The pool consults the attached spill manager before zeroing; if a
+    /// tier demotion succeeds, the block remains live in the spill tier and can be promoted back later.
     pub fn free(&mut self, id: BlockId) {
         self.free_with_tier(id, false).ok();
     }
 
-    /// Free with optional force-demote: when `force_tier` is true, the
-    /// pool actively demotes to host RAM even if the refcount is still
-    /// positive (used when the caller is shedding pressure).
-    ///
-    /// Demotion is tried compressed first (compressor + spill attached),
-    /// then raw. If BOTH demotion paths fail, the block falls back to the
-    /// in-place release (zero + free list) — a failed demotion must never
-    /// strand the block in a fake `HostRam` state with no free-list path,
-    /// because nothing else would ever reclaim the slot.
+    /// Free with optional force-demote: when `force_tier` is true, the pool actively demotes to host RAM even if the refcount is still positive (used when the caller is shedding pressure).
+    /// Demotion is tried compressed first (compressor + spill attached), then raw.
     pub fn free_with_tier(&mut self, id: BlockId, force_tier: bool) -> Result<()> {
         if !self.ref_counts.contains_key(&id) && !force_tier {
             return Ok(());
@@ -501,9 +462,8 @@ impl KvBlockPool {
         // Demote-before-drop: spill manager routes to host RAM + NVMe.
         if let Some(spill) = self.spill.as_ref() {
             let mut demoted = false;
-            // 1. Compressed path: the compressor's serialized block IS the
-            // spilled bytes — closes the compression-to-spill loop instead
-            // of recording compression as metadata only.
+            // 1. Compressed path: the compressor's serialized block IS the spilled bytes
+            // - closes the compression-to-spill loop instead of recording compression as metadata only.
             if let Some(_c) = self.compressor.as_ref() {
                 if let Ok(Some(compressed)) = self.compress_block(id) {
                     match spill.demote_compressed(id, compressed.to_bytes()) {
@@ -552,8 +512,7 @@ impl KvBlockPool {
                 // for fresh allocation. Only promote_to_gpu can reclaim it.
             } else {
                 // Both demotion paths failed: the block must stay reclaimable.
-                // Zero it in place and return it to the free list rather than
-                // stranding GPU capacity in a fake spilled state.
+                // Zero it in place and return it to the free list rather than stranding GPU.
                 self.blocks[id].num_tokens = 0;
                 self.blocks[id].received = false;
                 self.blocks[id].key_data.fill(0.0);
@@ -573,15 +532,8 @@ impl KvBlockPool {
         Ok(())
     }
 
-    /// Promote a previously demoted block back to GPU resident. Compressed
-    /// spill is decompressed back to f32 K/V first; raw spill is validated
-    /// STRICTLY: the retrieved lengths must match the block capacity
-    /// exactly, otherwise this is an `Err` — never a silent `.min()`
-    /// truncation of cache contents. On success the retrieved key/value
-    /// data is written back into the block and its `location` restored to
-    /// [`CacheTier::Gpu`]. Returns the contents if promotion succeeded
-    /// (the block was demoted), or `None` if there was nothing to promote
-    /// (block already GPU-resident or no spill manager).
+    /// Promote a previously demoted block back to GPU resident.
+    /// Compressed spill is decompressed back to f32 K/V first; raw spill is validated STRICTLY: the.
     pub fn promote_to_gpu(&mut self, id: BlockId) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
         let Some(spill) = self.spill.as_ref() else {
             return Ok(None);
@@ -590,9 +542,7 @@ impl KvBlockPool {
         let (k, v) = match spill.retrieve_compressed(id)? {
             Some(blob) => {
                 let compressor = self.compressor.as_ref().ok_or_else(|| {
-                    Error::KvCache(
-                        "compressed spill block found but no compressor attached".into(),
-                    )
+                    Error::KvCache("compressed spill block found but no compressor attached".into())
                 })?;
                 let block = CompressedKvBlock::from_bytes(&blob)?;
                 let (keys, values) =
@@ -604,9 +554,8 @@ impl KvBlockPool {
                 None => return Ok(None),
             },
         };
-        // Strict capacity validation — a mismatch is an error, not silent
-        // truncation (the pre-fix `.min()` copies silently dropped cache
-        // rows when the spill geometry disagreed with the pool).
+        // Strict capacity validation - a mismatch is an error, not silent truncation (the pre-fix
+        // `.min()` copies silently dropped cache rows when the spill geometry disagreed with the pool).
         let key_cap = self.blocks[id].key_data.len();
         let val_cap = self.blocks[id].value_data.len();
         if k.len() != key_cap || v.len() != val_cap {
@@ -666,11 +615,8 @@ impl KvBlockPool {
         Ok(count)
     }
 
-    /// Trie-leaf LRU eviction (Phase 1.6): reclaim the coldest childless
-    /// tree leaf whose physical block is not actively referenced, freeing
-    /// its contents (demote-to-host/NVMe if a spill manager is attached,
-    /// otherwise in-place zero) and returning it to the free list. Returns
-    /// `true` if a block was reclaimed.
+    /// Trie-leaf LRU eviction (Phase 1.6): reclaim the coldest childless tree leaf whose physical block is not actively referenced, freeing its contents (demote-to-host/NVMe if a spill manager is attached, otherwise in-place zero) and returning it to the free list.
+    /// Returns `true` if a block was reclaimed.
     fn evict_cold(&mut self) -> bool {
         let Some(bid) = self.prefix_tree.evict_coldest_leaf() else {
             return false;
@@ -718,9 +664,8 @@ impl KvBlockPool {
                 self.ref_counts.remove(&bid);
                 return true;
             }
-            // Demotion failed: fall through to the in-place release below so
-            // the slot is reclaimable instead of stranded in a fake spilled
-            // state with no valid backing storage.
+            // Demotion failed: fall through to the in-place release below so the slot is
+            // reclaimable instead of stranded in a fake spilled state with no valid backing storage.
         }
         self.blocks[bid].num_tokens = 0;
         self.blocks[bid].received = false;
@@ -731,11 +676,8 @@ impl KvBlockPool {
         true
     }
 
-    /// Compress the latest snapshot of `id` via the attached
-    /// compressor and expose the [`CompressedKvBlock`]. `None` if no
-    /// compressor is attached or the block holds no tokens — the snapshot
-    /// is taken at the block's ACTUAL `num_tokens` rows, never padded to
-    /// [`BLOCK_SIZE`], so compression does no work on padding.
+    /// Compress the latest snapshot of `id` via the attached compressor and expose the [`CompressedKvBlock`].
+    /// `None` if no compressor is attached or the block holds no tokens - the snapshot.
     pub fn compress_block(&self, id: BlockId) -> Result<Option<CompressedKvBlock>> {
         let c = match self.compressor.as_ref() {
             Some(c) => c,
@@ -756,10 +698,8 @@ impl KvBlockPool {
             self.blocks[id].key_data[..rows * elem].to_vec(),
             shape.clone(),
         );
-        let v_tensor = grim_backend_cpu::cpu_tensor(
-            self.blocks[id].value_data[..rows * elem].to_vec(),
-            shape,
-        );
+        let v_tensor =
+            grim_backend_cpu::cpu_tensor(self.blocks[id].value_data[..rows * elem].to_vec(), shape);
         (k_tensor, v_tensor)
     }
 
@@ -922,18 +862,14 @@ impl KvBlockPool {
         &self.blocks[id].value_data
     }
 
-    /// Whether block `id` has received real KV data (via `write_keys`
-    /// / `store_kv` / network ingestion). Replaces the fragile
-    /// non-zero-content sniff: a genuinely all-zero KV block is valid
-    /// data, not "not yet arrived."
+    /// Whether block `id` has received real KV data (via `write_keys` / `store_kv` / network ingestion).
+    /// Replaces the fragile non-zero-content sniff: a genuinely all-zero KV block is valid data, not "not.
     pub fn block_is_received(&self, id: BlockId) -> bool {
         id < self.blocks.len() && self.blocks[id].received
     }
 
-    /// Valid token count stored for block `id` (0 for out-of-range or
-    /// never-written blocks). This is the value handoffs must preserve:
-    /// deriving the count from the buffer length reports every block as
-    /// full because buffers are zero-padded to block capacity.
+    /// Valid token count stored for block `id` (0 for out-of-range or never-written blocks).
+    /// This is the value handoffs must preserve: deriving the count from the buffer length reports.
     pub fn block_num_tokens(&self, id: BlockId) -> Option<usize> {
         self.blocks
             .get(id)
@@ -941,15 +877,8 @@ impl KvBlockPool {
             .map(|b| b.num_tokens)
     }
 
-    /// Explicitly set whether block `id` holds complete KV data; clearing
-    /// the flag also resets `num_tokens` so the block reads as empty.
-    ///
-    /// NOTE (F8/F10 audit): an earlier comment described a disagg pull path
-    /// that clears this flag on partial multi-layer fetch failure "so a
-    /// partial transfer is retried next tick." No such retry/tick machinery
-    /// exists — `DisaggRouter::fetch_kv_block` is a single blocking
-    /// whole-block call. The flag is available for a future per-layer
-    /// retry design, but nothing implements it today; do not rely on it.
+    /// Explicitly set whether block `id` holds complete KV data; clearing the flag also resets `num_tokens` so the block reads as empty.
+    /// NOTE (F8/F10 audit): an earlier comment described a disagg pull path that clears this flag.
     pub fn set_received(&mut self, id: BlockId, received: bool) {
         if let Some(b) = self.blocks.get_mut(id) {
             if !received {
@@ -963,17 +892,14 @@ impl KvBlockPool {
         self.blocks.len()
     }
 
-    /// Volume of pending demotion work — anything in `recently_zero`
-    /// that hasn't yet been pushed to the spill manager by a free call.
-    /// Mostly a telemetry hook: zero typically means the pool is caught
-    /// up.
+    /// Volume of pending demotion work - anything in `recently_zero` that hasn't yet been pushed to the spill manager by a free call.
+    /// Mostly a telemetry hook: zero typically means the pool is caught up.
     pub fn pending_demote_count(&self) -> usize {
         self.recently_zero.len()
     }
 
-    /// Collect the contents of `recently_zero` into a Vec for callers
-    /// that want to drain the queue (e.g. a background tier-promotion
-    /// thread). Does not remove the entries — call `clear_demote_queue`.
+    /// Collect the contents of `recently_zero` into a Vec for callers that want to drain the queue (e.g.
+    /// a background tier-promotion thread).
     pub fn drain_demote_queue(&self) -> Vec<BlockId> {
         self.recently_zero.iter().copied().collect()
     }
@@ -1044,18 +970,8 @@ impl BlockTable {
         self.logical_to_physical.push(block_id);
     }
 
-    /// Truncate the logical table to `len` blocks, returning every freed
-    /// physical id to `pool`.
-    ///
-    /// `len` is a *block count* (this wraps `Vec<BlockId>::truncate`), not a
-    /// token count — there is no unit conversion here, which is deliberate to
-    /// avoid the block-vs-token arithmetic that bit the speculative
-    /// `commit`/`rollback_to` family.
-    ///
-    /// The free loop mirrors `PagedKvCache::rollback_to` exactly: pop from the
-    /// back of `logical_to_physical`, call `pool.free_with_tier(pid, false)`
-    /// per entry. Keeping both release paths structurally identical is worth
-    /// more than either being marginally more efficient in isolation.
+    /// Truncate the logical table to `len` blocks, returning every freed physical id to `pool`.
+    /// `len` is a *block count* (this wraps `Vec<BlockId>::truncate`), not a token count - there is.
     pub fn truncate(&mut self, len: usize, pool: &mut KvBlockPool) {
         if len >= self.logical_to_physical.len() {
             return;
@@ -1094,24 +1010,20 @@ pub struct PagedKvCache {
     /// Per-layer token count so page offsets stay per-layer even though the
     /// block-table / `committed_tokens` counter is shared across layers.
     layer_committed_tokens: Vec<usize>,
-    /// Owning device for this session. When ROCm, paged_kv_handles copies
-    /// page slices to GPU once and returns RocmStorage tensors so the ROCm
-    /// qkv_attention_paged kernel (which demands as_rocm inputs) doesn't
-    /// panic on CPU-resident pages.
+    /// Owning device for this session. When ROCm, paged_kv_handles copies page slices to GPU once and returns
+    /// RocmStorage tensors so the ROCm qkv_attention_paged kernel (which demands as_rocm inputs) doesn't panic on CPU-resident pages.
     device: Option<Device>,
     /// Backend device handle used for `from_cpu` when staging pages to GPU.
     backend: Option<Arc<dyn grim_tensor::BackendDevice>>,
-    /// Per-layer full K/V GPU tensors (flat):
-    /// `[capacity * page_size * num_kv_heads * head_dim]`, cached once per layer
-    /// when first requested on a ROCm session.
+    /// Per-layer full K/V GPU tensors (flat): `[capacity * page_size * num_kv_heads *
+    /// head_dim]`, cached once per layer when first requested on a ROCm session.
     gpu_paged_k: Vec<Option<Arc<dyn grim_tensor::BackendStorage>>>,
     gpu_paged_v: Vec<Option<Arc<dyn grim_tensor::BackendStorage>>>,
     /// F10: dirty-block device KV mirror state (interior-mutable; the KvCache
     /// trait hands out `&self`).
     mirror_state: std::sync::Mutex<DeviceKvMirror>,
-    /// WI-kv: cached device-resident block table (`BlockTableEntry` ABI),
-    /// keyed on (len, first id, last id). Skips the per-layer-per-token H2D
-    /// upload of the table in the paged-attention decode path.
+    /// WI-kv: cached device-resident block table (`BlockTableEntry` ABI), keyed on (len, first id, last id).
+    /// Skips the per-layer-per-token H2D upload of the table in the paged-attention decode path.
     gpu_block_table: std::sync::Mutex<Option<GpuBlockTableCache>>,
 }
 
@@ -1121,10 +1033,8 @@ struct GpuBlockTableCache {
     storage: Arc<dyn grim_tensor::BackendStorage>,
 }
 
-/// F10: per-block device-resident K/V mirror. Appended KV history is
-/// immutable, so each (layer, physical block) uploads to the device exactly
-/// once — dirty re-staging only ever touches the ACTIVE tail block, instead
-/// of re-pushing the full layer on every append.
+/// F10: per-block device-resident K/V mirror.
+/// Appended KV history is immutable, so each (layer, physical block) uploads to the device exactly.
 pub type DeviceKvMirrorBlocks = HashMap<
     (usize, usize),
     (
@@ -1143,10 +1053,8 @@ pub struct DeviceKvMirror {
     pub total_uploads: u64,
     /// Distinct blocks ever uploaded.
     pub uploaded_elems: u64,
-    /// F10: persistent full-layer K/V device buffers. Keyed by layer, shared
-    /// into every returned Tensor — new K/V land via device-side region writes
-    /// of just the dirty tail block instead of whole-layer host re-uploads
-    /// (16 MB · 24 layers · every token → KB-scale).
+    /// F10: persistent full-layer K/V device buffers.
+    /// Keyed by layer, shared into every returned Tensor - new K/V land via device-side region.
     pub k_full: HashMap<usize, Arc<dyn grim_tensor::BackendStorage>>,
     pub v_full: HashMap<usize, Arc<dyn grim_tensor::BackendStorage>>,
 }
@@ -1238,11 +1146,8 @@ impl PagedKvCache {
         self.k_pages.len()
     }
 
-    /// Valid token count stored in physical block `block_id` of the logical
-    /// block table: every block is a full page except the tail, which
-    /// carries the `committed_tokens` remainder. `None` when the id is
-    /// outside the table. Handoffs use this so a partially-filled tail
-    /// block does not arrive marked as fully valid.
+    /// Valid token count stored in physical block `block_id` of the logical block table: every block is a full page except the tail, which carries the `committed_tokens` remainder.
+    /// `None` when the id is outside the table.
     pub fn block_num_tokens(&self, block_id: usize) -> Option<usize> {
         let num_blocks = self.table.len();
         if block_id >= num_blocks {
@@ -1404,18 +1309,11 @@ impl KvCache for PagedKvCache {
     fn append_kv_layer(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
         let k_flat = k.to_vec_f32()?;
         let v_flat = v.to_vec_f32()?;
-        // Derive the per-token stride from the tensor's real shape rather than
-        // trusting the cache's configured head counts: the engine builds its
-        // `PagedKvCache` from `EngineConfig` defaults that may not match the
-        // registered model (e.g. small_llama uses kvh=1, hd=16 while the
-        // default config is kvh=4, hd=128). The paged kernel indexes the page
-        // tensor by flat `(block_id * page_size + offset) * kv_stride` offset,
-        // so only the stride matters — the declared tensor shape is cosmetic.
+        // Derive the per-token stride from the tensor's real shape rather than trusting the cache's configured head counts: the engine builds its `PagedKvCache` from `EngineConfig` defaults that may not match the registered model (e.g.
+        // small_llama uses kvh=1, hd=16 while the default config is kvh=4, hd=128).
         let k_dims = k.shape().dims();
-        // 3-D `[batch, seq, kvh*head_dim]` (post-RoPE K from the block, or
-        // prefill batch) vs 2-D `[seq, kvh*head_dim]` (single-token decode).
-        // The batch dim is always 1 here; `seq` is dim 1 for 3-D and dim 0
-        // for 2-D.
+        // 3-D `[batch, seq, kvh*head_dim]` (post-RoPE K from the block, or prefill batch) vs 2-D `[seq, kvh*head_dim]` (single-token decode).
+        // The batch dim is always 1 here; `seq` is dim 1 for 3-D and dim.
         let (seq, stride) = if k_dims.len() == 3 {
             (k_dims[1], k_dims[2])
         } else if k_dims.len() == 2 {
@@ -1437,9 +1335,8 @@ impl KvCache for PagedKvCache {
             }
         }
         for t in 0..seq {
-            // Only layer 0 drives block-table growth (all layers see the
-            // same token sequence, so `append_slot` must fire once per token,
-            // not once per layer per token).
+            // Only layer 0 drives block-table growth (all layers see the same token sequence,
+            // so `append_slot` must fire once per token, not once per layer per token).
             if layer == 0 {
                 self.append_slot()?;
             }
@@ -1459,14 +1356,8 @@ impl KvCache for PagedKvCache {
                 pool.write_layer_values(physical, layer, &v_flat[tok_start..tok_start + stride]);
             }
 
-            // WI-perf (decode fast path): when the persistent full-layer device
-            // buffer already exists and this append is a single token (decode),
-            // push the K/V row device-to-device straight into it. The device
-            // copy stays current without the host→device dirty-region upload in
-            // `paged_kv_handles`, so steady-state decode issues zero H2D traffic.
-            // Prefill (seq > 1) keeps the host-page + dirty-marking path: the
-            // first `paged_kv_handles` call materializes `k_full`/`v_full` and
-            // back-fills only the touched blocks.
+            // WI-perf (decode fast path): when the persistent full-layer device buffer already exists and this append is a single token (decode), push the K/V row device-to-device straight into it.
+            // The device copy stays current without the host→device dirty-region upload in `paged_kv_handles`, so steady-state decode.
             let mut device_appended = false;
             if seq == 1 {
                 let m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1475,28 +1366,16 @@ impl KvCache for PagedKvCache {
                     drop(m);
                     if let Some(dev) = self.backend.as_ref() {
                         let ok_k = dev
-                            .copy_slice_into(
-                                &*k_arc,
-                                k.storage().as_ref(),
-                                offset,
-                                stride,
-                            )
+                            .copy_slice_into(&*k_arc, k.storage().as_ref(), offset, stride)
                             .is_ok();
                         let ok_v = dev
-                            .copy_slice_into(
-                                &*v_arc,
-                                v.storage().as_ref(),
-                                offset,
-                                stride,
-                            )
+                            .copy_slice_into(&*v_arc, v.storage().as_ref(), offset, stride)
                             .is_ok();
                         device_appended = ok_k && ok_v;
                         if device_appended {
-                            // Count the D2D tail refresh as a block upload for
-                            // the ITL gate stats (same semantics as the H2D
-                            // dirty-region refresh it replaces).
-                            let mut m =
-                                self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+                            // Count the D2D tail refresh as a block upload for the
+                            // ITL gate stats (same semantics as the H2D dirty-region refresh it replaces).
+                            let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
                             m.total_uploads += 1;
                             m.uploaded_elems += (stride * 2) as u64;
                         }
@@ -1504,11 +1383,8 @@ impl KvCache for PagedKvCache {
                 }
             }
             if !device_appended {
-                // F10: mark the touched (layer, block) dirty. Per-block device
-                // upload happens lazily in paged_kv_handles — once per block
-                // lifetime for sealed history, only the active tail block while
-                // it receives tokens. The old eager path re-uploaded the FULL
-                // layer on every single token.
+                // F10: mark the touched (layer, block) dirty.
+                // Per-block device upload happens lazily in paged_kv_handles - once per block lifetime for sealed history,.
                 let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
                 m.dirty.insert((layer, physical));
             }
@@ -1533,7 +1409,10 @@ impl KvCache for PagedKvCache {
             bt.first().copied().unwrap_or(0),
             *bt.last().unwrap(),
         );
-        let mut g = self.gpu_block_table.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self
+            .gpu_block_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = g.as_ref() {
             if cached.fingerprint == fingerprint {
                 return Some(cached.storage.clone());
@@ -1546,12 +1425,9 @@ impl KvCache for PagedKvCache {
             .flat_map(|&b| [f32::from_bits(b), f32::from_bits(self.page_size as u32)])
             .collect();
         let dev = self.backend.as_ref()?;
-        let storage = dev.from_cpu(
-            &pairs,
-            &Shape::new(vec![pairs.len()]),
-            DType::F32,
-        )
-        .ok()?;
+        let storage = dev
+            .from_cpu(&pairs, &Shape::new(vec![pairs.len()]), DType::F32)
+            .ok()?;
         let arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(storage);
         *g = Some(GpuBlockTableCache {
             fingerprint,
@@ -1612,11 +1488,8 @@ impl KvCache for PagedKvCache {
                 .map(|&(_, b)| b)
                 .collect();
 
-            // F10: persistent full-layer device buffers. First call uploads the
-            // whole layer once; later calls push ONLY dirty tail blocks into the
-            // same buffer via host→device slice uploads. The old path re-uploaded
-            // the full [capacity·page_size, stride] layer (16 MB for 2×128 head
-            // config) on every call — that was the per-token H2D flood.
+            // F10: persistent full-layer device buffers.
+            // First call uploads the whole layer once; later calls push ONLY dirty tail blocks into.
             let k_arc = match m.k_full.get(&layer) {
                 Some(a) => a.clone(),
                 None => {
@@ -1652,8 +1525,7 @@ impl KvCache for PagedKvCache {
                 ) {
                     let _ = dev.copy_slice_into(&*k_arc, ks.as_ref(), off, block_elems);
                     let _ = dev.copy_slice_into(&*v_arc, vs.as_ref(), off, block_elems);
-                    m.blocks
-                        .insert((layer, b), (Arc::from(ks), Arc::from(vs)));
+                    m.blocks.insert((layer, b), (Arc::from(ks), Arc::from(vs)));
                     m.total_uploads += 1;
                     m.uploaded_elems += (block_elems * 2) as u64;
                 }
@@ -1752,8 +1624,7 @@ impl KvCache for PagedKvCache {
 }
 
 /// Subtype alias for [`TransportBlockId`] so callers can use the
-/// canonical [`BlockId`] type from this crate without importing
-/// kvtransport directly.
+/// canonical [`BlockId`] type from this crate without importing kvtransport directly.
 pub type KvTransportId = TransportBlockId;
 
 #[cfg(test)]
@@ -1891,9 +1762,8 @@ mod tests {
 
     #[test]
     fn prefix_demoted_under_pressure_is_promoted_on_match() {
-        // Phase 2: a cached prefix demoted to host/NVMe under pressure must
-        // be promoted back (and its KV recovered, not recomputed) when a
-        // later request hits that prefix.
+        // Phase 2: a cached prefix demoted to host/NVMe under pressure must be promoted
+        // back (and its KV recovered, not recomputed) when a later request hits that prefix.
         let dir = tempdir().unwrap();
         let block_elems = BLOCK_SIZE * 2 * 4;
         let spill =
@@ -1927,15 +1797,8 @@ mod tests {
 
     #[test]
     fn block_table_truncate_returns_freed_ids_to_the_pool() {
-        // P1-2 partial: BlockTable::truncate must return the freed physical
-        // ids to the pool's free list, not merely forget them. The pre-fix
-        // body was `self.logical_to_physical.truncate(len)` (zero pool
-        // contact), so this test pins the fix and would re-leak on revert.
-        //
-        // Start with a 4-capacity pool (free_list length == 4), alloc three
-        // blocks into a table (free_list drops to 1), then truncate to 0 and
-        // require the free list to refill to 4 — the exact invariant the bare
-        // Vec::truncate version would fail.
+        // P1-2 partial: BlockTable::truncate must return the freed physical ids to the pool's free list, not merely forget them.
+        // The pre-fix body was `self.logical_to_physical.truncate(len)` (zero pool contact), so this test pins the fix and.
         let mut pool = KvBlockPool::new(4, 2, 4);
         assert_eq!(pool.free_list.len(), 4, "fresh pool has 4 free blocks");
 
@@ -1964,9 +1827,8 @@ mod tests {
 
     #[test]
     fn block_table_truncate_partial_keeps_prefix_and_frees_tail() {
-        // Partial truncate keeps the first `len` entries and returns only
-        // the tail ids to the pool. With 4 free, alloc 3 (leaves 1 free),
-        // truncate to 1: exactly 2 ids must come back, leaving 3 free.
+        // Partial truncate keeps the first `len` entries and returns only the tail ids to the pool.
+        // With 4 free, alloc 3 (leaves 1 free), truncate to 1: exactly 2 ids must.
         let mut pool = KvBlockPool::new(4, 2, 4);
         let mut table = BlockTable::new();
         let mut pushed = Vec::new();
@@ -2064,18 +1926,14 @@ mod tests {
         assert_eq!(cache.table.len(), 1);
     }
 
-    /// Audit remediation: a failed demotion must NOT strand the block in a
-    /// fake HostRam state — the block must fall back to the in-place release
-    /// (zero + free list) so the slot stays reclaimable. The mismatched
-    /// spill manager (wrong block_elems) makes every demote_to_host fail.
+    /// Audit remediation: a failed demotion must NOT strand the block in a fake HostRam state - the block must fall back to the in-place release (zero + free list) so the slot stays reclaimable.
+    /// The mismatched spill manager (wrong block_elems) makes every demote_to_host fail.
     #[test]
     fn failed_demotion_falls_back_to_in_place_release() {
         let dir = tempdir().unwrap();
         // Spill expects 256-elem blocks; the pool's blocks are
         // BLOCK_SIZE * 2 * 4 = 128 elems → every raw demotion errors.
-        let spill = Arc::new(
-            SharedSpillManager::new(dir.path().to_path_buf(), 256).unwrap(),
-        );
+        let spill = Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), 256).unwrap());
         let mut pool = KvBlockPool::new(2, 2, 4);
         pool.attach_spill(spill.clone());
         let id = pool.alloc().unwrap();
@@ -2084,7 +1942,11 @@ mod tests {
         pool.free(id);
         // Block must be back on the free list at Gpu tier, NOT stranded as
         // a HostRam block with no backing storage.
-        assert_eq!(pool.free_list.len(), 2, "failed demotion must return the slot");
+        assert_eq!(
+            pool.free_list.len(),
+            2,
+            "failed demotion must return the slot"
+        );
         assert_eq!(pool.block_location(id), CacheTier::Gpu);
         assert!(!pool.block_is_received(id));
     }
@@ -2094,9 +1956,8 @@ mod tests {
     #[test]
     fn promote_geometry_mismatch_is_an_error() {
         let dir = tempdir().unwrap();
-        // Spill managed with the WRONG geometry (double the pool's elems):
-        // demote a full-size raw block through the manager directly, then
-        // promote through the pool.
+        // Spill managed with the WRONG geometry (double the pool's elems): demote a
+        // full-size raw block through the manager directly, then promote through the pool.
         let spill = Arc::new(
             SharedSpillManager::new(dir.path().to_path_buf(), BLOCK_SIZE * 2 * 8).unwrap(),
         );
@@ -2104,7 +1965,11 @@ mod tests {
         pool.attach_spill(spill.clone());
         let id = pool.alloc().unwrap();
         spill
-            .demote_to_host(id, vec![1.0; BLOCK_SIZE * 2 * 8], vec![2.0; BLOCK_SIZE * 2 * 8])
+            .demote_to_host(
+                id,
+                vec![1.0; BLOCK_SIZE * 2 * 8],
+                vec![2.0; BLOCK_SIZE * 2 * 8],
+            )
             .unwrap();
         let err = pool.promote_to_gpu(id).unwrap_err();
         assert!(
@@ -2125,20 +1990,21 @@ mod tests {
         pool.attach_compressor(compressor);
         let id = pool.alloc().unwrap();
         // Only 5 of 16 slots written.
-        pool.write_keys(id, &vec![0.5f32; 5 * 2 * 4], 5);
-        pool.write_values(id, &vec![0.25f32; 5 * 2 * 4]);
+        pool.write_keys(id, &[0.5f32; 5 * 2 * 4], 5);
+        pool.write_values(id, &[0.25f32; 5 * 2 * 4]);
         let compressed = pool.compress_block(id).unwrap().unwrap();
-        assert_eq!(compressed.num_tokens, 5, "snapshot must carry real tokens, not padding");
+        assert_eq!(
+            compressed.num_tokens, 5,
+            "snapshot must carry real tokens, not padding"
+        );
         // Empty block compresses to None instead of quantizing zeros.
         let id2 = pool.alloc().unwrap();
         pool.write_keys(id2, &[], 0);
         assert!(pool.compress_block(id2).unwrap().is_none());
     }
 
-    /// Audit remediation: the compression-to-spill loop must be CLOSED —
-    /// freeing a block with compressor + spill attached stores the
-    /// COMPRESSED bytes in the spill tier, and promote decompresses back to
-    /// f32 K/V at the exact original geometry.
+    /// Audit remediation: the compression-to-spill loop must be CLOSED - freeing a block with compressor + spill attached stores
+    /// the COMPRESSED bytes in the spill tier, and promote decompresses back to f32 K/V at the exact original geometry.
     #[test]
     fn compressor_spill_loop_is_closed_end_to_end() {
         let dir = tempdir().unwrap();
@@ -2147,9 +2013,8 @@ mod tests {
             Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
         let mut pool = KvBlockPool::new(4, 2, 4);
         pool.attach_spill(spill.clone());
-        // Constant data compresses/decompresses EXACTLY under both quantizers
-        // (scale of a constant is the constant itself), so the round trip is
-        // bit-tight and any scale/geometry bug fails the equality below.
+        // Constant data compresses/decompresses EXACTLY under both quantizers (scale of a constant is the constant
+        // itself), so the round trip is bit-tight and any scale/geometry bug fails the equality below.
         let k = vec![0.5f32; block_elems];
         let v = vec![-0.25f32; block_elems];
         pool.attach_compressor(Arc::new(LloydMaxCompressor::new(KvQuantConfig {
@@ -2165,19 +2030,17 @@ mod tests {
         // Free → the spilled bytes are the COMPRESSED blob (not raw f32).
         pool.free(id);
         assert!(spill.get_tier(id).is_some());
-        let blob = spill.retrieve_compressed(id).unwrap().expect(
-            "spill must hold the compressed blob when a compressor is attached",
-        );
+        let blob = spill
+            .retrieve_compressed(id)
+            .unwrap()
+            .expect("spill must hold the compressed blob when a compressor is attached");
         let block = CompressedKvBlock::from_bytes(&blob).unwrap();
         assert_eq!(block.num_tokens, BLOCK_SIZE);
         // The raw f32 tier must NOT hold this block anymore.
         assert_eq!(spill.retrieve(id).unwrap(), None);
 
         // Promote → decompress back to f32 at the exact original geometry.
-        // The dequantized result must be BIT-IDENTICAL to the compressor's
-        // own reference dequantization of the same snapshot (the pipeline is
-        // deterministic: same seed → same rotation matrix), isolating pool
-        // wiring from the quantizer's inherent lossiness.
+        // The dequantized result must be BIT-IDENTICAL to the compressor's own reference dequantization of the same.
         let compressor = LloydMaxCompressor::new(KvQuantConfig {
             key_bits: 3,
             value_bits: 4,
@@ -2187,7 +2050,10 @@ mod tests {
         let (k_ref, v_ref) = compressor
             .dequantize_for_attention(&block, &CpuDevice::new(), Device::Cpu)
             .unwrap();
-        let promoted = pool.promote_to_gpu(id).unwrap().expect("compressed promote");
+        let promoted = pool
+            .promote_to_gpu(id)
+            .unwrap()
+            .expect("compressed promote");
         assert_eq!(
             promoted.0,
             k_ref.to_vec_f32().unwrap(),
@@ -2213,11 +2079,12 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_k_err < 0.5, "key lossiness bounded, got {max_k_err}");
-        assert!(max_v_err < 1e-4, "constant values must be exact, got {max_v_err}");
-        // The block now holds the DECOMPRESSED-COMPRESSED data: identical to
-        // the reference dequantization, lossy vs the original by exactly the
-        // quantizer's granularity (keys rotated + 3-bit; constant values
-        // exact under asymmetric min/max quantization).
+        assert!(
+            max_v_err < 1e-4,
+            "constant values must be exact, got {max_v_err}"
+        );
+        // The block now holds the DECOMPRESSED-COMPRESSED data: identical to the reference dequantization, lossy vs the original
+        // by exactly the quantizer's granularity (keys rotated + 3-bit; constant values exact under asymmetric min/max quantization).
         assert_eq!(pool.read_keys(id), promoted.0.as_slice());
         assert_eq!(pool.read_values(id), promoted.1.as_slice());
         assert_eq!(pool.block_location(id), CacheTier::Gpu);
@@ -2270,11 +2137,8 @@ mod f10_mirror_tests {
     use super::*;
     use grim_backend_cpu::CpuDevice;
 
-    /// F10 ITL gate (deterministic proxy): with the dirty-block mirror, a
-    /// decode/prefill sequence uploads each physical block exactly once plus
-    /// refreshes limited to the ACTIVE tail block — never sealed history, and
-    /// never the full layer per token. The hardware ITL measurement itself
-    /// requires the gfx1036 runner (see plan.md F10c).
+    /// F10 ITL gate (deterministic proxy): with the dirty-block mirror, a decode/prefill sequence uploads each physical block exactly once plus refreshes limited to the ACTIVE tail block - never sealed history, and never the full layer per token.
+    /// The hardware ITL measurement itself requires the gfx1036 runner (see plan.md F10c).
     #[test]
     fn itl_gate_dirty_block_mirror_uploads_each_block_once() {
         let pool = Arc::new(std::sync::Mutex::new(KvBlockPool::new(4, 2, 4)));
@@ -2316,9 +2180,8 @@ mod f10_mirror_tests {
         assert_eq!(up, 6, "2 initial + 4 tail refreshes");
         assert_eq!(dirty, 0, "no dirty blocks survive a staging call");
 
-        // ITL gate: naive per-append FULL-LAYER staging would have uploaded
-        // 25 appends × capacity(4 blocks × 16 tokens) rows; the mirror moved
-        // 6 block uploads total — a ≥10× traffic reduction at this shape.
+        // ITL gate: naive per-append FULL-LAYER staging would have uploaded 25 appends × capacity(4 blocks × 16
+        // tokens) rows; the mirror moved 6 block uploads total - a ≥10× traffic reduction at this shape.
         let naive_uploads = 25u64 * 4;
         assert!(
             up * 4 < naive_uploads,

@@ -12,16 +12,7 @@ use crate::kernels::tile_picker::{ShapeDims, pick_tiles};
 use crate::rccl::RcclAllReduce;
 
 /// Launch a kernel across N GPUs with shard split on the M dimension.
-///
-/// Each device `i` computes shard `[i * M/N, (i+1) * M/N)` of the output into
-/// its own output pointer (per-rank shard). After all device kernels complete,
-/// an optional RCCL all-reduce combines the shards using each rank's own
-/// communicator. `out_ptrs` must contain one device pointer per rank, each
-/// pointing to the rank's shard of the output buffer (shard_m * full_dims.n
-/// elements at offset `rank * shard_m * full_dims.n`).
-///
-/// [P0-18/P0-19 fix: previously used shared output pointer + wrong count +
-/// rank-0 communicator only.]
+/// Each device `i` computes shard `[i * M/N, (i+1) * M/N)` of the output into.
 pub fn launch_multi_gpu_kernel(
     devices: &[&RocmDevice],
     comm: Option<&RcclAllReduce>,

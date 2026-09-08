@@ -1,24 +1,21 @@
 //! `AttentionOps` implementation for VulkanDevice.
-//!
-//! Extracted from lib.rs (modularization): trait impls live in `device/`,
-//! dispatch plumbing in `kernel.rs`, buffers in `storage.rs`, device init
-//! in `context.rs`.
+//! Extracted from lib.rs (modularization): trait impls live in `device/`, dispatch plumbing in `kernel.rs`, buffers in.
 
 use std::ffi::c_void;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::DType;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ArithType, BackendStorage, Shape, CoreTensorOps, AttentionOps};
+use grim_tensor::{ArithType, AttentionOps, BackendStorage, CoreTensorOps, Shape};
 
 use crate::context::global_context;
 use crate::ffi::*;
-use crate::kernel::{push_params, run_compute_shader, run_compute_shader_kernel, spirv_for, VulkanKernel};
+use crate::kernel::{
+    VulkanKernel, push_params, run_compute_shader, run_compute_shader_kernel, spirv_for,
+};
 use crate::{VulkanDevice, VulkanHandle, VulkanStorage};
 
 impl AttentionOps for VulkanDevice {
-
-
     fn sage_attention(
         &self,
         q: &dyn BackendStorage,
@@ -81,7 +78,6 @@ impl AttentionOps for VulkanDevice {
         ))
     }
 
-
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -95,10 +91,8 @@ impl AttentionOps for VulkanDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // `window == Some(w)` dispatches the dedicated `QkvAttentionSwa` kernel
-        // (host-computed `window_lo` lower bound); `None` runs the plain
-        // full-causal `QkvAttention` kernel. Both produce correct on-device
-        // output; no host fallback.
+        // `window == Some(w)` dispatches the dedicated `QkvAttentionSwa` kernel (host-computed `window_lo` lower bound); `None` runs the plain full-causal `QkvAttention` kernel.
+        // Both produce correct on-device output; no host fallback.
         self.qkv_attention_inner(
             q,
             k,
@@ -112,7 +106,6 @@ impl AttentionOps for VulkanDevice {
             window,
         )
     }
-
 
     fn qkv_attention_paged(
         &self,
@@ -227,7 +220,6 @@ impl AttentionOps for VulkanDevice {
         ))
     }
 
-
     fn tree_attention(
         &self,
         q: &dyn BackendStorage,
@@ -313,7 +305,6 @@ impl AttentionOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn kv_dequant_attention(
         &self,
@@ -409,7 +400,6 @@ impl AttentionOps for VulkanDevice {
         ))
     }
 
-
     fn rope(
         &self,
         x: &dyn BackendStorage,
@@ -471,9 +461,7 @@ impl AttentionOps for VulkanDevice {
 
         if !cfg.is_plain() {
             // Partial-rotary / YaRN: dispatch the dedicated `RopeYarn` kernel.
-            // The YaRN frequency ramp + mscale are recomputed inside the shader
-            // from the push-constant scalars (no inv_freq buffer needed),
-            // numerically matching the CPU/HIP references.
+            // The YaRN frequency ramp + mscale are recomputed inside the shader from the push-constant scalars.
             let rotary_dim = cfg.rotary_dim.min(dim);
             let rotary_half = rotary_dim / 2;
             let (has_yarn, yarn_factor, yarn_orig_max, yarn_beta_fast, yarn_beta_slow, mscale) =
@@ -488,10 +476,8 @@ impl AttentionOps for VulkanDevice {
                     ),
                     None => (0u32, 1.0f32, 8192.0f32, 32.0f32, 1.0f32, 1.0f32),
                 };
-            // Params block (11 × u32 = 44 bytes):
-            //   num_tokens, head_dim, num_heads, rotary_dim, has_yarn,
-            //   base(f32 bits), yarn_factor, yarn_orig_max, yarn_beta_fast,
-            //   yarn_beta_slow, mscale
+            // Params block (11 × u32 = 44 bytes): num_tokens, head_dim,
+            // num_heads, rotary_dim, has_yarn, base(f32 bits), yarn_factor, yarn_orig_max, yarn_beta_fast, yarn_beta_slow, mscale
             let push: [u32; 11] = [
                 num_tokens as u32,
                 dim as u32,
@@ -544,7 +530,6 @@ impl AttentionOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn rerope(
         &self,
@@ -675,7 +660,6 @@ impl AttentionOps for VulkanDevice {
         ))
     }
 
-
     fn flash_attention(
         &self,
         q: &dyn BackendStorage,
@@ -727,7 +711,6 @@ impl AttentionOps for VulkanDevice {
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
-
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -757,10 +740,8 @@ impl AttentionOps for VulkanDevice {
         )?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
-    // Tier B complex — MLA kernels (audit gap: DeepSeek-family attention hit
-    // Err(Unimplemented) on Vulkan). CPU-reference fallbacks that mirror the
-    // documented kernel contract exactly: elementwise norm + split. A device
-    // kernel (`grim_mla_*`) is the documented upgrade for decode-path latency.
+    // Tier B complex - MLA kernels (audit gap: DeepSeek-family attention hit Err(Unimplemented) on Vulkan).
+    // CPU-reference fallbacks that mirror the documented kernel contract exactly: elementwise norm + split.
 
     /// MLA Q/KV norm + split.
     fn mla_q_kv_norm_split(
@@ -812,6 +793,7 @@ impl AttentionOps for VulkanDevice {
     }
 
     /// Matrix-absorbed MLA decode (CPU reference).
+    #[allow(clippy::needless_range_loop)]
     fn mla_absorbed_decode(
         &self,
         q_absorbed: &dyn BackendStorage,
@@ -835,7 +817,9 @@ impl AttentionOps for VulkanDevice {
         let scale = (1.0 / ((latent + qk_rope_dim) as f32).sqrt()).max(1e-5);
         let mut out_buf = out.to_cpu_vec_f32()?;
         let out_dims = out.shape().dims().to_vec();
-        for o in out_buf.iter_mut() { *o = 0.0; }
+        for o in out_buf.iter_mut() {
+            *o = 0.0;
+        }
         if qa.len() < num_heads * latent || qr.len() < num_heads * qk_rope_dim {
             return Err(Error::Shape("mla_absorbed_decode: q size mismatch".into()));
         }
@@ -846,12 +830,20 @@ impl AttentionOps for VulkanDevice {
             let mut max_score = f32::NEG_INFINITY;
             for t in 0..seq_len {
                 let kv_off = t * (latent + qk_rope_dim);
-                if kv_off + latent + qk_rope_dim > kv.len() { break; }
+                if kv_off + latent + qk_rope_dim > kv.len() {
+                    break;
+                }
                 let mut dot = 0.0f32;
-                for i in 0..latent { dot += qa[qa_off + i] * kv[kv_off + i]; }
-                for i in 0..qk_rope_dim { dot += qr[qr_off + i] * kv[kv_off + latent + i]; }
+                for i in 0..latent {
+                    dot += qa[qa_off + i] * kv[kv_off + i];
+                }
+                for i in 0..qk_rope_dim {
+                    dot += qr[qr_off + i] * kv[kv_off + latent + i];
+                }
                 scores[t] = dot * scale;
-                if scores[t] > max_score { max_score = scores[t]; }
+                if scores[t] > max_score {
+                    max_score = scores[t];
+                }
             }
             let mut sum_exp = 0.0f32;
             for t in 0..seq_len {
@@ -859,7 +851,11 @@ impl AttentionOps for VulkanDevice {
                 sum_exp += scores[t];
             }
             let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
-            let head_dim = if out_dims.len() >= 3 { out_dims[2] } else { v_head_dim };
+            let head_dim = if out_dims.len() >= 3 {
+                out_dims[2]
+            } else {
+                v_head_dim
+            };
             let out_off = h * head_dim;
             for t in 0..seq_len {
                 let kv_off = t * (latent + qk_rope_dim);
@@ -870,13 +866,19 @@ impl AttentionOps for VulkanDevice {
                         let mut acc = 0.0f32;
                         for i in 0..latent {
                             let widx = w_off + d * latent + i;
-                            if widx < w.len() { acc += w[widx] * kv[kv_off + i]; }
+                            if widx < w.len() {
+                                acc += w[widx] * kv[kv_off + i];
+                            }
                         }
-                        if out_off + d < out_buf.len() { out_buf[out_off + d] += p * acc; }
+                        if out_off + d < out_buf.len() {
+                            out_buf[out_off + d] += p * acc;
+                        }
                     }
                 } else {
                     for i in 0..head_dim.min(latent) {
-                        if out_off + i < out_buf.len() { out_buf[out_off + i] += p * kv[kv_off + i]; }
+                        if out_off + i < out_buf.len() {
+                            out_buf[out_off + i] += p * kv[kv_off + i];
+                        }
                     }
                 }
             }
@@ -885,9 +887,9 @@ impl AttentionOps for VulkanDevice {
         Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
 
-
     /// QKV attention with ALiBi position bias: score += slopes[h]*(j-i).
     /// CPU reference (the device kernel is `grim_qkv_attention_alibi`).
+    #[allow(clippy::needless_range_loop)]
     fn qkv_attention_alibi(
         &self,
         q: &dyn BackendStorage,
@@ -907,16 +909,24 @@ impl AttentionOps for VulkanDevice {
         let dims = out_shape.dims();
         let (seq_len, num_heads, head_dim) = match dims.len() {
             3 => (dims[0], dims[1], dims[2]),
-            _ => return Err(Error::Shape("qkv_attention_alibi: out_shape must be [seq,heads,head_dim]".into())),
+            _ => {
+                return Err(Error::Shape(
+                    "qkv_attention_alibi: out_shape must be [seq,heads,head_dim]".into(),
+                ));
+            }
         };
         if slopes_v.len() < num_heads {
-            return Err(Error::Shape("qkv_attention_alibi: slopes fewer than heads".into()));
+            return Err(Error::Shape(
+                "qkv_attention_alibi: slopes fewer than heads".into(),
+            ));
         }
         let q_per_kv = (num_heads / num_kv_heads.max(1)).max(1);
         let cache_off = cache_offset as i32;
         let win = window.unwrap_or(kv_seq_len);
         let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
-        if k_v.len() < kv_seq_len * num_kv_heads * head_dim || v_v.len() < kv_seq_len * num_kv_heads * head_dim {
+        if k_v.len() < kv_seq_len * num_kv_heads * head_dim
+            || v_v.len() < kv_seq_len * num_kv_heads * head_dim
+        {
             return Err(Error::Shape("qkv_attention_alibi: k/v too short".into()));
         }
         for qi in 0..seq_len {
@@ -928,35 +938,48 @@ impl AttentionOps for VulkanDevice {
                 for j in 0..kv_seq_len {
                     let q_pos = cache_off + qi as i32;
                     let k_pos = j as i32;
-                    if k_pos > q_pos { scores[j] = f32::NEG_INFINITY; continue; }
-                    if (q_pos - k_pos) as usize >= win { scores[j] = f32::NEG_INFINITY; continue; }
+                    if k_pos > q_pos {
+                        scores[j] = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    if (q_pos - k_pos) as usize >= win {
+                        scores[j] = f32::NEG_INFINITY;
+                        continue;
+                    }
                     let k_off = (j * num_kv_heads + kv_h) * head_dim;
                     let mut dot = 0.0f32;
-                    for d in 0..head_dim { dot += q_v[q_off + d] * k_v[k_off + d]; }
+                    for d in 0..head_dim {
+                        dot += q_v[q_off + d] * k_v[k_off + d];
+                    }
                     scores[j] = dot + slopes_v[h] * (k_pos - q_pos) as f32;
-                    if scores[j] > max_score { max_score = scores[j]; }
+                    if scores[j] > max_score {
+                        max_score = scores[j];
+                    }
                 }
                 let mut sum_exp = 0.0f32;
                 for j in 0..kv_seq_len {
                     if scores[j].is_finite() {
                         scores[j] = (scores[j] - max_score).exp();
                         sum_exp += scores[j];
-                    } else { scores[j] = 0.0; }
+                    } else {
+                        scores[j] = 0.0;
+                    }
                 }
                 let inv = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
                 let o_off = (qi * num_heads + h) * head_dim;
                 for j in 0..kv_seq_len {
                     let p = scores[j] * inv;
-                    if p == 0.0 { continue; }
+                    if p == 0.0 {
+                        continue;
+                    }
                     let v_off = (j * num_kv_heads + kv_h) * head_dim;
-                    for d in 0..head_dim { out[o_off + d] += p * v_v[v_off + d]; }
+                    for d in 0..head_dim {
+                        out[o_off + d] += p * v_v[v_off + d];
+                    }
                 }
             }
         }
         let storage = self.from_cpu(&out, out_shape, DType::F32)?;
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
-
-
 }
-

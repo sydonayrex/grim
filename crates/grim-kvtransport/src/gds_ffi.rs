@@ -1,7 +1,5 @@
 //! FFI bindings for GDS / hipFile (Direct NVMe-GPU I/O).
-//!
-//! Provides dynamic loading of `libhipfile.so` (or `libcufile.so`) with
-//! symbol verification, `#[repr(C)]` boundaries, and `catch_unwind` safety guards.
+//! Provides dynamic loading of `libhipfile.so` (or `libcufile.so`) with symbol verification, `#[repr(C)]` boundaries, and `catch_unwind` safety.
 
 use libloading::{Library, Symbol};
 use std::ffi::CString;
@@ -53,6 +51,7 @@ pub struct HipFileLib {
 static GDS_PROBED: AtomicBool = AtomicBool::new(false);
 static GDS_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 impl HipFileLib {
     /// Probe if `libhipfile.so` or `libcufile.so` is available on the system.
     pub fn probe_available() -> bool {
@@ -72,14 +71,20 @@ impl HipFileLib {
         for name in candidate_libs {
             if let Ok(lib) = unsafe { Library::new(name) } {
                 unsafe {
-                    let fn_driver_open: Result<Symbol<FnDriverOpen>, _> = lib.get(b"cuFileDriverOpen\0");
-                    let fn_driver_close: Result<Symbol<FnDriverClose>, _> = lib.get(b"cuFileDriverClose\0");
-                    let fn_handle_reg: Result<Symbol<FnFileHandleRegister>, _> = lib.get(b"cuFileHandleRegister\0");
-                    let fn_handle_dereg: Result<Symbol<FnFileHandleDeregister>, _> = lib.get(b"cuFileHandleDeregister\0");
+                    let fn_driver_open: Result<Symbol<FnDriverOpen>, _> =
+                        lib.get(b"cuFileDriverOpen\0");
+                    let fn_driver_close: Result<Symbol<FnDriverClose>, _> =
+                        lib.get(b"cuFileDriverClose\0");
+                    let fn_handle_reg: Result<Symbol<FnFileHandleRegister>, _> =
+                        lib.get(b"cuFileHandleRegister\0");
+                    let fn_handle_dereg: Result<Symbol<FnFileHandleDeregister>, _> =
+                        lib.get(b"cuFileHandleDeregister\0");
                     let fn_read: Result<Symbol<FnFileRead>, _> = lib.get(b"cuFileRead\0");
                     let fn_write: Result<Symbol<FnFileWrite>, _> = lib.get(b"cuFileWrite\0");
-                    let fn_buf_reg: Result<Symbol<FnBufRegister>, _> = lib.get(b"cuFileBufRegister\0");
-                    let fn_buf_dereg: Result<Symbol<FnBufDeregister>, _> = lib.get(b"cuFileBufDeregister\0");
+                    let fn_buf_reg: Result<Symbol<FnBufRegister>, _> =
+                        lib.get(b"cuFileBufRegister\0");
+                    let fn_buf_dereg: Result<Symbol<FnBufDeregister>, _> =
+                        lib.get(b"cuFileBufDeregister\0");
 
                     if let (
                         Ok(f_dopen),
@@ -154,9 +159,7 @@ impl HipFileLib {
     /// Register a file path for direct DMA.
     pub fn register_file(&self, path: &str, flags: i32) -> Option<HipFileHandle> {
         let c_path = CString::new(path).ok()?;
-        let res = catch_unwind(|| unsafe {
-            (self.fn_handle_reg)(c_path.as_ptr(), flags as c_int)
-        });
+        let res = catch_unwind(|| unsafe { (self.fn_handle_reg)(c_path.as_ptr(), flags as c_int) });
         match res {
             Ok(handle) if !handle.0.is_null() => Some(handle),
             _ => None,
@@ -165,9 +168,7 @@ impl HipFileLib {
 
     /// Deregister a previously registered file handle.
     pub fn deregister_file(&self, handle: HipFileHandle) -> bool {
-        let res = catch_unwind(|| unsafe {
-            (self.fn_handle_dereg)(handle)
-        });
+        let res = catch_unwind(|| unsafe { (self.fn_handle_dereg)(handle) });
         res.map(|code| code == 0).unwrap_or(false)
     }
 

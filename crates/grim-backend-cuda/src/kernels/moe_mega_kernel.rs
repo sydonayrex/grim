@@ -1,8 +1,5 @@
-//! MoE Mega Kernel — Persistent CTA cooperative scheduler for top-k expert dispatch.
-//!
-//! Implements a persistent thread block scheduler for multi-expert top-k MoE
-//! execution, matching `moe_mega_kernel.rs` in grim-backend-rocm. A single
-//! long-lived kernel launch replaces per-expert sequential cuBLAS calls.
+//! MoE Mega Kernel - Persistent CTA cooperative scheduler for top-k expert dispatch.
+//! Implements a persistent thread block scheduler for multi-expert top-k MoE execution, matching `moe_mega_kernel.rs` in grim-backend-rocm.
 
 pub const MOE_MEGA_KERNEL_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -13,19 +10,8 @@ namespace cg = cooperative_groups;
 
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// grim_moe_mega_kernel — Persistent CTA scheduler for top-k MoE dispatch.
-//
-// Each CTA persists for the entire duration of the kernel and pulls work
-// items from a shared atomic counter. One work item = one (token, expert)
-// pair. When a CTA finishes its pair it atomically fetches the next.
-//
-// This avoids the per-expert kernel launch overhead that sequential cuBLAS
-// paths pay for K > 8 experts, and lets the GPU scheduler saturate all SMs
-// before any expert's batch completes.
-//
-// Grid: (num_ctas, 1, 1)  Block: (block_threads, 1, 1)
-// ---------------------------------------------------------------------------
+// grim_moe_mega_kernel - Persistent CTA scheduler for top-k MoE dispatch.
+// Each CTA persists for the entire duration of the kernel and pulls work items from.
 __global__ void grim_moe_mega_kernel(
     const float* __restrict__ activations,     // [batch, hidden]
     const float* __restrict__ expert_gate_w,   // [num_experts, inter, hidden]
@@ -75,13 +61,8 @@ __global__ void grim_moe_mega_kernel(
     }
 }
 
-// ---------------------------------------------------------------------------
-// grim_moe_align_block_size — Compute per-expert token counts and padded layout
-// for the token-sorted grouped dispatch path.
-//
-// Mirrors `moe_align_block_size` on ROCm: fills sorted_token_ids,
-// sorted_expert_ids, sorted_weights, and num_tokens_post_padded.
-// ---------------------------------------------------------------------------
+// grim_moe_align_block_size - Compute per-expert token counts and padded layout for the token-sorted grouped dispatch path.
+// Mirrors `moe_align_block_size` on ROCm: fills sorted_token_ids, sorted_expert_ids, sorted_weights, and num_tokens_post_padded.
 __global__ void grim_moe_align_block_size(
     const unsigned int* __restrict__ topk_ids,       // [batch * topk]
     const float* __restrict__ topk_weights,          // [batch * topk]

@@ -1,58 +1,14 @@
-//! Charon MoE backward pass — expert-weight gradients (WI-Charon-1).
-//!
-//! Confirms the v2 plan's finding: `grim-backend-rocm` had **no** MoE backward
-//! kernel before this file. We build `d_gate_w` / `d_up_w` / `d_down_w` / `d_x`
-//! for the FP32 path first (matches `grim_moe_fused_dispatch` /
-//! `grim_moe_fused_grouped` scope), mirroring the backward-dequant-GEMM
-//! structure already established in `wmma_gemm.rs`
-//! (`grim_fused_dequant_backward_gemm_{fp8,mxfp4,mxfp8}`): recompute the
-//! forward activation, form `d_x` and `d_w` via the standard matmul-transpose
-//! gradient identities, adapted from a single dense GEMM to Charon's
-//! per-expert grouped-dispatch shape.
-//!
-//! Decomposition (standard MoE backward, router gradient explicitly OUT of scope
-//! per the plan — non-differentiable top-k is a separate work item):
-//!   * forward:  h_gate = gate_w @ x ; h_up = up_w @ x
-//!               act    = silu(h_gate) * h_up
-//!               y      = down_w @ act
-//!   * d_down_w = d_y ⊗ act                  (outer product, [hidden, inter])
-//!   * d_hidden = down_w^T @ d_y             (pre-SiLU activation grad)
-//!   * d_gate   = d_hidden * silu'(h_gate)   (silu gating grad)
-//!     d_up     = d_hidden * h_up            (up branch grad)
-//!   * d_gate_w = d_gate ⊗ x ; d_up_w = d_up ⊗ x   (outer products)
-//!   * d_x = gate_w^T @ d_gate + up_w^T @ d_up       (input grad)
-//!
-//! All kernels are the grouped (token-sorted) shape using the same
-//! `sorted_token_ids` / `sorted_expert_ids` / `sorted_weights` contract as the
-//! forward `grim_moe_fused_grouped`. A token routed to K>1 experts has K
-//! backward blocks; gradients into `d_x[token]` use `atomicAdd`.
-//!
-//! Dispatch status (P2): the HIP kernel source (`KERNEL_SOURCE`) is written and
-//! the host-side math is validated (see `tests/charon_backward_grad_check.rs`,
-//! 7/7 green: analytical backward + finite-difference vs `MoeFfn::forward` +
-//! kernel-source structural + directional derivative). What is NOT wired is the
-//! device dispatch — there is no ROCm launch path that constructs the sorted
-//! routing arrays (`sorted_token_ids`/`sorted_expert_ids`/`sorted_weights`) and
-//! calls `grim_moe_fused_grouped_backward`. The per-weight `atomicAdd` sites and
-//! the forward `hg`/`hu` recomputation loops in the kernel are the patterns P2
-//! calls a gap; they remain until a device run verifies the kernel produces
-//! correct grads. P2 is DEFERRED to device-run; the green host-side verifier is
-//! the in-sandbox anchor.
+//! Charon MoE backward pass - expert-weight gradients (WI-Charon-1).
+//! Confirms the v2 plan's finding: `grim-backend-rocm` had **no** MoE backward kernel before this file.
 
 use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
-// ---------------------------------------------------------------------------
-// HIP source — Charon MoE backward kernels (FP32 expert-weight gradients)
-// ---------------------------------------------------------------------------
+// HIP source - Charon MoE backward kernels (FP32 expert-weight gradients)
 
 /// HIP source for the Charon MoE backward kernel family.
-///
-/// Entries (each `__global__`, grouped/token-sorted contract):
-/// * `grim_moe_fused_grouped_backward` — computes `d_gate_w`, `d_up_w`,
-///   `d_down_w`, `d_x` for the FP32 (BF16-grade f32) path in a single fused
-///   launch, one block per expert-block (matching `grim_moe_fused_grouped`).
+/// Entries (each `__global__`, grouped/token-sorted contract): * `grim_moe_fused_grouped_backward` - computes `d_gate_w`, `d_up_w`, `d_down_w`, `d_x` for the.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
@@ -63,24 +19,8 @@ extern "C" {
         return s * (1.0f + z * (1.0f - s));
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // grim_moe_fused_grouped_backward — FP32 expert-weight backward (WI-Charon-1).
-    //
-    // Layout (matches grim_moe_fused_grouped forward):
-    //   activations : [batch, hidden]              (input x, needed for d_w)
-    //   gate_w/up_w : [num_experts, inter*hidden]  (row-major, [inter, hidden])
-    //   down_w      : [num_experts, hidden*inter]  (row-major, [hidden, inter])
-    //   d_y         : [batch, hidden]              (gradient w.r.t. expert output)
-    //   d_gate_w/d_up_w : [num_experts, inter*hidden]   (OUTPUT)
-    //   d_down_w        : [num_experts, hidden*inter]   (OUTPUT)
-    //   d_x             : [batch, hidden]                (OUTPUT, atomicAdd)
-    //   sorted_*        : token-sorted routing arrays (post moe_align_block_size)
-    //   hidden, inter, num_tokens, block_size, routed_scaling_factor as forward.
-    //
-    // NOTE: this is the base FP32 case. Quantized-weight backward (matching the
-    // 5 quantized forward variants) is phase 2 and reuses the dequant helpers
-    // from wmma_gemm.rs exactly as the forward kernels do.
-    // ────────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────── grim_moe_fused_grouped_backward - FP32 expert-weight backward (WI-Charon-1).
+    // Layout (matches grim_moe_fused_grouped forward): activations : [batch, hidden] (input x, needed for d_w) gate_w/up_w :.
     __global__ void grim_moe_fused_grouped_backward(
         const float* __restrict__ activations,
         const float* __restrict__ gate_w,
@@ -119,35 +59,11 @@ extern "C" {
             float* ddw = d_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
             float* dx  = d_x      + (unsigned long long)tok * hidden;
 
-            // ── Recompute the forward hidden states for this (token, expert) ──
-            //   h_gate[j] = sum_i gate_w[j, i] * x[i]     (j ∈ [0, inter), i ∈ [0, hidden))
-            //   h_up[j]   = sum_i up_w[j, i]   * x[i]
-            //   act[j]    = silu(h_gate[j]) * h_up[j]
-            //   y[h]      = sum_j down_w[h, j] * act[j]   (h ∈ [0, hidden))
-            //
-            // The historical draft conflated the inter activation dim (`j`)
-            // with the hidden output dim (`h`) by reusing a single outer
-            // `h` loop — i.e. it indexed gate_w with `h ∈ [0, hidden)` even
-            // though gate_w's row dim is `inter`. That both mis-read weights
-            // AND dropped the `h_up` factor in the gate gradient. The WI-
-            // Charon-1 by-name gradient gate (host finite-difference vs this
-            // decomposition) surfaced both bugs; this rewrite matches the
-            // validated host reference exactly.
-            //
-            // Backward decomposition (per (token, expert) with combine `w`,
-            //   s = routed_scaling_factor * w, output boundary d_y = 1[h]):
-            //   d_down_w[h, j]  += s * d_y[h] * act[j]
-            //   d_act[j]          = sum_h s * d_y[h] * down_w[h, j]   (scaled by s)
-            //   d_h_gate[j]       = d_act[j] * silu'(h_gate[j]) * h_up[j]   ← h_up factor
-            //   d_h_up[j]         = d_act[j] * silu(h_gate[j])
-            //   d_gate_w[j, i]   += d_h_gate[j] * x[i]   (no extra s; s absorbed via d_act)
-            //   d_up_w[j, i]     += d_h_up[j]   * x[i]
-            //   d_x[i]            += sum_j (gate_w[j, i] * d_h_gate[j] + up_w[j, i] * d_h_up[j])
-            // (No double-scaling: `s` enters ONCE through `d_down_w`/`d_act`.)
+            // ── Recompute the forward hidden states for this (token, expert) ── h_gate[j] = sum_i gate_w[j, i] * x[i]   (j ∈ [0, inter), i ∈ [0, hidden)) h_up[j]  = sum_i up_w[j, i]  * x[i] act[j]  = silu(h_gate[j]) * h_up[j] y[h]   = sum_j down_w[h, j] * act[j]  (h ∈ [0, hidden)) The historical draft conflated the inter activation dim (`j`) with the hidden output dim (`h`) by reusing a single outer `h` loop - i.e.
+            // it indexed gate_w with `h ∈ [0, hidden)` even though gate_w's row dim is `inter`.
             for (int j = 0; j < inter; ++j) {
                 // h_gate / h_up are scalar per j (recomputed here; kept in
-                // registers, matching the host reference and the pre-JIT
-                // grouped forward's recompute pattern).
+                // registers, matching the host reference and the pre-JIT grouped forward's recompute pattern).
                 float hg = 0.0f, hu = 0.0f;
                 for (int i = 0; i < hidden; ++i) {
                     hg += gw[j * hidden + i] * x[i];
@@ -189,16 +105,10 @@ extern "C" {
 }
 "#;
 
-// ---------------------------------------------------------------------------
 // Host-side planning / validation helpers (pure, unit-testable w/o a device)
-// ---------------------------------------------------------------------------
 
 /// Per-expert gradient-tensor byte size for the FP32 backward path.
-///
 /// `d_gate_w` / `d_up_w` are `[num_experts, inter * hidden]` f32.
-///
-/// # Panics
-/// Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
 pub fn expert_weight_grad_bytes(num_experts: usize, inter: usize, hidden: usize) -> usize {
     num_experts
         .checked_mul(inter)
@@ -207,11 +117,8 @@ pub fn expert_weight_grad_bytes(num_experts: usize, inter: usize, hidden: usize)
         .expect("expert_weight_grad_bytes: dimension product overflows usize")
 }
 
-/// `d_down_w` is `[num_experts, hidden * inter]` f32 (down is already
-/// `[hidden, inter]` in the forward layout, see `grim_moe_fused_grouped`).
-///
-/// # Panics
-/// Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
+/// `d_down_w` is `[num_experts, hidden * inter]` f32 (down is already `[hidden, inter]` in the forward layout, see `grim_moe_fused_grouped`).
+/// # Panics Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
 pub fn expert_down_grad_bytes(num_experts: usize, inter: usize, hidden: usize) -> usize {
     num_experts
         .checked_mul(hidden)
@@ -220,10 +127,8 @@ pub fn expert_down_grad_bytes(num_experts: usize, inter: usize, hidden: usize) -
         .expect("expert_down_grad_bytes: dimension product overflows usize")
 }
 
-/// `d_x` is `[batch, hidden]` f32.
-///
-/// # Panics
-/// Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
+/// `d_x` is `[batch, hidden]` f32. # Panics Panics on
+/// arithmetic overflow (dimensions so large the byte count wraps `usize`).
 pub fn input_grad_bytes(batch: usize, hidden: usize) -> usize {
     batch
         .checked_mul(hidden)
@@ -309,14 +214,8 @@ mod tests {
 
     #[test]
     fn backward_kernel_source_is_jit_discoverable() {
-        // The kernel is declared inside an `extern "C" { ... }` block (so the
-        // HIPRTC symbol has C linkage and no name-mangling) — the literal
-        // `__global__ void grim_moe_fused_grouped_backward` appears, with the
-        // surrounding `extern "C" {` conferring C linkage. We assert both the
-        // symbol AND the C-linkage block rather than `extern "C" __global__`
-        // as a joint prefix (which would force a redundant per-declaration
-        // `extern "C"` that the existing kernel sources in this crate don't
-        // use — they use the block form consistently).
+        // The kernel is declared inside an `extern "C" { ...
+        // }` block (so the HIPRTC symbol has C linkage and no name-mangling) - the literal.
         assert!(KERNEL_SOURCE.contains("extern \"C\" {"));
         assert!(KERNEL_SOURCE.contains("__global__ void grim_moe_fused_grouped_backward"));
         // Must reuse the SiLU-derivative decomposition documented in the plan.

@@ -1,25 +1,21 @@
 //! `CoreTensorOps` implementation for VulkanDevice.
-//!
-//! Extracted from lib.rs (modularization): trait impls live in `device/`,
-//! dispatch plumbing in `kernel.rs`, buffers in `storage.rs`, device init
-//! in `context.rs`.
+//! Extracted from lib.rs (modularization): trait impls live in `device/`, dispatch plumbing in `kernel.rs`, buffers in.
 
 use std::ffi::c_void;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::DType;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ArithType, BackendStorage, Shape, CoreTensorOps};
+use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, Shape};
 
 use crate::context::global_context;
 use crate::ffi::*;
-use crate::kernel::{push_params, run_compute_shader, spirv_for, VulkanKernel};
-use crate::{f32_to_bf16_to_f32, VulkanDevice, VulkanStorage};
+use crate::kernel::{VulkanKernel, push_params, run_compute_shader, spirv_for};
+use crate::{VulkanDevice, VulkanStorage, f32_to_bf16_to_f32};
 
 impl CoreTensorOps for VulkanDevice {
-    /// Tier A: delegate to the existing rms_norm kernel. (No separate
-    /// in-place shader: the trait contract only requires the HANDLE
-    /// semantics; the allocation-free in-place form is a future kernel.)
+    /// Tier A: delegate to the existing rms_norm kernel.
+    /// (No separate in-place shader: the trait contract only requires the HANDLE semantics; the allocation-free in-place.
     fn rms_norm_inplace(
         &self,
         x: &dyn BackendStorage,
@@ -43,10 +39,8 @@ impl CoreTensorOps for VulkanDevice {
         self.matmul(a, b, out)
     }
 
-    /// B5: device-side 2-D transpose — `[rows, cols] -> [cols, rows]` via the
-    /// `grim_transpose_2d` compute shader. Eliminates the host round-trip the
-    /// `lora_accumulate` default previously needed to transpose its A/B
-    /// operands on every forward call.
+    /// B5: device-side 2-D transpose - `[rows, cols] -> [cols, rows]` via the `grim_transpose_2d` compute shader.
+    /// Eliminates the host round-trip the `lora_accumulate` default previously needed to transpose its A/B operands on.
     fn transpose_2d(
         &self,
         x: &dyn BackendStorage,
@@ -58,9 +52,11 @@ impl CoreTensorOps for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan transpose_2d x is not VulkanStorage".into()))?;
-        if x.shape().elem_count() != rows.checked_mul(cols).ok_or_else(|| {
-            Error::Shape("Vulkan transpose_2d: rows*cols overflow".into())
-        })? {
+        if x.shape().elem_count()
+            != rows
+                .checked_mul(cols)
+                .ok_or_else(|| Error::Shape("Vulkan transpose_2d: rows*cols overflow".into()))?
+        {
             return Err(Error::Shape(format!(
                 "Vulkan transpose_2d: storage holds {} elements, expected {rows}×{cols}",
                 x.shape().elem_count()
@@ -90,7 +86,6 @@ impl CoreTensorOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = global_context();
@@ -126,7 +121,6 @@ impl CoreTensorOps for VulkanDevice {
         Ok(Box::new(storage))
     }
 
-
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -135,7 +129,6 @@ impl CoreTensorOps for VulkanDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_op(a, b, out_shape, None)
     }
-
 
     fn add(
         &self,
@@ -180,7 +173,6 @@ impl CoreTensorOps for VulkanDevice {
         ))
     }
 
-
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -223,7 +215,6 @@ impl CoreTensorOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn silu_mul(
         &self,
@@ -268,7 +259,6 @@ impl CoreTensorOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn rms_norm(
         &self,
@@ -318,7 +308,6 @@ impl CoreTensorOps for VulkanDevice {
         ))
     }
 
-
     fn softmax(
         &self,
 
@@ -360,7 +349,6 @@ impl CoreTensorOps for VulkanDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn embedding(
         &self,
@@ -438,7 +426,6 @@ impl CoreTensorOps for VulkanDevice {
         ))
     }
 
-
     fn from_cpu(
         &self,
         data: &[f32],
@@ -489,7 +476,6 @@ impl CoreTensorOps for VulkanDevice {
         Ok(Box::new(storage))
     }
 
-
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -499,4 +485,3 @@ impl CoreTensorOps for VulkanDevice {
         Ok(())
     }
 }
-

@@ -1,7 +1,5 @@
-//! `grim-kvtransport` — tiered KV cache local transport and spillage.
-//!
+//! `grim-kvtransport` - tiered KV cache local transport and spillage.
 //! Handles moving KV block contents between GPU, Host RAM, and local scratch NVMe files.
-//! Sits inside the paged KV pool's eviction policy to support demote-before-drop.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -127,10 +125,8 @@ pub struct LocalSpillManager {
     block_tiers: HashMap<BlockId, CacheTier>,
     /// In-memory cache for Host RAM tier.
     host_ram_cache: HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
-    /// Compressed-blob host tier: serialized `CompressedKvBlock` bytes for
-    /// blocks spilled through the pool's compressor path (closed
-    /// compression-to-spill loop). Raw `host_ram_cache` and this map are
-    /// mutually exclusive per block id.
+    /// Compressed-blob host tier: serialized `CompressedKvBlock` bytes for blocks spilled through the pool's compressor path (closed compression-to-spill loop).
+    /// Raw `host_ram_cache` and this map are mutually exclusive per block id.
     compressed_host: HashMap<BlockId, Vec<u8>>,
     /// File path tracking for NVMe disk tier.
     nvme_cache: HashMap<BlockId, PathBuf>,
@@ -175,11 +171,14 @@ impl LocalSpillManager {
     /// Demotes a block from Host RAM to NVMe disk cache, freeing RAM space.
     pub fn demote_to_nvme(&mut self, block_id: BlockId) -> Result<()> {
         if let Some((k, v)) = self.host_ram_cache.remove(&block_id) {
-            let temp_path = self.scratch_dir.join(format!("tmp_kv_block_{}.bin", block_id));
+            let temp_path = self
+                .scratch_dir
+                .join(format!("tmp_kv_block_{}.bin", block_id));
             let file_path = self.scratch_dir.join(format!("kv_block_{}.bin", block_id));
 
             let write_res = (|| -> Result<()> {
-                let mut file = File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
+                let mut file =
+                    File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
 
                 // Explicit little-endian encoding: host-endianness independent,
                 // bit-exact for every IEEE-754 payload including NaNs.
@@ -227,7 +226,8 @@ impl LocalSpillManager {
             CacheTier::NvMe => {
                 if let Some(path) = self.nvme_cache.remove(&block_id) {
                     let read_res = (|| -> Result<(Vec<f32>, Vec<f32>)> {
-                        let mut file = File::open(&path).map_err(|e| Error::KvCache(e.to_string()))?;
+                        let mut file =
+                            File::open(&path).map_err(|e| Error::KvCache(e.to_string()))?;
                         let mut bytes = vec![0u8; self.block_elems * 8];
 
                         file.read_exact(&mut bytes)
@@ -267,17 +267,10 @@ impl LocalSpillManager {
     }
 
     /// Demote an already-compressed block blob into the Host RAM tier.
-    ///
-    /// This is the compressor-side spill path (`KvBlockPool` + `KvCompressor`):
-    /// the blob is the serialized `CompressedKvBlock`, stored verbatim — no
-    /// f32-length validation applies because the payload is variable-length.
-    /// Raw and compressed residency for the same id are mutually exclusive;
-    /// demoting compressed evicts any raw copy and vice versa.
+    /// This is the compressor-side spill path (`KvBlockPool` + `KvCompressor`): the blob is the serialized `CompressedKvBlock`,.
     pub fn demote_compressed(&mut self, block_id: BlockId, blob: Vec<u8>) -> Result<()> {
         if blob.is_empty() {
-            return Err(Error::KvCache(
-                "demote_compressed: empty blob".into(),
-            ));
+            return Err(Error::KvCache("demote_compressed: empty blob".into()));
         }
         self.host_ram_cache.remove(&block_id);
         self.nvme_cache.remove(&block_id);
@@ -295,9 +288,7 @@ impl LocalSpillManager {
         let temp_path = self
             .scratch_dir
             .join(format!("tmp_kv_block_c_{block_id}.bin"));
-        let file_path = self
-            .scratch_dir
-            .join(format!("kv_block_c_{block_id}.bin"));
+        let file_path = self.scratch_dir.join(format!("kv_block_c_{block_id}.bin"));
         let write_res = (|| -> Result<()> {
             let mut file = File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
             file.write_all(&blob)
@@ -320,11 +311,8 @@ impl LocalSpillManager {
         Ok(())
     }
 
-    /// Retrieve a compressed blob from whichever compressed tier it
-    /// currently resides in. Host-tier reads are non-destructive (cloned,
-    /// mirroring raw `retrieve`); an NVMe read promotes the blob into the
-    /// compressed host tier and hands back a clone. `Ok(None)` = not
-    /// compressed-tier managed (callers fall back to the raw path).
+    /// Retrieve a compressed blob from whichever compressed tier it currently resides in.
+    /// Host-tier reads are non-destructive (cloned, mirroring raw `retrieve`); an NVMe read promotes the blob into.
     pub fn retrieve_compressed(&mut self, block_id: BlockId) -> Result<Option<Vec<u8>>> {
         if let Some(blob) = self.compressed_host.get(&block_id).cloned() {
             return Ok(Some(blob));
@@ -374,10 +362,8 @@ impl LocalSpillManager {
         self.block_tiers.get(&block_id).copied()
     }
 
-    /// Retargets the rotary position embedding of a cached block in Host RAM from
-    /// `old_start_pos` to `new_start_pos` using CPU Re-RoPE without re-prefill.
-    // The Re-RoPE retarget configuration is naturally seven flat positional
-    // parameters; a config struct would be ceremony without a second caller.
+    /// Retargets the rotary position embedding of a cached block in Host RAM from `old_start_pos` to `new_start_pos` using CPU Re-RoPE without re-prefill.
+    /// The Re-RoPE retarget configuration is naturally seven flat positional parameters; a config struct would be.
     #[allow(clippy::too_many_arguments)]
     pub fn retarget_block_positions(
         &mut self,
@@ -390,14 +376,18 @@ impl LocalSpillManager {
         base_freq: f32,
     ) -> Result<()> {
         let (k_data, v_data) = self.retrieve(block_id)?.ok_or_else(|| {
-            Error::KvCache(format!("block {} not found in cache for retargeting", block_id))
+            Error::KvCache(format!(
+                "block {} not found in cache for retargeting",
+                block_id
+            ))
         })?;
 
         let expected_elems = tokens_per_block * num_heads * head_dim;
         if k_data.len() != expected_elems {
             return Err(Error::KvCache(format!(
                 "retarget_block_positions: block elements {} does not match expected {}",
-                k_data.len(), expected_elems
+                k_data.len(),
+                expected_elems
             )));
         }
 
@@ -417,15 +407,19 @@ impl LocalSpillManager {
 
         let cfg = grim_tensor::RopeConfig::new(head_dim, base_freq);
 
-        let (retargeted_k, _) = dev.rerope(
-            &k_storage,
-            &old_positions,
-            &new_positions,
-            &cfg,
-            &grim_tensor::shape::Shape::new(vec![num_heads, tokens_per_block, head_dim]),
-        ).map_err(|e| Error::KvCache(e.to_string()))?;
+        let (retargeted_k, _) = dev
+            .rerope(
+                &k_storage,
+                &old_positions,
+                &new_positions,
+                &cfg,
+                &grim_tensor::shape::Shape::new(vec![num_heads, tokens_per_block, head_dim]),
+            )
+            .map_err(|e| Error::KvCache(e.to_string()))?;
 
-        let new_k_vec = retargeted_k.to_cpu_vec_f32().map_err(|e| Error::KvCache(e.to_string()))?;
+        let new_k_vec = retargeted_k
+            .to_cpu_vec_f32()
+            .map_err(|e| Error::KvCache(e.to_string()))?;
         self.host_ram_cache.insert(block_id, (new_k_vec, v_data));
         self.block_tiers.insert(block_id, CacheTier::HostRam);
         Ok(())
@@ -491,26 +485,12 @@ impl SharedSpillManager {
 /// Wire-protocol magic for the V2 header. 0x4B56434B = "KVCK" in ASCII.
 const KV_MAGIC: u32 = 0x4B56434B;
 
-/// Current on-wire protocol version.
-///
-/// V3: header carries the sender's valid token count (`num_tokens`) and
-/// every push transfer is answered with a 1-header ACK, so a receiver that
-/// silently discards a block (checksum mismatch, out-of-range id) is no
-/// longer indistinguishable from a successful commit.
+/// Current on-wire protocol version. V3: header carries the sender's valid token count (`num_tokens`) and every push transfer is answered with a
+/// 1-header ACK, so a receiver that silently discards a block (checksum mismatch, out-of-range id) is no longer indistinguishable from a successful commit.
 const KV_PROTOCOL_VERSION: u32 = 3;
 
 /// Fixed-size header (32 bytes) prepended to every KV block transfer.
-///
-/// Layout (all little-endian):
-/// | magic (u32) | version (u32) | block_id (u64) |
-/// | layer_idx (u32) | num_elements (u32) | checksum (u32) |
-/// | num_tokens (u32) |
-///
-/// `num_tokens` is the sender's valid token count for the block. The V2
-/// protocol omitted it and receivers derived the count from the payload
-/// length — which is always a full block because payloads are zero-padded —
-/// silently marking partially-filled blocks as fully valid on the
-/// destination. It is now carried end-to-end.
+/// Layout (all little-endian): | magic (u32) | version (u32) | block_id (u64) | | layer_idx.
 #[derive(Debug, Clone, Copy)]
 pub struct KvBlockHeader {
     pub magic: u32,
@@ -579,10 +559,8 @@ pub fn compute_checksum_bytes(bytes: &[u8]) -> u32 {
     hash
 }
 
-/// FNV-1a 32-bit checksum over the on-wire little-endian encoding of the key
-/// and value float slices. Encodes via `to_le_bytes` (never a host-endian
-/// pointer reinterpretation) so the checksum always describes the exact bytes
-/// put on the wire, bit-exactly for every IEEE-754 payload including NaNs.
+/// FNV-1a 32-bit checksum over the on-wire little-endian encoding of the key and value float slices.
+/// Encodes via `to_le_bytes` (never a host-endian pointer reinterpretation) so the checksum always describes the exact.
 pub fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
     let mut hash: u32 = 0x811c9275;
     for f in k.iter().chain(v.iter()) {
@@ -594,10 +572,8 @@ pub fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
     hash
 }
 
-/// Trait abstracting the operations a network KV receiver needs from a block
-/// store.  Defined here (in grim-kvtransport) to avoid a circular dependency:
-/// grim-memory depends on grim-kvtransport, so it can implement this trait
-/// for `KvBlockPool`, but grim-kvtransport cannot depend on grim-memory.
+/// Trait abstracting the operations a network KV receiver needs from a block store.
+/// Defined here (in grim-kvtransport) to avoid a circular dependency: grim-memory depends on grim-kvtransport, so it.
 pub trait KvBlockStore: Send + Sync {
     /// Total number of physical blocks in the pool.
     fn num_blocks(&self) -> usize;
@@ -611,23 +587,18 @@ pub trait KvBlockStore: Send + Sync {
     /// Write value data into `id`'s block.  Uses the `num_tokens` previously
     /// set by `write_keys`.
     fn write_values(&mut self, id: BlockId, values: &[f32]);
-    /// Whether block `id` has received real KV data (via `write_keys`,
-    /// `store_kv`, or network ingestion).  Replaces the fragile non-zero
-    /// content sniff: a genuinely all-zero KV block is valid data, not
-    /// "not yet arrived."
+    /// Whether block `id` has received real KV data (via `write_keys`, `store_kv`, or network ingestion).
+    /// Replaces the fragile non-zero content sniff: a genuinely all-zero KV block is valid data, not.
     fn block_is_received(&self, id: BlockId) -> bool;
 
     /// Valid token count stored for block `id`, if the store tracks one.
-    /// `None` (the default) makes fetch replies fall back to deriving the
-    /// count from the payload length, which reports partially-filled blocks
-    /// as full — implementors that track fill state should override this.
+    /// `None` (the default) makes fetch replies fall back to deriving the count from the payload.
     fn block_num_tokens(&self, _id: BlockId) -> Option<usize> {
         None
     }
 
-    /// Read key data for layer 0 of block `id`.  Returns `None` when the
-    /// block is out of range — pull-mode fetch (F8/F10) turns that into a
-    /// "not available" reply instead of deadlocking or fabricating data.
+    /// Read key data for layer 0 of block `id`.
+    /// Returns `None` when the block is out of range - pull-mode fetch (F8/F10) turns that.
     fn read_keys(&self, id: BlockId) -> Option<Vec<f32>>;
     /// Read value data for layer 0 of block `id`.  Returns `None` when the
     /// block is out of range.
@@ -711,28 +682,8 @@ impl NetworkKvClient {
         }
     }
 
-    /// Dispatches a KV block key/value payload buffer to a target remote IP
-    /// endpoint using the client's configured [`TransportProtocol`].
-    ///
-    /// The V3 wire contract is transport-independent: a 32-byte header
-    /// (magic, version, block_id, layer_idx, num_elements, checksum,
-    /// num_tokens) followed by the raw f32 bytes of the key slice and then
-    /// the value slice; `Ok(())` means the data actually landed and was
-    /// committed by the receiver — not just that the bytes left the local
-    /// buffer.
-    ///
-    /// `num_tokens` is the block's valid token count; receivers store it
-    /// verbatim instead of deriving it from the (zero-padded) payload length.
-    ///
-    /// Per-protocol behavior:
-    /// * `Tcp` — sockets, one ACK per block.
-    /// * `SharedMemP2p` — same-host file-inbox handoff (tmpfs-backed when
-    ///   `/dev/shm` is available); receiver consumption acts as the ACK.
-    ///   If the receiver has no active inbox the send **falls back to TCP**
-    ///   with a logged warning. Cross-host targets are a hard error.
-    /// * `RdmaRoce` / `UcxDirect` — explicit error: no hardware backend is
-    ///   implemented in this build, and silently downgrading RDMA to TCP
-    ///   would misrepresent the deployment.
+    /// Dispatches a KV block key/value payload buffer to a target remote IP endpoint using the client's configured [`TransportProtocol`].
+    /// The V3 wire contract is transport-independent: a 32-byte header (magic, version, block_id, layer_idx, num_elements, checksum,.
     pub fn send_block_remote(
         &self,
         block_id: BlockId,
@@ -760,24 +711,17 @@ impl NetworkKvClient {
                         "[grim-kvtransport] SharedMemP2p send for block {block_id} layer \
                          {layer_idx} failed ({shm_err}); falling back to TCP"
                     );
-                    return self.send_block_tcp(
-                        block_id,
-                        layer_idx,
-                        k,
-                        v,
-                        num_tokens,
-                        target_ip,
-                    );
+                    return self.send_block_tcp(block_id, layer_idx, k, v, num_tokens, target_ip);
                 }
                 Ok(())
             }
-            TransportProtocol::RdmaRoce | TransportProtocol::UcxDirect => Err(Error::KvCache(
-                format!(
+            TransportProtocol::RdmaRoce | TransportProtocol::UcxDirect => {
+                Err(Error::KvCache(format!(
                     "{:?} transport requested but no hardware backend is implemented in \
                      this build; use Tcp or SharedMemP2p (same-host)",
                     self.protocol
-                ),
-            )),
+                )))
+            }
         }
     }
 
@@ -797,11 +741,8 @@ impl NetworkKvClient {
         Self::write_and_ack(&mut stream, &msg, block_id as u64, layer_idx)
     }
 
-    /// Send several (block, layer) KV payloads over ONE TCP connection:
-    /// all payloads are written first, then every ACK is read back in
-    /// order. Cuts the per-message connection setup cost of
-    /// [`Self::send_block_remote`] for large multi-layer handoffs while
-    /// keeping the same per-message ACK guarantee.
+    /// Send several (block, layer) KV payloads over ONE TCP connection: all payloads are written first, then every ACK is read back in order.
+    /// Cuts the per-message connection setup cost of [`Self::send_block_remote`] for large multi-layer handoffs while keeping the.
     pub fn send_blocks_batch_remote(
         &self,
         items: &[KvBlockTransfer<'_>],
@@ -923,9 +864,8 @@ impl NetworkKvClient {
         Self::read_ack(stream, block_id, layer_idx)
     }
 
-    /// Read and validate one push-ACK header. `checksum == ACK_OK` means
-    /// committed; `0` means the receiver rejected the message — a FINAL
-    /// error (retrying can never succeed: the receiver refused the data).
+    /// Read and validate one push-ACK header. `checksum == ACK_OK` means committed; `0` means the receiver
+    /// rejected the message - a FINAL error (retrying can never succeed: the receiver refused the data).
     pub(crate) fn read_ack(
         stream: &mut std::net::TcpStream,
         block_id: u64,
@@ -958,11 +898,7 @@ impl NetworkKvClient {
     }
 
     /// Fetches a key/value payload block from a remote IP endpoint over a TCP stream.
-    ///
-    /// Sends a V3 fetch request (header only) and receives a V3 response
-    /// containing the key and value data plus the block's stored valid token
-    /// count. Returns an error if the remote endpoint is unreachable or the
-    /// response fails validation — never fabricates data.
+    /// Sends a V3 fetch request (header only) and receives a V3 response containing the key.
     pub fn fetch_block_remote(
         &self,
         block_id: BlockId,
@@ -972,11 +908,8 @@ impl NetworkKvClient {
     ) -> Result<(Vec<f32>, Vec<f32>, usize)> {
         let addr = Self::resolve_addr(target_ip);
 
-        // Build a fetch-request header: same format but with a zero checksum
-        // and a special request flag in layer_idx (bit 31 set). Mask bit 31
-        // out of the caller's layer so a stray high bit can't smuggle a
-        // second flag into the request. The element-count field is u32 —
-        // reject an absurd block_elems rather than silently truncating.
+        // Build a fetch-request header: same format but with a zero checksum and a special request flag in layer_idx (bit 31 set).
+        // Mask bit 31 out of the caller's layer so a stray high bit can't smuggle.
         let req_num_elements = u32::try_from(block_elems).map_err(|_| {
             Error::KvCache(format!(
                 "block_elems {block_elems} exceeds the wire protocol u32::MAX"
@@ -992,9 +925,8 @@ impl NetworkKvClient {
             num_tokens: 0,
         };
 
-        // Deadline the whole exchange, not just the connect: a server that
-        // never answers (protocol mismatch, wedged peer) must fail fast
-        // instead of hanging the caller's read_exact forever (F8 follow-up).
+        // Deadline the whole exchange, not just the connect: a server that never answers (protocol
+        // mismatch, wedged peer) must fail fast instead of hanging the caller's read_exact forever (F8 follow-up).
         let mut stream = Self::connect_to(&addr, "fetch")?;
 
         stream
@@ -1014,9 +946,8 @@ impl NetworkKvClient {
                 header.magic, header.version
             )));
         }
-        // The receiver answers "block/layer not available here" with an
-        // empty payload rather than silence — translate that into an error
-        // so no caller mistakes it for a legitimate zero-length block.
+        // The receiver answers "block/layer not available here" with an empty payload rather than silence -
+        // translate that into an error so no caller mistakes it for a legitimate zero-length block.
         if header.num_elements == 0 {
             return Err(Error::KvCache(format!(
                 "TCP fetch: remote {addr} reports block {block_id} layer {} not available",
@@ -1041,10 +972,8 @@ impl NetworkKvClient {
             .read_exact(&mut payload)
             .map_err(|e| Error::KvCache(format!("TCP fetch read error: {e}")))?;
 
-        // Verify the checksum over the RAW received bytes, not a
-        // parse→re-encode round-trip: IEEE-754 NaN payloads are not guaranteed
-        // to survive an f32 bit round-trip, and re-encoding is host-endian
-        // dependent. The sender checksummed the exact bytes transmitted.
+        // Verify the checksum over the RAW received bytes, not a parse→re-encode round-trip: IEEE-754 NaN payloads are not guaranteed to survive an f32 bit round-trip, and re-encoding is host-endian dependent.
+        // The sender checksummed the exact bytes transmitted.
         let expected = compute_checksum_bytes(&payload);
         let split = header.num_elements as usize * 4;
         let k_vec = parse_f32_slice(&payload[..split]);
@@ -1064,11 +993,7 @@ impl NetworkKvClient {
     }
 
     /// Send a prompt-token control message to a remote node (push model).
-    ///
-    /// This is the real control channel for disaggregated handoff: the
-    /// prefill→decode (or decode→prefill) side learns WHICH tokens a request
-    /// carries without smuggling them through a fake KV block. Payload is the
-    /// raw token IDs as little-endian u32; `request_id` rides in `block_id`.
+    /// This is the real control channel for disaggregated handoff: the prefill→decode (or decode→prefill) side learns.
     pub fn send_prompt_tokens(
         &self,
         request_id: u64,
@@ -1115,9 +1040,8 @@ impl NetworkKvClient {
         stream
             .write_all(&buf)
             .map_err(|e| Error::KvCache(format!("TCP prompt send error: {e}")))?;
-        // Wait for the receiver's ACK so a prompt the receiver refused
-        // (over cap, checksum mismatch) surfaces as an error here instead
-        // of silently never arriving in the PromptChannel.
+        // Wait for the receiver's ACK so a prompt the receiver refused (over cap, checksum
+        // mismatch) surfaces as an error here instead of silently never arriving in the PromptChannel.
         Self::read_ack(&mut stream, request_id, PROMPT_FLAG)
     }
 }
@@ -1137,30 +1061,24 @@ pub struct KvBlockTransfer<'a> {
 /// "this is a fetch request, reply with data" rather than a push transfer.
 const FETCH_REQUEST_FLAG: u32 = 0x8000_0000;
 
-/// Bit flag embedded in `layer_idx` marking a prompt-token control message:
-/// the payload is raw u32 token IDs, `block_id` carries the request id, and
-/// the receiver stores it in the shared [`PromptChannel`] instead of the KV
-/// block store.
+/// Bit flag embedded in `layer_idx` marking a prompt-token control message: the payload is raw u32 token IDs, `block_id`
+/// carries the request id, and the receiver stores it in the shared [`PromptChannel`] instead of the KV block store.
 const PROMPT_FLAG: u32 = 0x4000_0000;
 
-/// Value written to the `checksum` field of a push-ACK header when the
-/// receiver committed the block (or stored the prompt). `0` means the
-/// receiver rejected the message.
+/// Value written to the `checksum` field of a push-ACK header when the receiver committed the block (or stored the prompt).
+/// `0` means the receiver rejected the message.
 const ACK_OK: u32 = 1;
 
-/// Sanity cap on `layer_idx` of push messages. The value indexes per-layer
-/// storage on the receiver, so an unbounded (or garbage) index would make
-/// the receiver allocate `(layer_idx + 1)` per-layer buffers.
+/// Sanity cap on `layer_idx` of push messages.
+/// The value indexes per-layer storage on the receiver, so an unbounded (or garbage) index would.
 const MAX_WIRE_LAYER_IDX: u32 = 4_096;
 
-/// Per-socket I/O deadline for both the client and the receiver. Bounds
-/// every individual read/write so a wedged peer fails the transfer instead
-/// of hanging it.
+/// Per-socket I/O deadline for both the client and the receiver.
+/// Bounds every individual read/write so a wedged peer fails the transfer instead of hanging it.
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Shared store for prompt-token control messages received over the wire
-/// (see [`NetworkKvClient::send_prompt_tokens`]). Cloneable handle; `take`
-/// consumes the stored prompt for a request id.
+/// Shared store for prompt-token control messages received over the wire (see [`NetworkKvClient::send_prompt_tokens`]).
+/// Cloneable handle; `take` consumes the stored prompt for a request id.
 #[derive(Default, Clone)]
 pub struct PromptChannel {
     inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>>,
@@ -1171,15 +1089,10 @@ impl PromptChannel {
         Self::default()
     }
 
-    /// Store (or overwrite) the prompt tokens for a request id. When the
-    /// channel is at [`MAX_PENDING_PROMPTS`] and this is a new request, one
-    /// pending entry is evicted (unordered — at that size every victim is
-    /// equally stale) to keep the channel bounded.
+    /// Store (or overwrite) the prompt tokens for a request id.
+    /// When the channel is at [`MAX_PENDING_PROMPTS`] and this is a new request, one pending entry.
     pub fn store(&self, request_id: u64, tokens: Vec<u32>) {
-        let mut map = self
-            .inner
-            .lock()
-            .expect("prompt channel mutex poisoned");
+        let mut map = self.inner.lock().expect("prompt channel mutex poisoned");
         if map.len() >= MAX_PENDING_PROMPTS && !map.contains_key(&request_id) {
             if let Some(victim) = map.keys().next().copied() {
                 map.remove(&victim);
@@ -1224,25 +1137,12 @@ fn parse_f32_slice(bytes: &[u8]) -> Vec<f32> {
 /// Maximum tokens allowed in a single prompt-token control message (1M tokens).
 pub const MAX_PROMPT_TOKENS: usize = 1_000_000;
 
-/// Maximum number of distinct pending prompts the channel retains. Requests
-/// that are never consumed would otherwise accumulate for the process
-/// lifetime on a long-running receiver.
+/// Maximum number of distinct pending prompts the channel retains.
+/// Requests that are never consumed would otherwise accumulate for the process lifetime on a long-running.
 pub const MAX_PENDING_PROMPTS: usize = 10_000;
 
-/// Spawns a background TCP server that listens for incoming
-/// `NetworkKvClient::send_block_remote` streams and writes them into a shared
-/// KV block store.
-///
-/// The server runs in a background OS thread, accepting one connection per
-/// transferred block.  Each connection is expected to send a 28-byte
-/// [`KvBlockHeader`] followed by the key slice and value slice as raw
-/// little-endian f32 bytes.  The magic number and checksum are verified
-/// before the data is committed to the store.
-///
-/// Accepts any type implementing [`KvBlockStore`] behind a
-/// `std::sync::Mutex` — this avoids a circular dependency on grim-memory
-/// (grim-memory already depends on grim-kvtransport; KvBlockPool implements
-/// the trait in grim-memory).
+/// Spawns a background TCP server that listens for incoming `NetworkKvClient::send_block_remote` streams and writes them into a shared KV block store.
+/// The server runs in a background OS thread, accepting one connection per transferred block.
 pub fn start_kv_receiver_server<T>(
     listen_addr: &str,
     pool: std::sync::Arc<std::sync::Mutex<T>>,
@@ -1253,9 +1153,8 @@ where
     start_kv_receiver_server_with_prompts(listen_addr, pool, PromptChannel::new())
 }
 
-/// Like [`start_kv_receiver_server`], but prompt-token control messages
-/// ([`NetworkKvClient::send_prompt_tokens`]) are stored into the supplied
-/// [`PromptChannel`] instead of being dropped.
+/// Like [`start_kv_receiver_server`], but prompt-token control messages ([`NetworkKvClient::send_prompt_tokens`]) are
+/// stored into the supplied [`PromptChannel`] instead of being dropped.
 pub fn start_kv_receiver_server_with_prompts<T>(
     listen_addr: &str,
     pool: std::sync::Arc<std::sync::Mutex<T>>,
@@ -1268,15 +1167,16 @@ where
     Ok(handle)
 }
 
-/// Like [`start_kv_receiver_server_with_prompts`], but also returns a stop
-/// flag: setting it makes the accept loop exit within its poll interval, so
-/// callers that own the server's lifetime can shut it down (dropping the
-/// returned handle alone never stops the listener thread).
+/// Like [`start_kv_receiver_server_with_prompts`], but also returns a stop flag: setting it makes the accept loop exit within its poll interval, so
+/// callers that own the server's lifetime can shut it down (dropping the returned handle alone never stops the listener thread).
 pub fn start_kv_receiver_server_stoppable<T>(
     listen_addr: &str,
     pool: std::sync::Arc<std::sync::Mutex<T>>,
     prompts: PromptChannel,
-) -> Result<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)>
 where
     T: KvBlockStore + 'static,
 {
@@ -1303,15 +1203,12 @@ where
             }
             match listener.accept() {
                 Ok((mut stream, _peer)) => {
-                    // Deadline every read/write on this connection: a peer
-                    // that connects, sends a header, then stalls must not
-                    // wedge the single-threaded accept loop.
+                    // Deadline every read/write on this connection: a peer that connects, sends
+                    // a header, then stalls must not wedge the single-threaded accept loop.
                     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                    // Drain loop: V3 clients may pipeline several messages
-                    // over one connection (batch transfers). Legacy
-                    // one-message-per-connection senders simply close after
-                    // the first message, which breaks the loop via EOF.
+                    // Drain loop: V3 clients may pipeline several messages over one connection (batch transfers).
+                    // Legacy one-message-per-connection senders simply close after the first message, which breaks the loop via EOF.
                     loop {
                         // Read the fixed-size header.
                         let mut hdr = [0u8; KvBlockHeader::SIZE];
@@ -1323,9 +1220,8 @@ where
                             None => break,
                         };
 
-                        // Reject protocol mismatches immediately. The payload
-                        // has not been read yet, so the stream framing is
-                        // unrecoverable: NAK, then close the connection.
+                        // Reject protocol mismatches immediately. The payload has not been read yet,
+                        // so the stream framing is unrecoverable: NAK, then close the connection.
                         if !header.verify() {
                             eprintln!(
                                 "[grim-kvtransport] KV receiver: rejecting connection \
@@ -1336,165 +1232,155 @@ where
                             break;
                         }
 
-                    // F8/F10: a fetch request (FETCH_REQUEST_FLAG set in
-                    // layer_idx) asks the server to REPLY with the block's
-                    // data instead of pushing a payload. The old loop fell
-                    // through to the push path unconditionally and blocked
-                    // reading a payload the fetcher never sends — a
-                    // deadlock between both sides on the first pull-mode
-                    // fetch. Answer from the store's read side; an empty
-                    // payload means "not available here".
-                    if header.layer_idx & FETCH_REQUEST_FLAG != 0 {
-                        let layer_idx = header.layer_idx & !FETCH_REQUEST_FLAG;
-                        let block_id = header.block_id as usize;
-                        let (k_data, v_data, stored_tokens) = {
-                            let guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-                            if block_id < guard.num_blocks() && guard.block_is_received(block_id) {
-                                match (
-                                    guard.read_layer_keys(block_id, layer_idx),
-                                    guard.read_layer_values(block_id, layer_idx),
-                                ) {
-                                    (Some(k), Some(v)) if k.len() == v.len() && !k.is_empty() => {
-                                        let derived = {
-                                            let elem = guard.block_elem_per_token();
-                                            if elem == 0 {
-                                                0
-                                            } else {
-                                                k.len() / elem
-                                            }
-                                        };
-                                        // Prefer the store's own fill state; only
-                                        // fall back to the (inflation-prone)
-                                        // payload-derived count when the store
-                                        // does not track it.
-                                        let stored = guard
-                                            .block_num_tokens(block_id)
-                                            .unwrap_or(derived)
-                                            .min(derived);
-                                        (k, v, stored)
+                        // F8/F10: a fetch request (FETCH_REQUEST_FLAG set in layer_idx) asks the server to REPLY with the block's data instead of pushing a payload.
+                        // The old loop fell through to the push path unconditionally and blocked reading a payload.
+                        if header.layer_idx & FETCH_REQUEST_FLAG != 0 {
+                            let layer_idx = header.layer_idx & !FETCH_REQUEST_FLAG;
+                            let block_id = header.block_id as usize;
+                            let (k_data, v_data, stored_tokens) = {
+                                let guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+                                if block_id < guard.num_blocks()
+                                    && guard.block_is_received(block_id)
+                                {
+                                    match (
+                                        guard.read_layer_keys(block_id, layer_idx),
+                                        guard.read_layer_values(block_id, layer_idx),
+                                    ) {
+                                        (Some(k), Some(v))
+                                            if k.len() == v.len() && !k.is_empty() =>
+                                        {
+                                            let derived = {
+                                                let elem = guard.block_elem_per_token();
+                                                k.len().checked_div(elem).unwrap_or(0)
+                                            };
+                                            // Prefer the store's own fill state; only fall back to
+                                            // the (inflation-prone) payload-derived count when the store does not track it.
+                                            let stored = guard
+                                                .block_num_tokens(block_id)
+                                                .unwrap_or(derived)
+                                                .min(derived);
+                                            (k, v, stored)
+                                        }
+                                        _ => (Vec::new(), Vec::new(), 0),
                                     }
-                                    _ => (Vec::new(), Vec::new(), 0),
+                                } else {
+                                    (Vec::new(), Vec::new(), 0)
                                 }
-                            } else {
-                                (Vec::new(), Vec::new(), 0)
+                            };
+                            let resp = KvBlockHeader {
+                                magic: KV_MAGIC,
+                                version: KV_PROTOCOL_VERSION,
+                                block_id: header.block_id,
+                                layer_idx,
+                                num_elements: k_data.len() as u32,
+                                checksum: compute_checksum(&k_data, &v_data),
+                                num_tokens: stored_tokens as u32,
+                            };
+                            let mut buf = resp.serialize().to_vec();
+                            for &val in k_data.iter().chain(v_data.iter()) {
+                                buf.extend_from_slice(&val.to_le_bytes());
+                            }
+                            if let Err(e) = stream.write_all(&buf) {
+                                eprintln!(
+                                    "[grim-kvtransport] KV receiver: fetch reply for block {} \
+                                 layer {layer_idx} failed: {e}",
+                                    header.block_id
+                                );
+                            }
+                            continue;
+                        }
+
+                        // Prompt-token control message: payload is raw u32 token IDs (request id rides in block_id).
+                        // Store into the prompt channel - never into the KV block store.
+                        if header.layer_idx & PROMPT_FLAG != 0 {
+                            let num_tokens = header.num_elements as usize;
+                            if num_tokens > MAX_PROMPT_TOKENS {
+                                eprintln!(
+                                    "[grim-kvtransport] KV receiver: prompt num_tokens {num_tokens} \
+                                 exceeds safety cap {MAX_PROMPT_TOKENS}"
+                                );
+                                send_ack(&mut stream, &header, false, 0);
+                                continue;
+                            }
+                            let mut payload = vec![0u8; num_tokens.saturating_mul(4)];
+                            if stream.read_exact(&mut payload).is_err() {
+                                eprintln!(
+                                    "[grim-kvtransport] KV receiver: short read on prompt message \
+                                 for request {}",
+                                    header.block_id
+                                );
+                                break;
+                            }
+                            if compute_checksum_bytes(&payload) != header.checksum {
+                                eprintln!(
+                                    "[grim-kvtransport] KV receiver: checksum mismatch on prompt \
+                                 message for request {}",
+                                    header.block_id
+                                );
+                                send_ack(&mut stream, &header, false, 0);
+                                continue;
+                            }
+                            let tokens: Vec<u32> = payload
+                                .chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            prompts.store(header.block_id, tokens);
+                            send_ack(&mut stream, &header, true, num_tokens as u32);
+                            continue;
+                        }
+
+                        let num_elems = header.num_elements as usize;
+                        // Flag-free push message: layer_idx now indexes per-layer storage, so a garbage
+                        // value would make the write path allocate `(layer_idx + 1)` per-layer buffers.
+                        if header.layer_idx > MAX_WIRE_LAYER_IDX {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: layer_idx {} exceeds cap \
+                             {MAX_WIRE_LAYER_IDX}",
+                                header.layer_idx
+                            );
+                            // Payload not consumed — framing is unrecoverable.
+                            send_ack(&mut stream, &header, false, 0);
+                            break;
+                        }
+                        if num_elems > 100_000_000 {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: num_elements {num_elems} exceeds safety cap"
+                            );
+                            // Payload not consumed — framing is unrecoverable.
+                            send_ack(&mut stream, &header, false, 0);
+                            break;
+                        }
+                        let total_bytes = match num_elems.checked_mul(8) {
+                            Some(b) => b,
+                            None => {
+                                eprintln!(
+                                    "[grim-kvtransport] KV receiver: num_elements {num_elems} multiplied by 8 overflowed usize"
+                                );
+                                send_ack(&mut stream, &header, false, 0);
+                                break;
                             }
                         };
-                        let resp = KvBlockHeader {
-                            magic: KV_MAGIC,
-                            version: KV_PROTOCOL_VERSION,
-                            block_id: header.block_id,
-                            layer_idx,
-                            num_elements: k_data.len() as u32,
-                            checksum: compute_checksum(&k_data, &v_data),
-                            num_tokens: stored_tokens as u32,
-                        };
-                        let mut buf = resp.serialize().to_vec();
-                        for &val in k_data.iter().chain(v_data.iter()) {
-                            buf.extend_from_slice(&val.to_le_bytes());
-                        }
-                        if let Err(e) = stream.write_all(&buf) {
-                            eprintln!(
-                                "[grim-kvtransport] KV receiver: fetch reply for block {} \
-                                 layer {layer_idx} failed: {e}",
-                                header.block_id
-                            );
-                        }
-                        continue;
-                    }
-
-                    // Prompt-token control message: payload is raw u32 token
-                    // IDs (request id rides in block_id). Store into the
-                    // prompt channel — never into the KV block store.
-                    if header.layer_idx & PROMPT_FLAG != 0 {
-                        let num_tokens = header.num_elements as usize;
-                        if num_tokens > MAX_PROMPT_TOKENS {
-                            eprintln!(
-                                "[grim-kvtransport] KV receiver: prompt num_tokens {num_tokens} \
-                                 exceeds safety cap {MAX_PROMPT_TOKENS}"
-                            );
-                            send_ack(&mut stream, &header, false, 0);
-                            continue;
-                        }
-                        let mut payload = vec![0u8; num_tokens.saturating_mul(4)];
+                        let mut payload = vec![0u8; total_bytes];
                         if stream.read_exact(&mut payload).is_err() {
                             eprintln!(
-                                "[grim-kvtransport] KV receiver: short read on prompt message \
-                                 for request {}",
-                                header.block_id
-                            );
-                            break;
-                        }
-                        if compute_checksum_bytes(&payload) != header.checksum {
-                            eprintln!(
-                                "[grim-kvtransport] KV receiver: checksum mismatch on prompt \
-                                 message for request {}",
-                                header.block_id
-                            );
-                            send_ack(&mut stream, &header, false, 0);
-                            continue;
-                        }
-                        let tokens: Vec<u32> = payload
-                            .chunks_exact(4)
-                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        prompts.store(header.block_id, tokens);
-                        send_ack(&mut stream, &header, true, num_tokens as u32);
-                        continue;
-                    }
-
-                    let num_elems = header.num_elements as usize;
-                    // Flag-free push message: layer_idx now indexes per-layer
-                    // storage, so a garbage value would make the write path
-                    // allocate `(layer_idx + 1)` per-layer buffers.
-                    if header.layer_idx > MAX_WIRE_LAYER_IDX {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: layer_idx {} exceeds cap \
-                             {MAX_WIRE_LAYER_IDX}",
-                            header.layer_idx
-                        );
-                        // Payload not consumed — framing is unrecoverable.
-                        send_ack(&mut stream, &header, false, 0);
-                        break;
-                    }
-                    if num_elems > 100_000_000 {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: num_elements {num_elems} exceeds safety cap"
-                        );
-                        // Payload not consumed — framing is unrecoverable.
-                        send_ack(&mut stream, &header, false, 0);
-                        break;
-                    }
-                    let total_bytes = match num_elems.checked_mul(8) {
-                        Some(b) => b,
-                        None => {
-                            eprintln!(
-                                "[grim-kvtransport] KV receiver: num_elements {num_elems} multiplied by 8 overflowed usize"
-                            );
-                            send_ack(&mut stream, &header, false, 0);
-                            break;
-                        }
-                    };
-                    let mut payload = vec![0u8; total_bytes];
-                    if stream.read_exact(&mut payload).is_err() {
-                        eprintln!(
-                            "[grim-kvtransport] KV receiver: short read on \
+                                "[grim-kvtransport] KV receiver: short read on \
                              block {}",
-                            header.block_id
-                        );
-                        break;
-                    }
+                                header.block_id
+                            );
+                            break;
+                        }
 
-                    // Verify + store via the shared push-path fn so the
-                    // TCP and shared-memory wire paths cannot drift.
-                    match store_push_payload(&pool, &header, &payload) {
-                        Ok(num_tokens) => {
-                            send_ack(&mut stream, &header, true, num_tokens as u32);
+                        // Verify + store via the shared push-path fn so the
+                        // TCP and shared-memory wire paths cannot drift.
+                        match store_push_payload(&pool, &header, &payload) {
+                            Ok(num_tokens) => {
+                                send_ack(&mut stream, &header, true, num_tokens as u32);
+                            }
+                            Err(PushRejection::Rejected) => {
+                                send_ack(&mut stream, &header, false, 0);
+                                continue;
+                            }
                         }
-                        Err(PushRejection::Rejected) => {
-                            send_ack(&mut stream, &header, false, 0);
-                            continue;
-                        }
-                    }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1514,10 +1400,8 @@ where
     Ok((handle, stop))
 }
 
-/// Reply to a push transfer with a 1-header ACK. `ok == false` is a NAK:
-/// the receiver refused the message (checksum, range, size). Errors are
-/// logged, not propagated — the sender's own ACK read times out and
-/// surfaces the failure.
+/// Reply to a push transfer with a 1-header ACK.
+/// `ok == false` is a NAK: the receiver refused the message (checksum, range, size).
 fn send_ack(
     stream: &mut std::net::TcpStream,
     header: &KvBlockHeader,
@@ -1542,14 +1426,7 @@ fn send_ack(
 }
 
 /// Reads one layer's weights from the configured NVMe weights file.
-///
-/// The file is treated as a flat sequence of `f32` values sectioned by
-/// `LAYER_ELEMS` per layer (1024 floats = 4096 bytes per layer). Reads the
-/// layer's slice via `pread` so we don't mutate a shared file offset.
-///
-/// Returns an explicit `KvCache` error if the file is missing, too short for
-/// the requested layer, or the I/O call fails — never substitutes mock data
-/// (sims.md issue #3).
+/// The file is treated as a flat sequence of `f32` values sectioned by `LAYER_ELEMS` per.
 fn read_layer_weights(
     weights_path: &std::path::Path,
     layer_id: usize,
@@ -1620,16 +1497,7 @@ fn read_layer_weights(
 }
 
 /// Double-buffered weight prefetch engine for NVMe layer/unit streaming.
-///
-/// Originally framed as a "layer" streamer with a fixed 1024-element per-layer
-/// assumption; now generalised so callers specify `unit_elems` at construction
-/// time. An "embedding unit" maps naturally to this framing: `unit_id` is
-/// "which row-block of the vocabulary" and `unit_elems` is "floats per row-block"
-/// (e.g. 4096 vocab-rows × 128 hidden-dim = 524 288 floats per unit).
-///
-/// When a unit is evicted from the host-RAM LRU to NVMe, its tier transitions
-/// to `CacheTier::NvMeWeightStream` in `unit_tier_map`. Call [`NvmeWeightStreamer::get_unit_tier`]
-/// to query placement, mirroring `LocalSpillManager::get_tier` for KV blocks.
+/// Originally framed as a "layer" streamer with a fixed 1024-element per-layer assumption; now generalised so.
 pub struct NvmeWeightStreamer {
     /// LRU unit cache capacity (number of units held in host RAM simultaneously).
     pub lru_capacity_layers: usize,
@@ -1649,22 +1517,18 @@ pub struct NvmeWeightStreamer {
     /// Current transfer bandwidth usage (bytes/sec) for PCIe backpressure.
     bandwidth_usage: Mutex<f64>,
     /// Tier tracking per unit: populated when a unit is evicted to NVMe so
-    /// `grim-scheduler` can inspect embedding-table placement the same way
-    /// it inspects KV-block placement via `LocalSpillManager::get_tier`.
+    /// `grim-scheduler` can inspect embedding-table placement the same way it inspects KV-block placement via `LocalSpillManager::get_tier`.
     unit_tier_map: Mutex<HashMap<usize, CacheTier>>,
 }
 
 impl NvmeWeightStreamer {
-    /// Create a new streamer.
-    ///
-    /// # Parameters
-    /// - `weights_path`: Path to the flat f32 weight file (row-major, concatenated units).
-    /// - `lru_capacity_layers`: How many units to keep in host RAM simultaneously.
-    /// - `unit_elems`: Number of f32 elements per unit. Replaces the former hardcoded
-    ///   `LAYER_ELEMS = 1024` constant. Pass `1024` to reproduce the old behaviour for
-    ///   tests and callers that have not yet migrated to a larger granularity.
+    /// Create a new streamer. # Parameters - `weights_path`: Path
+    /// to the flat f32 weight file (row-major, concatenated units).
     pub fn new(weights_path: PathBuf, lru_capacity_layers: usize, unit_elems: usize) -> Self {
-        assert!(unit_elems > 0, "NvmeWeightStreamer: unit_elems must be greater than 0");
+        assert!(
+            unit_elems > 0,
+            "NvmeWeightStreamer: unit_elems must be greater than 0"
+        );
         Self {
             weights_path,
             lru_capacity_layers,
@@ -1679,26 +1543,10 @@ impl NvmeWeightStreamer {
     }
 
     /// Prefetch a target unit's weights asynchronously into pinned CPU RAM.
-    ///
-    /// In a production environment under Linux, this leverages `io_uring` and
-    /// `O_DIRECT`; here we synchronously `pread` the weights file, since the
-    /// network/io_uring backend is not yet wired (sims.md issue #3). The
-    /// previous implementation inserted hardcoded `vec![0.5f32; 1024]` weights
-    /// instead of reading from disk. We now read the real bytes from `weights_path`:
-    ///
-    /// - If the file is missing or the read fails, we surface an explicit
-    ///   `KvCache` error rather than substituting mock data.
-    /// - The on-disk layout is a flat stream of `f32` weights sectioned by
-    ///   `self.unit_elems` floats per unit. When `unit_elems` is 1024 this
-    ///   matches the previous fixed behaviour exactly.
-    ///
-    /// When a unit is evicted from the host-RAM LRU, its tier is set to
-    /// `CacheTier::NvMeWeightStream` in `unit_tier_map` so `grim-scheduler`
-    /// can query embedding placement via `get_unit_tier`.
+    /// In a production environment under Linux, this leverages `io_uring` and `O_DIRECT`; here we synchronously `pread`.
     pub fn prefetch_layer_async(&self, layer_id: usize) -> Result<()> {
-        // Bandwidth Admission and Backpressure check:
-        // If bandwidth usage exceeds 12.0 GB/s (~PCIe Gen4 x8 saturation),
-        // defer the prefetch instead of saturating the link.
+        // Bandwidth Admission and Backpressure check: If bandwidth usage exceeds 12.0 GB/s
+        // (~PCIe Gen4 x8 saturation), defer the prefetch instead of saturating the link.
         let cur_bandwidth = *self.bandwidth_usage.lock().unwrap();
         if cur_bandwidth > 12.0 * 1024.0 * 1024.0 * 1024.0 {
             return Err(Error::KvCache(
@@ -1710,9 +1558,8 @@ impl NvmeWeightStreamer {
         let unit_elems = self.unit_elems;
         let unit_bytes = unit_elems * std::mem::size_of::<f32>();
 
-        // Read the unit's weights from the configured NVMe path up-front
-        // (before acquiring cache locks) so I/O errors fail loudly instead of
-        // leaving the cache half-mutated.
+        // Read the unit's weights from the configured NVMe path up-front (before acquiring
+        // cache locks) so I/O errors fail loudly instead of leaving the cache half-mutated.
         let weights = read_layer_weights(&self.weights_path, layer_id, unit_elems, unit_bytes)?;
 
         *self.uring_submitting.lock().unwrap() = true;
@@ -1754,21 +1601,13 @@ impl NvmeWeightStreamer {
     }
 
     /// Query the current storage tier of a weight unit.
-    ///
-    /// Returns `Some(CacheTier::HostRam)` if the unit is in the LRU cache,
-    /// `Some(CacheTier::NvMeWeightStream)` if it was evicted to disk, or
-    /// `None` if the unit has never been prefetched. This mirrors
-    /// `LocalSpillManager::get_tier` so `grim-scheduler` can reason about
-    /// embedding-table placement the same way it reasons about KV-block placement.
+    /// Returns `Some(CacheTier::HostRam)` if the unit is in the LRU cache, `Some(CacheTier::NvMeWeightStream)` if it was evicted.
     pub fn get_unit_tier(&self, unit_id: usize) -> Option<CacheTier> {
         self.unit_tier_map.lock().unwrap().get(&unit_id).copied()
     }
 
     /// Retrieve the cached weight data for a unit, if present in host RAM.
-    ///
-    /// Returns `Some(data)` when the unit is cached, `None` when it has been
-    /// evicted or never loaded. Use `prefetch_layer_async` first to ensure the
-    /// unit is cached before calling this.
+    /// Returns `Some(data)` when the unit is cached, `None` when it has been evicted or never.
     pub fn retrieve_unit(&self, unit_id: usize) -> Option<Vec<f32>> {
         self.host_weight_cache
             .lock()
@@ -1792,23 +1631,8 @@ impl NvmeWeightStreamer {
     }
 }
 
-/// Tiered embedding table spill manager.
-///
-/// Wraps `NvmeWeightStreamer` around a flat embedding weight tensor
-/// (shape `[vocab_size, hidden_dim]` row-major) sharded into row-blocks
-/// ("units") of `rows_per_unit` vocabulary rows each.
-///
-/// # Tier policy: Gpu → HostRam → NvMe
-/// - The full table is never assumed to be GPU-resident here; this manager
-///   operates at the HostRam/NvMe boundary. GPU-side promotion is up to the
-///   calling inference stack.
-/// - When a unit is evicted from the host-RAM LRU, its tier flips to
-///   `CacheTier::NvMeWeightStream` and is queryable via `get_unit_tier`.
-///
-/// # Wire to grim-scheduler
-/// `EmbeddingSpillManager::get_unit_tier` mirrors `LocalSpillManager::get_tier`
-/// so the scheduler can reason about embedding placement alongside KV-block
-/// placement using the same `CacheTier` enum.
+/// Tiered embedding table spill manager. Wraps `NvmeWeightStreamer` around a flat embedding weight tensor
+/// (shape `[vocab_size, hidden_dim]` row-major) sharded into row-blocks ("units") of `rows_per_unit` vocabulary rows each.
 pub struct EmbeddingSpillManager {
     streamer: NvmeWeightStreamer,
     /// Number of vocabulary rows in one streaming unit.
@@ -1819,25 +1643,24 @@ pub struct EmbeddingSpillManager {
 
 impl EmbeddingSpillManager {
     /// Create a new manager backed by the given NVMe file.
-    ///
-    /// # Parameters
-    /// - `weights_path`: Flat row-major f32 file containing the full embedding
-    ///   table in `[vocab_size, hidden_dim]` layout (concatenated row-wise).
-    /// - `lru_capacity_units`: Number of row-block units to keep in host RAM.
-    /// - `rows_per_unit`: How many vocabulary rows per streaming unit. A
-    ///   reasonable starting point is 4096 rows; tune to match available RAM.
-    /// - `hidden_dim`: Embedding hidden dimension (floats per row).
+    /// # Parameters - `weights_path`: Flat row-major f32 file containing the full embedding table in `[vocab_size,.
     pub fn new(
         weights_path: std::path::PathBuf,
         lru_capacity_units: usize,
         rows_per_unit: usize,
         hidden_dim: usize,
     ) -> Self {
-        assert!(rows_per_unit > 0, "EmbeddingSpillManager: rows_per_unit must be > 0");
-        assert!(hidden_dim > 0, "EmbeddingSpillManager: hidden_dim must be > 0");
-        let unit_elems = rows_per_unit
-            .checked_mul(hidden_dim)
-            .expect("EmbeddingSpillManager: unit_elems (rows_per_unit * hidden_dim) overflowed usize");
+        assert!(
+            rows_per_unit > 0,
+            "EmbeddingSpillManager: rows_per_unit must be > 0"
+        );
+        assert!(
+            hidden_dim > 0,
+            "EmbeddingSpillManager: hidden_dim must be > 0"
+        );
+        let unit_elems = rows_per_unit.checked_mul(hidden_dim).expect(
+            "EmbeddingSpillManager: unit_elems (rows_per_unit * hidden_dim) overflowed usize",
+        );
         Self {
             streamer: NvmeWeightStreamer::new(weights_path, lru_capacity_units, unit_elems),
             rows_per_unit,
@@ -1846,12 +1669,7 @@ impl EmbeddingSpillManager {
     }
 
     /// Look up the embedding row for `token_id`.
-    ///
-    /// Computes which unit the token's row lives in, prefetches the unit if
-    /// not already cached, and extracts the `hidden_dim`-length row.
-    ///
-    /// Returns an explicit error if the unit cannot be loaded (file missing,
-    /// too short, or bandwidth-saturated). Never fabricates a zero row.
+    /// Computes which unit the token's row lives in, prefetches the unit if not already cached,.
     pub fn lookup(&self, token_id: u32) -> Result<Vec<f32>> {
         let token = token_id as usize;
         let unit_id = token / self.rows_per_unit;
@@ -1879,10 +1697,7 @@ impl EmbeddingSpillManager {
     }
 
     /// Query the current storage tier for the unit containing `token_id`.
-    ///
-    /// Returns `None` if the containing unit has never been prefetched,
-    /// `Some(CacheTier::HostRam)` if cached, or
-    /// `Some(CacheTier::NvMeWeightStream)` if evicted to disk.
+    /// Returns `None` if the containing unit has never been prefetched, `Some(CacheTier::HostRam)` if cached, or `Some(CacheTier::NvMeWeightStream)`.
     pub fn get_unit_tier_for_token(&self, token_id: u32) -> Option<CacheTier> {
         let unit_id = token_id as usize / self.rows_per_unit;
         self.streamer.get_unit_tier(unit_id)
@@ -1894,16 +1709,11 @@ impl EmbeddingSpillManager {
     }
 }
 
-// ── Wire transports ──────────────────────────────────────────────────────────
-//
-// `TransportProtocol` variants map onto concrete senders here. TCP is the
-// portable baseline; `SharedMemP2p` is the same-host fast path (tmpfs-backed
-// file handoff when `/dev/shm` is available); RDMA/UCX stay explicitly
-// unimplemented rather than silently downgrading to TCP.
+// ── Wire transports ────────────────────────────────────────────────────────── `TransportProtocol` variants map onto concrete senders here.
+// TCP is the portable baseline; `SharedMemP2p` is the same-host fast path (tmpfs-backed file handoff when.
 
-/// Transport-agnostic single-block send. Implementations must preserve the
-/// V3 contract: `send_block` returns `Ok` only after the receiver committed
-/// the payload.
+/// Transport-agnostic single-block send. Implementations must preserve the V3 contract:
+/// `send_block` returns `Ok` only after the receiver committed the payload.
 pub trait KvWireTransport: Send + Sync {
     /// Protocol this transport implements.
     fn protocol(&self) -> TransportProtocol;
@@ -1934,11 +1744,8 @@ impl KvWireTransport for TcpWireTransport {
     }
 }
 
-/// Same-host shared-memory handoff. Payloads are the *same V3 wire bytes*
-/// the TCP path sends, published atomically (tmp file + rename) into the
-/// receiver's inbox directory; the receiver consuming the file acts as the
-/// ACK. On Linux the inbox lives under `/dev/shm` when available, so the
-/// handoff never touches a socket or a disk platter.
+/// Same-host shared-memory handoff. Payloads are the *same V3 wire bytes* the TCP path sends, published atomically (tmp
+/// file + rename) into the receiver's inbox directory; the receiver consuming the file acts as the ACK.
 #[derive(Debug, Clone)]
 pub struct SharedMemWireTransport {
     /// How long to wait for the receiver to consume the handoff file.
@@ -1953,9 +1760,8 @@ impl Default for SharedMemWireTransport {
     }
 }
 
-/// Root directory for shared-memory KV inboxes. Overridable with
-/// `GRIM_SHM_DIR`; defaults to `/dev/shm` when present (RAM-backed), else
-/// the OS temp dir.
+/// Root directory for shared-memory KV inboxes.
+/// Overridable with `GRIM_SHM_DIR`; defaults to `/dev/shm` when present (RAM-backed), else the OS temp dir.
 pub fn shm_root() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("GRIM_SHM_DIR") {
         return std::path::PathBuf::from(dir);
@@ -1974,7 +1780,10 @@ pub fn shm_inbox_for_port(port: u16) -> std::path::PathBuf {
 
 fn shm_is_same_host(addr: &str) -> bool {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0")
+    matches!(
+        host,
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0"
+    )
 }
 
 static SHM_HANDOFF_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1998,11 +1807,12 @@ impl KvWireTransport for SharedMemWireTransport {
             .rsplit(':')
             .next()
             .and_then(|p| p.parse().ok())
-            .ok_or_else(|| Error::KvCache(format!("SharedMemP2p: cannot parse port from {resolved}")))?;
+            .ok_or_else(|| {
+                Error::KvCache(format!("SharedMemP2p: cannot parse port from {resolved}"))
+            })?;
         let inbox = shm_inbox_for_port(port);
-        // The `active` marker is written by `start_shm_inbox_poller`; its
-        // absence means no receiver is picking up this inbox and the caller
-        // should fall back to TCP (or fail loudly under an explicit policy).
+        // The `active` marker is written by `start_shm_inbox_poller`; its absence means no receiver is picking up this
+        // inbox and the caller should fall back to TCP (or fail loudly under an explicit policy).
         if !inbox.join("active").exists() {
             return Err(Error::KvCache(format!(
                 "SharedMemP2p: no active receiver inbox at {}",
@@ -2010,9 +1820,8 @@ impl KvWireTransport for SharedMemWireTransport {
             )));
         }
 
-        // Same wire bytes as TCP: header + K + V. The poller reuses the
-        // shared push-path validation, so both transports accept exactly
-        // the same payloads.
+        // Same wire bytes as TCP: header + K + V. The poller
+        // reuses the shared push-path validation, so both transports accept exactly the same payloads.
         let wire = NetworkKvClient::encode_block_message(
             item.block_id,
             item.layer_idx,
@@ -2078,17 +1887,14 @@ enum PushRejection {
 }
 
 /// Verify + store one V3 push payload. Shared by the TCP accept loop and the
-/// shared-memory inbox poller so the two wire paths cannot drift apart on
-/// validation or store semantics.
+/// shared-memory inbox poller so the two wire paths cannot drift apart on validation or store semantics.
 fn store_push_payload<T: KvBlockStore>(
     pool: &std::sync::Arc<std::sync::Mutex<T>>,
     header: &KvBlockHeader,
     payload: &[u8],
 ) -> std::result::Result<usize, PushRejection> {
-    // Verify the checksum over the RAW received bytes before parsing:
-    // re-encoding parsed floats back to bytes is not guaranteed to reproduce
-    // the wire representation for NaN payloads (and is host-endian
-    // dependent). The sender checksummed the exact bytes transmitted.
+    // Verify the checksum over the RAW received bytes before parsing: re-encoding parsed floats back to bytes is not guaranteed to reproduce the wire representation for NaN payloads (and is host-endian dependent).
+    // The sender checksummed the exact bytes transmitted.
     let computed = compute_checksum_bytes(payload);
     if computed != header.checksum {
         eprintln!(
@@ -2115,11 +1921,8 @@ fn store_push_payload<T: KvBlockStore>(
     }
     let block_id = header.block_id as usize;
     let elem_per_token = guard.block_elem_per_token();
-    // The sender computed `num_elems` using its OWN pool's
-    // `block_elem_per_token()`. If that differs from this receiver's value,
-    // the token count derived below is wrong. Detect the mismatch and warn,
-    // but keep sizing off the receiver's value so the write never overflows
-    // the block.
+    // The sender computed `num_elems` using its OWN pool's `block_elem_per_token()`.
+    // If that differs from this receiver's value, the token count derived below is wrong.
     if elem_per_token == 0 {
         eprintln!(
             "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
@@ -2137,9 +1940,8 @@ fn store_push_payload<T: KvBlockStore>(
             header.block_id
         );
     }
-    // V3 senders carry the block's true valid token count; cap it at what
-    // the payload can back (and at block size). A zero field means a legacy
-    // V2-style sender — fall back to the payload-derived count.
+    // V3 senders carry the block's true valid token count; cap it at what the payload can back (and at block size).
+    // A zero field means a legacy V2-style sender - fall back to the payload-derived count.
     let derived = num_elems
         .checked_div(elem_per_token)
         .unwrap_or(num_elems)
@@ -2154,9 +1956,8 @@ fn store_push_payload<T: KvBlockStore>(
     Ok(num_tokens)
 }
 
-/// Consume one handoff file: validate + store, then either remove it (ACK)
-/// or quarantine it as `rejected_*` (NAK) so the sender's poll observes a
-/// definitive answer.
+/// Consume one handoff file: validate + store, then either remove it (ACK) or
+/// quarantine it as `rejected_*` (NAK) so the sender's poll observes a definitive answer.
 fn consume_shm_handoff<T: KvBlockStore>(
     path: &std::path::Path,
     pool: &std::sync::Arc<std::sync::Mutex<T>>,
@@ -2235,13 +2036,8 @@ fn consume_shm_handoff<T: KvBlockStore>(
     }
 }
 
-/// Start a polling receiver for [`SharedMemWireTransport`] handoffs addressed
-/// to `listen_addr`'s port. Every consumed file is validated and stored with
-/// the exact same [`store_push_payload`] semantics as the TCP accept loop.
-/// The poller runs until `stop` flips, then removes its inbox marker.
-///
-/// Requires an explicit port in `listen_addr` (`:0` cannot have a
-/// deterministic inbox address).
+/// Start a polling receiver for [`SharedMemWireTransport`] handoffs addressed to `listen_addr`'s port.
+/// Every consumed file is validated and stored with the exact same [`store_push_payload`] semantics as the.
 pub fn start_shm_inbox_poller<T: KvBlockStore + 'static>(
     listen_addr: &str,
     pool: std::sync::Arc<std::sync::Mutex<T>>,
@@ -2587,7 +2383,10 @@ mod tests {
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = poller.join();
-        assert!(!inbox.join("active").exists(), "poller must clear its marker");
+        assert!(
+            !inbox.join("active").exists(),
+            "poller must clear its marker"
+        );
     }
 
     /// No active inbox → `SharedMemP2p` must fall back to TCP and still
@@ -2597,12 +2396,8 @@ mod tests {
         let port = find_free_port();
         let addr = format!("127.0.0.1:{port}");
         let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(4)));
-        let (_handle, stop) = start_kv_receiver_server_stoppable(
-            &addr,
-            store.clone(),
-            PromptChannel::new(),
-        )
-        .unwrap();
+        let (_handle, stop) =
+            start_kv_receiver_server_stoppable(&addr, store.clone(), PromptChannel::new()).unwrap();
 
         let client = NetworkKvClient::with_protocol(
             "127.0.0.1".to_string(),
@@ -2627,12 +2422,8 @@ mod tests {
     /// TCP downgrade that would misrepresent the deployment.
     #[test]
     fn rdma_and_ucx_protocols_are_explicitly_unsupported() {
-        for protocol in [
-            TransportProtocol::RdmaRoce,
-            TransportProtocol::UcxDirect,
-        ] {
-            let client =
-                NetworkKvClient::with_protocol("127.0.0.1".to_string(), protocol);
+        for protocol in [TransportProtocol::RdmaRoce, TransportProtocol::UcxDirect] {
+            let client = NetworkKvClient::with_protocol("127.0.0.1".to_string(), protocol);
             let res = client.send_block_remote(1, 0, &[1.0], &[1.0], 1, "127.0.0.1:1");
             let err = res.expect_err("hardware transports must error without a backend");
             let msg = err.to_string();
@@ -2643,10 +2434,8 @@ mod tests {
         }
     }
 
-    /// F8/F10: the receiver server must ANSWER fetch requests from the
-    /// store's read side instead of deadlocking on a payload the fetcher
-    /// never sends. Push a block, then pull it back and require exact
-    /// round-trip equality.
+    /// F8/F10: the receiver server must ANSWER fetch requests from the store's read side instead of deadlocking on a payload the fetcher never sends.
+    /// Push a block, then pull it back and require exact round-trip equality.
     #[test]
     fn test_fetch_block_remote_roundtrip_against_live_server() {
         struct TestStore {
@@ -2710,9 +2499,8 @@ mod tests {
         assert_eq!(got_tokens, 8, "fetched token count must match pushed count");
     }
 
-    /// F8/F10: fetching a block the server does not hold must produce a
-    /// prompt "not available" error — never silence, never fabricated data,
-    /// never a hang (the pre-fix server wedged here).
+    /// F8/F10: fetching a block the server does not hold must produce a prompt "not available"
+    /// error - never silence, never fabricated data, never a hang (the pre-fix server wedged here).
     #[test]
     fn test_fetch_block_remote_missing_block_errors_not_hangs() {
         struct EmptyStore;
@@ -2842,9 +2630,7 @@ mod tests {
     // ── New tests for generalised NvmeWeightStreamer (unit_elems param) ──────
 
     /// Verify NvmeWeightStreamer works with non-1024 unit_elems (embedding-table granularity).
-    ///
     /// Uses rows_per_unit=4, hidden_dim=8 → unit_elems=32 for a fast synthetic test.
-    /// Asserts exact round-trip values and that the tier map reflects HostRam after load.
     #[test]
     fn test_nvme_weight_streamer_configurable_unit_elems() {
         let dir = tempdir().unwrap();
@@ -2863,7 +2649,9 @@ mod tests {
         let streamer = NvmeWeightStreamer::new(path, 4, unit_elems);
 
         // Load unit 0 and assert exact values.
-        streamer.prefetch_layer_async(0).expect("unit 0 must prefetch");
+        streamer
+            .prefetch_layer_async(0)
+            .expect("unit 0 must prefetch");
         let got0 = streamer.retrieve_unit(0).expect("unit 0 must be cached");
         assert_eq!(got0, unit0, "unit 0 round-trip must be exact");
         assert_eq!(
@@ -2873,7 +2661,9 @@ mod tests {
         );
 
         // Load unit 1.
-        streamer.prefetch_layer_async(1).expect("unit 1 must prefetch");
+        streamer
+            .prefetch_layer_async(1)
+            .expect("unit 1 must prefetch");
         let got1 = streamer.retrieve_unit(1).expect("unit 1 must be cached");
         assert_eq!(got1, unit1, "unit 1 round-trip must be exact");
         assert_eq!(
@@ -2884,9 +2674,7 @@ mod tests {
     }
 
     /// Verify that LRU eviction records the evicted unit's tier as NvMeWeightStream.
-    ///
     /// Capacity = 1 unit → loading unit 1 evicts unit 0.
-    /// Unit 0's tier must flip to NvMeWeightStream; unit 1's tier must be HostRam.
     #[test]
     fn test_nvme_weight_streamer_lru_eviction_updates_tier() {
         let dir = tempdir().unwrap();
@@ -2939,9 +2727,7 @@ mod tests {
 
     // ── EmbeddingSpillManager tests ───────────────────────────────────────────
 
-    /// Unit test: construct an EmbeddingSpillManager with a small synthetic embedding
-    /// table, lookup several token IDs, assert exact row values.
-    ///
+    /// Unit test: construct an EmbeddingSpillManager with a small synthetic embedding table, lookup several token IDs, assert exact row values.
     /// vocab=8 tokens, hidden_dim=4, rows_per_unit=4 → 2 units.
     #[test]
     fn test_embedding_spill_manager_lookup_exact_values() {
@@ -2967,11 +2753,13 @@ mod tests {
         let mgr = EmbeddingSpillManager::new(path, 4, 4, hidden);
 
         for token in 0u32..vocab as u32 {
-            let row = mgr.lookup(token).unwrap_or_else(|e| {
-                panic!("lookup({token}) must succeed: {e}")
-            });
+            let row = mgr
+                .lookup(token)
+                .unwrap_or_else(|e| panic!("lookup({token}) must succeed: {e}"));
             assert_eq!(row.len(), hidden, "row length must be hidden_dim={hidden}");
-            let expected: Vec<f32> = (0..hidden).map(|j| (token as usize * hidden + j) as f32).collect();
+            let expected: Vec<f32> = (0..hidden)
+                .map(|j| (token as usize * hidden + j) as f32)
+                .collect();
             assert_eq!(
                 row, expected,
                 "token {token} row must match exact table values"
@@ -2980,11 +2768,7 @@ mod tests {
     }
 
     /// Integration test: eviction under small LRU capacity, then re-request returns identical data.
-    ///
-    /// This mirrors LocalSpillManager's existing demote_to_nvme/retrieve test pattern
-    /// (plan Issue 2 criterion §2). Uses a 3-unit table with capacity=1 so the first
-    /// unit is evicted when the second is loaded. Re-requesting the first unit must
-    /// round-trip the same values (via re-prefetch from disk).
+    /// This mirrors LocalSpillManager's existing demote_to_nvme/retrieve test pattern (plan Issue 2 criterion §2).
     #[test]
     fn test_embedding_spill_manager_eviction_and_reread_roundtrip() {
         let dir = tempdir().unwrap();
@@ -3011,11 +2795,15 @@ mod tests {
         let mgr = EmbeddingSpillManager::new(path, 1, rows_per_unit, hidden);
 
         // First lookup: unit 0 loaded, HostRam.
-        let row0_first = mgr.lookup(0).expect("initial lookup of token 0 must succeed");
+        let row0_first = mgr
+            .lookup(0)
+            .expect("initial lookup of token 0 must succeed");
         assert_eq!(mgr.get_unit_tier(0), Some(CacheTier::HostRam));
 
         // Second lookup: unit 1 loaded, unit 0 evicted to NvMeWeightStream.
-        let _ = mgr.lookup(4).expect("lookup of token 4 (unit 1) must succeed");
+        let _ = mgr
+            .lookup(4)
+            .expect("lookup of token 4 (unit 1) must succeed");
         assert_eq!(
             mgr.get_unit_tier(0),
             Some(CacheTier::NvMeWeightStream),
@@ -3023,7 +2811,9 @@ mod tests {
         );
 
         // Re-request token 0: triggers re-prefetch from disk.
-        let row0_second = mgr.lookup(0).expect("re-lookup of token 0 must succeed after eviction");
+        let row0_second = mgr
+            .lookup(0)
+            .expect("re-lookup of token 0 must succeed after eviction");
         assert_eq!(
             row0_first, row0_second,
             "re-read from NvMe must produce bit-identical values to first read"
@@ -3063,8 +2853,11 @@ mod tests {
         mgr.lookup(0).unwrap();
         assert_eq!(mgr.get_unit_tier(0), Some(CacheTier::HostRam));
         assert_eq!(mgr.get_unit_tier_for_token(0), Some(CacheTier::HostRam));
-        assert_eq!(mgr.get_unit_tier_for_token(3), Some(CacheTier::HostRam),
-            "all tokens in unit 0 (rows 0-3) must report the same tier");
+        assert_eq!(
+            mgr.get_unit_tier_for_token(3),
+            Some(CacheTier::HostRam),
+            "all tokens in unit 0 (rows 0-3) must report the same tier"
+        );
 
         // After lookup of token 4 (unit 1): unit 0 is still HostRam (capacity=4, not evicted yet).
         mgr.lookup(4).unwrap();
@@ -3124,10 +2917,8 @@ mod tests {
         }
     }
 
-    /// A block carrying every awkward IEEE-754 pattern (NaNs with differing
-    /// payloads, -0.0, subnormals, infinity) must round-trip the wire
-    /// bit-exactly. The receiver verifies raw wire bytes, so no parse→re-encode
-    /// step can spuriously fail the checksum or canonicalize NaN payloads.
+    /// A block carrying every awkward IEEE-754 pattern (NaNs with differing payloads, -0.0, subnormals, infinity) must round-trip the wire bit-exactly.
+    /// The receiver verifies raw wire bytes, so no parse→re-encode step can spuriously fail the checksum.
     #[test]
     fn test_wire_roundtrip_nan_and_special_bit_patterns() {
         let port = find_free_port();
@@ -3158,10 +2949,18 @@ mod tests {
         let guard = store.lock().unwrap();
         let stored = guard.blocks.get(&901).expect("NaN block must be stored");
         for (i, (a, b)) in stored.0.iter().zip(k.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(), "key word {i} must round-trip bit-exactly");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "key word {i} must round-trip bit-exactly"
+            );
         }
         for (i, (a, b)) in stored.1.iter().zip(v.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(), "value word {i} must round-trip bit-exactly");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "value word {i} must round-trip bit-exactly"
+            );
         }
     }
 
@@ -3183,8 +2982,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let guard = store.lock().unwrap();
-        assert!(guard.block_is_received(902), "all-zero block must count as received");
-        let stored = guard.blocks.get(&902).expect("all-zero block must be stored");
+        assert!(
+            guard.block_is_received(902),
+            "all-zero block must count as received"
+        );
+        let stored = guard
+            .blocks
+            .get(&902)
+            .expect("all-zero block must be stored");
         assert!(stored.0.iter().all(|f| f.to_bits() == 0));
         assert!(stored.1.iter().all(|f| f.to_bits() == 0));
     }
@@ -3197,9 +3002,8 @@ mod tests {
         assert_eq!(compute_checksum(&[], &[]), 0x811c_9275);
     }
 
-    /// A malicious or compromised server answering a fetch with a header
-    /// claiming a huge payload must be refused BEFORE any allocation happens:
-    /// u32::MAX elements and exactly MAX_PAYLOAD_BYTES/8 + 1 both reject.
+    /// A malicious or compromised server answering a fetch with a header claiming a huge payload
+    /// must be refused BEFORE any allocation happens: u32::MAX elements and exactly MAX_PAYLOAD_BYTES/8 + 1 both reject.
     #[test]
     fn test_fetch_rejects_malicious_oversized_num_elements() {
         for evil_count in [u32::MAX, (512 * 1024 * 1024 / 8) + 1] {
@@ -3251,8 +3055,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         assert!(prompts.contains(77));
-        assert_eq!(prompts.take(77), Some(tokens), "stored prompt tokens must round-trip");
-        assert_eq!(prompts.take(77), None, "take must consume the stored prompt");
+        assert_eq!(
+            prompts.take(77),
+            Some(tokens),
+            "stored prompt tokens must round-trip"
+        );
+        assert_eq!(
+            prompts.take(77),
+            None,
+            "take must consume the stored prompt"
+        );
     }
 
     /// A prompt message whose header claims more tokens than the cap must be
@@ -3285,11 +3097,8 @@ mod tests {
         );
     }
 
-    /// A receiver whose store reports block_elem_per_token() == 0 cannot size
-    /// the incoming write; it must skip the block entirely, never write with a
-    /// bogus token count derived from a division-by-zero fallback — and since
-    /// the ACK protocol, the sender must hear about the rejection instead of
-    /// reporting success while the data silently vanished.
+    /// A receiver whose store reports block_elem_per_token() == 0 cannot size the incoming write; it must skip the block entirely, never write with a bogus token count
+    /// derived from a division-by-zero fallback - and since the ACK protocol, the sender must hear about the rejection instead of reporting success while the data silently vanished.
     #[test]
     fn test_receiver_skips_write_when_elem_per_token_zero() {
         let port = find_free_port();
@@ -3309,12 +3118,14 @@ mod tests {
 
         let guard = store.lock().unwrap();
         assert_eq!(guard.write_count, 0, "store must receive no writes");
-        assert!(!guard.blocks.contains_key(&903), "block must not be written");
+        assert!(
+            !guard.blocks.contains_key(&903),
+            "block must not be written"
+        );
     }
 
-    /// `layer_id * layer_bytes` must not wrap: an absurd layer id yields an
-    /// explicit error (offset overflow, or too-short file on narrow usize)
-    /// instead of a wrapped offset that silently passes the length check.
+    /// `layer_id * layer_bytes` must not wrap: an absurd layer id yields an explicit error (offset overflow,
+    /// or too-short file on narrow usize) instead of a wrapped offset that silently passes the length check.
     #[test]
     fn test_prefetch_layer_offset_overflow_errors() {
         let dir = tempdir().unwrap();

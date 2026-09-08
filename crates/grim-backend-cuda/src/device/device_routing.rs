@@ -9,18 +9,13 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::cuda_device::CudaDevice;
-use crate::device::handles::{
-    cuLaunchKernel, cuModuleGetFunction, CUfunction, CudaHandle,
-};
+use crate::device::handles::{CUfunction, CudaHandle, cuLaunchKernel, cuModuleGetFunction};
 use crate::device::jit_cache::compile_and_load_kernel;
 use crate::memory::storage::CudaStorage;
 
 impl CudaDevice {
-    /// Fused grouped MoE dispatch (WI-M5). Mirrors `grim_moe_fused_dispatch` on ROCm
-    /// and `moe_fused_dispatch` on Vulkan: one CUDA thread block per routed
-    /// (token, expert) pair, computing the full SwiGLU expert contribution and
-    /// atomicAdding the `routed_scaling_factor * weight`-scaled result into the
-    /// shared token output. `grid_x = num_pairs`.
+    /// Fused grouped MoE dispatch (WI-M5). Mirrors `grim_moe_fused_dispatch` on ROCm and `moe_fused_dispatch` on Vulkan: one CUDA thread block per routed (token,
+    /// expert) pair, computing the full SwiGLU expert contribution and atomicAdding the `routed_scaling_factor * weight`-scaled result into the shared token output.
     pub fn moe_fused_dispatch(
         &self,
         x: &dyn BackendStorage,
@@ -154,7 +149,6 @@ impl CudaDevice {
     }
 
     /// Fused MoE dispatch against resident weights.
-    ///
     /// Provides parity with resident MoE dispatch entry points on other backend devices.
     pub fn moe_fused_dispatch_resident(
         &self,
@@ -188,6 +182,4 @@ impl CudaDevice {
             routed_scaling_factor,
         )
     }
-
-
 }

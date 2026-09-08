@@ -1,9 +1,5 @@
 //! Qwen3.5-MoE architecture with YaRN RoPE support and fine-grained routed/shared experts.
-//!
-//! # Architecture Details
-//! - **YaRN Frequency Scaling**: Decoupled high/low frequency interpolation on RoPE positional encodings.
-//! - **Fine-Grained MoE**: Top-k softmax routing across $N$ routed experts plus dedicated shared expert pathways.
-//! - **GQA Attention**: Grouped Query Attention with RMSNorm pre/post attention normalizations.
+//! # Architecture Details - **YaRN Frequency Scaling**: Decoupled high/low frequency interpolation on RoPE positional encodings.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -12,9 +8,7 @@ use grim_nn::moe::{ExpertBank, ExpertTriple, MoeFfn, MoeRouter, RouterKind};
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Qwen3.5-MoE transformer architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,9 +76,7 @@ impl ModelConfig for Qwen35MoeConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Feed-Forward Layer
-// ---------------------------------------------------------------------------
 
 pub struct Qwen35MoeExpert {
     pub gate_proj: Linear,
@@ -119,11 +111,8 @@ impl Qwen35MoeExpert {
     }
 }
 
-/// Qwen3.5-MoE feed-forward: routes through the shared `MoeFfn` so ROCm
-/// serving gets the fused Charon dispatch (top-k router + routed experts +
-/// shared expert) instead of a per-token host loop. Weight layout is
-/// unchanged (`mlp.gate`, `mlp.experts.{e}.gate_proj|up_proj|down_proj`,
-/// `mlp.shared_expert.*`).
+/// Qwen3.5-MoE feed-forward: routes through the shared `MoeFfn` so ROCm serving gets the fused Charon dispatch (top-k router + routed experts + shared expert) instead of a per-token host loop.
+/// Weight layout is unchanged (`mlp.gate`, `mlp.experts.{e}.gate_proj|up_proj|down_proj`, `mlp.shared_expert.*`).
 pub struct Qwen35MoeLayer {
     pub ffn: MoeFfn,
 }
@@ -194,9 +183,7 @@ impl Qwen35MoeLayer {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct Qwen35MoeBlock {
     pub wq: Linear,
@@ -256,10 +243,8 @@ impl Qwen35MoeBlock {
         })
     }
 
-    /// GPU-first forward: Q/K RoPE, KV-cache concat, attention and the
-    /// residual adds run on the tensor's device. Host paths are only reached
-    /// through the fused-kernel fallback guards and the (host-side) MoE
-    /// routing pull.
+    /// GPU-first forward: Q/K RoPE, KV-cache concat, attention and the residual adds run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards and the (host-side) MoE routing.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -273,12 +258,8 @@ impl Qwen35MoeBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -325,9 +306,7 @@ impl Qwen35MoeBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct Qwen35Moe {
     pub cfg: Qwen35MoeConfig,
@@ -453,11 +432,8 @@ mod tests {
         assert_eq!(cfg.num_experts_per_tok, 8);
     }
 
-    /// Parity gate for the MoeFfn migration: the layer must reproduce the
-    /// original per-token host algorithm (softmax top-k routing, weighted
-    /// expert sum scaled by routed_scaling_factor, shared expert added
-    /// unconditionally) — that algorithm is what the fused Charon kernel
-    /// matches bit-for-bit on ROCm.
+    /// Parity gate for the MoeFfn migration: the layer must reproduce the original per-token host algorithm (softmax top-k routing, weighted expert
+    /// sum scaled by routed_scaling_factor, shared expert added unconditionally) - that algorithm is what the fused Charon kernel matches bit-for-bit on ROCm.
     #[test]
     fn test_qwen35moe_layer_matches_host_reference() {
         let hidden = 4usize;
@@ -485,9 +461,15 @@ mod tests {
             num_experts,
             None,
         );
-        let gates: Vec<Linear> = (0..num_experts).map(|e| lin(hidden, inter, e as f32)).collect();
-        let ups: Vec<Linear> = (0..num_experts).map(|e| lin(hidden, inter, e as f32 + 0.3)).collect();
-        let downs: Vec<Linear> = (0..num_experts).map(|e| lin(inter, hidden, e as f32 + 0.6)).collect();
+        let gates: Vec<Linear> = (0..num_experts)
+            .map(|e| lin(hidden, inter, e as f32))
+            .collect();
+        let ups: Vec<Linear> = (0..num_experts)
+            .map(|e| lin(hidden, inter, e as f32 + 0.3))
+            .collect();
+        let downs: Vec<Linear> = (0..num_experts)
+            .map(|e| lin(inter, hidden, e as f32 + 0.6))
+            .collect();
         let shared = ExpertTriple {
             gate: lin(hidden, inter, 9.1),
             up: lin(hidden, inter, 9.4),
@@ -542,16 +524,21 @@ mod tests {
             let token = &x[s * hidden..(s + 1) * hidden];
             let mut row_logits: Vec<(usize, f32)> = (0..num_experts)
                 .map(|e| {
-                    let dot: f32 = (0..hidden).map(|k| token[k] * gw[e * hidden + k]).sum::<f32>();
+                    let dot: f32 = (0..hidden)
+                        .map(|k| token[k] * gw[e * hidden + k])
+                        .sum::<f32>();
                     (e, dot)
                 })
                 .collect();
             row_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let top = &row_logits[..top_k];
-            let max_l = top.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = top
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = top.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum: f32 = exps.iter().sum();
-            for (_i, ((e, _), ex)) in top.iter().zip(exps.iter()).enumerate() {
+            for ((e, _), ex) in top.iter().zip(exps.iter()) {
                 let w = ex / sum * scaling;
                 let eo = forward_expert(&gates[*e], &ups[*e], &downs[*e], token);
                 for dd in 0..hidden {

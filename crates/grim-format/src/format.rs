@@ -1,8 +1,5 @@
 //! Custom `.grim` (Outlier-Aware Streams & Wave-aware) Format representation.
-//!
-//! Defines the binary layout for native `.grim` model files: a header,
-//! a JSON metadata layer, a tensor registry, and a dual-stream payload
-//! (normals + outliers). See `grim_v2.md` §1 for the format specification.
+//! Defines the binary layout for native `.grim` model files: a header, a JSON metadata layer,.
 
 use grim_tensor::error::{Error, Result};
 use std::collections::HashMap;
@@ -16,25 +13,15 @@ pub const FUCKING_SORCERY: [u8; 5] = [0x47, 0x52, 0x49, 0x4d, 0x01];
 pub const GRIM_MAGIC: [u8; 5] = FUCKING_SORCERY;
 
 /// Wave64 coalesced memory segment size in bytes.
-///
-/// Normals streams are aligned to a wavefront segment boundary (256 B for
-/// Wave64, 128 B for Wave32) so that a single wavefront load fetches
-/// exactly one segment (spec §1, §4).
+/// Normals streams are aligned to a wavefront segment boundary (256 B for Wave64, 128 B.
 pub const WAVE64_SEGMENT_BYTES: usize = 256;
 
 /// Coalesced memory segment size (bytes) of a **Wave32** wavefront's load.
-///
-/// RDNA2 (gfx103x) and later discrete ADIS parts run 32-wide wavefronts, so
-/// their nominal coalesced segment is half a Wave64 segment (32 lanes × 4B).
+/// RDNA2 (gfx103x) and later discrete ADIS parts run 32-wide wavefronts, so their nominal coalesced segment.
 pub const WAVE32_SEGMENT_BYTES: usize = 128;
 
 /// Which wavefront size a `.grim` payload was packed and offset-aligned for.
-///
-/// The wave is a *build-time* property: the conversion process dictates it
-/// (RDNA → [`WaveSize::W32`] — the default; CDNA `gfx90x` → [`WaveSize::W64`];
-/// unknown / "all" → [`WaveSize::W32`]). The file is written (padding,
-/// offsets) against that segment. Most callers get W32 by default; a Wave64
-/// build is only reached via an explicit override or a CDNA GCN.
+/// The wave is a *build-time* property: the conversion process dictates it (RDNA → [`WaveSize::W32`] -.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WaveSize {
     /// 64-lane wavefront (CDNA), 256-byte coalesced segment. Opt-in.
@@ -62,12 +49,7 @@ impl WaveSize {
     }
 
     /// Map a GCN architecture string to the wave it should be built for.
-    ///
-    /// This project is RDNA-first: RDNA (`gfx103x`, `gfx11x`, `gfx12x`) is
-    /// Wave32 and is the default for anything unrecognized ("auto", "all",
-    /// unknown). Only CDNA (`gfx90x`) resolves to Wave64. Mirrors the
-    /// `gfx` → profile → wavefront mapping used at convert time and by the
-    /// ROCm backend.
+    /// This project is RDNA-first: RDNA (`gfx103x`, `gfx11x`, `gfx12x`) is Wave32 and is the default for.
     pub fn from_gcn(gcn: &str) -> Self {
         let g = gcn.trim().to_ascii_lowercase();
         if g.starts_with("gfx9") {
@@ -271,10 +253,8 @@ impl GrimTensorEntry {
             .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
         let outlier_offset = u64::from_le_bytes(o_offset_bytes);
 
-        // FMT-15 fix (cont.): the KV fields are now always read below, so the
-        // initializers are dead — declare without an initializer to avoid
-        // "value assigned is never read" warnings (the workspace denies
-        // warnings). Each is assigned exactly once in the read block.
+        // FMT-15 fix (cont.): the KV fields are now always read below, so the initializers are dead - declare without an initializer to avoid "value assigned is never read" warnings (the workspace denies warnings).
+        // Each is assigned exactly once in the read block.
         let kv_present: u8;
         let kv_rotated: u8;
         let kv_bits_k: u8;
@@ -286,13 +266,8 @@ impl GrimTensorEntry {
         let kv_compressed_offset: u64;
         let kv_compressed_size: u64;
 
-        // FMT-15 fix: the writer (`GrimTensorEntry::write`) and the byte-size
-        // accounting (`registry_entry_size`, used to lay out payload offsets)
-        // ALWAYS emit/charge the 45-byte KV field block per entry, so the
-        // reader must always consume it too. The previous `has_kv`-gated read
-        // desynced the stream whenever a file was read with `has_kv == false`
-        // (e.g. `has_kv_registry` unset), silently misaligning every subsequent
-        // tensor's payload. We now unconditionally read the KV fields.
+        // FMT-15 fix: the writer (`GrimTensorEntry::write`) and the byte-size accounting (`registry_entry_size`, used to lay out payload offsets) ALWAYS emit/charge the 45-byte KV field block per entry, so the reader must always consume it too.
+        // The previous `has_kv`-gated read desynced the stream whenever a file was read with `has_kv ==.
         {
             let mut buf_u8 = [0u8; 1];
             r.read_exact(&mut buf_u8)
@@ -359,20 +334,10 @@ impl GrimTensorEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Outlier stream layout (spec §1: "Outliers Stream — Indices + float outliers")
-// ---------------------------------------------------------------------------
+// Outlier stream layout (spec §1: "Outliers Stream - Indices + float outliers")
 
 /// Byte-level record for one outlier in the outliers stream.
-///
 /// Layout: `[ index: u32 LE | value: f16 LE ]` = 6 bytes per outlier.
-/// `index` is the flat position within the tensor's dequantized element
-/// space (row-major). `value` is the high-precision correction that
-/// replaces the low-bit normal at that position.
-///
-/// `outlier_count` in [`GrimTensorEntry`] gives the number of these
-/// records; the outliers stream for one tensor spans
-/// `outlier_count * OUTLIER_RECORD_BYTES` starting at `outlier_offset`.
 pub const OUTLIER_RECORD_BYTES: usize = 6;
 
 /// One decoded outlier: position + correction value.
@@ -413,11 +378,7 @@ impl GrimOutlier {
 }
 
 /// Read and decode the outliers stream for one tensor.
-///
 /// Defaults to the legacy flat `OUTLIER_RECORD_BYTES` (6-byte) encoding.
-/// Callers that store `outlier_index_encoding` on the tensor's
-/// [`crate::spec::GrimTensorExt`] should use
-/// [`read_outliers_with_encoding`] to dispatch on the encoding mode.
 pub fn read_outliers<R: Read + Seek>(
     reader: &mut R,
     entry: &GrimTensorEntry,
@@ -444,13 +405,8 @@ pub fn read_outliers<R: Read + Seek>(
     Ok(outliers)
 }
 
-/// Read outliers, dispatching on the encoding declared in the tensor's
-/// capability extension. Returns a `Vec<GrimOutlier>` of length
-/// `entry.outlier_count` regardless of the on-disk encoding.
-///
-/// - `FlatU32` (default, legacy): 6 bytes per record, see [`GrimOutlier`].
-/// - `DeltaVarint` (compressed): see
-///   [`crate::spec::decode_outliers_delta_varint`].
+/// Read outliers, dispatching on the encoding declared in the tensor's capability extension.
+/// Returns a `Vec<GrimOutlier>` of length `entry.outlier_count` regardless of the on-disk encoding.
 pub fn read_outliers_with_encoding<R: Read + Seek>(
     reader: &mut R,
     entry: &GrimTensorEntry,
@@ -480,18 +436,10 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
         .collect())
 }
 
-// ---------------------------------------------------------------------------
 // Normals stream layout (spec §1, §4: Wave64-aligned packed blocks)
-// ---------------------------------------------------------------------------
 
 /// Compute the packed byte size of a normals stream for one tensor.
-///
-/// The normals stream holds the low-bit-weight majority, packed at
-/// `base_bitwidth` bits per weight and aligned to a wave segment
-/// (default [`WAVE64_SEGMENT_BYTES`]; pass a [`WaveSize`] to pack for a
-/// Wave32 host instead). Outlier positions are excluded (they live in
-/// the outliers stream), so the element count is
-/// `total_elements - outlier_count`.
+/// The normals stream holds the low-bit-weight majority, packed at `base_bitwidth` bits per weight and aligned.
 pub fn normals_packed_size(total_elements: usize, outlier_count: u32, base_bitwidth: u8) -> u64 {
     normals_packed_size_for_wave(total_elements, outlier_count, base_bitwidth, WaveSize::W64)
 }
@@ -509,17 +457,8 @@ pub fn normals_packed_size_for_wave(
     align_to_segment(bytes, wave.segment_bytes())
 }
 
-/// Layout of a single tensor's normals stream, used by the Phase 2
-/// codes+scales readers/writers.
-///
-/// `Legacy` (default) is codes-only — matches the original V1 layout
-/// where the per-tensor entry has no scale region. `WithScales` adds a
-/// per-row scale region of `row_count` bytes (one u8 per row) right
-/// after the codes region, both aligned to the wave segment.
-///
-/// Phase 3 adds optional per-row mixed bitwidths: when `row_bpw_table`
-/// is non-empty, each row is packed at its own bpw and padded to a
-/// wave segment independently.
+/// Layout of a single tensor's normals stream, used by the Phase 2 codes+scales readers/writers.
+/// `Legacy` (default) is codes-only - matches the original V1 layout where the per-tensor entry has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalsLayout {
     /// Total dequantized element count of the tensor (rows × row_stride).
@@ -579,11 +518,8 @@ impl NormalsLayout {
         }
     }
 
-    /// Phase 3 layout: per-row mixed bitwidths plus an optional per-row
-    /// scale region.
-    ///
-    /// `row_bpw_table` length must equal `row_count` (when scales are
-    /// present) or zero (uniform mode). Each entry must be in 2..=8.
+    /// Phase 3 layout: per-row mixed bitwidths plus an optional per-row scale region.
+    /// `row_bpw_table` length must equal `row_count` (when scales are present) or zero (uniform mode).
     pub fn with_mixed_bpw(
         total_elements: usize,
         outlier_count: u32,
@@ -620,10 +556,7 @@ impl NormalsLayout {
     }
 
     /// Byte size of the codes region, aligned to the layout's wave segment.
-    ///
-    /// In uniform mode this is the total packed-bit size aligned to one
-    /// wave segment. In mixed-bpw mode each row is packed at its own
-    /// bpw and aligned independently, then concatenated.
+    /// In uniform mode this is the total packed-bit size aligned to one wave segment.
     pub fn codes_size(&self) -> u64 {
         let seg = self.wave.segment_bytes();
         if self.is_mixed_bpw() {
@@ -676,16 +609,10 @@ fn align_wave64(n: u64) -> u64 {
     align_to_segment(n, WAVE64_SEGMENT_BYTES)
 }
 
-// ---------------------------------------------------------------------------
-// Backup (residual) stream layout — spec Phase 4 (D4, D5)
-// ---------------------------------------------------------------------------
+// Backup (residual) stream layout - spec Phase 4 (D4, D5)
 
 /// Layout of one backup (residual) stream for a tensor.
-///
-/// A backup stream is an additive correction applied at dequant time
-/// after the codes. It carries its own packed codes at `bpw` bits and
-/// its own per-row u8 scale region. Spec §Architecture "Residual
-/// (backup) streams".
+/// A backup stream is an additive correction applied at dequant time after the codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupLayout {
     /// Number of elements the backup covers (= the tensor's element count).
@@ -735,13 +662,8 @@ impl BackupLayout {
     }
 }
 
-/// Write a backup stream: codes first (Wave64-aligned), then the per-row
-/// u8 scale region (Wave64-aligned).
-///
-/// Mirrors [`write_normals`] but for the additive residual layer. The
-/// caller supplies packed codes bytes (length ≤ `layout.codes_size()`)
-/// and per-row u8 scales (length = `layout.row_count`, or empty when no
-/// scales).
+/// Write a backup stream: codes first (Wave64-aligned), then the per-row u8 scale region (Wave64-aligned).
+/// Mirrors [`write_normals`] but for the additive residual layer.
 pub fn write_backup<W: Write>(
     w: &mut W,
     layout: &BackupLayout,
@@ -789,9 +711,7 @@ pub fn write_backup<W: Write>(
 }
 
 /// Read a backup stream previously written by [`write_backup`].
-///
-/// Returns the codes bytes (always `layout.codes_size()` long when
-/// present) and the per-row scale bytes (trimmed to `row_count`).
+/// Returns the codes bytes (always `layout.codes_size()` long when present) and the per-row scale bytes (trimmed.
 pub fn read_backup<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -828,18 +748,8 @@ pub struct NormalsPayload {
     pub scales: Vec<u8>,
 }
 
-/// Write a normals stream: codes first, then (if the layout has scales)
-/// the per-row u8 scale bytes. Both regions are Wave64-aligned.
-///
-/// `codes_in` is the still-packed codes buffer (its length must match
-/// `layout.codes_size()`). `scales_in` is the per-row u8 scale buffer
-/// (length must match `layout.row_count`); ignored when the layout has
-/// no scales.
-///
-/// In mixed-bpw mode, `codes_in` must already be laid out as the
-/// concatenation of per-row Wave64-aligned packed segments — callers
-/// pack each row at its own bpw and let this function handle only the
-/// scale-region append.
+/// Write a normals stream: codes first, then (if the layout has scales) the per-row u8 scale bytes.
+/// Both regions are Wave64-aligned.
 pub fn write_normals<W: Write>(
     w: &mut W,
     layout: &NormalsLayout,
@@ -884,20 +794,15 @@ pub fn write_normals<W: Write>(
 }
 
 /// Pack one row's elements at `bpw` bits and append with Wave64 padding.
-///
-/// Helper for mixed-bpw writers: given `row_values` as f32 and the row's
-/// bitwidth, pack to `bpw` bits big-endian-bit / little-endian-byte (the
-/// spec convention matching EXL2/GPTQ) and append to `out`, zero-padded
-/// to the next 256-byte boundary.
+/// Helper for mixed-bpw writers: given `row_values` as f32 and the row's bitwidth, pack to `bpw`.
 pub fn pack_row_bpw(out: &mut Vec<u8>, row_values: &[f32], bpw: u8) {
     let bits = row_values.len() as u64 * bpw as u64;
     let bytes_needed = bits.div_ceil(8) as usize;
     let start = out.len();
     out.resize(start + bytes_needed, 0u8);
 
-    // Big-endian-bit, little-endian-byte packing. Each value occupies
-    // `bpw` bits; the first value lives in the high bits of byte 0.
-    // Codes can straddle a byte boundary when (bit_offset % 8) + bpw > 8.
+    // Big-endian-bit, little-endian-byte packing.
+    // Each value occupies `bpw` bits; the first value lives in the high bits of byte.
     for (i, &v) in row_values.iter().enumerate() {
         let code = quantize_to_bpw(v, bpw) as u32;
         let bit_offset = i * bpw as usize;
@@ -970,10 +875,7 @@ fn quantize_to_bpw(value: f32, bpw: u8) -> u8 {
 }
 
 /// Read a normals stream previously written by [`write_normals`].
-///
-/// Splits the payload at `codes_size()` and returns the codes and scales
-/// regions separately. The codes region is always returned; the scales
-/// region is empty when the layout has no scales.
+/// Splits the payload at `codes_size()` and returns the codes and scales regions separately.
 pub fn read_normals_split<R: Read + Seek>(
     reader: &mut R,
     payload_offset: u64,
@@ -999,9 +901,7 @@ pub fn read_normals_split<R: Read + Seek>(
 }
 
 /// Read the raw (still-packed) normals bytes for one tensor.
-///
-/// The caller is responsible for dequantizing the packed bits according
-/// to `entry.base_bitwidth`. This function returns the bytes verbatim.
+/// The caller is responsible for dequantizing the packed bits according to `entry.base_bitwidth`.
 pub fn read_normals<R: Read + Seek>(reader: &mut R, entry: &GrimTensorEntry) -> Result<Vec<u8>> {
     if entry.payload_size == 0 {
         return Ok(Vec::new());
@@ -1012,13 +912,8 @@ pub fn read_normals<R: Read + Seek>(reader: &mut R, entry: &GrimTensorEntry) -> 
     Ok(buf)
 }
 
-/// Read normals bytes, decompressing if the tensor's capability
-/// extension declares `PayloadCompression::Zstd`.
-///
-/// Phase 6 (spec D13). When `compression == Raw` (or when no extension
-/// is supplied) this is identical to [`read_normals`]. When `Zstd` is
-/// declared, the on-disk payload is zstd-compressed and this function
-/// returns the decompressed bytes.
+/// Read normals bytes, decompressing if the tensor's capability extension declares `PayloadCompression::Zstd`.
+/// Phase 6 (spec D13).
 pub fn read_normals_decompressing<R: Read + Seek>(
     reader: &mut R,
     entry: &GrimTensorEntry,
@@ -1035,24 +930,15 @@ pub fn read_normals_decompressing<R: Read + Seek>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Persistent KV-cache layout (WI-R4) — extends `GrimTensorEntry`
-// ---------------------------------------------------------------------------
+// Persistent KV-cache layout (WI-R4) - extends `GrimTensorEntry`
 
 /// Wave64-aligned byte blob encoding for a compressed KV cache.
-///
-/// The on-disk KV region is a single Wave64-aligned byte blob pointed at by
-/// `GrimTensorEntry::kv_compressed_offset` / `kv_compressed_size`. The exact
-/// inner byte layout is owned by the producer (e.g. `grim-kvquant`'s
-/// `CompressedKvBlock::to_bytes`); this module only carries the bytes
-/// verbatim so that a reloaded session can reproduce the compressed cache
-/// bit-for-bit. Legacy (V2) entries carry `kv_present = 0` and an empty blob.
+/// The on-disk KV region is a single Wave64-aligned byte blob pointed at by `GrimTensorEntry::kv_compressed_offset` /.
 pub fn write_kv_block<W: Write>(w: &mut W, blob: &[u8]) -> Result<()> {
     w.write_all(blob)
         .map_err(|e| Error::Backend(format!("kv block write failed: {e}")))?;
-    // Pad the KV blob to the next Wave64 segment boundary so the next
-    // tensor's payload region stays Wave64-aligned (consistency with the
-    // normals/outlier payloads).
+    // Pad the KV blob to the next Wave64 segment boundary so
+    // the next tensor's payload region stays Wave64-aligned (consistency with the normals/outlier payloads).
     let pad = align_wave64(blob.len() as u64) as usize - blob.len();
     if pad > 0 {
         w.write_all(&vec![0u8; pad])
@@ -1062,10 +948,7 @@ pub fn write_kv_block<W: Write>(w: &mut W, blob: &[u8]) -> Result<()> {
 }
 
 /// Read a previously-written KV blob back from the payload region.
-///
-/// Returns exactly `entry.kv_compressed_size` bytes starting at
-/// `entry.kv_compressed_offset`. When `kv_present == 0` the caller should
-/// not call this (the blob is empty); we still guard against zero size.
+/// Returns exactly `entry.kv_compressed_size` bytes starting at `entry.kv_compressed_offset`.
 pub fn read_kv_block<R: Read + Seek>(reader: &mut R, entry: &GrimTensorEntry) -> Result<Vec<u8>> {
     if entry.kv_compressed_size == 0 {
         return Ok(Vec::new());
@@ -1077,15 +960,8 @@ pub fn read_kv_block<R: Read + Seek>(reader: &mut R, entry: &GrimTensorEntry) ->
 }
 
 impl GrimTensorEntry {
-    /// Record the persistent-KV layout fields from a compressed KV block's
-    /// shape, leaving the byte blob (`kv_compressed_offset`/`size`) to be set
-    /// by the writer after payload offsets are computed.
-    ///
-    /// `rotated` reflects RotateKV-style pre-rotation; `bits_k`/`bits_v` are
-    /// the per-head bit-widths (0 = inherit default). Callers pass the
-    /// producer's serialized blob length via `compressed_size` so the reader
-    /// can fetch the right number of bytes; the `*_offset` is filled in by
-    /// `GrimFile::write`.
+    /// Record the persistent-KV layout fields from a compressed KV block's shape, leaving the byte blob (`kv_compressed_offset`/`size`) to be set by the writer after payload offsets are computed.
+    /// `rotated` reflects RotateKV-style pre-rotation; `bits_k`/`bits_v` are the per-head bit-widths (0 = inherit default).
     #[allow(clippy::too_many_arguments)]
     pub fn set_kv_layout(
         &mut self,
@@ -1110,37 +986,26 @@ impl GrimTensorEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Parsed file assembly + reader
-// ---------------------------------------------------------------------------
 
 /// Fully parsed native `.grim` file: header, metadata, tensor registry.
-///
-/// Raw payload bytes are not held in memory — use [`read_normals`] /
-/// [`read_outliers`] to lazily fetch tensor data from the underlying reader.
+/// Raw payload bytes are not held in memory - use [`read_normals`] / [`read_outliers`] to lazily.
 pub struct GrimFile {
     pub header: GrimHeader,
     pub metadata: crate::gguf::GrimMetadata,
     pub tensors: Vec<GrimTensorEntry>,
-    /// Wavefront segment this file's payload offsets are aligned to
-    /// (build-time property; derived from metadata on read, RDNA-first
-    /// [`WaveSize::W32`] when unset).
+    /// Wavefront segment this file's payload offsets are aligned to (build-time
+    /// property; derived from metadata on read, RDNA-first [`WaveSize::W32`] when unset).
     pub wave: WaveSize,
     pub tensors_by_name: HashMap<String, usize>,
-    /// Optional per-tensor serialized KV-cache blobs (WI-R4). Keyed by
-    /// tensor name; only present when a writer attached a compressed KV
-    /// block via [`GrimFile::add_kv_blob`]. The blob bytes are written into
-    /// the payload region and the owning entry's `kv_compressed_offset` is
-    /// assigned during [`GrimFile::write`].
+    /// Optional per-tensor serialized KV-cache blobs (WI-R4).
+    /// Keyed by tensor name; only present when a writer attached a compressed KV block via.
     pub kv_blobs: HashMap<String, Vec<u8>>,
 }
 
 impl GrimFile {
     /// Attach a serialized KV-cache blob for `tensor_name` (WI-R4).
-    ///
-    /// The blob is written into the payload region at `GrimFile::write`
-    /// time; `entry.kv_compressed_offset` is assigned then. Legacy files
-    /// that never call this keep an empty map and `kv_present == 0`.
+    /// The blob is written into the payload region at `GrimFile::write` time; `entry.kv_compressed_offset` is assigned then.
     pub fn add_kv_blob(&mut self, tensor_name: impl Into<String>, blob: Vec<u8>) {
         self.kv_blobs.insert(tensor_name.into(), blob);
     }
@@ -1148,10 +1013,7 @@ impl GrimFile {
 
 impl GrimFile {
     /// Parse the header + JSON metadata + tensor registry from a reader.
-    ///
-    /// The reader's position after this call is at the start of the raw
-    /// payload region. Tensor data is read lazily via [`read_normals`] /
-    /// [`read_outliers`].
+    /// The reader's position after this call is at the start of the raw payload region.
     pub fn read<R: Read + Seek>(reader: &mut R) -> Result<Self> {
         let header = GrimHeader::read(reader)?;
 
@@ -1206,10 +1068,7 @@ impl GrimFile {
     }
 
     /// Write the complete `.grim` file: header + JSON metadata + registry + payloads.
-    ///
-    /// Payload offsets (`payload_offset`, `outlier_offset`) in `tensors` are
-    /// recomputed relative to the start of the payload region and overwritten
-    /// in the written entries, so callers can pass zeros.
+    /// Payload offsets (`payload_offset`, `outlier_offset`) in `tensors` are recomputed relative to the start of the payload.
     pub fn write<W: Write + Seek>(&self, w: &mut W) -> Result<Vec<GrimTensorEntry>> {
         let mut metadata = self.metadata.clone();
         metadata.has_kv_registry = Some(true);
@@ -1238,10 +1097,8 @@ impl GrimFile {
             offset += entry.payload_size;
             entry.outlier_offset = offset;
             offset += entry.outlier_count as u64 * OUTLIER_RECORD_BYTES as u64;
-            // KV blob (WI-R4): appended after the outlier stream, then
-            // Wave64-aligned. `kv_compressed_offset` is assigned here;
-            // `kv_compressed_size` was set by the caller via
-            // `GrimTensorEntry::set_kv_layout`.
+            // KV blob (WI-R4): appended after the outlier stream, then Wave64-aligned.
+            // `kv_compressed_offset` is assigned here; `kv_compressed_size` was set by the caller via `GrimTensorEntry::set_kv_layout`.
             if entry.kv_present != 0 && entry.kv_compressed_size > 0 {
                 entry.kv_compressed_offset = offset;
                 offset += entry.kv_compressed_size;
@@ -1256,10 +1113,8 @@ impl GrimFile {
             entry.write(w)?;
         }
 
-        // KV blobs (WI-R4) are emitted by the caller after `write`, using the
-        // assigned `kv_compressed_offset`. This matches the existing pattern
-        // where the caller writes the normals payload at `payload_offset`
-        // using the returned `written_entries`. See `write_kv_block`.
+        // KV blobs (WI-R4) are emitted by the caller after `write`, using the assigned `kv_compressed_offset`.
+        // This matches the existing pattern where the caller writes the normals payload at `payload_offset` using.
 
         Ok(written_entries)
     }
@@ -1270,14 +1125,8 @@ impl GrimFile {
     }
 }
 
-/// Rewrite a `.grim` file's JSON metadata in place, preserving every payload
-/// byte (P1 §8: `preferred_dtype`, `gemm_backend`, `fp8`,
-/// `multi_gpu.strategy`, … tags written at train/save time).
-///
-/// The metadata region length changes shift every payload offset, so the file
-/// is rebuilt into a sibling temp file — header + mutated metadata + registry
-/// with recomputed offsets, then each tensor's payload/outlier/KV extents are
-/// stream-copied from the original — and atomically renamed over `path`.
+/// Rewrite a `.grim` file's JSON metadata in place, preserving every payload byte (P1 §8: `preferred_dtype`, `gemm_backend`, `fp8`, `multi_gpu.strategy`, … tags written at train/save time).
+/// The metadata region length changes shift every payload offset, so the file is rebuilt into.
 pub fn rewrite_metadata<P: AsRef<std::path::Path>>(
     path: P,
     mutate: impl FnOnce(&mut crate::gguf::GrimMetadata),
@@ -1408,9 +1257,8 @@ mod tests {
 
     #[test]
     fn normals_packed_size_for_wave_uses_half_segment_on_wave32() {
-        // Same 1000 elements at 4 bits = 500 bytes, but a Wave32 segment is
-        // 128 bytes → ceiling is 4 segments = 512 (identical); pick a payload
-        // that differs so the Wave64/Wave32 delineation is observable.
+        // Same 1000 elements at 4 bits = 500 bytes, but a Wave32 segment is 128 bytes →
+        // ceiling is 4 segments = 512 (identical); pick a payload that differs so the Wave64/Wave32 delineation is observable.
         let w64 = normals_packed_size(128, 0, 4); // 64 bytes → up to 256
         let w32 = normals_packed_size_for_wave(128, 0, 4, WaveSize::W32); // → up to 128
         assert_eq!(w64, WAVE64_SEGMENT_BYTES as u64);
@@ -1507,9 +1355,8 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// Phase 2: a legacy layout has no scales region — write_normals
-    /// accepts an empty scales buffer and read_normals_split returns
-    /// empty scales.
+    /// Phase 2: a legacy layout has no scales region -
+    /// write_normals accepts an empty scales buffer and read_normals_split returns empty scales.
     #[test]
     fn write_then_read_normals_legacy_has_no_scales() {
         let layout = NormalsLayout::legacy(256, 0, 4);
@@ -1539,14 +1386,12 @@ mod tests {
         assert_eq!(layout.codes_size(), 512);
     }
 
-    /// Phase 3: mixed-bpw layout's total size is between uniform-min and
-    /// uniform-max at the same element count, for realistic tensor sizes
-    /// where Wave64 padding is negligible.
+    /// Phase 3: mixed-bpw layout's total size is between uniform-min and uniform-max at
+    /// the same element count, for realistic tensor sizes where Wave64 padding is negligible.
     #[test]
     fn normals_layout_mixed_bpw_size_between_uniform_bounds() {
-        // 2 rows × 4096 elements each = 8192 total. Wave64 alignment is
-        // negligible here, so the mixed size sits between uniform-2 and
-        // uniform-6 as the spec requires.
+        // 2 rows × 4096 elements each = 8192 total.
+        // Wave64 alignment is negligible here, so the mixed size sits between uniform-2 and uniform-6 as.
         let total = 8192;
         let row_stride = 4096u64;
         let uniform_2 = NormalsLayout::legacy(total, 0, 2).codes_size();
@@ -1561,9 +1406,8 @@ mod tests {
         );
     }
 
-    /// Phase 3: pack_row_bpw lays out a single row of 8 f32 values at
-    /// 4 bits each, producing exactly 4 bytes of packed codes followed
-    /// by Wave64 alignment padding.
+    /// Phase 3: pack_row_bpw lays out a single row of 8 f32 values at 4
+    /// bits each, producing exactly 4 bytes of packed codes followed by Wave64 alignment padding.
     #[test]
     fn pack_row_bpw_packs_eight_values_at_4_bits() {
         let values = vec![-1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, -0.25, 0.75];
@@ -1575,9 +1419,8 @@ mod tests {
         assert!(out.len() >= 4);
         assert_eq!(out.len() % WAVE64_SEGMENT_BYTES, 0);
 
-        // First value -1.0 maps to code 0; second -0.5 to code 5 (in a
-        // 16-level grid: (-0.5+1)*0.5*15 = 3.75 → 4). High nibble of
-        // byte 0 should be 0, low nibble should be the second code.
+        // First value -1.0 maps to code 0; second -0.5 to code 5 (in a 16-level grid: (-0.5+1)*0.5*15 = 3.75 → 4).
+        // High nibble of byte 0 should be 0, low nibble should be the second code.
         assert_eq!(out[0] >> 4, 0, "first code must be 0 for value -1.0");
     }
 
@@ -1751,8 +1594,7 @@ mod tests {
     }
 
     /// P1 §8: `rewrite_metadata` splices new tags into an on-disk `.grim`
-    /// file while preserving every payload/outlier byte at the recomputed
-    /// offsets.
+    /// file while preserving every payload/outlier byte at the recomputed offsets.
     #[test]
     fn rewrite_metadata_updates_tags_and_preserves_payloads() {
         use crate::gguf::{GrimMetadata, GrimRocmlProfile};
@@ -1840,9 +1682,8 @@ mod tests {
         .unwrap();
     }
 
-    /// WI-R4: a compressed KV block written via `GrimFile::add_kv_blob` +
-    /// `set_kv_layout` round-trips byte-identically, and a reloaded session
-    /// sees `kv_present == 1` with the same blob.
+    /// WI-R4: a compressed KV block written via `GrimFile::add_kv_blob` + `set_kv_layout` round-trips byte-identically,
+    /// and a reloaded session sees `kv_present == 1` with the same blob.
     #[test]
     fn kv_block_round_trips_byte_identical() {
         use crate::gguf::GrimMetadata;

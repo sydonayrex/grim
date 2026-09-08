@@ -1,8 +1,5 @@
 //! Paged KV cache device-resident mirror and asynchronous tiering coordinator (F10).
-//!
 //! Tracks dual-resident KV blocks between Device HBM and Host RAM backing mirrors.
-//! Enables asynchronous non-blocking writeback, high-watermark spill staging, and
-//! instantaneous promotion without stalling GPU decode kernel execution.
 
 use std::collections::{HashMap, HashSet};
 

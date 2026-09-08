@@ -30,20 +30,16 @@ pub struct LlamaConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
-    /// Fraction of `head_dim` that participates in RoPE (e.g. 0.5 → rotate
-    /// half the channels). Defaults to 1.0 (full rotary); set < 1.0 for
-    /// partial-rotary models like Qwen3.5-MoE.
+    /// Fraction of `head_dim` that participates in RoPE (e.g.
+    /// 0.5 → rotate half the channels).
     pub partial_rotary_factor: f32,
-    /// YaRN RoPE scaling parameters. `None` ⇒ plain RoPE. When `Some`, every
-    /// attention layer applies the YaRN frequency ramp + magnitude correction
-    /// on top of the partial-rotary base frequencies.
+    /// YaRN RoPE scaling parameters. `None` ⇒ plain RoPE.
     pub yarn: Option<grim_tensor::YaRNParams>,
 }
 
 impl LlamaConfig {
-    /// Derived rotary dim: `round(head_dim * partial_rotary_factor)`,
-    /// clamped to `head_dim`. This is what each layer's `RopeConfig.rotary_dim`
-    /// is populated with (mirrors the Laguna/Maple convention).
+    /// Derived rotary dim: `round(head_dim * partial_rotary_factor)`, clamped to `head_dim`.
+    /// This is what each layer's `RopeConfig.rotary_dim` is populated with (mirrors the Laguna/Maple convention).
     pub fn rotary_dim(&self) -> usize {
         let r = (self.head_dim as f32 * self.partial_rotary_factor).round() as usize;
         r.min(self.head_dim)
@@ -58,8 +54,7 @@ impl ModelConfig for LlamaConfig {
         ModalityHint::TextInTextOut
     }
     /// Context window in tokens. For LLaMA-family models this equals
-    /// `max_seq_len` (populated from GGUF `llama.context_length` /
-    /// `<arch>.context_length` during loading).
+    /// `max_seq_len` (populated from GGUF `llama.context_length` / `<arch>.context_length` during loading).
     fn context_length(&self) -> u64 {
         self.max_seq_len as u64
     }
@@ -73,33 +68,22 @@ pub struct Llama {
     pub device: Device,
     pub tok_embeddings: Embedding,
     pub layers: Vec<LlamaBlock>,
-    /// Per-layer optional MoE routing block. `Some` for MoE layers (the
-    /// corresponding `LlamaBlock.ffn_disabled` is set, so the dense FFN is
-    /// skipped and this router+expert bank runs instead). `None` for dense
-    /// layers and for the dense fallback when `load_tp` is used.
+    /// Per-layer optional MoE routing block. `Some` for MoE layers (the corresponding `LlamaBlock.ffn_disabled` is
+    /// set, so the dense FFN is skipped and this router+expert bank runs instead).
     pub moe_blocks: Vec<Option<MoeBlock>>,
     pub norm: RmsNorm,
     pub output: Linear,
     /// Device assignment for each transformer layer. Defaults to the model
     /// device; farm/pipeline callers may replace it with contiguous segments.
     pub layer_devices: Vec<Device>,
-    /// WI-SB4a telemetry: actual cross-segment activation moves performed by
-    /// [`Llama::decode_paged`] since model construction. The hop-bound gate
-    /// drains this via [`Llama::take_boundary_moves`].
+    /// WI-SB4a telemetry: actual cross-segment activation moves performed by [`Llama::decode_paged`] since model construction.
+    /// The hop-bound gate drains this via [`Llama::take_boundary_moves`].
     boundary_moves: std::sync::atomic::AtomicUsize,
 }
 
 impl Llama {
     /// Load a `Llama` model with TP config taken from the `WeightSource`.
-    ///
-    /// The `WeightSource` is the single source of truth for TP — it carries
-    /// the `(rank, world_size)` set by `model_loader` (which derives it from
-    /// `GRIM_TP_*` env once and threads it through `with_tp_config`). Re-reading
-    /// the env here would split the contract: the loader's `get_sharded` would
-    /// slice by `ws.tp_config().rank` while `load_tp` would shard by a
-    /// freshly-parsed env rank. During a transient env mutation those can
-    /// disagree, so this entry uses `ws.tp_config()` and never calls
-    /// `from_env()`.
+    /// The `WeightSource` is the single source of truth for TP - it carries the `(rank,.
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: LlamaConfig) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
@@ -142,8 +126,7 @@ impl Llama {
         };
         let num_layers = cfg.num_layers;
 
-        // Weight sanity check: models that loaded with zeroed weights should fail
-        // at load time rather than silently returning Unimplemented on first forward.
+        // Weight sanity check: models that loaded with zeroed weights should fail at load time rather than silently returning Unimplemented on first forward.
         // [P1-36 fix: fail loudly on zeroed weights.]
         let check_not_zeroed =
             |name: &str, tensor: &grim_tensor::Tensor| weights_look_broken(name, tensor);
@@ -180,10 +163,7 @@ impl Llama {
     }
 
     /// Load a `Llama` model that mixes dense and MoE layers.
-    ///
-    /// `moe_spec` is `Some(spec)` for layers that should route through a
-    /// `MoeBlock` (their dense FFN is disabled), `None` for plain dense
-    /// layers. The attention towers are always loaded per layer.
+    /// `moe_spec` is `Some(spec)` for layers that should route through a `MoeBlock` (their dense FFN is.
     pub fn load_tp_moe(
         device: Device,
         ws: &grim_nn::WeightSource<'_>,
@@ -444,9 +424,8 @@ impl Llama {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for (i, block) in self.layers.iter().enumerate() {
-            // WI-SB4a contiguous layer pipeline: land `h` on this layer's
-            // segment device before the block runs; moves only ever occur at
-            // segment boundaries because the map is pre-merged into runs.
+            // WI-SB4a contiguous layer pipeline: land `h` on this layer's segment device before the block
+            // runs; moves only ever occur at segment boundaries because the map is pre-merged into runs.
             if let Some(seg) = self.layer_devices.get(i) {
                 if *seg != *h.device() {
                     h = grim_nn::modules::move_to_device(&h, seg)?;
@@ -458,11 +437,8 @@ impl Llama {
             let (attn_out, k, v) =
                 block.forward_with_kv_paged(&h, positions, Some(&mut *session), cache, i)?;
             kv_pairs.push((k, v));
-            // MoE layers: `attn_out` is the post-attention residual (dense FFN
-            // was skipped inside the block). Route it through the experts and
-            // ADD the residual back — `MoeBlock::forward` returns only the
-            // normed expert output, so skipping the add drops the residual
-            // stream entirely (matches bailingmoe3 / solar_open2 convention).
+            // MoE layers: `attn_out` is the post-attention residual (dense FFN was skipped inside the block).
+            // Route it through the experts and ADD the residual back - `MoeBlock::forward` returns only the.
             let out = if let Some(moe) = &self.moe_blocks[i] {
                 let routed = moe.forward(&attn_out)?;
                 grim_nn::modules::add_on_device(&attn_out, &routed)?
@@ -471,9 +447,8 @@ impl Llama {
             };
             h = out;
         }
-        // WI-SB4a: final norm + LM head stay on the last segment — `h` is
-        // already there after the last boundary check; in a split deployment
-        // their weights must be loaded onto that device.
+        // WI-SB4a: final norm + LM head stay on the last segment - `h` is already there
+        // after the last boundary check; in a split deployment their weights must be loaded onto that device.
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
         // TEMP-DIAG (MiniCPM5 gibberish hunt): dump top-5 logits of the LAST
@@ -488,12 +463,19 @@ impl Llama {
                 logits.to_vec_f32().unwrap_or_default()
             };
             let mut idx: Vec<usize> = (0..last.len()).collect();
-            idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap_or(std::cmp::Ordering::Equal));
+            idx.sort_by(|&a, &b| {
+                last[b]
+                    .partial_cmp(&last[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             eprintln!(
                 "[forward-trace] pos={:?} dims={:?} top5={:?}",
                 positions.last(),
                 dims,
-                idx.iter().take(5).map(|&i| (i, last[i])).collect::<Vec<_>>()
+                idx.iter()
+                    .take(5)
+                    .map(|&i| (i, last[i]))
+                    .collect::<Vec<_>>()
             );
         }
         Ok((logits, h, kv_pairs))
@@ -575,19 +557,13 @@ impl CausalLm for Llama {
             }
         };
         let seq_len = ids.len();
-        // Device-first: `Embedding::forward` gathers rows on the weight's
-        // device and already allocates the storage at rank-2
-        // [seq_len, hidden] — exactly what backend matmuls require. No
-        // host roundtrip needed here.
+        // Device-first: `Embedding::forward` gathers rows on the weight's device and already allocates the storage at rank-2 [seq_len, hidden] - exactly what backend matmuls require.
+        // No host roundtrip needed here.
         let hidden_t = self
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
-        // MAJ-3: use the positions tensor passed by the engine instead of
-        // hardcoding 0..seq_len. During decode the engine passes the actual
-        // current_pos so RoPE sees the correct absolute position.
-        // Audit fix (grim-models M9): a length MISMATCH used to silently
-        // renumber positions from 0 — masking caller bugs and corrupting
-        // RoPE for chunked/offset decodes. It is now a loud error.
+        // MAJ-3: use the positions tensor passed by the engine instead of hardcoding 0..seq_len.
+        // During decode the engine passes the actual current_pos so RoPE sees the correct absolute position.
         let pos_count = positions.shape().dims().iter().product::<usize>();
         let pos_vec: Vec<u32> = if pos_count == seq_len {
             positions
@@ -602,13 +578,8 @@ impl CausalLm for Llama {
             ))
             .into());
         };
-        // Two execution paths:
-        //  * paged  — when the session carries a `PagedKvCache` (engine
-        //    serving), K/V is written into physical page tensors and attention
-        //    runs through the paged kernel via the logical block table.
-        //  * classic — otherwise (single-shot tests, no KV session) we keep the
-        //    per-layer `LlamaLayerCache` in `model_state` and use dense causal
-        //    attention.
+        // Two execution paths: * paged - when the session carries a `PagedKvCache` (engine serving), K/V is written into physical page tensors and attention runs through the paged kernel via the logical block table.
+        // * classic - otherwise (single-shot tests, no KV session) we keep the per-layer `LlamaLayerCache` in.
         let use_paged = session.has_kv();
         let (logits, hidden_state, _kv_pairs) = if use_paged {
             self.decode_paged(&hidden_t, &pos_vec, &mut *session, None, 0)?
@@ -637,13 +608,8 @@ impl CausalLm for Llama {
         let logits = if adapters.is_empty() {
             logits
         } else {
-            // §4.5: fuse every active adapter's (α·x·A·B) bias into the
-            // output projection along the vocab dim. We apply it post-hoc
-            // to the final logits — a structural placeholder for the
-            // per-layer Punica-style fused matmul that ROCm fills in
-            // phase 4. Until then the correct mathematical operation
-            // (rank-r LoRA bias) still runs, just not fused with the
-            // base matmul.
+            // §4.5: fuse every active adapter's (α·x·A·B) bias into the output projection along the vocab dim.
+            // We apply it post-hoc to the final logits - a structural placeholder for the per-layer.
             crate::lora::apply_adapters_to_logits(&logits, adapters, self.cfg.hidden_size)?
         };
         session.advance_pos(seq_len);
@@ -651,19 +617,11 @@ impl CausalLm for Llama {
     }
 }
 
-/// Load-time weight sanity gate (P1-36, refined by the grim-models audit):
-/// rejects all-zero tensors everywhere, and all-CONSTANT tensors only when
-/// rank >= 2. The constant check is deliberately skipped for rank-1 tensors:
-/// RMS-norm weights of exactly 1.0 are legitimate and ship in real
-/// checkpoints — the old unconditional `all_same` check false-rejected them.
+/// Load-time weight sanity gate (P1-36, refined by the grim-models audit): rejects all-zero tensors everywhere, and all-CONSTANT tensors only when rank >= 2.
+/// The constant check is deliberately skipped for rank-1 tensors: RMS-norm weights of exactly 1.0 are.
 pub fn weights_look_broken(name: &str, tensor: &grim_tensor::Tensor) -> Result<()> {
-    // Perf (WI-load): the old gate called `to_vec_f32` on EVERY weight, which
-    // on quantized GGUF loads triggers a full GPU dequant + DTOH download per
-    // tensor (the long `[Q4K]/[Q6K] dequant` + copy storms in load logs). The
-    // gate exists to catch structurally-corrupt checkpoints where MANY tensors
-    // are zero/constant at once — that signal survives sampling. Large tensors
-    // are checked deterministically ~1/4 (rank-2) or ~1/16 (rank-1) by name
-    // hash; small tensors (norms, biases ≤ 256 KiB of f32) are always checked.
+    // Perf (WI-load): the old gate called `to_vec_f32` on EVERY weight, which on quantized GGUF loads triggers a full GPU dequant + DTOH download per tensor (the long `[Q4K]/[Q6K] dequant` + copy storms in load logs).
+    // The gate exists to catch structurally-corrupt checkpoints where MANY tensors are zero/constant at once -.
     let dims = tensor.shape().dims();
     let elem_count: usize = dims.iter().product();
     if elem_count > 1 << 16 {
@@ -741,11 +699,8 @@ mod tests {
         assert_eq!(base_cfg(16, 2.0).rotary_dim(), 16, "clamped to head_dim");
     }
 
-    /// WI-SB4a host gate: a layer map split across two fake segments — the
-    /// second tagged with a device whose backend falls back to CPU here —
-    /// must produce logits byte-identical to the unsplit model, and must
-    /// emit exactly one boundary move per segment change, never one per
-    /// layer.
+    /// WI-SB4a host gate: a layer map split across two fake segments - the second tagged with a device whose backend falls back to CPU
+    /// here - must produce logits byte-identical to the unsplit model, and must emit exactly one boundary move per segment change, never one per layer.
     #[test]
     fn scythe_layer_split_parity_and_hop_bound() {
         let cfg = LlamaConfig {
@@ -802,11 +757,8 @@ mod tests {
         assert_eq!(split.segment_devices().len(), 2, "two merged runs");
 
         let split_out = run_forward(&split);
-        // Cross-backend fake segments run different GEMM kernels behind the
-        // tags, so exact equality stops at the boundary — the gate is a tight
-        // fp bound here. Byte-parity belongs to the same-kernel case: both
-        // segments on identical-architecture ROCm ranks (the [sb] leg), the
-        // same rule WI-INF3's route parity uses.
+        // Cross-backend fake segments run different GEMM kernels behind the tags, so exact equality stops at the boundary - the gate is a tight fp bound here.
+        // Byte-parity belongs to the same-kernel case: both segments on identical-architecture ROCm ranks (the [sb] leg),.
         let max_diff = split_out
             .iter()
             .zip(&baseline)
@@ -829,9 +781,8 @@ mod tests {
         assert_eq!(split.take_boundary_moves(), 0);
     }
 
-    /// Audit gate (M9): a positions tensor whose length doesn't match the
-    /// input ids must be a LOUD error — the silent renumber-from-zero
-    /// fallback masked caller bugs and corrupted RoPE for offset decodes.
+    /// Audit gate (M9): a positions tensor whose length doesn't match the input ids must be a
+    /// LOUD error - the silent renumber-from-zero fallback masked caller bugs and corrupted RoPE for offset decodes.
     #[test]
     fn llama_forward_rejects_mismatched_positions_length() {
         let model = Llama::random(Device::Cpu, base_cfg(32, 1.0));

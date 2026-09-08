@@ -1,5 +1,4 @@
 //! OKLCH design tokens for Grim's Garage (WI-T9).
-//!
 //! Provides OKLCH color structures and theme tokens for CSS styling and layout configuration.
 
 use serde::{Deserialize, Serialize};

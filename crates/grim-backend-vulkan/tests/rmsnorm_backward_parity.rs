@@ -2,9 +2,9 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test rmsnorm_backward_parity`.
 
+use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::backend::AutogradOps;
 use grim_tensor::{CoreTensorOps, DType, Shape};
-use grim_backend_vulkan::VulkanDevice;
 
 #[test]
 fn rmsnorm_backward_matches_cpu_reference() {
@@ -36,12 +36,11 @@ fn rmsnorm_backward_matches_cpu_reference() {
 
     // CPU reference
     let cols = 8usize;
-    let mut dx_exp = vec![0.0f32; 16];
-    let mut dw_exp = vec![0.0f32; 8];
+    let mut dx_exp = [0.0f32; 16];
+    let mut dw_exp = [0.0f32; 8];
     for r in 0..2 {
         let base = r * cols;
-        let mean_sq: f32 =
-            (0..cols).map(|c| x[base + c] * x[base + c]).sum::<f32>() / cols as f32;
+        let mean_sq: f32 = (0..cols).map(|c| x[base + c] * x[base + c]).sum::<f32>() / cols as f32;
         let rms = (mean_sq + eps).sqrt();
         let inv_rms = 1.0 / rms;
         let sum_xg: f32 = (0..cols).map(|c| x[base + c] * grad[base + c]).sum();

@@ -1,7 +1,5 @@
 //! File path completion for `@` triggers in the composer.
-//!
 //! Synchronous `std::fs` based provider with token-boundary trigger detection.
-//! Results feed a `SelectList` when the composer text contains an active `@` prefix.
 
 use std::path::Path;
 
@@ -17,11 +15,7 @@ pub struct FileSuggestion {
 }
 
 /// Detect an active `@` trigger at `cursor` in `text`.
-///
-/// An `@` is active when it is at position 0 or the preceding character is
-/// whitespace, `"`, `'`, or `=`, and there is no content after the trigger
-/// that would make it part of an email or other non-trigger context.
-/// Returns the byte start of the trigger and the raw prefix including `@`.
+/// An `@` is active when it is at position 0 or the preceding character is.
 pub fn extract_at_prefix(text: &str, cursor: usize) -> Option<(usize, String)> {
     if cursor > text.len() {
         return None;
@@ -32,11 +26,10 @@ pub fn extract_at_prefix(text: &str, cursor: usize) -> Option<(usize, String)> {
 
     // `@` must be at a token boundary: start of string or preceded by
     // whitespace, quote, or assignment/equals.
-    let ok = at == 0
-        || {
-            let prev = before_at.chars().last()?;
-            prev.is_whitespace() || matches!(prev, '"' | '\'' | '=')
-        };
+    let ok = at == 0 || {
+        let prev = before_at.chars().last()?;
+        prev.is_whitespace() || matches!(prev, '"' | '\'' | '=')
+    };
     if !ok {
         return None;
     }
@@ -53,12 +46,7 @@ pub fn extract_at_prefix(text: &str, cursor: usize) -> Option<(usize, String)> {
 }
 
 /// List file suggestions for the path fragment after `@`.
-///
 /// `prefix` is the text after `@` (may be empty, may contain `/`).
-/// Results are bounded to `max_results` and sorted with directories first,
-/// then alphabetically. `.git` entries are skipped. Uses `std::fs::read_dir`
-/// and is synchronous and bounded, so it stays well under the 16ms frame budget
-/// for typical project directories.
 pub fn get_file_suggestions(
     prefix: &str,
     base_dir: &Path,
@@ -132,11 +120,7 @@ pub fn get_file_suggestions(
 }
 
 /// Replace the `@` triggered range in the composer with the chosen suggestion.
-///
-/// `start` is the byte index of `@` in the composer text. The range
-/// `start..cursor` is replaced with `suggestion.value`. Directories keep a
-/// trailing `/` and no trailing space so the user can continue completing.
-/// Files are inserted as plain text without extra quoting in this initial task.
+/// `start` is the byte index of `@` in the composer text.
 pub fn apply_file_completion(
     composer: &mut crate::tui::composer::Composer,
     start: usize,
@@ -165,14 +149,7 @@ pub fn apply_file_completion(
 }
 
 /// List file suggestions ranked by frecency score (higher first).
-///
-/// Combines the base `get_file_suggestions` with frecency ranking: files
-/// with higher frecency scores rank first, while still keeping directories
-/// above files at the same score tier. This is the recommended function
-/// when a `Frecency` tracker is available.
-///
-/// Suggestion values (relative paths) are resolved against `base_dir` before
-/// scoring so frecency keys (absolute paths) match.
+/// Combines the base `get_file_suggestions` with frecency ranking: files with higher frecency scores rank first, while.
 pub fn get_file_suggestions_ranked(
     prefix: &str,
     base_dir: &Path,
@@ -211,10 +188,7 @@ mod tests {
 
     #[test]
     fn at_prefix_after_space() {
-        assert_eq!(
-            extract_at_prefix("hi @foo", 7),
-            Some((3, "@foo".into()))
-        );
+        assert_eq!(extract_at_prefix("hi @foo", 7), Some((3, "@foo".into())));
     }
 
     #[test]

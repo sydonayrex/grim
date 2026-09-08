@@ -1,11 +1,5 @@
 //! Shared Mixture-of-Experts block (WI-M2/M3).
-//!
-//! A `MoeBlock` replaces the dense SwiGLU FFN in a transformer layer: the
-//! attention output is RMS-normalized, then routed through a `grim_nn::moe`
-//! router + expert bank (+ optional shared expert). Every MoE architecture
-//! (Qwen2/3-MoE, Laguna, GLM4, Granite-MoE, Phi, DBRX, OLMoE, BailingMoE,
-//! Nemotron-hMoE, ...) funnels through this single implementation and
-//! differs only by its `MoESpec` (expert counts, router kind, shared expert).
+//! A `MoeBlock` replaces the dense SwiGLU FFN in a transformer layer: the attention output is.
 
 use grim_core::error::Result;
 use grim_nn::moe::{ExpertBank, ExpertTriple, MoeFfn, MoeRouter, RouterKind};
@@ -34,9 +28,8 @@ pub struct MoESpec {
     pub moe_intermediate_size: Option<usize>,
     /// Shared-expert FFN width override (e.g., 1024 for Laguna-S-2.1).
     pub shared_expert_intermediate_size: Option<usize>,
-    /// Whether the GGUF stores expert tensors as `[num_experts, hidden, inter]`
-    /// instead of the standard `[num_experts, inter, hidden]`. Mellum2 (Unsloth
-    /// quantized) uses this layout.
+    /// Whether the GGUF stores expert tensors as `[num_experts, hidden, inter]` instead of the standard `[num_experts, inter, hidden]`.
+    /// Mellum2 (Unsloth quantized) uses this layout.
     pub transposed_expert_layout: bool,
 }
 
@@ -58,10 +51,8 @@ impl MoeBlock {
     ) -> Result<Self> {
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
-        // Router gate. llama.cpp stores the expert router as
-        // `ffn_gate_inp.weight` = [hidden, num_experts] (consistent with the
-        // in-repo Lfm2 MoE loader). `Linear::load` is TP-aware via `ws`'s
-        // tensor-parallel config.
+        // Router gate. llama.cpp stores the expert router as `ffn_gate_inp.weight`
+        // = [hidden, num_experts] (consistent with the in-repo Lfm2 MoE loader).
         let gate = Linear::load(
             &ws.pp("ffn_gate_inp"),
             cfg.hidden_size,
@@ -159,9 +150,8 @@ mod tests {
     use crate::model::LlamaConfig;
     use crate::moe_block::{MoESpec, MoeBlock};
 
-    /// In-memory `TensorProvider` so the MoE load path can be exercised
-    /// without a real GGUF file (WI-M6). Mirrors the `FullProvider` used in
-    /// `block.rs`'s load-path tests.
+    /// In-memory `TensorProvider` so the MoE load path can be exercised without a real GGUF file (WI-M6).
+    /// Mirrors the `FullProvider` used in `block.rs`'s load-path tests.
     #[derive(Clone)]
     struct FullProvider {
         tensors: HashMap<String, RawTensor>,
@@ -224,9 +214,8 @@ mod tests {
                 provenance: QuantProvenance::GrimNative,
             },
         );
-        // Router gate (`MoeBlock::load` queries `ffn_gate_inp.weight`, matching
-        // the in-repo Lfm2 MoE loader). `Linear::load(hidden, num_experts)`
-        // expects the stored weight in [out, in] = [num_experts, hidden].
+        // Router gate (`MoeBlock::load` queries `ffn_gate_inp.weight`, matching the in-repo Lfm2 MoE loader).
+        // `Linear::load(hidden, num_experts)` expects the stored weight in [out, in] = [num_experts, hidden].
         let gate_w: Vec<f32> = (0..num_experts * hidden)
             .map(|i| i as f32 * 0.3 - 1.0)
             .collect();
@@ -313,12 +302,7 @@ mod tests {
         use grim_nn::moe_deterministic::DeterministicTokenMap;
 
         // 4 tokens, top-2 routing, 4 experts
-        let selected = vec![
-            vec![0, 1],
-            vec![1, 2],
-            vec![0, 3],
-            vec![2, 3],
-        ];
+        let selected = vec![vec![0, 1], vec![1, 2], vec![0, 3], vec![2, 3]];
         let weights = vec![
             vec![0.6, 0.4],
             vec![0.7, 0.3],
@@ -341,7 +325,8 @@ mod tests {
         assert_eq!(&packed[0..hidden], &acts[0..hidden]);
 
         let mut combined = vec![0.0f32; 4 * hidden];
-        map.combine_expert_outputs(&packed, &weights, hidden, 1.0, &mut combined).unwrap();
+        map.combine_expert_outputs(&packed, &weights, hidden, 1.0, &mut combined)
+            .unwrap();
 
         // Since expert GEMM here is identity, each token output is sum(weight_k * token_act) = token_act * 1.0
         for t in 0..4 {

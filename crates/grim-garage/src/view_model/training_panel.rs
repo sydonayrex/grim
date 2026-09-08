@@ -8,9 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct TrainingPanelV1 {
     /// All training modes the dropdown exposes, in display order.
     pub mode_options: Vec<String>,
-    /// Whether the quantization-format picker should be shown. Always
-    /// hidden for Bf16-Full; always shown for QLoRA; defaults to hidden
-    /// for LoRA but the user can still see it.
+    /// Whether the quantization-format picker should be shown.
+    /// Always hidden for Bf16-Full; always shown for QLoRA; defaults to hidden for LoRA but the.
     pub show_quant_format_picker: bool,
     /// Quantization format options when the picker is shown.
     pub quant_format_options: Vec<String>,
@@ -62,12 +61,8 @@ impl TrainingPanelV1 {
                 "Training mode: ORPO (RL)".into(),
                 "Odds-Ratio Preference Optimization for joint SFT and alignment.".into(),
             ),
-            // L4: previously this arm silently masked typos / stale
-            // configs as BF16. There is no fallback family for "unknown"
-            // — the panel surfaces the unrecognized string verbatim and
-            // tells the operator to fix the config. Pre-fix, the
-            // wildcards arm quietly picked BF16 and the quant picker
-            // hid defective modes.
+            // L4: previously this arm silently masked typos / stale configs as BF16.
+            // There is no fallback family for "unknown" - the panel surfaces the unrecognized string verbatim.
             other => (
                 format!("Training mode: unknown ({other})"),
                 "Selected training_mode is not recognized; pick one from the dropdown. Quantization picker hidden until fixed.".into(),
@@ -153,10 +148,8 @@ mod tests {
 
     #[test]
     fn known_training_modes_have_specific_mode_options_strings() {
-        // L4: the canonical six modes the panel supports. Any drift
-        // from this list intentionally fails this assertion so the
-        // dropdown, the from_form match, the poller wire labels, and
-        // `jobs::TrainingMode` stay in lock-step.
+        // L4: the canonical six modes the panel supports.
+        // Any drift from this list intentionally fails this assertion so the dropdown, the from_form match,.
         let form = HyperparamFormV1::default();
         let p = TrainingPanelV1::from_form(&form);
         assert_eq!(
@@ -174,11 +167,8 @@ mod tests {
 
     #[test]
     fn unknown_training_mode_renders_unknown_panel_label() {
-        // L4: a stale config carrying "Lo-RA" (typo) silently trained as
-        // BF16 pre-fix (quantization picker hidden). The expected
-        // post-fix behavior is the panel rendering a recognizable
-        // `unknown (...)` title and help text that doesn't claim the
-        // mode *is* BF16.
+        // L4: a stale config carrying "Lo-RA" (typo) silently trained as BF16 pre-fix (quantization picker hidden).
+        // The expected post-fix behavior is the panel rendering a recognizable `unknown (...)` title and help.
         let form = HyperparamFormV1 {
             training_mode: "Lo-RA".into(),
             ..HyperparamFormV1::default()

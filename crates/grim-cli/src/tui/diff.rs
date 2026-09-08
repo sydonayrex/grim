@@ -1,11 +1,5 @@
-//! Small line-based diff used to preview edit_file / write_file changes in
-//! the transcript before they are applied.
-//!
-//! Strategy: peel the common prefix and suffix of the two line sequences,
-//! then diff the differing middle with LCS when it is small enough
-//! (≤ MAX_LCS cells), otherwise render the middle as a wholesale replacement.
-//! This keeps preview cost bounded for the large full-file rewrites models
-//! sometimes produce while staying precise for the typical surgical edit.
+//! Small line-based diff used to preview edit_file / write_file changes in the transcript before they are applied.
+//! Strategy: peel the common prefix and suffix of the two line sequences, then diff the.
 
 /// Kind of a rendered diff line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,10 +23,7 @@ pub struct DiffLine {
 const MAX_LCS_CELLS: usize = 200_000;
 
 /// Compute a compact diff between `old` and `new`.
-///
-/// `context` is the number of unchanged lines kept around each change hunk;
-/// the rest is summarized as "(N unchanged lines)" — context lines are what
-/// anchor the change visually, walls of green/red are not.
+/// `context` is the number of unchanged lines kept around each change hunk; the rest is.
 pub fn diff_lines(old: &str, new: &str, context: usize) -> Vec<DiffLine> {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
@@ -174,8 +165,7 @@ fn lcs_diff(old: &[&str], new: &[&str]) -> Vec<(DiffKind, String)> {
 }
 
 /// Preview the file change a write_file / edit_file call would make.
-/// Returns None for other tools or unreadable inputs — rendering falls back
-/// to the raw-arguments view.
+/// Returns None for other tools or unreadable inputs - rendering falls back to the raw-arguments.
 pub fn preview_edit(
     name: &str,
     arguments: &str,

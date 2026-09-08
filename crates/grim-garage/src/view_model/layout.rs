@@ -1,6 +1,5 @@
-//! Top-level dashboard layout — the column/row grid that the window
-//! renders into. Kept as data so renderers can read it without depending
-//! on any UI-framework-specific layout types.
+//! Top-level dashboard layout - the column/row grid that the window renders into.
+//! Kept as data so renderers can read it without depending on any UI-framework-specific layout types.
 
 use serde::{Deserialize, Serialize};
 

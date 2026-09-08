@@ -1,7 +1,5 @@
 //! Stateless fuzzy matching for slash command autocomplete.
-//!
-//! Scores candidates by how well the query characters appear as a
-//! subsequence. Contiguous runs and prefix matches score higher.
+//! Scores candidates by how well the query characters appear as a subsequence.
 
 /// Result of a successful fuzzy match.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +11,6 @@ pub struct FuzzyMatch {
 }
 
 /// Try to match `query` as a subsequence of `candidate` (case-insensitive).
-///
 /// Returns `None` when any query character cannot be found in order.
 pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
     if query.is_empty() {
@@ -67,9 +64,7 @@ pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
 }
 
 /// Filter and rank `items` by fuzzy match against `query`.
-///
-/// `key` extracts the searchable string from each item. Results are sorted
-/// descending by score. Empty query returns all items unsorted with score 0.
+/// `key` extracts the searchable string from each item.
 pub fn fuzzy_filter<'a, T>(
     query: &str,
     items: &'a [T],

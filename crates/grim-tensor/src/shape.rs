@@ -2,9 +2,8 @@
 
 use crate::error::{Error, Result};
 
-/// Fully-static shape. Multi-dim layout with row-major walks (this is the
-/// only layout Grim supports in v1; permuted strides for a few specific ops
-/// like attention come via temporary reshape/transpose).
+/// Fully-static row-major shape.
+/// Permuted strides for ops like attention use temporary reshape/transpose.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Shape {
     dims: Vec<usize>,

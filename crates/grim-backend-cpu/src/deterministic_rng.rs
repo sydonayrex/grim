@@ -1,5 +1,4 @@
 //! Per-request seeded RNG for speculative-decoding and non-deterministic paths (§5.8).
-//!
 //! SplitMix64 stream: cheap, single-state, no SIMD, bit-stable across toolchains.
 
 /// Deterministic RNG: seed once, consume via `next_u64` or `next_f32`.

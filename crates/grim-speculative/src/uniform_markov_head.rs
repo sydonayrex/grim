@@ -1,11 +1,5 @@
-//! Concrete `MarkovHead` impl: applies a position-conditioned bias to the
-//! base logits using only the prefix within the current block.
-//!
-//! §5.3.2: the Markov head is *intra-block* — it doesn't see beyond the
-//! block, just the prefix within it. A real implementation would learn
-//! a low-rank prefix-conditioned bias (typically rank-256 in DSpark-style
-//! configs). This structural impl uses a deterministic per-position
-//! address into a small learned bank.
+//! Concrete `MarkovHead` impl: applies a position-conditioned bias to the base logits using only the prefix within the current block.
+//! §5.3.2: the Markov head is *intra-block* - it doesn't see beyond the block, just the.
 
 use std::sync::Arc;
 
@@ -23,10 +17,7 @@ pub struct UniformMarkovHead {
 
 impl UniformMarkovHead {
     /// `bias_table.len() == max_block_len * max_block_len * vocab_size`.
-    /// The first axis represents the prefix length observed, the second the
-    /// query position within the block — typically the first index (prefix
-    /// length 0) applies a uniform bias; later positions bias later vocab
-    /// ids more strongly.
+    /// The first axis represents the prefix length observed, the second the query position within the.
     pub fn new(vocab_size: usize, max_block_len: usize, seed: u64) -> Self {
         let mut rng = grim_core::rng::SimpleRng::new(seed);
         let total = max_block_len * max_block_len * vocab_size;
@@ -93,9 +84,8 @@ mod tests {
         let logits = grim_backend_cpu::cpu_tensor(vec![1.0f32; 2 * 8], Shape::new(vec![2, 8]));
         let baseline = logits.to_vec_f32().unwrap();
         let biased = head.bias(&[], &logits).unwrap().to_vec_f32().unwrap();
-        // The biased output must differ at least somewhere from the
-        // baseline (Markov bias should never be a no-op on a real
-        // weight initialization).
+        // The biased output must differ at least somewhere from the baseline
+        // (Markov bias should never be a no-op on a real weight initialization).
         assert_ne!(baseline, biased);
     }
 }

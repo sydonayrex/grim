@@ -1,9 +1,9 @@
 //! Numerical parity test for Vulkan MoE Fused Dispatch on physical GPU.
 
 use grim_backend_vulkan::VulkanDevice;
+use grim_tensor::CoreTensorOps;
 use grim_tensor::dtype::DType;
 use grim_tensor::shape::Shape;
-use grim_tensor::CoreTensorOps;
 
 #[test]
 fn test_vulkan_moe_fused_dispatch_parity() {
@@ -33,8 +33,8 @@ fn test_vulkan_moe_fused_dispatch_parity() {
 
     // Synthetic inputs
     let mut x_data = vec![0.0f32; batch * hidden];
-    for i in 0..x_data.len() {
-        x_data[i] = ((i as f32 + 1.0) * 0.05).sin();
+    for (i, val) in x_data.iter_mut().enumerate() {
+        *val = ((i as f32 + 1.0) * 0.05).sin();
     }
 
     let mut gw_data = vec![0.0f32; num_experts * inter * hidden];
@@ -44,8 +44,8 @@ fn test_vulkan_moe_fused_dispatch_parity() {
         gw_data[i] = ((i as f32 + 1.0) * 0.02).cos() * 0.1;
         uw_data[i] = ((i as f32 + 2.0) * 0.02).sin() * 0.1;
     }
-    for i in 0..dw_data.len() {
-        dw_data[i] = ((i as f32 + 3.0) * 0.02).cos() * 0.1;
+    for (i, val) in dw_data.iter_mut().enumerate() {
+        *val = ((i as f32 + 3.0) * 0.02).cos() * 0.1;
     }
 
     let rtok = vec![0u32, 0, 1, 1];
@@ -87,9 +87,15 @@ fn test_vulkan_moe_fused_dispatch_parity() {
     let gw_s = vk_dev.upload_f32(&gw_data, &gw_shape).unwrap();
     let uw_s = vk_dev.upload_f32(&uw_data, &uw_shape).unwrap();
     let dw_s = vk_dev.upload_f32(&dw_data, &dw_shape).unwrap();
-    let tok_s = vk_dev.upload_u32(&rtok, &Shape::new(vec![num_pairs])).unwrap();
-    let exp_s = vk_dev.upload_u32(&rexp, &Shape::new(vec![num_pairs])).unwrap();
-    let w_s = vk_dev.upload_f32(&rw, &Shape::new(vec![num_pairs])).unwrap();
+    let tok_s = vk_dev
+        .upload_u32(&rtok, &Shape::new(vec![num_pairs]))
+        .unwrap();
+    let exp_s = vk_dev
+        .upload_u32(&rexp, &Shape::new(vec![num_pairs]))
+        .unwrap();
+    let w_s = vk_dev
+        .upload_f32(&rw, &Shape::new(vec![num_pairs]))
+        .unwrap();
 
     let (out_s, _handle) = vk_dev
         .moe_fused_dispatch(
@@ -113,7 +119,7 @@ fn test_vulkan_moe_fused_dispatch_parity() {
     assert_eq!(vk_out.len(), cpu_out.len());
 
     let mut max_diff = 0.0f32;
-    for (_i, (&v, &c)) in vk_out.iter().zip(cpu_out.iter()).enumerate() {
+    for (&v, &c) in vk_out.iter().zip(cpu_out.iter()) {
         let diff = (v - c).abs();
         if diff > max_diff {
             max_diff = diff;

@@ -4,11 +4,11 @@ pub mod awq;
 pub mod bank;
 pub mod bolt_on;
 pub mod convert;
+pub mod format;
+pub mod ftw;
 /// Fusion-pattern detection over checkpoint tensor names (folded in from
 /// the former grim-tensor-graph crate; `GrimFusionOp` lives here).
 pub mod fusion;
-pub mod format;
-pub mod ftw;
 pub mod gguf;
 pub mod gptq;
 pub mod onnx;
@@ -22,15 +22,15 @@ pub mod train;
 pub mod weight_format;
 
 pub use awq::{AwqConfig, AwqProvider, AwqTensorInfo, pack_awq_group_int};
-pub use fusion::{FusionGroup, TensorGraphIr, build_transformer_ir};
 pub use ftw::{FtwDirectLoader, FtwHeader, FtwHostBank, FtwQuantFormat};
+pub use fusion::{FusionGroup, TensorGraphIr, build_transformer_ir};
 pub use torch::{PthProvider, TorchTensorEntry};
 
 pub use convert::{
-    GpuDequant, classify_toolkit_tensor, convert_gguf_to_grim, convert_to_grim,
-    convert_to_grim_with_dequant, detect_toolkit_producer, detect_toolkit_producer_from_gguf,
-    reframe_toolkit_bytes, toolkit_to_provenance, toolkit_to_storage,
-    ToolkitProducer, ToolkitQuantFormat,
+    GpuDequant, ToolkitProducer, ToolkitQuantFormat, classify_toolkit_tensor, convert_gguf_to_grim,
+    convert_to_grim, convert_to_grim_with_dequant, detect_toolkit_producer,
+    detect_toolkit_producer_from_gguf, reframe_toolkit_bytes, toolkit_to_provenance,
+    toolkit_to_storage,
 };
 pub use format::normals_packed_size;
 pub use format::{

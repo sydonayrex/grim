@@ -8,15 +8,13 @@ use grim_tensor::{AttentionOps, BackendStorage, Shape};
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, as_rocm, dev_ptr, dtype_f32, hipFreeAsync, hipStreamSynchronize, hipSuccess,
-    linear_launch, upload_device_buffer, HipDim3, QkvAttentionFusionConfig, QuantMode, RocmHandle,
+    HipDim3, QkvAttentionFusionConfig, QuantMode, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32,
+    hipFreeAsync, hipStreamSynchronize, hipSuccess, linear_launch, upload_device_buffer,
 };
 
 impl AttentionOps for RocmDevice {
-
-    /// SageAttention dispatch. The GPU entry existed without trait wiring,
-    /// so callers always hit the Unimplemented default and fell back to the
-    /// F32 qkv path; this makes the kernel reachable.
+    /// SageAttention dispatch. The GPU entry existed without trait wiring, so callers always hit the
+    /// Unimplemented default and fell back to the F32 qkv path; this makes the kernel reachable.
     fn sage_attention(
         &self,
         q: &dyn BackendStorage,
@@ -58,7 +56,6 @@ impl AttentionOps for RocmDevice {
             out_shape,
         )
     }
-
 
     fn mla_q_kv_norm_split(
         &self,
@@ -151,7 +148,6 @@ impl AttentionOps for RocmDevice {
         ))
     }
 
-
     fn mla_absorbed_decode(
         &self,
         q_absorbed: &dyn BackendStorage,
@@ -215,7 +211,6 @@ impl AttentionOps for RocmDevice {
         ))))
     }
 
-
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -229,22 +224,15 @@ impl AttentionOps for RocmDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Compute host-side window_lo per-query position:
-        // For full causal attention (window == None), window_lo = 0 for all queries.
-        // For sliding-window (window == Some(w)), window_lo = max(0, abs_i - w + 1)
-        // is constant across all query positions in this call only when seq_len == 1
-        // (decode step). For prefill (seq_len > 1) the kernel receives the per-block
-        // minimum window_lo = max(0, cache_offset - w + 1); each query thread then
-        // computes its own abs_i = cache_offset + i and the KV range is
-        // [window_lo_block, abs_i + 1). This is a conservative lower bound:
-        // threads whose abs_i > cache_offset attend to slightly more KV than they
-        // should, but the causal upper bound (abs_i + 1) is still enforced.
+        // Compute host-side window_lo per-query position: For full causal attention (window == None), window_lo = 0 for all queries.
+        // For sliding-window (window == Some(w)), window_lo = max(0, abs_i - w + 1) is constant.
         let window_lo_i: i32 = match window {
             None => 0,
             Some(w) => {
                 let abs_first = cache_offset as usize;
                 let win_lo = abs_first.saturating_sub(w.saturating_sub(1));
-                i32::try_from(win_lo).map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
+                i32::try_from(win_lo)
+                    .map_err(|_| Error::Backend("window_lo exceeds i32::MAX".into()))?
             }
         };
         let config = {
@@ -366,10 +354,8 @@ impl AttentionOps for RocmDevice {
         let mut alibi_ptr: u64 = 0;
         let mut has_alibi: i32 = 0;
 
-        // Prior RoPE / cache ops were enqueued on the same stream, so stream
-        // ordering already guarantees they complete before this kernel reads
-        // q/k/v — no host sync needed (each removed sync stalls the whole
-        // per-token pipeline).
+        // Prior RoPE / cache ops were enqueued on the same stream, so stream ordering already guarantees they complete
+        // before this kernel reads q/k/v - no host sync needed (each removed sync stalls the whole per-token pipeline).
 
         // Split-KV FlashDecoding acceleration for long-context single-token decode
         if seq_len == 1
@@ -421,12 +407,8 @@ impl AttentionOps for RocmDevice {
             }
         }
         if tuned_block_dim.is_none() {
-            // WI-X5: record side — on a cache miss (and under the
-            // GRIM_ATTENTION_AUTOTUNE gates inside the helper), sweep candidate
-            // block dims with real launches and record the winner. The sweep
-            // writes the same attention output into `storage`; the real launch
-            // below then runs with the winning block dim, so results are
-            // unaffected by the benchmark launches.
+            // WI-X5: record side - on a cache miss (and under the GRIM_ATTENTION_AUTOTUNE gates inside the helper), sweep candidate block dims with real launches and record the winner.
+            // The sweep writes the same attention output into `storage`; the real launch below then runs.
             let sweep_winner = self.autotune_attention_block_dim(
                 key,
                 launch.block_dim.x,
@@ -520,14 +502,11 @@ impl AttentionOps for RocmDevice {
             odim, fuseo, alibi_ptr, has_alibi,
         );
 
-        // No post-launch sync: the output storage is returned to the caller
-        // and any readback (or same-stream reuse of pooled scratch) is
-        // ordered by the single active stream. A sync here would serialize
-        // the CPU against every attention of every layer of every token.
+        // No post-launch sync: the output storage is returned to the caller and any readback (or same-stream reuse of pooled scratch) is ordered by the single active stream.
+        // A sync here would serialize the CPU against every attention of every layer of every.
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
-
 
     fn qkv_attention_alibi(
         &self,
@@ -638,7 +617,6 @@ impl AttentionOps for RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
-
     fn rope(
         &self,
         x: &dyn BackendStorage,
@@ -658,9 +636,8 @@ impl AttentionOps for RocmDevice {
             ));
         }
 
-        // Partial-rotary / YaRN path: dispatch to grim_rope_yarn which accepts a
-        // pre-uploaded inv_freq[] buffer and handles both partial rotary_dim and
-        // YaRN magnitude correction entirely on-GPU.
+        // Partial-rotary / YaRN path: dispatch to grim_rope_yarn which accepts a pre-uploaded inv_freq[]
+        // buffer and handles both partial rotary_dim and YaRN magnitude correction entirely on-GPU.
         if !cfg.is_plain() {
             return self.rope_launch_yarn(x_s, positions, cfg, out_shape);
         }
@@ -724,7 +701,6 @@ impl AttentionOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn rerope(
         &self,
@@ -806,7 +782,6 @@ impl AttentionOps for RocmDevice {
         ))
     }
 
-
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -839,7 +814,6 @@ impl AttentionOps for RocmDevice {
         ))
     }
 
-
     /// SCYTHE-2 WI-5: Paged attention override. [see: `crate::launch_paged_attention`, `grim_qkv_attention_paged`]
     fn qkv_attention_paged(
         &self,
@@ -855,13 +829,8 @@ impl AttentionOps for RocmDevice {
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Sliding-window lower bound:
-        //   None       -> 0 (full causal)
-        //   Some(w)    -> max(0, cache_offset - (w - 1)). For decode (seq_len==1)
-        //                 this is exact; for prefill it is the per-block conservative
-        //                 lower bound (each query thread uses abs_i = cache_offset + i
-        //                 and the causal upper bound abs_i + 1 is still enforced in
-        //                 the kernel).
+        // Sliding-window lower bound: None    -> 0 (full causal) Some(w)  -> max(0, cache_offset - (w - 1)).
+        // For decode (seq_len==1) this is exact; for prefill it is the per-block conservative lower bound.
         let window_lo_i: i32 = match window {
             None => 0,
             Some(w) => {
@@ -893,9 +862,8 @@ impl AttentionOps for RocmDevice {
         let mut storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
 
-        // WI-X5: autotuner lookup + record side for the paged launch. Hot path
-        // unchanged on a cache hit; the sweep below only runs under the
-        // GRIM_ATTENTION_AUTOTUNE gates in `autotune_attention_block_dim`.
+        // WI-X5: autotuner lookup + record side for the paged launch.
+        // Hot path unchanged on a cache hit; the sweep below only runs under the GRIM_ATTENTION_AUTOTUNE.
         let arch_leak: &'static str = self.intern_str(&self.gpu_target);
         let paged_key = crate::autotune::KernelKey::paged_attention(
             arch_leak,
@@ -965,7 +933,6 @@ impl AttentionOps for RocmDevice {
         ))
     }
 
-
     /// SCYTHE-2 WI-5: Tree attention override. [see: `crate::launch_tree_attention`, `grim_tree_attention`]
     fn tree_attention(
         &self,
@@ -1025,18 +992,9 @@ impl AttentionOps for RocmDevice {
     }
 }
 
-
-
-
 impl RocmDevice {
-    /// GPU-side YaRN / partial-rotary RoPE: computes `inv_freq[]` on the host,
-    /// uploads it once per call, then dispatches `grim_rope_yarn` entirely on-device.
-    ///
-    /// # Contract
-    /// - `x_s` must have a valid device pointer (caller checks `device_ptr_is_valid`).
-    /// - `out_shape` must be `[B, S, D]` with `D == cfg.dim`.
-    /// - `cfg.rotary_dim <= cfg.dim`; the non-rotary tail `[rotary_dim, D)` is copied verbatim.
-    /// - Positions slice length must equal `S`.
+    /// GPU-side YaRN / partial-rotary RoPE: computes `inv_freq[]` on the host, uploads it once per call, then dispatches `grim_rope_yarn` entirely on-device.
+    /// # Contract - `x_s` must have a valid device pointer (caller checks `device_ptr_is_valid`).
     pub(crate) fn rope_launch_yarn(
         &self,
         x_s: &RocmStorage,
@@ -1151,9 +1109,8 @@ impl RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
-    /// Launch LFM2-style fused QKV projection: MXFP4 GEMM (x @ W_qkv) followed by
-    /// per-head QK-Norm + RoPE (YaRN-aware). The GEMM result is staged in a scratch
-    /// buffer (or `out_all` if provided) and consumed by `grim_qk_norm_rope`.
+    /// Launch LFM2-style fused QKV projection: MXFP4 GEMM (x @ W_qkv) followed by per-head QK-Norm + RoPE (YaRN-aware).
+    /// The GEMM result is staged in a scratch buffer (or `out_all` if provided) and consumed.
     pub fn launch_fused_mxfp4_gemm_qk_norm_rope_kv(
         &self,
         x_storage: &RocmStorage,
@@ -1278,13 +1235,8 @@ impl RocmDevice {
             ],
         )?;
 
-        // The transient scratch buffer returns to the caching allocator when
-        // `scratch` drops at scope exit. The previous code additionally
-        // hipFree'd the pointer by hand — a double free that also corrupted
-        // the pool's bookkeeping (the allocator hands the same address to a
-        // future allocation) — after a hipStreamSynchronize stall. Pooled
-        // reuse is ordered by the single active stream, so neither the sync
-        // nor the manual free is needed.
+        // The transient scratch buffer returns to the caching allocator when `scratch` drops at scope exit.
+        // The previous code additionally hipFree'd the pointer by hand - a double free that also.
         drop(scratch);
 
         Ok(stream)
@@ -1471,12 +1423,8 @@ impl RocmDevice {
         )
     }
 
-    /// Split-KV count for FlashDecoding: consult the autotuner (persisted in
-    /// `.autotune_cache/{gpu_target}.json`) keyed by
-    /// `(num_heads, head_dim, kv_len)`; on miss return the static heuristic.
-    /// With `GRIM_ATTENTION_AUTOTUNE=1` (and outside stream capture), a miss
-    /// instead benchmarks candidate split counts with real launches and
-    /// records the winner — same treatment as GEMM tiles (ADR 0001 §5).
+    /// Split-KV count for FlashDecoding: consult the autotuner (persisted in `.autotune_cache/{gpu_target}.json`) keyed by `(num_heads, head_dim, kv_len)`; on miss return the static heuristic.
+    /// With `GRIM_ATTENTION_AUTOTUNE=1` (and outside stream capture), a miss instead benchmarks candidate split counts with real.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flash_decode_split_count(
         &self,
@@ -1511,9 +1459,8 @@ impl RocmDevice {
             return heuristic;
         }
 
-        // Bench candidate splits: real launches on the active stream, timed
-        // wall-clock (launch + synchronize). Each candidate runs 3 iterations
-        // after 1 warmup; the minimum wins.
+        // Bench candidate splits: real launches on the active stream, timed wall-clock (launch + synchronize).
+        // Each candidate runs 3 iterations after 1 warmup; the minimum wins.
         let mut candidates: Vec<usize> = [2usize, 4, 8, 16, 32, 64]
             .into_iter()
             .filter(|&s| s <= kv_seq_len.max(2))
@@ -1594,30 +1541,8 @@ impl RocmDevice {
         }
     }
 
-    /// WI-X5: RECORD side of the attention block-dim autotuner, shared by the
-    /// dense `grim_qkv_attention` lookup (`qkv_attention`) and the paged
-    /// `grim_qkv_attention_paged` launch sites. Callers consult
-    /// `tuner.lookup(key)` FIRST; this helper runs only on a cache miss so the
-    /// hot path is untouched whenever a cached entry exists.
-    ///
-    /// Gating (mirrors `flash_decode_split_count`):
-    /// * `GRIM_ATTENTION_AUTOTUNE=1` must be set,
-    /// * no active graph-capture session,
-    /// * `kv_seq_len >= min_kv_len` caps total sweep cost on short contexts,
-    /// * at most one sweep per `KernelKey` per process (in-process attempt
-    ///   set; cross-process persistence comes from the `.autotune_cache` JSON).
-    ///
-    /// Candidates are 64/128/256 threads restricted to whole-wavefront
-    /// multiples that fit the qkv kernels' LDS budget (`num_waves =
-    /// blockDim.x / wavefront`, shared accumulators sized for up to 8 waves).
-    /// The current default (`fallback_block_dim`) is benched alongside them, so
-    /// a recorded winner is never slower than the static heuristic.
-    ///
-    /// Timing uses real launches of the live argument buffer with wall-clock
-    /// launch+sync measurement (1 warmup + 2 timed reps per candidate, minimum
-    /// wins) — same methodology as `flash_decode_split_count`.
-    /// `time_kernel_ms` cannot be used here: it launches tile-picker GEMM
-    /// shapes with dummy arguments rather than the live qkv pointers/scalars.
+    /// WI-X5: RECORD side of the attention block-dim autotuner, shared by the dense `grim_qkv_attention` lookup (`qkv_attention`) and the paged `grim_qkv_attention_paged` launch sites.
+    /// Callers consult `tuner.lookup(key)` FIRST; this helper runs only on a cache miss so the hot.
     pub(crate) fn autotune_attention_block_dim(
         &self,
         key: crate::autotune::KernelKey,

@@ -6,12 +6,12 @@
 //! * OS: Linux 7.2.0-1-cachyos x86_64
 //! * CUDA Toolchain: CUDA Toolkit 13.3 (libcuda stub linked via /opt/cuda/targets/x86_64-linux/lib/stubs)
 
+use grim_backend_cuda::CudaDevice;
 use grim_tensor::backend::BackendDevice;
 use grim_tensor::{
-    AttentionOps, AutogradOps, CollectiveOps, CoreTensorOps, ElementwiseOps,
-    FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
+    AttentionOps, AutogradOps, CollectiveOps, CoreTensorOps, ElementwiseOps, FusionOps,
+    GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps, SamplingOps,
 };
-use grim_backend_cuda::CudaDevice;
 
 #[test]
 fn test_cuda_device_implements_all_backend_traits() {

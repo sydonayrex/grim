@@ -1,17 +1,5 @@
 //! WI-3a/3b: constrained sampler wrapping any `grim_core::sampler::Sampler`.
-//!
-//! `ConstrainedSampler<S>` delegates to an inner sampler but masks logits
-//! before delegating, so the generated tokens stay on a valid FSM/schema
-//! path. Temperature/top-p/etc. still apply **within** the masked set —
-//! this is additive, not a rework of the inner sampler.
-//!
-//! The `Sampler` trait is **unmodified** — this is wrapping, not altering,
-//! so no existing sampler implementor needs changes.
-//!
-//! FSM/output state is held behind `Arc<Mutex>` so the sampler remains
-//! `Send + Sync` (it's shared across tokio tasks in the server). The lock
-//! is held only for the duration of the mask computation, never across the
-//! inner sampler call.
+//! `ConstrainedSampler<S>` delegates to an inner sampler but masks logits before delegating, so the generated tokens.
 
 use std::sync::{Arc, Mutex};
 
@@ -44,33 +32,20 @@ impl Constraint {
     }
 }
 
-/// WI-3a/3b: a `Sampler` that wraps an inner sampler and constrains its
-/// output to a grammar/schema. The inner sampler is held as a trait object
-/// (`Arc<dyn Sampler>`) so this composes with any sampler — plugin samplers,
-/// `SamplingParams`-built samplers, or another `ConstrainedSampler`.
-///
-/// The `Sampler` trait is **unmodified** — this is wrapping, not altering,
-/// so no existing sampler implementor needs changes.
-///
-/// FSM/output state is held behind `Arc<Mutex>` so the sampler remains
-/// `Send + Sync` (it's shared across tokio tasks in the server). The lock
-/// is held only for the duration of the mask computation, never across the
-/// inner sampler call.
+/// WI-3a/3b: a `Sampler` that wraps an inner sampler and constrains its output to a grammar/schema.
+/// The inner sampler is held as a trait object (`Arc<dyn Sampler>`) so this composes with.
 pub struct ConstrainedSampler {
     inner: std::sync::Arc<dyn Sampler>,
     constraint: Constraint,
     /// JSON-mode FSM state (used for `JsonObject`; ignored for `JsonSchema`).
-    /// The full pushdown automaton from `json_fsm`; was the shallow
-    /// bracket-counter before implodsion.md WP0.
+    /// The full pushdown automaton from `json_fsm`; was the shallow bracket-counter before implodsion.md WP0.
     fsm: Arc<Mutex<JsonState>>,
     /// Per-FSM-state token-validity cache (WI-3c). Keys on `JsonState`.
     cache: Arc<Mutex<TokenMaskCache>>,
     /// Accumulated output text, used by the JSON-schema validator.
     output: Arc<Mutex<String>>,
-    /// Optional vocabulary. When present, `compute_mask` simulates each
-    /// token through the FSM and masks invalid ones — this is the path that
-    /// makes the constraint actually bite. When `None`, the mask is
-    /// conservative (all-valid), which is honest but useless.
+    /// Optional vocabulary. When present, `compute_mask` simulates each token through the FSM and masks
+    /// invalid ones - this is the path that makes the constraint actually bite.
     vocab: Option<std::sync::Arc<[String]>>,
 }
 
@@ -87,11 +62,7 @@ impl ConstrainedSampler {
     }
 
     /// Attach a vocabulary so per-token FSM masking takes effect.
-    ///
-    /// The server sets this from the loaded tokenizer's token strings at
-    /// sampler-construction time. Without it the sampler is conservative
-    /// (masks nothing) — honest but not useful, and the difference is
-    /// visible in tests.
+    /// The server sets this from the loaded tokenizer's token strings at sampler-construction time.
     pub fn with_vocab(mut self, vocab: std::sync::Arc<[String]>) -> Self {
         self.vocab = Some(vocab);
         self
@@ -112,9 +83,8 @@ impl Sampler for ConstrainedSampler {
         let mask = self.compute_mask(vocab_size);
         let mut v = logits.to_vec_f32()?;
         apply_mask(&mut v, &mask);
-        // Rebuild a CPU tensor from the masked logits and delegate. The
-        // inner sampler's sampling policy (temperature/top-p) still applies
-        // within the masked set.
+        // Rebuild a CPU tensor from the masked logits and delegate.
+        // The inner sampler's sampling policy (temperature/top-p) still applies within the masked set.
         let masked = grim_backend_cpu::cpu_tensor(v, logits.shape().clone());
         let token_id = self.inner.sample(&masked, history)?;
         self.feed_sampled_token_id(token_id);
@@ -128,11 +98,7 @@ impl Sampler for ConstrainedSampler {
 
 impl ConstrainedSampler {
     /// Record a sampled token's text so the FSM/schema state advances.
-    ///
-    /// Call this after every `sample()` to keep the constraint state in
-    /// sync with the emitted tokens. Without it, the sampler masks against
-    /// the initial state forever (harmless but useless — the first token is
-    /// unconstrained and every later call re-applies the same mask).
+    /// Call this after every `sample()` to keep the constraint state in sync with the emitted.
     pub fn feed_sampled_token(&self, token_text: &str) {
         if let Ok(mut out) = self.output.lock() {
             out.push_str(token_text);
@@ -143,15 +109,7 @@ impl ConstrainedSampler {
     }
 
     /// Record a sampled token by its ID, decoding via the stored vocabulary.
-    ///
-    /// This is the convenience path for the server: after `sample()` returns
-    /// a token ID, the server decodes it via the tokenizer and calls this.
-    /// The constrained sampler uses its own stored vocab to look up the text,
-    /// so the server doesn't need to thread the decoded text separately.
-    ///
-    /// If no vocab is attached, this is a no-op (the FSM won't advance —
-    /// the caller should also call `feed_sampled_token` with the real text
-    /// from the tokenizer when a vocab is available).
+    /// This is the convenience path for the server: after `sample()` returns a token ID, the.
     pub fn feed_sampled_token_id(&self, token_id: u32) {
         if let Some(vocab) = &self.vocab {
             if let Some(text) = vocab.get(token_id as usize) {
@@ -171,11 +129,7 @@ impl ConstrainedSampler {
     }
 
     /// Compute the validity mask for the current FSM/schema state.
-    ///
-    /// With a vocabulary attached, this simulates each token through the
-    /// FSM and masks the ones that can't lead to valid JSON — the real
-    /// constraint. Without a vocab it falls back to the conservative
-    /// all-valid rule (honest but useless; `with_vocab` is the fix).
+    /// With a vocabulary attached, this simulates each token through the FSM and masks the ones.
     fn compute_mask(&self, vocab_size: usize) -> Vec<bool> {
         if self.vocab.is_none() {
             tracing::warn!(
@@ -203,10 +157,7 @@ impl ConstrainedSampler {
                     let base_mask = cache.mask_for(fsm.clone(), vocab);
                     let output = self.output.lock().unwrap();
 
-                    // 2. Query schema validity mask. F9 fast path: inside an
-                    // unterminated string with no pattern/enum constraints,
-                    // schema validity is invariant per token — reuse the
-                    // structural mask and skip the O(vocab) validate pass.
+                    // 2. Query schema validity mask.
                     let all_valid: Arc<[bool]> = vec![true; vocab_size].into();
                     let schema_mask = if comp.inside_string_fast_path(&output) {
                         &all_valid
@@ -228,11 +179,8 @@ impl ConstrainedSampler {
         }
     }
 
-    /// Return deterministic lookahead string if the current FSM/schema state
-    /// only permits a single literal continuation. Consumed by the server's
-    /// jump-forward-lite (F6): when the constrained mask admits the literal,
-    /// the sampler splices it and skips ahead instead of sampling token by
-    /// token.
+    /// Return deterministic lookahead string if the current FSM/schema state only permits a single literal continuation.
+    /// Consumed by the server's jump-forward-lite (F6): when the constrained mask admits the literal, the sampler.
     pub fn lookahead_literal(&self) -> Option<String> {
         // FSM-level singletons (JSON-object mode): forced colon, literal tails.
         {

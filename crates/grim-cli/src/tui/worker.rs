@@ -1,13 +1,9 @@
 //! Worker thread and channel protocol for the in-process engine.
-//!
-//! The worker owns the `Engine`, tokenizer, and sampler. The UI thread owns
-//! the terminal. GPU and model code runs only here, wrapped in
-//! `catch_unwind` so a backend panic becomes an `Error` event instead of
-//! killing the UI thread.
+//! The worker owns the `Engine`, tokenizer, and sampler.
 
 use std::any::Any;
-use std::path::PathBuf;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -86,9 +82,8 @@ pub enum WorkerEvent {
         name: String,
         arguments: String,
     },
-    /// Worker → UI: a tool the worker auto-executed (read-only or covered by
-    /// an always-allow rule). The UI mirrors it into the transcript and the
-    /// message history it owns, so the next turn sees the tool exchange.
+    /// Worker → UI: a tool the worker auto-executed (read-only or covered by an always-allow rule).
+    /// The UI mirrors it into the transcript and the message history it owns, so the.
     ToolExec {
         call_id: String,
         name: String,
@@ -120,9 +115,7 @@ pub enum WorkerEvent {
 pub use super::diagnostics::DiagnosticsSnapshot;
 
 /// Turn-level statistics emitted with `TurnComplete`.
-///
-/// `decode_tps` is `None` when the turn produced no tokens (e.g. immediate
-/// cancel). We never invent a number to fill the gap.
+/// `decode_tps` is `None` when the turn produced no tokens (e.g.
 #[derive(Debug)]
 pub struct TurnStats {
     pub encode_ms: f64,
@@ -146,18 +139,8 @@ pub struct WorkerParams {
     pub repeat_penalty: f32,
 }
 
-/// RAII guard that redirects stderr to a temporary log file for the
-/// duration of a model load. Uses the `gag` crate which safely handles
-/// the platform-specific details of stderr redirection without
-/// corrupting the C runtime's FILE* buffering.
-///
-/// Stderr is redirected globally in mod.rs::cmd_tui (to GRIM_TUI_LOG or
-/// /tmp/grim-tui.log). This per-load redirect is removed — gag only allows
-/// one process-wide stderr redirect, and the global one covers worker threads
-/// too. Kept as a comment so future readers don't re-add it.
-
-/// True if the token id is an end-of-stream token for this tokenizer.
-/// Mirrors the EOS check in run.rs:931-939.
+/// RAII guard that redirects stderr to a temporary log file for the duration of a model load.
+/// Uses the `gag` crate which safely handles the platform-specific details of stderr redirection without corrupting.
 pub fn is_eos_token(tok: &GgufTokenizer, id: u32) -> bool {
     tok.eos_token_id.map_or(false, |eos| id == eos)
         || tok.token_to_id.get("<|im_end|>").copied() == Some(id)
@@ -203,9 +186,7 @@ enum WorkerOutcome {
 }
 
 /// Owns all engine state for the lifetime of the worker thread.
-///
-/// `rx` is intentionally *not* stored here: it lives in `spawn_worker` so a
-/// panic in any handler leaves it intact and the loop keeps draining commands.
+/// `rx` is intentionally *not* stored here: it lives in `spawn_worker` so a panic in any.
 struct Worker {
     engine: Engine,
     sampler: Box<dyn Sampler>,
@@ -262,7 +243,7 @@ impl Worker {
             WorkerCommand::SetThinking { level } => {
                 self.sampling_params.thinking_level = level;
                 // Rebuild the sampler so the new thinking level takes effect.
-                self.sampler = self.sampling_params.clone().into_sampler(self.seed);
+                self.sampler = self.sampling_params.into_sampler(self.seed);
                 WorkerOutcome::Ignored
             }
             WorkerCommand::SetPlanMode { enabled } => {
@@ -287,17 +268,14 @@ impl Worker {
                 });
                 WorkerOutcome::Ignored
             }
-            WorkerCommand::SetSamplingParams {
-                temperature,
-                top_p,
-            } => {
+            WorkerCommand::SetSamplingParams { temperature, top_p } => {
                 if let Some(t) = temperature {
                     self.sampling_params.temperature = t;
                 }
                 if let Some(p) = top_p {
                     self.sampling_params.top_p = p;
                 }
-                self.sampler = self.sampling_params.clone().into_sampler(self.seed);
+                self.sampler = self.sampling_params.into_sampler(self.seed);
                 WorkerOutcome::Ignored
             }
             WorkerCommand::LoadModel { name } => self.load_model(name),
@@ -319,7 +297,12 @@ impl Worker {
                     messages
                 };
                 if self.tools_enabled {
-                    self.agentic_generate(messages, rx, &self.tools.clone(), self.sandbox_root.clone());
+                    self.agentic_generate(
+                        messages,
+                        rx,
+                        &self.tools.clone(),
+                        self.sandbox_root.clone(),
+                    );
                 } else {
                     let (_text, stats) = self.generate(&messages, rx, None);
                     let _ = self.tx.send(WorkerEvent::TurnComplete { stats });
@@ -329,9 +312,8 @@ impl Worker {
         }
     }
 
-    /// Load a model, hot-swapping the previous one. Never leaves the worker
-    /// in a silent no-model state: on failure the old model stays loaded and
-    /// the UI is told the honest state.
+    /// Load a model, hot-swapping the previous one.
+    /// Never leaves the worker in a silent no-model state: on failure the old model stays.
     fn load_model(&mut self, name: String) -> WorkerOutcome {
         let _ = self
             .tx
@@ -355,8 +337,6 @@ impl Worker {
         let path_str = resolved.to_string_lossy().to_string();
 
         // 1. new load (old model stays resident so a failure keeps it usable).
-        // Stderr is already redirected globally in cmd_tui (mod.rs) to the
-        // log file, so all backend debug output during load goes there.
         let model = match grim_engine::model_loader::load_from_path(&path_str) {
             Ok(m) => m,
             Err(e) => {
@@ -386,10 +366,8 @@ impl Worker {
             .unwrap_or(&name)
             .to_string();
 
-        // 2. register new, then unload old (brief coexistence; the serial
-        // worker prevents any Generate from interleaving).
-        // Stderr redirect stays active through engine registration/unload
-        // because those operations also emit debug logging.
+        // 2. register new, then unload old (brief coexistence;
+        // the serial worker prevents any Generate from interleaving).
         self.engine.register_model(&id, model);
         if let Some(old) = self.current_id.clone() {
             if old != id {
@@ -406,7 +384,7 @@ impl Worker {
             .unwrap_or(512);
 
         // sampler is rebuilt with the configured sampling params and seed on every load.
-        self.sampler = self.sampling_params.clone().into_sampler(self.seed);
+        self.sampler = self.sampling_params.into_sampler(self.seed);
 
         let catalog_entry = grim_core::catalog::list_local_models()
             .into_iter()
@@ -429,8 +407,7 @@ impl Worker {
 
         self.current_id = Some(id.clone());
         // Update active backend for diagnostics display.
-        self.backend = std::env::var("GRIM_BACKEND")
-            .unwrap_or_else(|_| "rocm".into());
+        self.backend = std::env::var("GRIM_BACKEND").unwrap_or_else(|_| "rocm".into());
         let snapshot = self.make_snapshot(context_length, 0);
         let _ = self.tx.send(WorkerEvent::Diagnostics { snap: snapshot });
         WorkerOutcome::ModelLoadOk {
@@ -480,8 +457,7 @@ impl Worker {
     }
 
     /// Run one turn of generation, streaming tokens and diagnostics.
-    /// Returns the collected assistant text and turn stats. When tools are
-    /// enabled, the caller is responsible for parsing tool calls and looping.
+    /// Returns the collected assistant text and turn stats.
     fn generate(
         &mut self,
         messages: &[grim_format::ChatMessage],
@@ -525,7 +501,7 @@ impl Worker {
         };
 
         let t0 = Instant::now();
-        let prompt_ids = build_prompt_ids_with_tools(&tok, &messages, tools);
+        let prompt_ids = build_prompt_ids_with_tools(&tok, messages, tools);
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let request_id = self.next_request_id;
@@ -686,7 +662,6 @@ impl Worker {
 
     /// Run an agentic turn with tool calling. Loops: generate → parse tool
     /// calls → emit ToolCall → wait for ToolResult → inject → re-generate.
-    /// Sends TurnComplete only when the model stops calling tools.
     fn agentic_generate(
         &mut self,
         mut messages: Vec<grim_format::ChatMessage>,
@@ -718,7 +693,9 @@ impl Worker {
             if self.cancel_requested {
                 self.cancel_requested = false;
                 total_stats.cancelled = true;
-                let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+                let _ = self
+                    .tx
+                    .send(WorkerEvent::TurnComplete { stats: total_stats });
                 return;
             }
 
@@ -729,15 +706,15 @@ impl Worker {
                 Some(calls) if !calls.is_empty() => calls,
                 _ => {
                     // No tool calls — turn is complete.
-                    let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+                    let _ = self
+                        .tx
+                        .send(WorkerEvent::TurnComplete { stats: total_stats });
                     return;
                 }
             };
 
-            // Record the assistant message that produced these calls BEFORE
-            // appending tool results, so the message history matches the
-            // canonical sequence (assistant with tool_calls, then one tool
-            // message per call) on the next render.
+            // Record the assistant message that produced these calls BEFORE appending tool results, so the message history
+            // matches the canonical sequence (assistant with tool_calls, then one tool message per call) on the next render.
             messages.push(grim_format::ChatMessage {
                 role: "assistant".to_string(),
                 content: crate::tui::tools::strip_tool_markup(&generated_text),
@@ -751,12 +728,10 @@ impl Worker {
                 let call_id = call.id.clone();
                 let name = call.name.clone();
 
-                // update_tasks targets the UI sidebar, not the filesystem:
-                // parse it here, push the new list to the UI, and reply with
-                // a summary — no approval needed, it mutates no user data.
+                // update_tasks targets the UI sidebar, not the filesystem: parse it here, push the new list to
+                // the UI, and reply with a summary - no approval needed, it mutates no user data.
                 if name == "update_tasks" {
-                    let output = match crate::tui::tools::parse_update_tasks(&call.arguments)
-                    {
+                    let output = match crate::tui::tools::parse_update_tasks(&call.arguments) {
                         Ok(items) => {
                             let summary = crate::tui::tools::summarize_tasks(&items);
                             let _ = self.tx.send(WorkerEvent::TaskSync { tasks: items });
@@ -780,9 +755,8 @@ impl Worker {
                     continue;
                 }
 
-                // Plan mode hard-blocks mutations: answer the model with a
-                // rejection instead of prompting the user, so the loop keeps
-                // going and the model must present a plan as text.
+                // Plan mode hard-blocks mutations: answer the model with a rejection instead of prompting the
+                // user, so the loop keeps going and the model must present a plan as text.
                 if self.plan_mode {
                     let output = format!(
                         "rejected: plan mode is active. {name} is disabled; \
@@ -804,9 +778,8 @@ impl Worker {
                     continue;
                 }
 
-                // Auto-execute read-only built-in tools; everything else
-                // (mutations and ALL mcp_* tools, since they are not in this
-                // match) requires either an always-allow rule or approval.
+                // Auto-execute read-only built-in tools; everything else (mutations and ALL mcp_* tools, since
+                // they are not in this match) requires either an always-allow rule or approval.
                 let is_read_only =
                     matches!(name.as_str(), "read_file" | "list_files" | "search_files");
                 let allowed = is_read_only || {
@@ -850,9 +823,10 @@ impl Worker {
                     });
                     // Block waiting for ToolResult from the UI.
                     match rx.recv_timeout(std::time::Duration::from_secs(300)) {
-                        Ok(WorkerCommand::ToolResult { call_id: resp_id, output })
-                            if resp_id == call_id =>
-                        {
+                        Ok(WorkerCommand::ToolResult {
+                            call_id: resp_id,
+                            output,
+                        }) if resp_id == call_id => {
                             messages.push(grim_format::ChatMessage {
                                 role: "tool".to_string(),
                                 content: output,
@@ -862,14 +836,18 @@ impl Worker {
                             });
                         }
                         _ => {
-                            let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+                            let _ = self
+                                .tx
+                                .send(WorkerEvent::TurnComplete { stats: total_stats });
                             return;
                         }
                     }
                 }
             }
         }
-        let _ = self.tx.send(WorkerEvent::TurnComplete { stats: total_stats });
+        let _ = self
+            .tx
+            .send(WorkerEvent::TurnComplete { stats: total_stats });
     }
 }
 
@@ -956,9 +934,7 @@ fn tokenizer_for_path(path_str: &str) -> Option<GgufTokenizer> {
 }
 
 /// Spawn the worker thread. The worker exits on `Quit`; a backend panic in
-/// any command handler becomes an `Error` event rather than killing the UI
-/// thread. `rx` lives in this scope (outside `Worker`) so a panic leaves it
-/// intact and the loop keeps draining commands afterwards.
+/// any command handler becomes an `Error` event rather than killing the UI thread.
 pub fn spawn_worker(
     params: WorkerParams,
     rx: Receiver<WorkerCommand>,
@@ -976,7 +952,7 @@ pub fn spawn_worker(
         };
         let mut worker = Worker {
             engine: Engine::new(EngineConfig::default()),
-            sampler: sampling.clone().into_sampler(params.seed),
+            sampler: sampling.into_sampler(params.seed),
             sampling_params: sampling,
             seed: params.seed,
             tokenizer: None,

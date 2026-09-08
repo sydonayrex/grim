@@ -1,8 +1,5 @@
-//! `WeightSource` — depth-first cursor over a `TensorProvider`.
-//!
-//! Mirrors Candle's `VarBuilder` exactly: every model constructor walks a
-//! config-defined layer hierarchy and pulls tensors by prefix. Per-tensor
-//! dtype/provenance resolution (§4.2, §7.2) happens in `get()`.
+//! `WeightSource` - depth-first cursor over a `TensorProvider`.
+//! Mirrors Candle's `VarBuilder` exactly: every model constructor walks a config-defined layer hierarchy and pulls tensors.
 
 use std::sync::Arc;
 
@@ -12,9 +9,7 @@ use grim_tensor::dtype::{
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
-use grim_tensor::{RawTensor,
-    CoreTensorOps, MemoryOps,
-};
+use grim_tensor::{CoreTensorOps, MemoryOps, RawTensor};
 
 use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_quant::{
@@ -38,9 +33,8 @@ use grim_backend_vulkan::VulkanDevice;
 
 use crate::TensorParallelConfig;
 
-/// A handle that walks a `TensorProvider` by hierarchical prefix. Models
-/// call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize
-/// tensors; the call-site shape determines what storage type comes back.
+/// A handle that walks a `TensorProvider` by hierarchical prefix.
+/// Models call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize tensors; the call-site shape determines what storage type comes back.
 pub struct WeightSource<'a> {
     tensors: &'a dyn grim_tensor::TensorProvider,
     prefix: Vec<String>,
@@ -50,23 +44,15 @@ pub struct WeightSource<'a> {
     /// Tensor-parallel config for sharded weight loading. Defaults to
     /// single-device (rank 0, world_size 1).
     tp_config: TensorParallelConfig,
-    /// Parallel-prefetch cache: tensors fetched + per-tensor CPU passes
-    /// (e.g. MXFP4 reframing) done ahead of the layer loop by `prefetch_all`.
-    /// Keyed by the *full* (prefixed) tensor name so it matches what `get`
-    /// requests. Shared across `pp`/`with_tp_config` clones via `Arc`.
+    /// Parallel-prefetch cache: tensors fetched + per-tensor CPU passes (e.g.
+    /// MXFP4 reframing) done ahead of the layer loop by `prefetch_all`.
     prefetch_cache: std::sync::Arc<
         parking_lot::Mutex<
             std::collections::HashMap<String, std::sync::Arc<grim_tensor::provider::RawTensor>>,
         >,
     >,
-    /// Host-f32 dequant cache, populated by [`prefetch_all`] in the parallel
-    /// worker for formats that the `materialize` path dequantizes to host f32
-    /// (native F32/BF16/F16 and GroupInt; quantized-resident GPU formats like
-    /// KQuant/FloatPack on ROCm/CUDA stay packed and are excluded). Keyed by
-    /// full (prefixed) name, matching `prefetch_cache`. When present, `get_f32`
-    /// and the host-dequant `materialize` branch reuse it instead of re-running
-    /// `dequant_to_f32` on the layer-construction thread — overlapping the
-    /// CPU dequant cost with disk I/O and device uploads.
+    /// Host-f32 dequant cache, populated by [`prefetch_all`] in the parallel worker for formats that the `materialize` path dequantizes to host f32 (native F32/BF16/F16 and GroupInt; quantized-resident GPU formats like KQuant/FloatPack on ROCm/CUDA stay packed and are excluded).
+    /// Keyed by full (prefixed) name, matching `prefetch_cache`.
     dequant_cache: std::sync::Arc<
         parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<f32>>>>,
     >,
@@ -129,17 +115,7 @@ impl<'a> WeightSource<'a> {
     }
 
     /// Parallel-prefetch every tensor the underlying provider can name.
-    ///
-    /// Reads + per-tensor CPU passes (MXFP4 reframing, etc.) run concurrently
-    /// across a rayon worker pool instead of serially behind the provider's
-    /// read path, and the results are cached keyed by full (prefixed) name.
-    /// This is the primary load-time speedup: by the time the layer-
-    /// construction loop calls `get`, each `RawTensor` is already resident in
-    /// the cache and only the device upload remains.
-    ///
-    /// Tensors that fail to fetch are skipped (left for on-demand fallback),
-    /// so a partial provider (or a name the model doesn't reference) never
-    /// aborts the load.
+    /// Reads + per-tensor CPU passes (MXFP4 reframing, etc.) run concurrently across a rayon worker pool.
     pub fn prefetch_all(&self) {
         let names = self.tensors.tensor_names();
         if names.is_empty() {
@@ -166,16 +142,8 @@ impl<'a> WeightSource<'a> {
                     cache
                         .lock()
                         .insert(name.clone(), std::sync::Arc::new(raw.clone()));
-                    // Move the CPU dequant into the worker so it overlaps the
-                    // remaining disk I/O and device uploads (task: dequant in
-                    // prefetch worker). Only formats that `materialize` always
-                    // dequantizes to host f32 (native F32/BF16/F16, GroupInt,
-                    // ResidualPacked) are pre-dequantized — quantized KQuant /
-                    // FloatPack / Block formats stay packed-resident on
-                    // ROCm/CUDA/CPU, so their dequant is left to the device-
-                    // aware `materialize` path. A dequant failure here is a
-                    // cache miss (on-demand path recomputes it) — never an
-                    // abort.
+                    // Move the CPU dequant into the worker so it overlaps the remaining disk I/O and device uploads (task: dequant in prefetch worker).
+                    // Only formats that `materialize` always dequantizes to host f32 (native F32/BF16/F16, GroupInt, ResidualPacked) are pre-dequantized.
                     let storage = &raw.dtype.storage;
                     let host_f32_route = matches!(
                         storage,
@@ -196,8 +164,7 @@ impl<'a> WeightSource<'a> {
     }
 
     /// Look up a host-dequantized f32 buffer produced by the prefetch worker.
-    /// Returns `None` when the tensor was not pre-dequantized (either not
-    /// prefetched, or a packed-resident format whose dequant is device-aware).
+    /// Returns `None` when the tensor was not pre-dequantized (either not prefetched, or a packed-resident format.
     fn prefetched_f32(&self, name: &str) -> Option<std::sync::Arc<Vec<f32>>> {
         self.dequant_cache.lock().get(name).cloned()
     }
@@ -220,8 +187,7 @@ impl<'a> WeightSource<'a> {
     }
 
     /// Fetch the rank-th shard of a tensor (delegates to the underlying
-    /// provider's `get_packed_sharded`, which may do zero-copy byte-range reads
-    /// for GGUF block-quant formats).
+    /// provider's `get_packed_sharded`, which may do zero-copy byte-range reads for GGUF block-quant formats).
     pub fn get_sharded(&self, shape: impl Into<Shape>, leaf: &str, dim: usize) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
@@ -246,19 +212,8 @@ impl<'a> WeightSource<'a> {
         materialize(raw, shape, dtype, provenance, &self.device)
     }
 
-    /// Resolve a rank shard for a tensor, consulting the parallel-prefetch
-    /// cache first.
-    ///
-    /// `prefetch_all` fetches the *full* tensor (zero-copy out of the mmap) and
-    /// caches the packed bytes by full name. When a shard is requested for a
-    /// name the prefetch has already made resident, we shard that cached full
-    /// tensor client-side instead of issuing a second provider read — so TP
-    /// (`get_sharded`) rides the same parallel prefetch the single-device
-    /// (`get`) path does.
-    ///
-    /// Block-quant GGUF formats keep their provider-specific byte-range read
-    /// (block boundaries do not align with clean f32 shard slices), so for
-    /// those we fall through to `get_packed_sharded` exactly as before.
+    /// Resolve a rank shard for a tensor, consulting the parallel-prefetch cache first.
+    /// `prefetch_all` fetches the *full* tensor (zero-copy out of the mmap) and caches the packed bytes.
     fn cached_raw_sharded(
         &self,
         name: &str,
@@ -322,18 +277,15 @@ impl<'a> WeightSource<'a> {
         self.device.clone()
     }
 
-    /// Fetch the raw packed bytes for a tensor BEFORE materialization. Used by
-    /// loaders that slice a 3D expert bank into per-expert tensors so each
-    /// expert can be materialized (quantized-resident on GPU) individually
-    /// instead of dequantizing the whole bank to host f32.
+    /// Fetch the raw packed bytes for a tensor BEFORE materialization.
+    /// Used by loaders that slice a 3D expert bank into per-expert tensors so each expert.
     pub fn get_raw_packed(&self, leaf: &str) -> Result<grim_tensor::provider::RawTensor> {
         let name = self.full_name(leaf);
         self.cached_raw(&name)
     }
 
-    /// Materialize an already-fetched `RawTensor` on this WeightSource's
-    /// device (quantized formats stay packed/resident on GPU; native formats
-    /// become f32 tensors). Crate-internal helper shared by module loaders.
+    /// Materialize an already-fetched `RawTensor` on this WeightSource's device (quantized formats stay packed/resident on GPU; native formats become f32 tensors).
+    /// Crate-internal helper shared by module loaders.
     pub(crate) fn materialize_raw(
         &self,
         raw: grim_tensor::provider::RawTensor,
@@ -353,9 +305,8 @@ impl<'a> WeightSource<'a> {
         s
     }
 
-    /// Materialize a tensor of the given `shape` and `leaf` name under the
-    /// current prefix. Resolves dtype + provenance per-tensor: first from
-    /// the checkpoint's per-tensor metadata, then falls back to defaults.
+    /// Materialize a tensor of the given `shape` and `leaf` name under the current prefix.
+    /// Resolves dtype + provenance per-tensor: first from the checkpoint's per-tensor metadata, then falls back to.
     pub fn get(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
@@ -382,10 +333,7 @@ impl<'a> WeightSource<'a> {
     }
 
     /// Materialize a tensor without enforcing an expected shape up-front.
-    ///
-    /// This contract enables callers to perform dynamic shape inspection and
-    /// layout normalization (for instance, [`Embedding::load`] handling
-    /// transposed weights or token dimension padding in model checkpoints).
+    /// This contract enables callers to perform dynamic shape inspection and layout normalization (for instance, [`Embedding::load`].
     pub fn get_unconstrained(&self, leaf: &str) -> Result<Tensor> {
         let name = self.full_name(leaf);
         let raw = self.cached_raw(&name)?;
@@ -398,16 +346,8 @@ impl<'a> WeightSource<'a> {
         materialize(raw, shape, dtype, provenance, &self.device)
     }
 
-    /// Materialize a tensor as an F32 tensor on the target device, dequantizing
-    /// on the host exactly once.
-    ///
-    /// This is the single-transfer alternative to loading a quantized weight
-    /// with [`get`] (which keeps packed bytes resident on-device for GPU) and
-    /// then pulling it back with `to_vec_f32()` + re-upload (`dequantize_for_gather`'s
-    /// DtoH→H2D round trip). `get_f32` dequantizes the packed bytes to a host
-    /// `Vec<f32>` and uploads that host f32 buffer once (one H2D, zero DtoH).
-    /// Used by embedding tables, whose lookup kernels read F32 rows, and by any
-    /// gather source that cannot consume quantized-resident storage.
+    /// Materialize a tensor as an F32 tensor on the target device, dequantizing on the host exactly once.
+    /// This is the single-transfer alternative to loading a quantized weight with [`get`] (which keeps packed.
     pub fn get_f32(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
@@ -422,9 +362,8 @@ impl<'a> WeightSource<'a> {
             Ok(m) => (m.dtype, m.provenance),
             Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
         };
-        // Dequantize to a host f32 buffer. Reuse the prefetch worker's result
-        // when available (dequant already overlapped with disk I/O + other
-        // uploads); otherwise dequant here.
+        // Dequantize to a host f32 buffer. Reuse the prefetch worker's result when
+        // available (dequant already overlapped with disk I/O + other uploads); otherwise dequant here.
         let f32s: Vec<f32> = if let Some(cached) = self.prefetched_f32(&name) {
             (*cached).clone()
         } else {
@@ -433,11 +372,8 @@ impl<'a> WeightSource<'a> {
         if self.device.is_cpu() {
             return Ok(cpu_tensor(f32s, shape));
         }
-        // ROCm: use the stream-ordered (async, non-blocking) upload path so the
-        // per-tensor H2D copy queues on the stream pool and overlaps with the
-        // dequant + upload of the next tensor, instead of blocking the layer
-        // loop. The pinned host buffer is retained and freed at the next device
-        // synchronize (model load syncs before the first inference step).
+        // ROCm: use the stream-ordered (async, non-blocking) upload path so the per-tensor H2D copy queues on the stream pool and overlaps with the dequant + upload of the next tensor, instead of blocking the layer loop.
+        // The pinned host buffer is retained and freed at the next device synchronize (model load.
         #[cfg(feature = "rocm-mem")]
         if let Device::Rocm(ordinal) = self.device {
             let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
@@ -461,10 +397,8 @@ impl<'a> WeightSource<'a> {
         ))
     }
 
-    /// Materialize a tensor for training. Quantized storage types (Q4_K, Q5_K,
-    /// Q6_K, Q8_0, ...) are dequantized to native F32 in CPU memory so the
-    /// optimization pass has full-precision weights to take gradients against.
-    /// Native dtypes flow through unchanged.
+    /// Materialize a tensor for training. Quantized storage types (Q4_K, Q5_K, Q6_K, Q8_0, ...) are dequantized to
+    /// native F32 in CPU memory so the optimization pass has full-precision weights to take gradients against.
     pub fn get_for_training(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
@@ -498,10 +432,8 @@ fn materialize_cuda(
     ordinal: usize,
 ) -> Result<Tensor> {
     let dev = CudaDevice::new(ordinal)?;
-    // Storage is F32 bytes regardless of the GGUF-stored quantization tag:
-    // `f32s` was already dequantized in `materialize` above. Pass F32 to
-    // `from_cpu` so the CUDA storage carries DType::F32, which downstream
-    // embedding/matmul kernels require.
+    // Storage is F32 bytes regardless of the GGUF-stored quantization tag: `f32s` was already dequantized in `materialize` above.
+    // Pass F32 to `from_cpu` so the CUDA storage carries DType::F32, which downstream embedding/matmul kernels require.
     let storage = CoreTensorOps::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
@@ -553,13 +485,8 @@ fn materialize_rocm(
     ordinal: usize,
 ) -> Result<Tensor> {
     let dev = RocmDevice::shared(ordinal);
-    // Storage is F32 bytes (already dequantized in `materialize`). Mirror
-    // CUDA: stamp the storage as DType::F32 so ROCm kernels that check
-    // input dtype (embedding, matmul) accept the result.
-    // Opt-in unified-memory residency for large model weights. HIP kernels
-    // can dereference this storage normally; the runtime migrates pages
-    // between VRAM and system RAM. Keep the default on ordinary VRAM until
-    // a global budget policy is selected by the caller.
+    // Storage is F32 bytes (already dequantized in `materialize`).
+    // Mirror CUDA: stamp the storage as DType::F32 so ROCm kernels that check input dtype (embedding,.
     let managed = rocm_managed_weight_mode(ordinal, f32s.len() * std::mem::size_of::<f32>());
     let storage = if managed {
         dev.from_cpu_managed(&f32s, &shape, DType::F32)?
@@ -664,19 +591,8 @@ fn materialize(
     provenance: QuantProvenance,
     device: &Device,
 ) -> Result<Tensor> {
-    // ROCm-only fast path for GPTQ/EfficientQAT `GroupInt` weights. Keeps the
-    // packed four-segment blob resident on-device so the engine's
-    // `Linear::forward` -> `quantized_matmul` reads it directly through the
-    // fused `grim_gptq_dequant_gemm` kernel (roc_device.rs GroupInt arm),
-    // instead of inflating every tensor to host f32 at load.
-    //
-    // Scoped to ROCm: the ROCm backend is the only one whose
-    // `quantized_matmul` has a `GroupInt` dispatch arm backed by a live GPU
-    // kernel. The CPU/Vulkan/Metal/CUDA backends lack that arm, so for them
-    // `GroupInt` intentionally falls through to the host-f32 dequant below.
-    // 3-bit GroupInt has no fused device kernel (segment-offset + kernel only
-    // support 2/4/8-bit), so it also falls through to host f32 here and is
-    // served by `dequant_gptq_group_int` at load.
+    // ROCm-only fast path for GPTQ/EfficientQAT `GroupInt` weights.
+    // Keeps the packed four-segment blob resident on-device so the engine's `Linear::forward` -> `quantized_matmul` reads it.
     #[cfg(feature = "rocm-mem")]
     if let Device::Rocm(ordinal) = device {
         if let Storage::GroupInt(cfg) = &dtype.storage {
@@ -701,10 +617,8 @@ fn materialize(
     {
         #[cfg(feature = "rocm-mem")]
         if let Device::Rocm(ordinal) = device {
-            // Priority 2 diagnostic (opt-in): set GRIM_ROCM_FASTPATH_TRACE to
-            // confirm which path each quantized tensor takes on ROCm. Left in
-            // as a debug aid — silent otherwise so it never spams large MoE
-            // loads (thousands of expert tensors).
+            // Priority 2 diagnostic (opt-in): set GRIM_ROCM_FASTPATH_TRACE to confirm which path each quantized tensor takes on ROCm.
+            // Left in as a debug aid - silent otherwise so it never spams large MoE.
             if std::env::var_os("GRIM_ROCM_FASTPATH_TRACE").is_some() {
                 eprintln!(
                     "[grim][fastpath] ROCm on-device packed residency for {:?} ({} elems) on ordinal {ordinal}",
@@ -724,12 +638,8 @@ fn materialize(
             ));
         }
 
-        // CUDA: keep KQuant / FloatPack / Block storage resident on-device
-        // (raw packed bytes) instead of dequantizing to F32 at load time. This
-        // mirrors ROCm's Q8_0 residency and enables the CUDA fused
-        // `quantized_matmul_backward_dx` path in `grim-autograd::matmul_backward`.
-        // ResidualPacked is excluded (no host dequant exists); GroupInt is left
-        // dequantized-to-F32 to preserve its multi-segment loader semantics.
+        // CUDA: keep KQuant / FloatPack / Block storage resident on-device (raw packed bytes) instead of dequantizing to F32 at load time.
+        // This mirrors ROCm's Q8_0 residency and enables the CUDA fused `quantized_matmul_backward_dx` path in `grim-autograd::matmul_backward`.
         #[cfg(feature = "cuda-mem")]
         if let Device::Cuda(ordinal) = device {
             let dev = CudaDevice::new(*ordinal)?;
@@ -748,11 +658,8 @@ fn materialize(
             let _ = (&raw, &shape, &dtype);
         }
 
-        // CPU: keep quantized (KQuant / FloatPack / Block) bytes resident in
-        // system memory rather than decompressing to F32 at load time. The CPU
-        // `quantized_matmul` path dequantizes on-the-fly, so a 12B MXFP4 model
-        // stays ~6GB in RAM instead of inflating to ~48GB F32 and blowing past
-        // system RAM / thrashing swap. Mirrors the ROCm/CUDA residency semantics.
+        // CPU: keep quantized (KQuant / FloatPack / Block) bytes resident in system memory rather than decompressing to F32 at load time.
+        // The CPU `quantized_matmul` path dequantizes on-the-fly, so a 12B MXFP4 model stays ~6GB in RAM.
         if let Device::Cpu = device {
             let dev = CpuDevice::new();
             let storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
@@ -772,9 +679,8 @@ fn materialize(
     }
 
     let f32s = {
-        // Priority 2 diagnostic (opt-in): this is the host-side scalar dequant
-        // fallthrough. If GRIM_ROCM_FASTPATH_TRACE is set and this fires for an
-        // MXFP4/FloatPack tensor, the ROCm fast path was NOT taken for it.
+        // Priority 2 diagnostic (opt-in): this is the host-side scalar dequant fallthrough.
+        // If GRIM_ROCM_FASTPATH_TRACE is set and this fires for an MXFP4/FloatPack tensor, the ROCm fast path.
         if std::env::var_os("GRIM_ROCM_FASTPATH_TRACE").is_some() {
             eprintln!(
                 "[grim][fastpath] host dequant fallthrough for {:?} ({} elems)",
@@ -797,11 +703,8 @@ fn materialize(
     }
 }
 
-/// Materialize any supported storage format to a flat `Vec<f32>` of
-/// `raw.shape` length. This is the single dequant dispatch shared by the
-/// inference `get()` path (and mirrors the training `get_for_training`
-/// layout). Supports native F32/BF16/F16, the K-quant family (Q2K–Q8K,
-/// IQ4_NL), and low-bit float packs (FP4/NF4/FP8).
+/// Materialize any supported storage format to a flat `Vec<f32>` of `raw.shape` length.
+/// This is the single dequant dispatch shared by the inference `get()` path (and mirrors the.
 fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
     let n = raw.shape.iter().product::<usize>();
     match &dtype.storage {
@@ -934,10 +837,8 @@ pub(crate) fn f16_to_f32_le(bytes: &[u8]) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
     if exp == 0 {
-        // Subnormal or zero. An f16 subnormal encodes `mant * 2^-24`, but
-        // `f32::from_bits((sign<<31)|(mant<<13))` instead yields
-        // `mant * 2^-136` (≈2^112 too small). Build the correct value; this
-        // mirrors the fix in grim-quant::f16_to_f32 so the two decoders agree.
+        // Subnormal or zero. An f16 subnormal encodes `mant * 2^-24`,
+        // but `f32::from_bits((sign<<31)|(mant<<13))` instead yields `mant * 2^-136` (≈2^112 too small).
         let value = (mant as f32) * 2f32.powi(-24);
         if sign != 0 { -value } else { value }
     } else if exp == 31 {
@@ -1078,9 +979,8 @@ mod tests {
 
     #[test]
     fn audit_prefetch_hits_through_hf_to_gguf_remap() {
-        // PRODUCTION scenario for Lfm2/Mellum2: the checkpoint is GGUF-named
-        // (blk.*) and the loader requests GGUF names; `remap_hf_to_gguf` only
-        // has HF keys, so it is the identity on GGUF names.
+        // PRODUCTION scenario for Lfm2/Mellum2: the checkpoint is GGUF-named (blk.*) and the loader requests GGUF
+        // names; `remap_hf_to_gguf` only has HF keys, so it is the identity on GGUF names.
         let mut map = HMap::new();
         let gguf_name = "blk.0.attn_norm.weight".to_string();
         map.insert(

@@ -1,18 +1,11 @@
 //! Multimodal 3D Rotary Position Embedding (M-RoPE) for Vision-Language Models (Qwen-VL).
-//!
-//! Decomposes rotary dimensions into 3 coordinate channels: Temporal (T), Height (H), Width (W),
-//! applying multi-dimensional rotary frequencies directly to Query and Key tensors.
+//! Decomposes rotary dimensions into 3 coordinate channels: Temporal (T), Height (H), Width (W), applying multi-dimensional.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
 // 3D Multimodal Rotary Embedding (M-RoPE) for Q and K
-// ---------------------------------------------------------------------------
-//
-// Grid: (num_tokens, num_q_heads + num_k_heads)
-// Block: (rotary_dim / 2, 1)
-// ---------------------------------------------------------------------------
+// Grid: (num_tokens, num_q_heads + num_k_heads) Block: (rotary_dim / 2, 1)
 __global__ void grim_mrope_qk(
     float* __restrict__ q,                // [num_tokens, num_q_heads, head_dim]
     float* __restrict__ k,                // [num_tokens, num_k_heads, head_dim]

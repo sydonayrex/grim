@@ -1,7 +1,5 @@
 //! Solar-Open2-250B hybrid-attention MoE model architecture implementation.
-//!
-//! Features 48 layers interleaving 1 GQA (softmax attention) layer with 3 KDA
-//! (linear attention) layers. MoE block utilizes 320 routed experts + 1 shared expert.
+//! Features 48 layers interleaving 1 GQA (softmax attention) layer with 3 KDA (linear attention) layers.
 
 use crate::{DeltaNetBase, DeltaNetBaseConfig};
 use grim_core::error::{Error, Result};

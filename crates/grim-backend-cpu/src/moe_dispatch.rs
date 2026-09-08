@@ -126,9 +126,7 @@ pub struct PersistentMoeWorkerPool {
 
 impl PersistentMoeWorkerPool {
     /// Create a new persistent worker pool with `num_threads` (defaults to physical cores).
-    ///
-    /// # Contract
-    /// Spawns worker threads once and keeps them warm for low-latency dispatch.
+    /// # Contract Spawns worker threads once and keeps them warm for low-latency dispatch.
     pub fn new(num_threads: Option<usize>) -> Self {
         let n = num_threads.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -190,12 +188,7 @@ impl PersistentMoeWorkerPool {
 }
 
 /// CPU MoE partial expert evaluation for FreeToken hybrid co-execution.
-///
-/// # Contract
-/// Given pre-routed token activations and their normalized gate weights, this function
-/// computes ONLY the experts specified in `assigned_expert_ids` (Set $\mathcal{C}$ from
-/// the $q^*$ bandwidth-adaptive policy) and returns the weighted partial output vector.
-/// Evaluates tokens and assigned experts in parallel using physical core threads and SIMD.
+/// # Contract Given pre-routed token activations and their normalized gate weights, this function computes ONLY.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_cpu_partial_dispatch(
     tokens: &[f32],

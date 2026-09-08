@@ -7,8 +7,8 @@ fn test_bandwidth_matched_fetch_fraction() {
     assert!((frac - 0.48).abs() < 0.01, "frac={}", frac);
 
     let (gpu_count, cpu_count) = bench.split_experts(16, frac);
-    assert_eq!(gpu_count, 8);  // 16 * 0.48 = 7.68 -> rounds to 8
-    assert_eq!(cpu_count, 8);  // remaining on CPU
+    assert_eq!(gpu_count, 8); // 16 * 0.48 = 7.68 -> rounds to 8
+    assert_eq!(cpu_count, 8); // remaining on CPU
 }
 
 #[test]

@@ -3,8 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Total number of allocations routed to the managed-memory fallback since
-/// process start (WI-P3 instrumentation: makes the otherwise-silent
-/// oversubscription path observable).
+/// process start (WI-P3 instrumentation: makes the otherwise-silent oversubscription path observable).
 static MANAGED_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether the one-time user-facing warning about the managed-memory fallback
@@ -27,14 +26,8 @@ pub fn reset_managed_fallback_instrumentation() {
     MANAGED_FALLBACK_WARNED.store(false, Ordering::Relaxed);
 }
 
-/// Record that an allocation fell back to HIP managed memory and surface the
-/// risk to the user once per process. AMD's SVM (the backing mechanism for
-/// `hipMallocManaged`) evicts FIFO with no reuse awareness and — as of ROCm
-/// 6.8.0 or later — migrates in 2 MiB fault granularity; under genuine
-/// oversubscription this can collapse throughput to near zero. grim cannot
-/// adopt the driver-level fix (it requires patching AMDGPU/TTM, not
-/// upstreamed), so the honest remediation is: say it plainly, once, and point
-/// at the lever (`GRIM_ROCM_VRAM_BUDGET_BYTES`).
+/// Record that an allocation fell back to HIP managed memory and surface the risk to the user once per process.
+/// AMD's SVM (the backing mechanism for `hipMallocManaged`) evicts FIFO with no reuse awareness and -.
 pub fn note_managed_fallback(ordinal: usize, bytes: usize) {
     MANAGED_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
     if MANAGED_FALLBACK_WARNED
@@ -54,12 +47,7 @@ pub fn note_managed_fallback(ordinal: usize, bytes: usize) {
 }
 
 /// Decide whether a new allocation should use HIP managed memory.
-///
 /// `GRIM_ROCM_MANAGED_ALLOCATIONS=always` forces the host-backed tier.
-/// `...=auto` uses the live free-memory watermark and an optional
-/// `GRIM_ROCM_VRAM_BUDGET_BYTES` ceiling. The policy is intentionally global:
-/// model weights, activations, gradients, and temporary kernel outputs all
-/// pass through the same allocation seam.
 pub fn use_managed_allocation(ordinal: usize, bytes: usize) -> bool {
     let mode = std::env::var("GRIM_ROCM_MANAGED_ALLOCATIONS").unwrap_or_default();
     if matches!(mode.as_str(), "1" | "true" | "always") {
@@ -152,9 +140,8 @@ mod tests {
         );
     }
 
-    /// WI-P3 negative case: allocation that does NOT hit the managed path must
-    /// not touch the instrumentation (no false-positive warning on normal
-    /// small-model loads).
+    /// WI-P3 negative case: allocation that does NOT hit the managed path
+    /// must not touch the instrumentation (no false-positive warning on normal small-model loads).
     #[test]
     fn non_managed_allocation_does_not_touch_instrumentation() {
         reset_managed_fallback_instrumentation();

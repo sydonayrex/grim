@@ -265,19 +265,12 @@ lazy_static::lazy_static! {
     pub(crate) static ref QUEUE_LOCK: Mutex<()> = Mutex::new(());
 }
 
-/// Guards against re-attempting Vulkan init on every consumer call after a
-/// persistent failure. A single on-demand retry (see `global_context`) is
-/// enough; re-running init in a hot loop would just spam the loader.
+/// Guards against re-attempting Vulkan init on every consumer call after a persistent failure.
+/// A single on-demand retry (see `global_context`) is enough; re-running init in a hot loop would.
 static RETRY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// Re-initializes the global Vulkan context after a failed init.
-///
-/// `lazy_static` caches `None` forever when the initial `VulkanContext::init`
-/// fails (e.g. GPU was busy or a transient loader error at process start).
-/// This is the explicit re-init/retry entry point consumers can call when
-/// they hit a stale "Vulkan context uninitialized" error. Only one fresh init
-/// is attempted; a persistent failure surfaces as `Err` and the caller decides
-/// whether to degrade gracefully.
+/// `lazy_static` caches `None` forever when the initial `VulkanContext::init` fails (e.g.
 pub fn reset_global_context() -> Result<()> {
     let mut guard = GLOBAL_CONTEXT.lock().unwrap();
     if guard.is_none() {
@@ -293,11 +286,8 @@ pub fn reset_global_context() -> Result<()> {
     }
 }
 
-/// Accessor for the global context that re-attempts init once when the
-/// initial `lazy_static` init failed (which would otherwise cache `None`
-/// forever). A persistent failure is not re-tried on every call thanks to
-/// `RETRY_ATTEMPTED`; callers see `None` and can invoke `reset_global_context`
-/// explicitly if they want another attempt.
+/// Accessor for the global context that re-attempts init once when the initial `lazy_static` init failed (which would otherwise cache `None` forever).
+/// A persistent failure is not re-tried on every call thanks to `RETRY_ATTEMPTED`; callers see `None`.
 pub(crate) fn global_context() -> std::sync::MutexGuard<'static, Option<VulkanContext>> {
     let mut guard = GLOBAL_CONTEXT.lock().unwrap();
     if guard.is_none() && !RETRY_ATTEMPTED.swap(true, Ordering::SeqCst) {
@@ -305,4 +295,3 @@ pub(crate) fn global_context() -> std::sync::MutexGuard<'static, Option<VulkanCo
     }
     guard
 }
-

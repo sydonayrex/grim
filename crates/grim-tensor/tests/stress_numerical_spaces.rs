@@ -28,13 +28,13 @@ fn test_rerope_large_position_jumps_and_boundary_delta() {
 
     // Test data with wide dynamic range: small numbers (1e-4), unit values, and moderate numbers (1e2)
     let mut data = vec![0.0f32; b * s * d];
-    for i in 0..data.len() {
+    for (i, val) in data.iter_mut().enumerate() {
         let factor = match i % 3 {
             0 => 1e-4,
             1 => 1.0,
             _ => 10.0,
         };
-        data[i] = ((i as f32 + 1.0) * 0.03).cos() * factor;
+        *val = ((i as f32 + 1.0) * 0.03).cos() * factor;
     }
 
     let k_orig = make_cpu_tensor(data, shape.clone());
@@ -46,9 +46,15 @@ fn test_rerope_large_position_jumps_and_boundary_delta() {
 
     let cfg = RopeConfig::new(d, 500000.0); // RoPE base typical for long context (e.g. Llama 3 / Qwen)
 
-    let (k_old, _) = dev.rope(k_orig.storage().as_ref(), &old_pos_far, &cfg, &shape).unwrap();
-    let (k_expected, _) = dev.rope(k_orig.storage().as_ref(), &new_pos_far, &cfg, &shape).unwrap();
-    let (k_rerope, _) = dev.rerope(k_old.as_ref(), &old_pos_far, &new_pos_far, &cfg, &shape).unwrap();
+    let (k_old, _) = dev
+        .rope(k_orig.storage().as_ref(), &old_pos_far, &cfg, &shape)
+        .unwrap();
+    let (k_expected, _) = dev
+        .rope(k_orig.storage().as_ref(), &new_pos_far, &cfg, &shape)
+        .unwrap();
+    let (k_rerope, _) = dev
+        .rerope(k_old.as_ref(), &old_pos_far, &new_pos_far, &cfg, &shape)
+        .unwrap();
 
     let exp_vec = k_expected.to_cpu_vec_f32().unwrap();
     let rerope_vec = k_rerope.to_cpu_vec_f32().unwrap();
@@ -68,7 +74,9 @@ fn test_rerope_large_position_jumps_and_boundary_delta() {
     );
 
     // 2. Identity / Zero Delta: p_new == p_old
-    let (k_identity, _) = dev.rerope(k_old.as_ref(), &old_pos_far, &old_pos_far, &cfg, &shape).unwrap();
+    let (k_identity, _) = dev
+        .rerope(k_old.as_ref(), &old_pos_far, &old_pos_far, &cfg, &shape)
+        .unwrap();
     let ident_vec = k_identity.to_cpu_vec_f32().unwrap();
     let old_vec = k_old.to_cpu_vec_f32().unwrap();
     let mut max_diff_ident = 0.0f32;
@@ -84,7 +92,15 @@ fn test_rerope_large_position_jumps_and_boundary_delta() {
     );
 
     // 3. Negative Delta: p_new < p_old (retargeting backwards in prompt)
-    let (k_backwards, _) = dev.rerope(k_expected.as_ref(), &new_pos_far, &old_pos_far, &cfg, &shape).unwrap();
+    let (k_backwards, _) = dev
+        .rerope(
+            k_expected.as_ref(),
+            &new_pos_far,
+            &old_pos_far,
+            &cfg,
+            &shape,
+        )
+        .unwrap();
     let back_vec = k_backwards.to_cpu_vec_f32().unwrap();
     let mut max_diff_back = 0.0f32;
     for (o, b) in old_vec.iter().zip(back_vec.iter()) {

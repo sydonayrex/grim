@@ -1,19 +1,11 @@
 //! Vulkan kernel catalog: shader dispatch, SPIR-V lookup, binding counts.
-//!
-//! Owns:
-//! - `VulkanKernel` enum — every compiled SPIR-V compute kernel.
-//! - `spirv_for` / `binding_count` — SPIR-V blob lookup + declared buffer count.
-//! - `run_compute_shader` — low-level dispatch (descriptor sets, pipeline,
-//!   command buffer, submit, wait-idle). Pure Vulkan plumbing; no math.
-//! - `run_compute_shader_kernel` — named-kernel dispatch with binding-count
-//!   assertion (turns silent corruption into a loud `Err`).
-//! - `push_params` / `push_params_backward` — shared push-constant layouts.
+//! Owns: - `VulkanKernel` enum - every compiled SPIR-V compute kernel.
 
 use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
-use crate::context::{VulkanContext, QUEUE_LOCK};
+use crate::context::{QUEUE_LOCK, VulkanContext};
 use crate::ffi::*;
 
 pub(crate) fn run_compute_shader(
@@ -175,10 +167,8 @@ pub(crate) fn run_compute_shader(
                 "SPIR-V code size must be a multiple of 4 bytes".into(),
             ));
         }
-        // SPIR-V words are little-endian u32 (spec §2.3). `include_bytes!`
-        // statics are only 1-byte aligned by Rust rules, so build a properly
-        // aligned `Vec<u32>` instead of casting the byte pointer. Kept alive
-        // through the `vkCreateShaderModule` call below.
+        // SPIR-V words are little-endian u32 (spec §2.3).
+        // `include_bytes!` statics are only 1-byte aligned by Rust rules, so build a properly aligned `Vec<u32>`.
         let spirv_words: Vec<u32> = spirv_code
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -359,26 +349,15 @@ pub(crate) fn run_compute_shader(
     Ok(())
 }
 
-/// Build the 24-byte push-constant block (`Params`) the precompiled kernels
-/// expect: { size:u32, dim:u32, k:u32, n:u32, m:u32, eps:f32 }. Each kernel
-/// reads only the fields it needs; supplying the full block is always valid.
-
+/// Build the 24-byte push-constant block (`Params`) the precompiled kernels expect: { size:u32, dim:u32, k:u32, n:u32, m:u32, eps:f32 }.
+/// Each kernel reads only the fields it needs; supplying the full block is always valid.
 pub(crate) fn push_params(size: u32, dim: u32, k: u32, n: u32, m: u32, eps: f32) -> [u32; 6] {
     let eps_bits = eps.to_bits();
     [size, dim, k, n, m, eps_bits]
 }
 
-/// Extended 15-field push-constant block (60 bytes) for residual-aware
-/// quantized backward kernels.  Layout mirrors the GLSL `Params` struct in
-/// `*.comp` files:
-///
-/// ```text
-/// pad0, pad1, k, n, m, pad_eps      // 6 u32  — prefix compat with forward
-/// default_bpw, outlier_count        // 2 u32
-/// backup1_bpw, backup1_codes_offset, backup1_scale_offset  // 3 u32
-/// backup2_bpw, backup2_codes_offset, backup2_scale_offset  // 3 u32
-/// grad_scale                        // 1 f32
-/// ```
+/// Extended 15-field push-constant block (60 bytes) for residual-aware quantized backward kernels.
+/// Layout mirrors the GLSL `Params` struct in `*.comp` files: ```text pad0, pad1, k, n, m,.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_params_backward(
     k: u32,
@@ -413,7 +392,6 @@ pub(crate) fn push_params_backward(
         grad_scale.to_bits(),
     ]
 }
-
 
 include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
 
@@ -451,9 +429,8 @@ pub enum VulkanKernel {
     Recip,
     Rope,
     RopeBackward,
-    /// Partial-rotary + YaRN RoPE. Same 3-binding layout as `Rope`; the YaRN
-    /// ramp + `mscale` are recomputed inside the shader from push-constant
-    /// scalars so no `inv_freq` buffer is needed.
+    /// Partial-rotary + YaRN RoPE. Same 3-binding layout as `Rope`; the YaRN ramp + `mscale`
+    /// are recomputed inside the shader from push-constant scalars so no `inv_freq` buffer is needed.
     RopeYarn,
     /// Fused un-rotate and re-rotate (Position Retargeting) RoPE. 4-binding layout:
     /// (k_in, old_pos, new_pos, out_k).
@@ -641,12 +618,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
 }
 
 /// Number of `layout(std430, binding = N)` buffers each kernel declares.
-///
-/// Single source of truth for the buffer count a caller must supply. Kept in
-/// lockstep with the `.comp` files in `kernels/`; if a kernel's bindings
-/// change, update this table or `run_compute_shader_kernel` will refuse to
-/// launch and surface the mismatch as an `Err` instead of silently binding the
-/// wrong symbols and returning corrupt output.
+/// Single source of truth for the buffer count a caller must supply.
 pub fn binding_count(kernel: VulkanKernel) -> usize {
     match kernel {
         VulkanKernel::Add
@@ -683,15 +655,13 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::RingAllReduce
         | VulkanKernel::LogSoftmaxVjp => 3,
         VulkanKernel::Sub => 3,
-        VulkanKernel::AddScalar
-        | VulkanKernel::SubScalar
-        | VulkanKernel::DivScalar => 2,
+        VulkanKernel::AddScalar | VulkanKernel::SubScalar | VulkanKernel::DivScalar => 2,
         VulkanKernel::ReduceSum
         | VulkanKernel::ReduceMax
         | VulkanKernel::Argmax
         | VulkanKernel::Transpose2d => 2,
-        | VulkanKernel::BroadcastBias => 2,
-        | VulkanKernel::ScaleBiasEpilogue => 4,
+        VulkanKernel::BroadcastBias => 2,
+        VulkanKernel::ScaleBiasEpilogue => 4,
         VulkanKernel::QkvAttention
         | VulkanKernel::QkvAttentionSwa
         | VulkanKernel::Rerope
@@ -741,11 +711,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
     }
 }
 
-/// Dispatch a *named* kernel, first asserting that the caller supplied exactly
-/// the buffers the SPIR-V declares. Use this in place of `run_compute_shader`
-/// whenever the kernel is known up-front — it turns a binding mismatch (which
-/// `run_compute_shader` would silently accept and then corrupt) into a loud
-/// `Err` before any Vulkan handle is created.
+/// Dispatch a *named* kernel, first asserting that the caller supplied exactly the buffers the SPIR-V declares.
+/// Use this in place of `run_compute_shader` whenever the kernel is known up-front - it turns.
 pub(crate) fn run_compute_shader_kernel(
     ctx: &VulkanContext,
     kernel: VulkanKernel,

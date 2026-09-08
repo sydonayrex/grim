@@ -1,8 +1,5 @@
 //! Q2_K/Q3_K/Q4_K/Q5_K/Q6_K fused dequant-GEMM CUDA kernels.
-//!
-//! All five GGUF K-quant formats with forward and backward passes,
-//! organized with shared dequant device helpers and a macro to avoid
-//! code duplication per quant format.
+//! All five GGUF K-quant formats with forward and backward passes, organized with shared dequant device.
 
 pub const Q_GEMM_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -10,9 +7,7 @@ pub const Q_GEMM_SOURCE: &str = r#"
 
 extern "C" {
 
-// ---------------------------------------------------------------------------
 // FP16 → float helper
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float q_fp16_to_float(unsigned short h) {
     unsigned int s = ((unsigned int)(h & 0x8000u)) << 16;
     unsigned int e = ((unsigned int)(h & 0x7C00u)) << 13;
@@ -26,10 +21,8 @@ __device__ __forceinline__ float q_fp16_to_float(unsigned short h) {
     return __uint_as_float(s | e | m | 0x38000000u);
 }
 
-// ---------------------------------------------------------------------------
-// Q2_K — 84 bytes per 256-element super-block.
+// Q2_K - 84 bytes per 256-element super-block.
 // Layout: d(f16) + dmin(f16) + sc(8) + m(8) + qs(64)
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float dequant_q2k(const unsigned char* blk, int in_sb) {
     float d    = q_fp16_to_float(((const unsigned short*)blk)[0]);
     float dmin = q_fp16_to_float(((const unsigned short*)blk)[1]);
@@ -44,10 +37,8 @@ __device__ __forceinline__ float dequant_q2k(const unsigned char* blk, int in_sb
     return d * sub_sc * (float)q_code - dmin * sub_m;
 }
 
-// ---------------------------------------------------------------------------
-// Q3_K — 110 bytes per 256-element super-block.
+// Q3_K - 110 bytes per 256-element super-block.
 // Layout: hmask(32) + qs(64) + scales(12) + d(f16) at offset 108
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float dequant_q3k(const unsigned char* blk, int in_sb) {
     const unsigned char* hmask  = blk + 0;
     const unsigned char* qs     = blk + 32;
@@ -70,10 +61,8 @@ __device__ __forceinline__ float dequant_q3k(const unsigned char* blk, int in_sb
     return d * sc * ((float)q_with_high - 4.0f);
 }
 
-// ---------------------------------------------------------------------------
-// Q4_K — 144 bytes per 256-element super-block.
+// Q4_K - 144 bytes per 256-element super-block.
 // Layout: d(f16) + dmin(f16) + scales(12) + qs(128)
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float dequant_q4k(const unsigned char* blk, int in_sb) {
     float d    = q_fp16_to_float(((const unsigned short*)blk)[0]);
     float dmin = q_fp16_to_float(((const unsigned short*)blk)[1]);
@@ -93,10 +82,8 @@ __device__ __forceinline__ float dequant_q4k(const unsigned char* blk, int in_sb
     return d * (float)sc * (float)q_code - dmin * (float)mn;
 }
 
-// ---------------------------------------------------------------------------
-// Q5_K — 176 bytes per 256-element super-block.
+// Q5_K - 176 bytes per 256-element super-block.
 // Layout: d(f16) + dmin(f16) + scales(12) + qs(128) + qh(32)
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float dequant_q5k(const unsigned char* blk, int in_sb) {
     float d    = q_fp16_to_float(((const unsigned short*)blk)[0]);
     float dmin = q_fp16_to_float(((const unsigned short*)blk)[1]);
@@ -118,10 +105,8 @@ __device__ __forceinline__ float dequant_q5k(const unsigned char* blk, int in_sb
     return d * (float)sc * (float)q_code - dmin * (float)mn;
 }
 
-// ---------------------------------------------------------------------------
-// Q6_K — 210 bytes per 256-element super-block.
+// Q6_K - 210 bytes per 256-element super-block.
 // Layout: ql(128) + qh(64) + scales(16) + d(f16) at offset 208
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ float dequant_q6k(const unsigned char* blk, int in_sb) {
     const unsigned char* ql     = blk + 0;
     const unsigned char* qh     = blk + 128;
@@ -137,9 +122,7 @@ __device__ __forceinline__ float dequant_q6k(const unsigned char* blk, int in_sb
     return d * (float)sc_val * ((float)q_code - 32.0f);
 }
 
-// ---------------------------------------------------------------------------
 // Macro to emit fwd + bwd kernels per K-quant format
-// ---------------------------------------------------------------------------
 
 #define GRIM_KQUANT_FWD(NAME, FN, BLOCK_BYTES) \
 __global__ void grim_fused_dequant_gemm_##NAME( \

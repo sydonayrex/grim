@@ -1,14 +1,11 @@
 //! Parallel communication primitives for intra-model Tensor Parallelism (TP) and Pipeline Parallelism (PP).
-//!
-//! Provides ring all-reduce, all-gather, broadcast, and peer-to-peer point-to-point exchanges
-//! across multiple GPU ranks on AMD ROCm hardware, supporting both HIP peer direct memory
-//! and shared memory/host staging fallbacks.
+//! Provides ring all-reduce, all-gather, broadcast, and peer-to-peer point-to-point exchanges across multiple GPU ranks on AMD.
 
-use std::sync::{Arc, Mutex};
-use grim_tensor::backend::BackendStorage;
-use grim_tensor::error::{Error, Result};
 use crate::device::util::DeviceGuard;
 use crate::memory::storage::RocmStorage;
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::error::{Error, Result};
+use std::sync::{Arc, Mutex};
 
 /// Communication topology descriptor for a parallel execution group.
 #[derive(Debug, Clone)]
@@ -23,13 +20,12 @@ pub struct ParallelTopology {
 
 impl ParallelTopology {
     /// Creates a new parallel topology descriptor.
-    ///
-    /// # Contracts
-    /// * `rank < world_size`
-    /// * `device_ordinals.is_empty() || device_ordinals.len() == world_size`
+    /// # Contracts * `rank < world_size` * `device_ordinals.is_empty() || device_ordinals.len() == world_size`
     pub fn new(rank: usize, world_size: usize, device_ordinals: Vec<usize>) -> Result<Self> {
         if world_size == 0 {
-            return Err(Error::Backend("ParallelTopology: world_size must be >= 1".into()));
+            return Err(Error::Backend(
+                "ParallelTopology: world_size must be >= 1".into(),
+            ));
         }
         if rank >= world_size {
             return Err(Error::Backend(format!(
@@ -53,7 +49,10 @@ impl ParallelTopology {
 
     /// Returns the physical GPU device ordinal corresponding to this rank.
     pub fn local_device_ordinal(&self) -> usize {
-        self.device_ordinals.get(self.rank).copied().unwrap_or(self.rank)
+        self.device_ordinals
+            .get(self.rank)
+            .copied()
+            .unwrap_or(self.rank)
     }
 }
 
@@ -157,11 +156,7 @@ impl ParallelCommunicator {
     }
 
     /// Constructs a multi-rank communicator configured for direct peer-to-peer HIP memory DMA.
-    pub fn with_p2p(
-        rank: usize,
-        world_size: usize,
-        device_ordinals: Vec<usize>,
-    ) -> Result<Self> {
+    pub fn with_p2p(rank: usize, world_size: usize, device_ordinals: Vec<usize>) -> Result<Self> {
         let topology = ParallelTopology::new(rank, world_size, device_ordinals)?;
         Ok(Self {
             topology,
@@ -172,10 +167,7 @@ impl ParallelCommunicator {
     }
 
     /// Performs an in-place All-Reduce (SUM) operation across all ranks in the communicator.
-    ///
-    /// # Contract
-    /// * Every rank must invoke this collective with equal-sized buffers `buf`.
-    /// * Upon return, `buf[i]` contains the sum of `buf[i]` across all ranks.
+    /// # Contract * Every rank must invoke this collective with equal-sized buffers `buf`.
     pub fn all_reduce_sum_f32(&self, buf: &mut [f32]) -> Result<()> {
         if self.topology.world_size <= 1 {
             return Ok(());
@@ -224,7 +216,9 @@ impl ParallelCommunicator {
         let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
 
         if let Some(rccl) = &self.rccl {
-            let ptr = storage.device_ptr.ok_or_else(|| Error::Backend("No valid device pointer on storage".into()))?;
+            let ptr = storage
+                .device_ptr
+                .ok_or_else(|| Error::Backend("No valid device pointer on storage".into()))?;
             let count = storage.shape.elem_count();
             rccl.sum_gradients_device(ptr, ptr, count, stream_u64, self.topology.rank)?;
             Ok(())
@@ -250,9 +244,7 @@ impl ParallelCommunicator {
     }
 
     /// Gathers slices from all ranks into a concatenated destination buffer.
-    ///
-    /// # Contract
-    /// * `dst.len() == src.len() * world_size`
+    /// # Contract * `dst.len() == src.len() * world_size`
     pub fn all_gather_f32(&self, src: &[f32], dst: &mut [f32]) -> Result<()> {
         let world_size = self.topology.world_size;
         if world_size <= 1 {
@@ -384,7 +376,12 @@ impl ParallelCommunicator {
         let _guard = DeviceGuard::set(my_ordinal);
 
         if let Some(send_ptr) = send_dev_ptr {
-            let dst_ordinal = self.topology.device_ordinals.get(dst_rank).copied().unwrap_or(dst_rank) as i32;
+            let dst_ordinal = self
+                .topology
+                .device_ordinals
+                .get(dst_rank)
+                .copied()
+                .unwrap_or(dst_rank) as i32;
             if let Some(recv_ptr) = recv_dev_ptr {
                 crate::rccl::p2p_memcpy_async(
                     recv_ptr as *mut std::ffi::c_void,
@@ -396,7 +393,12 @@ impl ParallelCommunicator {
                 )?;
             }
         } else if let Some(_recv_ptr) = recv_dev_ptr {
-            let _src_ordinal = self.topology.device_ordinals.get(src_rank).copied().unwrap_or(src_rank) as i32;
+            let _src_ordinal = self
+                .topology
+                .device_ordinals
+                .get(src_rank)
+                .copied()
+                .unwrap_or(src_rank) as i32;
         }
         Ok(())
     }
@@ -452,9 +454,7 @@ impl ParallelCommunicator {
     }
 
     /// Reduces (SUM) equal-sized input buffers from all ranks and scatters the respective rank slice into `dst`.
-    ///
-    /// # Contract
-    /// * `src.len() == dst.len() * world_size`
+    /// # Contract * `src.len() == dst.len() * world_size`
     pub fn reduce_scatter_sum_f32(&self, src: &[f32], dst: &mut [f32]) -> Result<()> {
         let world_size = self.topology.world_size;
         let chunk_size = dst.len();
@@ -555,8 +555,12 @@ impl ParallelCommunicator {
         let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
 
         if let Some(rccl) = &self.rccl {
-            let send_ptr = src.device_ptr.ok_or_else(|| Error::Backend("all_gather_storage: src device pointer missing".into()))?;
-            let recv_ptr = dst.device_ptr.ok_or_else(|| Error::Backend("all_gather_storage: dst device pointer missing".into()))?;
+            let send_ptr = src.device_ptr.ok_or_else(|| {
+                Error::Backend("all_gather_storage: src device pointer missing".into())
+            })?;
+            let recv_ptr = dst.device_ptr.ok_or_else(|| {
+                Error::Backend("all_gather_storage: dst device pointer missing".into())
+            })?;
             rccl.all_gather_device(
                 send_ptr,
                 recv_ptr,
@@ -625,8 +629,12 @@ impl ParallelCommunicator {
         let _guard = DeviceGuard::set(self.topology.local_device_ordinal() as i32);
 
         if let Some(rccl) = &self.rccl {
-            let send_ptr = src.device_ptr.ok_or_else(|| Error::Backend("reduce_scatter_storage: src device pointer missing".into()))?;
-            let recv_ptr = dst.device_ptr.ok_or_else(|| Error::Backend("reduce_scatter_storage: dst device pointer missing".into()))?;
+            let send_ptr = src.device_ptr.ok_or_else(|| {
+                Error::Backend("reduce_scatter_storage: src device pointer missing".into())
+            })?;
+            let recv_ptr = dst.device_ptr.ok_or_else(|| {
+                Error::Backend("reduce_scatter_storage: dst device pointer missing".into())
+            })?;
             rccl.reduce_scatter_device(
                 send_ptr,
                 recv_ptr,
@@ -676,8 +684,10 @@ mod tests {
     #[test]
     fn test_all_reduce_sum_shared_staging() {
         let ring = Arc::new(HostStagingRing::new(2));
-        let comm0 = ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap();
-        let comm1 = ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap();
+        let comm0 =
+            ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap();
+        let comm1 =
+            ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap();
 
         let mut buf0 = vec![1.0f32, 2.0, 3.0];
         let mut buf1 = vec![10.0f32, 20.0, 30.0];
@@ -691,8 +701,10 @@ mod tests {
     #[test]
     fn test_all_gather_shared_staging() {
         let ring = Arc::new(HostStagingRing::new(2));
-        let comm0 = ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap();
-        let comm1 = ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap();
+        let comm0 =
+            ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap();
+        let comm1 =
+            ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap();
 
         let src0 = vec![1.0f32, 2.0];
         let src1 = vec![3.0f32, 4.0];
@@ -708,20 +720,22 @@ mod tests {
     #[test]
     fn test_all_to_all_shared_staging() {
         let ring = Arc::new(HostStagingRing::new(2));
-        let comm0 = ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap();
-        let comm1 = ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap();
+        let comm0 =
+            ParallelCommunicator::with_shared_staging(0, 2, vec![0, 1], ring.clone()).unwrap();
+        let comm1 =
+            ParallelCommunicator::with_shared_staging(1, 2, vec![0, 1], ring.clone()).unwrap();
 
         // comm0 sends s00 to rank0, s01 to rank1
-        let s00 = vec![1.0f32, 1.1];
-        let s01 = vec![2.0f32, 2.2];
+        let s00 = [1.0f32, 1.1];
+        let s01 = [2.0f32, 2.2];
 
         // comm1 sends s10 to rank0, s11 to rank1
-        let s10 = vec![3.0f32, 3.3];
-        let s11 = vec![4.0f32, 4.4];
+        let s10 = [3.0f32, 3.3];
+        let s11 = [4.0f32, 4.4];
 
         let mut r00 = vec![0.0f32; 2];
-        let mut r01 = vec![0.0f32; 2];
-        let mut r10 = vec![0.0f32; 2];
+        let mut r01 = [0.0f32; 2];
+        let mut r10 = [0.0f32; 2];
         let mut r11 = vec![0.0f32; 2];
 
         let sends0 = [&s00[..], &s01[..]];

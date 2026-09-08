@@ -1,38 +1,5 @@
-//! `grim-autograd` — Scoped autograd for adapter-only backward pass.
-//!
-//! WI-T1 of the grim training plan (`grim_party_plan.md`). This crate
-//! provides a minimal reverse-mode autodiff engine specifically designed
-//! for LoRA/QLoRA training where the base model weights are frozen. Only
-//! the LoRA adapter parameters (A/B matrices) require gradients.
-//!
-//! # Architectural thesis
-//!
-//! Unsloth's core trick: never materialize the full unquantized model in
-//! VRAM. Frozen base weights stay quantized; only LoRA adapters + optimizer
-//! state are kept in full precision; dequantization happens fused,
-//! just-in-time, per-op, and is thrown away immediately after use.
-//!
-//! This crate implements the *bookkeeping* half of that story: a small,
-//! purpose-built reverse-mode tape over just the trainable path. It is much
-//! easier to make correct and fast on ROCm than a general-purpose autodiff
-//! engine (à la PyTorch), and is the only thing QLoRA needs.
-//!
-//! # Scope limits (from §WI-T1)
-//!
-//! - No autodiff for the frozen base weights — that is WI-T8's problem.
-//! - No reimplementing `grim-format::fusion`'s detector; that's a different shape.
-//! - No reaching into `grim-backend-rocm` kernel internals — goes through
-//!   `BackendDevice` like existing forward code.
-//!
-//! # Op set
-//!
-//! Only the ops touching adapter parameters during forward are recorded:
-//! - `MatMul` (the linear layer, the LoRA A, the LoRA B),
-//! - `Add` (LoRA delta added into the frozen base output, trivially routes gradient),
-//! - `Scale` (the α/r factor).
-//!
-//! Backward for this exact op set is implemented; nothing more. Cross-entropy
-//! loss backward arrives with WI-T5 (it slots in as one more op).
+//! `grim-autograd` - Scoped autograd for adapter-only backward pass.
+//! WI-T1 of the grim training plan (`grim_party_plan.md`).
 
 /// Controls which parameters are recorded on the backward tape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,10 +89,8 @@ pub use tops_prune::{TopsConfig, TopsPruner, compute_entropy};
 
 use grim_tensor::{BackendDevice, Device, Tensor};
 
-/// Pick the `BackendDevice` that matches the storage location of `x` so
-/// arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
+/// Pick the `BackendDevice` that matches the storage location of `x` so arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
 /// Falls back to CPU if the requested backend is unavailable in this build.
-/// Mirrors `grim_nn::modules::pick_device_for_tensor`.
 pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
     match x.device() {
         Device::Cpu => Box::new(grim_backend_cpu::CpuDevice::new()),
@@ -139,10 +104,8 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
         }
         #[cfg(feature = "rocm-mem")]
         Device::Rocm(ordinal) => {
-            // Process-wide shared device: per-op `try_new` + drop would run
-            // the ROCm destructor (hipDeviceSynchronize + allocator flush +
-            // module unload) on every dispatch. Arc clones keep the singleton
-            // alive (see `BackendDevice for Arc<T>` in grim_tensor).
+            // Process-wide shared device: per-op `try_new` + drop would run the ROCm destructor (hipDeviceSynchronize + allocator flush + module unload) on every dispatch.
+            // Arc clones keep the singleton alive (see `BackendDevice for Arc<T>` in grim_tensor).
             Box::new(grim_backend_rocm::RocmDevice::shared(*ordinal))
         }
         #[cfg(feature = "vulkan-mem")]

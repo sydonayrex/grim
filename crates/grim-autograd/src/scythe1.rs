@@ -1,15 +1,5 @@
-//! SCYTHE1 = SOUL EATER adapter + Natural GaLore inverse-FIM preconditioning
-//! in the adapter subspace.
-//!
-//! Extends `SoulEaterAdapter` / `SoulEaterOptimizer` with a diagonal Fisher
-//! Information Matrix (FIM) accumulator that runs a running-average estimate
-//! of `E[g * g^T]` over the low-rank adapter parameters.
-//!
-//! For rank-r=16 the FIM stays as an r×r diagonal (`Vec<f32>` of length 16).
-//! At each optimizer step:
-//!   1) accumulate outer products of adapter gradients into FIM,
-//!   2) precondition with `FIM_inv_diag = 1 / max(FIM_diag, eps)`,
-//!   3) delegate to `SoulEaterOptimizer::step` for the actual update.
+//! SCYTHE1 = SOUL EATER adapter + Natural GaLore inverse-FIM preconditioning in the adapter subspace.
+//! Extends `SoulEaterAdapter` / `SoulEaterOptimizer` with a diagonal Fisher Information Matrix (FIM) accumulator that runs a.
 
 use grim_tensor::{Result, Tensor};
 
@@ -56,10 +46,8 @@ impl Scythe1Optimizer {
         }
     }
 
-    /// Perform one optimizer step:
-    /// 1) accumulate diagonal FIM from raw gradients,
-    /// 2) precondition U, V, Σ gradients with inverse-FIM diagonal,
-    /// 3) delegate to `SoulEaterOptimizer::step` for the actual update.
+    /// Perform one optimizer step: 1) accumulate diagonal FIM from raw gradients, 2) precondition U,
+    /// V, Σ gradients with inverse-FIM diagonal, 3) delegate to `SoulEaterOptimizer::step` for the actual update.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,

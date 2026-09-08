@@ -29,9 +29,8 @@ extern "C" __global__ void grim_wmma_gemm(
     const _Float16* a_tile_ptr = A + tile_row * 16 * stride_a;
     const _Float16* b_tile_ptr = B + tile_col * 16;
 
-    // Optional ping-pong LDS staging. The JIT define is selected by the tile
-    // picker only when two tiles fit in the LDS budget. Each wave cooperatively
-    // fills one buffer, computes from it, then alternates buffers.
+    // Optional ping-pong LDS staging. The JIT define is selected by the
+    // tile picker only when two tiles fit in the LDS budget.
 #if GRIM_LDS_DOUBLE_BUFFER
     __shared__ _Float16 lds_a[2][256];
     __shared__ _Float16 lds_b[2][256];
@@ -67,11 +66,8 @@ extern "C" __global__ void grim_wmma_gemm(
     }
 #endif
 
-    // rocWMMA accumulators store float; store to an intermediate row-major
-    // float buffer, then cast to _Float16 for the output. Directly passing
-    // a _Float16* to store_matrix_sync triggers a type-mismatch static_assert
-    // (accumulator DataT is float, pointer DataT is _Float16). Using a flat
-    // 1-D __shared__ array so it decays to float* as rocWMMA expects.
+    // rocWMMA accumulators store float; store to an intermediate row-major float buffer, then cast to _Float16 for the output.
+    // Directly passing a _Float16* to store_matrix_sync triggers a type-mismatch static_assert (accumulator DataT is float, pointer.
     _Float16* c_tile_ptr = C + tile_row * 16 * stride_c + tile_col * 16;
     __shared__ float c_tile_f32[256];
     store_matrix_sync(c_tile_f32, frag_c, 16, layout_t::mem_row_major);
@@ -218,9 +214,8 @@ extern "C" __global__ void grim_fused_dequant_gemm_mxfp4(
     C[row * N + col] = acc;
 }
 
-// Jay MXFP4 Fused Dequant Backward GEMM
-// Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
-// B is stored as 4-bit codes (2 per byte) + shared FP8 exponents (1 per 32 elements).
+// Jay MXFP4 Fused Dequant Backward GEMM Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
+// B is stored as 4-bit codes (2 per byte) + shared FP8 exponents (1 per.
 extern "C" __global__ void grim_fused_dequant_backward_gemm_mxfp4(
     const float* __restrict__ dY,
     const unsigned char* __restrict__ B_codes,
@@ -280,9 +275,8 @@ extern "C" __global__ void grim_fused_dequant_gemm_mxfp8(
     C[row * N + col] = acc;
 }
 
-// Magpie MXFP8 Fused Dequant Backward GEMM
-// Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
-// B is stored as FP8 codes (1 per element) + shared FP8 exponents (1 per 32 elements).
+// Magpie MXFP8 Fused Dequant Backward GEMM Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
+// B is stored as FP8 codes (1 per element) + shared FP8 exponents (1 per.
 extern "C" __global__ void grim_fused_dequant_backward_gemm_mxfp8(
     const float* __restrict__ dY,
     const unsigned char* __restrict__ B_fp8,
@@ -311,17 +305,13 @@ extern "C" __global__ void grim_fused_dequant_backward_gemm_mxfp8(
     dA[row * K + k_idx] = acc;
 }
 
-// ---------- MFMA Gates (gfx1200+, CDNA3) ----------
-// Cross-lane matrix multiply-accumulate for MI300X and successors.
+// ---------- MFMA Gates (gfx1200+, CDNA3) ---------- Cross-lane matrix multiply-accumulate for MI300X and successors.
 // MFMA instructions operate on 32x32x32 tile groups within a wavefront.
-// On gfx1200 (CDNA3), these provide FP8 throughput via WMMA/MFMA fusion.
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
 
-// MFMA FP8 fused dequant GEMM — forward pass using cross-lane tile ops.
-// On gfx1200+ the hardware has native 32x32 FP8 MFMA tiles (32 FP8 inputs →
-// 32 FP32 accumulators per wavefront). This kernel packs A/B values into
-// 32-element granules and issues mfma_f32_32x32x32_f8 instructions.
+// MFMA FP8 fused dequant GEMM - forward pass using cross-lane tile ops.
+// On gfx1200+ the hardware has native 32x32 FP8 MFMA tiles (32 FP8 inputs → 32.
 
 // Helper: pack a slice of 32 FP8 values into a 32-bit integer where each byte
 // is one element. The mfma instruction consumes 32 bytes from each operand.
@@ -357,10 +347,8 @@ extern "C" __global__ void grim_fused_dequant_gemm_fp8_mfma(
         for (int i = 0; i < 32 && (k + i) < K; ++i) {
             b_vals[i] = B_fp8[col * K + (k + i)];
         }
-        // gfx1200 mfma_f32_32x32x32_f8 equivalent — scalar fallback here.
-        // On real CDNA hardware, these 32 FP8→F32 conversions happen via
-        // the mfma instruction itself. This scalar fallback ensures
-        // compilation on non-gfx1200 targets within the same source string.
+        // gfx1200 mfma_f32_32x32x32_f8 equivalent - scalar fallback here.
+        // On real CDNA hardware, these 32 FP8→F32 conversions happen via the mfma instruction itself.
         for (int i = 0; i < 32 && (k + i) < K; ++i) {
             float a_val = A[row * K + (k + i)];
             float b_f32 = fp8_e4m3_to_float_hip(b_vals[i]);
@@ -438,14 +426,8 @@ mod self_tests {
         );
     }
 
-    // WRECK-8: FP8 MFMA kernel structure test. The FP8 MFMA path (grim_fused_dequant_gemm_fp8_mfma
-    // + grim_fused_dequant_backward_gemm_fp8_mfma) is guarded by `#if defined(__gfx1200__)`
-    // so non-gfx1200 targets never compile it; the dispatch path (roc_device.rs:2831) checks
-    // `gpu_target.starts_with("gfx12")` before calling the MFMA kernel, falling back to the
-    // scalar grim_fused_dequant_gemm_fp8 on non-gfx12. The MFMA kernel is a scalar fallback
-    // (no real __builtin_amdgcn_mfma_f32_32x32x16f8f6f4) until on-device gfx1200 hardware
-    // is available to verify the builtin — that's the on-device WRECK-8 verification item,
-    // not a CPU-testable deliverable.
+    // WRECK-8: FP8 MFMA kernel structure test.
+    // The FP8 MFMA path (grim_fused_dequant_gemm_fp8_mfma + grim_fused_dequant_backward_gemm_fp8_mfma) is guarded by `#if defined(__gfx1200__)` so non-gfx1200 targets.
     #[test]
     fn source_contains_fp8_mfma_guarded_path() {
         // MFMA forward kernel present and guarded by gfx1200.
@@ -476,12 +458,8 @@ mod self_tests {
             "FP8 MFMA kernel must use the shared fp8_e4m3_to_float_hip helper"
         );
     }
-    /// Verifies the standalone FP8 GEMM kernel (fp8_gemm_rdna4.rs) is present in the
-    /// compute_kernel_source and is arch-gated. The standalone kernel is dead code
-    /// (launch_fp8_gemm_rdna4 has no callers — the fused dequant path in wmma_gemm.rs
-    /// handles FP8 GEMM); kept only because it is compiled into the kernel source for
-    /// JIT-compile test coverage. The real FP8 throughput path is the fused dequant
-    /// MFMA kernel in wmma_gemm.rs (WRECK-8 primary deliverable).
+    /// Verifies the standalone FP8 GEMM kernel (fp8_gemm_rdna4.rs) is present in the compute_kernel_source and is arch-gated.
+    /// The standalone kernel is dead code (launch_fp8_gemm_rdna4 has no callers - the fused dequant path.
     #[test]
     fn source_contains_fp8_standalone_gated_path() {
         let src = crate::kernels::source_asm::compute_kernel_source();
@@ -495,9 +473,8 @@ mod self_tests {
         );
     }
 
-    /// Verifies the standalone FP8 dequant kernel (fp8_standalone.rs) is present in the
-    /// compute_kernel_source. This is the scalar FP8 E4M3→F32 dequant path used by the
-    /// non-MFMA FP8 GEMM fallback (grim_fused_dequant_gemm_fp8 on non-gfx1200).
+    /// Verifies the standalone FP8 dequant kernel (fp8_standalone.rs) is present in the compute_kernel_source.
+    /// This is the scalar FP8 E4M3→F32 dequant path used by the non-MFMA FP8 GEMM fallback.
     #[test]
     fn source_contains_fp8_standalone() {
         let src = crate::kernels::source_asm::compute_kernel_source();

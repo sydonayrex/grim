@@ -1,15 +1,5 @@
-//! Grim CLI Client — model downloads, status checks, auth, and terminal interactions.
-//!
-//! `download_model` is the primary entry point:
-//!
-//! - Accepts Ollama-style short names (`llama3`, `mistral:7b-q4_k_m`).
-//! - Accepts Hugging Face refs (`hf:org/repo/file.gguf` or full HTTPS URLs to
-//!   `.gguf` / `.safetensors` files).
-//! - Accepts plain HTTPS URLs to any model file.
-//!
-//! After a successful download the function writes a JSON sidecar via
-//! `catalog::ModelEntry::save` so `grim run <name>` can resolve the file
-//! without a filesystem scan.
+//! Grim CLI Client - model downloads, status checks, auth, and terminal interactions.
+//! `download_model` is the primary entry point: - Accepts Ollama-style short names (`llama3`, `mistral:7b-q4_k_m`).
 
 use std::fs;
 use std::io::Write;
@@ -22,9 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::ModelEntry;
 
-// ---------------------------------------------------------------------------
 // Ollama registry constants
-// ---------------------------------------------------------------------------
 
 const GRIM_REGISTRY: &str = "https://registry.ollama.ai";
 const GRIM_LIBRARY_NS: &str = "library";
@@ -45,21 +33,10 @@ pub struct DownloadProgress {
     pub completed: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
 // Public API
-// ---------------------------------------------------------------------------
 
 /// Download a model with default console progress output.
-///
-/// `model_ref` is resolved as follows (first matching rule wins):
-/// 1. `hf:<org>/<repo>/<file>` — Hugging Face direct file download.
-/// 2. Any string containing `huggingface.co` or `hf.co` — treated as a
-///    plain HTTPS Hugging Face URL.
-/// 3. A plain `https://` or `http://` URL — downloaded as-is.
-/// 4. `<name>` or `<name>:<tag>` — looked up in the Ollama registry.
-///
-/// `output` overrides the destination file path (defaults to
-/// `grim_models_dir()/<derived_name>.gguf`).
+/// `model_ref` is resolved as follows (first matching rule wins): 1.
 pub async fn download_model(model_ref: &str, output: Option<String>) -> Result<()> {
     download_model_with_progress(model_ref, output, |p| {
         if p.status == "downloading" {
@@ -91,7 +68,6 @@ pub async fn download_model(model_ref: &str, output: Option<String>) -> Result<(
 }
 
 /// Download a model while invoking the specified progress callback for updates.
-///
 /// See `download_model` for details on how `model_ref` is resolved.
 pub async fn download_model_with_progress<F>(
     model_ref: &str,
@@ -137,9 +113,7 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
 // Ollama registry download
-// ---------------------------------------------------------------------------
 
 /// Resolve and download a model from the Ollama registry.
 async fn download_grim_registry<F>(
@@ -268,9 +242,7 @@ where
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Hugging Face download
-// ---------------------------------------------------------------------------
 
 /// Download a specific file from a Hugging Face repository.
 async fn download_huggingface<F>(
@@ -413,14 +385,8 @@ async fn resolve_hf_gguf_filename(org: &str, repo: &str) -> Result<String> {
 
 use std::net::ToSocketAddrs;
 
-/// Bind-time SSRF posture: incoming server listeners may only bind to
-/// loopback or RFC-1918 / link-local / ULA addresses. Public IPs and the
-/// all-interfaces wildcard (`0.0.0.0` / `::`) are refused so a `grim serve
-/// --address 0.0.0.0:11434` can never accidentally expose the inference or
-/// model-fetch endpoints to a routable network.
-///
-/// This is the *incoming* counterpart to `validate_public_url`'s *outgoing*
-/// rule (which only permits fetching public hosts).
+/// Bind-time SSRF posture: incoming server listeners may only bind to loopback or RFC-1918 / link-local / ULA addresses.
+/// Public IPs and the all-interfaces wildcard (`0.0.0.0` / `::`) are refused so a `grim serve.
 pub fn is_bind_address_allowed(addr: &str) -> bool {
     let parsed: Option<std::net::SocketAddr> = addr.parse().ok();
     let parsed = match parsed {
@@ -568,9 +534,7 @@ where
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Streaming download with progress + SHA-256
-// ---------------------------------------------------------------------------
 
 /// Retrieve HuggingFace API token from environment, stored credentials, or HF cache.
 pub fn get_hf_token() -> Option<String> {
@@ -703,9 +667,7 @@ where
     Ok(sha256_hex)
 }
 
-// ---------------------------------------------------------------------------
 // Credential management
-// ---------------------------------------------------------------------------
 
 /// Save a provider API token to `~/.grim/credentials.toml`.
 pub fn save_login_token(provider: &str, token: &str) -> Result<()> {
@@ -809,9 +771,7 @@ pub fn list_login_tokens() -> Result<Vec<(String, String)>> {
     Ok(tokens)
 }
 
-// ---------------------------------------------------------------------------
 // Model management helpers
-// ---------------------------------------------------------------------------
 
 /// Delete a model and its sidecar from the models directory.
 pub fn delete_model(model_name: &str) -> Result<()> {
@@ -1128,9 +1088,7 @@ pub fn check_model_cache() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn build_http_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));

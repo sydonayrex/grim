@@ -14,17 +14,14 @@ pub use readiness_dispatch::{
 };
 pub use self_tuning::{SelfTuningController, TunableKnob};
 
-/// Real KV-memory pressure source (§5.2): reports current KV pool occupancy
-/// in `[0.0, 1.0]`. The engine wires this to the live `KvBlockPool`; tests
-/// supply synthetic values. `None` on the scheduler keeps the legacy
-/// token-arithmetic-only pressure signal.
+/// Real KV-memory pressure source (§5.2): reports current KV pool occupancy in `[0.0, 1.0]`.
+/// The engine wires this to the live `KvBlockPool`; tests supply synthetic values.
 pub trait KvPressureSource: Send + Sync {
     fn kv_occupancy(&self) -> f32;
 }
 
-/// Adapts a shared KV block pool into a [`KvPressureSource`] via an occupancy
-/// closure (e.g. `used_count() / capacity()` over the pool guard). Defined
-/// over a closure so the scheduler keeps no grim-memory dependency.
+/// Adapts a shared KV block pool into a [`KvPressureSource`] via an occupancy closure (e.g.
+/// `used_count() / capacity()` over the pool guard).
 pub struct PoolKvPressure {
     occupancy: Box<dyn Fn() -> f32 + Send + Sync>,
 }
@@ -47,9 +44,8 @@ impl KvPressureSource for PoolKvPressure {
 /// pressure regardless of token arithmetic (default 0.9).
 pub const KV_PRESSURE_THRESHOLD: f32 = 0.9;
 
-/// Readiness-driven dispatch tuning constant (RRFP idea). Decode tasks are
-/// submitted with high priority so the dispatcher arbitrates them ahead of
-/// contending prefill work under pressure.
+/// Readiness-driven dispatch tuning constant (RRFP idea).
+/// Decode tasks are submitted with high priority so the dispatcher arbitrates them ahead of contending.
 const READINESS_DECODE_PRIORITY: i32 = 100;
 
 /// A request in the scheduler system.
@@ -60,11 +56,8 @@ pub struct Request {
     /// Maximum number of tokens this request may generate, used by admission
     /// guards that reserve KV capacity before selecting a device.
     pub max_new_tokens: usize,
-    /// Scheduling priority. One policy governs both consumers: admission
-    /// ordering (higher priority first, arrival order breaking ties) and
-    /// preemption victim selection (lowest priority, earliest-arrived first).
-    /// A request is never starved by admission deferral or rescued by
-    /// priority alone — the swap-in path below guarantees re-entry.
+    /// Scheduling priority. One policy governs both consumers: admission ordering (higher priority first,
+    /// arrival order breaking ties) and preemption victim selection (lowest priority, earliest-arrived first).
     pub priority: i32,
     /// Tokens consumed so far in the current prefill pass (chunked prefill tracking).
     pub consumed_tokens: usize,
@@ -72,9 +65,8 @@ pub struct Request {
     pub model_id: Option<String>,
     /// Adapter ids this request uses for LoRA/batch fusion.
     pub adapter_ids: Vec<u32>,
-    /// Actual input token IDs for the prompt. If provided, these are used
-    /// instead of synthetic position indices during prefill. Length must match
-    /// `prompt_tokens` when present.
+    /// Actual input token IDs for the prompt. If provided,
+    /// these are used instead of synthetic position indices during prefill.
     pub input_ids: Option<Vec<u32>>,
 }
 
@@ -115,10 +107,8 @@ impl AdmissionController {
     }
 
     pub fn admit(&self, request: &Request, backlog: &BatchTokenBacklog) -> AdmissionDecision {
-        // Solo-prompt predicted TTFT check (§5.2): if a single request's prompt length
-        // is so large that its predicted TTFT alone exceeds the target_ttft_ms,
-        // it would be deferred forever causing livelock.
-        // We bypass the defer decision and admit it if no other requests are waiting in the backlog.
+        // Solo-prompt predicted TTFT check (§5.2): if a single request's prompt length is so large that its predicted TTFT alone exceeds the target_ttft_ms, it would be deferred forever causing livelock.
+        // We bypass the defer decision and admit it if no other requests are waiting in.
         let solo_predicted = self.predict_ttft(request.prompt_tokens, 0);
         if backlog.total <= request.prompt_tokens
             && solo_predicted.as_millis() as u64 > self.target_ttft_ms
@@ -189,41 +179,28 @@ pub struct Scheduler {
     pub paused: VecDeque<Request>, // §5.2.1 — explicitly paused, KV retained
     pub max_batched_tokens: usize,
     pub max_num_seqs: usize,
-    /// Tuned by [`SelfTuningController::chunked_prefill_size`](crate::self_tuning::KnobKind::ChunkedPrefillSize)
-    /// (§5.7): how many tokens from any one prompt are drained per
-    /// schedule pass. Drives prefill-vs-decode TTFT balance.
+    /// Tuned by [`SelfTuningController::chunked_prefill_size`](crate::self_tuning::KnobKind::ChunkedPrefillSize) (§5.7): how many tokens from any one prompt are drained per schedule pass.
+    /// Drives prefill-vs-decode TTFT balance.
     pub chunked_prefill_size: usize,
     pub admission: AdmissionController,
     pub determinism_mode: DeterminismMode,
-    /// Cumulative admission events since scheduler creation. A request counts
-    /// once on first admission; a preempted request that is swapped back in
-    /// counts again (it is a fresh admission into the batch).
+    /// Cumulative admission events since scheduler creation.
+    /// A request counts once on first admission; a preempted request that is swapped back in.
     admitted_total: usize,
-    /// Live KV occupancy source wired by the engine (see
-    /// [`Scheduler::set_kv_pressure`]). `None` = legacy token-arithmetic-only
-    /// pressure.
+    /// Live KV occupancy source wired by the engine (see [`Scheduler::set_kv_pressure`]).
+    /// `None` = legacy token-arithmetic-only pressure.
     kv_pressure: Option<Arc<dyn KvPressureSource>>,
-    /// Readiness-driven dispatcher (RRFP idea): under pressure, arbitrates
-    /// decode (always ready) vs prefill (ready only if budget fits) instead of
-    /// the fixed prefill-first order. `None` keeps the legacy fixed-order path.
+    /// Readiness-driven dispatcher (RRFP idea): under pressure, arbitrates decode (always ready) vs prefill (ready only if budget fits) instead of the fixed prefill-first order.
+    /// `None` keeps the legacy fixed-order path.
     readiness: Option<ReadinessDispatcher>,
 }
 
 /// Why readiness-driven dispatch matters here.
-///
-/// The legacy `schedule()` admits prefill chunks up to the token budget, then
-/// returns decode IDs — a fixed prefill-first order. Under pressure a large
-/// prefill can starve decode and blow ITL. The RRFP insight ("schedule as a
-/// hint, dispatch ready work, skip blocked work") adapts to this single-stage
-/// batcher as: decode tasks are always ready (no dependencies); prefill tasks
-/// are ready only while budget remains. `ReadinessDispatcher::arbitrate` then
-/// picks decode-first under pressure, eliminating the head-of-line prefill
-/// block. Enabled with [`Scheduler::set_readiness_dispatch`].
+/// The legacy `schedule()` admits prefill chunks up to the token budget, then returns decode IDs.
 const _READINESS_DOC: () = ();
 
-/// Contiguous segment of sequences sharing a LoRA adapter ID. Advisory
-/// summary of one `schedule()` call — execution plans row-level segments
-/// via [`LoraRowSegment::plan_for_rows`] from the forwarded batch layout.
+/// Contiguous segment of sequences sharing a LoRA adapter ID.
+/// Advisory summary of one `schedule()` call - execution plans row-level segments via [`LoraRowSegment::plan_for_rows`] from the.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoraSegment {
     /// Primary adapter ID (0 = base model, > 0 = fine-tuned adapter).
@@ -236,14 +213,8 @@ pub struct LoraSegment {
     pub seq_ids: Vec<u64>,
 }
 
-/// Contiguous segment of *batch rows* sharing one LoRA adapter, for fused
-/// multi-LoRA kernel execution (S-LoRA/Punica style) over a stacked
-/// `[rows, dim]` matrix.
-///
-/// Unlike [`LoraSegment`] (sequence-level, advisory), row segments are the
-/// execution contract: `row_start`/`row_count` index packed rows directly, so
-/// the consumer must plan them from the batch layout it actually forwards
-/// ([`LoraRowSegment::plan_for_rows`]).
+/// Contiguous segment of *batch rows* sharing one LoRA adapter, for fused multi-LoRA kernel execution (S-LoRA/Punica style) over a stacked `[rows, dim]` matrix.
+/// Unlike [`LoraSegment`] (sequence-level, advisory), row segments are the execution contract: `row_start`/`row_count` index packed rows directly,.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoraRowSegment {
     /// Adapter applied to every row in this segment (0 = base model, no delta).
@@ -256,11 +227,7 @@ pub struct LoraRowSegment {
 
 impl LoraRowSegment {
     /// Plan contiguous row segments from per-row primary adapter ids.
-    ///
-    /// Rows are consumed in the given order; equal adapter ids adjacent in
-    /// that order coalesce into one segment. This is a pure grouping pass —
-    /// callers that want maximal contiguity should sort their rows by adapter
-    /// id (stable, to keep determinism) before calling.
+    /// Rows are consumed in the given order; equal adapter ids adjacent in that order coalesce.
     pub fn plan_for_rows(row_adapters: &[u32]) -> Vec<Self> {
         let mut segments: Vec<Self> = Vec::new();
         for (row, &adapter_id) in row_adapters.iter().enumerate() {
@@ -283,11 +250,8 @@ pub struct SchedulerOutput {
     pub prefill_ids: Vec<u64>,
     pub decode_ids: Vec<u64>,
     pub preempted_ids: Vec<u64>,
-    /// Advisory grouping of running sequence IDs by primary LoRA adapter ID
-    /// (0 = base model). Nothing in the execution path is required to consume
-    /// this: fused batched LoRA dispatch plans its own row segments from the
-    /// batch layout it actually forwards (`LoraRowSegment::plan_for_rows`).
-    /// This field exists for observability and as a scheduling-level summary.
+    /// Advisory grouping of running sequence IDs by primary LoRA adapter ID (0 = base model).
+    /// Nothing in the execution path is required to consume this: fused batched LoRA dispatch plans.
     pub adapter_batches: std::collections::HashMap<u32, Vec<u64>>,
     /// Contiguous sequence-level segment descriptors (advisory, same contract
     /// as `adapter_batches`).
@@ -299,9 +263,8 @@ pub struct SchedulerOutput {
 pub struct SchedulerSnapshot {
     pub active_requests: usize,
     pub waiting_requests: usize,
-    /// Cumulative admissions since scheduler creation (`Scheduler::
-    /// admitted_total`) — matches the `grim_scheduler_admitted_requests`
-    /// counter semantics on the serve surface.
+    /// Cumulative admissions since scheduler creation (`Scheduler:: admitted_total`) -
+    /// matches the `grim_scheduler_admitted_requests` counter semantics on the serve surface.
     pub admitted_requests: usize,
     pub paused_requests: usize,
 }
@@ -345,18 +308,14 @@ impl Scheduler {
         }
     }
 
-    /// Enable readiness-driven dispatch (RRFP idea). When set, `schedule()`
-    /// uses the [`ReadinessDispatcher`] to arbitrate decode-before-prefill under
-    /// pressure instead of the legacy fixed prefill-first order. Pass `None` to
-    /// restore legacy behavior.
+    /// Enable readiness-driven dispatch (RRFP idea).
+    /// When set, `schedule()` uses the [`ReadinessDispatcher`] to arbitrate decode-before-prefill under pressure instead of the legacy.
     pub fn set_readiness_dispatch(&mut self, dispatcher: Option<ReadinessDispatcher>) {
         self.readiness = dispatcher;
     }
 
-    /// Wire a live KV occupancy source (§5.2): when occupancy exceeds
-    /// [`KV_PRESSURE_THRESHOLD`], the scheduler enters memory pressure
-    /// regardless of token arithmetic — preemption and chunked draining
-    /// then react to actual pool exhaustion, not just prompt-token sums.
+    /// Wire a live KV occupancy source (§5.2): when occupancy exceeds [`KV_PRESSURE_THRESHOLD`], the scheduler enters memory pressure regardless
+    /// of token arithmetic - preemption and chunked draining then react to actual pool exhaustion, not just prompt-token sums.
     pub fn set_kv_pressure(&mut self, source: Arc<dyn KvPressureSource>) {
         self.kv_pressure = Some(source);
     }
@@ -383,13 +342,6 @@ impl Scheduler {
     }
 
     /// Called once per engine tick. Decides what runs this step.
-    /// Chunked-prefill progress per request whose drain has started but not
-    /// finished: id -> (consumed_tokens, prompt_tokens). Covers mid-drain
-    /// remainders parked in `waiting` as well as `running` entries, so
-    /// consumers like the multi-rank VPP coordinator can interleave two
-    /// requests' chunks for drain-window packing without reaching into
-    /// scheduler collections. Requests that have not been chunk-scheduled
-    /// yet report no offset — there is no boundary to interleave with.
     pub fn chunk_offsets(&self) -> std::collections::HashMap<u64, (usize, usize)> {
         self.running
             .iter()
@@ -409,10 +361,8 @@ impl Scheduler {
             // Sort running list deterministically by request ID
             self.running.sort_by_key(|r| r.id);
         } else {
-            // Admission policy (see `Request::priority`): higher priority
-            // first, arrival order breaking ties (stable sort). Checked
-            // before sorting so the common already-ordered case stays
-            // allocation-free.
+            // Admission policy (see `Request::priority`): higher priority first, arrival order breaking ties (stable sort).
+            // Checked before sorting so the common already-ordered case stays allocation-free.
             let has_inversion = (1..self.waiting.len())
                 .any(|i| self.waiting[i - 1].priority < self.waiting[i].priority);
             if has_inversion {
@@ -433,18 +383,8 @@ impl Scheduler {
             || total_running_tokens > self.max_batched_tokens
             || self.kv_memory_pressure();
 
-        // Swap-in (§5.2): once pressure lifts, preempted requests re-enter
-        // admission from the FRONT of `waiting` (older than new arrivals).
-        // `consumed_tokens` is preserved across the swap, so chunked prefill
-        // resumes at the true offset, and a fully-prefilled swap-in skips
-        // straight to decode (handled in the admission loop below). Before
-        // this path existed, `finish()` was the only remover of `swapped` —
-        // a preempted request was stranded until it was aborted.
-        //
-        // Entries already tracked elsewhere (a preempted mid-prefill request
-        // whose chunk remainder is still in `waiting`) are dropped: the
-        // remaining copy is the live one, and keeping both would schedule
-        // the same id twice per pass.
+        // Swap-in (§5.2): once pressure lifts, preempted requests re-enter admission from the FRONT of `waiting` (older than new arrivals).
+        // `consumed_tokens` is preserved across the swap, so chunked prefill resumes at the true offset, and.
         if !pressure_active {
             let mut swap_back = Vec::new();
             while let Some(r) = self.swapped.pop_front() {
@@ -460,8 +400,6 @@ impl Scheduler {
         }
 
         // 0. Admission control: defer requests that would bust the TTFT budget.
-        // Push deferred requests to the back of the queue so they don't
-        // starve newer requests (livelock prevention).
         let mut admitted = VecDeque::new();
         while let Some(r) = self.waiting.pop_front() {
             if self.admission.admit(&r, &backlog) == AdmissionDecision::Admit {
@@ -474,10 +412,8 @@ impl Scheduler {
 
         let mut output = SchedulerOutput::default();
 
-        // Preemption check (§5.2): swap the lowest-priority, earliest-arrived
-        // running sequence to `swapped` under token pressure. Victims return
-        // via the swap-in path above once pressure lifts (see
-        // `Request::priority` for the single ordering policy).
+        // Preemption check (§5.2): swap the lowest-priority, earliest-arrived running sequence to `swapped` under token pressure.
+        // Victims return via the swap-in path above once pressure lifts (see `Request::priority` for the single.
         if pressure_active
             && total_running_tokens > self.max_batched_tokens
             && !self.running.is_empty()
@@ -498,16 +434,8 @@ impl Scheduler {
         let mut total_prefill = 0usize;
         let current_running = self.running.len();
 
-        // Readiness-driven decode-first interleaving (RRFP idea). The engine
-        // runs all admitted prefills before any decode this tick, so under
-        // pressure a large newly-admitted prefill chunk head-of-line-blocks
-        // ready decode work and spikes ITL. When the dispatcher is enabled and
-        // decode work is ready under pressure, interleave: submit the ready
-        // decode tasks, let the dispatcher arbitrate decode-first, and if it
-        // does, defer new prefill admission to next tick so decode runs now.
-        // This is the RRFP "dispatch ready work, skip blocked work" insight
-        // applied to the prefill/decode contention — not a new pipeline stage.
-        // Without the dispatcher (or off pressure) prefill proceeds greedily.
+        // Readiness-driven decode-first interleaving (RRFP idea).
+        // The engine runs all admitted prefills before any decode this tick, so under pressure a.
         let defer_prefill_this_tick = if self.readiness.is_some() && pressure_active {
             let decode_ready: Vec<&Request> = self
                 .running
@@ -554,19 +482,12 @@ impl Scheduler {
                 self.waiting.push_back(r);
                 continue;
             }
-            // Chunked prefill (Sarathi-Serve style, §5.2): drain tokens up to
-            // chunked_prefill_size only under load. Chunks operate on the
-            // REMAINING unconsumed tokens — F9 (audit): the previous code
-            // assigned `consumed_tokens = chunk_size` and sized chunks off the
-            // full prompt, so a request scheduled on a 3rd+ pass had its
-            // consumed count reset backward and reprocessed the entire prompt
-            // from offset 0.
+            // Chunked prefill (Sarathi-Serve style, §5.2): drain tokens up to chunked_prefill_size only under load.
+            // Chunks operate on the REMAINING unconsumed tokens - F9 (audit): the previous code assigned `consumed_tokens.
             let remaining_before = r.prompt_tokens.saturating_sub(r.consumed_tokens);
             if remaining_before == 0 {
-                // Fully prefilled before leaving the batch (a swap-in): no
-                // prefill work remains, so it re-enters `running` directly
-                // and becomes decode-eligible this pass instead of paying a
-                // zero-token prefill pass.
+                // Fully prefilled before leaving the batch (a swap-in): no prefill work remains, so it
+                // re-enters `running` directly and becomes decode-eligible this pass instead of paying a zero-token prefill pass.
                 match self.running.iter().position(|e| e.id == r.id) {
                     Some(pos) => self.running[pos] = r,
                     None => {
@@ -592,12 +513,8 @@ impl Scheduler {
             output.prefill_ids.push(r.id);
             let mut running_req = r.clone();
             running_req.consumed_tokens = new_consumed;
-            // One running entry per request: a chunked request re-enters
-            // through `waiting` every pass, and pushing a fresh copy each
-            // time accumulated duplicates (a 3-pass prefill left 3 entries,
-            // tripling that request's decode work every tick and letting
-            // preemption swap one copy while another kept running). Replace
-            // the prior entry instead of appending.
+            // One running entry per request: a chunked request re-enters through `waiting` every pass, and pushing a fresh copy each time accumulated duplicates (a 3-pass prefill left 3 entries, tripling that request's decode work every tick and letting preemption swap one copy while another kept running).
+            // Replace the prior entry instead of appending.
             match self.running.iter().position(|e| e.id == r.id) {
                 Some(pos) => self.running[pos] = running_req,
                 None => {
@@ -624,11 +541,7 @@ impl Scheduler {
             }
         }
 
-        // 2. Return decode IDs for already-running sequences. A request
-        // still mid-prefill (chunked, remainder waiting) must NOT decode:
-        // its prompt is not fully in KV yet, and the engine's decode step
-        // would feed a prompt token as if it were generated. It idles
-        // until its remainder is scheduled.
+        // 2. Return decode IDs for already-running sequences.
         for r in &self.running {
             if !output.prefill_ids.contains(&r.id) && r.consumed_tokens >= r.prompt_tokens {
                 output.decode_ids.push(r.id);
@@ -679,9 +592,8 @@ impl Scheduler {
         self.paused.retain(|r| r.id != id);
     }
 
-    /// Pause a running request — moves it to `paused` queue, keeping its
-    /// KV state alive (ref-counted, per §5.4). The request will not be
-    /// selected for the running batch until `resume` is called.
+    /// Pause a running request - moves it to `paused` queue, keeping its KV state alive (ref-counted, per §5.4).
+    /// The request will not be selected for the running batch until `resume` is called.
     pub fn pause(&mut self, id: u64) -> bool {
         if let Some(pos) = self.running.iter().position(|r| r.id == id) {
             let r = self.running.remove(pos);
@@ -709,37 +621,11 @@ impl Scheduler {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WI 3.4.1 / 3.4.5 — Hybrid CPU/GPU attention offload (APEX-style).
-//
-// The *decision* of how to partition a sequence's KV blocks between GPU and
-// CPU for a hybrid decode step lives here in the scheduler (Gate 3.6.4:
-// scheduling policy must not live in a backend crate). The backend crates
-// expose the primitives ("run this partial on CPU", "run that partial on
-// GPU"); this module decides *which* blocks go where using the existing
-// tier-tracking API from `grim-kvtransport`.
-// ---------------------------------------------------------------------------
+// WI 3.4.1 / 3.4.5 - Hybrid CPU/GPU attention offload (APEX-style).
+// The *decision* of how to partition a sequence's KV blocks between GPU and CPU for.
 
-/// Partition a sequence's physical block list into device-resident and
-/// host-offloaded halves, based on each block's current `CacheTier`.
-///
-/// Per WI 3.4.1: for a given decode step, once some KV blocks are on the
-/// `HostRam`/`NvMe` tier and some remain on-device, the attention computation
-/// needs contributions from both. This function uses the existing
-/// `SharedSpillManager::get_tier` API to classify each block — no new
-/// tier-tracking mechanism is added.
-///
-/// **Tier inference rule** (matches the spill manager's contract):
-/// - `get_tier(id) == None` → device/GPU-resident (a block that was `alloc`'d
-///   and never demoted has no tier entry).
-/// - `get_tier(id) == Some(HostRam)` or `Some(NvMe)` → host/offloaded.
-/// - `Some(Gpu)` is theoretically in the enum but never written by this spill
-///   manager; treated as device-resident (same as `None`) for safety.
-/// - `Some(NvMeWeightStream)` is for weight tensors, not KV blocks; treated as
-///   device-resident (should not appear for KV block IDs).
-///
-/// Returns `(device_blocks, host_blocks)` — the two partitions, preserving
-/// the input order within each.
+/// Partition a sequence's physical block list into device-resident and host-offloaded halves, based on each block's current `CacheTier`.
+/// Per WI 3.4.1: for a given decode step, once some KV blocks are on the.
 pub fn plan_hybrid_attention_step(
     physical_ids: &[grim_kvtransport::BlockId],
     spill: &grim_kvtransport::SharedSpillManager,
@@ -1035,18 +921,13 @@ mod tests {
         assert_eq!(req0_waiting.prompt_tokens, 120);
     }
 
-    /// F9 (audit): consumed_tokens must ACCUMULATE across scheduling passes,
-    /// not reset to the current chunk's size. A 120-token prompt under
-    /// pressure with chunk size 50 drains 50 → 100 → 120 across three
-    /// passes; the pre-fix code produced 50 → 50 → 20 (reset on every pass)
-    /// and, once pressure lifted mid-drain, reprocessed the whole prompt
-    /// because chunk sizing ignored already-consumed tokens.
+    /// F9 (audit): consumed_tokens must ACCUMULATE across scheduling passes, not reset to the current chunk's size.
+    /// A 120-token prompt under pressure with chunk size 50 drains 50 → 100 → 120.
     #[test]
     fn test_chunked_prefill_accumulates_across_passes() {
         let ctrl = AdmissionController::new(0, 0);
-        // Small max_batched_tokens so backlog alone (120 > 100) keeps
-        // pressure_active on every pass — with one request in the queue the
-        // remainder is always the head of `waiting` next pass.
+        // Small max_batched_tokens so backlog alone (120 > 100) keeps pressure_active on every pass - with
+        // one request in the queue the remainder is always the head of `waiting` next pass.
         let mut sched = Scheduler::new(100, 8, ctrl);
         sched.chunked_prefill_size = 50;
 
@@ -1100,12 +981,8 @@ mod tests {
         assert_eq!(out4.decode_ids, vec![7], "fully-prefilled request decodes");
     }
 
-    /// VPP drain-window packing: the multi-rank VPP coordinator interleaves
-    /// two requests' prefill chunks, so it needs each in-flight request's
-    /// chunk progress without reaching into scheduler collections.
-    /// `chunk_offsets` reports id -> (consumed_tokens, prompt_tokens) for
-    /// every request that still has prefill work outstanding — including
-    /// mid-drain remainders parked in `waiting`, not just `running` entries.
+    /// VPP drain-window packing: the multi-rank VPP coordinator interleaves two requests' prefill chunks, so it needs each in-flight request's chunk progress without reaching into scheduler collections.
+    /// `chunk_offsets` reports id -> (consumed_tokens, prompt_tokens) for every request that still has prefill work outstanding.
     #[test]
     fn test_chunk_offsets_expose_drain_progress() {
         let ctrl = AdmissionController::new(0, 0);
@@ -1144,10 +1021,7 @@ mod tests {
         );
     }
 
-    /// Decode-mid-prefill exclusion: a request whose prompt is only partly
-    /// consumed (its remainder is still in `waiting`) must NOT appear in
-    /// `decode_ids` — the engine would run a decode step against an
-    /// incomplete KV and feed a prompt token as if it were generated.
+    /// Decode-mid-prefill exclusion: a request whose prompt is only partly consumed (its remainder is still in `waiting`) must NOT appear in `decode_ids` - the engine would run a decode step against an incomplete KV and feed a prompt token as if it were generated.
     /// A fully-consumed request decodes normally.
     #[test]
     fn test_decode_excludes_partially_prefilled_requests() {
@@ -1165,19 +1039,16 @@ mod tests {
         assert_eq!(out1.prefill_ids, vec![1]);
         assert!(out1.decode_ids.is_empty());
 
-        // Enqueue request 2. Note queue order: under pressure the leftover
-        // admissions return to `waiting` BEFORE the processed request's
-        // remainder, so the order below is [remainder(1), 2] and after the
-        // next pass [2, remainder(1)].
+        // Enqueue request 2. Note queue order: under pressure the leftover admissions return to `waiting` BEFORE the
+        // processed request's remainder, so the order below is [remainder(1), 2] and after the next pass [2, remainder(1)].
         sched.enqueue(Request {
             id: 2,
             prompt_tokens: 40,
             ..Default::default()
         });
 
-        // Pass 2 drains request 1's next chunk (50 → 100 consumed). While
-        // any part of its prompt is unconsumed it must NOT decode — the
-        // pre-fix scheduler listed it here with a half-filled KV.
+        // Pass 2 drains request 1's next chunk (50 → 100 consumed).
+        // While any part of its prompt is unconsumed it must NOT decode - the pre-fix.
         let out2 = sched.schedule();
         assert_eq!(out2.prefill_ids, vec![1]);
         assert!(
@@ -1186,9 +1057,8 @@ mod tests {
             out2.decode_ids
         );
 
-        // Pass 3 prefills request 2 in one pass. Request 1 is STILL
-        // mid-prefill (100/120) and stays excluded even though another
-        // runnable request exists; request 2 was just prefilled this pass.
+        // Pass 3 prefills request 2 in one pass. Request 1 is STILL mid-prefill (100/120) and
+        // stays excluded even though another runnable request exists; request 2 was just prefilled this pass.
         let out3 = sched.schedule();
         assert_eq!(out3.prefill_ids, vec![2]);
         assert!(out3.decode_ids.is_empty());
@@ -1228,10 +1098,8 @@ mod tests {
         assert_eq!(sched.swapped[0].id, 2);
     }
 
-    /// Swap-in round trip: a preempted request must re-enter the batch once
-    /// pressure lifts — `swapped` may not be a terminal state (before the
-    /// swap-in path existed, `finish()` was the only remover, so preemption
-    /// stranded the request until it was aborted).
+    /// Swap-in round trip: a preempted request must re-enter the batch once pressure lifts - `swapped` may not be a terminal
+    /// state (before the swap-in path existed, `finish()` was the only remover, so preemption stranded the request until it was aborted).
     #[test]
     fn test_preempted_request_reenters_after_pressure_lifts() {
         let ctrl = AdmissionController::new(0, 0);
@@ -1263,9 +1131,8 @@ mod tests {
         );
     }
 
-    /// A preempted request whose chunked-prefill remainder is still in
-    /// `waiting` must not be duplicated by the swap-in: the remainder copy
-    /// is the live one, and keeping both would schedule the id twice.
+    /// A preempted request whose chunked-prefill remainder is still in `waiting` must not be duplicated by the
+    /// swap-in: the remainder copy is the live one, and keeping both would schedule the id twice.
     #[test]
     fn test_swap_in_dedups_against_live_remainder() {
         let ctrl = AdmissionController::new(0, 0);
@@ -1322,9 +1189,8 @@ mod tests {
         );
     }
 
-    /// `admitted_requests` is a real cumulative counter, not a hardcoded 0:
-    /// first admission counts once, chunked re-passes don't recount,
-    /// swap-in re-entry counts as a fresh admission.
+    /// `admitted_requests` is a real cumulative counter, not a hardcoded 0: first admission
+    /// counts once, chunked re-passes don't recount, swap-in re-entry counts as a fresh admission.
     #[test]
     fn test_snapshot_admitted_requests_counts_admissions() {
         let ctrl = AdmissionController::new(0, 0);
@@ -1361,10 +1227,8 @@ mod tests {
         assert_eq!(sched.snapshot().admitted_requests, 3);
     }
 
-    /// Single priority policy: admission order is priority-descending with
-    /// arrival order breaking ties (stable), while victim selection evicts
-    /// the lowest priority. High-priority work is admitted before older
-    /// low-priority work.
+    /// Single priority policy: admission order is priority-descending with arrival order breaking ties (stable), while victim selection evicts the lowest priority.
+    /// High-priority work is admitted before older low-priority work.
     #[test]
     fn test_priority_orders_admission_arrival_breaks_ties() {
         let ctrl = AdmissionController::new(0, 0);
@@ -1394,10 +1258,8 @@ mod tests {
         }
     }
 
-    /// A wired KV source above [`KV_PRESSURE_THRESHOLD`] puts the scheduler
-    /// under memory pressure even with a small token backlog: chunked
-    /// draining engages. Below the threshold (or unwired), the same request
-    /// prefills in a single pass.
+    /// A wired KV source above [`KV_PRESSURE_THRESHOLD`] puts the scheduler under memory pressure even with a small token backlog: chunked draining engages.
+    /// Below the threshold (or unwired), the same request prefills in a single pass.
     #[test]
     fn test_kv_memory_pressure_drives_scheduling() {
         // 120-token prompt, chunk 50, huge token budget → token arithmetic
@@ -1480,24 +1342,33 @@ mod tests {
 
         // Verify contiguous segment layout (0, 101, 202)
         assert_eq!(out.lora_segments.len(), 3);
-        assert_eq!(out.lora_segments[0], LoraSegment {
-            adapter_id: 0,
-            seq_start: 0,
-            seq_count: 1,
-            seq_ids: vec![40],
-        });
-        assert_eq!(out.lora_segments[1], LoraSegment {
-            adapter_id: 101,
-            seq_start: 1,
-            seq_count: 2,
-            seq_ids: vec![10, 20],
-        });
-        assert_eq!(out.lora_segments[2], LoraSegment {
-            adapter_id: 202,
-            seq_start: 3,
-            seq_count: 1,
-            seq_ids: vec![30],
-        });
+        assert_eq!(
+            out.lora_segments[0],
+            LoraSegment {
+                adapter_id: 0,
+                seq_start: 0,
+                seq_count: 1,
+                seq_ids: vec![40],
+            }
+        );
+        assert_eq!(
+            out.lora_segments[1],
+            LoraSegment {
+                adapter_id: 101,
+                seq_start: 1,
+                seq_count: 2,
+                seq_ids: vec![10, 20],
+            }
+        );
+        assert_eq!(
+            out.lora_segments[2],
+            LoraSegment {
+                adapter_id: 202,
+                seq_start: 3,
+                seq_count: 1,
+                seq_ids: vec![30],
+            }
+        );
     }
 
     #[test]
@@ -1510,23 +1381,37 @@ mod tests {
         assert_eq!(
             segs,
             vec![
-                LoraRowSegment { adapter_id: 7, row_start: 0, row_count: 2 },
-                LoraRowSegment { adapter_id: 0, row_start: 2, row_count: 3 },
-                LoraRowSegment { adapter_id: 9, row_start: 5, row_count: 1 },
+                LoraRowSegment {
+                    adapter_id: 7,
+                    row_start: 0,
+                    row_count: 2
+                },
+                LoraRowSegment {
+                    adapter_id: 0,
+                    row_start: 2,
+                    row_count: 3
+                },
+                LoraRowSegment {
+                    adapter_id: 9,
+                    row_start: 5,
+                    row_count: 1
+                },
             ]
         );
 
         // Single base-only batch: one passthrough segment covering all rows.
         assert_eq!(
             LoraRowSegment::plan_for_rows(&[0, 0]),
-            vec![LoraRowSegment { adapter_id: 0, row_start: 0, row_count: 2 }]
+            vec![LoraRowSegment {
+                adapter_id: 0,
+                row_start: 0,
+                row_count: 2
+            }]
         );
     }
 
-    /// R1 validation: with the readiness dispatcher enabled, a decode-eligible
-    /// running request wins arbitration over a contending new prefill under
-    /// pressure, so the prefill is deferred to protect ITL (RRFP decode-first
-    /// interleaving). Without the dispatcher, the prefill is admitted greedily.
+    /// R1 validation: with the readiness dispatcher enabled, a decode-eligible running request wins arbitration over a contending new prefill under pressure, so the prefill is deferred to protect ITL (RRFP decode-first interleaving).
+    /// Without the dispatcher, the prefill is admitted greedily.
     #[test]
     fn test_readiness_dispatch_defers_prefill_under_pressure() {
         use crate::readiness_dispatch::ReadinessDispatcher;

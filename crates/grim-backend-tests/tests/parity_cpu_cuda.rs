@@ -113,34 +113,92 @@ fn test_cuda_parity_dequant_and_kernels_if_available() {
             let draft_tokens_data = vec![0.0f32; num_draft]; // storage uploaded as f32 bits
             let uniform_rands_data = vec![0.05f32; num_draft + 1]; // uniform rands <= accept_prob (0.7/0.7=1.0) -> accept all
 
-            let tp_dev = dev.from_cpu(&target_probs_data, &Shape::new(vec![1, num_draft + 1, vocab_size]), grim_tensor::DType::F32).unwrap();
-            let dp_dev = dev.from_cpu(&draft_probs_data, &Shape::new(vec![1, num_draft, vocab_size]), grim_tensor::DType::F32).unwrap();
-            let dt_dev = dev.from_cpu(&draft_tokens_data, &Shape::new(vec![1, num_draft]), grim_tensor::DType::F32).unwrap();
-            let ur_dev = dev.from_cpu(&uniform_rands_data, &Shape::new(vec![1, num_draft + 1]), grim_tensor::DType::F32).unwrap();
+            let tp_dev = dev
+                .from_cpu(
+                    &target_probs_data,
+                    &Shape::new(vec![1, num_draft + 1, vocab_size]),
+                    grim_tensor::DType::F32,
+                )
+                .unwrap();
+            let dp_dev = dev
+                .from_cpu(
+                    &draft_probs_data,
+                    &Shape::new(vec![1, num_draft, vocab_size]),
+                    grim_tensor::DType::F32,
+                )
+                .unwrap();
+            let dt_dev = dev
+                .from_cpu(
+                    &draft_tokens_data,
+                    &Shape::new(vec![1, num_draft]),
+                    grim_tensor::DType::F32,
+                )
+                .unwrap();
+            let ur_dev = dev
+                .from_cpu(
+                    &uniform_rands_data,
+                    &Shape::new(vec![1, num_draft + 1]),
+                    grim_tensor::DType::F32,
+                )
+                .unwrap();
 
             let accepted_tokens_init = vec![0.0f32; num_draft + 1];
             let accepted_lens_init = vec![0.0f32; batch_size];
 
-            let at_dev = dev.from_cpu(&accepted_tokens_init, &Shape::new(vec![1, num_draft + 1]), grim_tensor::DType::F32).unwrap();
-            let al_dev = dev.from_cpu(&accepted_lens_init, &Shape::new(vec![batch_size]), grim_tensor::DType::F32).unwrap();
+            let at_dev = dev
+                .from_cpu(
+                    &accepted_tokens_init,
+                    &Shape::new(vec![1, num_draft + 1]),
+                    grim_tensor::DType::F32,
+                )
+                .unwrap();
+            let al_dev = dev
+                .from_cpu(
+                    &accepted_lens_init,
+                    &Shape::new(vec![batch_size]),
+                    grim_tensor::DType::F32,
+                )
+                .unwrap();
 
-            let tp_cuda = tp_dev.as_any().downcast_ref::<grim_backend_cuda::CudaStorage>().unwrap();
-            let dp_cuda = dp_dev.as_any().downcast_ref::<grim_backend_cuda::CudaStorage>().unwrap();
-            let dt_cuda = dt_dev.as_any().downcast_ref::<grim_backend_cuda::CudaStorage>().unwrap();
-            let ur_cuda = ur_dev.as_any().downcast_ref::<grim_backend_cuda::CudaStorage>().unwrap();
-            let at_cuda = at_dev.as_any().downcast_ref::<grim_backend_cuda::CudaStorage>().unwrap();
-            let al_cuda = al_dev.as_any().downcast_ref::<grim_backend_cuda::CudaStorage>().unwrap();
+            let tp_cuda = tp_dev
+                .as_any()
+                .downcast_ref::<grim_backend_cuda::CudaStorage>()
+                .unwrap();
+            let dp_cuda = dp_dev
+                .as_any()
+                .downcast_ref::<grim_backend_cuda::CudaStorage>()
+                .unwrap();
+            let dt_cuda = dt_dev
+                .as_any()
+                .downcast_ref::<grim_backend_cuda::CudaStorage>()
+                .unwrap();
+            let ur_cuda = ur_dev
+                .as_any()
+                .downcast_ref::<grim_backend_cuda::CudaStorage>()
+                .unwrap();
+            let at_cuda = at_dev
+                .as_any()
+                .downcast_ref::<grim_backend_cuda::CudaStorage>()
+                .unwrap();
+            let al_cuda = al_dev
+                .as_any()
+                .downcast_ref::<grim_backend_cuda::CudaStorage>()
+                .unwrap();
 
             dev.launch_speculative_rejection_sample(
-                tp_cuda, dp_cuda, dt_cuda, ur_cuda, at_cuda, al_cuda,
-                batch_size, num_draft, vocab_size
-            ).expect("launch_speculative_rejection_sample failed");
+                tp_cuda, dp_cuda, dt_cuda, ur_cuda, at_cuda, al_cuda, batch_size, num_draft,
+                vocab_size,
+            )
+            .expect("launch_speculative_rejection_sample failed");
 
             let res_lens = al_cuda.to_cpu_vec_f32().unwrap();
             let res_tokens = at_cuda.to_cpu_vec_f32().unwrap();
 
             let accepted_len = i32::from_ne_bytes(res_lens[0].to_ne_bytes());
-            assert_eq!(accepted_len, 4, "all 3 draft tokens + 1 target bonus token should be accepted");
+            assert_eq!(
+                accepted_len, 4,
+                "all 3 draft tokens + 1 target bonus token should be accepted"
+            );
             for i in 0..accepted_len as usize {
                 let tok = i32::from_ne_bytes(res_tokens[i].to_ne_bytes());
                 assert_eq!(tok, 0, "accepted token at {i} should be 0");

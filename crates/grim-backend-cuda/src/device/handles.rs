@@ -1,9 +1,9 @@
 //! CUDA FFI bindings, error codes, stream definitions, and execution handles.
 
-use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::error::{Error, Result};
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 
 // ---------- CUDA FFI Root Error Codes & Constants ----------
 
@@ -129,9 +129,8 @@ impl ComputeHandle for CudaHandle {
     fn synchronize(&self) -> Result<()> {
         let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
         if !*completed {
-            // SAFETY: `cudaDeviceSynchronize` blocks until all previous CUDA work
-            // on the current device completes. It is always valid to call on the
-            // current device.
+            // SAFETY: `cudaDeviceSynchronize` blocks until all previous CUDA work on the current device completes.
+            // It is always valid to call on the current device.
             let res = unsafe { cudaDeviceSynchronize() };
             if res != cudaSuccess {
                 return Err(Error::Backend(format!(

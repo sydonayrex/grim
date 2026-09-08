@@ -1,10 +1,5 @@
-//! IBM Granite-3.1 Hybrid MoE architecture with interleaved attention,
-//! shared experts, fine-grained routed MoE, and parameterized residual multipliers.
-//!
-//! # Architecture Details
-//! - **Hybrid Feed Forward**: Routed Top-K sparse experts + dedicated shared expert pathways.
-//! - **Residual Scaling**: Parameterized `residual_multiplier` applied across attention and MLP residuals.
-//! - **Attention**: GQA with RoPE rotation.
+//! IBM Granite-3.1 Hybrid MoE architecture with interleaved attention, shared experts, fine-grained routed MoE, and parameterized residual multipliers.
+//! # Architecture Details - **Hybrid Feed Forward**: Routed Top-K sparse experts + dedicated shared expert.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for IBM Granite MoE Hybrid architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,9 +64,7 @@ impl ModelConfig for GraniteMoeHybridConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Block
-// ---------------------------------------------------------------------------
 
 struct GraniteExpert {
     gate_proj: Linear,
@@ -96,8 +87,8 @@ impl GraniteExpert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let act = grim_nn::modules::silu_mul_on_device(&g, &u)
-            .map_err(grim_core::error::Error::from)?;
+        let act =
+            grim_nn::modules::silu_mul_on_device(&g, &u).map_err(grim_core::error::Error::from)?;
         Ok(self.down_proj.forward(&act)?)
     }
 }
@@ -111,7 +102,8 @@ pub struct GraniteMoeBlock {
 
 impl GraniteMoeBlock {
     pub fn load(ws: &WeightSource<'_>, cfg: &GraniteMoeHybridConfig) -> Result<Self> {
-        let gate = Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_local_experts])?;
+        let gate =
+            Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_local_experts])?;
 
         let experts_count = cfg.num_local_experts.min(8);
         let mut experts = Vec::with_capacity(experts_count);
@@ -166,9 +158,7 @@ impl GraniteMoeBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct GraniteMoeHybridBlock {
     pub wq: Linear,
@@ -186,7 +176,11 @@ pub struct GraniteMoeHybridBlock {
 }
 
 impl GraniteMoeHybridBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &GraniteMoeHybridConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &GraniteMoeHybridConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -226,9 +220,8 @@ impl GraniteMoeHybridBlock {
         })
     }
 
-    /// GPU-first forward for RoPE and attention; the residual adds stay
-    /// host-side (kernel gap: the parameterized `residual_multiplier` needs a
-    /// scaled add and no device scalar-scale kernel exists).
+    /// GPU-first forward for RoPE and attention; the residual adds stay host-side (kernel gap:
+    /// the parameterized `residual_multiplier` needs a scaled add and no device scalar-scale kernel exists).
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -237,12 +230,8 @@ impl GraniteMoeHybridBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -289,9 +278,7 @@ impl GraniteMoeHybridBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 /// IBM Granite MoE Hybrid Causal Language Model.
 pub struct GraniteMoeHybrid {
@@ -346,7 +333,10 @@ impl GraniteMoeHybrid {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -420,9 +410,7 @@ impl CausalLm for GraniteMoeHybrid {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -442,8 +430,8 @@ mod tests {
     #[test]
     fn test_granite_moe_residual_multiplier_scaling() {
         let res_mult = 0.22f32;
-        let x = vec![1.0f32; 8];
-        let delta = vec![2.0f32; 8];
+        let x = [1.0f32; 8];
+        let delta = [2.0f32; 8];
         let mut out = vec![0.0f32; 8];
         for i in 0..8 {
             out[i] = x[i] + res_mult * delta[i];
@@ -453,6 +441,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_granite_moe_forward_and_session_state() {
         let mut cfg = GraniteMoeHybridConfig::default();
@@ -467,7 +456,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![2.0, 5.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

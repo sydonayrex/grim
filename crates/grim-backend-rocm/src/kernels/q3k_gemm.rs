@@ -5,32 +5,15 @@ pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
 /// Dequantize one Q3K element from a super-block.
-    /// `in_sb` is the weight index within the 256-weight super-block (0..255).
-    ///
-    /// Faithful HIP translation of the authoritative CPU reference
-    /// `grim_quant::dequant_q3k` (crates/grim-quant/src/lib.rs), which itself
-    /// matches llama.cpp `dequantize_row_q3_K` bit-for-bit.
-    ///
-    /// The true ggml `block_q3_K` layout is 110 bytes / 256 weights:
-    ///   - 32 bytes hmask (one high-bit per weight)
-    ///   - 64 bytes qs (2-bit quant codes, packed 4 per byte)
-    ///   - 12 bytes scales (16 6-bit sub-block scales, aux-shuffled)
-    ///   - 2 bytes d (f16 super-block scale)
-    /// There is no `dmin` field and no `m` array.
+/// `in_sb` is the weight index within the 256-weight super-block (0..255).
     __device__ inline float dequant_q3k_element(const unsigned char* block_ptr, int in_sb) {
         const unsigned char* hmask = block_ptr + 0;
         const unsigned char* qs    = block_ptr + 32;
         const unsigned char* scales_ptr = block_ptr + 96;
         float d = fp16_to_float_device(((const unsigned short*)(block_ptr + 108))[0]);
 
-        // ── Decode the 12-byte scales field into 16 signed bytes ──────────
-        // Mirrors the ggml aux‑shuffle (dequantize_row_q3_K):
-        //   memcpy(aux, x->scales, 12);
-        //   tmp = aux[2];
-        //   aux[2] = ((aux[0]>>4) & 0x0F0F0F0F) | (((tmp>>4) & 0x03030303) << 4);
-        //   aux[3] = ((aux[1]>>4) & 0x0F0F0F0F) | (((tmp>>6) & 0x03030303) << 4);
-        //   aux[0] = ( aux[0]     & 0x0F0F0F0F) | (((tmp>>0) & 0x03030303) << 4);
-        //   aux[1] = ( aux[1]     & 0x0F0F0F0F) | (((tmp>>2) & 0x03030303) << 4);
+        // ── Decode the 12-byte scales field into 16 signed bytes ────────── Mirrors the ggml aux‑shuffle (dequantize_row_q3_K): memcpy(aux, x->scales, 12); tmp = aux[2]; aux[2] = ((aux[0]>>4) & 0x0F0F0F0F) | (((tmp>>4) & 0x03030303) << 4); aux[3]
+        // = ((aux[1]>>4) & 0x0F0F0F0F) | (((tmp>>6) & 0x03030303) << 4); aux[0] = ( aux[0] & 0x0F0F0F0F) | (((tmp>>0) & 0x03030303) << 4); aux[1] = ( aux[1] & 0x0F0F0F0F) | (((tmp>>2) & 0x03030303) << 4);
         const unsigned int kmask1 = 0x03030303u;
         const unsigned int kmask2 = 0x0F0F0F0Fu;
         unsigned int aux0 = ((unsigned int)scales_ptr[0]) | (((unsigned int)scales_ptr[1]) << 8)
@@ -39,8 +22,7 @@ extern "C" {
                           | (((unsigned int)scales_ptr[6]) << 16) | (((unsigned int)scales_ptr[7]) << 24);
         unsigned int tmp  = ((unsigned int)scales_ptr[8]) | (((unsigned int)scales_ptr[9]) << 8)
                           | (((unsigned int)scales_ptr[10]) << 16) | (((unsigned int)scales_ptr[11]) << 24);
-        // In ggml the final two bytes of the 16-byte aux[3] are set to zero
-        // because memcpy only copied 12 bytes and aux is a 4×uint32 array.
+        // In ggml the final two bytes of the 16-byte aux[3] are set to zero because memcpy only copied 12 bytes and aux is a 4×uint32 array.
         // Therefore aux[3]~(0) is harmless.
         unsigned int qw0 = (aux0 & kmask2) | (((tmp >>  0) & kmask1) << 4);
         unsigned int qw1 = (aux1 & kmask2) | (((tmp >>  2) & kmask1) << 4);

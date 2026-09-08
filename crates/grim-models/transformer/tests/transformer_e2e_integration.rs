@@ -118,6 +118,7 @@ fn test_attention_dispatcher_tier_selection_and_gqa() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_gpt_oss_loads_all_configured_layers() {
     use grim_models_transformer::{GptOss, GptOssConfig};
     let mut cfg = GptOssConfig::default();
@@ -132,6 +133,7 @@ fn test_gpt_oss_loads_all_configured_layers() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_gpt_oss_forward_and_device_residency() {
     use grim_models_transformer::{GptOss, GptOssConfig};
     let mut cfg = GptOssConfig::default();
@@ -145,11 +147,14 @@ fn test_gpt_oss_forward_and_device_residency() {
     let input_ids = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2]));
     let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-    let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+    let logits = model
+        .forward(session.as_mut(), &input_ids, &positions, &[])
+        .unwrap();
     assert_eq!(logits.device(), &Device::Cpu);
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn test_qwen38_flash_next_loads_all_configured_layers_and_dynamic_routing() {
     use grim_models_transformer::{Qwen38FlashNext, Qwen38FlashNextConfig};
 
@@ -172,8 +177,9 @@ fn test_qwen38_flash_next_loads_all_configured_layers_and_dynamic_routing() {
     let input_ids = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2]));
     let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-    let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+    let logits = model
+        .forward(session.as_mut(), &input_ids, &positions, &[])
+        .unwrap();
     assert_eq!(logits.shape().dims(), &[2, 16]);
     assert_eq!(logits.device(), &Device::Cpu);
 }
-

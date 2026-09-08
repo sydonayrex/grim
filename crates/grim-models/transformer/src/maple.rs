@@ -10,9 +10,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 use crate::model::{Llama, LlamaConfig};
 use crate::moe_block::MoESpec;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct MapleConfig {
@@ -95,9 +93,7 @@ impl ModelConfig for MapleConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama with MoE & Hybrid Attention specs
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama with MoE & Hybrid Attention specs
 
 pub struct Maple {
     pub cfg: MapleConfig,

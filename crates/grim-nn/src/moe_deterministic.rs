@@ -1,12 +1,8 @@
 //! Deterministic token mapping and scoreboard synchronization for MoE dispatch (UniEP).
-//!
-//! Implements UniEP-style deterministic token ordering (Zheng et al., arXiv:2604.19241)
-//! using exclusive prefix-sum offset tables and atomic-free destination addressing.
-//! Guarantees bitwise numerical consistency under asynchronous comm-compute overlap
-//! and strictly preserves GRIM's `routed_scaling_factor` and shared-expert conventions.
+//! Implements UniEP-style deterministic token ordering (Zheng et al., arXiv:2604.19241) using exclusive prefix-sum offset tables and.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use grim_tensor::error::Error;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Deterministic token mapping metadata for MoE expert dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,20 +28,8 @@ pub struct DeterministicTokenMap {
 
 impl DeterministicTokenMap {
     /// Computes deterministic, conflict-free destination addressing using exclusive prefix sums.
-    ///
-    /// # Mathematical Guarantee
-    /// Given selected expert indices $E_{\text{sel}}[i, k]$:
-    /// 1. $C_{\text{exp}}[e] = \sum_{i, k} \mathbf{1}(E_{\text{sel}}[i, k] == e)$
-    /// 2. $O_{\text{all}}[e] = \sum_{j=0}^{e-1} C_{\text{exp}}[j]$
-    /// 3. Tokens assigned to expert $e$ are packed in deterministic arrival order:
-    ///    $\text{slot}(i, k) = O_{\text{all}}[e] + \text{rank\_within\_expert}(i, e)$
-    ///
-    /// This eliminates race conditions, atomic write contention, and ensures bitwise
-    /// identical accumulation order during reduction across parallel ranks.
-    pub fn build(
-        selected_experts: &[Vec<usize>],
-        num_experts: usize,
-    ) -> Result<Self, Error> {
+    /// # Mathematical Guarantee Given selected expert indices $E_{\text{sel}}[i, k]$: 1.
+    pub fn build(selected_experts: &[Vec<usize>], num_experts: usize) -> Result<Self, Error> {
         let num_tokens = selected_experts.len();
         if num_tokens == 0 {
             return Ok(Self {
@@ -158,6 +142,7 @@ impl DeterministicTokenMap {
 
     /// Combine expert outputs $[N_{\text{routed}}, D]$ back to $[N_{\text{tok}}, D]$ using
     /// deterministic summation ordering, applying `routed_scaling_factor`.
+    #[allow(clippy::needless_range_loop)]
     pub fn combine_expert_outputs(
         &self,
         packed_outputs: &[f32],
@@ -264,8 +249,16 @@ impl ScoreboardSync {
 
     /// Expose atomic values as raw vectors of u32 for GPU device buffer uploads.
     pub fn to_device_buffers(&self) -> (Vec<u32>, Vec<u32>) {
-        let arrivals = self.token_arrivals.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-        let ready = self.tile_ready.iter().map(|r| r.load(Ordering::Relaxed)).collect();
+        let arrivals = self
+            .token_arrivals
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        let ready = self
+            .tile_ready
+            .iter()
+            .map(|r| r.load(Ordering::Relaxed))
+            .collect();
         (arrivals, ready)
     }
 }
@@ -276,17 +269,9 @@ mod tests {
 
     #[test]
     fn test_deterministic_token_map_prefix_sums() {
-        // 4 tokens, top-2 routing, 4 total experts
-        // Token 0 -> E0, E2
-        // Token 1 -> E1, E2
-        // Token 2 -> E0, E3
-        // Token 3 -> E2, E3
-        let selected = vec![
-            vec![0, 2],
-            vec![1, 2],
-            vec![0, 3],
-            vec![2, 3],
-        ];
+        // 4 tokens, top-2 routing, 4 total experts Token 0 -> E0, E2 Token
+        // 1 -> E1, E2 Token 2 -> E0, E3 Token 3 -> E2, E3
+        let selected = vec![vec![0, 2], vec![1, 2], vec![0, 3], vec![2, 3]];
 
         let map = DeterministicTokenMap::build(&selected, 4).unwrap();
 
@@ -295,24 +280,15 @@ mod tests {
         // Offsets: E0: 0, E1: 2, E2: 3, E3: 6, End: 8
         assert_eq!(map.global_offsets, vec![0, 2, 3, 6, 8]);
 
-        // Destination slots:
-        // Token 0: E0 -> slot 0, E2 -> slot 3
-        // Token 1: E1 -> slot 2, E2 -> slot 4
-        // Token 2: E0 -> slot 1, E3 -> slot 6
-        // Token 3: E2 -> slot 5, E3 -> slot 7
+        // Destination slots: Token 0: E0 -> slot 0, E2 -> slot 3 Token 1: E1 -> slot 2, E2 -> slot
+        // 4 Token 2: E0 -> slot 1, E3 -> slot 6 Token 3: E2 -> slot 5, E3 -> slot 7
         assert_eq!(map.destination_slots, vec![0, 3, 2, 4, 1, 6, 5, 7]);
     }
 
     #[test]
     fn test_pack_and_combine_numerical_exactness() {
-        let selected = vec![
-            vec![0, 1],
-            vec![1, 2],
-        ];
-        let weights = vec![
-            vec![0.6, 0.4],
-            vec![0.7, 0.3],
-        ];
+        let selected = vec![vec![0, 1], vec![1, 2]];
+        let weights = vec![vec![0.6, 0.4], vec![0.7, 0.3]];
         let map = DeterministicTokenMap::build(&selected, 3).unwrap();
 
         let hidden_dim = 2;
@@ -322,12 +298,11 @@ mod tests {
         ];
 
         let mut packed = vec![0.0f32; 4 * hidden_dim];
-        map.pack_activations(&activations, hidden_dim, &mut packed).unwrap();
+        map.pack_activations(&activations, hidden_dim, &mut packed)
+            .unwrap();
 
-        // Simulated expert GEMMs:
-        // E0: doubles inputs (*2.0)
-        // E1: triples inputs (*3.0)
-        // E2: quadruples inputs (*4.0)
+        // Simulated expert GEMMs: E0: doubles inputs (*2.0)
+        // E1: triples inputs (*3.0) E2: quadruples inputs (*4.0)
         let mut gemm_out = packed.clone();
         for slot in 0..4 {
             let (_, exp, _) = map.reverse_map[slot];
@@ -338,19 +313,16 @@ mod tests {
         }
 
         let mut combined = vec![0.0f32; 2 * hidden_dim];
-        map.combine_expert_outputs(&gemm_out, &weights, hidden_dim, 1.0, &mut combined).unwrap();
+        map.combine_expert_outputs(&gemm_out, &weights, hidden_dim, 1.0, &mut combined)
+            .unwrap();
 
-        // Expected Token 0:
-        // E0: [1.0, 2.0] * 2.0 = [2.0, 4.0] * 0.6 = [1.2, 2.4]
-        // E1: [1.0, 2.0] * 3.0 = [3.0, 6.0] * 0.4 = [1.2, 2.4]
-        // Total = [2.4, 4.8]
+        // Expected Token 0: E0: [1.0, 2.0] * 2.0 = [2.0, 4.0] * 0.6 = [1.2, 2.4]
+        // E1: [1.0, 2.0] * 3.0 = [3.0, 6.0] * 0.4 = [1.2, 2.4] Total = [2.4, 4.8]
         assert!((combined[0] - 2.4).abs() < 1e-5);
         assert!((combined[1] - 4.8).abs() < 1e-5);
 
-        // Expected Token 1:
-        // E1: [3.0, 4.0] * 3.0 = [9.0, 12.0] * 0.7 = [6.3, 8.4]
-        // E2: [3.0, 4.0] * 4.0 = [12.0, 16.0] * 0.3 = [3.6, 4.8]
-        // Total = [9.9, 13.2]
+        // Expected Token 1: E1: [3.0, 4.0] * 3.0 = [9.0, 12.0] * 0.7 = [6.3, 8.4]
+        // E2: [3.0, 4.0] * 4.0 = [12.0, 16.0] * 0.3 = [3.6, 4.8] Total = [9.9, 13.2]
         assert!((combined[2] - 9.9).abs() < 1e-5);
         assert!((combined[3] - 13.2).abs() < 1e-5);
     }
@@ -363,7 +335,7 @@ mod tests {
         assert!(!scoreboard.record_token_arrival(0)); // 1
         assert!(!scoreboard.record_token_arrival(0)); // 2
         assert!(!scoreboard.record_token_arrival(0)); // 3
-        assert!(scoreboard.record_token_arrival(0));  // 4 -> ready!
+        assert!(scoreboard.record_token_arrival(0)); // 4 -> ready!
 
         assert!(scoreboard.is_tile_ready(0));
         assert!(!scoreboard.is_tile_ready(1));

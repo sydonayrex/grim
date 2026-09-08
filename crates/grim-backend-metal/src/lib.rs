@@ -8,8 +8,7 @@ pub use caps::MetalCaps;
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 #[allow(unused_imports)]
 use grim_tensor::dtype::{
-    DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
-    Storage as DTypeStorage,
+    DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance, Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
 pub use grim_tensor::{
@@ -72,20 +71,9 @@ impl BufferUsage {
     }
 }
 
-/// SIMDgroup GEMM dispatch gate (audit Metal-track). Returns the chosen
-/// variant for an (m, n, k) GEMM, or `None` to use the autotuned naive
-/// kernel.
-///
-/// Correctness requirement: the simdgroup kernels use unclipped 8x8 tile
-/// loads, so every dimension MUST be a multiple of 8. Efficiency heuristic:
-/// the hardware MMA only wins once tiles are fully populated — small GEMMs
-/// pay more in scheduling than they save in MACs, and skinny-K GEMMs are
-/// memory-bound anyway. `supports_simdgroup_matrix` (Apple7+) is checked by
-/// the caller alongside this gate.
-#[cfg_attr(
-    not(target_vendor = "apple"),
-    allow(dead_code)
-)]
+/// SIMDgroup GEMM dispatch gate (audit Metal-track).
+/// Returns the chosen variant for an (m, n, k) GEMM, or `None` to use the.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) fn simdgroup_gemm_variant(m: usize, n: usize, k: usize) -> Option<SimdgroupGemmVariant> {
     const MIN_DIM: usize = 64;
     if m % 8 != 0 || n % 8 != 0 || k % 8 != 0 {
@@ -104,10 +92,7 @@ pub(crate) fn simdgroup_gemm_variant(m: usize, n: usize, k: usize) -> Option<Sim
 
 /// Which simdgroup kernel the gate selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(target_vendor = "apple"),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) enum SimdgroupGemmVariant {
     /// 32-row × 8-col blocks, one 8x8 MMA per simdgroup.
     Tile8,
@@ -1176,10 +1161,8 @@ impl MetalDevice {
     }
 
     /// Fused LM-head + cross-entropy forward pass for Metal.
-    ///
-    /// Computes `logits = hidden @ lm_head^T` and cross-entropy loss + LSE in a
-    /// single Metal GPU pass via `grim_fused_linear_ce`. Mirrors the ROCm
-    /// `fused_linear_cross_entropy_forward` signature.
+    /// Computes `logits = hidden @ lm_head^T` and cross-entropy loss + LSE in a single Metal.
+    #[allow(clippy::type_complexity)]
     pub fn fused_linear_cross_entropy_forward(
         &self,
         hidden: &dyn BackendStorage,
@@ -1207,28 +1190,45 @@ impl MetalDevice {
                     .downcast_ref::<MetalStorage>()
                     .ok_or_else(|| Error::Backend("Metal targets is not MetalStorage".into()))?;
 
-                let h_buf = h_s.buffer.as_ref().ok_or_else(|| Error::Backend("hidden lacks buffer".into()))?;
-                let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("lm_head lacks buffer".into()))?;
-                let t_buf = t_s.buffer.as_ref().ok_or_else(|| Error::Backend("targets lacks buffer".into()))?;
+                let h_buf = h_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("hidden lacks buffer".into()))?;
+                let w_buf = w_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("lm_head lacks buffer".into()))?;
+                let t_buf = t_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("targets lacks buffer".into()))?;
 
                 let hd = hidden.shape().dims();
                 let wd = lm_head.shape().dims();
                 let td = targets.shape().dims();
-                if hd.len() != 2 || wd.len() != 2 || td.len() != 1
-                    || td[0] != hd[0] || wd[1] != hd[1]
+                if hd.len() != 2
+                    || wd.len() != 2
+                    || td.len() != 1
+                    || td[0] != hd[0]
+                    || wd[1] != hd[1]
                 {
                     return Err(Error::Shape(
-                    "fused_linear_ce: incompatible input shapes".into(),
-                ));
+                        "fused_linear_ce: incompatible input shapes".into(),
+                    ));
                 }
                 if v_tile_size <= 0 {
-                    return Err(Error::Backend("fused_linear_ce: v_tile_size must be positive".into()));
+                    return Err(Error::Backend(
+                        "fused_linear_ce: v_tile_size must be positive".into(),
+                    ));
                 }
 
                 let batch = hd[0];
                 let loss_storage = self.zeros(&Shape::new(vec![batch]), DType::F32)?;
                 let lse_storage = self.zeros(&Shape::new(vec![batch]), DType::F32)?;
-                let loss_s = loss_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                let loss_s = loss_storage
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .unwrap();
                 let lse_s = lse_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
 
                 let loss_buf = loss_s.buffer.as_ref().unwrap();
@@ -1270,14 +1270,20 @@ impl MetalDevice {
                 }
 
                 let threads_per_group = MTLSize::new(256, 1, 1);
-                let groups = MTLSize::new((batch.max(1) as u64 + threads_per_group.width - 1) / threads_per_group.width, 1, 1);
+                let groups = MTLSize::new(
+                    (batch.max(1) as u64 + threads_per_group.width - 1) / threads_per_group.width,
+                    1,
+                    1,
+                );
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
                 return Ok((
                     loss_storage,
                     lse_storage,
-                    Box::new(MetalHandle { command_buffer: cmd_buffer }),
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
                 ));
             }
         }
@@ -1323,15 +1329,12 @@ impl MetalDevice {
             }
             let loss_storage = cpu.from_cpu(&loss, &Shape::new(vec![batch]), DType::F32)?;
             let lse_storage = cpu.from_cpu(&lse, &Shape::new(vec![batch]), DType::F32)?;
-            return Ok((loss_storage, lse_storage, Box::new(MetalHandle)));
+            Ok((loss_storage, lse_storage, Box::new(MetalHandle)))
         }
     }
 
     /// Fused LM-head + cross-entropy backward pass for Metal.
-    ///
-    /// Computes `grad_h = d(logits)/d(hidden)` using the LSE and targets from the
-    /// forward pass. Mirrors the ROCm `fused_linear_cross_entropy_backward`
-    /// signature. Wraps `grim_fused_linear_ce_backward` kernel.
+    /// Computes `grad_h = d(logits)/d(hidden)` using the LSE and targets from the forward pass.
     pub fn fused_linear_cross_entropy_backward(
         &self,
         hidden: &dyn BackendStorage,
@@ -1366,21 +1369,43 @@ impl MetalDevice {
                     .downcast_ref::<MetalStorage>()
                     .ok_or_else(|| Error::Backend("Metal grad_h is not MetalStorage".into()))?;
 
-                let h_buf = h_s.buffer.as_ref().ok_or_else(|| Error::Backend("hidden lacks buffer".into()))?;
-                let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("lm_head lacks buffer".into()))?;
-                let t_buf = t_s.buffer.as_ref().ok_or_else(|| Error::Backend("targets lacks buffer".into()))?;
-                let lse_buf = l_s.buffer.as_ref().ok_or_else(|| Error::Backend("lse lacks buffer".into()))?;
-                let grad_buf = g_s.buffer.as_ref().ok_or_else(|| Error::Backend("grad_h lacks buffer".into()))?;
+                let h_buf = h_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("hidden lacks buffer".into()))?;
+                let w_buf = w_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("lm_head lacks buffer".into()))?;
+                let t_buf = t_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("targets lacks buffer".into()))?;
+                let lse_buf = l_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("lse lacks buffer".into()))?;
+                let grad_buf = g_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("grad_h lacks buffer".into()))?;
 
                 let hd = hidden.shape().dims();
                 let wd = lm_head.shape().dims();
                 let td = targets.shape().dims();
                 let ld = lse.shape().dims();
 
-                if hd.len() != 2 || wd.len() != 2 || td.len() != 1 || ld.len() != 1
-                    || td[0] != hd[0] || wd[1] != hd[1] || ld[0] != hd[0]
+                if hd.len() != 2
+                    || wd.len() != 2
+                    || td.len() != 1
+                    || ld.len() != 1
+                    || td[0] != hd[0]
+                    || wd[1] != hd[1]
+                    || ld[0] != hd[0]
                 {
-                    return Err(Error::Shape("fused_linear_ce_backward: incompatible input shapes".into()));
+                    return Err(Error::Shape(
+                        "fused_linear_ce_backward: incompatible input shapes".into(),
+                    ));
                 }
                 let _v_tile_size = v_tile_size;
 
@@ -1432,11 +1457,17 @@ impl MetalDevice {
                 }
 
                 let threads_per_group = MTLSize::new(256, 1, 1);
-                let groups = MTLSize::new((batch.max(1) as u64 + threads_per_group.width - 1) / threads_per_group.width, 1, 1);
+                let groups = MTLSize::new(
+                    (batch.max(1) as u64 + threads_per_group.width - 1) / threads_per_group.width,
+                    1,
+                    1,
+                );
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                return Ok(Box::new(MetalHandle { command_buffer: cmd_buffer }));
+                return Ok(Box::new(MetalHandle {
+                    command_buffer: cmd_buffer,
+                }));
             }
         }
 
@@ -1479,9 +1510,8 @@ impl MetalDevice {
         }
     }
 
-    /// Fused RMSNorm + MXFP4 GEMM.
-    /// Mirrors ROCm's `fused_rmsnorm_mxfp4_gemm`: x @ MXFP4(W) with fused RMSNorm.
-    /// W is stored as per-row interleaved [codes...(K+1)/2 bytes][shared_exps...(K/32) bytes].
+    /// Fused RMSNorm + MXFP4 GEMM. Mirrors ROCm's `fused_rmsnorm_mxfp4_gemm`: x @ MXFP4(W) with fused RMSNorm.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_rmsnorm_mxfp4_gemm(
         &self,
         x: &dyn BackendStorage,
@@ -1497,21 +1527,38 @@ impl MetalDevice {
             let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                 Error::Backend("fused_rmsnorm_mxfp4_gemm: x not MetalStorage".into())
             })?;
-            let gamma_s = gamma.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                Error::Backend("fused_rmsnorm_mxfp4_gemm: gamma not MetalStorage".into())
-            })?;
-            let w_s = w_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                Error::Backend("fused_rmsnorm_mxfp4_gemm: w_packed not MetalStorage".into())
-            })?;
-            let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x no buffer".into()))?;
-            let gamma_buf = gamma_s.buffer.as_ref().ok_or_else(|| Error::Backend("gamma no buffer".into()))?;
-            let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("w_packed no buffer".into()))?;
+            let gamma_s = gamma
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend("fused_rmsnorm_mxfp4_gemm: gamma not MetalStorage".into())
+                })?;
+            let w_s = w_packed
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend("fused_rmsnorm_mxfp4_gemm: w_packed not MetalStorage".into())
+                })?;
+            let x_buf = x_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("x no buffer".into()))?;
+            let gamma_buf = gamma_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("gamma no buffer".into()))?;
+            let w_buf = w_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("w_packed no buffer".into()))?;
             let out_storage = self.zeros(&Shape::new(vec![m, n]), DType::F32)?;
             let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
             let out_buf = out_s.buffer.as_ref().unwrap();
             let ctx = MetalContext::get()?;
             let cmd = self.get_or_create_command_buffer()?;
-            let enc = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
+            let enc = cmd
+                .computeCommandEncoder()
+                .ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
             enc.setComputePipelineState(&ctx.pipelines.fused_rmsnorm_mxfp4_gemm);
             enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
             enc.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
@@ -1532,7 +1579,12 @@ impl MetalDevice {
             enc.endEncoding();
             cmd.commit();
             cmd.waitUntilCompleted();
-            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+            return Ok((
+                out_storage,
+                Box::new(MetalHandle {
+                    command_buffer: cmd,
+                }),
+            ));
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -1541,11 +1593,17 @@ impl MetalDevice {
             let gamma_cpu = gamma.to_cpu_vec_f32()?;
             // w_packed is MXFP4: raw u8 bytes (codes + shared exps), not f32.
             // Downcast to MetalStorage and read the data Mutex directly.
-            let w_s = w_packed.as_any().downcast_ref::<MetalStorage>()
-                .ok_or_else(|| Error::Backend("fused_rmsnorm_mxfp4_gemm CPU fallback: w_packed not MetalStorage".into()))?;
+            let w_s = w_packed
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend(
+                        "fused_rmsnorm_mxfp4_gemm CPU fallback: w_packed not MetalStorage".into(),
+                    )
+                })?;
             let w_data = w_s.data.lock().unwrap();
             let w_bytes: &[u8] = w_data.as_slice();
-            let codes_bytes = (k + 1) / 2;
+            let codes_bytes = k.div_ceil(2);
             let exps_bytes = k / 32;
             let row_bytes = codes_bytes + exps_bytes;
             let eps = eps.max(1e-5f32);
@@ -1553,10 +1611,15 @@ impl MetalDevice {
             for row in 0..m {
                 let x_row = &x_cpu[row * k..(row + 1) * k];
                 let mut mean = 0.0f32;
-                for &v in x_row { mean += v; }
+                for &v in x_row {
+                    mean += v;
+                }
                 mean /= k as f32;
                 let mut sum_sq = 0.0f32;
-                for &v in x_row { let d = v - mean; sum_sq += d * d; }
+                for &v in x_row {
+                    let d = v - mean;
+                    sum_sq += d * d;
+                }
                 let inv_rms = 1.0f32 / (sum_sq / k as f32 + eps).sqrt();
                 let _w_row = &w_bytes[row * row_bytes..(row + 1) * row_bytes];
                 for col in 0..n {
@@ -1565,13 +1628,19 @@ impl MetalDevice {
                     for i in 0..k {
                         let byte_idx = i / 2;
                         let packed = w_col[byte_idx];
-                        let nib = if (i % 2) == 0 { packed & 0x0F } else { packed >> 4 };
+                        let nib = if (i % 2) == 0 {
+                            packed & 0x0F
+                        } else {
+                            packed >> 4
+                        };
                         let shared_exp = w_col[codes_bytes + i / 32];
                         // Replicate metal_mxfp4_to_float in host-side fallback:
                         // MXFP4 = 4-bit mantissa (bits 3:0), shared exponent from exps table.
                         let mant = (nib & 0x0F) as f32 / 15.0f32;
                         let exp_delta = (shared_exp as i32) - 124; // E4M3 bias 124 → exponent補
-                        let w = (if (nib & 0x08) != 0 { -mant } else { mant }) * (1.0f32 + mant) * (1u32 << (exp_delta.max(0) as u32)) as f32;
+                        let w = (if (nib & 0x08) != 0 { -mant } else { mant })
+                            * (1.0f32 + mant)
+                            * (1u32 << (exp_delta.max(0) as u32)) as f32;
                         acc += (x_row[i] * inv_rms * gamma_cpu[i]) * w;
                     }
                     out[row * n + col] = acc;
@@ -1584,6 +1653,7 @@ impl MetalDevice {
 
     /// Fused RMSNorm + MXFP4 GEMM + RoPE + KV cache scatter.
     /// Mirrors ROCm's `fused_rmsnorm_mxfp4_gemm_rope_kv`.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_rmsnorm_mxfp4_gemm_rope_kv(
         &self,
         x: &dyn BackendStorage,
@@ -1609,38 +1679,75 @@ impl MetalDevice {
             let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                 Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: x not MetalStorage".into())
             })?;
-            let gamma_s = gamma.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: gamma not MetalStorage".into())
-            })?;
-            let wq_s = wq_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: wq_packed not MetalStorage".into())
-            })?;
-            let wk_s = wk_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: wk_packed not MetalStorage".into())
-            })?;
-            let wv_s = wv_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: wv_packed not MetalStorage".into())
-            })?;
-            let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x no buffer".into()))?;
-            let gamma_buf = gamma_s.buffer.as_ref().ok_or_else(|| Error::Backend("gamma no buffer".into()))?;
-            let wq_buf = wq_s.buffer.as_ref().ok_or_else(|| Error::Backend("wq_packed no buffer".into()))?;
-            let wk_buf = wk_s.buffer.as_ref().ok_or_else(|| Error::Backend("wk_packed no buffer".into()))?;
-            let wv_buf = wv_s.buffer.as_ref().ok_or_else(|| Error::Backend("wv_packed no buffer".into()))?;
-            let q_out_buf = q_out.and_then(|o| {
-                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
-            }).ok_or_else(|| Error::Backend("q_out no buffer".into()))?;
-            let k_cache_buf = k_cache.and_then(|o| {
-                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
-            }).ok_or_else(|| Error::Backend("k_cache no buffer".into()))?;
-            let v_cache_buf = v_cache.and_then(|o| {
-                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
-            }).ok_or_else(|| Error::Backend("v_cache no buffer".into()))?;
-            let pos_buf = positions.and_then(|o| {
-                o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref()
-            }).ok_or_else(|| Error::Backend("positions no buffer".into()))?;
+            let gamma_s = gamma
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend(
+                        "fused_rmsnorm_mxfp4_gemm_rope_kv: gamma not MetalStorage".into(),
+                    )
+                })?;
+            let wq_s = wq_packed
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend(
+                        "fused_rmsnorm_mxfp4_gemm_rope_kv: wq_packed not MetalStorage".into(),
+                    )
+                })?;
+            let wk_s = wk_packed
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend(
+                        "fused_rmsnorm_mxfp4_gemm_rope_kv: wk_packed not MetalStorage".into(),
+                    )
+                })?;
+            let wv_s = wv_packed
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| {
+                    Error::Backend(
+                        "fused_rmsnorm_mxfp4_gemm_rope_kv: wv_packed not MetalStorage".into(),
+                    )
+                })?;
+            let x_buf = x_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("x no buffer".into()))?;
+            let gamma_buf = gamma_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("gamma no buffer".into()))?;
+            let wq_buf = wq_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("wq_packed no buffer".into()))?;
+            let wk_buf = wk_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("wk_packed no buffer".into()))?;
+            let wv_buf = wv_s
+                .buffer
+                .as_ref()
+                .ok_or_else(|| Error::Backend("wv_packed no buffer".into()))?;
+            let q_out_buf = q_out
+                .and_then(|o| o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref())
+                .ok_or_else(|| Error::Backend("q_out no buffer".into()))?;
+            let k_cache_buf = k_cache
+                .and_then(|o| o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref())
+                .ok_or_else(|| Error::Backend("k_cache no buffer".into()))?;
+            let v_cache_buf = v_cache
+                .and_then(|o| o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref())
+                .ok_or_else(|| Error::Backend("v_cache no buffer".into()))?;
+            let pos_buf = positions
+                .and_then(|o| o.as_any().downcast_ref::<MetalStorage>()?.buffer.as_ref())
+                .ok_or_else(|| Error::Backend("positions no buffer".into()))?;
             let ctx = MetalContext::get()?;
             let cmd = self.get_or_create_command_buffer()?;
-            let enc = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
+            let enc = cmd
+                .computeCommandEncoder()
+                .ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
             enc.setComputePipelineState(&ctx.pipelines.fused_rmsnorm_mxfp4_gemm_rope_kv);
             enc.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
             enc.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
@@ -1662,12 +1769,36 @@ impl MetalDevice {
             unsafe {
                 enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 9);
                 enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 10);
-                enc.setBytes_length_atIndex(&q_dim_val as *const i32 as *const std::ffi::c_void, 4, 11);
-                enc.setBytes_length_atIndex(&kv_dim_val as *const i32 as *const std::ffi::c_void, 4, 12);
-                enc.setBytes_length_atIndex(&rotary_dim_val as *const i32 as *const std::ffi::c_void, 4, 13);
-                enc.setBytes(&rope_theta_val as *const f32 as *const std::ffi::c_void, 4, 14);
-                enc.setBytes_length_atIndex(&num_kv_heads_val as *const i32 as *const std::ffi::c_void, 4, 15);
-                enc.setBytes_length_atIndex(&head_dim_val as *const i32 as *const std::ffi::c_void, 4, 16);
+                enc.setBytes_length_atIndex(
+                    &q_dim_val as *const i32 as *const std::ffi::c_void,
+                    4,
+                    11,
+                );
+                enc.setBytes_length_atIndex(
+                    &kv_dim_val as *const i32 as *const std::ffi::c_void,
+                    4,
+                    12,
+                );
+                enc.setBytes_length_atIndex(
+                    &rotary_dim_val as *const i32 as *const std::ffi::c_void,
+                    4,
+                    13,
+                );
+                enc.setBytes(
+                    &rope_theta_val as *const f32 as *const std::ffi::c_void,
+                    4,
+                    14,
+                );
+                enc.setBytes_length_atIndex(
+                    &num_kv_heads_val as *const i32 as *const std::ffi::c_void,
+                    4,
+                    15,
+                );
+                enc.setBytes_length_atIndex(
+                    &head_dim_val as *const i32 as *const std::ffi::c_void,
+                    4,
+                    16,
+                );
             }
             let out_dim = q_dim.max(kv_dim);
             let tpg = MTLSize::new(16, 16, 1);
@@ -1676,17 +1807,40 @@ impl MetalDevice {
             enc.endEncoding();
             cmd.commit();
             cmd.waitUntilCompleted();
-            return Ok(Box::new(MetalHandle { command_buffer: cmd }));
+            return Ok(Box::new(MetalHandle {
+                command_buffer: cmd,
+            }));
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (x, gamma, wq_packed, wk_packed, wv_packed, q_out, k_cache, v_cache, positions, m, k, q_dim, kv_dim, rotary_dim, rope_theta, num_kv_heads, head_dim);
-            Err(Error::Backend("fused_rmsnorm_mxfp4_gemm_rope_kv: CPU fallback not implemented".into()))
+            let _ = (
+                x,
+                gamma,
+                wq_packed,
+                wk_packed,
+                wv_packed,
+                q_out,
+                k_cache,
+                v_cache,
+                positions,
+                m,
+                k,
+                q_dim,
+                kv_dim,
+                rotary_dim,
+                rope_theta,
+                num_kv_heads,
+                head_dim,
+            );
+            Err(Error::Backend(
+                "fused_rmsnorm_mxfp4_gemm_rope_kv: CPU fallback not implemented".into(),
+            ))
         }
     }
 
     /// Flash-decode (split-KV parallel attention) for Metal.
     /// Wraps `grim_flash_decode_split_k` + `grim_softmax_merge` kernels.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn flash_decode(
         &self,
         q: &dyn BackendStorage,
@@ -1701,19 +1855,31 @@ impl MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                let q_s = q.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("flash_decode: q not MetalStorage".into())
-                })?;
-                let k_s = k.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("flash_decode: k not MetalStorage".into())
-                })?;
-                let v_s = v.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("flash_decode: v not MetalStorage".into())
-                })?;
+                let q_s = q
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("flash_decode: q not MetalStorage".into()))?;
+                let k_s = k
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("flash_decode: k not MetalStorage".into()))?;
+                let v_s = v
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("flash_decode: v not MetalStorage".into()))?;
 
-                let q_buf = q_s.buffer.as_ref().ok_or_else(|| Error::Backend("q lacks buffer".into()))?;
-                let k_buf = k_s.buffer.as_ref().ok_or_else(|| Error::Backend("k lacks buffer".into()))?;
-                let v_buf = v_s.buffer.as_ref().ok_or_else(|| Error::Backend("v lacks buffer".into()))?;
+                let q_buf = q_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("q lacks buffer".into()))?;
+                let k_buf = k_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("k lacks buffer".into()))?;
+                let v_buf = v_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("v lacks buffer".into()))?;
 
                 let ns = num_splits.max(1);
                 let mid_out = self.zeros(&Shape::new(vec![ns, num_heads, head_dim]), DType::F32)?;
@@ -1729,9 +1895,9 @@ impl MetalDevice {
                 let msum_buf = msum_s.buffer.as_ref().unwrap();
 
                 let cmd = self.get_or_create_command_buffer()?;
-                let enc = cmd.computeCommandEncoder().ok_or_else(|| {
-                    Error::from(MetalError::Ffi("compute encoder".into()))
-                })?;
+                let enc = cmd
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::from(MetalError::Ffi("compute encoder".into())))?;
 
                 enc.setComputePipelineState(&inner.pipelines.flash_decode_split_k);
                 enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
@@ -1744,31 +1910,39 @@ impl MetalDevice {
                 let scale = (1.0f32 / (head_dim.max(1) as f32).sqrt()) as f32;
                 unsafe {
                     enc.setBytes_length_atIndex(
-                        &(num_heads as i32) as *const i32 as *const std::ffi::c_void, 6, 6,
+                        &(num_heads as i32) as *const i32 as *const std::ffi::c_void,
+                        6,
+                        6,
                     );
                     enc.setBytes_length_atIndex(
-                        &(num_kv_heads as i32) as *const i32 as *const std::ffi::c_void, 6, 7,
+                        &(num_kv_heads as i32) as *const i32 as *const std::ffi::c_void,
+                        6,
+                        7,
                     );
                     enc.setBytes_length_atIndex(
-                        &(head_dim as i32) as *const i32 as *const std::ffi::c_void, 6, 8,
+                        &(head_dim as i32) as *const i32 as *const std::ffi::c_void,
+                        6,
+                        8,
                     );
                     enc.setBytes_length_atIndex(
-                        &(kv_seq_len as i32) as *const i32 as *const std::ffi::c_void, 6, 9,
+                        &(kv_seq_len as i32) as *const i32 as *const std::ffi::c_void,
+                        6,
+                        9,
                     );
                     enc.setBytes_length_atIndex(
-                        &(ns as i32) as *const i32 as *const std::ffi::c_void, 6, 10,
+                        &(ns as i32) as *const i32 as *const std::ffi::c_void,
+                        6,
+                        10,
                     );
                     enc.setBytes_length_atIndex(
-                        &scale as *const f32 as *const std::ffi::c_void, 6, 11,
+                        &scale as *const f32 as *const std::ffi::c_void,
+                        6,
+                        11,
                     );
                 }
 
                 let tpg = MTLSize::new(256, 1, 1);
-                let gr = MTLSize::new(
-                    (num_heads.max(1) as u64) * (ns as u64),
-                    1,
-                    1,
-                );
+                let gr = MTLSize::new((num_heads.max(1) as u64) * (ns as u64), 1, 1);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(gr, tpg);
 
                 // Stage 2: softmax merge
@@ -1777,13 +1951,19 @@ impl MetalDevice {
                 enc.setBuffer_offset_atIndex(Some(mmax_buf), 0, 1);
                 enc.setBuffer_offset_atIndex(Some(msum_buf), 0, 2);
                 enc.setBytes_length_atIndex(
-                    &(num_heads as i32) as *const i32 as *const std::ffi::c_void, 4, 4,
+                    &(num_heads as i32) as *const i32 as *const std::ffi::c_void,
+                    4,
+                    4,
                 );
                 enc.setBytes_length_atIndex(
-                    &(ns as i32) as *const i32 as *const std::ffi::c_void, 4, 5,
+                    &(ns as i32) as *const i32 as *const std::ffi::c_void,
+                    4,
+                    5,
                 );
                 enc.setBytes_length_atIndex(
-                    &(head_dim as i32) as *const i32 as *const std::ffi::c_void, 4, 6,
+                    &(head_dim as i32) as *const i32 as *const std::ffi::c_void,
+                    4,
+                    6,
                 );
                 let gr2 = MTLSize::new(num_heads.max(1) as u64, 1, 1);
                 enc.dispatchThreadgroups_threadsPerThreadgroup(gr2, tpg);
@@ -1791,7 +1971,12 @@ impl MetalDevice {
 
                 cmd.commit();
                 cmd.waitUntilCompleted();
-                return Ok((mid_out, Box::new(MetalHandle { command_buffer: cmd })));
+                return Ok((
+                    mid_out,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd,
+                    }),
+                ));
             }
         }
 
@@ -1807,7 +1992,7 @@ impl MetalDevice {
             let hd = head_dim.max(1);
             let sl = kv_seq_len.max(1);
             let ns = num_splits.max(1);
-            let cl = (sl + ns - 1) / ns;
+            let cl = sl.div_ceil(ns);
             let scale = 1.0f32 / (hd as f32).sqrt();
 
             let mut mo = vec![0.0f32; ns * nh * hd];
@@ -1827,12 +2012,19 @@ impl MetalDevice {
                         let pos = st + i;
                         let kbase = (pos * nkh + kh) * hd;
                         let mut d = 0.0f32;
-                        for dd in 0..hd { d += qv[h*hd+dd] * kv[kbase+dd]; }
+                        for dd in 0..hd {
+                            d += qv[h * hd + dd] * kv[kbase + dd];
+                        }
                         sf[i] = d * scale;
-                        if sf[i] > mx { mx = sf[i]; }
+                        if sf[i] > mx {
+                            mx = sf[i];
+                        }
                     }
                     let mut se = 0.0f32;
-                    for i in 0..ll { sf[i] = (sf[i] - mx).exp(); se += sf[i]; }
+                    for i in 0..ll {
+                        sf[i] = (sf[i] - mx).exp();
+                        se += sf[i];
+                    }
                     mm[split_off] = mx;
                     ms[split_off] = se;
                     let ob = split_off * hd;
@@ -1841,25 +2033,27 @@ impl MetalDevice {
                         for i in 0..ll {
                             let pos = st + i;
                             let vbase = (pos * nkh + kh) * hd;
-                            a += sf[i] * vv[vbase+dd];
+                            a += sf[i] * vv[vbase + dd];
                         }
-                        mo[ob+dd] = a;
+                        mo[ob + dd] = a;
                     }
                 }
             }
 
             let mut out = vec![0.0f32; nh * hd];
             for h in 0..nh {
-                let gm: f32 = (0..ns).map(|s| mm[h*ns+s]).fold(-1e20, f32::max);
-                let gs = (0..ns).map(|s| (mm[h*ns+s] - gm).exp() * ms[h*ns+s]).sum::<f32>();
+                let gm: f32 = (0..ns).map(|s| mm[h * ns + s]).fold(-1e20, f32::max);
+                let gs = (0..ns)
+                    .map(|s| (mm[h * ns + s] - gm).exp() * ms[h * ns + s])
+                    .sum::<f32>();
                 let inv = 1.0f32 / gs.max(1e-38f32);
                 for dd in 0..hd {
                     let mut a = 0.0f32;
                     for s in 0..ns {
-                        let w = (mm[h*ns+s] - gm).exp() * ms[h*ns+s] * inv;
-                        a += w * mo[(h*ns+s)*hd+dd];
+                        let w = (mm[h * ns + s] - gm).exp() * ms[h * ns + s] * inv;
+                        a += w * mo[(h * ns + s) * hd + dd];
                     }
-                    out[h*hd+dd] = a;
+                    out[h * hd + dd] = a;
                 }
             }
 
@@ -2056,13 +2250,7 @@ impl MetalDevice {
         Ok((storage, Box::new(ReadyHandle)))
     }
 
-    /// Fused grouped MoE dispatch (WI-M5). Mirrors `grim_moe_fused_dispatch` on
-    /// ROCm and `moe_fused_dispatch` on Vulkan. The MSL kernel runs one thread
-    /// per output element of `out` (`[batch, hidden]`) and accumulates the
-    /// gated-MLP contributions of every routed (token, expert) pair targeting
-    /// that token. The router arrays (`router_tokens`/`router_experts`) are
-    /// f32-backed (Metal has no integer buffer storage in this crate) and are
-    /// cast to `int` inside the shader.
+    /// Fused grouped MoE dispatch (WI-M5). Mirrors `grim_moe_fused_dispatch` on ROCm and `moe_fused_dispatch` on Vulkan.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     pub fn moe_fused_dispatch(
@@ -2249,10 +2437,8 @@ impl MetalDevice {
         self.matmul_with_op_internal(a, b, out, Some(op))
     }
 
-    /// Convenience alias for the LM-head projection GEMM. Mirrors ROCm's
-    /// `matmul_lm_head` (roc_device.rs:13879) — routes through
-    /// `matmul_with_op(GemmOp::LmHead)`, which selects the `TLOLog` shape class
-    /// in the Metal autotune.
+    /// Convenience alias for the LM-head projection GEMM.
+    /// Mirrors ROCm's `matmul_lm_head` (roc_device.rs:13879) - routes through `matmul_with_op(GemmOp::LmHead)`, which selects the `TLOLog` shape class in.
     pub fn matmul_lm_head(
         &self,
         a: &dyn BackendStorage,
@@ -2382,9 +2568,8 @@ impl MetalDevice {
                     Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
                 })?;
 
-                // SIMDgroup dispatch gate (audit Metal-track): eligible f32
-                // GEMMs route to the hardware-MMA kernels; everything else
-                // keeps the autotuned naive path below.
+                // SIMDgroup dispatch gate (audit Metal-track): eligible f32 GEMMs route to
+                // the hardware-MMA kernels; everything else keeps the autotuned naive path below.
                 if inner.caps.supports_simdgroup_matrix {
                     if let Some(variant) = simdgroup_gemm_variant(m, n, k) {
                         let pipeline = match variant {
@@ -2430,10 +2615,8 @@ impl MetalDevice {
                                 MTLSize::new(128, 1, 1),
                             ),
                         };
-                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                            groups,
-                            threads_per_group,
-                        );
+                        encoder
+                            .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                         encoder.endEncoding();
                         return Ok((
                             out_storage,
@@ -2523,9 +2706,8 @@ impl MetalDevice {
 }
 
 impl CoreTensorOps for MetalDevice {
-    /// Audit B5: device-side 2-D transpose via `grim_transpose_2d` — keeps
-    /// LoRA A/B transposes resident on GPU. Non-Apple builds (and anything
-    /// without a Metal context) fall back to the trait's host default path.
+    /// Audit B5: device-side 2-D transpose via `grim_transpose_2d` - keeps LoRA A/B transposes resident on GPU.
+    /// Non-Apple builds (and anything without a Metal context) fall back to the trait's host default.
     fn transpose_2d(
         &self,
         x: &dyn BackendStorage,
@@ -2573,8 +2755,16 @@ impl CoreTensorOps for MetalDevice {
                 let r = rows as u32;
                 let c = cols as u32;
                 unsafe {
-                    encoder.setBytes_length_atIndex(&r as *const u32 as *const std::ffi::c_void, 4, 2);
-                    encoder.setBytes_length_atIndex(&c as *const u32 as *const std::ffi::c_void, 4, 3);
+                    encoder.setBytes_length_atIndex(
+                        &r as *const u32 as *const std::ffi::c_void,
+                        4,
+                        2,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &c as *const u32 as *const std::ffi::c_void,
+                        4,
+                        3,
+                    );
                 }
                 let grid = objc2_metal::MTLSize::new(((n + 255) / 256) as u64, 1, 1);
                 let threads = objc2_metal::MTLSize::new(256, 1, 1);
@@ -2609,7 +2799,6 @@ impl CoreTensorOps for MetalDevice {
         let storage = self.from_cpu(&out, out_shape, x.dtype())?;
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
-
 
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let elem_count = shape.elem_count();
@@ -2666,7 +2855,6 @@ impl CoreTensorOps for MetalDevice {
         }
     }
 
-
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -2675,7 +2863,6 @@ impl CoreTensorOps for MetalDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_with_op_internal(a, b, out, None)
     }
-
 
     fn add(
         &self,
@@ -2704,7 +2891,6 @@ impl CoreTensorOps for MetalDevice {
         }
     }
 
-
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -2732,7 +2918,6 @@ impl CoreTensorOps for MetalDevice {
         }
     }
 
-
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -2759,7 +2944,6 @@ impl CoreTensorOps for MetalDevice {
             })
         }
     }
-
 
     fn rms_norm(
         &self,
@@ -2853,7 +3037,6 @@ impl CoreTensorOps for MetalDevice {
             })
         }
     }
-
 
     fn softmax(
         &self,
@@ -2950,7 +3133,6 @@ impl CoreTensorOps for MetalDevice {
             Ok((out_metal, handle))
         }
     }
-
 
     fn embedding(
         &self,
@@ -3060,7 +3242,6 @@ impl CoreTensorOps for MetalDevice {
         }
     }
 
-
     fn from_cpu(
         &self,
         data: &[f32],
@@ -3132,7 +3313,6 @@ impl CoreTensorOps for MetalDevice {
         }
     }
 
-
     fn advise(
         &self,
         _storage: &dyn BackendStorage,
@@ -3143,8 +3323,6 @@ impl CoreTensorOps for MetalDevice {
 }
 
 impl ElementwiseOps for MetalDevice {
-
-
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -3171,7 +3349,6 @@ impl ElementwiseOps for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-
     fn sqrt(
         &self,
         x: &dyn BackendStorage,
@@ -3188,7 +3365,6 @@ impl ElementwiseOps for MetalDevice {
         let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
-
 
     fn recip(
         &self,
@@ -3262,12 +3438,9 @@ impl ElementwiseOps for MetalDevice {
     }
 }
 
-impl SamplingOps for MetalDevice {
-}
+impl SamplingOps for MetalDevice {}
 
 impl AttentionOps for MetalDevice {
-
-
     fn kv_dequant_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3451,7 +3624,6 @@ impl AttentionOps for MetalDevice {
         }
     }
 
-
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3479,7 +3651,6 @@ impl AttentionOps for MetalDevice {
         )
     }
 
-
     #[allow(unused_variables)] // params only used on the cfg-gated Apple path
     fn qkv_attention_paged(
         &self,
@@ -3495,9 +3666,8 @@ impl AttentionOps for MetalDevice {
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // The Metal `grim_qkv_attention_paged` kernel accepts a `window_lo` +
-        // `has_window` argument pair; SWA layers compute the lower bound
-        // host-side and the kernel masks below it. No host fallback needed.
+        // The Metal `grim_qkv_attention_paged` kernel accepts a `window_lo` + `has_window` argument pair; SWA layers compute the lower bound host-side and the kernel masks below it.
+        // No host fallback needed.
 
         #[cfg(target_vendor = "apple")]
         if let Some(ref inner) = self.inner {
@@ -3605,7 +3775,6 @@ impl AttentionOps for MetalDevice {
             "Metal paged attention requires Apple Metal GPU support".into(),
         ))
     }
-
 
     #[allow(unused_variables)] // params only used on the cfg-gated Apple path
     fn tree_attention(
@@ -3717,7 +3886,6 @@ impl AttentionOps for MetalDevice {
         ))
     }
 
-
     fn sage_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3741,6 +3909,7 @@ impl AttentionOps for MetalDevice {
         )
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn mla_absorbed_decode(
         &self,
         q_absorbed: &dyn BackendStorage,
@@ -3814,7 +3983,6 @@ impl AttentionOps for MetalDevice {
         Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
 
-
     fn mla_q_kv_norm_split(
         &self,
         q_raw: &dyn BackendStorage,
@@ -3886,7 +4054,6 @@ impl AttentionOps for MetalDevice {
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
-
 
     fn rope(
         &self,
@@ -4138,7 +4305,6 @@ impl AttentionOps for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-
     fn flash_attention(
         &self,
         q: &dyn BackendStorage,
@@ -4168,7 +4334,6 @@ impl AttentionOps for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -4190,12 +4355,9 @@ impl AttentionOps for MetalDevice {
     }
 }
 
-impl FusionOps for MetalDevice {
-}
+impl FusionOps for MetalDevice {}
 
 impl AutogradOps for MetalDevice {
-
-
     fn silu_mul_backward(
         &self,
         e: &dyn BackendStorage,
@@ -4312,24 +4474,50 @@ impl AutogradOps for MetalDevice {
         eps: f32,
         x_shape: &Shape,
         w_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
                 let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal rmsnorm_backward: x is not MetalStorage".into())
                 })?;
-                let w_s = weight.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal rmsnorm_backward: weight is not MetalStorage".into())
-                })?;
-                let g_s = out_grad.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal rmsnorm_backward: out_grad is not MetalStorage".into())
-                })?;
-                let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
-                let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("weight has no GPU buffer".into()))?;
-                let g_buf = g_s.buffer.as_ref().ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
+                let w_s = weight
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("Metal rmsnorm_backward: weight is not MetalStorage".into())
+                    })?;
+                let g_s = out_grad
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend(
+                            "Metal rmsnorm_backward: out_grad is not MetalStorage".into(),
+                        )
+                    })?;
+                let x_buf = x_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
+                let w_buf = w_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("weight has no GPU buffer".into()))?;
+                let g_buf = g_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
                 let row_len = w_shape.dims().last().copied().unwrap_or(1);
-                let num_rows = x_shape.dims().iter().take(x_shape.dims().len() - 1).product::<usize>() / row_len.max(1);
+                let num_rows = x_shape
+                    .dims()
+                    .iter()
+                    .take(x_shape.dims().len() - 1)
+                    .product::<usize>()
+                    / row_len.max(1);
                 let total = x_shape.elem_count();
                 let dx_storage = self.zeros(x_shape, DType::F32)?;
                 let dx_s = dx_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -4352,16 +4540,38 @@ impl AutogradOps for MetalDevice {
                 let total_val = total as i32;
                 let num_rows_val = num_rows as i32;
                 unsafe {
-                    encoder.setBytes_length_atIndex(&row_len_val as *const i32 as *const std::ffi::c_void, 4, 5);
-                    encoder.setBytes_length_atIndex(&eps_val as *const f32 as *const std::ffi::c_void, 4, 6);
-                    encoder.setBytes_length_atIndex(&total_val as *const i32 as *const std::ffi::c_void, 4, 7);
-                    encoder.setBytes_length_atIndex(&num_rows_val as *const i32 as *const std::ffi::c_void, 4, 8);
+                    encoder.setBytes_length_atIndex(
+                        &row_len_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        5,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &eps_val as *const f32 as *const std::ffi::c_void,
+                        4,
+                        6,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &total_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        7,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &num_rows_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        8,
+                    );
                 }
                 let threads = MTLSize::new(32, 1, 1);
                 let groups = MTLSize::new((num_rows.max(1) + 31) as u64, 1, 1);
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                 encoder.endEncoding();
-                return Ok((dx_storage, dw_storage, Box::new(MetalHandle { command_buffer: cmd })));
+                return Ok((
+                    dx_storage,
+                    dw_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd,
+                    }),
+                ));
             }
         }
         let cpu = CpuDevice::new();
@@ -4399,7 +4609,11 @@ impl AutogradOps for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             let command_buffer = self.get_or_create_command_buffer()?;
-            return Ok((dx_storage, dw_storage, Box::new(MetalHandle { command_buffer })));
+            return Ok((
+                dx_storage,
+                dw_storage,
+                Box::new(MetalHandle { command_buffer }),
+            ));
         }
         #[cfg(not(target_vendor = "apple"))]
         Ok((dx_storage, dw_storage, Box::new(MetalHandle)))
@@ -4415,18 +4629,30 @@ impl AutogradOps for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                let g_s = out_grad.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal rope_backward: out_grad is not MetalStorage".into())
-                })?;
+                let g_s = out_grad
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("Metal rope_backward: out_grad is not MetalStorage".into())
+                    })?;
                 let c_s = cos.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal rope_backward: cos is not MetalStorage".into())
                 })?;
                 let s_s = sin.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal rope_backward: sin is not MetalStorage".into())
                 })?;
-                let g_buf = g_s.buffer.as_ref().ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
-                let c_buf = c_s.buffer.as_ref().ok_or_else(|| Error::Backend("cos has no GPU buffer".into()))?;
-                let s_buf = s_s.buffer.as_ref().ok_or_else(|| Error::Backend("sin has no GPU buffer".into()))?;
+                let g_buf = g_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
+                let c_buf = c_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("cos has no GPU buffer".into()))?;
+                let s_buf = s_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("sin has no GPU buffer".into()))?;
                 let half_dim = cos.shape().elem_count();
                 let head_dim = half_dim * 2;
                 let total_tokens = out_shape.elem_count() / head_dim.max(1);
@@ -4446,14 +4672,27 @@ impl AutogradOps for MetalDevice {
                 let half_dim_val = half_dim as i32;
                 let total_tokens_val = total_tokens as i32;
                 unsafe {
-                    encoder.setBytes_length_atIndex(&half_dim_val as *const i32 as *const std::ffi::c_void, 4, 4);
-                    encoder.setBytes_length_atIndex(&total_tokens_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                    encoder.setBytes_length_atIndex(
+                        &half_dim_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        4,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &total_tokens_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        5,
+                    );
                 }
                 let threads = MTLSize::new(256, 1, 1);
                 let groups = MTLSize::new(((total_pairs as usize + 255) / 256) as u64, 1, 1);
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                 encoder.endEncoding();
-                return Ok((dx_storage, Box::new(MetalHandle { command_buffer: cmd })));
+                return Ok((
+                    dx_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd,
+                    }),
+                ));
             }
         }
         let cpu = CpuDevice::new();
@@ -4494,14 +4733,30 @@ impl AutogradOps for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                let g_s = out_grad.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal softmax_backward: out_grad is not MetalStorage".into())
-                })?;
-                let s_s = softmax_out.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal softmax_backward: softmax_out is not MetalStorage".into())
-                })?;
-                let g_buf = g_s.buffer.as_ref().ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
-                let s_buf = s_s.buffer.as_ref().ok_or_else(|| Error::Backend("softmax_out has no GPU buffer".into()))?;
+                let g_s = out_grad
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend(
+                            "Metal softmax_backward: out_grad is not MetalStorage".into(),
+                        )
+                    })?;
+                let s_s = softmax_out
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend(
+                            "Metal softmax_backward: softmax_out is not MetalStorage".into(),
+                        )
+                    })?;
+                let g_buf = g_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
+                let s_buf = s_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("softmax_out has no GPU buffer".into()))?;
                 let row_len = out_shape.dims().last().copied().unwrap_or(1);
                 let total = out_shape.elem_count();
                 let dx_storage = self.zeros(out_shape, DType::F32)?;
@@ -4518,14 +4773,27 @@ impl AutogradOps for MetalDevice {
                 let row_len_val = row_len as i32;
                 let total_val = total as i32;
                 unsafe {
-                    encoder.setBytes_length_atIndex(&row_len_val as *const i32 as *const std::ffi::c_void, 4, 3);
-                    encoder.setBytes_length_atIndex(&total_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                    encoder.setBytes_length_atIndex(
+                        &row_len_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        3,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &total_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        4,
+                    );
                 }
                 let threads = MTLSize::new(256, 1, 1);
                 let groups = MTLSize::new(((total as usize + 255) / 256) as u64, 1, 1);
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                 encoder.endEncoding();
-                return Ok((dx_storage, Box::new(MetalHandle { command_buffer: cmd })));
+                return Ok((
+                    dx_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd,
+                    }),
+                ));
             }
         }
         let cpu = CpuDevice::new();
@@ -4555,6 +4823,7 @@ impl AutogradOps for MetalDevice {
         Ok((dx_storage, Box::new(MetalHandle)))
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn embedding_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -4565,13 +4834,23 @@ impl AutogradOps for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                let g_s = out_grad.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal embedding_backward: out_grad is not MetalStorage".into())
-                })?;
-                let g_buf = g_s.buffer.as_ref().ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
+                let g_s = out_grad
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend(
+                            "Metal embedding_backward: out_grad is not MetalStorage".into(),
+                        )
+                    })?;
+                let g_buf = g_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("out_grad has no GPU buffer".into()))?;
                 let num_tokens = token_ids.len();
                 if num_tokens == 0 || hidden_dim == 0 || vocab_size == 0 {
-                    return Err(Error::Shape("embedding_backward: empty vocab/hidden/tokens".into()));
+                    return Err(Error::Shape(
+                        "embedding_backward: empty vocab/hidden/tokens".into(),
+                    ));
                 }
                 let dw_shape = Shape::new(vec![vocab_size * hidden_dim]);
                 let dw_storage = self.zeros(&dw_shape, DType::F32)?;
@@ -4579,7 +4858,8 @@ impl AutogradOps for MetalDevice {
                 let dw_buf = dw_s.buffer.as_ref().unwrap();
                 // Upload token_ids as U32 buffer
                 let ids_bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
-                let ids_storage = self.from_cpu_bytes(&ids_bytes, &Shape::new(vec![num_tokens]), DType::U32)?;
+                let ids_storage =
+                    self.from_cpu_bytes(&ids_bytes, &Shape::new(vec![num_tokens]), DType::U32)?;
                 let ids_s = ids_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
                 let ids_buf = ids_s.buffer.as_ref().unwrap();
                 let cmd = self.get_or_create_command_buffer()?;
@@ -4591,10 +4871,15 @@ impl AutogradOps for MetalDevice {
                 encoder0.setBuffer_offset_atIndex(Some(dw_buf), 0, 0);
                 let size_val = dw_shape.elem_count() as i32;
                 unsafe {
-                    encoder0.setBytes_length_atIndex(&size_val as *const i32 as *const std::ffi::c_void, 4, 1);
+                    encoder0.setBytes_length_atIndex(
+                        &size_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        1,
+                    );
                 }
                 let threads0 = MTLSize::new(256, 1, 1);
-                let groups0 = MTLSize::new(((dw_shape.elem_count() as usize + 255) / 256) as u64, 1, 1);
+                let groups0 =
+                    MTLSize::new(((dw_shape.elem_count() as usize + 255) / 256) as u64, 1, 1);
                 encoder0.dispatchThreadgroups_threadsPerThreadgroup(groups0, threads0);
                 encoder0.endEncoding();
                 // Then scatter-add
@@ -4608,8 +4893,16 @@ impl AutogradOps for MetalDevice {
                 let hidden_val = hidden_dim as i32;
                 let num_tokens_val = num_tokens as i32;
                 unsafe {
-                    encoder1.setBytes_length_atIndex(&hidden_val as *const i32 as *const std::ffi::c_void, 4, 3);
-                    encoder1.setBytes_length_atIndex(&num_tokens_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                    encoder1.setBytes_length_atIndex(
+                        &hidden_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        3,
+                    );
+                    encoder1.setBytes_length_atIndex(
+                        &num_tokens_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        4,
+                    );
                 }
                 let total = num_tokens * hidden_dim;
                 let threads1 = MTLSize::new(256, 1, 1);
@@ -4618,8 +4911,14 @@ impl AutogradOps for MetalDevice {
                 encoder1.endEncoding();
                 cmd.commit();
                 cmd.waitUntilCompleted();
-                let dw_storage2 = self.zeros(&Shape::new(vec![vocab_size, hidden_dim]), DType::F32)?;
-                return Ok((dw_storage2, Box::new(MetalHandle { command_buffer: cmd })));
+                let dw_storage2 =
+                    self.zeros(&Shape::new(vec![vocab_size, hidden_dim]), DType::F32)?;
+                return Ok((
+                    dw_storage2,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd,
+                    }),
+                ));
             }
         }
         let cpu = CpuDevice::new();
@@ -4647,8 +4946,6 @@ impl AutogradOps for MetalDevice {
 }
 
 impl OptimizerOps for MetalDevice {
-
-
     fn fused_adamw_step(
         &self,
         p: &dyn BackendStorage,
@@ -4690,7 +4987,6 @@ impl OptimizerOps for MetalDevice {
         Ok(Box::new(grim_tensor::backend::ReadyHandle))
     }
 
-
     fn fused_lion_step(
         &self,
         p: &dyn BackendStorage,
@@ -4731,8 +5027,6 @@ impl OptimizerOps for MetalDevice {
 }
 
 impl QuantOps for MetalDevice {
-
-
     fn quantize(
         &self,
         x: &dyn BackendStorage,
@@ -4741,7 +5035,6 @@ impl QuantOps for MetalDevice {
         let (out, _handle) = self.quantize_on_device(x, format)?;
         Ok(out)
     }
-
 
     fn quantized_matmul(
         &self,
@@ -4757,10 +5050,8 @@ impl QuantOps for MetalDevice {
         let k = a_dims[1];
         let n = out_dims[1];
 
-        // --- Apple Silicon GPU fast-path ----------------------------------------
-        // Each thread computes one output element [row, col] by dequantizing
-        // its column of B on-the-fly inside the kernel.  Both A and B-packed
-        // must be device-resident MetalStorage buffers.
+        // --- Apple Silicon GPU fast-path ---------------------------------------- Each thread computes one output element [row, col] by dequantizing its column of B on-the-fly inside the kernel.
+        // Both A and B-packed must be device-resident MetalStorage buffers.
         #[cfg(target_vendor = "apple")]
         {
             let a_s = a.as_any().downcast_ref::<MetalStorage>();
@@ -4953,13 +5244,15 @@ impl QuantOps for MetalDevice {
                                 let out_buf = out_s.buffer.as_ref().unwrap();
 
                                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
-                                    Error::from(MetalError::Ffi(
-                                        "Failed to create compute encoder".into(),
-                                    ))
-                                })?;
+                                let encoder =
+                                    cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                        Error::from(MetalError::Ffi(
+                                            "Failed to create compute encoder".into(),
+                                        ))
+                                    })?;
 
-                                encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_q4k);
+                                encoder
+                                    .setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_q4k);
                                 encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
                                 encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
                                 encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
@@ -5063,9 +5356,8 @@ impl QuantOps for MetalDevice {
                         }
 
                         // MXFP4 fast-path — fused dequant+INT8 GEMM via simdgroup_matrix
-                        if let DTypeStorage::FloatPack(
-                            FloatPackScheme::MxFp4,
-                        ) = b_packed.dtype().storage
+                        if let DTypeStorage::FloatPack(FloatPackScheme::MxFp4) =
+                            b_packed.dtype().storage
                         {
                             let out_storage = self.zeros(out_shape, DType::F32)?;
                             let out_s =
@@ -5073,13 +5365,11 @@ impl QuantOps for MetalDevice {
                             let out_buf = out_s.buffer.as_ref().unwrap();
 
                             let cmd_buffer = self.get_or_create_command_buffer()?;
-                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(
-                                || {
-                                    Error::from(MetalError::Ffi(
-                                        "Failed to create compute encoder".into(),
-                                    ))
-                                },
-                            )?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi(
+                                    "Failed to create compute encoder".into(),
+                                ))
+                            })?;
 
                             encoder
                                 .setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_mxfp4);
@@ -5277,7 +5567,6 @@ impl QuantOps for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
@@ -5461,8 +5750,6 @@ impl QuantOps for MetalDevice {
 }
 
 impl RecurrentOps for MetalDevice {
-
-
     fn selective_scan(
         &self,
         x: &dyn BackendStorage,
@@ -5523,7 +5810,6 @@ impl RecurrentOps for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-
     fn rwkv_time_mix(
         &self,
         x: &dyn BackendStorage,
@@ -5577,7 +5863,6 @@ impl RecurrentOps for MetalDevice {
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-
     fn rwkv_channel_mix(
         &self,
         x: &dyn BackendStorage,
@@ -5615,8 +5900,6 @@ impl RecurrentOps for MetalDevice {
 }
 
 impl CollectiveOps for MetalDevice {
-
-
     #[allow(unused_variables)] // locals only used on the cfg-gated Apple path
     fn all_reduce(
         &self,
@@ -5732,7 +6015,6 @@ impl CollectiveOps for MetalDevice {
         #[cfg(not(target_vendor = "apple"))]
         Ok((storage, Box::new(MetalHandle)))
     }
-
 
     #[allow(unused_variables)] // locals only used on the cfg-gated Apple path
     fn comm_fuse_reduce(
@@ -5860,7 +6142,6 @@ impl CollectiveOps for MetalDevice {
         Ok(storage)
     }
 
-
     fn estimate_gemm_latency_ms(
         &self,
         m: usize,
@@ -5880,8 +6161,6 @@ impl CollectiveOps for MetalDevice {
 }
 
 impl MemoryOps for MetalDevice {
-
-
     fn from_cpu_bytes(
         &self,
         data: &[u8],
@@ -5946,11 +6225,9 @@ impl MemoryOps for MetalDevice {
     }
 }
 
-impl GraphCaptureOps for MetalDevice {
-}
+impl GraphCaptureOps for MetalDevice {}
 
 impl grim_tensor::BackendDevice for MetalDevice {}
-
 
 impl MetalDevice {
     #[allow(clippy::too_many_arguments)]
@@ -5967,11 +6244,8 @@ impl MetalDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // The Metal `grim_qkv_attention` kernel accepts a `window_lo` +
-        // `has_window` argument pair; SWA layers compute the lower bound
-        // host-side and the kernel masks below it. No host fallback needed.
-        // (On non-Apple targets the Apple dispatch block is cfg'd out, so
-        // reference `window` here to keep the binding live.)
+        // The Metal `grim_qkv_attention` kernel accepts a `window_lo` + `has_window` argument pair; SWA layers compute the lower bound host-side and the kernel masks below it.
+        // No host fallback needed.
         let _ = &window;
 
         let out_dims = out.dims();
@@ -6603,10 +6877,7 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
 }
 
 /// WI-1: live compute utilization for `ordinal`.
-///
-/// Scope note (per WI-1): Metal has no cross-vendor utilization API. Returns
-/// `None` rather than fabricating a value from indirect signals — `null` on the
-/// wire is the honest answer.
+/// Scope note (per WI-1): Metal has no cross-vendor utilization API.
 pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
     None
 }
@@ -7051,7 +7322,11 @@ mod simdgroup_gate_tests {
     fn non_multiple_of_eight_falls_back() {
         assert_eq!(simdgroup_gemm_variant(63, 128, 128), None);
         assert_eq!(simdgroup_gemm_variant(128, 127, 128), None);
-        assert_eq!(simdgroup_gemm_variant(128, 128, 8), None, "k=8 is a multiple but below threshold? no — k=8 < 64");
+        assert_eq!(
+            simdgroup_gemm_variant(128, 128, 8),
+            None,
+            "k=8 is a multiple but below threshold? no — k=8 < 64"
+        );
         assert_eq!(simdgroup_gemm_variant(128, 128, 63), None);
     }
 
@@ -7088,11 +7363,8 @@ mod simdgroup_gate_tests {
     }
 }
 
-/// Apple-hardware parity gate: the simdgroup path must agree with the
-/// Accelerate/CPU fallback within f32 accumulation tolerance for an
-/// eligible (m,n,k). Runs wherever Metal hardware exists; a no-op
-/// elsewhere (the dispatch gate keeps non-eligible shapes off the
-/// simdgroup path entirely).
+/// Apple-hardware parity gate: the simdgroup path must agree with the Accelerate/CPU fallback within f32 accumulation tolerance for an eligible (m,n,k).
+/// Runs wherever Metal hardware exists; a no-op elsewhere (the dispatch gate keeps non-eligible shapes off.
 #[cfg(all(test, target_vendor = "apple"))]
 mod simdgroup_parity_tests {
     use super::*;

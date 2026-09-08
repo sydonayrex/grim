@@ -1,23 +1,18 @@
 //! Fused Batched Multi-LoRA (S-LoRA / Punica style) HIP kernel and dispatch orchestrator.
-//!
-//! Evaluates heterogeneous LoRA adapters across batch tokens in a single execution pass:
-//! $Y = X \cdot W_{\text{base}}^T + \sum_{s} \alpha_s (X_s \cdot A_s^T) \cdot B_s^T$.
+//! Evaluates heterogeneous LoRA adapters across batch tokens in a single execution pass: $Y = X.
 
 use grim_tensor::error::{Error, Result};
 
-use crate::device::handles::{HipDim3, hipFree, hipModuleGetFunction, hipModuleLaunchKernel,
-    hipModuleLoad, hipModuleUnload};
+use crate::device::handles::{
+    HipDim3, hipFree, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload,
+};
 use crate::device::helpers::{check_hip, upload_device_buffer};
 use crate::device::roc_device::RocmDevice;
 use crate::device::util::{DeviceGuard, arg};
 use crate::{HipMemcpyKind, hipMemcpy, hipStreamSynchronize, hipSuccess};
 
 /// HIP kernel source for segmented batched LoRA projection.
-///
-/// Two-kernel pipeline per adapter segment (Punica/S-LoRA style):
-/// 1. `grim_batched_lora_shrink`  — `inter = X_seg · Aᵀ` (one thread per token×rank).
-/// 2. `grim_batched_lora_accumulate` — `Y[seg] += (inter · Bᵀ) · scaling`
-///    via `atomicAdd` at the segment's global row offset.
+/// Two-kernel pipeline per adapter segment (Punica/S-LoRA style): 1.
 pub const BATCHED_LORA_KERNEL_SOURCE: &str = r#"
 // Segmented batched LoRA gather-scatter kernel (Punica/S-LoRA style).
 // Accumulates delta = (alpha / rank) * (X[s] @ A_s^T) @ B_s^T into Y[s].
@@ -70,17 +65,7 @@ extern "C" __global__ void grim_batched_lora_shrink(
 "#;
 
 /// HIP kernel source for the **dispatched** batched LoRA path.
-///
-/// Two launches TOTAL regardless of adapter count (the Punica/SGLang contract):
-/// 1. `grim_lora_shrink_dispatched`  — every token computes its own
-///    `intermediate[t, :] = X[t, :] · A_{idx[t]}^T`, looking up its adapter
-///    through a per-token indirection table.
-/// 2. `grim_lora_expand_dispatched`  — every (token, out_col) accumulates
-///    `Y[t, o] += scaling_{idx[t]} · (intermediate[t, :] · B_{idx[t]}[o, :])`.
-///
-/// The indirection table (`token_adapter_idx`) plus per-adapter device pointer
-/// and rank arrays let a single launch serve heterogeneous adapters in parallel —
-/// no per-adapter host loop, no per-adapter kernel launch.
+/// Two launches TOTAL regardless of adapter count (the Punica/SGLang contract): 1.
 pub const BATCHED_LORA_DISPATCHED_KERNEL_SOURCE: &str = r#"
 // Dispatched shrink: each token looks up its adapter via token_adapter_idx and
 // computes intermediate[t, r] = X[t, :] . A_{idx[t]}[r, :].
@@ -158,12 +143,7 @@ pub struct BatchedLoraSegment {
 }
 
 /// Host-side reference implementation for multi-LoRA segmented computation.
-///
-/// # Contracts
-/// * `x` shape: `[total_tokens, in_dim]`
-/// * `y` shape: `[total_tokens, out_dim]` (accumulates in-place onto base GEMM output)
-/// * `a_weights` shape for segment: `[rank, in_dim]`
-/// * `b_weights` shape for segment: `[out_dim, rank]`
+/// # Contracts * `x` shape: `[total_tokens, in_dim]` * `y` shape: `[total_tokens, out_dim]` (accumulates in-place onto.
 pub fn batched_lora_accumulate_cpu(
     x: &[f32],
     y: &mut [f32],
@@ -217,9 +197,8 @@ pub fn batched_lora_accumulate_cpu(
     Ok(())
 }
 
-/// One adapter's weights plus scaling, for the dispatched path. The dispatched
-/// kernel looks the adapter up per-token via an indirection table, so weights
-/// live in per-adapter device allocations addressed through pointer arrays.
+/// One adapter's weights plus scaling, for the dispatched path.
+/// The dispatched kernel looks the adapter up per-token via an indirection table, so weights live.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchedLoraAdapter {
     /// A weights, row-major `[rank, in_dim]`.
@@ -232,24 +211,8 @@ pub struct DispatchedLoraAdapter {
     pub scaling: f32,
 }
 
-/// Dispatched batched multi-LoRA (Punica/SGLang style): two kernel launches
-/// TOTAL, regardless of how many adapters are active.
-///
-/// # How it is dispatched (not grouped)
-/// The old [`batched_lora_group_device`] loops over adapters on the host and
-/// issues a shrink+expand pair per adapter — 2N launches, serialized. This
-/// function issues **one** shrink launch and **one** expand launch over the
-/// whole batch; each thread picks its adapter from `token_adapter_idx` and
-/// gathers that adapter's A/B pointers and rank from device-side pointer arrays.
-/// Tokens using different adapters run in the same launch, in parallel.
-///
-/// # Contracts
-/// * `x_host`: `[total_tokens, in_dim]`, `y_host`: `[total_tokens, out_dim]`
-///   (base GEMM output; deltas accumulate in place)
-/// * `token_adapter_idx[t]` is the index into `adapters` for token `t`, or
-///   `u32::MAX` for the base model (no delta).
-/// * Every adapter's `a_weights` is `[rank, in_dim]`, `b_weights` is
-///   `[out_dim, rank]`.
+/// Dispatched batched multi-LoRA (Punica/SGLang style): two kernel launches TOTAL, regardless of how many adapters are active.
+/// # How it is dispatched (not grouped) The old [`batched_lora_group_device`] loops over adapters on the.
 pub fn batched_lora_dispatched_device(
     device: &RocmDevice,
     x_host: &[f32],
@@ -281,7 +244,7 @@ pub fn batched_lora_dispatched_device(
         return Err(Error::Backend(format!(
             "batched_lora_dispatched_device: token_adapter_idx len {} != tokens {total_tokens}",
             token_adapter_idx.len()
-       )));
+        )));
     }
     if adapters.is_empty() {
         return Ok(());
@@ -353,7 +316,11 @@ pub fn batched_lora_dispatched_device(
                 device,
                 BATCHED_LORA_DISPATCHED_KERNEL_SOURCE,
                 "grim_lora_shrink_dispatched",
-                HipDim3::new(max_rank.div_ceil(BATCHED_LORA_BLOCK) as u32, total_tokens as u32, 1),
+                HipDim3::new(
+                    max_rank.div_ceil(BATCHED_LORA_BLOCK) as u32,
+                    total_tokens as u32,
+                    1,
+                ),
                 HipDim3::new(BATCHED_LORA_BLOCK as u32, 1, 1),
                 &mut [
                     arg(&mut x_arg),
@@ -381,7 +348,11 @@ pub fn batched_lora_dispatched_device(
                 device,
                 BATCHED_LORA_DISPATCHED_KERNEL_SOURCE,
                 "grim_lora_expand_dispatched",
-                HipDim3::new(out_dim.div_ceil(BATCHED_LORA_BLOCK) as u32, total_tokens as u32, 1),
+                HipDim3::new(
+                    out_dim.div_ceil(BATCHED_LORA_BLOCK) as u32,
+                    total_tokens as u32,
+                    1,
+                ),
                 HipDim3::new(BATCHED_LORA_BLOCK as u32, 1, 1),
                 &mut [
                     arg(&mut inter_arg2),
@@ -416,19 +387,16 @@ pub fn batched_lora_dispatched_device(
 
         // D2H the accumulated output.
         let _guard = DeviceGuard::set(device.ordinal as i32);
-        let bytes = y_host.len() * std::mem::size_of::<f32>();
+        let bytes = std::mem::size_of_val(y_host);
         if bytes > 0 {
-            check_hip(
-                "dispatched batched_lora D2H copy",
-                unsafe {
-                    hipMemcpy(
-                        y_host.as_mut_ptr() as *mut std::ffi::c_void,
-                        y_ptr,
-                        bytes,
-                        HipMemcpyKind::DeviceToHost,
-                    )
-                },
-            )?;
+            check_hip("dispatched batched_lora D2H copy", unsafe {
+                hipMemcpy(
+                    y_host.as_mut_ptr() as *mut std::ffi::c_void,
+                    y_ptr,
+                    bytes,
+                    HipMemcpyKind::DeviceToHost,
+                )
+            })?;
         }
         Ok(())
     })();
@@ -440,10 +408,9 @@ pub fn batched_lora_dispatched_device(
     result
 }
 
-/// CPU reference for the dispatched path: mirrors
-/// [`batched_lora_dispatched_device`] without the GPU, applying each token's
-/// adapter via the same indirection table. Used to validate the GPU kernel and
-/// as the portable fallback.
+/// CPU reference for the dispatched path: mirrors [`batched_lora_dispatched_device`] without the GPU, applying each token's adapter via the same indirection table.
+/// Used to validate the GPU kernel and as the portable fallback.
+#[allow(clippy::needless_range_loop)]
 pub fn batched_lora_dispatched_cpu(
     x: &[f32],
     y: &mut [f32],
@@ -504,10 +471,8 @@ pub struct BatchedLoraGroup<'a> {
 
 const BATCHED_LORA_BLOCK: usize = 256;
 
-/// Launch one JIT-compiled kernel from `source` (either the segmented or the
-/// dispatched batched-LoRA source) and wait for it. Compile results go through
-/// the device's persistent disk cache (`jit_compile_or_cache`), so cold-start
-/// cost is paid once per (entry, arch, source) triple per machine.
+/// Launch one JIT-compiled kernel from `source` (either the segmented or the dispatched batched-LoRA source) and wait for it.
+/// Compile results go through the device's persistent disk cache (`jit_compile_or_cache`), so cold-start cost is paid.
 fn launch_batched_lora_kernel(
     device: &RocmDevice,
     source: &str,
@@ -521,16 +486,21 @@ fn launch_batched_lora_kernel(
     let _guard = DeviceGuard::set(device.ordinal as i32);
     let (hsaco_path, lowered) = device.jit_compile_or_cache(source, entry, None)?;
 
-    let path_c = CString::new(hsaco_path.to_str().ok_or_else(|| {
-        Error::Backend("batched_lora: hsaco path is not valid UTF-8".into())
-    })?)
+    let path_c = CString::new(
+        hsaco_path
+            .to_str()
+            .ok_or_else(|| Error::Backend("batched_lora: hsaco path is not valid UTF-8".into()))?,
+    )
     .map_err(|e| Error::Backend(format!("batched_lora: CString path: {e}")))?;
     let entry_c = CString::new(lowered.as_str())
         .map_err(|e| Error::Backend(format!("batched_lora: CString entry: {e}")))?;
 
     unsafe {
         let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
-        check_hip("batched_lora hipModuleLoad", hipModuleLoad(&mut module, path_c.as_ptr()))?;
+        check_hip(
+            "batched_lora hipModuleLoad",
+            hipModuleLoad(&mut module, path_c.as_ptr()),
+        )?;
 
         let mut func: *mut std::ffi::c_void = std::ptr::null_mut();
         let get_status = hipModuleGetFunction(&mut func, module, entry_c.as_ptr());
@@ -554,9 +524,8 @@ fn launch_batched_lora_kernel(
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         );
-        // Null (legacy default) stream — same discipline as
-        // `RocmDevice::time_kernel_ms`: the launch and its sync order against
-        // all blocking streams on the pinned device.
+        // Null (legacy default) stream - same discipline as `RocmDevice::time_kernel_ms`: the launch
+        // and its sync order against all blocking streams on the pinned device.
         let sync_status = hipStreamSynchronize(std::ptr::null_mut());
         hipModuleUnload(module);
 
@@ -566,16 +535,8 @@ fn launch_batched_lora_kernel(
     Ok(())
 }
 
-/// Execute heterogeneous multi-LoRA segments across a stacked batch in one
-/// device residency: uploads `x_host`/`y_host` once, runs shrink+expand per
-/// segment on-device, downloads `y_host` once. `y_host` accumulates in place
-/// onto the base GEMM output (same contract as
-/// [`batched_lora_accumulate_cpu`]).
-///
-/// # Contracts
-/// * `x_host` shape: `[total_rows, in_dim]`, `y_host` shape: `[total_rows, out_dim]`
-/// * Every segment's `token_start + token_count <= total_rows`
-/// * `a_weights`: `[rank, in_dim]`, `b_weights`: `[out_dim, rank]`
+/// Execute heterogeneous multi-LoRA segments across a stacked batch in one device residency: uploads `x_host`/`y_host` once, runs shrink+expand per segment on-device, downloads `y_host` once.
+/// `y_host` accumulates in place onto the base GEMM output (same contract as [`batched_lora_accumulate_cpu`]).
 pub fn batched_lora_group_device(
     device: &RocmDevice,
     x_host: &[f32],
@@ -641,10 +602,7 @@ pub fn batched_lora_group_device(
             let inter_elems = seg.token_count * seg.rank;
             let mut inter_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             let alloc_res = unsafe {
-                crate::hipMalloc(
-                    &mut inter_ptr,
-                    inter_elems * std::mem::size_of::<f32>(),
-                )
+                crate::hipMalloc(&mut inter_ptr, inter_elems * std::mem::size_of::<f32>())
             };
             check_hip("batched_lora hipMalloc(intermediate)", alloc_res)?;
 
@@ -721,19 +679,16 @@ pub fn batched_lora_group_device(
 
         // D2H the accumulated output.
         let _guard = DeviceGuard::set(device.ordinal as i32);
-        let bytes = y_host.len() * std::mem::size_of::<f32>();
+        let bytes = std::mem::size_of_val(y_host);
         if bytes > 0 {
-            check_hip(
-                "batched_lora D2H copy",
-                unsafe {
-                    hipMemcpy(
-                        y_host.as_mut_ptr() as *mut std::ffi::c_void,
-                        y_ptr,
-                        bytes,
-                        HipMemcpyKind::DeviceToHost,
-                    )
-                },
-            )?;
+            check_hip("batched_lora D2H copy", unsafe {
+                hipMemcpy(
+                    y_host.as_mut_ptr() as *mut std::ffi::c_void,
+                    y_ptr,
+                    bytes,
+                    HipMemcpyKind::DeviceToHost,
+                )
+            })?;
         }
         Ok(())
     })();
@@ -773,17 +728,9 @@ mod tests {
         };
 
         // A = [[1, 0, 0, 0], [0, 1, 0, 0]] -> rank 2, in_dim 4
-        let a1 = vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-        ];
+        let a1 = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         // B = [[1, 0], [0, 1], [0, 0], [0, 0]] -> out_dim 4, rank 2
-        let b1 = vec![
-            1.0, 0.0,
-            0.0, 1.0,
-            0.0, 0.0,
-            0.0, 0.0,
-        ];
+        let b1 = vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
 
         batched_lora_accumulate_cpu(&x, &mut y, in_dim, out_dim, &segment1, &a1, &b1).unwrap();
 
@@ -795,10 +742,8 @@ mod tests {
         assert_eq!(&y[8..12], &[0.0, 0.0, 0.0, 0.0]);
     }
 
-    /// Device parity gate: the JIT shrink+expand kernel pair must produce the
-    /// same accumulation as the CPU reference on a mixed two-adapter batch.
-    /// Skips (rather than fails) when no ROCm device is visible — CI boxes
-    /// without HIP still validate the host-side contract above.
+    /// Device parity gate: the JIT shrink+expand kernel pair must produce the same accumulation as the CPU reference on a mixed two-adapter batch.
+    /// Skips (rather than fails) when no ROCm device is visible - CI boxes without HIP.
     #[test]
     fn batched_lora_device_matches_cpu_reference() {
         if !crate::device::roc_device::RocmDevice::probe_one(0).unwrap_or(false) {
@@ -834,26 +779,10 @@ mod tests {
 
         // CPU reference: rows 0-1 adapter 1, rows 2-3 adapter 2.
         let mut y_cpu = vec![0.0f32; rows * out_dim];
-        batched_lora_accumulate_cpu(
-            &x,
-            &mut y_cpu,
-            in_dim,
-            out_dim,
-            &mk_seg(1, 0, 2),
-            &a1,
-            &b1,
-        )
-        .unwrap();
-        batched_lora_accumulate_cpu(
-            &x,
-            &mut y_cpu,
-            in_dim,
-            out_dim,
-            &mk_seg(2, 2, 2),
-            &a2,
-            &b2,
-        )
-        .unwrap();
+        batched_lora_accumulate_cpu(&x, &mut y_cpu, in_dim, out_dim, &mk_seg(1, 0, 2), &a1, &b1)
+            .unwrap();
+        batched_lora_accumulate_cpu(&x, &mut y_cpu, in_dim, out_dim, &mk_seg(2, 2, 2), &a2, &b2)
+            .unwrap();
 
         // Device path over both segments in one residency.
         let mut y_gpu = vec![0.0f32; rows * out_dim];
@@ -879,17 +808,15 @@ mod tests {
                 }
             }
             Err(e) => {
-                // A compile or launch failure on an exotic target is an
-                // environment problem, not a logic failure — but it must be
-                // loud, never silent.
+                // A compile or launch failure on an exotic target is an environment
+                // problem, not a logic failure - but it must be loud, never silent.
                 panic!("batched_lora device dispatch failed on visible device: {e}");
             }
         }
     }
 
-    /// The dispatched path must match the path the engine actually used before
-    /// (grouped per-segment launches) — they are mathematically identical, so a
-    /// regression in either shows up here. Skips without a ROCm device.
+    /// The dispatched path must match the path the engine actually used before (grouped per-segment launches) - they are mathematically identical, so a regression in either shows up here.
+    /// Skips without a ROCm device.
     #[test]
     fn batched_lora_dispatched_matches_grouped() {
         let device = match crate::device::roc_device::RocmDevice::probe_one(0) {
@@ -908,7 +835,9 @@ mod tests {
         let token_adapter_idx: Vec<u32> = vec![u32::MAX, 0, 0, u32::MAX, 1];
 
         let sample = |n: usize, seed: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32 + seed) * 0.137).sin().clamp(-1.0, 1.0)).collect()
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.137).sin().clamp(-1.0, 1.0))
+                .collect()
         };
 
         // Two distinct adapters with distinct weights.

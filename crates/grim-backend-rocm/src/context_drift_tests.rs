@@ -1,35 +1,5 @@
 //! WI-M3 context-correctness gates (gguf_multigpu_context_plan.md).
-//!
-//! The ctx_dev=2 page fault only reproduces when a second HIP device is
-//! visible AND some thread parks its context on that device mid-forward.
-//! These tests manufacture exactly that state on purpose:
-//!
-//! 1. A worker thread holds `DeviceGuard::set(foreign)` **alive** while the
-//!    main thread uploads a tensor and launches `grim_rms_norm` through the
-//!    public API. The launch must still be context-correct (`ctx_dev ==
-//!    self_dev == owning ordinal`) and produce correct numbers. Roles are
-//!    then swapped so both ordinals are exercised.
-//!
-//! 2. `copy_from_host_raw_bytes` runs under the same foreign guard: the
-//!    storage must land physically on the intended ordinal, not on whatever
-//!    device the drifted thread's context pointed at. Residency is checked
-//!    two ways — free-VRAM deltas per device (a real `hipMalloc` on the
-//!    intended ordinal shrinks ITS free memory), and a functional
-//!    `grim_rms_norm` readback against a CPU reference.
-//!
-//! Mutation check (plan gate): revert the WI-M1 pins (storage.rs seams +
-//! allocator alloc/free) and these tests fail — the H2D fill / malloc then
-//! executes under the worker's foreign context and the device-0 launch reads
-//! wrong-device memory (garbage or a page fault). Run once manually when
-//! touching the pins:
-//!
-//! ```text
-//! GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm --lib context_drift
-//! # mutation: git revert <pin commit> → rerun → expect FAIL → restore
-//! ```
-//!
-//! Device-gated: requires ≥2 visible HIP devices and `GRIM_GPU_TEST=1`
-//! (single-device boxes cannot express cross-device drift).
+//! The ctx_dev=2 page fault only reproduces when a second HIP device is visible AND some.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -40,7 +10,7 @@ use crate::RocmDevice;
 use crate::device::capability_profiler::vram_info;
 use crate::device::util::{DeviceGuard, dtype_f32, last_launch_context};
 use crate::memory::storage::RocmStorage;
-use grim_tensor::{CoreTensorOps};
+use grim_tensor::CoreTensorOps;
 
 fn multi_gpu_available() -> Option<usize> {
     if !crate::gpu_test_enabled() {
@@ -55,17 +25,14 @@ fn multi_gpu_available() -> Option<usize> {
     Some(count)
 }
 
-/// Park a fresh thread's HIP context on `ordinal` and hold it there until
-/// the returned sender is dropped. This is the drift state the fault hunt
-/// observed on tape: some other thread with ctx_dev != 0 alive during our
-/// launches (per-thread current device semantics).
+/// Park a fresh thread's HIP context on `ordinal` and hold it there until the returned sender is dropped.
+/// This is the drift state the fault hunt observed on tape: some other thread with.
 fn park_foreign_context(ordinal: i32) -> mpsc::Sender<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        // Guard held for the whole thread body: the point is that the
-        // foreign context stays CURRENT on a live second thread while the
-        // main thread runs its own uploads + launches.
+        // Guard held for the whole thread body: the point is that the foreign context stays
+        // CURRENT on a live second thread while the main thread runs its own uploads + launches.
         let _guard = DeviceGuard::set(ordinal);
         ready_tx.send(()).expect("park ready signal");
         let _ = release_rx.recv();
@@ -142,9 +109,8 @@ fn upload_and_launch_rms_norm(fx: &DriftFixture, x_data: &[f32]) -> Vec<f32> {
         .expect("grim_rms_norm launch through public API");
     handle.synchronize().expect("rms_norm sync");
 
-    // The launch seam stamped (self_dev, ctx_dev): the launching (main)
-    // thread must have been on the OWNING device's context, not the worker's
-    // foreign one.
+    // The launch seam stamped (self_dev, ctx_dev): the launching (main) thread must
+    // have been on the OWNING device's context, not the worker's foreign one.
     let (self_dev, ctx_dev) = last_launch_context();
     assert_eq!(
         self_dev, fx.dev.ordinal as i32,
