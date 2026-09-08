@@ -1092,12 +1092,16 @@ pub fn check_model_cache() -> Result<()> {
 
 fn build_http_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
-    // Gate TLS cert bypass behind GRIM_INSECURE_TLS=1 for local development only.
+    // Gate TLS cert bypass behind GRIM_INSECURE_TLS=1 for local testing/development only.
+    // In release builds, invalid certificates are never accepted.
+    #[cfg(debug_assertions)]
     if std::env::var("GRIM_INSECURE_TLS")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
     {
-        eprintln!("[grim-core] WARNING: GRIM_INSECURE_TLS=1 — accepting invalid TLS certificates");
+        eprintln!(
+            "[grim-core] WARNING: GRIM_INSECURE_TLS=1 — accepting invalid TLS certificates (debug build only)"
+        );
         builder = builder.danger_accept_invalid_certs(true);
     }
     builder

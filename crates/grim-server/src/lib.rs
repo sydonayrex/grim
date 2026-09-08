@@ -2723,6 +2723,19 @@ async fn load_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadModelRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Validate model identifier: disallow directory traversal sequences ('..', absolute paths, backslashes).
+    if req.model.contains("..") || req.model.starts_with('/') || req.model.contains('\\') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Invalid model identifier '{}': path traversal sequences are not permitted.", req.model),
+                "resolved_path": serde_json::Value::Null,
+                "loaded_kind": serde_json::Value::Null,
+            })),
+        );
+    }
+
     // P0-WI-3: prefer a `.grim` sibling when both exist; centralize resolution in `catalog::resolve_model_preferring_grim`
     // so `/v1/models/load` shares the same lookup logic as the CLI's on-demand model loader.
     let resolved_path = grim_core::catalog::resolve_model_preferring_grim(&req.model);
