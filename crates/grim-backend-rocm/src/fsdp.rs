@@ -180,14 +180,17 @@ impl ConsumerFsdpGroup {
         if let Some(comm) = &self.comm {
             comm.all_gather_storage(local_shard, full_dst, stream)?;
         } else {
-            // Single rank: copy into destination
+            // Single rank: copy into destination.
+            // SPEED-ROC-11: stream-ordered D2D copy on the caller's stream —
+            // the old blocking hipMemcpy serialized the whole device.
             if let (Some(s_ptr), Some(d_ptr)) = (local_shard.device_ptr, full_dst.device_ptr) {
                 unsafe {
-                    crate::hipMemcpy(
+                    crate::hipMemcpyAsync(
                         d_ptr as *mut std::ffi::c_void,
                         s_ptr as *const std::ffi::c_void,
                         local_shard.bytes(),
                         crate::HipMemcpyKind::DeviceToDevice,
+                        stream as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -214,16 +217,18 @@ impl ConsumerFsdpGroup {
         if let Some(comm) = &self.comm {
             comm.reduce_scatter_storage(local_full_grad, sharded_dst, stream)?;
         } else {
-            // Single rank: copy rank shard into destination
+            // Single rank: copy rank shard into destination.
+            // SPEED-ROC-11: stream-ordered D2D copy on the caller's stream.
             if let (Some(s_ptr), Some(d_ptr)) = (local_full_grad.device_ptr, sharded_dst.device_ptr)
             {
                 let offset_bytes = self.config.rank * sharded_dst.bytes();
                 unsafe {
-                    crate::hipMemcpy(
+                    crate::hipMemcpyAsync(
                         d_ptr as *mut std::ffi::c_void,
                         (s_ptr + offset_bytes as u64) as *const std::ffi::c_void,
                         sharded_dst.bytes(),
                         crate::HipMemcpyKind::DeviceToDevice,
+                        stream as *mut std::ffi::c_void,
                     );
                 }
             }

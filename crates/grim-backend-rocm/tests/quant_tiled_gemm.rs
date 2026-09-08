@@ -8,7 +8,7 @@
 
 use grim_backend_rocm::device::q4k_test_shim;
 use grim_backend_rocm::{RocmCachingAllocator, RocmDevice, RocmStorage};
-use grim_tensor::dtype::{KQuantScheme, Storage as DTypeStorage, DType};
+use grim_tensor::dtype::{DType, KQuantScheme, Storage as DTypeStorage};
 use grim_tensor::{ArithType, BackendStorage, Shape};
 use std::sync::Arc;
 
@@ -19,16 +19,76 @@ fn gpu_enabled() -> bool {
 /// (format tag, KQuant scheme for the storage dtype, super-block elements,
 /// bytes per block, scalar forward kernel entry)
 const FORMATS: &[(&str, KQuantScheme, usize, usize, &str)] = &[
-    ("q8_0", KQuantScheme::Q80, 32, 34, "grim_fused_dequant_gemm_q8_0"),
-    ("q5k", KQuantScheme::Q5K, 256, 176, "grim_fused_dequant_gemm_q5k"),
-    ("q6k", KQuantScheme::Q6K, 256, 210, "grim_fused_dequant_gemm_q6k"),
-    ("iq2xxs", KQuantScheme::IQ2XXS, 256, 66, "grim_fused_dequant_gemm_iq2xxs"),
-    ("iq2xs", KQuantScheme::IQ2XS, 256, 74, "grim_fused_dequant_gemm_iq2xs"),
-    ("iq2s", KQuantScheme::IQ2S, 256, 82, "grim_fused_dequant_gemm_iq2s"),
-    ("iq3xxs", KQuantScheme::IQ3XXS, 256, 96, "grim_fused_dequant_gemm_iq3xxs"),
-    ("iq3s", KQuantScheme::IQ3S, 256, 110, "grim_fused_dequant_gemm_iq3s"),
-    ("iq4nl", KQuantScheme::IQ4NL, 256, 170, "grim_fused_dequant_gemm_iq4nl"),
-    ("iq4xs", KQuantScheme::IQ4XS, 256, 136, "grim_fused_dequant_gemm_iq4xs"),
+    (
+        "q8_0",
+        KQuantScheme::Q80,
+        32,
+        34,
+        "grim_fused_dequant_gemm_q8_0",
+    ),
+    (
+        "q5k",
+        KQuantScheme::Q5K,
+        256,
+        176,
+        "grim_fused_dequant_gemm_q5k",
+    ),
+    (
+        "q6k",
+        KQuantScheme::Q6K,
+        256,
+        210,
+        "grim_fused_dequant_gemm_q6k",
+    ),
+    (
+        "iq2xxs",
+        KQuantScheme::IQ2XXS,
+        256,
+        66,
+        "grim_fused_dequant_gemm_iq2xxs",
+    ),
+    (
+        "iq2xs",
+        KQuantScheme::IQ2XS,
+        256,
+        74,
+        "grim_fused_dequant_gemm_iq2xs",
+    ),
+    (
+        "iq2s",
+        KQuantScheme::IQ2S,
+        256,
+        82,
+        "grim_fused_dequant_gemm_iq2s",
+    ),
+    (
+        "iq3xxs",
+        KQuantScheme::IQ3XXS,
+        256,
+        96,
+        "grim_fused_dequant_gemm_iq3xxs",
+    ),
+    (
+        "iq3s",
+        KQuantScheme::IQ3S,
+        256,
+        110,
+        "grim_fused_dequant_gemm_iq3s",
+    ),
+    (
+        "iq4nl",
+        KQuantScheme::IQ4NL,
+        256,
+        170,
+        "grim_fused_dequant_gemm_iq4nl",
+    ),
+    (
+        "iq4xs",
+        KQuantScheme::IQ4XS,
+        256,
+        136,
+        "grim_fused_dequant_gemm_iq4xs",
+    ),
 ];
 
 struct Fixture {
@@ -50,8 +110,7 @@ fn quant_dtype(scheme: KQuantScheme) -> DType {
 }
 
 fn upload_f32(fx: &Fixture, data: &[f32], dims: &[usize]) -> RocmStorage {
-    RocmStorage::copy_from_host(data, &Shape::new(dims.to_vec()), DType::F32, &fx.alloc, 0)
-        .unwrap()
+    RocmStorage::copy_from_host(data, &Shape::new(dims.to_vec()), DType::F32, &fx.alloc, 0).unwrap()
 }
 
 /// Deterministic pseudo-random quant blob: n rows x (k / blk) blocks x bytes.
@@ -69,9 +128,20 @@ fn sync_and_read(_fx: &Fixture, stream: *mut std::ffi::c_void, out: &RocmStorage
     out.to_cpu_vec_f32().unwrap()
 }
 
-fn parity_forward(fx: &Fixture, tag: &str, scheme: KQuantScheme, blk: usize, bytes: usize,
-                  scalar_entry: &str, m: usize, n: usize, k: usize) -> f32 {
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.125 - 0.75).collect();
+fn parity_forward(
+    fx: &Fixture,
+    tag: &str,
+    scheme: KQuantScheme,
+    blk: usize,
+    bytes: usize,
+    scalar_entry: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> f32 {
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.125 - 0.75)
+        .collect();
     let blob = make_blob(n, k, blk, bytes);
     let a = upload_f32(fx, &a_data, &[m, k]);
     let b_dtype = quant_dtype(scheme);
@@ -91,7 +161,12 @@ fn parity_forward(fx: &Fixture, tag: &str, scheme: KQuantScheme, blk: usize, byt
             q4k_test_shim::launch_quant_tiled(
                 &fx.dev,
                 &format!("grim_fused_dequant_gemm_{tag}_tiled"),
-                &a, &b, &out, m, n, k,
+                &a,
+                &b,
+                &out,
+                m,
+                n,
+                k,
             )
         } else {
             q4k_test_shim::launch_quant_scalar(&fx.dev, scalar_entry, &a, &b, &out, m, n, k)
@@ -109,8 +184,17 @@ fn parity_forward(fx: &Fixture, tag: &str, scheme: KQuantScheme, blk: usize, byt
     max_abs
 }
 
-fn parity_backward(fx: &Fixture, tag: &str, scheme: KQuantScheme, blk: usize, bytes: usize,
-                   scalar_entry: &str, m: usize, n: usize, k: usize) -> f32 {
+fn parity_backward(
+    fx: &Fixture,
+    tag: &str,
+    scheme: KQuantScheme,
+    blk: usize,
+    bytes: usize,
+    scalar_entry: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> f32 {
     let dy_data: Vec<f32> = (0..m * n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
     let blob = make_blob(n, k, blk, bytes);
     let dy = upload_f32(fx, &dy_data, &[m, n]);
@@ -131,11 +215,23 @@ fn parity_backward(fx: &Fixture, tag: &str, scheme: KQuantScheme, blk: usize, by
             q4k_test_shim::launch_quant_tiled_backward(
                 &fx.dev,
                 &format!("grim_fused_dequant_gemm_{tag}_backward_tiled"),
-                &dy, &b, &out, m, n, k,
+                &dy,
+                &b,
+                &out,
+                m,
+                n,
+                k,
             )
         } else {
             q4k_test_shim::launch_quant_scalar_backward(
-                &fx.dev, &scalar_entry, &dy, &b, &out, m, n, k,
+                &fx.dev,
+                &scalar_entry,
+                &dy,
+                &b,
+                &out,
+                m,
+                n,
+                k,
             )
         }
         .unwrap();
@@ -177,7 +273,10 @@ fn tiled_quant_parity_all_formats_backward() {
     let fx = fixture();
     for (tag, scheme, blk, bytes, entry) in FORMATS {
         let d = parity_backward(&fx, tag, *scheme, *blk, *bytes, entry, 18, 100, 256);
-        assert!(d <= 1e-3, "{tag} backward parity: max_abs_diff {d} exceeds 1e-3");
+        assert!(
+            d <= 1e-3,
+            "{tag} backward parity: max_abs_diff {d} exceeds 1e-3"
+        );
     }
 }
 
@@ -189,7 +288,9 @@ fn tiled_q8_0_prefill_throughput() {
     }
     let fx = fixture();
     let (m, n, k) = (512usize, 4096usize, 4096usize);
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.125 - 0.75).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.125 - 0.75)
+        .collect();
     let blob = make_blob(n, k, 32, 34);
     let a = upload_f32(&fx, &a_data, &[m, k]);
     let b = RocmStorage::copy_from_host_raw_bytes(
@@ -208,13 +309,23 @@ fn tiled_q8_0_prefill_throughput() {
             q4k_test_shim::launch_quant_tiled(
                 &fx.dev,
                 "grim_fused_dequant_gemm_q8_0_tiled",
-                &a, &b, &out, m, n, k,
+                &a,
+                &b,
+                &out,
+                m,
+                n,
+                k,
             )
         } else {
             q4k_test_shim::launch_quant_scalar(
                 &fx.dev,
                 "grim_fused_dequant_gemm_q8_0",
-                &a, &b, &out, m, n, k,
+                &a,
+                &b,
+                &out,
+                m,
+                n,
+                k,
             )
         }
         .unwrap();
