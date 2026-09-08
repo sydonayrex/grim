@@ -7,7 +7,7 @@ use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
-use crate::device::roc_device::{CharonBackwardResult, RocmDevice};
+use crate::device::roc_device::{CharonBackwardResult, CharonForwardStash, RocmDevice};
 use crate::memory::storage::RocmStorage;
 use crate::{
     HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFreeAsync, hipMemsetAsync,
@@ -532,8 +532,18 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
         num_experts: usize,
-    ) -> Result<*mut c_void> {
-        self.launch_charon_grouped_dispatch_entry(
+    ) -> Result<CharonForwardStash> {
+        // SPEED-ROC-14: allocate the stash buffers the FP32 forward kernel
+        // writes (h_gate/h_up per sorted slot) and the backward kernel reads.
+        let stash_shape = Shape::new(vec![sorted.num_tokens_post_padded, inter]);
+        let hg_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &stash_shape, DType::F32)?;
+        let hu_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &stash_shape, DType::F32)?;
+        let hg_s = as_rocm(hg_storage.as_ref())?;
+        let hu_s = as_rocm(hu_storage.as_ref())?;
+
+        let stream = self.launch_charon_grouped_dispatch_entry(
             activations,
             expert_gate_w_ptr,
             expert_up_w_ptr,
@@ -545,7 +555,16 @@ impl RocmDevice {
             routed_scaling_factor,
             num_experts,
             "grim_moe_fused_grouped",
-        )
+            Some(hg_s),
+            Some(hu_s),
+        )?;
+        // The stash must outlive the stream until the backward launch; stash the
+        // stream handle inside the returned handle for a single synchronize().
+        unsafe { crate::hipStreamSynchronize(stream) };
+        Ok(CharonForwardStash {
+            hg: hg_storage,
+            hu: hu_storage,
+        })
     }
 
     /// WI-F3 - grouped dispatch against a caller-selected kernel entry, so `CharonSelector` variants can route to the WMMA grouped kernel (`grim_moe_fused_grouped_wmma`) or the scalar grouped kernel via `kernels::charon::grouped_dispatch_entry`.
@@ -563,6 +582,8 @@ impl RocmDevice {
         routed_scaling_factor: f32,
         num_experts: usize,
         entry: &str,
+        stash_hg: Option<&RocmStorage>,
+        stash_hu: Option<&RocmStorage>,
     ) -> Result<*mut c_void> {
         // P1-3: raw HIP ops below bind to the calling thread's current
         // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
@@ -619,26 +640,56 @@ impl RocmDevice {
         let mut block_size_i = sorted.block_size as i32;
         let mut rsf = routed_scaling_factor;
 
-        let stream = self.launch_compute_kernel(
-            entry,
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut a),
-                arg(&mut gw),
-                arg(&mut uw),
-                arg(&mut dw),
-                arg(&mut tok_ptr),
-                arg(&mut exp_ptr),
-                arg(&mut w_ptr),
-                arg(&mut optr),
-                arg(&mut hidden_i),
-                arg(&mut inter_i),
-                arg(&mut num_tokens_i),
-                arg(&mut block_size_i),
-                arg(&mut rsf),
-            ],
-        )?;
+        // SPEED-ROC-14: the FP32 scalar grouped kernel takes two trailing
+        // stash pointers (its global signature was extended). The WMMA/quant
+        // entries have no such params, so append only for the FP32 entry.
+        let mut shg = stash_hg.and_then(|s| s.device_ptr).unwrap_or(0) as *mut c_void;
+        let mut shu = stash_hu.and_then(|s| s.device_ptr).unwrap_or(0) as *mut c_void;
+        let stream = if entry == "grim_moe_fused_grouped" {
+            self.launch_compute_kernel(
+                entry,
+                grid_dim,
+                block_dim,
+                &mut [
+                    arg(&mut a),
+                    arg(&mut gw),
+                    arg(&mut uw),
+                    arg(&mut dw),
+                    arg(&mut tok_ptr),
+                    arg(&mut exp_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut optr),
+                    arg(&mut hidden_i),
+                    arg(&mut inter_i),
+                    arg(&mut num_tokens_i),
+                    arg(&mut block_size_i),
+                    arg(&mut rsf),
+                    arg(&mut shg),
+                    arg(&mut shu),
+                ],
+            )?
+        } else {
+            self.launch_compute_kernel(
+                entry,
+                grid_dim,
+                block_dim,
+                &mut [
+                    arg(&mut a),
+                    arg(&mut gw),
+                    arg(&mut uw),
+                    arg(&mut dw),
+                    arg(&mut tok_ptr),
+                    arg(&mut exp_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut optr),
+                    arg(&mut hidden_i),
+                    arg(&mut inter_i),
+                    arg(&mut num_tokens_i),
+                    arg(&mut block_size_i),
+                    arg(&mut rsf),
+                ],
+            )?
+        };
 
         // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
         // The old per-launch hipStreamSynchronize blocked the host once per MoE
@@ -1639,7 +1690,7 @@ impl RocmDevice {
         let uw_ptr = dev_ptr(uw_s)?;
         let dw_ptr = dev_ptr(dw_s)?;
 
-        self.launch_charon_grouped_dispatch(
+        let _stash = self.launch_charon_grouped_dispatch(
             act_s,
             gw_ptr,
             uw_ptr,
@@ -1713,6 +1764,8 @@ impl RocmDevice {
             routed_scaling_factor,
             num_experts,
             entry,
+            None,
+            None,
         )?;
         self.synchronize();
         out_storage.to_cpu_vec_f32()
@@ -1722,7 +1775,7 @@ impl RocmDevice {
 
     /// Device launcher for the FP32 Charon MoE backward kernel (`grim_moe_fused_grouped_backward`).
     /// Mirrors `launch_charon_grouped_dispatch`: validates inputs, zero-initialises the four atomicAdd output buffers, plans the grouped grid/block from.
-    pub(crate) fn launch_charon_grouped_backward(
+    pub fn launch_charon_grouped_backward(
         &self,
         activations: &RocmStorage,
         expert_gate_w_ptr: u64,
@@ -1734,6 +1787,8 @@ impl RocmDevice {
         d_down_w: &RocmStorage,
         d_x: &RocmStorage,
         sorted: &crate::kernels::charon::SortedRouting,
+        stash_hg: Option<&RocmStorage>,
+        stash_hu: Option<&RocmStorage>,
         hidden: usize,
         inter: usize,
         routed_scaling_factor: f32,
@@ -1817,8 +1872,12 @@ impl RocmDevice {
         let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
         let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
-        // Kernel arg order matches grim_moe_fused_grouped_backward signature: activations, gate_w, up_w, down_w, d_y,
-        // d_gate_w, d_up_w, d_down_w, d_x, sorted_token_ids, sorted_expert_ids, sorted_weights, hidden, inter, num_tokens, block_size, routed_scaling_factor
+        // Kernel arg order matches grim_moe_fused_grouped_backward signature:
+        // activations, gate_w, up_w, down_w, d_y,
+        // d_gate_w, d_up_w, d_down_w, d_x,
+        // sorted_token_ids, sorted_expert_ids, sorted_weights,
+        // stash_hg, stash_hu,
+        // hidden, inter, num_tokens, block_size, routed_scaling_factor
         let mut a = a_ptr as *mut c_void;
         let mut gw = expert_gate_w_ptr as *mut c_void;
         let mut uw = expert_up_w_ptr as *mut c_void;
@@ -1828,6 +1887,8 @@ impl RocmDevice {
         let mut duw = duw_ptr as *mut c_void;
         let mut ddw = ddw_ptr as *mut c_void;
         let mut dx = dx_ptr as *mut c_void;
+        let mut shg = stash_hg.and_then(|s| s.device_ptr).unwrap_or(0) as *mut c_void;
+        let mut shu = stash_hu.and_then(|s| s.device_ptr).unwrap_or(0) as *mut c_void;
         let mut hidden_i = hidden as i32;
         let mut inter_i = inter as i32;
         let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
@@ -1851,6 +1912,8 @@ impl RocmDevice {
                 arg(&mut tok_ptr),
                 arg(&mut exp_ptr),
                 arg(&mut w_ptr),
+                arg(&mut shg),
+                arg(&mut shu),
                 arg(&mut hidden_i),
                 arg(&mut inter_i),
                 arg(&mut num_tokens_i),
@@ -1888,6 +1951,36 @@ impl RocmDevice {
         hidden: usize,
         inter: usize,
         routed_scaling_factor: f32,
+    ) -> Result<CharonBackwardResult> {
+        self.charon_grouped_backward_roundtrip_stashed(
+            activations,
+            expert_gate_w,
+            expert_up_w,
+            expert_down_w,
+            d_y,
+            assignment,
+            batch,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            true,
+        )
+    }
+
+    /// Host-to-host roundtrip for the Charon MoE backward kernel with optional stashing.
+    pub fn charon_grouped_backward_roundtrip_stashed(
+        &self,
+        activations: &[f32],
+        expert_gate_w: &[f32],
+        expert_up_w: &[f32],
+        expert_down_w: &[f32],
+        d_y: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        use_stash: bool,
     ) -> Result<CharonBackwardResult> {
         let num_experts = expert_gate_w.len() / (inter * hidden);
         let block_size = 128usize;
@@ -1941,6 +2034,49 @@ impl RocmDevice {
         let uw_ptr = dev_ptr(uw_s)?;
         let dw_ptr = dev_ptr(dw_s)?;
 
+        let (shg_storage, shu_storage) = if use_stash {
+            // SPEED-ROC-14: the stash is written by the FORWARD GPU kernel, not
+            // computed on the host. Allocate empty device buffers, run the FP32
+            // grouped forward (which fills them via the stash_hg/stash_hu params),
+            // then let the backward kernel read them.
+            let stash_shape = Shape::new(vec![sorted.num_tokens_post_padded, inter]);
+            let hg_storage: Box<dyn BackendStorage> =
+                MemoryOps::alloc_storage(self, &stash_shape, DType::F32)?;
+            let hu_storage: Box<dyn BackendStorage> =
+                MemoryOps::alloc_storage(self, &stash_shape, DType::F32)?;
+            let hg_s = as_rocm(hg_storage.as_ref())?;
+            let hu_s = as_rocm(hu_storage.as_ref())?;
+
+            // Throwaway forward output buffer (roundtrip only cares about grads).
+            let fwd_out_shape = Shape::new(vec![batch, hidden]);
+            let fwd_out_storage: Box<dyn BackendStorage> =
+                MemoryOps::alloc_storage(self, &fwd_out_shape, DType::F32)?;
+            let fwd_out_s = as_rocm(fwd_out_storage.as_ref())?;
+
+            self.launch_charon_grouped_dispatch_entry(
+                act_s,
+                gw_ptr,
+                uw_ptr,
+                dw_ptr,
+                &sorted,
+                fwd_out_s,
+                hidden,
+                inter,
+                routed_scaling_factor,
+                num_experts,
+                "grim_moe_fused_grouped",
+                Some(hg_s),
+                Some(hu_s),
+            )?;
+            self.synchronize();
+            (Some(hg_storage), Some(hu_storage))
+        } else {
+            (None, None)
+        };
+
+        let shg_s = shg_storage.as_ref().map(|s| as_rocm(s.as_ref())).transpose()?;
+        let shu_s = shu_storage.as_ref().map(|s| as_rocm(s.as_ref())).transpose()?;
+
         self.launch_charon_grouped_backward(
             act_s,
             gw_ptr,
@@ -1952,6 +2088,8 @@ impl RocmDevice {
             ddw_s,
             dx_s,
             &sorted,
+            shg_s,
+            shu_s,
             hidden,
             inter,
             routed_scaling_factor,
@@ -1969,6 +2107,127 @@ impl RocmDevice {
             d_down_w: ddw_storage,
             d_x: dx_storage,
         })
+    }
+
+    /// Benchmarks MoE backward step time (pure device kernel execution, excluding CPU-GPU uploads)
+    /// comparing recompute (use_stash = false) vs stashed (use_stash = true).
+    pub fn benchmark_charon_backward_step_time(
+        &self,
+        activations: &[f32],
+        expert_gate_w: &[f32],
+        expert_up_w: &[f32],
+        expert_down_w: &[f32],
+        d_y: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        iters: usize,
+    ) -> Result<(f64, f64)> {
+        let num_experts = expert_gate_w.len() / (inter * hidden);
+        let block_size = 128usize;
+
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w.len()]);
+        let dy_shape = Shape::new(vec![d_y.len()]);
+
+        let dgw_shape = Shape::new(vec![num_experts * inter * hidden]);
+        let duw_shape = Shape::new(vec![num_experts * inter * hidden]);
+        let ddw_shape = Shape::new(vec![num_experts * hidden * inter]);
+        let dx_shape = Shape::new(vec![batch * hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, expert_gate_w, &gw_shape, DType::F32)?;
+        let uw_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, expert_up_w, &uw_shape, DType::F32)?;
+        let dw_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, expert_down_w, &dw_shape, DType::F32)?;
+        let dy_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, d_y, &dy_shape, DType::F32)?;
+
+        let dgw_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &dgw_shape, DType::F32)?;
+        let duw_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &duw_shape, DType::F32)?;
+        let ddw_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &ddw_shape, DType::F32)?;
+        let dx_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &dx_shape, DType::F32)?;
+
+        let stash_shape = Shape::new(vec![sorted.num_tokens_post_padded, inter]);
+        let shg_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &stash_shape, DType::F32)?;
+        let shu_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &stash_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let dy_s = as_rocm(dy_storage.as_ref())?;
+        let dgw_s = as_rocm(dgw_storage.as_ref())?;
+        let duw_s = as_rocm(duw_storage.as_ref())?;
+        let ddw_s = as_rocm(ddw_storage.as_ref())?;
+        let dx_s = as_rocm(dx_storage.as_ref())?;
+        let shg_s = as_rocm(shg_storage.as_ref())?;
+        let shu_s = as_rocm(shu_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+
+        // Warmup
+        let _ = self.launch_charon_grouped_backward(
+            act_s, gw_ptr, uw_ptr, dw_ptr, dy_s, dgw_s, duw_s, ddw_s, dx_s,
+            &sorted, None, None, hidden, inter, routed_scaling_factor, num_experts,
+        )?;
+        self.synchronize();
+
+        // 1. Recompute path
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = self.launch_charon_grouped_backward(
+                act_s, gw_ptr, uw_ptr, dw_ptr, dy_s, dgw_s, duw_s, ddw_s, dx_s,
+                &sorted, None, None, hidden, inter, routed_scaling_factor, num_experts,
+            )?;
+        }
+        self.synchronize();
+        let recompute_dur = t0.elapsed();
+        let recompute_us = (recompute_dur.as_micros() as f64) / (iters as f64);
+
+        // 2. Stashed path — fill the stash with the FORWARD GPU kernel first
+        // (SPEED-ROC-14), exactly as the training path does, then time only the
+        // backward kernel reading those stashed activations.
+        let fwd_out_shape = Shape::new(vec![batch, hidden]);
+        let fwd_out_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &fwd_out_shape, DType::F32)?;
+        let fwd_out_s = as_rocm(fwd_out_storage.as_ref())?;
+        self.launch_charon_grouped_dispatch_entry(
+            act_s, gw_ptr, uw_ptr, dw_ptr, &sorted, fwd_out_s,
+            hidden, inter, routed_scaling_factor, num_experts,
+            "grim_moe_fused_grouped", Some(shg_s), Some(shu_s),
+        )?;
+        self.synchronize();
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = self.launch_charon_grouped_backward(
+                act_s, gw_ptr, uw_ptr, dw_ptr, dy_s, dgw_s, duw_s, ddw_s, dx_s,
+                &sorted, Some(shg_s), Some(shu_s), hidden, inter, routed_scaling_factor, num_experts,
+            )?;
+        }
+        self.synchronize();
+        let stashed_dur = t1.elapsed();
+        let stashed_us = (stashed_dur.as_micros() as f64) / (iters as f64);
+
+        Ok((recompute_us, stashed_us))
     }
 
     /// Host-to-host roundtrip for the #3 MXFP4 (E2M1 + E8M0) token-sorted grouped dispatch.

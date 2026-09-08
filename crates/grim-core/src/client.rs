@@ -1091,6 +1091,7 @@ pub fn check_model_cache() -> Result<()> {
 // Helpers
 
 fn build_http_client() -> Result<reqwest::Client> {
+    #[allow(unused_mut)]
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
     // Gate TLS cert bypass behind GRIM_INSECURE_TLS=1 for local testing/development only.
     // In release builds, invalid certificates are never accepted.

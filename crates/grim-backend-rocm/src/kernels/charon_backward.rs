@@ -34,6 +34,8 @@ extern "C" {
         const unsigned int* __restrict__ sorted_token_ids,
         const unsigned int* __restrict__ sorted_expert_ids,
         const float* __restrict__ sorted_weights,
+        const float* __restrict__ stash_hg,
+        const float* __restrict__ stash_hu,
         int hidden, int inter, int num_tokens, int block_size,
         float routed_scaling_factor)
     {
@@ -59,15 +61,23 @@ extern "C" {
             float* ddw = d_down_w + (unsigned long long)exp * (unsigned long long)hidden * inter;
             float* dx  = d_x      + (unsigned long long)tok * hidden;
 
-            // ── Recompute the forward hidden states for this (token, expert) ── h_gate[j] = sum_i gate_w[j, i] * x[i]   (j ∈ [0, inter), i ∈ [0, hidden)) h_up[j]  = sum_i up_w[j, i]  * x[i] act[j]  = silu(h_gate[j]) * h_up[j] y[h]   = sum_j down_w[h, j] * act[j]  (h ∈ [0, hidden)) The historical draft conflated the inter activation dim (`j`) with the hidden output dim (`h`) by reusing a single outer `h` loop - i.e.
-            // it indexed gate_w with `h ∈ [0, hidden)` even though gate_w's row dim is `inter`.
+            const float* cur_shg = stash_hg != nullptr ? stash_hg + (unsigned long long)s * inter : nullptr;
+            const float* cur_shu = stash_hu != nullptr ? stash_hu + (unsigned long long)s * inter : nullptr;
+
+            // ── Hidden states for this (token, expert) ──
+            // If stashed activations are provided (Stage 1), read them directly without recomputing.
+            // Otherwise fallback to recomputation from x and weights.
             for (int j = 0; j < inter; ++j) {
-                // h_gate / h_up are scalar per j (recomputed here; kept in
-                // registers, matching the host reference and the pre-JIT grouped forward's recompute pattern).
-                float hg = 0.0f, hu = 0.0f;
-                for (int i = 0; i < hidden; ++i) {
-                    hg += gw[j * hidden + i] * x[i];
-                    hu += uw[j * hidden + i] * x[i];
+                float hg, hu;
+                if (cur_shg != nullptr && cur_shu != nullptr) {
+                    hg = cur_shg[j];
+                    hu = cur_shu[j];
+                } else {
+                    hg = 0.0f; hu = 0.0f;
+                    for (int i = 0; i < hidden; ++i) {
+                        hg += gw[j * hidden + i] * x[i];
+                        hu += uw[j * hidden + i] * x[i];
+                    }
                 }
                 float silu_gj = hg / (1.0f + expf(-hg));
                 float act_j = silu_gj * hu;

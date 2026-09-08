@@ -4,7 +4,7 @@ use std::ffi::{CString, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
-use std::sync::atomic::AtomicI32;
+use std::cell::Cell;
 
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::{ArithType, BackendStorage, Error, Result};
@@ -144,24 +144,26 @@ pub fn raw_set_device(ordinal: i32) -> crate::HipErrorT {
     status
 }
 
-/// Test-only launch-seam stamps used by the WI-M3 context-drift gates: every kernel launch records `(self_dev, ctx_dev)`
-/// so a test can assert the launching thread was not parked on a foreign device.
+// Test-only launch-seam stamps used by the WI-M3 context-drift gates: every kernel launch records (self_dev, ctx_dev)
+// so a test can assert the launching thread was not parked on a foreign device.
+// Thread-local so parallel tests running on other threads don't stomp each other's values.
 #[cfg(test)]
-static LAUNCH_SELF_STAMP: AtomicI32 = AtomicI32::new(-1);
-#[cfg(test)]
-static LAUNCH_CTX_STAMP: AtomicI32 = AtomicI32::new(-1);
+thread_local! {
+    static LAUNCH_SELF_STAMP: Cell<i32> = const { Cell::new(-1) };
+    static LAUNCH_CTX_STAMP:  Cell<i32> = const { Cell::new(-1) };
+}
 
 #[cfg(test)]
 pub(crate) fn stamp_launch_context(self_dev: i32, ctx_dev: i32) {
-    LAUNCH_SELF_STAMP.store(self_dev, Ordering::Relaxed);
-    LAUNCH_CTX_STAMP.store(ctx_dev, Ordering::Relaxed);
+    LAUNCH_SELF_STAMP.with(|c| c.set(self_dev));
+    LAUNCH_CTX_STAMP.with(|c| c.set(ctx_dev));
 }
 
 #[cfg(test)]
 pub(crate) fn last_launch_context() -> (i32, i32) {
     (
-        LAUNCH_SELF_STAMP.load(Ordering::Relaxed),
-        LAUNCH_CTX_STAMP.load(Ordering::Relaxed),
+        LAUNCH_SELF_STAMP.with(|c| c.get()),
+        LAUNCH_CTX_STAMP.with(|c| c.get()),
     )
 }
 

@@ -394,4 +394,147 @@ fn p2_charon_backward_device_verifier() {
     let dx_err = rms_rel_err(&device_grads.d_x, &host.d_x);
     eprintln!("d_x: rms_rel_err = {dx_err:.6} (tol={tol})");
     assert!(dx_err <= tol, "P2 d_x: RMS rel err {dx_err} exceeds {tol}");
+
+    // ────────────────────────────────────────────────────────────────────────
+    // SPEED-ROC-14 correctness gate: the stashed path must produce the SAME
+    // gradients as the recompute path (the stash only changes where h_gate/h_up
+    // come from, not the math). Compare the two device paths directly.
+    // ────────────────────────────────────────────────────────────────────────
+    let recompute_grads = dev
+        .charon_grouped_backward_roundtrip_stashed(
+            &fw.x, &gw_flat, &uw_flat, &dw_flat, &dy, &assignment,
+            BATCH, HIDDEN, INTER, RSF, false,
+        )
+        .expect("recompute roundtrip")
+        .to_cpu()
+        .expect("recompute readback");
+    let stashed_grads = dev
+        .charon_grouped_backward_roundtrip_stashed(
+            &fw.x, &gw_flat, &uw_flat, &dw_flat, &dy, &assignment,
+            BATCH, HIDDEN, INTER, RSF, true,
+        )
+        .expect("stashed roundtrip")
+        .to_cpu()
+        .expect("stashed readback");
+    let stash_tol = 1e-5f32;
+    for (name, re, st) in [
+        ("d_gate_w", &recompute_grads.d_gate_w, &stashed_grads.d_gate_w),
+        ("d_up_w", &recompute_grads.d_up_w, &stashed_grads.d_up_w),
+        ("d_down_w", &recompute_grads.d_down_w, &stashed_grads.d_down_w),
+        ("d_x", &recompute_grads.d_x, &stashed_grads.d_x),
+    ] {
+        let max_diff = re.iter().zip(st.iter()).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("stash-vs-recompute {name}: max_abs_diff = {max_diff:.2e} (tol={stash_tol:.0e})");
+        assert!(
+            max_diff <= stash_tol,
+            "SPEED-ROC-14 {name}: stashed path diverges from recompute (max_abs_diff {max_diff})"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // MoE-layer backward step time benchmark: before (recompute) vs after (stashed)
+    // ────────────────────────────────────────────────────────────────────────
+    let iters = 100;
+    let (recompute_us_per_step, stashed_us_per_step) = dev
+        .benchmark_charon_backward_step_time(
+            &fw.x,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &dy,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            RSF,
+            iters,
+        )
+        .expect("benchmark_charon_backward_step_time");
+
+    eprintln!(
+        "\n--- Charon MoE Backward Step Time Benchmark ({} iterations) ---",
+        iters
+    );
+    eprintln!("Before (recompute h_gate/h_up): {:.2} µs / step", recompute_us_per_step);
+    eprintln!("After  (stashed activations):   {:.2} µs / step", stashed_us_per_step);
+    if stashed_us_per_step < recompute_us_per_step {
+        eprintln!(
+            "Speedup: {:.2}x faster ({:.1}% step time reduction)",
+            recompute_us_per_step / stashed_us_per_step,
+            (1.0 - stashed_us_per_step / recompute_us_per_step) * 100.0
+        );
+    }
+}
+
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn p2_charon_backward_benchmark_realistic() {
+    let Some(dev) = gpu_device() else {
+        return;
+    };
+
+    // Representative MoE dimensions
+    let batch = 16;
+    let hidden = 512;
+    let inter = 1024;
+    let num_experts = 4;
+    let rsf = 1.0f32;
+
+    let mut rng_seed = 42u64;
+    let mut next_f32 = || {
+        rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((rng_seed >> 33) as f32) / (u32::MAX as f32) * 0.02 - 0.01
+    };
+
+    let x: Vec<f32> = (0..batch * hidden).map(|_| next_f32()).collect();
+    let gw: Vec<f32> = (0..num_experts * inter * hidden).map(|_| next_f32()).collect();
+    let uw: Vec<f32> = (0..num_experts * inter * hidden).map(|_| next_f32()).collect();
+    let dw: Vec<f32> = (0..num_experts * hidden * inter).map(|_| next_f32()).collect();
+    let dy: Vec<f32> = (0..batch * hidden).map(|_| next_f32()).collect();
+
+    // Balanced routing: 4 tokens per expert
+    let mut tokens = Vec::with_capacity(batch);
+    let mut experts = Vec::with_capacity(batch);
+    let mut weights = Vec::with_capacity(batch);
+    for t in 0..batch {
+        tokens.push(t as u32);
+        experts.push((t % num_experts) as u32);
+        weights.push(1.0f32);
+    }
+    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment {
+        tokens,
+        experts,
+        weights,
+    };
+
+    let iters = 5;
+    let (recompute_us, stashed_us) = dev
+        .benchmark_charon_backward_step_time(
+            &x,
+            &gw,
+            &uw,
+            &dw,
+            &dy,
+            &assignment,
+            batch,
+            hidden,
+            inter,
+            rsf,
+            iters,
+        )
+        .expect("benchmark_charon_backward_step_time");
+
+    eprintln!(
+        "\n--- Realistic MoE Layer Backward Benchmark (batch={}, hidden={}, inter={}, iters={}) ---",
+        batch, hidden, inter, iters
+    );
+    eprintln!("Before (recompute h_gate/h_up): {:.2} ms / step", recompute_us / 1000.0);
+    eprintln!("After  (stashed activations):   {:.2} ms / step", stashed_us / 1000.0);
+    if stashed_us < recompute_us {
+        eprintln!(
+            "Speedup: {:.2}x faster ({:.1}% step time reduction)",
+            recompute_us / stashed_us,
+            (1.0 - stashed_us / recompute_us) * 100.0
+        );
+    }
 }

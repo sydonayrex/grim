@@ -29,52 +29,322 @@ extern "C" __global__ void grim_wmma_gemm(
     const _Float16* a_tile_ptr = A + tile_row * 16 * stride_a;
     const _Float16* b_tile_ptr = B + tile_col * 16;
 
-    // Optional ping-pong LDS staging. The JIT define is selected by the
-    // tile picker only when two tiles fit in the LDS budget.
-#if GRIM_LDS_DOUBLE_BUFFER
-    __shared__ _Float16 lds_a[2][256];
-    __shared__ _Float16 lds_b[2][256];
-    int ping = 0;
+    const bool need_boundary_a = (tile_row * 16 + 16 > M);
+    const bool need_boundary_b = (tile_col * 16 + 16 > N);
+
+    __shared__ _Float16 lds_staging_a[256];
+    // Bank-conflict-free transpose buffer: 16 rows x 17 cols (pad = 1)
+    __shared__ _Float16 lds_staging_b[16 * 17];
+    __shared__ _Float16 lds_frag_b[256];
+
     for (int k = 0; k < K; k += 16) {
-        int lane = threadIdx.x & 255;
-        if (lane < 256) {
-            int r = lane / 16;
-            int c = lane & 15;
-            lds_a[ping][lane] = (r < 16 && k + c < K)
-                ? a_tile_ptr[r * stride_a + k + c] : (_Float16)0;
-            lds_b[ping][lane] = (r < 16 && k + r < K)
-                ? b_tile_ptr[(k + r) * stride_b + c] : (_Float16)0;
+        const bool need_boundary_k = (k + 16 > K);
+
+        if (need_boundary_a || need_boundary_k) {
+            // Stage tile A with zero-padding for rows >= M or cols >= K.
+            for (int idx = threadIdx.x; idx < 256; idx += 32) {
+                int r = idx / 16;
+                int c = idx % 16;
+                bool valid = (tile_row * 16 + r < M) && (k + c < K);
+                lds_staging_a[idx] = valid ? a_tile_ptr[r * stride_a + k + c] : (_Float16)0;
+            }
+            __builtin_amdgcn_wave_barrier();
+            load_matrix_sync(frag_a, lds_staging_a, 16);
+            __builtin_amdgcn_wave_barrier();
+        } else {
+            load_matrix_sync(frag_a, a_tile_ptr + k, stride_a);
         }
-        __syncthreads();
+
+        // Stage tile B into padded LDS to transpose without 32-byte stride bank collisions:
+        // Memory B is row-major (K x N), element (r in K, c in N) is at b_tile_ptr[(k + r) * stride_b + c].
+        // Store into lds_staging_b with stride 17: row c, col r -> [c * 17 + r].
+        for (int idx = threadIdx.x; idx < 256; idx += 32) {
+            int r = idx / 16;
+            int c = idx % 16;
+            bool valid = (!need_boundary_k || (k + r < K)) && (!need_boundary_b || (tile_col * 16 + c < N));
+            lds_staging_b[c * 17 + r] = valid ? b_tile_ptr[(k + r) * stride_b + c] : (_Float16)0;
+        }
+        __builtin_amdgcn_wave_barrier();
+
+        // Copy from padded transpose buffer to contiguous tile for load_matrix_sync
+        for (int idx = threadIdx.x; idx < 256; idx += 32) {
+            int c = idx / 16;
+            int r = idx % 16;
+            lds_frag_b[idx] = lds_staging_b[c * 17 + r];
+        }
+        __builtin_amdgcn_wave_barrier();
+        load_matrix_sync(frag_b, lds_frag_b, 16);
+        __builtin_amdgcn_wave_barrier();
+
+        mma_sync(frag_c, frag_a, frag_b, frag_c);
 #if GRIM_SCHED_GROUP_BARRIER
         __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
 #endif
-        load_matrix_sync(frag_a, lds_a[ping], 16);
-        load_matrix_sync(frag_b, lds_b[ping], 16);
-        mma_sync(frag_c, frag_a, frag_b, frag_c);
-        __syncthreads();
-        ping ^= 1;
     }
-#else
-    for (int k = 0; k < K; k += 16) {
-        load_matrix_sync(frag_a, a_tile_ptr + k, stride_a);
-        load_matrix_sync(frag_b, b_tile_ptr + k * stride_b, stride_b);
-        mma_sync(frag_c, frag_a, frag_b, frag_c);
-#if GRIM_SCHED_GROUP_BARRIER
-        __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
-#endif
-    }
-#endif
 
     // rocWMMA accumulators store float; store to an intermediate row-major float buffer, then cast to _Float16 for the output.
-    // Directly passing a _Float16* to store_matrix_sync triggers a type-mismatch static_assert (accumulator DataT is float, pointer.
     _Float16* c_tile_ptr = C + tile_row * 16 * stride_c + tile_col * 16;
     __shared__ float c_tile_f32[256];
     store_matrix_sync(c_tile_f32, frag_c, 16, layout_t::mem_row_major);
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            c_tile_ptr[i * stride_c + j] = (_Float16)c_tile_f32[i * 16 + j];
+    __builtin_amdgcn_wave_barrier();
+
+    // Boundary-safe store: only write elements where row < M and col < N
+    for (int idx = threadIdx.x; idx < 256; idx += 32) {
+        int i = idx / 16;
+        int j = idx % 16;
+        if (tile_row * 16 + i < M && tile_col * 16 + j < N) {
+            c_tile_ptr[i * stride_c + j] = (_Float16)c_tile_f32[idx];
+        }
+    }
+}
+
+// Zero-overhead fast-path: B is pre-transposed in memory (or column-major K x N / row-major N x K).
+// No transposition or LDS staging required for matrix B in the inner loop.
+// Single-wave 16x32 tile: 1 wave computes two 16x16 output tiles (frag_c0, frag_c1)
+// Reuses frag_a across both N-tiles purely in registers.
+// Zero cross-wave LDS sharing, safe on RDNA3/4.
+extern "C" __global__ void grim_wmma_gemm_b_transposed(
+    const _Float16* __restrict__ A,
+    const _Float16* __restrict__ B_col_major,
+    _Float16* __restrict__ C,
+    int M, int N, int K,
+    int stride_a, int stride_b_col, int stride_c)
+{
+    const int tile_row = blockIdx.y;
+    const int tile_col_base = blockIdx.x * 2; // 2 tiles of 16 along N
+
+    if (tile_row * 16 >= M || tile_col_base * 16 >= N) return;
+
+    fragment<matrix_a, 16, 16, 16, _Float16, row_major> frag_a;
+    fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b0;
+    fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b1;
+    fragment<accumulator, 16, 16, 16, float> frag_c0;
+    fragment<accumulator, 16, 16, 16, float> frag_c1;
+
+    fill_fragment(frag_c0, 0.0f);
+    fill_fragment(frag_c1, 0.0f);
+
+    const _Float16* a_tile_ptr = A + tile_row * 16 * stride_a;
+    const _Float16* b0_tile_ptr = B_col_major + tile_col_base * 16 * stride_b_col;
+    const _Float16* b1_tile_ptr = B_col_major + (tile_col_base + 1) * 16 * stride_b_col;
+
+    const bool need_boundary_a = (tile_row * 16 + 16 > M);
+    const bool need_boundary_b0 = (tile_col_base * 16 + 16 > N);
+    const bool need_boundary_b1 = ((tile_col_base + 1) * 16 + 16 > N);
+    const bool valid_col1 = ((tile_col_base + 1) * 16 < N);
+
+    __shared__ _Float16 lds_staging[256];
+
+    for (int k = 0; k < K; k += 16) {
+        const bool need_boundary_k = (k + 16 > K);
+
+        // Load A (reused for both b0 and b1)
+        if (need_boundary_a || need_boundary_k) {
+            for (int idx = threadIdx.x; idx < 256; idx += 32) {
+                int r = idx / 16;
+                int c = idx % 16;
+                bool valid = (tile_row * 16 + r < M) && (k + c < K);
+                lds_staging[idx] = valid ? a_tile_ptr[r * stride_a + k + c] : (_Float16)0;
+            }
+            __builtin_amdgcn_wave_barrier();
+            load_matrix_sync(frag_a, lds_staging, 16);
+            __builtin_amdgcn_wave_barrier();
+        } else {
+            load_matrix_sync(frag_a, a_tile_ptr + k, stride_a);
+        }
+
+        // Load B0
+        if (need_boundary_b0 || need_boundary_k) {
+            for (int idx = threadIdx.x; idx < 256; idx += 32) {
+                int r = idx % 16;
+                int c = idx / 16;
+                bool valid = (!need_boundary_k || (k + r < K)) && (!need_boundary_b0 || (tile_col_base * 16 + c < N));
+                lds_staging[idx] = valid ? b0_tile_ptr[c * stride_b_col + k + r] : (_Float16)0;
+            }
+            __builtin_amdgcn_wave_barrier();
+            load_matrix_sync(frag_b0, lds_staging, 16);
+            __builtin_amdgcn_wave_barrier();
+        } else {
+            load_matrix_sync(frag_b0, b0_tile_ptr + k, stride_b_col);
+        }
+
+        mma_sync(frag_c0, frag_a, frag_b0, frag_c0);
+
+        // Load B1 (if within bounds)
+        if (valid_col1) {
+            if (need_boundary_b1 || need_boundary_k) {
+                for (int idx = threadIdx.x; idx < 256; idx += 32) {
+                    int r = idx % 16;
+                    int c = idx / 16;
+                    bool valid = (!need_boundary_k || (k + r < K)) && (!need_boundary_b1 || ((tile_col_base + 1) * 16 + c < N));
+                    lds_staging[idx] = valid ? b1_tile_ptr[c * stride_b_col + k + r] : (_Float16)0;
+                }
+                __builtin_amdgcn_wave_barrier();
+                load_matrix_sync(frag_b1, lds_staging, 16);
+                __builtin_amdgcn_wave_barrier();
+            } else {
+                load_matrix_sync(frag_b1, b1_tile_ptr + k, stride_b_col);
+            }
+            mma_sync(frag_c1, frag_a, frag_b1, frag_c1);
+        }
+
+#if GRIM_SCHED_GROUP_BARRIER
+        __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
+#endif
+    }
+
+    // Write tile 0
+    _Float16* c0_tile_ptr = C + tile_row * 16 * stride_c + tile_col_base * 16;
+    __shared__ float c_tile_f32[256];
+    store_matrix_sync(c_tile_f32, frag_c0, 16, layout_t::mem_row_major);
+    __builtin_amdgcn_wave_barrier();
+
+    for (int idx = threadIdx.x; idx < 256; idx += 32) {
+        int i = idx / 16;
+        int j = idx % 16;
+        if (tile_row * 16 + i < M && tile_col_base * 16 + j < N) {
+            c0_tile_ptr[i * stride_c + j] = (_Float16)c_tile_f32[idx];
+        }
+    }
+
+    // Write tile 1 (if within bounds)
+    if (valid_col1) {
+        _Float16* c1_tile_ptr = C + tile_row * 16 * stride_c + (tile_col_base + 1) * 16;
+        __builtin_amdgcn_wave_barrier();
+        store_matrix_sync(c_tile_f32, frag_c1, 16, layout_t::mem_row_major);
+        __builtin_amdgcn_wave_barrier();
+
+        for (int idx = threadIdx.x; idx < 256; idx += 32) {
+            int i = idx / 16;
+            int j = idx % 16;
+            if (tile_row * 16 + i < M && (tile_col_base + 1) * 16 + j < N) {
+                c1_tile_ptr[i * stride_c + j] = (_Float16)c_tile_f32[idx];
+            }
+        }
+    }
+}
+
+// RDNA4-only multi-wave workgroup kernel (16x64 tile per block: 2 waves x 16x32).
+// Wave 0 computes tiles [col+0, col+1], Wave 1 computes tiles [col+2, col+3].
+// Both waves share activation tile A staged in LDS once per K-step.
+extern "C" __global__ void grim_wmma_gemm_b_transposed_rdna4(
+    const _Float16* __restrict__ A,
+    const _Float16* __restrict__ B_col_major,
+    _Float16* __restrict__ C,
+    int M, int N, int K,
+    int stride_a, int stride_b_col, int stride_c)
+{
+    const int tile_row = blockIdx.y;
+    const int wave_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    // 4 tiles of 16 along N per workgroup (64 elements of N per block)
+    const int tile_col_base = blockIdx.x * 4 + wave_id * 2;
+
+    if (tile_row * 16 >= M || (blockIdx.x * 4) * 16 >= N) return;
+
+    fragment<matrix_a, 16, 16, 16, _Float16, row_major> frag_a;
+    fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b0;
+    fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b1;
+    fragment<accumulator, 16, 16, 16, float> frag_c0;
+    fragment<accumulator, 16, 16, 16, float> frag_c1;
+
+    fill_fragment(frag_c0, 0.0f);
+    fill_fragment(frag_c1, 0.0f);
+
+    const _Float16* a_tile_ptr = A + tile_row * 16 * stride_a;
+    const _Float16* b0_tile_ptr = B_col_major + tile_col_base * 16 * stride_b_col;
+    const _Float16* b1_tile_ptr = B_col_major + (tile_col_base + 1) * 16 * stride_b_col;
+
+    const bool need_boundary_a = (tile_row * 16 + 16 > M);
+    const bool valid_col0 = (tile_col_base * 16 < N);
+    const bool valid_col1 = ((tile_col_base + 1) * 16 < N);
+    const bool need_boundary_b0 = (tile_col_base * 16 + 16 > N);
+    const bool need_boundary_b1 = ((tile_col_base + 1) * 16 + 16 > N);
+
+    __shared__ _Float16 lds_shared_a[256];
+    __shared__ _Float16 lds_staging_b[2][256];
+
+    for (int k = 0; k < K; k += 16) {
+        const bool need_boundary_k = (k + 16 > K);
+
+        // Cooperative load of A into shared memory (64 threads in block, 4 elements/thread)
+        for (int idx = threadIdx.x; idx < 256; idx += 64) {
+            int r = idx / 16;
+            int c = idx % 16;
+            bool valid = (!need_boundary_a || (tile_row * 16 + r < M)) && (!need_boundary_k || (k + c < K));
+            lds_shared_a[idx] = valid ? a_tile_ptr[r * stride_a + k + c] : (_Float16)0;
+        }
+        __syncthreads();
+
+        load_matrix_sync(frag_a, lds_shared_a, 16);
+
+        // Load B0
+        if (valid_col0) {
+            if (need_boundary_b0 || need_boundary_k) {
+                for (int idx = lane_id; idx < 256; idx += 32) {
+                    int r = idx % 16;
+                    int c = idx / 16;
+                    bool valid = (!need_boundary_k || (k + r < K)) && (!need_boundary_b0 || (tile_col_base * 16 + c < N));
+                    lds_staging_b[wave_id][idx] = valid ? b0_tile_ptr[c * stride_b_col + k + r] : (_Float16)0;
+                }
+                __builtin_amdgcn_wave_barrier();
+                load_matrix_sync(frag_b0, lds_staging_b[wave_id], 16);
+                __builtin_amdgcn_wave_barrier();
+            } else {
+                load_matrix_sync(frag_b0, b0_tile_ptr + k, stride_b_col);
+            }
+            mma_sync(frag_c0, frag_a, frag_b0, frag_c0);
+        }
+
+        // Load B1
+        if (valid_col1) {
+            if (need_boundary_b1 || need_boundary_k) {
+                for (int idx = lane_id; idx < 256; idx += 32) {
+                    int r = idx % 16;
+                    int c = idx / 16;
+                    bool valid = (!need_boundary_k || (k + r < K)) && (!need_boundary_b1 || ((tile_col_base + 1) * 16 + c < N));
+                    lds_staging_b[wave_id][idx] = valid ? b1_tile_ptr[c * stride_b_col + k + r] : (_Float16)0;
+                }
+                __builtin_amdgcn_wave_barrier();
+                load_matrix_sync(frag_b1, lds_staging_b[wave_id], 16);
+                __builtin_amdgcn_wave_barrier();
+            } else {
+                load_matrix_sync(frag_b1, b1_tile_ptr + k, stride_b_col);
+            }
+            mma_sync(frag_c1, frag_a, frag_b1, frag_c1);
+        }
+
+        __syncthreads();
+    }
+
+    __shared__ float c_out_f32[2][256];
+
+    if (valid_col0) {
+        _Float16* c0_tile_ptr = C + tile_row * 16 * stride_c + tile_col_base * 16;
+        store_matrix_sync(c_out_f32[wave_id], frag_c0, 16, layout_t::mem_row_major);
+        __builtin_amdgcn_wave_barrier();
+
+        for (int idx = lane_id; idx < 256; idx += 32) {
+            int i = idx / 16;
+            int j = idx % 16;
+            if (tile_row * 16 + i < M && tile_col_base * 16 + j < N) {
+                c0_tile_ptr[i * stride_c + j] = (_Float16)c_out_f32[wave_id][idx];
+            }
+        }
+    }
+
+    if (valid_col1) {
+        _Float16* c1_tile_ptr = C + tile_row * 16 * stride_c + (tile_col_base + 1) * 16;
+        __builtin_amdgcn_wave_barrier();
+        store_matrix_sync(c_out_f32[wave_id], frag_c1, 16, layout_t::mem_row_major);
+        __builtin_amdgcn_wave_barrier();
+
+        for (int idx = lane_id; idx < 256; idx += 32) {
+            int i = idx / 16;
+            int j = idx % 16;
+            if (tile_row * 16 + i < M && (tile_col_base + 1) * 16 + j < N) {
+                c1_tile_ptr[i * stride_c + j] = (_Float16)c_out_f32[wave_id][idx];
+            }
         }
     }
 }
@@ -99,6 +369,54 @@ extern "C" __global__ void grim_wmma_gemm(
     for (int k = 0; k < K; ++k) {
         float a_val = (float)A[row * stride_a + k];
         float b_val = (float)B[k * stride_b + col];
+        acc += a_val * b_val;
+    }
+
+    C[row * stride_c + col] = (_Float16)acc;
+}
+
+extern "C" __global__ void grim_wmma_gemm_b_transposed(
+    const _Float16* __restrict__ A,
+    const _Float16* __restrict__ B_col_major,
+    _Float16* __restrict__ C,
+    int M, int N, int K,
+    int stride_a, int stride_b_col, int stride_c)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    const int row = idx / N;
+    const int col = idx % N;
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float a_val = (float)A[row * stride_a + k];
+        float b_val = (float)B_col_major[col * stride_b_col + k];
+        acc += a_val * b_val;
+    }
+
+    C[row * stride_c + col] = (_Float16)acc;
+}
+
+extern "C" __global__ void grim_wmma_gemm_b_transposed_rdna4(
+    const _Float16* __restrict__ A,
+    const _Float16* __restrict__ B_col_major,
+    _Float16* __restrict__ C,
+    int M, int N, int K,
+    int stride_a, int stride_b_col, int stride_c)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    const int row = idx / N;
+    const int col = idx % N;
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float a_val = (float)A[row * stride_a + k];
+        float b_val = (float)B_col_major[col * stride_b_col + k];
         acc += a_val * b_val;
     }
 

@@ -200,7 +200,11 @@ mod source_asm_self_tests {
         assert!(source.contains("#define GRIM_LDS_DOUBLE_BUFFER"));
         assert!(source.contains("#define GRIM_SCHED_GROUP_BARRIER"));
         assert!(source.contains("__builtin_amdgcn_sched_group_barrier"));
-        assert!(source.contains("lds_a[2][256]"));
+        // Bank-conflict-free LDS symbols present in grim_wmma_gemm inner loop:
+        assert!(source.contains("lds_staging_b"));
+        assert!(source.contains("lds_frag_b"));
+        // Pre-transposed B kernel always included in kernel source:
+        assert!(source.contains("grim_wmma_gemm_b_transposed"));
     }
 
     /// A.0 regression guard: every shared __device__ helper must be defined

@@ -154,6 +154,25 @@ impl CharonBackwardResult {
     }
 }
 
+/// Device-resident stash of the per-slot gate/up pre-activations written by
+/// the FP32 Charon grouped forward kernel (`grim_moe_fused_grouped`). The
+/// backward kernel reads these instead of recomputing the projections
+/// (SPEED-ROC-14). Owned by the caller between the forward launch and the
+/// matching backward launch; freed on Drop.
+pub struct CharonForwardStash {
+    pub hg: Box<dyn BackendStorage>,
+    pub hu: Box<dyn BackendStorage>,
+}
+
+impl std::fmt::Debug for CharonForwardStash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CharonForwardStash")
+            .field("hg", &self.hg.shape().dims())
+            .field("hu", &self.hu.shape().dims())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct RocmDevice {
     pub(crate) ordinal: usize,
@@ -1204,7 +1223,7 @@ impl RocmDevice {
                     let _ = rocblas_set_stream(h, stream);
                 }
             }
-            self.launch_decode_gemm_f16(a, b, out, m, n, k)?;
+            self.launch_rocblas_gemm_f16(a, b, out, m, n, k)?;
             Ok(())
         })?;
         mgr.replay(key)?;
